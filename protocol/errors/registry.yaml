@@ -1,0 +1,127 @@
+version: 1
+errors:
+  - code: UNAUTHENTICATED
+    rust_name: Unauthenticated
+    http_status: 401
+    default_retryable: false
+    message: Authentication is required.
+  - code: DEVICE_REVOKED
+    rust_name: DeviceRevoked
+    http_status: 401
+    default_retryable: false
+    message: This device has been revoked.
+  - code: FORBIDDEN
+    rust_name: Forbidden
+    http_status: 403
+    default_retryable: false
+    message: This operation is not allowed.
+  - code: POLICY_DENIED
+    rust_name: PolicyDenied
+    http_status: 403
+    default_retryable: false
+    message: Policy denied this operation.
+  - code: CONSENT_REQUIRED
+    rust_name: ConsentRequired
+    http_status: 403
+    default_retryable: false
+    message: Explicit consent is required.
+  - code: APPROVAL_REQUIRED
+    rust_name: ApprovalRequired
+    http_status: 409
+    default_retryable: false
+    message: Approval is required before this operation can continue.
+  - code: APPROVAL_EXPIRED
+    rust_name: ApprovalExpired
+    http_status: 409
+    default_retryable: false
+    message: The approval request expired.
+  - code: REVISION_CONFLICT
+    rust_name: RevisionConflict
+    http_status: 409
+    default_retryable: false
+    message: The object changed before this operation completed.
+  - code: IDEMPOTENCY_CONFLICT
+    rust_name: IdempotencyConflict
+    http_status: 409
+    default_retryable: false
+    message: The idempotency key was already used for a different command.
+  - code: CONNECTOR_OFFLINE
+    rust_name: ConnectorOffline
+    http_status: 503
+    default_retryable: true
+    message: No eligible connector is online.
+  - code: CONNECTOR_UNHEALTHY
+    rust_name: ConnectorUnhealthy
+    http_status: 503
+    default_retryable: true
+    message: The selected connector is not healthy.
+  - code: CAPABILITY_UNAVAILABLE
+    rust_name: CapabilityUnavailable
+    http_status: 409
+    default_retryable: false
+    message: A required capability is unavailable.
+  - code: STALE_LEASE
+    rust_name: StaleLease
+    http_status: 409
+    default_retryable: false
+    message: The operation used an expired lease.
+  - code: PLAN_REVISION_CONFLICT
+    rust_name: PlanRevisionConflict
+    http_status: 409
+    default_retryable: false
+    message: The job plan changed before approval.
+  - code: BUDGET_EXCEEDED
+    rust_name: BudgetExceeded
+    http_status: 409
+    default_retryable: false
+    message: The approved budget would be exceeded.
+  - code: CLOUD_CONNECTION_INVALID
+    rust_name: CloudConnectionInvalid
+    http_status: 422
+    default_retryable: false
+    message: The cloud connection is invalid.
+  - code: CLOUD_CONNECTION_IN_USE
+    rust_name: CloudConnectionInUse
+    http_status: 409
+    default_retryable: false
+    message: The cloud connection is still in use.
+  - code: CLOUD_PERMISSION_MISSING
+    rust_name: CloudPermissionMissing
+    http_status: 403
+    default_retryable: false
+    message: The cloud connection lacks a required permission.
+  - code: CLOUD_RATE_LIMITED
+    rust_name: CloudRateLimited
+    http_status: 429
+    default_retryable: true
+    message: The cloud provider temporarily rate limited the operation.
+  - code: RESOURCE_DISPOSITION_BLOCKED
+    rust_name: ResourceDispositionBlocked
+    http_status: 409
+    default_retryable: false
+    message: A resource cannot enter its approved disposition.
+  - code: RESOURCE_ORPHANED
+    rust_name: ResourceOrphaned
+    http_status: 409
+    default_retryable: false
+    message: A managed resource requires operator reconciliation.
+  - code: VERIFICATION_FAILED
+    rust_name: VerificationFailed
+    http_status: 422
+    default_retryable: false
+    message: Result verification failed.
+  - code: HANDOFF_REQUIRED
+    rust_name: HandoffRequired
+    http_status: 409
+    default_retryable: false
+    message: Owner handoff must complete before this operation can finish.
+  - code: CURSOR_EXPIRED
+    rust_name: CursorExpired
+    http_status: 410
+    default_retryable: false
+    message: The event cursor expired and a signed snapshot is required.
+  - code: PROTOCOL_VERSION_UNSUPPORTED
+    rust_name: ProtocolVersionUnsupported
+    http_status: 426
+    default_retryable: false
+    message: This protocol version is not supported.

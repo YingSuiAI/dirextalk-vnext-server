@@ -9,16 +9,45 @@ permissions:
   contents: read
 
 jobs:
-  rust:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Install pinned Rust toolchain
         run: |
           rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
           rustup override set 1.97.0
+
+      - name: Install pinned Dart SDK
+        uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260 # v1.7.2
+        with:
+          sdk: 3.12.2
+
+      - name: Verify generated and frozen protocol contracts
+        run: |
+          cargo run -p dtx-protocol --locked -- generate .
+          if [[ -n "$(git status --porcelain --untracked-files=all -- crates/dtx-wire/src/generated protocol/generated/dart/lib/src)" ]]; then
+            git status --short -- crates/dtx-wire/src/generated protocol/generated/dart/lib/src
+            exit 1
+          fi
+          cargo run -p dtx-protocol --locked -- check-generated .
+          cargo run -p dtx-protocol --locked -- validate .
+          cargo run -p dtx-protocol --locked -- check-breaking .
+
+      - name: Install locked Dart dependencies
+        working-directory: protocol/generated/dart
+        run: dart pub get --enforce-lockfile
+
+      - name: Check Dart contracts
+        working-directory: protocol/generated/dart
+        run: |
+          dart format --output=none --set-exit-if-changed .
+          dart analyze --fatal-infos
+          dart test
+          dart compile js tool/web_smoke.dart -O2 -o "$RUNNER_TEMP/dtx-protocol-web-smoke.js"
+          node "$RUNNER_TEMP/dtx-protocol-web-smoke.js"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -38,3 +67,6 @@ jobs:
         run: |
           cargo deny check
           cargo audit
+
+      - name: Check diff hygiene
+        run: git diff --check

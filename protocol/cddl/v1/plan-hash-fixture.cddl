@@ -1,0 +1,22 @@
+plan-resource-fixture-v1 = {
+  1: bounded-string,
+  2: stable-code,
+  3: stable-code
+}
+
+money-fixture-v1 = {
+  1: tstr .size 3,
+  2: safe-uint
+}
+
+job-plan-hash-fixture-v1 = {
+  1: uuid-v7,
+  2: safe-uint,
+  3: sha256-digest,
+  4: bounded-string,
+  5: [+ plan-resource-fixture-v1],
+  6: money-fixture-v1,
+  7: safe-uint,
+  8: stable-code,
+  9: stable-code
+}

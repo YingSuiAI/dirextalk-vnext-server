@@ -7,7 +7,16 @@ if ($cargoArguments.Count -eq 0) {
 $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $currentPath = $env:Path
-$env:Path = "$currentPath;$userPath;$machinePath"
+$pathEntries = @()
+foreach ($pathSource in @($currentPath, $userPath, $machinePath)) {
+    foreach ($pathEntry in ($pathSource -split ';')) {
+        $pathEntry = $pathEntry.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($pathEntry) -and $pathEntries -notcontains $pathEntry) {
+            $pathEntries += $pathEntry
+        }
+    }
+}
+$env:Path = $pathEntries -join ';'
 
 if (Get-Command link.exe -ErrorAction SilentlyContinue) {
     & cargo @cargoArguments

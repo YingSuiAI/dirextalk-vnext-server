@@ -1,0 +1,24 @@
+protocol-version = {
+  1: 0..65535,
+  2: 0..65535
+}
+
+; cddl-cat does not implement .regexp, so dtx-protocol performs the UUIDv7
+; version/variant/lowercase validation in addition to this encoded-size rule.
+uuid-v7 = tstr .size 36
+stable-code = tstr .size (1..128)
+bounded-string = tstr .size (1..1024)
+api-error-code = tstr .size (3..64)
+api-error-message = tstr .size (1..512)
+api-error-detail-key = tstr .size (1..64)
+api-error-detail-text = tstr .size (0..256)
+sha256-digest = bstr .size 32
+ed25519-public-key = bstr .size 32
+ed25519-signature = bstr .size 64
+utc-millis = -62135596800000..253402300799999
+safe-uint = 0..9007199254740991
+positive-safe-uint = 1..9007199254740991
+safe-int = -9007199254740991..9007199254740991
+u32 = 0..4294967295
+public-subject-id = tstr .size 57
+job-evidence-id-list = [*4096 uuid-v7]

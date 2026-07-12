@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package dirextalk.v1;
+
+// Protobuf control-stream wrappers carry the same primitive semantics as the
+// JSON/CBOR contracts. Proxies that must preserve unknown fields retain the
+// original frame bytes rather than decode/re-encode with Prost.
+
+message WireVersion {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  uint32 minimum_reader_major = 3;
+  uint32 minimum_reader_minor = 4;
+}
+
+message Sha256Digest {
+  bytes value = 1; // Exactly 32 bytes.
+}
+
+message Ed25519PublicKey {
+  bytes value = 1; // Exactly 32 canonical, non-weak bytes.
+}
+
+message Ed25519Signature {
+  bytes value = 1; // Exactly 64 bytes.
+}
+
+message ApiErrorDetail {
+  // Text is at most 256 UTF-8 bytes; signed integers are restricted to
+  // [-9007199254740991, 9007199254740991] for JSON/CBOR interoperability.
+  oneof value {
+    string text = 1;
+    sint64 integer = 2;
+    bool boolean = 3;
+    StringList text_list = 4;
+    IntegerList integer_list = 5;
+  }
+}
+
+message StringList {
+  // At most 16 values; each value is at most 256 UTF-8 bytes.
+  repeated string values = 1;
+}
+
+message IntegerList {
+  // At most 16 values; each is a JSON-safe signed integer.
+  repeated sint64 values = 1;
+}
+
+message ApiErrorV1 {
+  string code = 1; // 3..64 bytes, stable UPPER_SNAKE_CASE.
+  string message = 2; // 1..512 UTF-8 bytes, without control characters.
+  string request_id = 3; // Canonical lowercase UUIDv7 text.
+  bool retryable = 4;
+  // At most 16 entries; keys are 1..64 bytes in lower_snake_case.
+  map<string, ApiErrorDetail> details = 5;
+}
+
+message ApiErrorResponseV1 {
+  ApiErrorV1 error = 1;
+}
+
+// Durable payload truth remains the signed deterministic CBOR envelope.
+// This frame supplies low-latency control-stream delivery without creating a
+// second serialization to hash or sign.
+message DurableEventFrameV1 {
+  WireVersion version = 1;
+  string event_type = 2;
+  string event_id = 3; // Canonical lowercase UUIDv7 text.
+  // 1..9007199254740991; zero and larger integers are invalid on the wire.
+  uint64 stream_sequence = 4;
+  bytes canonical_cbor_envelope = 5;
+}

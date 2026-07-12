@@ -1,0 +1,291 @@
+version: 1
+events:
+  - type: agent.installation.changed.v1
+    rust_name: AgentInstallationChangedV1
+    schema_version: 1
+    aggregate: agent_installation
+    required_reader_capability: agent_installation.v1
+    authorization: owner_or_operator
+    retention: tenant_policy
+    redaction: no_runtime_secret
+    snapshot_projection: agent_installations
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: installation_id, type: installation_id }
+      - { key: 2, name: descriptor_hash, type: sha256_digest }
+      - { key: 3, name: state, type: stable_code }
+      - { key: 4, name: policy_revision, type: u64 }
+  - type: agent.binding.changed.v1
+    rust_name: AgentBindingChangedV1
+    schema_version: 1
+    aggregate: agent_binding
+    required_reader_capability: agent_binding.v1
+    authorization: owner_or_operator
+    retention: tenant_policy
+    redaction: identifiers_only
+    snapshot_projection: agent_bindings
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: binding_id, type: binding_id }
+      - { key: 2, name: installation_id, type: installation_id }
+      - { key: 3, name: connector_id, type: connector_id }
+      - { key: 4, name: mode, type: stable_code }
+      - { key: 5, name: priority, type: u32 }
+      - { key: 6, name: enabled, type: bool }
+      - { key: 7, name: revision, type: u64 }
+  - type: agent.grant.changed.v1
+    rust_name: AgentGrantChangedV1
+    schema_version: 1
+    aggregate: conversation_grant
+    required_reader_capability: agent_grant.v1
+    authorization: conversation_member_and_owner
+    retention: conversation_lifecycle
+    redaction: no_message_body
+    snapshot_projection: conversation_grants
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: conversation_id, type: conversation_id }
+      - { key: 2, name: installation_id, type: installation_id }
+      - { key: 3, name: permission_hash, type: sha256_digest }
+      - { key: 4, name: trigger, type: stable_code }
+      - { key: 5, name: expires_at, type: optional_utc_millis }
+      - { key: 6, name: revoked, type: bool }
+  - type: agent.consent.changed.v1
+    rust_name: AgentConsentChangedV1
+    schema_version: 1
+    aggregate: agent_consent
+    required_reader_capability: agent_consent.v1
+    authorization: owner_or_approver
+    retention: audit_long_term
+    redaction: hashes_only
+    snapshot_projection: agent_consents
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: consent_id, type: consent_id }
+      - { key: 2, name: egress_hash, type: sha256_digest }
+      - { key: 3, name: policy_hash, type: sha256_digest }
+      - { key: 4, name: state, type: stable_code }
+      - { key: 5, name: actor_device_id, type: device_id }
+  - type: agent.approval.requested.v1
+    rust_name: AgentApprovalRequestedV1
+    schema_version: 1
+    aggregate: agent_approval
+    required_reader_capability: agent_approval.v1
+    authorization: designated_approver
+    retention: audit_long_term
+    redaction: redacted_summary_only
+    snapshot_projection: pending_approvals
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: approval_id, type: approval_id }
+      - { key: 2, name: operation_hash, type: sha256_digest }
+      - { key: 3, name: risk, type: stable_code }
+      - { key: 4, name: expires_at, type: utc_millis }
+      - { key: 5, name: redacted_summary, type: bounded_string }
+  - type: agent.approval.resolved.v1
+    rust_name: AgentApprovalResolvedV1
+    schema_version: 1
+    aggregate: agent_approval
+    required_reader_capability: agent_approval.v1
+    authorization: owner_approver_or_auditor
+    retention: audit_long_term
+    redaction: receipt_hash_only
+    snapshot_projection: approval_history
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: approval_id, type: approval_id }
+      - { key: 2, name: decision, type: stable_code }
+      - { key: 3, name: actor_device_id, type: device_id }
+      - { key: 4, name: receipt_hash, type: sha256_digest }
+  - type: host.observed.v1
+    rust_name: HostObservedV1
+    schema_version: 1
+    aggregate: agent_host
+    required_reader_capability: host_observed.v1
+    authorization: owner_or_operator
+    retention: operational_short_term
+    redaction: no_host_secret
+    snapshot_projection: agent_hosts
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: host_id, type: host_id }
+      - { key: 2, name: supervisor_version, type: bounded_string }
+      - { key: 3, name: state, type: stable_code }
+      - { key: 4, name: heartbeat_expires_at, type: utc_millis }
+      - { key: 5, name: revision, type: u64 }
+  - type: connector.spec.changed.v1
+    rust_name: ConnectorSpecChangedV1
+    schema_version: 1
+    aggregate: connector
+    required_reader_capability: connector_spec.v1
+    authorization: owner_or_operator
+    retention: tenant_policy
+    redaction: immutable_release_only
+    snapshot_projection: connectors
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: connector_id, type: connector_id }
+      - { key: 2, name: host_id, type: host_id }
+      - { key: 3, name: adapter_kind, type: stable_code }
+      - { key: 4, name: desired_state, type: stable_code }
+      - { key: 5, name: release_digest, type: sha256_digest }
+      - { key: 6, name: revision, type: u64 }
+  - type: connector.observed.v1
+    rust_name: ConnectorObservedV1
+    schema_version: 1
+    aggregate: connector
+    required_reader_capability: null
+    authorization: owner_or_operator
+    retention: operational_short_term
+    redaction: no_log_or_runtime_secret
+    snapshot_projection: connector_health
+    unknown_version_policy: preserve_and_skip
+    fields:
+      - { key: 1, name: connector_id, type: connector_id }
+      - { key: 2, name: boot_id, type: boot_id }
+      - { key: 3, name: state, type: stable_code }
+      - { key: 4, name: capability_hash, type: sha256_digest }
+      - { key: 5, name: capacity, type: u32 }
+      - { key: 6, name: lease_expires_at, type: optional_utc_millis }
+      - { key: 7, name: error_code, type: optional_api_error_code }
+  - type: agent.run.changed.v1
+    rust_name: AgentRunChangedV1
+    schema_version: 1
+    aggregate: agent_run
+    required_reader_capability: agent_run.v1
+    authorization: conversation_member_and_owner
+    retention: conversation_lifecycle
+    redaction: no_output_body
+    snapshot_projection: agent_runs
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: run_id, type: run_id }
+      - { key: 2, name: installation_id, type: installation_id }
+      - { key: 3, name: binding_id, type: binding_id }
+      - { key: 4, name: connector_id, type: optional_connector_id }
+      - { key: 5, name: state, type: stable_code }
+      - { key: 6, name: checkpoint_sequence, type: u64 }
+      - { key: 7, name: outcome, type: optional_stable_code }
+  - type: job.changed.v1
+    rust_name: JobChangedV1
+    schema_version: 1
+    aggregate: job
+    required_reader_capability: job_state.v1
+    authorization: owner_operator_or_approver
+    retention: audit_long_term
+    redaction: budget_summary_hash_only
+    snapshot_projection: jobs
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: job_id, type: job_id }
+      - { key: 2, name: execution_state, type: stable_code }
+      - { key: 3, name: desired_state, type: stable_code }
+      - { key: 4, name: outcome, type: stable_code }
+      - { key: 5, name: plan_revision, type: u64 }
+      - { key: 6, name: budget_summary_hash, type: sha256_digest }
+  - type: job.step.changed.v1
+    rust_name: JobStepChangedV1
+    schema_version: 1
+    aggregate: job
+    required_reader_capability: job_step.v1
+    authorization: job_audience
+    retention: audit_long_term
+    redaction: no_stdout
+    snapshot_projection: job_steps
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: job_id, type: job_id }
+      - { key: 2, name: step_id, type: job_step_id }
+      - { key: 3, name: attempt, type: u32 }
+      - { key: 4, name: state, type: stable_code }
+      - { key: 5, name: lease_epoch, type: u64 }
+      - { key: 6, name: progress_basis_points, type: u32 }
+      - { key: 7, name: evidence_ids, type: job_evidence_id_list }
+  - type: job.evidence.changed.v1
+    rust_name: JobEvidenceChangedV1
+    schema_version: 1
+    aggregate: job
+    required_reader_capability: null
+    authorization: job_audience
+    retention: audit_long_term
+    redaction: no_artifact_url
+    snapshot_projection: job_evidence
+    unknown_version_policy: preserve_and_skip
+    fields:
+      - { key: 1, name: evidence_id, type: job_evidence_id }
+      - { key: 2, name: evidence_type, type: stable_code }
+      - { key: 3, name: status, type: stable_code }
+      - { key: 4, name: digest, type: sha256_digest }
+      - { key: 5, name: verifier, type: stable_code }
+      - { key: 6, name: observed_at, type: utc_millis }
+  - type: cloud.resource.changed.v1
+    rust_name: CloudResourceChangedV1
+    schema_version: 1
+    aggregate: job_resource
+    required_reader_capability: cloud_resource.v1
+    authorization: owner_operator_or_auditor
+    retention: audit_long_term
+    redaction: redacted_provider_state
+    snapshot_projection: cloud_resources
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: job_id, type: job_id }
+      - { key: 2, name: resource_id, type: job_resource_id }
+      - { key: 3, name: resource_key, type: bounded_string }
+      - { key: 4, name: lifecycle, type: stable_code }
+      - { key: 5, name: desired_state, type: stable_code }
+      - { key: 6, name: observed_state, type: stable_code }
+      - { key: 7, name: disposition, type: stable_code }
+      - { key: 8, name: cost_estimate_minor_units, type: u64 }
+      - { key: 9, name: currency, type: bounded_string }
+  - type: service.changed.v1
+    rust_name: ServiceChangedV1
+    schema_version: 1
+    aggregate: managed_service
+    required_reader_capability: managed_service.v1
+    authorization: owner_operator_or_auditor
+    retention: audit_long_term
+    redaction: summary_only
+    snapshot_projection: managed_services
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: service_id, type: managed_service_id }
+      - { key: 2, name: state, type: stable_code }
+      - { key: 3, name: health, type: stable_code }
+      - { key: 4, name: release_digest, type: optional_sha256_digest }
+      - { key: 5, name: budget_summary_hash, type: sha256_digest }
+      - { key: 6, name: backup_state, type: stable_code }
+      - { key: 7, name: revision, type: u64 }
+  - type: service.operation.changed.v1
+    rust_name: ServiceOperationChangedV1
+    schema_version: 1
+    aggregate: service_operation
+    required_reader_capability: service_operation.v1
+    authorization: owner_operator_or_approver
+    retention: audit_long_term
+    redaction: evidence_refs_only
+    snapshot_projection: service_operations
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: service_id, type: managed_service_id }
+      - { key: 2, name: operation_id, type: service_operation_id }
+      - { key: 3, name: plan_hash, type: sha256_digest }
+      - { key: 4, name: state, type: stable_code }
+      - { key: 5, name: evidence_ids, type: job_evidence_id_list }
+  - type: directory.registration.changed.v1
+    rust_name: DirectoryRegistrationChangedV1
+    schema_version: 1
+    aggregate: directory_registration
+    required_reader_capability: directory_registration.v1
+    authorization: publisher_owner
+    retention: public_subject_lifecycle
+    redaction: public_descriptor_state_only
+    snapshot_projection: directory_registrations
+    unknown_version_policy: stop_cursor
+    fields:
+      - { key: 1, name: registration_id, type: directory_registration_id }
+      - { key: 2, name: indexer_id, type: indexer_id }
+      - { key: 3, name: stable_id, type: public_subject_id }
+      - { key: 4, name: sequence, type: u64 }
+      - { key: 5, name: state, type: stable_code }
+      - { key: 6, name: error_code, type: optional_api_error_code }

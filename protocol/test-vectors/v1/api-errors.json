@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "error": {
+    "code": "PLAN_REVISION_CONFLICT",
+    "message": "The job plan changed before approval.",
+    "request_id": "0190f2a5-7b1c-7abc-8def-0123456789ab",
+    "retryable": false,
+    "details": {
+      "current_revision": 5
+    }
+  },
+  "canonical_cbor_hex": "a50176504c414e5f5245564953494f4e5f434f4e464c494354027825546865206a6f6220706c616e206368616e676564206265666f726520617070726f76616c2e03782430313930663261352d376231632d376162632d386465662d30313233343536373839616204f405a17063757272656e745f7265766973696f6e05"
+}

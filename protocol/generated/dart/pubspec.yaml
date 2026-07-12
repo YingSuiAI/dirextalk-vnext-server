@@ -1,0 +1,14 @@
+name: dirextalk_protocol_conformance
+description: Independent Dart consumer for Dirextalk vNext protocol golden vectors.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: '>=3.12.0 <4.0.0'
+
+dependencies:
+  crypto: 3.0.7
+
+dev_dependencies:
+  lints: 6.1.0
+  test: 1.31.2

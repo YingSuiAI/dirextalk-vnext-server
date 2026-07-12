@@ -1,18 +1,19 @@
 [package]
-name = "dtx-domain"
+name = "dtx-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
-ed25519-dalek.workspace = true
+cddl-cat.workspace = true
+oas3.workspace = true
+prost-types.workspace = true
+protox.workspace = true
 serde.workspace = true
-sha2.workspace = true
-uuid.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+sha2.workspace = true
+yaml_serde.workspace = true
 
 [lints]
 workspace = true

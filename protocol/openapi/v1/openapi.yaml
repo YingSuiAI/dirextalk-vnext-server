@@ -1,0 +1,751 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk vNext Contract Components
+  version: 1.0.0
+  description: Server-owned v1 wire components and the durable Job event page contract.
+paths:
+  /v1/agent-jobs/{job_id}/events:
+    get:
+      operationId: listAgentJobEvents
+      summary: Read durable Job events from a server cursor.
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/UuidV7'
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+            x-dirextalk-max-utf8-bytes: 512
+      responses:
+        '200':
+          description: A durable event page. JSON is limited to current known schemas; CBOR preserves exact envelope bytes for extensible cursor sync. The cursor advances only after transactional reduction.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventPageV1'
+            application/cbor:
+              x-dirextalk-max-body-bytes: 1048576
+              schema:
+                $ref: '#/components/schemas/EventPageCborV1'
+        '410':
+          description: The cursor expired; a signed snapshot must be applied before resuming.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponseV1'
+        default:
+          description: A bounded public API error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponseV1'
+components:
+  schemas:
+    ProtocolVersion:
+      type: string
+      pattern: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+      example: '1.0'
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+      example: 0190f2a5-7b1c-7abc-8def-0123456789ab
+    IdentityId:
+      type: string
+      pattern: '^dtxi1[a-z2-7]{52}$'
+    ChannelId:
+      type: string
+      pattern: '^dtxc1[a-z2-7]{52}$'
+    AgentId:
+      type: string
+      pattern: '^dtxa1[a-z2-7]{52}$'
+    PublicSubjectId:
+      oneOf:
+        - $ref: '#/components/schemas/IdentityId'
+        - $ref: '#/components/schemas/ChannelId'
+        - $ref: '#/components/schemas/AgentId'
+    Sha256Digest:
+      type: string
+      pattern: '^sha256:[0-9a-f]{64}$'
+    Ed25519PublicKey:
+      type: string
+      pattern: '^ed25519:[A-Za-z0-9_-]{43}$'
+    Ed25519Signature:
+      type: string
+      pattern: '^ed25519:[A-Za-z0-9_-]{86}$'
+    UtcMillis:
+      type: integer
+      format: int64
+      minimum: -62135596800000
+      maximum: 253402300799999
+    StableCode:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[a-z][a-z0-9]*(?:_[a-z0-9]+)*(?:\.[a-z][a-z0-9]*(?:_[a-z0-9]+)*)*$'
+    BoundedString:
+      type: string
+      minLength: 1
+      maxLength: 1024
+      description: Non-empty public text capped by UTF-8 encoded bytes; Unicode control characters are prohibited.
+      pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
+      x-dirextalk-max-utf8-bytes: 1024
+      x-dirextalk-disallow-control-characters: true
+    SafeUint:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+    PositiveSafeUint:
+      type: integer
+      minimum: 1
+      maximum: 9007199254740991
+    Uint32:
+      type: integer
+      minimum: 0
+      maximum: 4294967295
+    ApiErrorCode:
+      type: string
+      minLength: 3
+      maxLength: 64
+      pattern: '^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*$'
+      x-dirextalk-known-values:
+        - UNAUTHENTICATED
+        - DEVICE_REVOKED
+        - FORBIDDEN
+        - POLICY_DENIED
+        - CONSENT_REQUIRED
+        - APPROVAL_REQUIRED
+        - APPROVAL_EXPIRED
+        - REVISION_CONFLICT
+        - IDEMPOTENCY_CONFLICT
+        - CONNECTOR_OFFLINE
+        - CONNECTOR_UNHEALTHY
+        - CAPABILITY_UNAVAILABLE
+        - STALE_LEASE
+        - PLAN_REVISION_CONFLICT
+        - BUDGET_EXCEEDED
+        - CLOUD_CONNECTION_INVALID
+        - CLOUD_CONNECTION_IN_USE
+        - CLOUD_PERMISSION_MISSING
+        - CLOUD_RATE_LIMITED
+        - RESOURCE_DISPOSITION_BLOCKED
+        - RESOURCE_ORPHANED
+        - VERIFICATION_FAILED
+        - HANDOFF_REQUIRED
+        - CURSOR_EXPIRED
+        - PROTOCOL_VERSION_UNSUPPORTED
+    ApiErrorDetailValue:
+      oneOf:
+        - type: string
+          maxLength: 256
+          pattern: '^[^\u0000-\u001F\u007F-\u009F]*$'
+          x-dirextalk-max-utf8-bytes: 256
+          x-dirextalk-disallow-control-characters: true
+        - type: integer
+          format: int64
+          minimum: -9007199254740991
+          maximum: 9007199254740991
+        - type: boolean
+        - type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            type: string
+            maxLength: 256
+            pattern: '^[^\u0000-\u001F\u007F-\u009F]*$'
+            x-dirextalk-max-utf8-bytes: 256
+            x-dirextalk-disallow-control-characters: true
+        - type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            type: integer
+            format: int64
+            minimum: -9007199254740991
+            maximum: 9007199254740991
+    ApiErrorV1:
+      type: object
+      additionalProperties: false
+      required: [code, message, request_id, retryable, details]
+      properties:
+        code:
+          $ref: '#/components/schemas/ApiErrorCode'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Public message capped by UTF-8 encoded bytes; Unicode control characters are prohibited.
+          pattern: '^[^\u0000-\u001F\u007F-\u009F]+$'
+          x-dirextalk-max-utf8-bytes: 512
+          x-dirextalk-disallow-control-characters: true
+        request_id:
+          $ref: '#/components/schemas/UuidV7'
+        retryable:
+          type: boolean
+        details:
+          type: object
+          maxProperties: 16
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: '^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$'
+          additionalProperties:
+            $ref: '#/components/schemas/ApiErrorDetailValue'
+    ApiErrorResponseV1:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ApiErrorV1'
+
+    AgentInstallationChangedV1:
+      type: object
+      additionalProperties: false
+      required: [installation_id, descriptor_hash, state, policy_revision]
+      properties:
+        installation_id: { $ref: '#/components/schemas/UuidV7' }
+        descriptor_hash: { $ref: '#/components/schemas/Sha256Digest' }
+        state: { $ref: '#/components/schemas/StableCode' }
+        policy_revision: { $ref: '#/components/schemas/SafeUint' }
+    AgentBindingChangedV1:
+      type: object
+      additionalProperties: false
+      required: [binding_id, installation_id, connector_id, mode, priority, enabled, revision]
+      properties:
+        binding_id: { $ref: '#/components/schemas/UuidV7' }
+        installation_id: { $ref: '#/components/schemas/UuidV7' }
+        connector_id: { $ref: '#/components/schemas/UuidV7' }
+        mode: { $ref: '#/components/schemas/StableCode' }
+        priority: { $ref: '#/components/schemas/Uint32' }
+        enabled: { type: boolean }
+        revision: { $ref: '#/components/schemas/SafeUint' }
+    AgentGrantChangedV1:
+      type: object
+      additionalProperties: false
+      required: [conversation_id, installation_id, permission_hash, trigger, expires_at, revoked]
+      properties:
+        conversation_id: { $ref: '#/components/schemas/UuidV7' }
+        installation_id: { $ref: '#/components/schemas/UuidV7' }
+        permission_hash: { $ref: '#/components/schemas/Sha256Digest' }
+        trigger: { $ref: '#/components/schemas/StableCode' }
+        expires_at:
+          oneOf:
+            - $ref: '#/components/schemas/UtcMillis'
+            - type: 'null'
+        revoked: { type: boolean }
+    AgentConsentChangedV1:
+      type: object
+      additionalProperties: false
+      required: [consent_id, egress_hash, policy_hash, state, actor_device_id]
+      properties:
+        consent_id: { $ref: '#/components/schemas/UuidV7' }
+        egress_hash: { $ref: '#/components/schemas/Sha256Digest' }
+        policy_hash: { $ref: '#/components/schemas/Sha256Digest' }
+        state: { $ref: '#/components/schemas/StableCode' }
+        actor_device_id: { $ref: '#/components/schemas/UuidV7' }
+    AgentApprovalRequestedV1:
+      type: object
+      additionalProperties: false
+      required: [approval_id, operation_hash, risk, expires_at, redacted_summary]
+      properties:
+        approval_id: { $ref: '#/components/schemas/UuidV7' }
+        operation_hash: { $ref: '#/components/schemas/Sha256Digest' }
+        risk: { $ref: '#/components/schemas/StableCode' }
+        expires_at: { $ref: '#/components/schemas/UtcMillis' }
+        redacted_summary: { $ref: '#/components/schemas/BoundedString' }
+    AgentApprovalResolvedV1:
+      type: object
+      additionalProperties: false
+      required: [approval_id, decision, actor_device_id, receipt_hash]
+      properties:
+        approval_id: { $ref: '#/components/schemas/UuidV7' }
+        decision: { $ref: '#/components/schemas/StableCode' }
+        actor_device_id: { $ref: '#/components/schemas/UuidV7' }
+        receipt_hash: { $ref: '#/components/schemas/Sha256Digest' }
+    HostObservedV1:
+      type: object
+      additionalProperties: false
+      required: [host_id, supervisor_version, state, heartbeat_expires_at, revision]
+      properties:
+        host_id: { $ref: '#/components/schemas/UuidV7' }
+        supervisor_version: { $ref: '#/components/schemas/BoundedString' }
+        state: { $ref: '#/components/schemas/StableCode' }
+        heartbeat_expires_at: { $ref: '#/components/schemas/UtcMillis' }
+        revision: { $ref: '#/components/schemas/SafeUint' }
+    ConnectorSpecChangedV1:
+      type: object
+      additionalProperties: false
+      required: [connector_id, host_id, adapter_kind, desired_state, release_digest, revision]
+      properties:
+        connector_id: { $ref: '#/components/schemas/UuidV7' }
+        host_id: { $ref: '#/components/schemas/UuidV7' }
+        adapter_kind: { $ref: '#/components/schemas/StableCode' }
+        desired_state: { $ref: '#/components/schemas/StableCode' }
+        release_digest: { $ref: '#/components/schemas/Sha256Digest' }
+        revision: { $ref: '#/components/schemas/SafeUint' }
+    ConnectorObservedV1:
+      type: object
+      additionalProperties: false
+      required: [connector_id, boot_id, state, capability_hash, capacity, lease_expires_at, error_code]
+      properties:
+        connector_id: { $ref: '#/components/schemas/UuidV7' }
+        boot_id: { $ref: '#/components/schemas/UuidV7' }
+        state: { $ref: '#/components/schemas/StableCode' }
+        capability_hash: { $ref: '#/components/schemas/Sha256Digest' }
+        capacity: { $ref: '#/components/schemas/Uint32' }
+        lease_expires_at:
+          oneOf:
+            - $ref: '#/components/schemas/UtcMillis'
+            - type: 'null'
+        error_code:
+          oneOf:
+            - $ref: '#/components/schemas/ApiErrorCode'
+            - type: 'null'
+    AgentRunChangedV1:
+      type: object
+      additionalProperties: false
+      required: [run_id, installation_id, binding_id, connector_id, state, checkpoint_sequence, outcome]
+      properties:
+        run_id: { $ref: '#/components/schemas/UuidV7' }
+        installation_id: { $ref: '#/components/schemas/UuidV7' }
+        binding_id: { $ref: '#/components/schemas/UuidV7' }
+        connector_id:
+          oneOf:
+            - $ref: '#/components/schemas/UuidV7'
+            - type: 'null'
+        state: { $ref: '#/components/schemas/StableCode' }
+        checkpoint_sequence: { $ref: '#/components/schemas/SafeUint' }
+        outcome:
+          oneOf:
+            - $ref: '#/components/schemas/StableCode'
+            - type: 'null'
+    JobChangedV1:
+      type: object
+      additionalProperties: false
+      required: [job_id, execution_state, desired_state, outcome, plan_revision, budget_summary_hash]
+      properties:
+        job_id: { $ref: '#/components/schemas/UuidV7' }
+        execution_state: { $ref: '#/components/schemas/StableCode' }
+        desired_state: { $ref: '#/components/schemas/StableCode' }
+        outcome: { $ref: '#/components/schemas/StableCode' }
+        plan_revision: { $ref: '#/components/schemas/SafeUint' }
+        budget_summary_hash: { $ref: '#/components/schemas/Sha256Digest' }
+    JobStepChangedV1:
+      type: object
+      additionalProperties: false
+      required: [job_id, step_id, attempt, state, lease_epoch, progress_basis_points, evidence_ids]
+      properties:
+        job_id: { $ref: '#/components/schemas/UuidV7' }
+        step_id: { $ref: '#/components/schemas/UuidV7' }
+        attempt: { $ref: '#/components/schemas/Uint32' }
+        state: { $ref: '#/components/schemas/StableCode' }
+        lease_epoch: { $ref: '#/components/schemas/SafeUint' }
+        progress_basis_points: { $ref: '#/components/schemas/Uint32' }
+        evidence_ids:
+          type: array
+          maxItems: 4096
+          items: { $ref: '#/components/schemas/UuidV7' }
+    JobEvidenceChangedV1:
+      type: object
+      additionalProperties: false
+      required: [evidence_id, evidence_type, status, digest, verifier, observed_at]
+      properties:
+        evidence_id: { $ref: '#/components/schemas/UuidV7' }
+        evidence_type: { $ref: '#/components/schemas/StableCode' }
+        status: { $ref: '#/components/schemas/StableCode' }
+        digest: { $ref: '#/components/schemas/Sha256Digest' }
+        verifier: { $ref: '#/components/schemas/StableCode' }
+        observed_at: { $ref: '#/components/schemas/UtcMillis' }
+    CloudResourceChangedV1:
+      type: object
+      additionalProperties: false
+      required: [job_id, resource_id, resource_key, lifecycle, desired_state, observed_state, disposition, cost_estimate_minor_units, currency]
+      properties:
+        job_id: { $ref: '#/components/schemas/UuidV7' }
+        resource_id: { $ref: '#/components/schemas/UuidV7' }
+        resource_key: { $ref: '#/components/schemas/BoundedString' }
+        lifecycle: { $ref: '#/components/schemas/StableCode' }
+        desired_state: { $ref: '#/components/schemas/StableCode' }
+        observed_state: { $ref: '#/components/schemas/StableCode' }
+        disposition: { $ref: '#/components/schemas/StableCode' }
+        cost_estimate_minor_units: { $ref: '#/components/schemas/SafeUint' }
+        currency: { $ref: '#/components/schemas/BoundedString' }
+    ServiceChangedV1:
+      type: object
+      additionalProperties: false
+      required: [service_id, state, health, release_digest, budget_summary_hash, backup_state, revision]
+      properties:
+        service_id: { $ref: '#/components/schemas/UuidV7' }
+        state: { $ref: '#/components/schemas/StableCode' }
+        health: { $ref: '#/components/schemas/StableCode' }
+        release_digest:
+          oneOf:
+            - $ref: '#/components/schemas/Sha256Digest'
+            - type: 'null'
+        budget_summary_hash: { $ref: '#/components/schemas/Sha256Digest' }
+        backup_state: { $ref: '#/components/schemas/StableCode' }
+        revision: { $ref: '#/components/schemas/SafeUint' }
+    ServiceOperationChangedV1:
+      type: object
+      additionalProperties: false
+      required: [service_id, operation_id, plan_hash, state, evidence_ids]
+      properties:
+        service_id: { $ref: '#/components/schemas/UuidV7' }
+        operation_id: { $ref: '#/components/schemas/UuidV7' }
+        plan_hash: { $ref: '#/components/schemas/Sha256Digest' }
+        state: { $ref: '#/components/schemas/StableCode' }
+        evidence_ids:
+          type: array
+          maxItems: 4096
+          items: { $ref: '#/components/schemas/UuidV7' }
+    DirectoryRegistrationChangedV1:
+      type: object
+      additionalProperties: false
+      required: [registration_id, indexer_id, stable_id, sequence, state, error_code]
+      properties:
+        registration_id: { $ref: '#/components/schemas/UuidV7' }
+        indexer_id: { $ref: '#/components/schemas/UuidV7' }
+        stable_id: { $ref: '#/components/schemas/PublicSubjectId' }
+        sequence: { $ref: '#/components/schemas/SafeUint' }
+        state: { $ref: '#/components/schemas/StableCode' }
+        error_code:
+          oneOf:
+            - $ref: '#/components/schemas/ApiErrorCode'
+            - type: 'null'
+
+    EventIntegrityV1:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [algorithm, digest]
+          properties:
+            algorithm: { const: sha256 }
+            digest: { $ref: '#/components/schemas/Sha256Digest' }
+        - type: object
+          additionalProperties: false
+          required: [algorithm, digest, signer, signature]
+          properties:
+            algorithm: { const: ed25519 }
+            digest: { $ref: '#/components/schemas/Sha256Digest' }
+            signer: { $ref: '#/components/schemas/Ed25519PublicKey' }
+            signature: { $ref: '#/components/schemas/Ed25519Signature' }
+    EventEnvelopeCoreV1:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, minimum_reader_version, event_id, tenant_id, aggregate_type, aggregate_id, aggregate_revision, stream_sequence, occurred_at, schema_version, event_type, required_reader_capability, payload, integrity]
+      properties:
+        protocol_version: { $ref: '#/components/schemas/ProtocolVersion' }
+        minimum_reader_version: { $ref: '#/components/schemas/ProtocolVersion' }
+        event_id: { $ref: '#/components/schemas/UuidV7' }
+        tenant_id: { $ref: '#/components/schemas/UuidV7' }
+        aggregate_type: { $ref: '#/components/schemas/StableCode' }
+        aggregate_id: { $ref: '#/components/schemas/UuidV7' }
+        aggregate_revision: { $ref: '#/components/schemas/PositiveSafeUint' }
+        stream_sequence: { $ref: '#/components/schemas/PositiveSafeUint' }
+        occurred_at: { $ref: '#/components/schemas/UtcMillis' }
+        schema_version:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        event_type:
+          type: string
+          pattern: '^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+\.v[1-9][0-9]*$'
+        required_reader_capability:
+          oneOf:
+            - $ref: '#/components/schemas/StableCode'
+            - type: 'null'
+        payload: { type: object }
+        integrity: { $ref: '#/components/schemas/EventIntegrityV1' }
+    EventEnvelopeV1:
+      oneOf:
+        - $ref: '#/components/schemas/EventEnvelopeAgentInstallationChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeAgentBindingChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeAgentGrantChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeAgentConsentChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeAgentApprovalRequestedV1'
+        - $ref: '#/components/schemas/EventEnvelopeAgentApprovalResolvedV1'
+        - $ref: '#/components/schemas/EventEnvelopeHostObservedV1'
+        - $ref: '#/components/schemas/EventEnvelopeConnectorSpecChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeConnectorObservedV1'
+        - $ref: '#/components/schemas/EventEnvelopeAgentRunChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeJobChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeJobStepChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeJobEvidenceChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeCloudResourceChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeServiceChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeServiceOperationChangedV1'
+        - $ref: '#/components/schemas/EventEnvelopeDirectoryRegistrationChangedV1'
+      discriminator:
+        propertyName: event_type
+        mapping:
+          agent.installation.changed.v1: '#/components/schemas/EventEnvelopeAgentInstallationChangedV1'
+          agent.binding.changed.v1: '#/components/schemas/EventEnvelopeAgentBindingChangedV1'
+          agent.grant.changed.v1: '#/components/schemas/EventEnvelopeAgentGrantChangedV1'
+          agent.consent.changed.v1: '#/components/schemas/EventEnvelopeAgentConsentChangedV1'
+          agent.approval.requested.v1: '#/components/schemas/EventEnvelopeAgentApprovalRequestedV1'
+          agent.approval.resolved.v1: '#/components/schemas/EventEnvelopeAgentApprovalResolvedV1'
+          host.observed.v1: '#/components/schemas/EventEnvelopeHostObservedV1'
+          connector.spec.changed.v1: '#/components/schemas/EventEnvelopeConnectorSpecChangedV1'
+          connector.observed.v1: '#/components/schemas/EventEnvelopeConnectorObservedV1'
+          agent.run.changed.v1: '#/components/schemas/EventEnvelopeAgentRunChangedV1'
+          job.changed.v1: '#/components/schemas/EventEnvelopeJobChangedV1'
+          job.step.changed.v1: '#/components/schemas/EventEnvelopeJobStepChangedV1'
+          job.evidence.changed.v1: '#/components/schemas/EventEnvelopeJobEvidenceChangedV1'
+          cloud.resource.changed.v1: '#/components/schemas/EventEnvelopeCloudResourceChangedV1'
+          service.changed.v1: '#/components/schemas/EventEnvelopeServiceChangedV1'
+          service.operation.changed.v1: '#/components/schemas/EventEnvelopeServiceOperationChangedV1'
+          directory.registration.changed.v1: '#/components/schemas/EventEnvelopeDirectoryRegistrationChangedV1'
+
+    EventEnvelopeAgentInstallationChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingAgentInstallationChangedV1'
+    EventEnvelopeAgentBindingChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingAgentBindingChangedV1'
+    EventEnvelopeAgentGrantChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingAgentGrantChangedV1'
+    EventEnvelopeAgentConsentChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingAgentConsentChangedV1'
+    EventEnvelopeAgentApprovalRequestedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingAgentApprovalRequestedV1'
+    EventEnvelopeAgentApprovalResolvedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingAgentApprovalResolvedV1'
+    EventEnvelopeHostObservedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingHostObservedV1'
+    EventEnvelopeConnectorSpecChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingConnectorSpecChangedV1'
+    EventEnvelopeConnectorObservedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingConnectorObservedV1'
+    EventEnvelopeAgentRunChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingAgentRunChangedV1'
+    EventEnvelopeJobChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingJobChangedV1'
+    EventEnvelopeJobStepChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingJobStepChangedV1'
+    EventEnvelopeJobEvidenceChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingJobEvidenceChangedV1'
+    EventEnvelopeCloudResourceChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingCloudResourceChangedV1'
+    EventEnvelopeServiceChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingServiceChangedV1'
+    EventEnvelopeServiceOperationChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingServiceOperationChangedV1'
+    EventEnvelopeDirectoryRegistrationChangedV1:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelopeCoreV1'
+        - $ref: '#/components/schemas/EventBindingDirectoryRegistrationChangedV1'
+
+    EventBindingAgentInstallationChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: agent_installation }
+        schema_version: { const: 1 }
+        event_type: { const: agent.installation.changed.v1 }
+        required_reader_capability: { const: agent_installation.v1 }
+        payload: { $ref: '#/components/schemas/AgentInstallationChangedV1' }
+    EventBindingAgentBindingChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: agent_binding }
+        schema_version: { const: 1 }
+        event_type: { const: agent.binding.changed.v1 }
+        required_reader_capability: { const: agent_binding.v1 }
+        payload: { $ref: '#/components/schemas/AgentBindingChangedV1' }
+    EventBindingAgentGrantChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: conversation_grant }
+        schema_version: { const: 1 }
+        event_type: { const: agent.grant.changed.v1 }
+        required_reader_capability: { const: agent_grant.v1 }
+        payload: { $ref: '#/components/schemas/AgentGrantChangedV1' }
+    EventBindingAgentConsentChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: agent_consent }
+        schema_version: { const: 1 }
+        event_type: { const: agent.consent.changed.v1 }
+        required_reader_capability: { const: agent_consent.v1 }
+        payload: { $ref: '#/components/schemas/AgentConsentChangedV1' }
+    EventBindingAgentApprovalRequestedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: agent_approval }
+        schema_version: { const: 1 }
+        event_type: { const: agent.approval.requested.v1 }
+        required_reader_capability: { const: agent_approval.v1 }
+        payload: { $ref: '#/components/schemas/AgentApprovalRequestedV1' }
+    EventBindingAgentApprovalResolvedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: agent_approval }
+        schema_version: { const: 1 }
+        event_type: { const: agent.approval.resolved.v1 }
+        required_reader_capability: { const: agent_approval.v1 }
+        payload: { $ref: '#/components/schemas/AgentApprovalResolvedV1' }
+    EventBindingHostObservedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: agent_host }
+        schema_version: { const: 1 }
+        event_type: { const: host.observed.v1 }
+        required_reader_capability: { const: host_observed.v1 }
+        payload: { $ref: '#/components/schemas/HostObservedV1' }
+    EventBindingConnectorSpecChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: connector }
+        schema_version: { const: 1 }
+        event_type: { const: connector.spec.changed.v1 }
+        required_reader_capability: { const: connector_spec.v1 }
+        payload: { $ref: '#/components/schemas/ConnectorSpecChangedV1' }
+    EventBindingConnectorObservedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: connector }
+        schema_version: { const: 1 }
+        event_type: { const: connector.observed.v1 }
+        required_reader_capability: { type: 'null' }
+        payload: { $ref: '#/components/schemas/ConnectorObservedV1' }
+    EventBindingAgentRunChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: agent_run }
+        schema_version: { const: 1 }
+        event_type: { const: agent.run.changed.v1 }
+        required_reader_capability: { const: agent_run.v1 }
+        payload: { $ref: '#/components/schemas/AgentRunChangedV1' }
+    EventBindingJobChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: job }
+        schema_version: { const: 1 }
+        event_type: { const: job.changed.v1 }
+        required_reader_capability: { const: job_state.v1 }
+        payload: { $ref: '#/components/schemas/JobChangedV1' }
+    EventBindingJobStepChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: job }
+        schema_version: { const: 1 }
+        event_type: { const: job.step.changed.v1 }
+        required_reader_capability: { const: job_step.v1 }
+        payload: { $ref: '#/components/schemas/JobStepChangedV1' }
+    EventBindingJobEvidenceChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: job }
+        schema_version: { const: 1 }
+        event_type: { const: job.evidence.changed.v1 }
+        required_reader_capability: { type: 'null' }
+        payload: { $ref: '#/components/schemas/JobEvidenceChangedV1' }
+    EventBindingCloudResourceChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: job_resource }
+        schema_version: { const: 1 }
+        event_type: { const: cloud.resource.changed.v1 }
+        required_reader_capability: { const: cloud_resource.v1 }
+        payload: { $ref: '#/components/schemas/CloudResourceChangedV1' }
+    EventBindingServiceChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: managed_service }
+        schema_version: { const: 1 }
+        event_type: { const: service.changed.v1 }
+        required_reader_capability: { const: managed_service.v1 }
+        payload: { $ref: '#/components/schemas/ServiceChangedV1' }
+    EventBindingServiceOperationChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: service_operation }
+        schema_version: { const: 1 }
+        event_type: { const: service.operation.changed.v1 }
+        required_reader_capability: { const: service_operation.v1 }
+        payload: { $ref: '#/components/schemas/ServiceOperationChangedV1' }
+    EventBindingDirectoryRegistrationChangedV1:
+      type: object
+      required: [aggregate_type, schema_version, event_type, required_reader_capability, payload]
+      properties:
+        aggregate_type: { const: directory_registration }
+        schema_version: { const: 1 }
+        event_type: { const: directory.registration.changed.v1 }
+        required_reader_capability: { const: directory_registration.v1 }
+        payload: { $ref: '#/components/schemas/DirectoryRegistrationChangedV1' }
+
+    EventPageV1:
+      type: object
+      additionalProperties: false
+      description: JSON projection containing only event types and schema versions enumerated by the current EventEnvelopeV1 union. A reader must use application/cbor when unknown events need lossless retention.
+      x-dirextalk-unknown-event-policy: reject_without_advancing_cursor
+      required: [events, next_cursor]
+      properties:
+        events:
+          type: array
+          maxItems: 1000
+          items: { $ref: '#/components/schemas/EventEnvelopeV1' }
+        next_cursor:
+          type: string
+          minLength: 1
+          maxLength: 512
+          x-dirextalk-max-utf8-bytes: 512
+    EventPageCborV1:
+      type: string
+      format: binary
+      contentMediaType: application/cbor
+      description: Deterministic CBOR event-page-v1 containing each event as its exact canonical envelope bytes, including unknown event types or schema versions. The complete encoded response, including page framing, is capped at 1048576 bytes and pagination uses accumulated encoded bytes before the 1000-event count limit.
+      x-dirextalk-cddl-rule: event-page-v1
+      x-dirextalk-unknown-event-policy: preserve_exact_bytes_then_admit

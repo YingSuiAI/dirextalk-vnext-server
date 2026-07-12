@@ -5,5 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+base64ct.workspace = true
+dtx-domain = { path = "../dtx-domain" }
+ed25519-dalek.workspace = true
+serde.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde_json.workspace = true
+
 [lints]
 workspace = true

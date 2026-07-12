@@ -1,0 +1,332 @@
+agent-installation-changed-v1 = {
+  1: uuid-v7,
+  2: sha256-digest,
+  3: stable-code,
+  4: safe-uint
+}
+
+agent-binding-changed-v1 = {
+  1: uuid-v7,
+  2: uuid-v7,
+  3: uuid-v7,
+  4: stable-code,
+  5: u32,
+  6: bool,
+  7: safe-uint
+}
+
+agent-grant-changed-v1 = {
+  1: uuid-v7,
+  2: uuid-v7,
+  3: sha256-digest,
+  4: stable-code,
+  5: utc-millis / null,
+  6: bool
+}
+
+agent-consent-changed-v1 = {
+  1: uuid-v7,
+  2: sha256-digest,
+  3: sha256-digest,
+  4: stable-code,
+  5: uuid-v7
+}
+
+agent-approval-requested-v1 = {
+  1: uuid-v7,
+  2: sha256-digest,
+  3: stable-code,
+  4: utc-millis,
+  5: bounded-string
+}
+
+agent-approval-resolved-v1 = {
+  1: uuid-v7,
+  2: stable-code,
+  3: uuid-v7,
+  4: sha256-digest
+}
+
+host-observed-v1 = {
+  1: uuid-v7,
+  2: bounded-string,
+  3: stable-code,
+  4: utc-millis,
+  5: safe-uint
+}
+
+connector-spec-changed-v1 = {
+  1: uuid-v7,
+  2: uuid-v7,
+  3: stable-code,
+  4: stable-code,
+  5: sha256-digest,
+  6: safe-uint
+}
+
+connector-observed-v1 = {
+  1: uuid-v7,
+  2: uuid-v7,
+  3: stable-code,
+  4: sha256-digest,
+  5: u32,
+  6: utc-millis / null,
+  7: api-error-code / null
+}
+
+agent-run-changed-v1 = {
+  1: uuid-v7,
+  2: uuid-v7,
+  3: uuid-v7,
+  4: uuid-v7 / null,
+  5: stable-code,
+  6: safe-uint,
+  7: stable-code / null
+}
+
+job-changed-v1 = {
+  1: uuid-v7,
+  2: stable-code,
+  3: stable-code,
+  4: stable-code,
+  5: safe-uint,
+  6: sha256-digest
+}
+
+job-step-changed-v1 = {
+  1: uuid-v7,
+  2: uuid-v7,
+  3: u32,
+  4: stable-code,
+  5: safe-uint,
+  6: u32,
+  7: job-evidence-id-list
+}
+
+job-evidence-changed-v1 = {
+  1: uuid-v7,
+  2: stable-code,
+  3: stable-code,
+  4: sha256-digest,
+  5: stable-code,
+  6: utc-millis
+}
+
+cloud-resource-changed-v1 = {
+  1: uuid-v7,
+  2: uuid-v7,
+  3: bounded-string,
+  4: stable-code,
+  5: stable-code,
+  6: stable-code,
+  7: stable-code,
+  8: safe-uint,
+  9: bounded-string
+}
+
+service-changed-v1 = {
+  1: uuid-v7,
+  2: stable-code,
+  3: stable-code,
+  4: sha256-digest / null,
+  5: sha256-digest,
+  6: stable-code,
+  7: safe-uint
+}
+
+service-operation-changed-v1 = {
+  1: uuid-v7,
+  2: uuid-v7,
+  3: sha256-digest,
+  4: stable-code,
+  5: job-evidence-id-list
+}
+
+directory-registration-changed-v1 = {
+  1: uuid-v7,
+  2: uuid-v7,
+  3: public-subject-id,
+  4: safe-uint,
+  5: stable-code,
+  6: api-error-code / null
+}
+
+event-integrity-v1 =
+  {
+    1: "sha256",
+    2: sha256-digest
+  } /
+  {
+    1: "ed25519",
+    2: sha256-digest,
+    3: ed25519-public-key,
+    4: ed25519-signature
+  }
+
+event-envelope-common-v1 = (
+  1: protocol-version,
+  2: protocol-version,
+  3: uuid-v7,
+  4: uuid-v7,
+  6: uuid-v7,
+  7: positive-safe-uint,
+  8: positive-safe-uint,
+  9: utc-millis,
+  10: 1,
+  14: event-integrity-v1
+)
+
+event-envelope-v1 =
+  event-envelope-agent-installation-v1 /
+  event-envelope-agent-binding-v1 /
+  event-envelope-agent-grant-v1 /
+  event-envelope-agent-consent-v1 /
+  event-envelope-agent-approval-requested-v1 /
+  event-envelope-agent-approval-resolved-v1 /
+  event-envelope-host-observed-v1 /
+  event-envelope-connector-spec-v1 /
+  event-envelope-connector-observed-v1 /
+  event-envelope-agent-run-v1 /
+  event-envelope-job-v1 /
+  event-envelope-job-step-v1 /
+  event-envelope-job-evidence-v1 /
+  event-envelope-cloud-resource-v1 /
+  event-envelope-service-v1 /
+  event-envelope-service-operation-v1 /
+  event-envelope-directory-registration-v1
+
+event-envelope-agent-installation-v1 = {
+  event-envelope-common-v1,
+  5: "agent_installation",
+  11: "agent.installation.changed.v1",
+  12: "agent_installation.v1",
+  13: agent-installation-changed-v1
+}
+
+event-envelope-agent-binding-v1 = {
+  event-envelope-common-v1,
+  5: "agent_binding",
+  11: "agent.binding.changed.v1",
+  12: "agent_binding.v1",
+  13: agent-binding-changed-v1
+}
+
+event-envelope-agent-grant-v1 = {
+  event-envelope-common-v1,
+  5: "conversation_grant",
+  11: "agent.grant.changed.v1",
+  12: "agent_grant.v1",
+  13: agent-grant-changed-v1
+}
+
+event-envelope-agent-consent-v1 = {
+  event-envelope-common-v1,
+  5: "agent_consent",
+  11: "agent.consent.changed.v1",
+  12: "agent_consent.v1",
+  13: agent-consent-changed-v1
+}
+
+event-envelope-agent-approval-requested-v1 = {
+  event-envelope-common-v1,
+  5: "agent_approval",
+  11: "agent.approval.requested.v1",
+  12: "agent_approval.v1",
+  13: agent-approval-requested-v1
+}
+
+event-envelope-agent-approval-resolved-v1 = {
+  event-envelope-common-v1,
+  5: "agent_approval",
+  11: "agent.approval.resolved.v1",
+  12: "agent_approval.v1",
+  13: agent-approval-resolved-v1
+}
+
+event-envelope-host-observed-v1 = {
+  event-envelope-common-v1,
+  5: "agent_host",
+  11: "host.observed.v1",
+  12: "host_observed.v1",
+  13: host-observed-v1
+}
+
+event-envelope-connector-spec-v1 = {
+  event-envelope-common-v1,
+  5: "connector",
+  11: "connector.spec.changed.v1",
+  12: "connector_spec.v1",
+  13: connector-spec-changed-v1
+}
+
+event-envelope-connector-observed-v1 = {
+  event-envelope-common-v1,
+  5: "connector",
+  11: "connector.observed.v1",
+  12: null,
+  13: connector-observed-v1
+}
+
+event-envelope-agent-run-v1 = {
+  event-envelope-common-v1,
+  5: "agent_run",
+  11: "agent.run.changed.v1",
+  12: "agent_run.v1",
+  13: agent-run-changed-v1
+}
+
+event-envelope-job-v1 = {
+  event-envelope-common-v1,
+  5: "job",
+  11: "job.changed.v1",
+  12: "job_state.v1",
+  13: job-changed-v1
+}
+
+event-envelope-job-step-v1 = {
+  event-envelope-common-v1,
+  5: "job",
+  11: "job.step.changed.v1",
+  12: "job_step.v1",
+  13: job-step-changed-v1
+}
+
+event-envelope-job-evidence-v1 = {
+  event-envelope-common-v1,
+  5: "job",
+  11: "job.evidence.changed.v1",
+  12: null,
+  13: job-evidence-changed-v1
+}
+
+event-envelope-cloud-resource-v1 = {
+  event-envelope-common-v1,
+  5: "job_resource",
+  11: "cloud.resource.changed.v1",
+  12: "cloud_resource.v1",
+  13: cloud-resource-changed-v1
+}
+
+event-envelope-service-v1 = {
+  event-envelope-common-v1,
+  5: "managed_service",
+  11: "service.changed.v1",
+  12: "managed_service.v1",
+  13: service-changed-v1
+}
+
+event-envelope-service-operation-v1 = {
+  event-envelope-common-v1,
+  5: "service_operation",
+  11: "service.operation.changed.v1",
+  12: "service_operation.v1",
+  13: service-operation-changed-v1
+}
+
+event-envelope-directory-registration-v1 = {
+  event-envelope-common-v1,
+  5: "directory_registration",
+  11: "directory.registration.changed.v1",
+  12: "directory_registration.v1",
+  13: directory-registration-changed-v1
+}

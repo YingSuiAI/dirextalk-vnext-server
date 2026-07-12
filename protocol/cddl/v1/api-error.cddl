@@ -1,0 +1,16 @@
+api-error-detail =
+  api-error-detail-text /
+  safe-int /
+  bool /
+  [1*16 api-error-detail-text] /
+  [1*16 safe-int]
+
+api-error-details = { *16 api-error-detail-key => api-error-detail }
+
+api-error-v1 = {
+  1: api-error-code,
+  2: api-error-message,
+  3: uuid-v7,
+  4: bool,
+  5: api-error-details
+}

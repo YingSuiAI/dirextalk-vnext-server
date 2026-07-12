@@ -1,4 +1,7 @@
 /target/
+**/.dart_tool/
+**/build/
+**/coverage/
 /.codegraph/
 /.idea/
 /.vscode/

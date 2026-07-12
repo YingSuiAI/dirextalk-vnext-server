@@ -1,0 +1,15 @@
+; JSON event pages expose only schemas enumerated by the current OpenAPI
+; EventEnvelopeV1 union. Extensible cursor sync uses this CBOR page so an
+; unknown event's exact canonical envelope bytes can be retained and passed to
+; OpaqueCanonicalEvent admission without decode/re-encode loss.
+; The complete encoded event-page-v1, including this outer framing, MUST be at
+; most 1048576 bytes. Writers paginate on accumulated encoded bytes before the
+; structural 1000-event limit; an envelope's contextual maximum is therefore
+; smaller than its standalone maximum below.
+canonical-event-envelope-bytes = bstr .size (1..1048576)
+event-cursor = tstr .size (1..512)
+
+event-page-v1 = {
+  1: [*1000 canonical-event-envelope-bytes],
+  2: event-cursor
+}
