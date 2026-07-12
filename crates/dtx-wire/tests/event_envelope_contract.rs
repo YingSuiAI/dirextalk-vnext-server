@@ -152,6 +152,54 @@ fn typed_decoder_verifies_hash_only_and_signed_golden_envelopes() {
     ));
 }
 
+#[test]
+fn persistence_boundary_retains_exact_golden_bytes_and_verified_metadata() {
+    let vector = event_vector();
+    let hash_only = unhex(vector["hash_only_cbor_hex"].as_str().unwrap());
+    let persisted =
+        dtx_wire::VerifiedCanonicalEvent::admit(hash_only.clone(), ProtocolVersion::new(1, 0))
+            .unwrap();
+    let metadata = persisted.metadata();
+
+    assert_eq!(persisted.as_bytes(), hash_only);
+    assert_eq!(metadata.protocol_version(), ProtocolVersion::new(1, 0));
+    assert_eq!(
+        metadata.minimum_reader_version(),
+        ProtocolVersion::new(1, 0)
+    );
+    assert_eq!(metadata.event_id().to_string(), UUID_V7);
+    assert_eq!(metadata.tenant_id().to_string(), UUID_V7);
+    assert_eq!(metadata.aggregate_type().as_str(), "agent_installation");
+    assert_eq!(metadata.aggregate_id().to_string(), UUID_V7);
+    assert_eq!(metadata.aggregate_revision(), SafeUint::new(3).unwrap());
+    assert_eq!(metadata.stream_sequence(), SafeUint::new(42).unwrap());
+    assert_eq!(
+        metadata.occurred_at(),
+        UtcMillis::new(1_721_234_567_890).unwrap()
+    );
+    assert_eq!(metadata.schema_version(), 1);
+    assert_eq!(
+        metadata.event_type().as_str(),
+        "agent.installation.changed.v1"
+    );
+    assert_eq!(
+        metadata
+            .required_reader_capability()
+            .map(StableCode::as_str),
+        Some("agent_installation.v1")
+    );
+    assert_eq!(metadata.verification(), IntegrityVerification::HashOnly);
+    assert_eq!(metadata.unknown_action(), None);
+
+    let signed = unhex(vector["signed_cbor_hex"].as_str().unwrap());
+    let signed_persisted =
+        dtx_wire::VerifiedCanonicalEvent::admit(signed, ProtocolVersion::new(1, 0)).unwrap();
+    assert!(matches!(
+        signed_persisted.metadata().verification(),
+        IntegrityVerification::Signed { .. }
+    ));
+}
+
 fn rehash_hash_only(entries: &mut [(CanonicalValue, CanonicalValue)]) {
     let unsigned = CanonicalValue::Map(entries[..13].to_vec());
     let unsigned_bytes = encode_deterministic_cbor(&unsigned).unwrap();
@@ -250,6 +298,48 @@ fn typed_decoder_rejects_unknown_fields_wrong_metadata_unsafe_uint_and_tamper() 
             ProtocolVersion::new(1, 0),
         ),
         Err(EventIntegrityError::DigestMismatch)
+    );
+}
+
+#[test]
+fn persistence_boundary_rejects_invalid_registered_payloads() {
+    let vector = event_vector();
+    let golden = unhex(vector["hash_only_cbor_hex"].as_str().unwrap());
+
+    let CanonicalValue::Map(mut extra_payload) =
+        dtx_wire::decode_deterministic_cbor(&golden).unwrap()
+    else {
+        unreachable!()
+    };
+    let CanonicalValue::Map(payload) = &mut extra_payload[12].1 else {
+        unreachable!()
+    };
+    payload.push((CanonicalValue::Unsigned(5), CanonicalValue::Null));
+    rehash_hash_only(&mut extra_payload);
+    let extra_payload = encode_deterministic_cbor(&CanonicalValue::Map(extra_payload)).unwrap();
+    assert_eq!(
+        dtx_wire::VerifiedCanonicalEvent::admit(extra_payload, ProtocolVersion::new(1, 0)),
+        Err(EventIntegrityError::PayloadDecode(
+            CanonicalDecodeError::InvalidMapFields
+        ))
+    );
+
+    let CanonicalValue::Map(mut unsafe_uint) =
+        dtx_wire::decode_deterministic_cbor(&golden).unwrap()
+    else {
+        unreachable!()
+    };
+    let CanonicalValue::Map(payload) = &mut unsafe_uint[12].1 else {
+        unreachable!()
+    };
+    payload[3].1 = CanonicalValue::Unsigned(SafeUint::MAX + 1);
+    rehash_hash_only(&mut unsafe_uint);
+    let unsafe_uint = encode_deterministic_cbor(&CanonicalValue::Map(unsafe_uint)).unwrap();
+    assert_eq!(
+        dtx_wire::VerifiedCanonicalEvent::admit(unsafe_uint, ProtocolVersion::new(1, 0)),
+        Err(EventIntegrityError::PayloadDecode(
+            CanonicalDecodeError::IntegerOutOfRange
+        ))
     );
 }
 
@@ -550,6 +640,40 @@ fn known_family_future_version_requires_both_registry_and_envelope_to_be_optiona
     assert_eq!(
         dtx_wire::OpaqueCanonicalEvent::admit(mismatched_type_suffix, ProtocolVersion::new(1, 0),),
         Err(EventIntegrityError::ContractMismatch)
+    );
+}
+
+#[test]
+fn persistence_boundary_retains_unknown_events_with_trusted_cursor_actions() {
+    let optional = opaque_hash_only_event("connector.observed.v2", 2, None, 1, 2);
+    let unrelated = opaque_hash_only_event("future.optional.changed.v1", 1, None, 1, 2);
+    let required = opaque_hash_only_event("agent.installation.changed.v2", 2, None, 1, 2);
+
+    let optional_persisted =
+        dtx_wire::VerifiedCanonicalEvent::admit(optional.clone(), ProtocolVersion::new(1, 0))
+            .unwrap();
+    assert_eq!(optional_persisted.as_bytes(), optional);
+    assert_eq!(
+        optional_persisted.metadata().unknown_action(),
+        Some(UnknownEventAction::PreserveAndSkip)
+    );
+
+    let unrelated_persisted =
+        dtx_wire::VerifiedCanonicalEvent::admit(unrelated.clone(), ProtocolVersion::new(1, 0))
+            .unwrap();
+    assert_eq!(unrelated_persisted.as_bytes(), unrelated);
+    assert_eq!(
+        unrelated_persisted.metadata().unknown_action(),
+        Some(UnknownEventAction::StopCursor)
+    );
+
+    let required_persisted =
+        dtx_wire::VerifiedCanonicalEvent::admit(required.clone(), ProtocolVersion::new(1, 0))
+            .unwrap();
+    assert_eq!(required_persisted.as_bytes(), required);
+    assert_eq!(
+        required_persisted.metadata().unknown_action(),
+        Some(UnknownEventAction::StopCursor)
     );
 }
 

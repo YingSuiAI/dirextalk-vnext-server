@@ -164,6 +164,8 @@ macro_rules! define_uuid_v7_id {
 define_uuid_v7_id!(TenantId, "tenant ID");
 define_uuid_v7_id!(EventId, "event ID");
 define_uuid_v7_id!(RequestId, "request ID");
+define_uuid_v7_id!(AuditId, "audit event ID");
+define_uuid_v7_id!(OutboxId, "outbox message ID");
 define_uuid_v7_id!(AggregateId, "aggregate ID");
 define_uuid_v7_id!(DeviceId, "device ID");
 define_uuid_v7_id!(ConversationId, "conversation ID");

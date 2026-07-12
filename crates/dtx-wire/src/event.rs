@@ -673,6 +673,188 @@ pub fn peek_verified_event_dispatch_metadata(
     })
 }
 
+/// Integrity- and schema-verified event metadata safe to persist and index.
+///
+/// Values can only be constructed by [`VerifiedCanonicalEvent::admit`] from the
+/// exact canonical envelope bytes. Callers cannot supply or override metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedEventMetadata {
+    protocol_version: ProtocolVersion,
+    minimum_reader_version: ProtocolVersion,
+    event_id: EventId,
+    tenant_id: TenantId,
+    aggregate_type: StableCode,
+    aggregate_id: AggregateId,
+    aggregate_revision: SafeUint,
+    stream_sequence: SafeUint,
+    occurred_at: UtcMillis,
+    schema_version: u16,
+    event_type: StableCode,
+    required_reader_capability: Option<StableCode>,
+    verification: IntegrityVerification,
+    unknown_action: Option<UnknownEventAction>,
+}
+
+impl VerifiedEventMetadata {
+    /// Returns the writer protocol version carried by the checked envelope.
+    #[must_use]
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
+    /// Returns the minimum reader version carried by the checked envelope.
+    #[must_use]
+    pub const fn minimum_reader_version(&self) -> ProtocolVersion {
+        self.minimum_reader_version
+    }
+
+    /// Returns the checked event identifier.
+    #[must_use]
+    pub const fn event_id(&self) -> EventId {
+        self.event_id
+    }
+
+    /// Returns the checked tenant identifier.
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+
+    /// Returns the checked aggregate family.
+    #[must_use]
+    pub const fn aggregate_type(&self) -> &StableCode {
+        &self.aggregate_type
+    }
+
+    /// Returns the checked aggregate identifier.
+    #[must_use]
+    pub const fn aggregate_id(&self) -> AggregateId {
+        self.aggregate_id
+    }
+
+    /// Returns the positive checked aggregate revision.
+    #[must_use]
+    pub const fn aggregate_revision(&self) -> SafeUint {
+        self.aggregate_revision
+    }
+
+    /// Returns the positive checked stream sequence.
+    #[must_use]
+    pub const fn stream_sequence(&self) -> SafeUint {
+        self.stream_sequence
+    }
+
+    /// Returns the checked occurrence timestamp.
+    #[must_use]
+    pub const fn occurred_at(&self) -> UtcMillis {
+        self.occurred_at
+    }
+
+    /// Returns the positive checked payload schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    /// Returns the checked event type.
+    #[must_use]
+    pub const fn event_type(&self) -> &StableCode {
+        &self.event_type
+    }
+
+    /// Returns the checked wire capability claim, if present.
+    #[must_use]
+    pub const fn required_reader_capability(&self) -> Option<&StableCode> {
+        self.required_reader_capability.as_ref()
+    }
+
+    /// Returns the integrity level established before admission.
+    #[must_use]
+    pub const fn verification(&self) -> IntegrityVerification {
+        self.verification
+    }
+
+    /// Returns trusted cursor behavior for an unknown event pair.
+    ///
+    /// Registered events return `None`; consumers process them through their
+    /// generated typed representation. Unknown events return `Some`, including
+    /// `StopCursor` events which remain safe to persist but must not advance a
+    /// consumer cursor.
+    #[must_use]
+    pub const fn unknown_action(&self) -> Option<UnknownEventAction> {
+        self.unknown_action
+    }
+}
+
+/// Exact canonical event bytes admitted through the safe persistence boundary.
+///
+/// Registered event pairs must pass the generated typed decoder, including its
+/// exact payload map and primitive bounds. Unknown pairs must pass opaque-event
+/// admission, which derives cursor behavior solely from the compiled registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedCanonicalEvent {
+    bytes: Vec<u8>,
+    metadata: VerifiedEventMetadata,
+}
+
+impl VerifiedCanonicalEvent {
+    /// Verifies exact canonical bytes before they may cross a persistence boundary.
+    ///
+    /// This constructor accepts no caller-supplied metadata. Unknown events whose
+    /// action is [`UnknownEventAction::StopCursor`] are retained for durable
+    /// inspection; the consuming cursor must enforce the returned action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventIntegrityError`] for malformed, unreadable, tampered, or
+    /// contract-invalid envelopes and registered payloads.
+    pub fn admit(bytes: Vec<u8>, reader: ProtocolVersion) -> Result<Self, EventIntegrityError> {
+        let parsed = parse_and_verify_event(&bytes, reader)?;
+        let is_registered_pair = crate::event_registry_metadata(parsed.event_type.as_str())
+            .is_some_and(|metadata| metadata.schema_version == parsed.schema_version);
+
+        let unknown_action = if is_registered_pair {
+            if crate::decode_registered_event(&bytes, reader)?.is_none() {
+                return Err(EventIntegrityError::ContractMismatch);
+            }
+            None
+        } else {
+            Some(OpaqueCanonicalEvent::admit(bytes.clone(), reader)?.action())
+        };
+
+        let metadata = VerifiedEventMetadata {
+            protocol_version: parsed.protocol_version,
+            minimum_reader_version: parsed.minimum_reader_version,
+            event_id: parsed.event_id,
+            tenant_id: parsed.tenant_id,
+            aggregate_type: parsed.aggregate_type,
+            aggregate_id: parsed.aggregate_id,
+            aggregate_revision: parsed.aggregate_revision,
+            stream_sequence: parsed.stream_sequence,
+            occurred_at: parsed.occurred_at,
+            schema_version: parsed.schema_version,
+            event_type: parsed.event_type,
+            required_reader_capability: parsed.required_reader_capability,
+            verification: parsed.verification,
+            unknown_action,
+        };
+
+        Ok(Self { bytes, metadata })
+    }
+
+    /// Returns exact canonical bytes for durable storage and forwarding.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns metadata derived from and verified against the exact bytes.
+    #[must_use]
+    pub const fn metadata(&self) -> &VerifiedEventMetadata {
+        &self.metadata
+    }
+}
+
 /// Exact validated bytes for an event version this reader does not understand.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpaqueCanonicalEvent {

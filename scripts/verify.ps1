@@ -51,6 +51,8 @@ try {
     Invoke-CargoChecked -CargoArguments @('fmt', '--all', '--', '--check')
     Invoke-CargoChecked -CargoArguments @('clippy', '--workspace', '--locked', '--all-targets', '--all-features', '--', '-D', 'warnings')
     Invoke-CargoChecked -CargoArguments @('test', '--workspace', '--locked')
+    & (Join-Path $PSScriptRoot 'sqlx-prepare.ps1')
+    Assert-LastExitCode 'SQLx migration/prepare gate'
     Invoke-CargoChecked -CargoArguments @('deny', 'check')
     Invoke-CargoChecked -CargoArguments @('audit')
 

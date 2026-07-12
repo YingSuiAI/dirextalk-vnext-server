@@ -1,0 +1,19 @@
+[package]
+name = "dtx-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dtx-domain = { path = "../dtx-domain" }
+dtx-wire = { path = "../dtx-wire" }
+sqlx.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+testcontainers-modules.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

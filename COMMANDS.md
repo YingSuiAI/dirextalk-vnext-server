@@ -7,6 +7,9 @@ Run commands from this repository root.
 | format | `cargo fmt --all` |
 | verify (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1` |
 | test | `cargo test --workspace --locked` |
+| persistence migrations | `cargo test -p dtx-storage --test migrations --locked` |
+| persistence contracts | `cargo test -p dtx-storage --test persistence_contract --locked` |
+| SQLx migration/prepare gate | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sqlx-prepare.ps1` |
 | build | `cargo build --workspace --locked` |
 | release-build | `cargo build --workspace --locked --release` |
 | regenerate contracts | `cargo run -p dtx-protocol --locked -- generate .` |
@@ -35,3 +38,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 audit
 ```
 
 The wrapper preserves an existing Visual Studio Developer Prompt and otherwise selects the pinned `1.97.0-x86_64-pc-windows-gnu` toolchain plus a local linker. CI and Linux use normal `cargo` commands.
+
+The SQLx gate uses exact PostgreSQL `18.4-alpine3.24` in an ephemeral Docker
+container. Install its pinned user-scoped CLI once when it is not already
+available:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 install sqlx-cli --version 0.9.0 --force --no-default-features --features 'rustls,postgres' --root "$env:LOCALAPPDATA\Dirextalk\tools\sqlx-cli-0.9.0"
+```

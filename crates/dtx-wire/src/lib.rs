@@ -23,9 +23,9 @@ pub use canonical_decode::{
 pub use event::{
     EVENT_HASH_DOMAIN, EVENT_SIGNATURE_DOMAIN, EventEnvelopeV1, EventIntegrityError,
     EventIntegrityV1, IntegrityVerification, OpaqueCanonicalEvent, RegisteredEventPayload,
-    UnknownEventAction, UnknownVersionPolicy, UnsignedEventEnvelopeV1,
-    VerifiedEventDispatchMetadata, VerifiedEventEnvelope, event_signature_input,
-    peek_verified_event_dispatch_metadata,
+    UnknownEventAction, UnknownVersionPolicy, UnsignedEventEnvelopeV1, VerifiedCanonicalEvent,
+    VerifiedEventDispatchMetadata, VerifiedEventEnvelope, VerifiedEventMetadata,
+    event_signature_input, peek_verified_event_dispatch_metadata,
 };
 pub use generated::*;
 pub use hashing::{PLAN_HASH_DOMAIN, plan_hash};
