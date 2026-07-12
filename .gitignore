@@ -1,0 +1,14 @@
+/target/
+/.codegraph/
+/.idea/
+/.vscode/
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.pem
+*.key
+*.p12
