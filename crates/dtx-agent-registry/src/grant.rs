@@ -68,6 +68,20 @@ impl AgentConversationPermissions {
         self.cloud_connections.contains(&connection_id)
     }
 
+    /// Iterates the closed permission kinds in stable order for persistence/audit.
+    #[must_use]
+    pub fn permission_kinds(
+        &self,
+    ) -> impl ExactSizeIterator<Item = AgentConversationPermission> + '_ {
+        self.permissions.iter().copied()
+    }
+
+    /// Iterates exact cloud connection grants in stable order for persistence/audit.
+    #[must_use]
+    pub fn cloud_connection_ids(&self) -> impl ExactSizeIterator<Item = CloudConnectionId> + '_ {
+        self.cloud_connections.iter().copied()
+    }
+
     fn is_empty(&self) -> bool {
         self.permissions.is_empty() && self.cloud_connections.is_empty()
     }
@@ -100,6 +114,12 @@ impl PrivacyPolicyDigest {
     #[must_use]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
+    }
+
+    /// Returns the exact non-secret digest bytes for durable encoding.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
     }
 }
 
@@ -208,6 +228,24 @@ pub struct ConversationGrant {
     used_grant_ids: BTreeSet<GrantId>,
 }
 
+/// Complete non-secret persistence image of one current grant head and its ID fence history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationGrantSnapshot {
+    pub tenant_id: TenantId,
+    pub grant_id: GrantId,
+    pub conversation_id: ConversationId,
+    pub installation_id: InstallationId,
+    pub permissions: AgentConversationPermissions,
+    pub trigger_policy: TriggerPolicy,
+    pub privacy_policy_hash: PrivacyPolicyDigest,
+    pub grant_version: Revision,
+    pub approved_by_device: DeviceId,
+    pub approved_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
+    pub revoked_at_ms: Option<i64>,
+    pub used_grant_ids: BTreeSet<GrantId>,
+}
+
 impl ConversationGrant {
     /// Issues the first grant version from a freshly approved installation flow.
     ///
@@ -250,6 +288,95 @@ impl ConversationGrant {
             revoked_at_ms: None,
             used_grant_ids,
         })
+    }
+
+    /// Captures the current authorization facts and every retired lifecycle ID.
+    #[must_use]
+    pub fn snapshot(&self) -> ConversationGrantSnapshot {
+        ConversationGrantSnapshot {
+            tenant_id: self.tenant_id,
+            grant_id: self.grant_id,
+            conversation_id: self.conversation_id,
+            installation_id: self.installation_id,
+            permissions: self.permissions.clone(),
+            trigger_policy: self.trigger_policy,
+            privacy_policy_hash: self.privacy_policy_hash,
+            grant_version: self.grant_version,
+            approved_by_device: self.approved_by_device,
+            approved_at_ms: self.approved_at_ms,
+            expires_at_ms: self.expires_at_ms,
+            revoked_at_ms: self.revoked_at_ms,
+            used_grant_ids: self.used_grant_ids.clone(),
+        }
+    }
+
+    /// Rehydrates a grant after validating lifecycle, time, and version fences.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty authority, invalid times, missing/reused lifecycle history,
+    /// and histories that could not fit within the captured monotonic version.
+    pub fn try_from_snapshot(
+        snapshot: ConversationGrantSnapshot,
+    ) -> Result<Self, ConversationGrantSnapshotError> {
+        if snapshot.permissions.is_empty() {
+            return Err(ConversationGrantSnapshotError::EmptyPermissions);
+        }
+        if snapshot
+            .expires_at_ms
+            .is_some_and(|expires_at| expires_at <= snapshot.approved_at_ms)
+        {
+            return Err(ConversationGrantSnapshotError::InvalidExpiry);
+        }
+        if snapshot
+            .revoked_at_ms
+            .is_some_and(|revoked_at| revoked_at < snapshot.approved_at_ms)
+        {
+            return Err(ConversationGrantSnapshotError::InvalidRevocationTime);
+        }
+        if !snapshot.used_grant_ids.contains(&snapshot.grant_id) {
+            return Err(ConversationGrantSnapshotError::CurrentGrantIdMissing);
+        }
+        let id_count = u64::try_from(snapshot.used_grant_ids.len())
+            .map_err(|_| ConversationGrantSnapshotError::ImpossibleVersionHistory)?;
+        let minimum_version = id_count
+            .checked_mul(2)
+            .and_then(|value| value.checked_sub(1))
+            .and_then(|value| value.checked_add(u64::from(snapshot.revoked_at_ms.is_some())))
+            .ok_or(ConversationGrantSnapshotError::ImpossibleVersionHistory)?;
+        if snapshot.grant_version.get() < minimum_version {
+            return Err(ConversationGrantSnapshotError::ImpossibleVersionHistory);
+        }
+        if snapshot.grant_version.get() == Revision::INITIAL.get()
+            && (snapshot.used_grant_ids.len() != 1 || snapshot.revoked_at_ms.is_some())
+        {
+            return Err(ConversationGrantSnapshotError::UnreachableInitialState);
+        }
+        Ok(Self {
+            tenant_id: snapshot.tenant_id,
+            grant_id: snapshot.grant_id,
+            conversation_id: snapshot.conversation_id,
+            installation_id: snapshot.installation_id,
+            permissions: snapshot.permissions,
+            trigger_policy: snapshot.trigger_policy,
+            privacy_policy_hash: snapshot.privacy_policy_hash,
+            grant_version: snapshot.grant_version,
+            approved_by_device: snapshot.approved_by_device,
+            approved_at_ms: snapshot.approved_at_ms,
+            expires_at_ms: snapshot.expires_at_ms,
+            revoked_at_ms: snapshot.revoked_at_ms,
+            used_grant_ids: snapshot.used_grant_ids,
+        })
+    }
+
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+
+    #[must_use]
+    pub const fn installation_id(&self) -> InstallationId {
+        self.installation_id
     }
 
     /// Returns the current grant lifecycle ID.
@@ -527,3 +654,29 @@ impl fmt::Display for ConversationGrantError {
 }
 
 impl Error for ConversationGrantError {}
+
+/// Stable rejection for an invalid durable grant image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversationGrantSnapshotError {
+    EmptyPermissions,
+    InvalidExpiry,
+    InvalidRevocationTime,
+    CurrentGrantIdMissing,
+    ImpossibleVersionHistory,
+    UnreachableInitialState,
+}
+
+impl fmt::Display for ConversationGrantSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::EmptyPermissions => "grant snapshot has no permissions",
+            Self::InvalidExpiry => "grant snapshot expiry is invalid",
+            Self::InvalidRevocationTime => "grant snapshot revocation time is invalid",
+            Self::CurrentGrantIdMissing => "grant snapshot omits its current lifecycle ID",
+            Self::ImpossibleVersionHistory => "grant snapshot history exceeds its version",
+            Self::UnreachableInitialState => "grant snapshot has an unreachable initial state",
+        })
+    }
+}
+
+impl Error for ConversationGrantSnapshotError {}

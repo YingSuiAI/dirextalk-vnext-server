@@ -282,6 +282,46 @@ struct ConnectorConformanceRecord {
     max_concurrency: u32,
 }
 
+/// Durable non-secret trusted conformance record for one connector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorConformanceSnapshot {
+    pub connector_id: ConnectorId,
+    pub adapter_kind: AdapterKind,
+    pub registry_revision: Revision,
+    pub supports_multi_session: bool,
+    pub max_concurrency: u32,
+}
+
+/// Durable non-secret routing policy record keyed by installation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoutingPolicySnapshot {
+    pub installation_id: InstallationId,
+    pub policy: RoutingPolicy,
+    pub revision: Revision,
+}
+
+/// Durable non-secret connector binding record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BindingRecordSnapshot {
+    pub binding_id: BindingId,
+    pub installation_id: InstallationId,
+    pub connector_id: ConnectorId,
+    pub agent_device_id: AgentDeviceId,
+    pub priority: u16,
+    pub max_concurrency: u32,
+    pub state: BindingState,
+    pub revision: Revision,
+}
+
+/// Complete non-secret persistence image of one tenant-wide binding registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindingSetSnapshot {
+    pub tenant_id: TenantId,
+    pub connector_conformance: Vec<ConnectorConformanceSnapshot>,
+    pub routing_policies: Vec<RoutingPolicySnapshot>,
+    pub bindings: Vec<BindingRecordSnapshot>,
+}
+
 impl BindingSet {
     /// Creates an empty tenant binding registry.
     #[must_use]
@@ -292,6 +332,207 @@ impl BindingSet {
             routing_policies: BTreeMap::new(),
             bindings: BTreeMap::new(),
         }
+    }
+
+    /// Captures trusted connector facts, routing policies, and identity reservations.
+    #[must_use]
+    pub fn snapshot(&self) -> BindingSetSnapshot {
+        BindingSetSnapshot {
+            tenant_id: self.tenant_id,
+            connector_conformance: self
+                .connector_conformance
+                .iter()
+                .map(|(&connector_id, record)| ConnectorConformanceSnapshot {
+                    connector_id,
+                    adapter_kind: record.conformance.adapter_kind(),
+                    registry_revision: record.conformance.registry_revision(),
+                    supports_multi_session: record.conformance.supports_multi_session(),
+                    max_concurrency: record.max_concurrency,
+                })
+                .collect(),
+            routing_policies: self
+                .routing_policies
+                .iter()
+                .map(|(&installation_id, record)| RoutingPolicySnapshot {
+                    installation_id,
+                    policy: record.policy,
+                    revision: record.revision,
+                })
+                .collect(),
+            bindings: self
+                .bindings
+                .values()
+                .map(|binding| BindingRecordSnapshot {
+                    binding_id: binding.id,
+                    installation_id: binding.installation_id,
+                    connector_id: binding.connector_id,
+                    agent_device_id: binding.agent_device_id,
+                    priority: binding.priority,
+                    max_concurrency: binding.max_concurrency,
+                    state: binding.state,
+                    revision: binding.revision,
+                })
+                .collect(),
+        }
+    }
+
+    /// Rehydrates a binding registry after validating all tenant-wide invariants.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate identities, missing conformance/policies, impossible
+    /// lifecycle revisions, capacity violations, and routing/cardinality conflicts.
+    #[allow(clippy::too_many_lines)] // Keeping the full validation transaction in one audit boundary is intentional.
+    pub fn try_from_snapshot(
+        snapshot: BindingSetSnapshot,
+    ) -> Result<Self, BindingSetSnapshotError> {
+        let mut connector_conformance = BTreeMap::new();
+        for connector in snapshot.connector_conformance {
+            if connector.max_concurrency == 0 {
+                return Err(BindingSetSnapshotError::InvalidCapacity);
+            }
+            let conformance = if connector.supports_multi_session {
+                AdapterConformance::trusted_multi_session(
+                    connector.adapter_kind,
+                    connector.registry_revision,
+                )
+            } else {
+                AdapterConformance::trusted_single_session(
+                    connector.adapter_kind,
+                    connector.registry_revision,
+                )
+            };
+            if connector_conformance
+                .insert(
+                    connector.connector_id,
+                    ConnectorConformanceRecord {
+                        conformance,
+                        max_concurrency: connector.max_concurrency,
+                    },
+                )
+                .is_some()
+            {
+                return Err(BindingSetSnapshotError::DuplicateConnector);
+            }
+        }
+
+        let mut routing_policies = BTreeMap::new();
+        for policy in snapshot.routing_policies {
+            if routing_policies
+                .insert(
+                    policy.installation_id,
+                    RoutingPolicyRecord {
+                        policy: policy.policy,
+                        revision: policy.revision,
+                    },
+                )
+                .is_some()
+            {
+                return Err(BindingSetSnapshotError::DuplicateRoutingPolicy);
+            }
+        }
+
+        let mut bindings = BTreeMap::new();
+        let mut installation_connectors = BTreeSet::new();
+        let mut agent_devices = BTreeSet::new();
+        for record in snapshot.bindings {
+            let connector = connector_conformance
+                .get(&record.connector_id)
+                .ok_or(BindingSetSnapshotError::MissingConnector)?;
+            let policy = routing_policies
+                .get(&record.installation_id)
+                .ok_or(BindingSetSnapshotError::MissingRoutingPolicy)?;
+            if record.max_concurrency == 0 || record.max_concurrency > connector.max_concurrency {
+                return Err(BindingSetSnapshotError::InvalidCapacity);
+            }
+            if !installation_connectors.insert((record.installation_id, record.connector_id)) {
+                return Err(BindingSetSnapshotError::DuplicateInstallationConnector);
+            }
+            if !agent_devices.insert(record.agent_device_id) {
+                return Err(BindingSetSnapshotError::AgentDeviceReused);
+            }
+            let reachable = match record.state {
+                BindingState::Disabled => true,
+                BindingState::Enabled | BindingState::Revoked => record.revision.get() >= 2,
+            };
+            if !reachable {
+                return Err(BindingSetSnapshotError::UnreachableBindingState);
+            }
+            if policy.policy == RoutingPolicy::Exclusive
+                && record.state != BindingState::Revoked
+                && record.priority != 0
+            {
+                return Err(BindingSetSnapshotError::RoutingPolicyViolation);
+            }
+            let binding = Binding {
+                id: record.binding_id,
+                installation_id: record.installation_id,
+                connector_id: record.connector_id,
+                agent_device_id: record.agent_device_id,
+                priority: record.priority,
+                max_concurrency: record.max_concurrency,
+                state: record.state,
+                revision: record.revision,
+            };
+            if bindings.insert(record.binding_id, binding).is_some() {
+                return Err(BindingSetSnapshotError::DuplicateBinding);
+            }
+        }
+        if routing_policies.keys().any(|installation_id| {
+            !bindings
+                .values()
+                .any(|binding| binding.installation_id == *installation_id)
+        }) {
+            return Err(BindingSetSnapshotError::OrphanRoutingPolicy);
+        }
+        for (&installation_id, policy) in &routing_policies {
+            let members = bindings
+                .values()
+                .filter(|binding| binding.installation_id == installation_id)
+                .collect::<Vec<_>>();
+            match policy.policy {
+                RoutingPolicy::Exclusive => {
+                    if members
+                        .iter()
+                        .filter(|binding| binding.state == BindingState::Enabled)
+                        .count()
+                        > 1
+                    {
+                        return Err(BindingSetSnapshotError::RoutingPolicyViolation);
+                    }
+                }
+                RoutingPolicy::OrderedFailover => {
+                    let mut priorities = BTreeSet::new();
+                    if members
+                        .iter()
+                        .filter(|binding| binding.state != BindingState::Revoked)
+                        .any(|binding| !priorities.insert(binding.priority))
+                    {
+                        return Err(BindingSetSnapshotError::RoutingPolicyViolation);
+                    }
+                }
+            }
+        }
+        for (&connector_id, conformance) in &connector_conformance {
+            if !conformance.conformance.supports_multi_session()
+                && bindings
+                    .values()
+                    .filter(|binding| {
+                        binding.connector_id == connector_id
+                            && binding.state == BindingState::Enabled
+                    })
+                    .count()
+                    > 1
+            {
+                return Err(BindingSetSnapshotError::ConnectorCardinalityViolation);
+            }
+        }
+        Ok(Self {
+            tenant_id: snapshot.tenant_id,
+            connector_conformance,
+            routing_policies,
+            bindings,
+        })
     }
 
     /// Registers immutable conformance admitted by the trusted adapter registry.
@@ -973,3 +1214,45 @@ impl fmt::Display for BindingError {
 }
 
 impl Error for BindingError {}
+
+/// Stable rejection for an invalid durable tenant binding-registry image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingSetSnapshotError {
+    InvalidCapacity,
+    DuplicateConnector,
+    DuplicateRoutingPolicy,
+    DuplicateBinding,
+    MissingConnector,
+    MissingRoutingPolicy,
+    OrphanRoutingPolicy,
+    DuplicateInstallationConnector,
+    AgentDeviceReused,
+    UnreachableBindingState,
+    RoutingPolicyViolation,
+    ConnectorCardinalityViolation,
+}
+
+impl fmt::Display for BindingSetSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidCapacity => "binding-set snapshot capacity is invalid",
+            Self::DuplicateConnector => "binding-set snapshot repeats a connector",
+            Self::DuplicateRoutingPolicy => "binding-set snapshot repeats a routing policy",
+            Self::DuplicateBinding => "binding-set snapshot repeats a binding ID",
+            Self::MissingConnector => "binding-set snapshot omits connector conformance",
+            Self::MissingRoutingPolicy => "binding-set snapshot omits a routing policy",
+            Self::OrphanRoutingPolicy => "binding-set snapshot has an orphan routing policy",
+            Self::DuplicateInstallationConnector => {
+                "binding-set snapshot repeats an installation/connector pair"
+            }
+            Self::AgentDeviceReused => "binding-set snapshot reuses an Agent Device",
+            Self::UnreachableBindingState => "binding-set snapshot binding state is unreachable",
+            Self::RoutingPolicyViolation => "binding-set snapshot violates routing policy",
+            Self::ConnectorCardinalityViolation => {
+                "binding-set snapshot violates connector session cardinality"
+            }
+        })
+    }
+}
+
+impl Error for BindingSetSnapshotError {}

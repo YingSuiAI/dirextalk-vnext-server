@@ -716,6 +716,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-agent-persistence"
+version = "0.1.0"
+dependencies = [
+ "dtx-agent-host",
+ "dtx-agent-registry",
+ "dtx-connect-registry",
+ "dtx-domain",
+ "dtx-storage",
+ "sqlx",
+ "testcontainers-modules",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "dtx-agent-registry"
 version = "0.1.0"
 dependencies = [

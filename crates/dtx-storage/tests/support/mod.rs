@@ -81,7 +81,29 @@ impl PostgresHarness {
              GRANT SELECT, INSERT, UPDATE ON system.outbox_events TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON system.inbox_dedup TO dtx_runtime_test;
              GRANT SELECT, INSERT ON system.audit_events TO dtx_runtime_test;
-             GRANT SELECT, INSERT, UPDATE ON system.projection_cursors TO dtx_runtime_test;",
+             GRANT SELECT, INSERT, UPDATE ON system.projection_cursors TO dtx_runtime_test;
+
+             GRANT USAGE ON SCHEMA agent TO dtx_runtime_test;
+             GRANT EXECUTE ON FUNCTION agent.is_public_id(text, text) TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.agent_definition_heads TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.agent_definitions TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.installations TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.agent_devices TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.hosts TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.host_credentials TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.connector_instances TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.connector_revisions TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.connector_boots TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.connector_leases TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.connector_conformance TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.binding_set_heads TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.installation_routing_policies TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.connector_bindings TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.conversation_grant_ids TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.conversation_grant_versions TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.conversation_grant_heads TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.conversation_grant_permissions TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.conversation_grant_cloud_connections TO dtx_runtime_test;",
         )
         .execute(&mut *role_transaction)
         .await?;

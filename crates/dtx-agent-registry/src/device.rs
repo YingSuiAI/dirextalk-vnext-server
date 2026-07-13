@@ -14,6 +14,12 @@ impl DeviceCredentialFingerprint {
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    /// Returns the exact non-secret digest bytes for durable encoding.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
 }
 
 impl fmt::Debug for DeviceCredentialFingerprint {
@@ -53,6 +59,17 @@ pub struct AgentDevice {
     revision: Revision,
 }
 
+/// Complete non-secret persistence image of one Agent Device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentDeviceSnapshot {
+    pub tenant_id: TenantId,
+    pub installation_id: InstallationId,
+    pub agent_device_id: AgentDeviceId,
+    pub credential_fingerprint: DeviceCredentialFingerprint,
+    pub state: AgentDeviceState,
+    pub revision: Revision,
+}
+
 impl AgentDevice {
     /// Enrolls a verified credential under the exact installation boundary.
     ///
@@ -74,6 +91,45 @@ impl AgentDevice {
             credential_fingerprint,
             state: AgentDeviceState::Provisioning,
             revision: Revision::INITIAL,
+        })
+    }
+
+    /// Captures the durable credential fingerprint and lifecycle fence.
+    #[must_use]
+    pub const fn snapshot(&self) -> AgentDeviceSnapshot {
+        AgentDeviceSnapshot {
+            tenant_id: self.tenant_id,
+            installation_id: self.installation_id,
+            agent_device_id: self.device_id,
+            credential_fingerprint: self.credential_fingerprint,
+            state: self.state,
+            revision: self.revision,
+        }
+    }
+
+    /// Rehydrates a device after validating its reachable initial state.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an active or revoked device that still claims enrollment revision one.
+    pub const fn try_from_snapshot(
+        snapshot: AgentDeviceSnapshot,
+    ) -> Result<Self, AgentDeviceSnapshotError> {
+        let reachable = match snapshot.state {
+            AgentDeviceState::Provisioning => snapshot.revision.get() == 1,
+            AgentDeviceState::Active => snapshot.revision.get() == 2,
+            AgentDeviceState::Revoked => matches!(snapshot.revision.get(), 2 | 3),
+        };
+        if !reachable {
+            return Err(AgentDeviceSnapshotError::UnreachableInitialState);
+        }
+        Ok(Self {
+            tenant_id: snapshot.tenant_id,
+            installation_id: snapshot.installation_id,
+            device_id: snapshot.agent_device_id,
+            credential_fingerprint: snapshot.credential_fingerprint,
+            state: snapshot.state,
+            revision: snapshot.revision,
         })
     }
 
@@ -201,3 +257,18 @@ impl fmt::Display for AgentDeviceError {
 }
 
 impl Error for AgentDeviceError {}
+
+/// Stable rejection for an invalid durable Agent Device image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentDeviceSnapshotError {
+    /// Revision one can only be the provisioning state created by enrollment.
+    UnreachableInitialState,
+}
+
+impl fmt::Display for AgentDeviceSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Agent Device snapshot has an unreachable initial state")
+    }
+}
+
+impl Error for AgentDeviceSnapshotError {}

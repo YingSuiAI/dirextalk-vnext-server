@@ -71,22 +71,30 @@ async fn validate_runtime_role(pool: &PgPool) -> Result<(), StorageError> {
                AND (candidate.rolsuper OR candidate.rolbypassrls \
                  OR candidate.rolcreatedb OR candidate.rolcreaterole \
                  OR candidate.rolreplication OR left(candidate.rolname, 3) = 'pg_' \
-                 OR has_schema_privilege(candidate.oid, 'system', 'CREATE') \
                  OR EXISTS (\
                      SELECT 1 FROM pg_database \
                      WHERE datname = current_database() AND datdba = candidate.oid\
                  ) \
                  OR EXISTS (\
-                     SELECT 1 FROM pg_namespace \
-                     WHERE nspname = 'system' AND nspowner = candidate.oid\
+                     SELECT 1 FROM pg_namespace AS namespace \
+                     WHERE namespace.nspname IN ('system', 'agent') \
+                       AND (namespace.nspowner = candidate.oid \
+                         OR has_schema_privilege(candidate.oid, namespace.oid, 'CREATE'))\
                  ) OR EXISTS (\
                      SELECT 1 FROM pg_class AS relation \
                      JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
-                     WHERE namespace.nspname = 'system' AND relation.relowner = candidate.oid\
+                     WHERE namespace.nspname IN ('system', 'agent') \
+                       AND relation.relowner = candidate.oid\
                  ) OR EXISTS (\
                      SELECT 1 FROM pg_proc AS procedure \
                      JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace \
-                     WHERE namespace.nspname = 'system' AND procedure.proowner = candidate.oid\
+                     WHERE namespace.nspname IN ('system', 'agent') \
+                       AND procedure.proowner = candidate.oid\
+                 ) OR EXISTS (\
+                     SELECT 1 FROM pg_type AS data_type \
+                     JOIN pg_namespace AS namespace ON namespace.oid = data_type.typnamespace \
+                     WHERE namespace.nspname IN ('system', 'agent') \
+                       AND data_type.typowner = candidate.oid\
                  ))\
          )",
     )

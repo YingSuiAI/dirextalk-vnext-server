@@ -91,6 +91,13 @@ pub struct AgentDefinitionRegistry {
     versions: BTreeMap<(AgentId, Revision), VerifiedAgentDefinition>,
 }
 
+/// Complete non-secret persistence image of the immutable definition registry.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentDefinitionRegistrySnapshot {
+    /// Every admitted immutable descriptor version. Ordering is not significant on input.
+    pub definitions: Vec<VerifiedAgentDefinition>,
+}
+
 impl AgentDefinitionRegistry {
     /// Creates an empty registry.
     #[must_use]
@@ -99,6 +106,57 @@ impl AgentDefinitionRegistry {
             heads: BTreeMap::new(),
             versions: BTreeMap::new(),
         }
+    }
+
+    /// Captures every immutable version required to rebuild registry heads exactly.
+    #[must_use]
+    pub fn snapshot(&self) -> AgentDefinitionRegistrySnapshot {
+        AgentDefinitionRegistrySnapshot {
+            definitions: self.versions.values().cloned().collect(),
+        }
+    }
+
+    /// Rebuilds a registry from durable non-secret state after validating its history.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate/equivocating versions and publisher changes within an Agent history.
+    pub fn try_from_snapshot(
+        snapshot: AgentDefinitionRegistrySnapshot,
+    ) -> Result<Self, AgentDefinitionSnapshotError> {
+        let mut registry = Self::new();
+        for definition in snapshot.definitions {
+            let key = (definition.agent_id, definition.version);
+            if registry.versions.insert(key, definition.clone()).is_some() {
+                return Err(AgentDefinitionSnapshotError::DuplicateVersion);
+            }
+            match registry.head(definition.agent_id) {
+                Some(head) if head.publisher_id != definition.publisher_id => {
+                    return Err(AgentDefinitionSnapshotError::PublisherChanged);
+                }
+                Some(head) if head.version > definition.version => {}
+                _ => {
+                    registry
+                        .heads
+                        .insert(definition.agent_id, definition.version);
+                }
+            }
+        }
+        // Input ordering may put the lowest version first or last. Validate the
+        // publisher across the now-complete per-Agent histories independently.
+        for (&agent_id, &head_version) in &registry.heads {
+            let publisher = registry
+                .versions
+                .get(&(agent_id, head_version))
+                .ok_or(AgentDefinitionSnapshotError::MissingHead)?
+                .publisher_id;
+            if registry.versions.iter().any(|((candidate, _), version)| {
+                *candidate == agent_id && version.publisher_id != publisher
+            }) {
+                return Err(AgentDefinitionSnapshotError::PublisherChanged);
+            }
+        }
+        Ok(registry)
     }
 
     /// Returns the latest admitted definition for an Agent.
@@ -222,3 +280,26 @@ impl fmt::Display for AgentDefinitionError {
 }
 
 impl Error for AgentDefinitionError {}
+
+/// Stable rejection for an invalid durable definition-registry image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentDefinitionSnapshotError {
+    /// The image repeats an `(Agent, version)` identity.
+    DuplicateVersion,
+    /// Versions under one Agent do not retain one publisher identity.
+    PublisherChanged,
+    /// A derived head has no matching immutable version.
+    MissingHead,
+}
+
+impl fmt::Display for AgentDefinitionSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::DuplicateVersion => "definition snapshot repeats a version",
+            Self::PublisherChanged => "definition snapshot changes publisher",
+            Self::MissingHead => "definition snapshot head is missing",
+        })
+    }
+}
+
+impl Error for AgentDefinitionSnapshotError {}

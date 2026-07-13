@@ -50,6 +50,14 @@ struct HostObservation {
     heartbeat_expires_at_millis: i64,
 }
 
+/// Non-secret durable host heartbeat observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostObservationSnapshot {
+    pub health: ReportedHealth,
+    pub observed_at_millis: i64,
+    pub heartbeat_expires_at_millis: i64,
+}
+
 /// Aggregate for one tenant-owned machine capable of hosting many Connectors.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentHost {
@@ -63,6 +71,21 @@ pub struct AgentHost {
     observed_revision: Option<Revision>,
     observation: Option<HostObservation>,
     revision: Revision,
+}
+
+/// Complete non-secret persistence image of one Agent Host aggregate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentHostSnapshot {
+    pub tenant_id: TenantId,
+    pub host_id: HostId,
+    pub owner_id: IdentityId,
+    pub lifecycle: HostLifecycle,
+    pub credential_id: Option<HostCredentialId>,
+    pub retired_credentials: BTreeSet<HostCredentialId>,
+    pub desired_revision: Revision,
+    pub observed_revision: Option<Revision>,
+    pub observation: Option<HostObservationSnapshot>,
+    pub revision: Revision,
 }
 
 impl AgentHost {
@@ -81,6 +104,102 @@ impl AgentHost {
             observation: None,
             revision: Revision::INITIAL,
         }
+    }
+
+    /// Captures lifecycle, credential-ID fences, observations, and exact revisions.
+    #[must_use]
+    pub fn snapshot(&self) -> AgentHostSnapshot {
+        AgentHostSnapshot {
+            tenant_id: self.tenant_id,
+            host_id: self.host_id,
+            owner_id: self.owner_id,
+            lifecycle: self.lifecycle,
+            credential_id: self.credential_id,
+            retired_credentials: self.retired_credentials.clone(),
+            desired_revision: self.desired_revision,
+            observed_revision: self.observed_revision,
+            observation: self.observation.map(|observation| HostObservationSnapshot {
+                health: observation.health,
+                observed_at_millis: observation.observed_at_millis,
+                heartbeat_expires_at_millis: observation.heartbeat_expires_at_millis,
+            }),
+            revision: self.revision,
+        }
+    }
+
+    /// Rehydrates a durable host image after validating lifecycle and time fences.
+    ///
+    /// # Errors
+    ///
+    /// Rejects impossible credential/lifecycle combinations, invalid observations,
+    /// observed revisions ahead of desired state, and unreachable revision-one state.
+    pub fn try_from_snapshot(snapshot: AgentHostSnapshot) -> Result<Self, AgentHostSnapshotError> {
+        let current_required = matches!(
+            snapshot.lifecycle,
+            HostLifecycle::Active | HostLifecycle::Quarantined
+        );
+        if current_required != snapshot.credential_id.is_some() {
+            return Err(AgentHostSnapshotError::CredentialLifecycleMismatch);
+        }
+        if snapshot
+            .credential_id
+            .is_some_and(|current| snapshot.retired_credentials.contains(&current))
+        {
+            return Err(AgentHostSnapshotError::CurrentCredentialRetired);
+        }
+        if snapshot
+            .observed_revision
+            .is_some_and(|observed| observed > snapshot.desired_revision)
+        {
+            return Err(AgentHostSnapshotError::ObservedRevisionAhead);
+        }
+        if snapshot.observation.is_some()
+            && (!matches!(
+                snapshot.lifecycle,
+                HostLifecycle::Active | HostLifecycle::Quarantined
+            ) || snapshot.observed_revision.is_none())
+        {
+            return Err(AgentHostSnapshotError::ObservationLifecycleMismatch);
+        }
+        if snapshot.lifecycle == HostLifecycle::AwaitingEnrollment
+            && (!snapshot.retired_credentials.is_empty()
+                || snapshot.observed_revision.is_some()
+                || snapshot.observation.is_some())
+        {
+            return Err(AgentHostSnapshotError::ObservationLifecycleMismatch);
+        }
+        if snapshot.observation.is_some_and(|observation| {
+            observation.heartbeat_expires_at_millis <= observation.observed_at_millis
+        }) {
+            return Err(AgentHostSnapshotError::InvalidHeartbeatWindow);
+        }
+        if snapshot.revision.get() == Revision::INITIAL.get()
+            && (!matches!(snapshot.lifecycle, HostLifecycle::AwaitingEnrollment)
+                || snapshot.credential_id.is_some()
+                || !snapshot.retired_credentials.is_empty()
+                || snapshot.desired_revision != Revision::INITIAL
+                || snapshot.observed_revision.is_some()
+                || snapshot.observation.is_some())
+        {
+            return Err(AgentHostSnapshotError::UnreachableInitialState);
+        }
+        let observation = snapshot.observation.map(|observation| HostObservation {
+            health: observation.health,
+            observed_at_millis: observation.observed_at_millis,
+            heartbeat_expires_at_millis: observation.heartbeat_expires_at_millis,
+        });
+        Ok(Self {
+            tenant_id: snapshot.tenant_id,
+            host_id: snapshot.host_id,
+            owner_id: snapshot.owner_id,
+            lifecycle: snapshot.lifecycle,
+            credential_id: snapshot.credential_id,
+            retired_credentials: snapshot.retired_credentials,
+            desired_revision: snapshot.desired_revision,
+            observed_revision: snapshot.observed_revision,
+            observation,
+            revision: snapshot.revision,
+        })
     }
 
     /// Consumes the host's only initial enrollment and installs its credential.
@@ -453,3 +572,29 @@ impl From<RevisionError> for HostError {
         Self::CounterExhausted
     }
 }
+
+/// Stable rejection for an invalid durable Agent Host image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentHostSnapshotError {
+    CredentialLifecycleMismatch,
+    CurrentCredentialRetired,
+    ObservedRevisionAhead,
+    ObservationLifecycleMismatch,
+    InvalidHeartbeatWindow,
+    UnreachableInitialState,
+}
+
+impl fmt::Display for AgentHostSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CredentialLifecycleMismatch => "host snapshot credential contradicts lifecycle",
+            Self::CurrentCredentialRetired => "host snapshot current credential is retired",
+            Self::ObservedRevisionAhead => "host snapshot observed revision exceeds desired",
+            Self::ObservationLifecycleMismatch => "host snapshot observation contradicts lifecycle",
+            Self::InvalidHeartbeatWindow => "host snapshot heartbeat window is invalid",
+            Self::UnreachableInitialState => "host snapshot has an unreachable initial state",
+        })
+    }
+}
+
+impl Error for AgentHostSnapshotError {}

@@ -2,6 +2,7 @@ mod support;
 
 use dtx_connect_registry::{
     AdapterKind, Connector, ConnectorError, ConnectorObservedState, LeaseStatus,
+    MAX_LEASE_TTL_MILLIS,
 };
 use dtx_domain::Revision;
 use dtx_domain::{BootId, ConnectorId, LeaseId, TenantId};
@@ -134,6 +135,19 @@ fn lease_issue_time_never_predates_the_boot_or_latest_heartbeat() {
         Err(ConnectorError::LeaseTimeRegressed)
     );
     assert_eq!(connector, before_regression);
+}
+
+#[test]
+fn lease_ttl_is_bounded_by_the_shared_persistence_contract() {
+    let mut connector = connector();
+    let boot_id = BootId::new();
+    connector.begin_boot(boot_id, NOW).unwrap();
+    let before = connector.clone();
+    assert_eq!(
+        connector.issue_lease(LeaseId::new(), boot_id, NOW, NOW + MAX_LEASE_TTL_MILLIS + 1,),
+        Err(ConnectorError::InvalidLeaseWindow)
+    );
+    assert_eq!(connector, before);
 }
 
 #[test]

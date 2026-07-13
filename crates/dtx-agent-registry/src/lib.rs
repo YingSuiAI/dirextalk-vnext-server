@@ -6,19 +6,21 @@ mod grant;
 mod installation;
 
 pub use definition::{
-    AgentDefinitionAdmission, AgentDefinitionError, AgentDefinitionRegistry, DescriptorDigest,
+    AgentDefinitionAdmission, AgentDefinitionError, AgentDefinitionRegistry,
+    AgentDefinitionRegistrySnapshot, AgentDefinitionSnapshotError, DescriptorDigest,
     VerifiedAgentDefinition,
 };
 pub use device::{
-    AgentDevice, AgentDeviceCommand, AgentDeviceError, AgentDeviceState,
-    DeviceCredentialFingerprint,
+    AgentDevice, AgentDeviceCommand, AgentDeviceError, AgentDeviceSnapshot,
+    AgentDeviceSnapshotError, AgentDeviceState, DeviceCredentialFingerprint,
 };
 pub use grant::{
     AgentConversationPermission, AgentConversationPermissions, AllMessagesConfirmation,
-    ConversationGrant, ConversationGrantCommand, ConversationGrantError, ConversationGrantUpdate,
-    PermissionExpansionConfirmation, PrivacyPolicyDigest, TriggerPolicy,
+    ConversationGrant, ConversationGrantCommand, ConversationGrantError, ConversationGrantSnapshot,
+    ConversationGrantSnapshotError, ConversationGrantUpdate, PermissionExpansionConfirmation,
+    PrivacyPolicyDigest, TriggerPolicy,
 };
 pub use installation::{
-    AgentInstallation, ExecutionMode, InstallationCommand, InstallationDesiredState,
-    InstallationError, InstallationObservedState,
+    AgentInstallation, AgentInstallationSnapshot, AgentInstallationSnapshotError, ExecutionMode,
+    InstallationCommand, InstallationDesiredState, InstallationError, InstallationObservedState,
 };

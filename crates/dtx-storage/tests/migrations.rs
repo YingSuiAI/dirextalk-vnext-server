@@ -5,8 +5,12 @@ use support::PostgresHarness;
 use uuid::Uuid;
 
 const INITIAL_MIGRATION_VERSION: i64 = 202_607_130_001;
+const AGENT_CONTROL_MIGRATION_VERSION: i64 = 202_607_130_002;
+const EXPECTED_MIGRATION_COUNT: i64 = 2;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
+const AGENT_CONTROL_DOWN: &str =
+    include_str!("../../../migrations/202607130002_agent_control_domain.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,18 +25,22 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
     let visible: i64 = sqlx::query_scalar("SELECT count(*) FROM system.schema_versions")
         .fetch_one(harness.admin_pool())
         .await?;
-    assert_eq!(applied, 1);
+    assert_eq!(applied, EXPECTED_MIGRATION_COUNT);
     assert_eq!(visible, applied);
     Ok(())
 }
 
 #[tokio::test]
-async fn initial_schema_can_run_up_down_up_on_an_empty_database()
+async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
 
-    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version = $1")
+    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version IN ($1, $2)")
         .bind(INITIAL_MIGRATION_VERSION)
+        .bind(AGENT_CONTROL_MIGRATION_VERSION)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(AGENT_CONTROL_DOWN)
         .execute(harness.admin_pool())
         .await?;
     sqlx::raw_sql(INITIAL_DOWN)
@@ -43,6 +51,11 @@ async fn initial_schema_can_run_up_down_up_on_an_empty_database()
             .fetch_one(harness.admin_pool())
             .await?;
     assert!(!system_schema_exists);
+    let agent_schema_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'agent')")
+            .fetch_one(harness.admin_pool())
+            .await?;
+    assert!(!agent_schema_exists);
 
     MigrationRunner::new().run(harness.admin_pool()).await?;
 
@@ -50,7 +63,7 @@ async fn initial_schema_can_run_up_down_up_on_an_empty_database()
         sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations WHERE success = true")
             .fetch_one(harness.admin_pool())
             .await?;
-    assert_eq!(applied, 1);
+    assert_eq!(applied, EXPECTED_MIGRATION_COUNT);
     Ok(())
 }
 
@@ -68,54 +81,61 @@ async fn runtime_role_is_non_owner_rls_bound_and_has_no_ddl()
     .await?;
     assert_eq!(role_flags, (false, false, false, false));
 
-    let protected_tables: i64 = sqlx::query_scalar(
-        "SELECT count(*)
+    let tenant_table_counts: (i64, i64) = sqlx::query_as(
+        "SELECT count(*),
+                count(*) FILTER (
+                    WHERE c.relrowsecurity
+                      AND c.relforcerowsecurity
+                      AND pg_get_userbyid(c.relowner) <> 'dtx_runtime_test'
+                )
            FROM pg_class c
            JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE n.nspname = 'system'
-            AND c.relname IN (
-              'tenant_stream_heads', 'durable_events', 'outbox_events',
-              'inbox_dedup', 'audit_events', 'projection_cursors'
-            )
-            AND c.relrowsecurity
-            AND c.relforcerowsecurity
-            AND pg_get_userbyid(c.relowner) <> 'dtx_runtime_test'",
+          WHERE n.nspname IN ('system', 'agent')
+            AND c.relkind = 'r'
+            AND EXISTS (
+                SELECT 1 FROM pg_attribute a
+                 WHERE a.attrelid = c.oid
+                   AND a.attname = 'tenant_id'
+                   AND NOT a.attisdropped
+            )",
     )
     .fetch_one(harness.admin_pool())
     .await?;
-    assert_eq!(protected_tables, 6);
+    assert!(tenant_table_counts.0 > 6, "agent tenant tables must exist");
+    assert_eq!(tenant_table_counts.1, tenant_table_counts.0);
 
     let tenant_policies: i64 = sqlx::query_scalar(
         "SELECT count(*)
            FROM pg_policies
-          WHERE schemaname = 'system'
+          WHERE schemaname IN ('system', 'agent')
             AND policyname = 'tenant_isolation'
             AND qual LIKE '%current_tenant_id%'
             AND with_check LIKE '%current_tenant_id%'",
     )
     .fetch_one(harness.admin_pool())
     .await?;
-    assert_eq!(tenant_policies, 6);
+    assert_eq!(tenant_policies, tenant_table_counts.0);
 
-    let can_delete_outbox: bool = sqlx::query_scalar(
-        "SELECT has_table_privilege(
-            'dtx_runtime_test', 'system.outbox_events', 'DELETE'
-        )",
+    let dangerous_table_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM information_schema.table_privileges
+          WHERE grantee = 'dtx_runtime_test'
+            AND table_schema IN ('system', 'agent')
+            AND privilege_type IN ('DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')",
     )
     .fetch_one(harness.admin_pool())
     .await?;
-    let can_delete_inbox: bool = sqlx::query_scalar(
-        "SELECT has_table_privilege(
-            'dtx_runtime_test', 'system.inbox_dedup', 'DELETE'
-        )",
-    )
-    .fetch_one(harness.admin_pool())
-    .await?;
-    assert!(!can_delete_outbox);
-    assert!(!can_delete_inbox);
+    assert_eq!(dangerous_table_grants, 0);
+    assert_append_only_tables_have_no_update(&harness).await?;
 
     assert!(
         sqlx::query("CREATE TABLE system.runtime_must_not_create (id integer)")
+            .execute(harness.runtime_pool())
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("CREATE TABLE agent.runtime_must_not_create (id integer)")
             .execute(harness.runtime_pool())
             .await
             .is_err()
@@ -127,30 +147,126 @@ async fn runtime_role_is_non_owner_rls_bound_and_has_no_ddl()
             .is_err()
     );
 
-    harness.runtime_store(1).await?;
+    assert_object_owner_membership_is_rejected(&harness).await?;
+    assert_schema_creator_membership_is_rejected(&harness).await?;
+    assert_predefined_role_membership_is_rejected(&harness).await?;
+    Ok(())
+}
+
+async fn assert_append_only_tables_have_no_update(
+    harness: &PostgresHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for table in [
+        "agent.agent_definitions",
+        "agent.connector_revisions",
+        "agent.connector_conformance",
+        "agent.conversation_grant_ids",
+        "agent.conversation_grant_versions",
+        "agent.conversation_grant_permissions",
+        "agent.conversation_grant_cloud_connections",
+    ] {
+        let can_update: bool =
+            sqlx::query_scalar("SELECT has_table_privilege('dtx_runtime_test', $1, 'UPDATE')")
+                .bind(table)
+                .fetch_one(harness.admin_pool())
+                .await?;
+        assert!(!can_update, "append-only table {table} exposed UPDATE");
+    }
+    Ok(())
+}
+
+async fn assert_object_owner_membership_is_rejected(
+    harness: &PostgresHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     sqlx::raw_sql(
-        "CREATE ROLE dtx_unsafe_parent NOLOGIN NOSUPERUSER NOBYPASSRLS;
+        "CREATE ROLE dtx_unsafe_system_owner NOLOGIN NOSUPERUSER NOBYPASSRLS;
          CREATE TABLE system.unsafe_parent_owned (id integer);
-         ALTER TABLE system.unsafe_parent_owned OWNER TO dtx_unsafe_parent;
-         GRANT dtx_unsafe_parent TO dtx_runtime_test;",
+         ALTER TABLE system.unsafe_parent_owned OWNER TO dtx_unsafe_system_owner;
+         GRANT dtx_unsafe_system_owner TO dtx_runtime_test;",
     )
     .execute(harness.admin_pool())
     .await?;
-    let unsafe_role = harness
+    let system_owner = harness
         .runtime_store(1)
         .await
         .expect_err("membership in a system object owner must be rejected");
-    assert!(matches!(unsafe_role, StorageError::UnsafeRuntimeRole));
+    assert!(matches!(system_owner, StorageError::UnsafeRuntimeRole));
 
     sqlx::raw_sql(
-        "REVOKE dtx_unsafe_parent FROM dtx_runtime_test;
+        "REVOKE dtx_unsafe_system_owner FROM dtx_runtime_test;
          ALTER TABLE system.unsafe_parent_owned OWNER TO dtx_test_admin;
          DROP TABLE system.unsafe_parent_owned;
-         DROP ROLE dtx_unsafe_parent;",
+         DROP ROLE dtx_unsafe_system_owner;
+
+         CREATE ROLE dtx_unsafe_agent_owner NOLOGIN NOSUPERUSER NOBYPASSRLS;
+         CREATE TABLE agent.unsafe_parent_owned (id integer);
+         ALTER TABLE agent.unsafe_parent_owned OWNER TO dtx_unsafe_agent_owner;
+         GRANT dtx_unsafe_agent_owner TO dtx_runtime_test;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    let agent_owner = harness
+        .runtime_store(1)
+        .await
+        .expect_err("membership in an agent object owner must be rejected");
+    assert!(matches!(agent_owner, StorageError::UnsafeRuntimeRole));
+    sqlx::raw_sql(
+        "REVOKE dtx_unsafe_agent_owner FROM dtx_runtime_test;
+         ALTER TABLE agent.unsafe_parent_owned OWNER TO dtx_test_admin;
+         DROP TABLE agent.unsafe_parent_owned;
+         DROP ROLE dtx_unsafe_agent_owner;",
     )
     .execute(harness.admin_pool())
     .await?;
     harness.runtime_store(1).await?;
+    Ok(())
+}
+
+async fn assert_schema_creator_membership_is_rejected(
+    harness: &PostgresHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::raw_sql(
+        "CREATE ROLE dtx_unsafe_system_creator NOLOGIN NOSUPERUSER NOBYPASSRLS;
+         GRANT CREATE ON SCHEMA system TO dtx_unsafe_system_creator;
+         GRANT dtx_unsafe_system_creator TO dtx_runtime_test;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    let system_creator = harness
+        .runtime_store(1)
+        .await
+        .expect_err("membership in a system schema creator must be rejected");
+    assert!(matches!(system_creator, StorageError::UnsafeRuntimeRole));
+    sqlx::raw_sql(
+        "REVOKE dtx_unsafe_system_creator FROM dtx_runtime_test;
+         REVOKE CREATE ON SCHEMA system FROM dtx_unsafe_system_creator;
+         DROP ROLE dtx_unsafe_system_creator;
+
+         CREATE ROLE dtx_unsafe_agent_creator NOLOGIN NOSUPERUSER NOBYPASSRLS;
+         GRANT CREATE ON SCHEMA agent TO dtx_unsafe_agent_creator;
+         GRANT dtx_unsafe_agent_creator TO dtx_runtime_test;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    let agent_creator = harness
+        .runtime_store(1)
+        .await
+        .expect_err("membership in an agent schema creator must be rejected");
+    assert!(matches!(agent_creator, StorageError::UnsafeRuntimeRole));
+    sqlx::raw_sql(
+        "REVOKE dtx_unsafe_agent_creator FROM dtx_runtime_test;
+         REVOKE CREATE ON SCHEMA agent FROM dtx_unsafe_agent_creator;
+         DROP ROLE dtx_unsafe_agent_creator;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    harness.runtime_store(1).await?;
+    Ok(())
+}
+
+async fn assert_predefined_role_membership_is_rejected(
+    harness: &PostgresHarness,
+) -> Result<(), Box<dyn std::error::Error>> {
     sqlx::query("GRANT pg_read_server_files TO dtx_runtime_test")
         .execute(harness.admin_pool())
         .await?;

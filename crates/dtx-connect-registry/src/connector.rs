@@ -3,6 +3,9 @@ use std::{error::Error, fmt};
 use dtx_agent_host::{AgentHost, HostLifecycle};
 use dtx_domain::{BootId, ConnectorId, HostId, LeaseId, Revision, TenantId};
 
+/// Maximum server-issued Connector lease TTL shared with `PostgreSQL` constraints.
+pub const MAX_LEASE_TTL_MILLIS: i64 = 86_400_000;
+
 /// Allowlisted runtime adapter schema selected for one connector process.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum AdapterKind {
@@ -131,7 +134,7 @@ pub enum LeaseStatus {
     Superseded,
 }
 
-/// Append-only lease record; only its status and heartbeat expiry may advance.
+/// Append-only lease record; only status, heartbeat expiry, and its replay fence may advance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectorLease {
     fence: ConnectorFence,
@@ -139,6 +142,8 @@ pub struct ConnectorLease {
     expires_at_millis: i64,
     ttl_millis: i64,
     status: LeaseStatus,
+    last_heartbeat: Option<HeartbeatRecord>,
+    last_heartbeat_at_millis: Option<i64>,
 }
 
 impl ConnectorLease {
@@ -298,11 +303,86 @@ pub struct Connector {
     leases: Vec<ConnectorLease>,
     active_lease_index: Option<usize>,
     highest_lease_epoch: Option<LeaseEpoch>,
-    last_heartbeat: Option<HeartbeatRecord>,
-    last_heartbeat_at_millis: Option<i64>,
     server_time_high_water_millis: Option<i64>,
     spec_revision: Revision,
     revisions: Vec<ConnectorRevision>,
+}
+
+/// Durable non-secret heartbeat replay fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeartbeatRecordSnapshot {
+    pub sequence: u64,
+    pub state: ConnectorObservedState,
+    pub capacity_available: u32,
+    pub ack: HeartbeatAckSnapshot,
+}
+
+/// Constructible durable form of the cached heartbeat acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeartbeatAckSnapshot {
+    pub sequence: u64,
+    pub lease_expires_at_millis: i64,
+}
+
+/// Durable non-secret process-incarnation history record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorBootSnapshot {
+    pub tenant_id: TenantId,
+    pub connector_id: ConnectorId,
+    pub boot_id: BootId,
+    pub generation: u64,
+    pub started_at_millis: i64,
+    pub ended_at_millis: Option<i64>,
+}
+
+/// Durable non-secret lease history record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorLeaseSnapshot {
+    pub tenant_id: TenantId,
+    pub connector_id: ConnectorId,
+    pub generation: u64,
+    pub boot_id: BootId,
+    pub lease_id: LeaseId,
+    pub lease_epoch: u64,
+    pub issued_at_millis: i64,
+    pub expires_at_millis: i64,
+    pub ttl_millis: i64,
+    pub status: LeaseStatus,
+    pub last_heartbeat: Option<HeartbeatRecordSnapshot>,
+    pub last_heartbeat_at_millis: Option<i64>,
+}
+
+/// Durable immutable connector specification history record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorRevisionSnapshot {
+    pub tenant_id: TenantId,
+    pub connector_id: ConnectorId,
+    pub revision: Revision,
+    pub generation: u64,
+    pub adapter_kind: AdapterKind,
+    pub desired_state: ConnectorDesiredState,
+    pub max_concurrency: u32,
+}
+
+/// Complete non-secret persistence image of a connector aggregate and all fences.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorSnapshot {
+    pub tenant_id: TenantId,
+    pub connector_id: ConnectorId,
+    pub host_id: HostId,
+    pub adapter_kind: AdapterKind,
+    pub generation: u64,
+    pub desired_state: ConnectorDesiredState,
+    pub observed_state: ConnectorObservedState,
+    pub max_concurrency: u32,
+    pub boots: Vec<ConnectorBootSnapshot>,
+    pub current_boot_id: Option<BootId>,
+    pub leases: Vec<ConnectorLeaseSnapshot>,
+    pub active_lease_index: Option<usize>,
+    pub highest_lease_epoch: Option<u64>,
+    pub server_time_high_water_millis: Option<i64>,
+    pub spec_revision: Revision,
+    pub revisions: Vec<ConnectorRevisionSnapshot>,
 }
 
 impl Connector {
@@ -348,11 +428,344 @@ impl Connector {
             leases: Vec::new(),
             active_lease_index: None,
             highest_lease_epoch: None,
-            last_heartbeat: None,
-            last_heartbeat_at_millis: None,
             server_time_high_water_millis: None,
             spec_revision: Revision::INITIAL,
             revisions: vec![initial_revision],
+        })
+    }
+
+    /// Captures the connector specification, runtime replay fences, and append-only histories.
+    #[must_use]
+    pub fn snapshot(&self) -> ConnectorSnapshot {
+        ConnectorSnapshot {
+            tenant_id: self.tenant_id,
+            connector_id: self.id,
+            host_id: self.host_id,
+            adapter_kind: self.adapter_kind,
+            generation: self.generation.get(),
+            desired_state: self.desired_state,
+            observed_state: self.observed_state,
+            max_concurrency: self.max_concurrency,
+            boots: self
+                .boots
+                .iter()
+                .map(|boot| ConnectorBootSnapshot {
+                    tenant_id: boot.tenant_id,
+                    connector_id: boot.parent_id,
+                    boot_id: boot.boot_id,
+                    generation: boot.generation.get(),
+                    started_at_millis: boot.started_at_millis,
+                    ended_at_millis: boot.ended_at_millis,
+                })
+                .collect(),
+            current_boot_id: self.current_boot_id,
+            leases: self
+                .leases
+                .iter()
+                .map(|lease| ConnectorLeaseSnapshot {
+                    tenant_id: lease.fence.tenant_id,
+                    connector_id: lease.fence.connector_id,
+                    generation: lease.fence.generation.get(),
+                    boot_id: lease.fence.boot_id,
+                    lease_id: lease.fence.lease_id,
+                    lease_epoch: lease.fence.lease_epoch.get(),
+                    issued_at_millis: lease.issued_at_millis,
+                    expires_at_millis: lease.expires_at_millis,
+                    ttl_millis: lease.ttl_millis,
+                    status: lease.status,
+                    last_heartbeat: lease
+                        .last_heartbeat
+                        .map(|heartbeat| HeartbeatRecordSnapshot {
+                            sequence: heartbeat.sequence,
+                            state: heartbeat.state,
+                            capacity_available: heartbeat.capacity_available,
+                            ack: HeartbeatAckSnapshot {
+                                sequence: heartbeat.ack.sequence,
+                                lease_expires_at_millis: heartbeat.ack.lease_expires_at_millis,
+                            },
+                        }),
+                    last_heartbeat_at_millis: lease.last_heartbeat_at_millis,
+                })
+                .collect(),
+            active_lease_index: self.active_lease_index,
+            highest_lease_epoch: self.highest_lease_epoch.map(LeaseEpoch::get),
+            server_time_high_water_millis: self.server_time_high_water_millis,
+            spec_revision: self.spec_revision,
+            revisions: self
+                .revisions
+                .iter()
+                .map(|revision| ConnectorRevisionSnapshot {
+                    tenant_id: revision.tenant_id,
+                    connector_id: revision.connector_id,
+                    revision: revision.revision,
+                    generation: revision.generation.get(),
+                    adapter_kind: revision.adapter_kind,
+                    desired_state: revision.desired_state,
+                    max_concurrency: revision.max_concurrency,
+                })
+                .collect(),
+        }
+    }
+
+    /// Rehydrates a connector only after validating every structural and fencing invariant.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid counters/capacity, broken immutable histories, incorrect
+    /// current pointers, impossible heartbeat replay state, or regressed high-water time.
+    #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)] // One fail-closed audit boundary consumes the durable image.
+    pub fn try_from_snapshot(snapshot: ConnectorSnapshot) -> Result<Self, ConnectorSnapshotError> {
+        let generation = snapshot_generation(snapshot.generation)?;
+        if snapshot.max_concurrency == 0 {
+            return Err(ConnectorSnapshotError::InvalidCapacity);
+        }
+        if snapshot.revisions.len() as u64 != snapshot.spec_revision.get()
+            || snapshot.revisions.is_empty()
+        {
+            return Err(ConnectorSnapshotError::InvalidRevisionHistory);
+        }
+        let mut revisions = Vec::with_capacity(snapshot.revisions.len());
+        for (index, revision) in snapshot.revisions.iter().enumerate() {
+            if revision.tenant_id != snapshot.tenant_id
+                || revision.connector_id != snapshot.connector_id
+                || revision.revision.get() != index as u64 + 1
+                || revision.adapter_kind != snapshot.adapter_kind
+                || revision.max_concurrency != snapshot.max_concurrency
+                || revision.generation == 0
+                || revision.generation > snapshot.generation
+            {
+                return Err(ConnectorSnapshotError::InvalidRevisionHistory);
+            }
+            if index == 0
+                && (revision.generation != ConnectorGeneration::INITIAL.get()
+                    || revision.desired_state != ConnectorDesiredState::Running)
+            {
+                return Err(ConnectorSnapshotError::InvalidRevisionHistory);
+            }
+            if index > 0 {
+                let previous = snapshot.revisions[index - 1];
+                let valid_transition = if revision.generation == previous.generation {
+                    valid_desired_transition(previous.desired_state, revision.desired_state)
+                } else {
+                    previous
+                        .generation
+                        .checked_add(1)
+                        .is_some_and(|next| revision.generation == next)
+                        && revision.desired_state == previous.desired_state
+                };
+                if !valid_transition {
+                    return Err(ConnectorSnapshotError::InvalidRevisionHistory);
+                }
+            }
+            revisions.push(ConnectorRevision {
+                tenant_id: revision.tenant_id,
+                connector_id: revision.connector_id,
+                revision: revision.revision,
+                generation: snapshot_generation(revision.generation)?,
+                adapter_kind: revision.adapter_kind,
+                desired_state: revision.desired_state,
+                max_concurrency: revision.max_concurrency,
+            });
+        }
+        let current_revision = snapshot
+            .revisions
+            .last()
+            .ok_or(ConnectorSnapshotError::InvalidRevisionHistory)?;
+        if current_revision.generation != snapshot.generation
+            || current_revision.desired_state != snapshot.desired_state
+        {
+            return Err(ConnectorSnapshotError::InvalidRevisionHistory);
+        }
+
+        let mut seen_boot_ids = std::collections::BTreeSet::new();
+        let mut boots = Vec::with_capacity(snapshot.boots.len());
+        for (index, boot) in snapshot.boots.iter().enumerate() {
+            if boot.tenant_id != snapshot.tenant_id
+                || boot.connector_id != snapshot.connector_id
+                || boot.generation == 0
+                || boot.generation > snapshot.generation
+                || !seen_boot_ids.insert(boot.boot_id)
+                || boot
+                    .ended_at_millis
+                    .is_some_and(|ended| ended < boot.started_at_millis)
+                || (index + 1 < snapshot.boots.len() && boot.ended_at_millis.is_none())
+            {
+                return Err(ConnectorSnapshotError::InvalidBootHistory);
+            }
+            if let Some(previous) = snapshot.boots.get(index.wrapping_sub(1))
+                && index > 0
+                && (boot.generation < previous.generation
+                    || boot.started_at_millis
+                        < previous
+                            .ended_at_millis
+                            .unwrap_or(previous.started_at_millis))
+            {
+                return Err(ConnectorSnapshotError::InvalidBootHistory);
+            }
+            boots.push(ConnectorBoot {
+                tenant_id: boot.tenant_id,
+                parent_id: boot.connector_id,
+                boot_id: boot.boot_id,
+                generation: snapshot_generation(boot.generation)?,
+                started_at_millis: boot.started_at_millis,
+                ended_at_millis: boot.ended_at_millis,
+            });
+        }
+        let open_boot_id = snapshot
+            .boots
+            .last()
+            .filter(|boot| boot.ended_at_millis.is_none())
+            .map(|boot| boot.boot_id);
+        if snapshot.current_boot_id != open_boot_id
+            || open_boot_id.is_some_and(|_| {
+                !matches!(
+                    snapshot.desired_state,
+                    ConnectorDesiredState::Running | ConnectorDesiredState::Draining
+                ) || snapshot
+                    .boots
+                    .last()
+                    .is_none_or(|boot| boot.generation != snapshot.generation)
+            })
+        {
+            return Err(ConnectorSnapshotError::InvalidCurrentBoot);
+        }
+
+        let mut seen_lease_ids = std::collections::BTreeSet::new();
+        let mut leases = Vec::with_capacity(snapshot.leases.len());
+        let mut active_index = None;
+        for (index, lease) in snapshot.leases.iter().enumerate() {
+            let matching_boot = snapshot
+                .boots
+                .iter()
+                .find(|boot| boot.boot_id == lease.boot_id && boot.generation == lease.generation);
+            if lease.tenant_id != snapshot.tenant_id
+                || lease.connector_id != snapshot.connector_id
+                || lease.generation == 0
+                || lease.generation > snapshot.generation
+                || lease.lease_epoch != index as u64 + 1
+                || !(1..=MAX_LEASE_TTL_MILLIS).contains(&lease.ttl_millis)
+                || lease.expires_at_millis
+                    < lease
+                        .issued_at_millis
+                        .checked_add(lease.ttl_millis)
+                        .ok_or(ConnectorSnapshotError::InvalidLeaseHistory)?
+                || !seen_lease_ids.insert(lease.lease_id)
+                || matching_boot.is_none()
+                || matching_boot.is_some_and(|boot| lease.issued_at_millis < boot.started_at_millis)
+                || matching_boot.is_some_and(|boot| {
+                    boot.ended_at_millis
+                        .is_some_and(|ended| lease.issued_at_millis > ended)
+                })
+                || snapshot
+                    .leases
+                    .get(index.wrapping_sub(1))
+                    .is_some_and(|previous| {
+                        index > 0 && lease.issued_at_millis < previous.issued_at_millis
+                    })
+            {
+                return Err(ConnectorSnapshotError::InvalidLeaseHistory);
+            }
+            if lease.status == LeaseStatus::Active && active_index.replace(index).is_some() {
+                return Err(ConnectorSnapshotError::InvalidActiveLease);
+            }
+            let fence = ConnectorFence {
+                tenant_id: lease.tenant_id,
+                connector_id: lease.connector_id,
+                generation: snapshot_generation(lease.generation)?,
+                boot_id: lease.boot_id,
+                lease_id: lease.lease_id,
+                lease_epoch: snapshot_epoch(lease.lease_epoch)?,
+            };
+            let last_heartbeat = snapshot_heartbeat(lease, snapshot.max_concurrency)?;
+            leases.push(ConnectorLease {
+                fence,
+                issued_at_millis: lease.issued_at_millis,
+                expires_at_millis: lease.expires_at_millis,
+                ttl_millis: lease.ttl_millis,
+                status: lease.status,
+                last_heartbeat,
+                last_heartbeat_at_millis: lease.last_heartbeat_at_millis,
+            });
+        }
+        if snapshot.active_lease_index != active_index
+            || snapshot.highest_lease_epoch
+                != (!snapshot.leases.is_empty()).then_some(snapshot.leases.len() as u64)
+        {
+            return Err(ConnectorSnapshotError::InvalidActiveLease);
+        }
+        if active_index.is_some_and(|index| index + 1 != snapshot.leases.len()) {
+            return Err(ConnectorSnapshotError::InvalidActiveLease);
+        }
+        if let Some(index) = active_index {
+            let lease = &snapshot.leases[index];
+            if snapshot.current_boot_id != Some(lease.boot_id)
+                || lease.generation != snapshot.generation
+            {
+                return Err(ConnectorSnapshotError::InvalidActiveLease);
+            }
+        }
+        if matches!(
+            snapshot.desired_state,
+            ConnectorDesiredState::Stopped | ConnectorDesiredState::Revoked
+        ) && (snapshot.current_boot_id.is_some() || active_index.is_some())
+        {
+            return Err(ConnectorSnapshotError::InvalidTerminalState);
+        }
+        if snapshot.desired_state == ConnectorDesiredState::Revoked
+            && snapshot.observed_state != ConnectorObservedState::Revoked
+        {
+            return Err(ConnectorSnapshotError::InvalidTerminalState);
+        }
+        if snapshot.desired_state == ConnectorDesiredState::Stopped
+            && snapshot.observed_state != ConnectorObservedState::Offline
+        {
+            return Err(ConnectorSnapshotError::InvalidTerminalState);
+        }
+
+        let high_water = snapshot.server_time_high_water_millis;
+        let time_exceeds_high_water = snapshot
+            .boots
+            .iter()
+            .flat_map(|boot| [Some(boot.started_at_millis), boot.ended_at_millis])
+            .flatten()
+            .chain(snapshot.leases.iter().map(|lease| lease.issued_at_millis))
+            .chain(
+                snapshot
+                    .leases
+                    .iter()
+                    .filter_map(|lease| lease.last_heartbeat_at_millis),
+            )
+            .any(|time| high_water.is_none_or(|high| time > high));
+        if time_exceeds_high_water {
+            return Err(ConnectorSnapshotError::InvalidServerTimeHighWater);
+        }
+        if snapshot.leases.iter().any(|lease| {
+            lease.status == LeaseStatus::Expired
+                && high_water.is_none_or(|high| high < lease.expires_at_millis)
+        }) {
+            return Err(ConnectorSnapshotError::InvalidServerTimeHighWater);
+        }
+
+        Ok(Self {
+            tenant_id: snapshot.tenant_id,
+            id: snapshot.connector_id,
+            host_id: snapshot.host_id,
+            adapter_kind: snapshot.adapter_kind,
+            generation,
+            desired_state: snapshot.desired_state,
+            observed_state: snapshot.observed_state,
+            max_concurrency: snapshot.max_concurrency,
+            boots,
+            current_boot_id: snapshot.current_boot_id,
+            leases,
+            active_lease_index: snapshot.active_lease_index,
+            highest_lease_epoch: snapshot
+                .highest_lease_epoch
+                .map(snapshot_epoch)
+                .transpose()?,
+            server_time_high_water_millis: snapshot.server_time_high_water_millis,
+            spec_revision: snapshot.spec_revision,
+            revisions,
         })
     }
 
@@ -405,8 +818,6 @@ impl Connector {
         });
         self.current_boot_id = Some(boot_id);
         self.terminalize_active_lease(LeaseStatus::Superseded);
-        self.last_heartbeat = None;
-        self.last_heartbeat_at_millis = None;
         self.observed_state = ConnectorObservedState::Starting;
         self.advance_server_time_high_water(started_at_millis);
         Ok(())
@@ -439,6 +850,9 @@ impl Connector {
         let ttl_millis = expires_at_millis
             .checked_sub(issued_at_millis)
             .ok_or(ConnectorError::InvalidLeaseWindow)?;
+        if ttl_millis > MAX_LEASE_TTL_MILLIS {
+            return Err(ConnectorError::InvalidLeaseWindow);
+        }
         if let Some(current) = self
             .leases
             .iter()
@@ -464,7 +878,9 @@ impl Connector {
             .last()
             .map_or(boot_started_at_millis, |lease| lease.issued_at_millis);
         let not_before_millis = self
-            .last_heartbeat_at_millis
+            .leases
+            .last()
+            .and_then(|lease| lease.last_heartbeat_at_millis)
             .unwrap_or(last_lease_issued_at_millis)
             .max(last_lease_issued_at_millis)
             .max(boot_started_at_millis);
@@ -489,10 +905,10 @@ impl Connector {
             expires_at_millis,
             ttl_millis,
             status: LeaseStatus::Active,
+            last_heartbeat: None,
+            last_heartbeat_at_millis: None,
         });
         self.active_lease_index = Some(self.leases.len() - 1);
-        self.last_heartbeat = None;
-        self.last_heartbeat_at_millis = None;
         self.observed_state = ConnectorObservedState::Starting;
         self.advance_server_time_high_water(issued_at_millis);
         Ok(fence)
@@ -555,7 +971,10 @@ impl Connector {
         state: ConnectorObservedState,
         capacity_available: u32,
     ) -> Result<HeartbeatAck, ConnectorError> {
-        let issued_at_millis = self.validate_fence_coordinates(fence)?.issued_at_millis;
+        let current = self.validate_fence_coordinates(fence)?;
+        let issued_at_millis = current.issued_at_millis;
+        let previous_heartbeat = current.last_heartbeat;
+        let previous_heartbeat_at_millis = current.last_heartbeat_at_millis;
         if observed_at_millis < issued_at_millis {
             return Err(ConnectorError::InvalidHeartbeatTime);
         }
@@ -571,7 +990,7 @@ impl Connector {
         if capacity_available > self.max_concurrency {
             return Err(ConnectorError::InvalidCapacity);
         }
-        if let Some(previous) = self.last_heartbeat {
+        if let Some(previous) = previous_heartbeat {
             if sequence < previous.sequence {
                 return Err(ConnectorError::StaleHeartbeat);
             }
@@ -584,9 +1003,7 @@ impl Connector {
                     Err(ConnectorError::HeartbeatConflict)
                 };
             }
-            if self
-                .last_heartbeat_at_millis
-                .is_some_and(|last_seen| observed_at_millis < last_seen)
+            if previous_heartbeat_at_millis.is_some_and(|last_seen| observed_at_millis < last_seen)
             {
                 return Err(ConnectorError::InvalidHeartbeatTime);
             }
@@ -605,13 +1022,13 @@ impl Connector {
             sequence,
             lease_expires_at_millis,
         };
-        self.last_heartbeat = Some(HeartbeatRecord {
+        lease.last_heartbeat = Some(HeartbeatRecord {
             sequence,
             state,
             capacity_available,
             ack,
         });
-        self.last_heartbeat_at_millis = Some(observed_at_millis);
+        lease.last_heartbeat_at_millis = Some(observed_at_millis);
         self.observed_state = state;
         self.advance_server_time_high_water(observed_at_millis);
         Ok(ack)
@@ -759,8 +1176,6 @@ impl Connector {
         self.spec_revision = next_revision;
         self.current_boot_id = None;
         self.terminalize_active_lease(LeaseStatus::Superseded);
-        self.last_heartbeat = None;
-        self.last_heartbeat_at_millis = None;
         self.observed_state = ConnectorObservedState::Offline;
         self.advance_server_time_high_water(changed_at_millis);
         self.append_current_revision();
@@ -828,16 +1243,12 @@ impl Connector {
                 self.close_current_boot(changed_at_millis);
                 self.current_boot_id = None;
                 self.terminalize_active_lease(LeaseStatus::Revoked);
-                self.last_heartbeat = None;
-                self.last_heartbeat_at_millis = None;
                 self.observed_state = ConnectorObservedState::Offline;
             }
             ConnectorDesiredState::Revoked => {
                 self.close_current_boot(changed_at_millis);
                 self.current_boot_id = None;
                 self.terminalize_active_lease(LeaseStatus::Revoked);
-                self.last_heartbeat = None;
-                self.last_heartbeat_at_millis = None;
                 self.observed_state = ConnectorObservedState::Revoked;
             }
             ConnectorDesiredState::Running => {}
@@ -980,3 +1391,124 @@ impl fmt::Display for ConnectorError {
 }
 
 impl Error for ConnectorError {}
+
+fn snapshot_generation(value: u64) -> Result<ConnectorGeneration, ConnectorSnapshotError> {
+    if value == 0 || value > Revision::MAX {
+        Err(ConnectorSnapshotError::InvalidGeneration)
+    } else {
+        Ok(ConnectorGeneration(value))
+    }
+}
+
+fn valid_desired_transition(
+    previous: ConnectorDesiredState,
+    current: ConnectorDesiredState,
+) -> bool {
+    matches!(
+        (previous, current),
+        (
+            ConnectorDesiredState::Running,
+            ConnectorDesiredState::Draining
+                | ConnectorDesiredState::Stopped
+                | ConnectorDesiredState::Revoked
+        ) | (
+            ConnectorDesiredState::Draining,
+            ConnectorDesiredState::Running
+                | ConnectorDesiredState::Stopped
+                | ConnectorDesiredState::Revoked
+        ) | (
+            ConnectorDesiredState::Stopped,
+            ConnectorDesiredState::Running | ConnectorDesiredState::Revoked
+        )
+    )
+}
+
+fn snapshot_epoch(value: u64) -> Result<LeaseEpoch, ConnectorSnapshotError> {
+    if value == 0 || value > Revision::MAX {
+        Err(ConnectorSnapshotError::InvalidLeaseHistory)
+    } else {
+        Ok(LeaseEpoch(value))
+    }
+}
+
+fn snapshot_heartbeat(
+    lease: &ConnectorLeaseSnapshot,
+    max_concurrency: u32,
+) -> Result<Option<HeartbeatRecord>, ConnectorSnapshotError> {
+    match (lease.last_heartbeat, lease.last_heartbeat_at_millis) {
+        (None, None) => {
+            if lease
+                .issued_at_millis
+                .checked_add(lease.ttl_millis)
+                .is_none_or(|initial_expiry| initial_expiry != lease.expires_at_millis)
+            {
+                return Err(ConnectorSnapshotError::InvalidHeartbeat);
+            }
+            Ok(None)
+        }
+        (Some(heartbeat), Some(observed_at)) => {
+            if heartbeat.sequence == 0
+                || heartbeat.sequence > Revision::MAX
+                || heartbeat.capacity_available > max_concurrency
+                || matches!(
+                    heartbeat.state,
+                    ConnectorObservedState::Offline | ConnectorObservedState::Revoked
+                )
+                || observed_at < lease.issued_at_millis
+                || heartbeat.ack.sequence != heartbeat.sequence
+                || heartbeat.ack.lease_expires_at_millis != lease.expires_at_millis
+                || observed_at
+                    .checked_add(lease.ttl_millis)
+                    .is_none_or(|expected| expected != lease.expires_at_millis)
+            {
+                return Err(ConnectorSnapshotError::InvalidHeartbeat);
+            }
+            Ok(Some(HeartbeatRecord {
+                sequence: heartbeat.sequence,
+                state: heartbeat.state,
+                capacity_available: heartbeat.capacity_available,
+                ack: HeartbeatAck {
+                    sequence: heartbeat.ack.sequence,
+                    lease_expires_at_millis: heartbeat.ack.lease_expires_at_millis,
+                },
+            }))
+        }
+        _ => Err(ConnectorSnapshotError::InvalidHeartbeat),
+    }
+}
+
+/// Stable rejection for an invalid durable connector image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorSnapshotError {
+    InvalidGeneration,
+    InvalidCapacity,
+    InvalidRevisionHistory,
+    InvalidBootHistory,
+    InvalidCurrentBoot,
+    InvalidLeaseHistory,
+    InvalidActiveLease,
+    InvalidHeartbeat,
+    InvalidTerminalState,
+    InvalidServerTimeHighWater,
+}
+
+impl fmt::Display for ConnectorSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidGeneration => "connector snapshot generation is invalid",
+            Self::InvalidCapacity => "connector snapshot capacity is invalid",
+            Self::InvalidRevisionHistory => "connector snapshot revision history is invalid",
+            Self::InvalidBootHistory => "connector snapshot boot history is invalid",
+            Self::InvalidCurrentBoot => "connector snapshot current boot pointer is invalid",
+            Self::InvalidLeaseHistory => "connector snapshot lease history is invalid",
+            Self::InvalidActiveLease => "connector snapshot active lease pointer is invalid",
+            Self::InvalidHeartbeat => "connector snapshot heartbeat replay fence is invalid",
+            Self::InvalidTerminalState => "connector snapshot terminal state is invalid",
+            Self::InvalidServerTimeHighWater => {
+                "connector snapshot server time high-water is invalid"
+            }
+        })
+    }
+}
+
+impl Error for ConnectorSnapshotError {}

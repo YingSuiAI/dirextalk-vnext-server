@@ -82,6 +82,22 @@ pub struct AgentInstallation {
     revision: Revision,
 }
 
+/// Complete non-secret persistence image of an Agent installation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentInstallationSnapshot {
+    pub tenant_id: TenantId,
+    pub installation_id: InstallationId,
+    pub agent_id: AgentId,
+    pub owner_id: IdentityId,
+    pub execution_mode: ExecutionMode,
+    pub descriptor_version: Revision,
+    pub descriptor_hash: DescriptorDigest,
+    pub policy_revision: Revision,
+    pub desired_state: InstallationDesiredState,
+    pub observed_state: InstallationObservedState,
+    pub revision: Revision,
+}
+
 impl AgentInstallation {
     /// Creates a newly installing aggregate at revision one.
     #[must_use]
@@ -107,6 +123,57 @@ impl AgentInstallation {
             observed_state: InstallationObservedState::Installing,
             revision: Revision::INITIAL,
         }
+    }
+
+    /// Captures all durable installation facts without credential material.
+    #[must_use]
+    pub const fn snapshot(&self) -> AgentInstallationSnapshot {
+        AgentInstallationSnapshot {
+            tenant_id: self.tenant_id,
+            installation_id: self.installation_id,
+            agent_id: self.agent_id,
+            owner_id: self.owner_id,
+            execution_mode: self.execution_mode,
+            descriptor_version: self.descriptor_version,
+            descriptor_hash: self.descriptor_hash,
+            policy_revision: self.policy_revision,
+            desired_state: self.desired_state,
+            observed_state: self.observed_state,
+            revision: self.revision,
+        }
+    }
+
+    /// Rehydrates a durable installation after checking reachable initial-state invariants.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a revision-one image containing facts that require a transition.
+    pub const fn try_from_snapshot(
+        snapshot: AgentInstallationSnapshot,
+    ) -> Result<Self, AgentInstallationSnapshotError> {
+        if snapshot.revision.get() == Revision::INITIAL.get()
+            && (snapshot.policy_revision.get() != Revision::INITIAL.get()
+                || !matches!(snapshot.desired_state, InstallationDesiredState::Enabled)
+                || !matches!(
+                    snapshot.observed_state,
+                    InstallationObservedState::Installing
+                ))
+        {
+            return Err(AgentInstallationSnapshotError::UnreachableInitialState);
+        }
+        Ok(Self {
+            tenant_id: snapshot.tenant_id,
+            installation_id: snapshot.installation_id,
+            agent_id: snapshot.agent_id,
+            owner_id: snapshot.owner_id,
+            execution_mode: snapshot.execution_mode,
+            descriptor_version: snapshot.descriptor_version,
+            descriptor_hash: snapshot.descriptor_hash,
+            policy_revision: snapshot.policy_revision,
+            desired_state: snapshot.desired_state,
+            observed_state: snapshot.observed_state,
+            revision: snapshot.revision,
+        })
     }
 
     /// Returns the immutable tenant boundary.
@@ -325,3 +392,18 @@ impl fmt::Display for InstallationError {
 }
 
 impl Error for InstallationError {}
+
+/// Stable rejection for an invalid durable installation image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentInstallationSnapshotError {
+    /// Revision one must still contain exactly the constructor lifecycle facts.
+    UnreachableInitialState,
+}
+
+impl fmt::Display for AgentInstallationSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("installation snapshot has an unreachable initial state")
+    }
+}
+
+impl Error for AgentInstallationSnapshotError {}
