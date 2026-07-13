@@ -6,7 +6,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgListener, PgPoolOptions},
 };
 
-use crate::StorageError;
+use crate::{StorageError, migrations::embedded_migrations_match};
 
 /// Validated runtime `PostgreSQL` pool whose credentials cannot bypass RLS.
 #[derive(Clone)]
@@ -68,6 +68,76 @@ impl PgStore {
         PgListener::connect_with(&pool)
             .await
             .map_err(StorageError::from)
+    }
+
+    /// Verifies database writeability, every embedded migration checksum, and
+    /// caller-supplied service privilege requirements without mutating data.
+    ///
+    /// Callers should apply their own readiness deadline so pool exhaustion or a
+    /// network partition cannot hold a probe open indefinitely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when a connection cannot execute the probe.
+    pub async fn readiness_check(
+        &self,
+        required_table_privileges: &[(&str, &str)],
+        required_function_privileges: &[(&str, &str)],
+    ) -> Result<bool, StorageError> {
+        let table_relations = required_table_privileges
+            .iter()
+            .map(|(relation, _)| (*relation).to_owned())
+            .collect::<Vec<_>>();
+        let table_privileges = required_table_privileges
+            .iter()
+            .map(|(_, privilege)| (*privilege).to_owned())
+            .collect::<Vec<_>>();
+        let function_signatures = required_function_privileges
+            .iter()
+            .map(|(signature, _)| (*signature).to_owned())
+            .collect::<Vec<_>>();
+        let function_privileges = required_function_privileges
+            .iter()
+            .map(|(_, privilege)| (*privilege).to_owned())
+            .collect::<Vec<_>>();
+        let mut connection = self.pool.acquire().await?;
+        let runtime_ready: bool = sqlx::query_scalar(
+            "SELECT current_setting('transaction_read_only') = 'off' \
+                 AND has_schema_privilege(current_user, 'system', 'USAGE') \
+                 AND has_schema_privilege(current_user, 'agent', 'USAGE') \
+                 AND COALESCE(( \
+                     SELECT bool_and(has_table_privilege( \
+                         current_user, requirement.relation_name, requirement.privilege_name \
+                     )) \
+                     FROM unnest($1::text[], $2::text[]) \
+                         AS requirement(relation_name, privilege_name) \
+                 ), true) \
+                 AND COALESCE(( \
+                     SELECT bool_and(has_function_privilege( \
+                         current_user, requirement.function_signature, \
+                         requirement.privilege_name \
+                     )) \
+                     FROM unnest($3::text[], $4::text[]) \
+                         AS requirement(function_signature, privilege_name) \
+                 ), true)",
+        )
+        .bind(table_relations)
+        .bind(table_privileges)
+        .bind(function_signatures)
+        .bind(function_privileges)
+        .fetch_one(&mut *connection)
+        .await?;
+        if !runtime_ready {
+            return Ok(false);
+        }
+        let applied = sqlx::query_as::<_, (i64, Vec<u8>)>(
+            "SELECT version, checksum \
+             FROM system.schema_versions \
+             WHERE success = true",
+        )
+        .fetch_all(&mut *connection)
+        .await?;
+        Ok(embedded_migrations_match(&applied))
     }
 
     /// Starts a transaction and binds its RLS context to one authenticated tenant.

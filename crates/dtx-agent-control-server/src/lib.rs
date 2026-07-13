@@ -38,7 +38,9 @@ pub use command_codec::{
 };
 pub use command_notifications::CommandNotificationSubscription;
 pub use dtx_agent_router::DispatchMode;
-pub use incoming::{MAX_CONCURRENT_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT, connector_tls_incoming};
+pub use incoming::{
+    MAX_CONCURRENT_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT, connector_tls_incoming, tls_incoming,
+};
 pub use postgres_application::{
     AgentRunReconcileBatch, ApplyConnectorConfigurationRequest, CloseConnectorStreamRequest,
     ConnectorCommandFence, ConnectorControlPolicy, CreateAgentRunRequest,

@@ -14,6 +14,19 @@ pub const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 128;
 /// Maximum time an unauthenticated peer may occupy one TLS handshake slot.
 pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Converts an already-bound listener into bounded rustls connections suitable
+/// for `tonic::transport::Server::serve_with_incoming`.
+///
+/// The caller owns the authentication policy in `server_config`. Pending
+/// handshakes are bounded globally, per source, and by time before tonic sees
+/// the connection.
+pub fn tls_incoming(
+    listener: TcpListener,
+    server_config: Arc<ServerConfig>,
+) -> impl Stream<Item = Result<TlsStream<TcpStream>, io::Error>> + Send + 'static {
+    tls_incoming_with_timeout(listener, server_config, TLS_HANDSHAKE_TIMEOUT)
+}
+
 /// Converts an already-bound control listener into concurrently authenticated
 /// rustls connections suitable for `tonic::transport::Server::serve_with_incoming`.
 ///
@@ -25,10 +38,10 @@ pub fn connector_tls_incoming(
     listener: TcpListener,
     server_config: Arc<ServerConfig>,
 ) -> impl Stream<Item = Result<TlsStream<TcpStream>, io::Error>> + Send + 'static {
-    connector_tls_incoming_with_timeout(listener, server_config, TLS_HANDSHAKE_TIMEOUT)
+    tls_incoming(listener, server_config)
 }
 
-fn connector_tls_incoming_with_timeout(
+fn tls_incoming_with_timeout(
     listener: TcpListener,
     server_config: Arc<ServerConfig>,
     handshake_timeout: Duration,
@@ -45,7 +58,7 @@ fn connector_tls_incoming_with_timeout(
                 let _handshake_permit = admission.try_acquire(source_ip).map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::WouldBlock,
-                        "Connector TLS admission is temporarily unavailable",
+                        "TLS admission is temporarily unavailable",
                     )
                 })?;
                 match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
@@ -54,7 +67,7 @@ fn connector_tls_incoming_with_timeout(
                     }
                     Err(_) => Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "Connector TLS handshake timed out",
+                        "TLS handshake timed out",
                     )),
                 }
             }
@@ -75,7 +88,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsConnector;
 
-    use super::{MAX_CONCURRENT_TLS_HANDSHAKES, connector_tls_incoming_with_timeout};
+    use super::{MAX_CONCURRENT_TLS_HANDSHAKES, tls_incoming_with_timeout};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slow_handshakes_release_capacity_for_the_next_valid_client() {
@@ -104,7 +117,7 @@ mod tests {
             .await
             .expect("loopback listener binds");
         let address = listener.local_addr().expect("listener has an address");
-        let incoming = connector_tls_incoming_with_timeout(
+        let incoming = tls_incoming_with_timeout(
             listener,
             Arc::new(server_config),
             Duration::from_millis(100),
@@ -187,11 +200,8 @@ mod tests {
             .await
             .expect("loopback listener binds");
         let address = listener.local_addr().expect("listener has an address");
-        let incoming = connector_tls_incoming_with_timeout(
-            listener,
-            Arc::new(server_config),
-            Duration::from_secs(2),
-        );
+        let incoming =
+            tls_incoming_with_timeout(listener, Arc::new(server_config), Duration::from_secs(2));
         let server = tokio::spawn(async move {
             let mut incoming = Box::pin(incoming);
             let mut established = Vec::new();

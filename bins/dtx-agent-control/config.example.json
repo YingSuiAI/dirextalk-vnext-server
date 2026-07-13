@@ -1,0 +1,23 @@
+{
+  "database_url_file": "secrets/database-url",
+  "max_database_connections": 16,
+  "health": {
+    "listen": "127.0.0.1:9080"
+  },
+  "enrollment": {
+    "listen": "0.0.0.0:9443",
+    "certificate_chain_pem": "tls/enrollment-chain.pem",
+    "private_key_pkcs8_pem": "secrets/enrollment-key.pem"
+  },
+  "control": {
+    "listen": "0.0.0.0:9444",
+    "certificate_chain_pem": "tls/control-chain.pem",
+    "private_key_pkcs8_pem": "secrets/control-key.pem",
+    "client_ca_bundle_pem": "tls/connector-client-roots.pem"
+  },
+  "connector_issuer": {
+    "certificate_pem": "tls/connector-issuer.pem",
+    "private_key_pkcs8_pem": "secrets/connector-issuer-key.pem",
+    "response_intermediate_bundle_pem": "tls/connector-response-intermediates.pem"
+  }
+}

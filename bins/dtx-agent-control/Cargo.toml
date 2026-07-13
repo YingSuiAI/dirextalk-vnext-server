@@ -1,0 +1,26 @@
+[package]
+name = "dtx-agent-control-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "dtx-agent-control"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+dtx-agent-control-server = { path = "../../crates/dtx-agent-control-server" }
+dtx-security = { path = "../../crates/dtx-security" }
+dtx-storage = { path = "../../crates/dtx-storage" }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true
