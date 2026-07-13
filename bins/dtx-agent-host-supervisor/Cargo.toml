@@ -1,0 +1,23 @@
+[package]
+name = "dtx-agent-host-supervisor-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "dtx-agent-host-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+dtx-agent-host = { path = "../../crates/dtx-agent-host" }
+dtx-agent-host-supervisor = { path = "../../crates/dtx-agent-host-supervisor" }
+dtx-connect-registry = { path = "../../crates/dtx-connect-registry" }
+dtx-domain = { path = "../../crates/dtx-domain" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

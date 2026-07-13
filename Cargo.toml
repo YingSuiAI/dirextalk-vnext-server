@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "bins/dtx-agent-control",
+    "bins/dtx-agent-host-supervisor",
     "crates/dtx-agent-control",
     "crates/dtx-agent-control-proto",
     "crates/dtx-agent-control-server",

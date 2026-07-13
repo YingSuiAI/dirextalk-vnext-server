@@ -806,6 +806,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-agent-host-supervisor-bin"
+version = "0.1.0"
+dependencies = [
+ "dtx-agent-host",
+ "dtx-agent-host-supervisor",
+ "dtx-connect-registry",
+ "dtx-domain",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "zeroize",
+]
+
+[[package]]
 name = "dtx-agent-persistence"
 version = "0.1.0"
 dependencies = [
