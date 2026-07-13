@@ -55,7 +55,7 @@ fn connector_snapshot_round_trips_all_histories_and_replay_fences() {
         .issue_lease(LeaseId::new(), boot_id, 1_000, 1_100)
         .unwrap();
     connector
-        .record_heartbeat(&fence, 7, 1_050, ConnectorObservedState::Ready, 3)
+        .record_heartbeat(&fence, 7, 1_050, ConnectorObservedState::Ready, 3, 1)
         .unwrap();
 
     assert_eq!(
@@ -109,13 +109,13 @@ fn replacement_lease_snapshot_preserves_each_streams_replay_fence() {
         .issue_lease(LeaseId::new(), boot_id, 1_000, 1_100)
         .unwrap();
     connector
-        .record_heartbeat(&first, 7, 1_050, ConnectorObservedState::Ready, 1)
+        .record_heartbeat(&first, 7, 1_050, ConnectorObservedState::Ready, 1, 1)
         .unwrap();
     let second = connector
         .issue_lease(LeaseId::new(), boot_id, 1_051, 1_151)
         .unwrap();
     connector
-        .record_heartbeat(&second, 1, 1_060, ConnectorObservedState::Busy, 0)
+        .record_heartbeat(&second, 1, 1_060, ConnectorObservedState::Busy, 0, 1)
         .unwrap();
 
     let snapshot = connector.snapshot();

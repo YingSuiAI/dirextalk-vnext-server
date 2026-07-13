@@ -7,13 +7,16 @@ use uuid::Uuid;
 const INITIAL_MIGRATION_VERSION: i64 = 202_607_130_001;
 const AGENT_CONTROL_MIGRATION_VERSION: i64 = 202_607_130_002;
 const HOST_AUTHORIZATION_MIGRATION_VERSION: i64 = 202_607_130_003;
-const EXPECTED_MIGRATION_COUNT: i64 = 3;
+const CONNECTOR_CONTROL_MIGRATION_VERSION: i64 = 202_607_130_004;
+const EXPECTED_MIGRATION_COUNT: i64 = 4;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
     include_str!("../../../migrations/202607130002_agent_control_domain.down.sql");
 const HOST_AUTHORIZATION_DOWN: &str =
     include_str!("../../../migrations/202607130003_host_credential_authorization.down.sql");
+const CONNECTOR_CONTROL_DOWN: &str =
+    include_str!("../../../migrations/202607130004_connector_control.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,10 +41,14 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
 
-    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version IN ($1, $2, $3)")
+    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version IN ($1, $2, $3, $4)")
         .bind(INITIAL_MIGRATION_VERSION)
         .bind(AGENT_CONTROL_MIGRATION_VERSION)
         .bind(HOST_AUTHORIZATION_MIGRATION_VERSION)
+        .bind(CONNECTOR_CONTROL_MIGRATION_VERSION)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(CONNECTOR_CONTROL_DOWN)
         .execute(harness.admin_pool())
         .await?;
     sqlx::raw_sql(HOST_AUTHORIZATION_DOWN)
@@ -71,6 +78,20 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
             .fetch_one(harness.admin_pool())
             .await?;
     assert_eq!(applied, EXPECTED_MIGRATION_COUNT);
+    let deferred_fence_triggers: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM pg_trigger
+          WHERE tgname IN (
+                    'connector_control_stream_fence',
+                    'connector_instance_control_stream_fence'
+                )
+            AND tgconstraint <> 0
+            AND tgdeferrable
+            AND tginitdeferred",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(deferred_fence_triggers, 2);
     Ok(())
 }
 
@@ -174,6 +195,12 @@ async fn assert_append_only_tables_have_no_update(
         "agent.host_credential_authorization_credentials",
         "agent.host_credential_authorization_revisions",
         "agent.host_credential_authorization_states",
+        "agent.connector_control_operations",
+        "agent.connector_control_credentials",
+        "agent.connector_control_credential_revisions",
+        "agent.connector_control_credential_rotations",
+        "agent.connector_runtime_claims",
+        "agent.connector_control_commands",
     ] {
         let can_update: bool =
             sqlx::query_scalar("SELECT has_table_privilege('dtx_runtime_test', $1, 'UPDATE')")

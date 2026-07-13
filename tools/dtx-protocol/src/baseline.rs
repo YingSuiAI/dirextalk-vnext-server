@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs::{self, OpenOptions},
     io::Write as _,
@@ -11,12 +11,42 @@ use sha2::{Digest, Sha256};
 
 use crate::{ProtocolToolError, load_error_registry, load_event_registry};
 
-const BASELINE_PATH: &str = "protocol/baseline/v1/manifest.json";
-const FROZEN_ARTIFACT_ROOTS: &[&str] = &[
+const V1_ARTIFACT_PATHS: &[&str] = &[
     "protocol/cddl/v1",
     "protocol/openapi/v1",
-    "protocol/proto",
+    "protocol/proto/buf.yaml",
+    "protocol/proto/dirextalk/v1",
     "protocol/test-vectors/v1",
+];
+const V2_ARTIFACT_PATHS: &[&str] = &["protocol/proto/dirextalk/agent_control/v1"];
+const OWNED_ARTIFACT_ROOTS: &[&str] = &[
+    "protocol/cddl",
+    "protocol/openapi",
+    "protocol/proto",
+    "protocol/test-vectors",
+];
+
+#[derive(Clone, Copy)]
+struct BaselineSpec {
+    version: u16,
+    path: &'static str,
+    includes_registries: bool,
+    artifact_paths: &'static [&'static str],
+}
+
+const BASELINE_SPECS: &[BaselineSpec] = &[
+    BaselineSpec {
+        version: 1,
+        path: "protocol/baseline/v1/manifest.json",
+        includes_registries: true,
+        artifact_paths: V1_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 2,
+        path: "protocol/baseline/v2/manifest.json",
+        includes_registries: false,
+        artifact_paths: V2_ARTIFACT_PATHS,
+    },
 ];
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -28,26 +58,39 @@ struct BaselineManifest {
     artifacts: BTreeMap<String, String>,
 }
 
-/// Creates the initial v1.0 baseline, or verifies an exact existing baseline.
+/// Creates a configured new versioned baseline, or verifies exact existing
+/// baselines without rewriting them.
 ///
-/// Once created, the v1.0 manifest is immutable. Any registry or artifact
-/// addition, mutation, or removal requires a new versioned contract and cannot
-/// be incorporated by rerunning this command.
+/// The published v1 manifest must already exist and is never regenerated. A
+/// missing newer manifest is created only from its explicitly assigned,
+/// disjoint artifact set. Any unassigned protocol artifact fails the command.
 ///
 /// # Errors
 ///
-/// Returns [`ProtocolToolError`] for invalid registries, any difference from an
-/// existing manifest, serialization, or I/O.
+/// Returns [`ProtocolToolError`] for a missing published baseline, invalid
+/// registries, an existing manifest difference, overlapping/unassigned
+/// artifacts, serialization, or I/O.
 pub fn freeze_baseline(root: &Path) -> Result<(), ProtocolToolError> {
-    let current = current_manifest(root)?;
-    let path = root.join(BASELINE_PATH);
-    if path.exists() {
-        let baseline = read_manifest(&path)?;
-        validate_manifest_version(&baseline)?;
-        compare_exact_entries("event", &baseline.events, &current.events)?;
-        compare_exact_entries("error", &baseline.errors, &current.errors)?;
-        compare_exact_entries("artifact", &baseline.artifacts, &current.artifacts)
-    } else {
+    let current = current_manifests(root)?;
+    validate_selected_artifact_coverage(root, &current)?;
+
+    let mut missing = Vec::new();
+    for (spec, manifest) in BASELINE_SPECS.iter().zip(&current) {
+        let path = root.join(spec.path);
+        if path.exists() {
+            let baseline = read_manifest(&path)?;
+            validate_manifest_version(&baseline, spec.version)?;
+            compare_manifest(*spec, &baseline, manifest)?;
+        } else if spec.version == 1 {
+            return Err(ProtocolToolError::new(
+                "published v1 baseline is missing and cannot be regenerated",
+            ));
+        } else {
+            missing.push((path, manifest));
+        }
+    }
+
+    for (path, manifest) in missing {
         let parent = path
             .parent()
             .ok_or_else(|| ProtocolToolError::new("baseline path has no parent"))?;
@@ -57,43 +100,72 @@ pub fn freeze_baseline(root: &Path) -> Result<(), ProtocolToolError> {
                 parent.display()
             ))
         })?;
-        write_manifest(&path, &current)
+        write_manifest(&path, manifest)?;
     }
+    Ok(())
 }
 
-/// Rejects removal, mutation, or an unreviewed/unfrozen addition in v1.
+/// Rejects removal, mutation, or an unreviewed/unfrozen addition across every
+/// configured versioned baseline.
 ///
-/// Additions require a new versioned contract; rerunning [`freeze_baseline`]
-/// cannot modify an existing v1.0 manifest.
+/// Versioned artifact sets are exact and disjoint. The v1 registry and schema
+/// set remains byte-for-byte immutable while new reviewed artifacts live only
+/// in the v2 manifest.
 ///
 /// # Errors
 ///
-/// Returns [`ProtocolToolError`] when the current contract differs from the
-/// exact reviewed baseline.
+/// Returns [`ProtocolToolError`] when a reviewed contract differs from its
+/// baseline, manifests overlap, or any owned artifact is not frozen.
 pub fn check_breaking(root: &Path) -> Result<(), ProtocolToolError> {
-    let path = root.join(BASELINE_PATH);
-    let baseline = read_manifest(&path)?;
-    validate_manifest_version(&baseline)?;
-    let current = current_manifest(root)?;
-    compare_exact_entries("event", &baseline.events, &current.events)?;
-    compare_exact_entries("error", &baseline.errors, &current.errors)?;
-    compare_exact_entries("artifact", &baseline.artifacts, &current.artifacts)
+    let current = current_manifests(root)?;
+    validate_selected_artifact_coverage(root, &current)?;
+
+    let mut frozen_artifacts = BTreeMap::new();
+    for (spec, manifest) in BASELINE_SPECS.iter().zip(&current) {
+        let baseline = read_manifest(&root.join(spec.path))?;
+        validate_manifest_version(&baseline, spec.version)?;
+        compare_manifest(*spec, &baseline, manifest)?;
+        for artifact in baseline.artifacts.keys() {
+            if let Some(previous) = frozen_artifacts.insert(artifact.clone(), spec.version) {
+                return Err(ProtocolToolError::new(format!(
+                    "frozen artifact belongs to both v{previous} and v{}: {artifact}",
+                    spec.version
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
-fn current_manifest(root: &Path) -> Result<BaselineManifest, ProtocolToolError> {
-    let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
-    let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
-    let event_hashes = events
-        .events
+fn current_manifests(root: &Path) -> Result<Vec<BaselineManifest>, ProtocolToolError> {
+    BASELINE_SPECS
         .iter()
-        .map(|event| Ok((event.event_type.clone(), hash_json(event)?)))
-        .collect::<Result<_, ProtocolToolError>>()?;
-    let error_hashes = errors
-        .errors
-        .iter()
-        .map(|error| Ok((error.code.clone(), hash_json(error)?)))
-        .collect::<Result<_, ProtocolToolError>>()?;
-    let artifact_hashes = collect_artifact_paths(root)?
+        .map(|spec| current_manifest(root, *spec))
+        .collect()
+}
+
+fn current_manifest(
+    root: &Path,
+    spec: BaselineSpec,
+) -> Result<BaselineManifest, ProtocolToolError> {
+    let (events, errors) = if spec.includes_registries {
+        let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
+        let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
+        let event_hashes = events
+            .events
+            .iter()
+            .map(|event| Ok((event.event_type.clone(), hash_json(event)?)))
+            .collect::<Result<_, ProtocolToolError>>()?;
+        let error_hashes = errors
+            .errors
+            .iter()
+            .map(|error| Ok((error.code.clone(), hash_json(error)?)))
+            .collect::<Result<_, ProtocolToolError>>()?;
+        (event_hashes, error_hashes)
+    } else {
+        (BTreeMap::new(), BTreeMap::new())
+    };
+    let artifacts = collect_selected_artifact_paths(root, spec.artifact_paths)?
         .into_iter()
         .map(|relative| {
             let bytes = fs::read(root.join(&relative)).map_err(|error| {
@@ -103,17 +175,49 @@ fn current_manifest(root: &Path) -> Result<BaselineManifest, ProtocolToolError> 
         })
         .collect::<Result<_, ProtocolToolError>>()?;
     Ok(BaselineManifest {
-        version: 1,
-        events: event_hashes,
-        errors: error_hashes,
-        artifacts: artifact_hashes,
+        version: spec.version,
+        events,
+        errors,
+        artifacts,
     })
 }
 
-fn collect_artifact_paths(root: &Path) -> Result<Vec<String>, ProtocolToolError> {
+fn compare_manifest(
+    spec: BaselineSpec,
+    baseline: &BaselineManifest,
+    current: &BaselineManifest,
+) -> Result<(), ProtocolToolError> {
+    compare_exact_entries("event", spec.version, &baseline.events, &current.events)?;
+    compare_exact_entries("error", spec.version, &baseline.errors, &current.errors)?;
+    compare_exact_entries(
+        "artifact",
+        spec.version,
+        &baseline.artifacts,
+        &current.artifacts,
+    )
+}
+
+fn collect_selected_artifact_paths(
+    root: &Path,
+    selected_paths: &[&str],
+) -> Result<Vec<String>, ProtocolToolError> {
     let mut paths = Vec::new();
-    for relative_root in FROZEN_ARTIFACT_ROOTS {
-        collect_artifact_paths_inner(root, &root.join(relative_root), &mut paths)?;
+    for relative in selected_paths {
+        let path = root.join(relative);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            ProtocolToolError::new(format!("read artifact path {}: {error}", path.display()))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(ProtocolToolError::new(format!(
+                "frozen protocol artifact cannot be a symlink: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            collect_artifact_paths_inner(root, &path, &mut paths)?;
+        } else if metadata.is_file() {
+            paths.push(normalize_relative(Path::new(relative))?);
+        }
     }
     paths.sort();
     paths.dedup();
@@ -123,6 +227,40 @@ fn collect_artifact_paths(root: &Path) -> Result<Vec<String>, ProtocolToolError>
         ));
     }
     Ok(paths)
+}
+
+fn collect_owned_artifact_paths(root: &Path) -> Result<BTreeSet<String>, ProtocolToolError> {
+    let mut paths = Vec::new();
+    for relative in OWNED_ARTIFACT_ROOTS {
+        collect_artifact_paths_inner(root, &root.join(relative), &mut paths)?;
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn validate_selected_artifact_coverage(
+    root: &Path,
+    manifests: &[BaselineManifest],
+) -> Result<(), ProtocolToolError> {
+    let mut selected = BTreeMap::new();
+    for manifest in manifests {
+        for artifact in manifest.artifacts.keys() {
+            if let Some(previous) = selected.insert(artifact.clone(), manifest.version) {
+                return Err(ProtocolToolError::new(format!(
+                    "protocol artifact is assigned to both v{previous} and v{}: {artifact}",
+                    manifest.version
+                )));
+            }
+        }
+    }
+
+    for artifact in collect_owned_artifact_paths(root)? {
+        if !selected.contains_key(&artifact) {
+            return Err(ProtocolToolError::new(format!(
+                "unfrozen protocol artifact addition: {artifact}; assign it to a new versioned baseline"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn collect_artifact_paths_inner(
@@ -188,11 +326,16 @@ fn read_manifest(path: &Path) -> Result<BaselineManifest, ProtocolToolError> {
     .map_err(|error| ProtocolToolError::new(format!("parse baseline: {error}")))
 }
 
-fn validate_manifest_version(manifest: &BaselineManifest) -> Result<(), ProtocolToolError> {
-    if manifest.version == 1 {
+fn validate_manifest_version(
+    manifest: &BaselineManifest,
+    expected: u16,
+) -> Result<(), ProtocolToolError> {
+    if manifest.version == expected {
         Ok(())
     } else {
-        Err(ProtocolToolError::new("baseline version must be 1"))
+        Err(ProtocolToolError::new(format!(
+            "baseline version must be {expected}"
+        )))
     }
 }
 
@@ -234,18 +377,20 @@ fn hash_bytes(bytes: &[u8]) -> String {
 
 fn compare_frozen_entries(
     kind: &str,
+    version: u16,
     baseline: &BTreeMap<String, String>,
     current: &BTreeMap<String, String>,
 ) -> Result<(), ProtocolToolError> {
+    let label = baseline_version_label(version);
     for (name, expected) in baseline {
         let Some(actual) = current.get(name) else {
             return Err(ProtocolToolError::new(format!(
-                "frozen {kind} was removed: {name}; v1.0 is immutable, create a new versioned contract"
+                "frozen {kind} was removed: {name}; {label} is immutable, create a new versioned contract"
             )));
         };
         if actual != expected {
             return Err(ProtocolToolError::new(format!(
-                "frozen {kind} changed: {name}; v1.0 is immutable, create a new versioned contract"
+                "frozen {kind} changed: {name}; {label} is immutable, create a new versioned contract"
             )));
         }
     }
@@ -254,18 +399,28 @@ fn compare_frozen_entries(
 
 fn compare_exact_entries(
     kind: &str,
+    version: u16,
     baseline: &BTreeMap<String, String>,
     current: &BTreeMap<String, String>,
 ) -> Result<(), ProtocolToolError> {
-    compare_frozen_entries(kind, baseline, current)?;
+    compare_frozen_entries(kind, version, baseline, current)?;
+    let label = baseline_version_label(version);
     for name in current.keys() {
         if !baseline.contains_key(name) {
             return Err(ProtocolToolError::new(format!(
-                "unfrozen {kind} addition: {name}; v1.0 is immutable, create a new versioned contract"
+                "unfrozen {kind} addition: {name}; {label} is immutable, create a new versioned contract"
             )));
         }
     }
     Ok(())
+}
+
+fn baseline_version_label(version: u16) -> String {
+    if version == 1 {
+        "v1.0".to_owned()
+    } else {
+        format!("v{version}")
+    }
 }
 
 #[cfg(test)]
@@ -280,24 +435,24 @@ mod tests {
     }
 
     #[test]
-    fn exact_check_rejects_an_unfrozen_addition() {
+    fn exact_check_rejects_an_unfrozen_addition_in_its_version() {
         let baseline = entries(&[("existing", "sha256:1")]);
         let current = entries(&[("existing", "sha256:1"), ("new", "sha256:2")]);
-        let error = compare_exact_entries("event", &baseline, &current).unwrap_err();
+        let error = compare_exact_entries("artifact", 2, &baseline, &current).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "unfrozen event addition: new; v1.0 is immutable, create a new versioned contract"
+            "unfrozen artifact addition: new; v2 is immutable, create a new versioned contract"
         );
     }
 
     #[test]
-    fn immutable_freeze_check_rejects_additions_and_old_hash_changes() {
+    fn immutable_v1_check_preserves_existing_diagnostics() {
         let baseline = entries(&[("existing", "sha256:1")]);
         let additive = entries(&[("existing", "sha256:1"), ("new", "sha256:2")]);
-        assert!(compare_exact_entries("event", &baseline, &additive).is_err());
+        assert!(compare_exact_entries("event", 1, &baseline, &additive).is_err());
 
         let changed = entries(&[("existing", "sha256:changed")]);
-        let error = compare_exact_entries("event", &baseline, &changed).unwrap_err();
+        let error = compare_exact_entries("event", 1, &baseline, &changed).unwrap_err();
         assert_eq!(
             error.to_string(),
             "frozen event changed: existing; v1.0 is immutable, create a new versioned contract"
@@ -305,28 +460,10 @@ mod tests {
     }
 
     #[test]
-    fn recursive_artifact_discovery_includes_new_nested_files() {
-        let unique = format!(
-            "dtx-protocol-baseline-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let root = std::env::temp_dir().join(unique);
-        for relative in FROZEN_ARTIFACT_ROOTS {
-            fs::create_dir_all(root.join(relative)).unwrap();
-            fs::write(root.join(relative).join("artifact.txt"), b"contract").unwrap();
-        }
-        let nested = root.join("protocol/proto/dirextalk/v1/nested.proto");
-        fs::create_dir_all(nested.parent().unwrap()).unwrap();
-        fs::write(&nested, b"syntax = \"proto3\";").unwrap();
-
-        let paths = collect_artifact_paths(&root).unwrap();
-        assert!(paths.contains(&"protocol/proto/dirextalk/v1/nested.proto".to_owned()));
-        assert_eq!(paths.len(), FROZEN_ARTIFACT_ROOTS.len() + 1);
-
-        fs::remove_dir_all(&root).unwrap();
+    fn versioned_selectors_are_disjoint() {
+        let v1 = V1_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
+        let v2 = V2_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
+        assert!(v1.is_disjoint(&v2));
+        assert!(!V1_ARTIFACT_PATHS.contains(&"protocol/proto"));
     }
 }

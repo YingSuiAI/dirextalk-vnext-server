@@ -304,9 +304,9 @@ async fn persist_connector(
             .await?,
         CurrentWrite::Advanced
     );
-    connector.record_heartbeat(&first_fence, 7, 1_070, ConnectorObservedState::Ready, 3)?;
+    connector.record_heartbeat(&first_fence, 7, 1_070, ConnectorObservedState::Ready, 3, 1)?;
     let second_fence = connector.issue_lease(LeaseId::new(), boot_id, 1_080, 1_180)?;
-    connector.record_heartbeat(&second_fence, 1, 1_090, ConnectorObservedState::Busy, 0)?;
+    connector.record_heartbeat(&second_fence, 1, 1_090, ConnectorObservedState::Busy, 0, 1)?;
     assert_eq!(
         connectors
             .save(
@@ -330,7 +330,7 @@ async fn persist_connector(
     let before_stale_heartbeat = loaded.snapshot();
     assert!(
         loaded
-            .record_heartbeat(&first_fence, 8, 1_100, ConnectorObservedState::Ready, 2,)
+            .record_heartbeat(&first_fence, 8, 1_100, ConnectorObservedState::Ready, 2, 1,)
             .is_err(),
         "a replacement lease must fence the prior stream"
     );
@@ -695,6 +695,7 @@ async fn assert_only_one_concurrent_replacement_lease_wins(
                 8,
                 1_150,
                 ConnectorObservedState::Ready,
+                1,
                 1,
             )
             .is_err()

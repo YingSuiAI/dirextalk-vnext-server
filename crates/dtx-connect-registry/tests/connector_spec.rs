@@ -114,6 +114,48 @@ fn connector_spec_revisions_are_append_only_and_failed_cas_does_not_append() {
 }
 
 #[test]
+fn live_configuration_revision_advances_without_fencing_the_active_lease() {
+    let mut connector = connector();
+    let boot = BootId::new();
+    connector.begin_boot(boot, NOW).unwrap();
+    let fence = connector
+        .issue_lease(LeaseId::new(), boot, NOW, NOW + 15_000)
+        .unwrap();
+
+    let running_revision = connector
+        .revise_live_configuration(Revision::INITIAL, ConnectorDesiredState::Running, NOW + 1)
+        .expect("same desired state can carry a new exact configuration");
+    assert_eq!(running_revision, Revision::new(2).unwrap());
+    assert_eq!(connector.validate_fence(&fence, NOW + 1), Ok(()));
+
+    let draining_revision = connector
+        .revise_live_configuration(running_revision, ConnectorDesiredState::Draining, NOW + 2)
+        .expect("live drain configuration advances the spec fence");
+    assert_eq!(draining_revision, Revision::new(3).unwrap());
+    assert_eq!(connector.desired_state(), ConnectorDesiredState::Draining);
+    assert_eq!(connector.validate_fence(&fence, NOW + 2), Ok(()));
+    assert_eq!(
+        Connector::try_from_snapshot(connector.snapshot())
+            .expect("live configuration history rehydrates"),
+        connector,
+    );
+
+    let snapshot = connector.clone();
+    assert_eq!(
+        connector.revise_live_configuration(
+            draining_revision,
+            ConnectorDesiredState::Stopped,
+            NOW + 3,
+        ),
+        Err(ConnectorError::InvalidDesiredTransition)
+    );
+    assert_eq!(
+        connector, snapshot,
+        "terminal intent is ACK-gated elsewhere"
+    );
+}
+
+#[test]
 fn generation_advance_immediately_fences_the_old_boot_and_lease() {
     let mut connector = connector();
     let boot = BootId::new();

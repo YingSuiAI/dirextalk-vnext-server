@@ -174,6 +174,8 @@ define_uuid_v7_id!(InstallationId, "agent installation ID");
 define_uuid_v7_id!(AgentDeviceId, "agent device ID");
 define_uuid_v7_id!(HostId, "agent host ID");
 define_uuid_v7_id!(ConnectorId, "connector ID");
+define_uuid_v7_id!(EnrollmentIntentId, "connector enrollment intent ID");
+define_uuid_v7_id!(ConnectorCredentialId, "connector credential ID");
 define_uuid_v7_id!(BootId, "connector boot ID");
 define_uuid_v7_id!(LeaseId, "lease ID");
 define_uuid_v7_id!(BindingId, "connector binding ID");

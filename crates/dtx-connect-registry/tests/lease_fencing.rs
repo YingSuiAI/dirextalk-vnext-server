@@ -1,8 +1,8 @@
 mod support;
 
 use dtx_connect_registry::{
-    AdapterKind, Connector, ConnectorError, ConnectorObservedState, LeaseStatus,
-    MAX_LEASE_TTL_MILLIS,
+    AdapterKind, Connector, ConnectorError, ConnectorHeartbeatHead, ConnectorHeartbeatHeadSnapshot,
+    ConnectorObservedState, LeaseStatus, MAX_LEASE_TTL_MILLIS,
 };
 use dtx_domain::Revision;
 use dtx_domain::{BootId, ConnectorId, LeaseId, TenantId};
@@ -12,6 +12,135 @@ const NOW: i64 = 1_800_000_000_000;
 
 fn connector() -> Connector {
     registered_connector(TenantId::new(), ConnectorId::new(), AdapterKind::Codex, 2)
+}
+
+#[test]
+fn compact_heartbeat_head_preserves_full_aggregate_semantics() {
+    let mut connector = connector();
+    let boot_id = BootId::new();
+    connector.begin_boot(boot_id, NOW).expect("boot starts");
+    let fence = connector
+        .issue_lease(LeaseId::new(), boot_id, NOW, NOW + 20_000)
+        .expect("lease starts");
+    connector
+        .record_heartbeat(
+            &fence,
+            1,
+            NOW + 5_000,
+            ConnectorObservedState::Ready,
+            1,
+            5_000,
+        )
+        .expect("initial heartbeat advances");
+
+    let before = connector.snapshot();
+    let mut compact = ConnectorHeartbeatHead::try_from_snapshot(ConnectorHeartbeatHeadSnapshot {
+        tenant_id: before.tenant_id,
+        connector_id: before.connector_id,
+        generation: before.generation,
+        adapter_kind: before.adapter_kind,
+        spec_revision: before.spec_revision,
+        desired_state: before.desired_state,
+        observed_state: before.observed_state,
+        max_concurrency: before.max_concurrency,
+        current_boot_id: before.current_boot_id.expect("active boot"),
+        highest_lease_epoch: before.highest_lease_epoch.expect("active lease epoch"),
+        server_time_high_water_millis: before.server_time_high_water_millis,
+        active_lease: *before.leases.last().expect("active lease"),
+    })
+    .expect("compact durable head validates");
+
+    let full_ack = connector
+        .record_heartbeat(
+            &fence,
+            2,
+            NOW + 10_000,
+            ConnectorObservedState::Busy,
+            0,
+            5_000,
+        )
+        .expect("full aggregate advances");
+    let compact_ack = compact
+        .record_heartbeat(
+            &fence,
+            2,
+            NOW + 10_000,
+            ConnectorObservedState::Busy,
+            0,
+            5_000,
+        )
+        .expect("compact head advances");
+    assert_eq!(compact_ack, full_ack);
+
+    let full = connector.snapshot();
+    let compact_snapshot = compact.snapshot();
+    assert_eq!(compact_snapshot.observed_state, full.observed_state);
+    assert_eq!(
+        compact_snapshot.server_time_high_water_millis,
+        full.server_time_high_water_millis
+    );
+    assert_eq!(
+        compact_snapshot.active_lease,
+        *full.leases.last().expect("active lease remains")
+    );
+    let replay_before = compact_snapshot;
+    assert_eq!(
+        compact
+            .record_heartbeat(
+                &fence,
+                2,
+                NOW + 11_000,
+                ConnectorObservedState::Busy,
+                0,
+                5_000,
+            )
+            .expect("exact retry replays"),
+        full_ack
+    );
+    assert_eq!(compact.snapshot(), replay_before);
+}
+
+#[test]
+fn compact_heartbeat_head_accepts_owner_draining_overlay() {
+    let mut connector = connector();
+    let boot_id = BootId::new();
+    connector.begin_boot(boot_id, NOW).expect("boot starts");
+    let fence = connector
+        .issue_lease(LeaseId::new(), boot_id, NOW, NOW + 20_000)
+        .expect("lease starts");
+    connector
+        .record_heartbeat(
+            &fence,
+            1,
+            NOW + 5_000,
+            ConnectorObservedState::Ready,
+            1,
+            5_000,
+        )
+        .expect("heartbeat advances");
+    connector
+        .set_desired_state(
+            Revision::INITIAL,
+            dtx_connect_registry::ConnectorDesiredState::Draining,
+            NOW + 6_000,
+        )
+        .expect("owner begins draining");
+    let snapshot = connector.snapshot();
+    ConnectorHeartbeatHead::try_from_snapshot(ConnectorHeartbeatHeadSnapshot {
+        tenant_id: snapshot.tenant_id,
+        connector_id: snapshot.connector_id,
+        generation: snapshot.generation,
+        adapter_kind: snapshot.adapter_kind,
+        spec_revision: snapshot.spec_revision,
+        desired_state: snapshot.desired_state,
+        observed_state: snapshot.observed_state,
+        max_concurrency: snapshot.max_concurrency,
+        current_boot_id: snapshot.current_boot_id.expect("active boot"),
+        highest_lease_epoch: snapshot.highest_lease_epoch.expect("active epoch"),
+        server_time_high_water_millis: snapshot.server_time_high_water_millis,
+        active_lease: *snapshot.leases.last().expect("active lease"),
+    })
+    .expect("server-derived draining state remains a valid compact head");
 }
 
 #[test]
@@ -55,17 +184,49 @@ fn heartbeat_sequence_is_monotonic_and_expiry_is_server_derived() {
         .unwrap();
 
     let first_ack = connector
-        .record_heartbeat(&fence, 1, NOW + 1_000, ConnectorObservedState::Ready, 1)
+        .record_heartbeat(
+            &fence,
+            1,
+            NOW + 1_000,
+            ConnectorObservedState::Ready,
+            1,
+            5_000,
+        )
         .expect("first heartbeat accepted");
     assert_eq!(
         connector
-            .record_heartbeat(&fence, 1, NOW + 2_000, ConnectorObservedState::Ready, 1)
+            .record_heartbeat(
+                &fence,
+                1,
+                NOW + 2_000,
+                ConnectorObservedState::Ready,
+                1,
+                5_000,
+            )
             .expect("identical heartbeat replay returns its cached ACK"),
         first_ack
     );
     assert_eq!(
-        connector.record_heartbeat(&fence, 1, NOW + 2_000, ConnectorObservedState::Degraded, 1,),
+        connector.record_heartbeat(
+            &fence,
+            1,
+            NOW + 2_000,
+            ConnectorObservedState::Degraded,
+            1,
+            5_000,
+        ),
         Err(ConnectorError::HeartbeatConflict)
+    );
+    assert_eq!(
+        connector.record_heartbeat(
+            &fence,
+            2,
+            NOW + 2_000,
+            ConnectorObservedState::Ready,
+            1,
+            5_000,
+        ),
+        Err(ConnectorError::HeartbeatTooFrequent),
     );
     assert_eq!(connector.validate_fence(&fence, NOW + 90_000), Ok(()));
     assert_eq!(
@@ -87,7 +248,14 @@ fn replacement_lease_on_same_boot_starts_a_fresh_heartbeat_stream() {
         .issue_lease(LeaseId::new(), boot_id, NOW, NOW + 15_000)
         .unwrap();
     connector
-        .record_heartbeat(&first_fence, 7, NOW + 1, ConnectorObservedState::Ready, 1)
+        .record_heartbeat(
+            &first_fence,
+            7,
+            NOW + 1,
+            ConnectorObservedState::Ready,
+            1,
+            1,
+        )
         .unwrap();
 
     let second_fence = connector
@@ -99,7 +267,14 @@ fn replacement_lease_on_same_boot_starts_a_fresh_heartbeat_stream() {
         "a new lease must not inherit the prior lease's readiness"
     );
     connector
-        .record_heartbeat(&second_fence, 1, NOW + 3, ConnectorObservedState::Ready, 1)
+        .record_heartbeat(
+            &second_fence,
+            1,
+            NOW + 3,
+            ConnectorObservedState::Ready,
+            1,
+            1,
+        )
         .expect("heartbeat sequence is scoped to the replacement lease");
 }
 
@@ -120,7 +295,7 @@ fn lease_issue_time_never_predates_the_boot_or_latest_heartbeat() {
         .issue_lease(first_lease_id, boot_id, NOW, NOW + 15_000)
         .unwrap();
     connector
-        .record_heartbeat(&first, 1, NOW + 100, ConnectorObservedState::Ready, 1)
+        .record_heartbeat(&first, 1, NOW + 100, ConnectorObservedState::Ready, 1, 1)
         .unwrap();
     assert_eq!(
         connector
@@ -226,7 +401,14 @@ fn connector_server_time_high_water_never_resets_across_lifecycle_boundaries() {
         .issue_lease(LeaseId::new(), first_boot, NOW, NOW + 15_000)
         .unwrap();
     connector
-        .record_heartbeat(&first_lease, 1, NOW + 50, ConnectorObservedState::Ready, 1)
+        .record_heartbeat(
+            &first_lease,
+            1,
+            NOW + 50,
+            ConnectorObservedState::Ready,
+            1,
+            1,
+        )
         .unwrap();
 
     let before_boot = connector.clone();
@@ -265,7 +447,7 @@ fn heartbeat_sequence_stays_exact_for_web_and_wire_consumers() {
 
     let before = connector.clone();
     assert_eq!(
-        connector.record_heartbeat(&fence, 1, NOW - 1, ConnectorObservedState::Ready, 1,),
+        connector.record_heartbeat(&fence, 1, NOW - 1, ConnectorObservedState::Ready, 1, 1,),
         Err(ConnectorError::InvalidHeartbeatTime)
     );
     assert_eq!(connector, before);
@@ -276,6 +458,7 @@ fn heartbeat_sequence_stays_exact_for_web_and_wire_consumers() {
             Revision::MAX + 1,
             NOW + 1,
             ConnectorObservedState::Ready,
+            1,
             1,
         ),
         Err(ConnectorError::InvalidHeartbeatSequence)

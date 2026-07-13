@@ -1,0 +1,23 @@
+[package]
+name = "dtx-agent-control-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+futures-core.workspace = true
+prost-types.workspace = true
+
+[lints]
+workspace = true

@@ -90,6 +90,61 @@ impl FromStr for HostWorkloadIdentity {
     }
 }
 
+/// Strict Connector identity carried by one exact URI SAN.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConnectorWorkloadIdentity {
+    tenant_id: TenantId,
+    connector_id: ConnectorId,
+}
+
+impl ConnectorWorkloadIdentity {
+    #[must_use]
+    pub const fn new(tenant_id: TenantId, connector_id: ConnectorId) -> Self {
+        Self {
+            tenant_id,
+            connector_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn tenant_id(self) -> TenantId {
+        self.tenant_id
+    }
+
+    #[must_use]
+    pub const fn connector_id(self) -> ConnectorId {
+        self.connector_id
+    }
+
+    #[must_use]
+    pub fn uri(self) -> String {
+        WorkloadIdentity::from(self).uri()
+    }
+}
+
+impl fmt::Display for ConnectorWorkloadIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.uri())
+    }
+}
+
+impl FromStr for ConnectorWorkloadIdentity {
+    type Err = WorkloadIdentityParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match WorkloadIdentity::from_str(value)? {
+            WorkloadIdentity::Connector {
+                tenant_id,
+                connector_id,
+            } => Ok(Self::new(tenant_id, connector_id)),
+            WorkloadIdentity::Host { .. }
+            | WorkloadIdentity::Executor { .. }
+            | WorkloadIdentity::InternalService { .. }
+            | WorkloadIdentity::ControlServer { .. } => Err(WorkloadIdentityParseError),
+        }
+    }
+}
+
 /// Closed workload identity variants used in URI SANs.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum WorkloadIdentity {
@@ -149,6 +204,15 @@ impl From<HostWorkloadIdentity> for WorkloadIdentity {
         Self::Host {
             tenant_id: value.tenant_id,
             host_id: value.host_id,
+        }
+    }
+}
+
+impl From<ConnectorWorkloadIdentity> for WorkloadIdentity {
+    fn from(value: ConnectorWorkloadIdentity) -> Self {
+        Self::Connector {
+            tenant_id: value.tenant_id,
+            connector_id: value.connector_id,
         }
     }
 }

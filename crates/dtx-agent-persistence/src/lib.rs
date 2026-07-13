@@ -7,19 +7,44 @@
 //! foreign keys remain the second enforcement boundary.
 
 mod binding;
+mod command_log;
 mod connector;
+mod connector_credential;
 mod definition;
+mod enrollment;
 mod error;
 mod grant;
 mod host;
 mod host_authorization;
+mod operation;
 mod registry;
+mod runtime_claim;
 
 pub use binding::BindingSetRepository;
-pub use connector::ConnectorRepository;
+pub use command_log::{
+    CONNECTOR_COMMAND_NOTIFY_CHANNEL, CommandAcknowledgementWrite, CommandLogRepository,
+    CommandReplayBatch, CommandStreamHead, DecodedDurableCommand, DurableCommandDecodeError,
+    DurableCommandDecoder, MAX_COMMAND_REPLAY_BYTES_PER_PAGE, MAX_COMMAND_REPLAY_FRAMES_PER_PAGE,
+    PersistedCommandFrame, connector_command_notification_payload,
+    parse_connector_command_notification_payload,
+};
+pub use connector::{ConnectorRepository, MAX_CONNECTOR_AUDIT_ROWS};
+pub use connector_credential::{
+    ConnectorCredentialAuthorizationHead, ConnectorCredentialAuthorizationRepository,
+    MAX_CONNECTOR_CREDENTIAL_AUDIT_ROWS,
+};
 pub use definition::{AgentDefinitionRepository, DefinitionInsert};
+pub use enrollment::EnrollmentIntentRepository;
 pub use error::AgentPersistenceError;
 pub use grant::ConversationGrantRepository;
 pub use host::AgentHostRepository;
 pub use host_authorization::HostCredentialAuthorizationRepository;
+pub use operation::{
+    ConnectorControlOperation, ConnectorControlOperationKind, ConnectorControlOperationRepository,
+};
 pub use registry::{AgentDeviceRepository, AgentInstallationRepository, CurrentWrite};
+pub use runtime_claim::{
+    DEFAULT_RUNTIME_CLAIM_RETENTION_LIMIT, RuntimeCapacity, RuntimeClaimRecord,
+    RuntimeClaimRecordError, RuntimeClaimRepository, RuntimeClaimRetentionError,
+    RuntimeClaimSource, VersionedRuntimeClaim,
+};

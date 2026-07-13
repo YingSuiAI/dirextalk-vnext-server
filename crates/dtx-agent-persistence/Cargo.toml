@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+dtx-agent-control = { path = "../dtx-agent-control" }
 dtx-agent-host = { path = "../dtx-agent-host" }
 dtx-agent-registry = { path = "../dtx-agent-registry" }
 dtx-connect-registry = { path = "../dtx-connect-registry" }
@@ -17,6 +18,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 dtx-storage = { path = "../dtx-storage" }
+ed25519-dalek.workspace = true
 testcontainers-modules.workspace = true
 tokio.workspace = true
 

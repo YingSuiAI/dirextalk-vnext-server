@@ -1,15 +1,28 @@
+use std::fmt;
+
 use dtx_domain::TenantId;
 use sqlx::{
     PgConnection, PgPool, Postgres, Transaction,
-    postgres::{PgConnectOptions, PgPoolOptions},
+    postgres::{PgConnectOptions, PgListener, PgPoolOptions},
 };
 
 use crate::StorageError;
 
 /// Validated runtime `PostgreSQL` pool whose credentials cannot bypass RLS.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
+    listener_options: PgConnectOptions,
+}
+
+impl fmt::Debug for PgStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PgStore")
+            .field("pool", &self.pool)
+            .field("listener_options", &"[REDACTED CONNECTION OPTIONS]")
+            .finish()
+    }
 }
 
 impl PgStore {
@@ -24,10 +37,37 @@ impl PgStore {
     ) -> Result<Self, StorageError> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections.max(1))
-            .connect_with(options)
+            .connect_with(options.clone())
             .await?;
         validate_runtime_role(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            listener_options: options,
+        })
+    }
+
+    /// Opens a dedicated auto-reconnecting `PostgreSQL` notification listener.
+    ///
+    /// The listener owns a separate single-connection pool so a long-lived
+    /// `LISTEN` cannot consume one of the bounded request/transaction slots.
+    /// It uses the same already-validated runtime role and never exposes its
+    /// connection options to application code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the dedicated connection cannot be opened
+    /// or the configured role no longer satisfies the runtime-role boundary.
+    pub async fn connect_listener(&self) -> Result<PgListener, StorageError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .max_lifetime(None)
+            .idle_timeout(None)
+            .connect_with(self.listener_options.clone())
+            .await?;
+        validate_runtime_role(&pool).await?;
+        PgListener::connect_with(&pool)
+            .await
+            .map_err(StorageError::from)
     }
 
     /// Starts a transaction and binds its RLS context to one authenticated tenant.

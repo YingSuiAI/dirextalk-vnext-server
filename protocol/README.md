@@ -12,20 +12,28 @@ Layout:
   redaction, and unknown-version registry.
 - `errors/registry.yaml` is the stable public error registry.
 - `cddl/v1`, `openapi/v1`, and `proto` describe deterministic CBOR, HTTPS JSON,
-  and control-stream transports.
+  and control-stream transports. The reviewed `dirextalk.agent_control.v1`
+  enrollment and control services are generated into
+  `dtx-agent-control-proto` with a vendored `protoc`; separate services keep
+  ordinary TLS enrollment off the mandatory-mTLS control listener.
+  Durable commands retain their exact nested Protobuf bytes inside a bounded
+  raw frame so reconnect replay does not depend on decode/re-encode behavior.
 - `test-vectors/v1` contains byte-exact public ID, plan hash, API error, and
   event-envelope fixtures.
 - `generated/dart` is an independent Dart conformance consumer. Its registry-
   generated `.g.dart` files and `crates/dtx-wire/src/generated` must not be
   edited manually.
-- `baseline/v1/manifest.json` freezes reviewed registry entries and versioned
-  artifacts by SHA-256.
+- `baseline/v1/manifest.json` freezes the published registry and original v1
+  artifacts by SHA-256. `baseline/v2/manifest.json` is a disjoint artifact set
+  that freezes the Agent Control Protobuf without changing any v1 entry.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen
-baseline. Adding a reviewed event/error or versioned artifact requires the
-next versioned registry/schema and its own baseline; the published v1.0 manifest
-is an exact closed set. Adding, changing, or deleting an entry in that set is a
+baseline. Adding a reviewed event/error or versioned artifact requires an
+explicitly assigned next versioned registry/schema set and its own baseline;
+the published v1.0 manifest is an exact closed set and is never regenerated.
+Every CDDL, OpenAPI, Protobuf, and test-vector artifact must belong to exactly
+one frozen set. Adding, changing, or deleting an entry in an existing set is a
 breaking change rather than an operation that re-freezing can repair.
 
 The v1 deterministic profile is defined by ADR-0003. In particular, exact

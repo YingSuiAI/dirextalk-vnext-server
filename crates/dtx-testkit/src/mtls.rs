@@ -31,6 +31,27 @@ pub enum CertificatePurpose {
     ServerAuth,
 }
 
+#[derive(Clone, Copy)]
+struct LeafCustomization<'a> {
+    additional_uri: Option<&'a str>,
+    additional_dns_name: Option<&'a str>,
+    common_name: Option<&'a str>,
+    include_extended_key_usage: bool,
+    additional_extended_key_usage: Option<CertificatePurpose>,
+}
+
+impl Default for LeafCustomization<'_> {
+    fn default() -> Self {
+        Self {
+            additional_uri: None,
+            additional_dns_name: None,
+            common_name: None,
+            include_extended_key_usage: true,
+            additional_extended_key_usage: None,
+        }
+    }
+}
+
 /// Test certificate with a secret private-key wrapper whose debug output is redacted.
 pub struct IssuedTestCertificate {
     issuer_fingerprint: [u8; 32],
@@ -189,7 +210,13 @@ impl TestCertificateAuthority {
         now_millis: i64,
         lifetime_seconds: u64,
     ) -> Result<IssuedTestCertificate, TestCertificateError> {
-        self.issue_customized_leaf(identity, purpose, None, true, now_millis, lifetime_seconds)
+        self.issue_customized_leaf(
+            identity,
+            purpose,
+            LeafCustomization::default(),
+            now_millis,
+            lifetime_seconds,
+        )
     }
 
     /// Issues an intentionally non-conforming multi-SAN leaf for negative verifier tests.
@@ -204,8 +231,52 @@ impl TestCertificateAuthority {
         self.issue_customized_leaf(
             identity,
             purpose,
-            Some(additional_uri),
-            true,
+            LeafCustomization {
+                additional_uri: Some(additional_uri),
+                ..LeafCustomization::default()
+            },
+            now_millis,
+            lifetime_seconds,
+        )
+    }
+
+    /// Issues an intentionally non-conforming URI-plus-DNS SAN leaf.
+    pub fn issue_with_additional_dns_san_for_test(
+        &self,
+        identity: &WorkloadIdentity,
+        purpose: CertificatePurpose,
+        additional_dns_name: &str,
+        now_millis: i64,
+        lifetime_seconds: u64,
+    ) -> Result<IssuedTestCertificate, TestCertificateError> {
+        self.issue_customized_leaf(
+            identity,
+            purpose,
+            LeafCustomization {
+                additional_dns_name: Some(additional_dns_name),
+                ..LeafCustomization::default()
+            },
+            now_millis,
+            lifetime_seconds,
+        )
+    }
+
+    /// Issues an intentionally ambiguous URI-SAN leaf with a subject common name.
+    pub fn issue_with_common_name_for_test(
+        &self,
+        identity: &WorkloadIdentity,
+        purpose: CertificatePurpose,
+        common_name: &str,
+        now_millis: i64,
+        lifetime_seconds: u64,
+    ) -> Result<IssuedTestCertificate, TestCertificateError> {
+        self.issue_customized_leaf(
+            identity,
+            purpose,
+            LeafCustomization {
+                common_name: Some(common_name),
+                ..LeafCustomization::default()
+            },
             now_millis,
             lifetime_seconds,
         )
@@ -219,15 +290,42 @@ impl TestCertificateAuthority {
         now_millis: i64,
         lifetime_seconds: u64,
     ) -> Result<IssuedTestCertificate, TestCertificateError> {
-        self.issue_customized_leaf(identity, purpose, None, false, now_millis, lifetime_seconds)
+        self.issue_customized_leaf(
+            identity,
+            purpose,
+            LeafCustomization {
+                include_extended_key_usage: false,
+                ..LeafCustomization::default()
+            },
+            now_millis,
+            lifetime_seconds,
+        )
+    }
+
+    /// Issues an intentionally over-privileged leaf with both TLS EKUs.
+    pub fn issue_with_dual_client_server_auth_for_test(
+        &self,
+        identity: &WorkloadIdentity,
+        now_millis: i64,
+        lifetime_seconds: u64,
+    ) -> Result<IssuedTestCertificate, TestCertificateError> {
+        self.issue_customized_leaf(
+            identity,
+            CertificatePurpose::ClientAuth,
+            LeafCustomization {
+                additional_extended_key_usage: Some(CertificatePurpose::ServerAuth),
+                ..LeafCustomization::default()
+            },
+            now_millis,
+            lifetime_seconds,
+        )
     }
 
     fn issue_customized_leaf(
         &self,
         identity: &WorkloadIdentity,
         purpose: CertificatePurpose,
-        additional_uri: Option<&str>,
-        include_extended_key_usage: bool,
+        customization: LeafCustomization<'_>,
         now_millis: i64,
         lifetime_seconds: u64,
     ) -> Result<IssuedTestCertificate, TestCertificateError> {
@@ -265,33 +363,14 @@ impl TestCertificateAuthority {
             serial
         };
         let mut params = CertificateParams::default();
+        params.distinguished_name = leaf_distinguished_name(customization.common_name);
         params.not_before = to_time(not_before_millis)?;
         params.not_after = to_time(not_after_millis)?;
         params.serial_number = Some(SerialNumber::from(serial));
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        if include_extended_key_usage {
-            params.extended_key_usages = vec![match purpose {
-                CertificatePurpose::ClientAuth => ExtendedKeyUsagePurpose::ClientAuth,
-                CertificatePurpose::ServerAuth => ExtendedKeyUsagePurpose::ServerAuth,
-            }];
-        }
-        params.subject_alt_names = vec![SanType::URI(
-            Ia5String::try_from(identity_uri.clone())
-                .map_err(|_| TestCertificateError::InvalidIdentity)?,
-        )];
-        if let Some(additional_uri) = additional_uri {
-            params.subject_alt_names.push(SanType::URI(
-                Ia5String::try_from(additional_uri)
-                    .map_err(|_| TestCertificateError::InvalidIdentity)?,
-            ));
-        }
-        if let WorkloadIdentity::ControlServer { dns_name } = identity {
-            params.subject_alt_names.push(SanType::DnsName(
-                Ia5String::try_from(dns_name.clone())
-                    .map_err(|_| TestCertificateError::InvalidIdentity)?,
-            ));
-        }
+        params.extended_key_usages = leaf_extended_key_usages(purpose, customization);
+        params.subject_alt_names = leaf_subject_alt_names(identity, &identity_uri, customization)?;
         params.use_authority_key_identifier_extension = true;
         let mut leaf_key =
             KeyPair::generate().map_err(|_| TestCertificateError::CertificateGeneration)?;
@@ -390,6 +469,65 @@ impl TestCertificateAuthority {
             .insert(serial);
         Ok(())
     }
+}
+
+fn leaf_distinguished_name(common_name: Option<&str>) -> DistinguishedName {
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::OrganizationName, "Dirextalk test workload");
+    if let Some(common_name) = common_name {
+        distinguished_name.push(DnType::CommonName, common_name);
+    }
+    distinguished_name
+}
+
+fn leaf_extended_key_usages(
+    purpose: CertificatePurpose,
+    customization: LeafCustomization<'_>,
+) -> Vec<ExtendedKeyUsagePurpose> {
+    if !customization.include_extended_key_usage {
+        return Vec::new();
+    }
+    let mut usages = vec![extended_key_usage(purpose)];
+    if let Some(additional_purpose) = customization.additional_extended_key_usage {
+        usages.push(extended_key_usage(additional_purpose));
+    }
+    usages
+}
+
+fn extended_key_usage(purpose: CertificatePurpose) -> ExtendedKeyUsagePurpose {
+    match purpose {
+        CertificatePurpose::ClientAuth => ExtendedKeyUsagePurpose::ClientAuth,
+        CertificatePurpose::ServerAuth => ExtendedKeyUsagePurpose::ServerAuth,
+    }
+}
+
+fn leaf_subject_alt_names(
+    identity: &WorkloadIdentity,
+    identity_uri: &str,
+    customization: LeafCustomization<'_>,
+) -> Result<Vec<SanType>, TestCertificateError> {
+    let mut subject_alt_names = vec![SanType::URI(
+        Ia5String::try_from(identity_uri).map_err(|_| TestCertificateError::InvalidIdentity)?,
+    )];
+    if let Some(additional_uri) = customization.additional_uri {
+        subject_alt_names.push(SanType::URI(
+            Ia5String::try_from(additional_uri)
+                .map_err(|_| TestCertificateError::InvalidIdentity)?,
+        ));
+    }
+    if let Some(additional_dns_name) = customization.additional_dns_name {
+        subject_alt_names.push(SanType::DnsName(
+            Ia5String::try_from(additional_dns_name)
+                .map_err(|_| TestCertificateError::InvalidIdentity)?,
+        ));
+    }
+    if let WorkloadIdentity::ControlServer { dns_name } = identity {
+        subject_alt_names.push(SanType::DnsName(
+            Ia5String::try_from(dns_name.as_str())
+                .map_err(|_| TestCertificateError::InvalidIdentity)?,
+        ));
+    }
+    Ok(subject_alt_names)
 }
 
 fn canonical_identity_uri(identity: &WorkloadIdentity) -> Result<String, TestCertificateError> {

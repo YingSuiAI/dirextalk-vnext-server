@@ -1,0 +1,39 @@
+[package]
+name = "dtx-agent-control-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dtx-agent-control = { path = "../dtx-agent-control" }
+dtx-agent-control-proto = { path = "../dtx-agent-control-proto" }
+dtx-agent-persistence = { path = "../dtx-agent-persistence" }
+dtx-connect-registry = { path = "../dtx-connect-registry" }
+dtx-domain = { path = "../dtx-domain" }
+dtx-security = { path = "../dtx-security" }
+dtx-storage = { path = "../dtx-storage" }
+futures-core.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+prost.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+dtx-agent-host = { path = "../dtx-agent-host" }
+dtx-testkit = { path = "../dtx-testkit" }
+ed25519-dalek.workspace = true
+testcontainers-modules.workspace = true
+
+[lints]
+workspace = true

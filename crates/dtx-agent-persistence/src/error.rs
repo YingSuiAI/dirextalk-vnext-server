@@ -14,6 +14,19 @@ pub enum AgentPersistenceError {
         /// Current stored safe-integer revision, or absent when not found.
         current: Option<u64>,
     },
+    /// A Connector generation/spec/lease fence did not match durable state.
+    FenceConflict,
+    /// A durable command cursor was stale, ahead, or non-contiguous.
+    CursorConflict {
+        /// Server-committed acknowledgement cursor.
+        acknowledged: u64,
+        /// Last durable command sequence.
+        last: u64,
+    },
+    /// Exact command bytes could not be decoded into their frozen typed projection.
+    CommandDecodeRejected,
+    /// A caller requested an intentionally bounded aggregate materialization beyond its limit.
+    MaterializationLimitExceeded(&'static str),
     /// A complete row set failed domain rehydration validation.
     SnapshotRejected(&'static str),
 }
@@ -25,6 +38,12 @@ impl fmt::Display for AgentPersistenceError {
             Self::CorruptData(_) => "Agent persistence contained corrupt domain data",
             Self::ImmutableConflict(_) => "Agent persistence immutable identity conflicted",
             Self::RevisionConflict { .. } => "Agent persistence revision conflicted",
+            Self::FenceConflict => "Agent persistence fence conflicted",
+            Self::CursorConflict { .. } => "Agent persistence cursor conflicted",
+            Self::CommandDecodeRejected => "Agent persistence command bytes were rejected",
+            Self::MaterializationLimitExceeded(_) => {
+                "Agent persistence materialization limit was exceeded"
+            }
             Self::SnapshotRejected(_) => "Agent persistence snapshot was rejected",
         })
     }
@@ -37,6 +56,10 @@ impl Error for AgentPersistenceError {
             Self::CorruptData(_)
             | Self::ImmutableConflict(_)
             | Self::RevisionConflict { .. }
+            | Self::FenceConflict
+            | Self::CursorConflict { .. }
+            | Self::CommandDecodeRejected
+            | Self::MaterializationLimitExceeded(_)
             | Self::SnapshotRejected(_) => None,
         }
     }

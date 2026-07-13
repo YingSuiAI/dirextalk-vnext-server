@@ -7,10 +7,11 @@ mod revision;
 
 pub use ids::{
     AgentDeviceId, AggregateId, ApprovalId, AuditId, BindingId, BootId, CloudConnectionId,
-    ConnectorId, ConsentId, ConversationId, DeviceId, DirectoryRegistrationId, EventId, GrantId,
-    HostCredentialId, HostId, IdParseError, IndexerId, InstallationId, JobEvidenceId, JobId,
-    JobResourceId, JobStepId, LeaseId, ManagedServiceId, OutboxId, RequestId, RunId, SecretId,
-    ServiceOperationId, TenantId, WorkerId,
+    ConnectorCredentialId, ConnectorId, ConsentId, ConversationId, DeviceId,
+    DirectoryRegistrationId, EnrollmentIntentId, EventId, GrantId, HostCredentialId, HostId,
+    IdParseError, IndexerId, InstallationId, JobEvidenceId, JobId, JobResourceId, JobStepId,
+    LeaseId, ManagedServiceId, OutboxId, RequestId, RunId, SecretId, ServiceOperationId, TenantId,
+    WorkerId,
 };
 pub use ports::{Clock, ClockError, IdGenerationError, IdGenerator, SystemClock, UuidV7Generator};
 pub use public_id::{

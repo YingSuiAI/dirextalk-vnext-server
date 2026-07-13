@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod connector_mtls;
 mod fault;
 mod host_mtls;
 mod secret;
 mod tls_client_identity;
 mod workload_identity;
 
+pub use connector_mtls::*;
 pub use fault::*;
 pub use host_mtls::*;
 pub use secret::*;

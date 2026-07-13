@@ -30,6 +30,7 @@ pub struct PostgresHarness {
 }
 
 impl PostgresHarness {
+    #[allow(clippy::too_many_lines)]
     pub async fn start() -> Result<Self, Box<dyn Error>> {
         let admin_password = random_password("admin");
         let runtime_password = random_password("runtime");
@@ -85,6 +86,12 @@ impl PostgresHarness {
 
              GRANT USAGE ON SCHEMA agent TO dtx_runtime_test;
              GRANT EXECUTE ON FUNCTION agent.is_public_id(text, text) TO dtx_runtime_test;
+             GRANT EXECUTE ON FUNCTION agent.connector_certificate_chain_valid(bytea[]) TO dtx_runtime_test;
+             GRANT EXECUTE ON FUNCTION agent.connector_runtime_name_valid(text, integer) TO dtx_runtime_test;
+             GRANT EXECUTE ON FUNCTION agent.connector_claim_codes_valid(text[]) TO dtx_runtime_test;
+             GRANT EXECUTE ON FUNCTION agent.connector_run_ids_valid(uuid[]) TO dtx_runtime_test;
+             GRANT EXECUTE ON FUNCTION agent.connector_runtime_error_code_valid(text) TO dtx_runtime_test;
+             GRANT EXECUTE ON FUNCTION agent.prune_connector_runtime_claim_history(uuid, uuid, integer) TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.agent_definition_heads TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.agent_definitions TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.installations TO dtx_runtime_test;
@@ -95,6 +102,16 @@ impl PostgresHarness {
              GRANT SELECT, INSERT ON agent.host_credential_authorization_revisions TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.host_credential_authorization_states TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.host_credential_authorization_heads TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.connector_control_operations TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.connector_enrollment_intents TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.connector_control_credentials TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.connector_control_credential_revisions TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.connector_control_credential_rotations TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.connector_control_credential_heads TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.connector_runtime_claims TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.connector_runtime_claim_heads TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.connector_control_stream_heads TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.connector_control_commands TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.connector_instances TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.connector_revisions TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.connector_boots TO dtx_runtime_test;

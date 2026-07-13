@@ -1,0 +1,27 @@
+use std::{env, error::Error, path::PathBuf};
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let repository_root = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR")
+            .ok_or("CARGO_MANIFEST_DIR is required to locate the reviewed protocol source")?,
+    )
+    .join("../..");
+    let proto_root = repository_root.join("protocol/proto");
+    let contract = proto_root.join("dirextalk/agent_control/v1/agent_control.proto");
+    let descriptor = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is required")?)
+        .join("agent_control_descriptor.bin");
+
+    // Watch the include root as well as the entrypoint so a future imported
+    // reviewed schema cannot leave generated Rust or descriptors stale.
+    println!("cargo:rerun-if-changed={}", proto_root.display());
+
+    let mut prost = tonic_prost_build::Config::new();
+    prost.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
+    tonic_prost_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .file_descriptor_set_path(descriptor)
+        .compile_with_config(prost, &[contract], &[proto_root])?;
+
+    Ok(())
+}

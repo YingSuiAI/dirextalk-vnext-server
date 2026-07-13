@@ -1,5 +1,8 @@
 [workspace]
 members = [
+    "crates/dtx-agent-control",
+    "crates/dtx-agent-control-proto",
+    "crates/dtx-agent-control-server",
     "crates/dtx-agent-host",
     "crates/dtx-agent-host-supervisor",
     "crates/dtx-agent-persistence",
@@ -22,8 +25,13 @@ rust-version = "1.97.0"
 [workspace.dependencies]
 base64ct = { version = "1.8.3", features = ["alloc"] }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
+futures-core = "0.3.32"
+futures-util = "0.3.32"
+getrandom = "0.4.3"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
-rcgen = { version = "0.14.8", default-features = false, features = ["ring", "zeroize"] }
+prost = "0.14.4"
+protoc-bin-vendored = "3.2.0"
+rcgen = { version = "0.14.8", default-features = false, features = ["ring", "x509-parser", "zeroize"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
 x509-parser = { version = "0.18.1", default-features = false }
 oas3 = { version = "0.22.0", default-features = false, features = ["yaml-spec"] }
@@ -35,7 +43,12 @@ sha2 = { version = "0.11.0", default-features = false }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros", "uuid"] }
 testcontainers-modules = { version = "0.15.0", default-features = false, features = ["postgres", "ring"] }
 time = { version = "0.3.53", default-features = false }
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+tokio-stream = { version = "0.1.18", features = ["net"] }
+tonic = { version = "0.14.6", default-features = false, features = ["codegen", "transport", "tls-ring"] }
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
 uuid = { version = "1.23.5", features = ["serde", "v7"] }
 zeroize = { version = "1.9.0", features = ["derive"] }
 yaml_serde = "0.10.4"

@@ -1,0 +1,16 @@
+[package]
+name = "dtx-agent-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dtx-connect-registry = { path = "../dtx-connect-registry" }
+dtx-domain = { path = "../dtx-domain" }
+ed25519-dalek.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

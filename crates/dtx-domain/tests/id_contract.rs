@@ -1,4 +1,4 @@
-use dtx_domain::{ConnectorId, DeviceId, IdParseError};
+use dtx_domain::{ConnectorCredentialId, ConnectorId, DeviceId, EnrollmentIntentId, IdParseError};
 
 const UUID_V7: &str = "0190f2a5-7b1c-7abc-8def-0123456789ab";
 
@@ -15,6 +15,12 @@ fn generated_connector_id_is_uuid_v7() {
     let id = ConnectorId::new();
 
     assert_eq!(id.as_uuid().get_version_num(), 7);
+}
+
+#[test]
+fn generated_connector_control_lifecycle_ids_are_uuid_v7() {
+    assert_eq!(EnrollmentIntentId::new().as_uuid().get_version_num(), 7);
+    assert_eq!(ConnectorCredentialId::new().as_uuid().get_version_num(), 7);
 }
 
 #[test]
