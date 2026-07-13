@@ -3,6 +3,6 @@
   "events": {},
   "errors": {},
   "artifacts": {
-    "protocol/proto/dirextalk/agent_control/v1_1/agent_control.proto": "sha256:1fad14260ad1c5529b2158deb5f27257a7a90063485f803b3f037563b48fcf63"
+    "protocol/proto/dirextalk/agent_control/v1_1/agent_control.proto": "sha256:1f0443733cf3fecb9d79c602c9788b464912b3bddf4f8e67c2dc89bd14c1d6ab"
   }
 }

@@ -13,6 +13,10 @@ mod authorization_index;
 mod certificate;
 mod command_codec;
 mod command_notifications;
+mod gateway_application;
+mod gateway_authentication;
+mod gateway_service;
+mod gateway_wire;
 mod incoming;
 mod postgres_application;
 mod run_notifications;
@@ -38,6 +42,17 @@ pub use command_codec::{
 };
 pub use command_notifications::CommandNotificationSubscription;
 pub use dtx_agent_router::DispatchMode;
+pub use gateway_application::AgentRunIngressApplication;
+pub use gateway_authentication::{
+    GatewayRequestAuthenticationError, authenticate_agent_gateway_request,
+};
+pub use gateway_service::{
+    AGENT_RUN_INGRESS_OPERATION_TIMEOUT, AgentRunIngressGrpc, agent_run_ingress_service,
+};
+pub use gateway_wire::{
+    GatewayWireError, GatewayWireErrorKind, ParsedAgentRunIngress,
+    build_agent_run_ingress_response, parse_agent_run_ingress,
+};
 pub use incoming::{
     MAX_CONCURRENT_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT, connector_tls_incoming, tls_incoming,
 };

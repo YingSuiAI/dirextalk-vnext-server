@@ -23,14 +23,15 @@ use axum::{
 };
 use config::BootstrapConfig;
 use dtx_agent_control_server::{
-    ConnectorCertificateAuthority, ConnectorControlApplication,
+    AgentRunIngressApplication, ConnectorCertificateAuthority, ConnectorControlApplication,
     ConnectorCredentialAuthorizationIndex, PostgresConnectorControlApplication,
-    ProtobufDurableCommandDecoder, connector_control_service, connector_enrollment_service,
-    connector_tls_incoming, tls_incoming,
+    ProtobufDurableCommandDecoder, agent_run_ingress_service, connector_control_service,
+    connector_enrollment_service, connector_tls_incoming, tls_incoming,
 };
 use dtx_security::{
-    ConnectorCredentialAuthorizer, ConnectorMtlsClientVerifier, SecretBytes,
-    build_connector_mtls_server_config,
+    ConnectorCredentialAuthorizer, ConnectorMtlsClientVerifier, InternalServiceKind,
+    InternalServiceMtlsClientVerifier, SecretBytes, build_connector_mtls_server_config,
+    build_internal_service_mtls_server_config,
 };
 use dtx_storage::PgStore;
 use rustls::{
@@ -155,6 +156,9 @@ async fn run() -> Result<(), BootstrapError> {
     let control_listener = TcpListener::bind(config.control.listen)
         .await
         .map_err(|_| BootstrapError::Bind)?;
+    let legacy_gateway_listener = TcpListener::bind(config.legacy_gateway.listen)
+        .await
+        .map_err(|_| BootstrapError::Bind)?;
     let health_listener = TcpListener::bind(config.health.listen)
         .await
         .map_err(|_| BootstrapError::Bind)?;
@@ -177,11 +181,26 @@ async fn run() -> Result<(), BootstrapError> {
         load_private_key(&config.control.private_key_pkcs8_pem)?,
     )
     .map_err(|_| BootstrapError::Tls)?;
+    let gateway_roots = Arc::new(load_root_store(
+        &config.legacy_gateway.client_ca_bundle_pem,
+    )?);
+    let gateway_verifier = InternalServiceMtlsClientVerifier::new(
+        gateway_roots,
+        InternalServiceKind::LegacyMatrixGateway,
+    )
+    .map_err(|_| BootstrapError::Tls)?;
+    let legacy_gateway_server_config = build_internal_service_mtls_server_config(
+        gateway_verifier.clone(),
+        load_certificate_chain(&config.legacy_gateway.certificate_chain_pem)?,
+        load_private_key(&config.legacy_gateway.private_key_pkcs8_pem)?,
+    )
+    .map_err(|_| BootstrapError::Tls)?;
     let enrollment_server_config = build_server_auth_tls_config(
         load_certificate_chain(&config.enrollment.certificate_chain_pem)?,
         load_private_key(&config.enrollment.private_key_pkcs8_pem)?,
     )?;
     let verifier = Arc::new(verifier);
+    let gateway_verifier = Arc::new(gateway_verifier);
 
     let issuer_certificate = load_single_certificate(&config.connector_issuer.certificate)?;
     let issuer_intermediates = config
@@ -206,10 +225,12 @@ async fn run() -> Result<(), BootstrapError> {
         Arc::new(ProtobufDurableCommandDecoder),
     ));
     let enrollment_application: Arc<dyn ConnectorControlApplication> = application.clone();
-    let control_application: Arc<dyn ConnectorControlApplication> = application;
+    let control_application: Arc<dyn ConnectorControlApplication> = application.clone();
+    let gateway_application: Arc<dyn AgentRunIngressApplication> = application;
 
     let (enrollment_shutdown_tx, enrollment_shutdown_rx) = oneshot::channel();
     let (control_shutdown_tx, control_shutdown_rx) = oneshot::channel();
+    let (legacy_gateway_shutdown_tx, legacy_gateway_shutdown_rx) = oneshot::channel();
     let (health_shutdown_tx, health_shutdown_rx) = oneshot::channel();
     let enrollment_server = Server::builder().serve_with_incoming_shutdown(
         connector_enrollment_service(enrollment_application),
@@ -225,6 +246,16 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = control_shutdown_rx.await;
         },
     );
+    let legacy_gateway_server = Server::builder().serve_with_incoming_shutdown(
+        agent_run_ingress_service(gateway_application, gateway_verifier),
+        tls_incoming(
+            legacy_gateway_listener,
+            Arc::new(legacy_gateway_server_config),
+        ),
+        async {
+            let _ = legacy_gateway_shutdown_rx.await;
+        },
+    );
     let health_state = HealthState {
         store: health_store,
         accepting_requests: Arc::clone(&accepting_requests),
@@ -238,20 +269,23 @@ async fn run() -> Result<(), BootstrapError> {
     };
     tokio::pin!(enrollment_server);
     tokio::pin!(control_server);
+    tokio::pin!(legacy_gateway_server);
     let mut health_server = tokio::spawn(health_server);
 
     accepting_requests.store(true, Ordering::Release);
     report_ready(
         config.enrollment.listen,
         config.control.listen,
+        config.legacy_gateway.listen,
         config.health.listen,
     )?;
     tokio::select! {
         result = &mut enrollment_server => {
             accepting_requests.store(false, Ordering::Release);
             let _ = control_shutdown_tx.send(());
+            let _ = legacy_gateway_shutdown_tx.send(());
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
-                let _ = control_server.as_mut().await;
+                let _ = tokio::join!(control_server.as_mut(), legacy_gateway_server.as_mut());
                 let _ = health_shutdown_tx.send(());
                 let _ = (&mut health_server).await;
             }).await;
@@ -260,8 +294,20 @@ async fn run() -> Result<(), BootstrapError> {
         result = &mut control_server => {
             accepting_requests.store(false, Ordering::Release);
             let _ = enrollment_shutdown_tx.send(());
+            let _ = legacy_gateway_shutdown_tx.send(());
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
-                let _ = enrollment_server.as_mut().await;
+                let _ = tokio::join!(enrollment_server.as_mut(), legacy_gateway_server.as_mut());
+                let _ = health_shutdown_tx.send(());
+                let _ = (&mut health_server).await;
+            }).await;
+            endpoint_result(&result)
+        }
+        result = &mut legacy_gateway_server => {
+            accepting_requests.store(false, Ordering::Release);
+            let _ = enrollment_shutdown_tx.send(());
+            let _ = control_shutdown_tx.send(());
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+                let _ = tokio::join!(enrollment_server.as_mut(), control_server.as_mut());
                 let _ = health_shutdown_tx.send(());
                 let _ = (&mut health_server).await;
             }).await;
@@ -271,8 +317,13 @@ async fn run() -> Result<(), BootstrapError> {
             accepting_requests.store(false, Ordering::Release);
             let _ = enrollment_shutdown_tx.send(());
             let _ = control_shutdown_tx.send(());
+            let _ = legacy_gateway_shutdown_tx.send(());
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
-                tokio::join!(enrollment_server.as_mut(), control_server.as_mut())
+                tokio::join!(
+                    enrollment_server.as_mut(),
+                    control_server.as_mut(),
+                    legacy_gateway_server.as_mut(),
+                )
             }).await;
             health_task_result(&result)
         }
@@ -281,13 +332,16 @@ async fn run() -> Result<(), BootstrapError> {
             accepting_requests.store(false, Ordering::Release);
             let _ = enrollment_shutdown_tx.send(());
             let _ = control_shutdown_tx.send(());
+            let _ = legacy_gateway_shutdown_tx.send(());
             tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
-                let (enrollment, control) = tokio::join!(
+                let (enrollment, control, legacy_gateway) = tokio::join!(
                     enrollment_server.as_mut(),
                     control_server.as_mut(),
+                    legacy_gateway_server.as_mut(),
                 );
                 enrollment.map_err(|_| BootstrapError::Server)?;
                 control.map_err(|_| BootstrapError::Server)?;
+                legacy_gateway.map_err(|_| BootstrapError::Server)?;
                 let _ = health_shutdown_tx.send(());
                 let health = (&mut health_server)
                     .await
@@ -513,12 +567,13 @@ fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, BootstrapError> {
 fn report_ready(
     enrollment: SocketAddr,
     control: SocketAddr,
+    legacy_gateway: SocketAddr,
     health: SocketAddr,
 ) -> Result<(), BootstrapError> {
     let mut output = io::stdout().lock();
     writeln!(
         output,
-        "dtx-agent-control ready enrollment={enrollment} control={control} health={health}"
+        "dtx-agent-control ready enrollment={enrollment} control={control} legacy_gateway={legacy_gateway} health={health}"
     )
     .map_err(|_| BootstrapError::Ready)?;
     output.flush().map_err(|_| BootstrapError::Ready)

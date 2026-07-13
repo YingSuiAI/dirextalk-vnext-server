@@ -13,6 +13,7 @@ pub enum InternalServiceKind {
     AgentControl,
     AgentOrchestrator,
     CloudBroker,
+    LegacyMatrixGateway,
     ResultVerifier,
 }
 
@@ -22,6 +23,7 @@ impl InternalServiceKind {
             Self::AgentControl => "agent-control",
             Self::AgentOrchestrator => "agent-orchestrator",
             Self::CloudBroker => "cloud-broker",
+            Self::LegacyMatrixGateway => "legacy-matrix-gateway",
             Self::ResultVerifier => "result-verifier",
         }
     }
@@ -35,8 +37,60 @@ impl FromStr for InternalServiceKind {
             "agent-control" => Ok(Self::AgentControl),
             "agent-orchestrator" => Ok(Self::AgentOrchestrator),
             "cloud-broker" => Ok(Self::CloudBroker),
+            "legacy-matrix-gateway" => Ok(Self::LegacyMatrixGateway),
             "result-verifier" => Ok(Self::ResultVerifier),
             _ => Err(WorkloadIdentityParseError),
+        }
+    }
+}
+
+/// Strict tenant-scoped internal service identity carried by one exact URI SAN.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct InternalServiceWorkloadIdentity {
+    tenant_id: TenantId,
+    service: InternalServiceKind,
+}
+
+impl InternalServiceWorkloadIdentity {
+    #[must_use]
+    pub const fn new(tenant_id: TenantId, service: InternalServiceKind) -> Self {
+        Self { tenant_id, service }
+    }
+
+    #[must_use]
+    pub const fn tenant_id(self) -> TenantId {
+        self.tenant_id
+    }
+
+    #[must_use]
+    pub const fn service(self) -> InternalServiceKind {
+        self.service
+    }
+
+    #[must_use]
+    pub fn uri(self) -> String {
+        WorkloadIdentity::from(self).uri()
+    }
+}
+
+impl fmt::Display for InternalServiceWorkloadIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.uri())
+    }
+}
+
+impl FromStr for InternalServiceWorkloadIdentity {
+    type Err = WorkloadIdentityParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match WorkloadIdentity::from_str(value)? {
+            WorkloadIdentity::InternalService { tenant_id, service } => {
+                Ok(Self::new(tenant_id, service))
+            }
+            WorkloadIdentity::Connector { .. }
+            | WorkloadIdentity::Host { .. }
+            | WorkloadIdentity::Executor { .. }
+            | WorkloadIdentity::ControlServer { .. } => Err(WorkloadIdentityParseError),
         }
     }
 }
@@ -213,6 +267,15 @@ impl From<ConnectorWorkloadIdentity> for WorkloadIdentity {
         Self::Connector {
             tenant_id: value.tenant_id,
             connector_id: value.connector_id,
+        }
+    }
+}
+
+impl From<InternalServiceWorkloadIdentity> for WorkloadIdentity {
+    fn from(value: InternalServiceWorkloadIdentity) -> Self {
+        Self::InternalService {
+            tenant_id: value.tenant_id,
+            service: value.service,
         }
     }
 }

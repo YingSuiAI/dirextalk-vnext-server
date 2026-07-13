@@ -7,8 +7,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )
     .join("../..");
     let proto_root = repository_root.join("protocol/proto");
-    let descriptor = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is required")?)
-        .join("agent_control_descriptor.bin");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is required")?);
 
     // Watch the include root as well as the entrypoint so a future imported
     // reviewed schema cannot leave generated Rust or descriptors stale.
@@ -16,7 +15,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     compile_contract(
         proto_root.join("dirextalk/agent_control/v1_1/agent_control.proto"),
-        descriptor,
+        out_dir.join("agent_control_descriptor.bin"),
+        &proto_root,
+    )?;
+    compile_contract(
+        proto_root.join("dirextalk/agent_gateway/v1/agent_gateway.proto"),
+        out_dir.join("agent_gateway_descriptor.bin"),
         &proto_root,
     )?;
 

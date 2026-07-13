@@ -13,5 +13,8 @@ sha2.workspace = true
 x509-parser.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+rcgen.workspace = true
+
 [lints]
 workspace = true

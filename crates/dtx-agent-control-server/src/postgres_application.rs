@@ -439,6 +439,16 @@ impl CreateAgentRunRequest {
             queue_ttl_millis,
         })
     }
+
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+
+    #[must_use]
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
 }
 
 /// Durable result of an exact create-and-route attempt.

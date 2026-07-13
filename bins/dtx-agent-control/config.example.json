@@ -15,6 +15,12 @@
     "private_key_pkcs8_pem": "secrets/control-key.pem",
     "client_ca_bundle_pem": "tls/connector-client-roots.pem"
   },
+  "legacy_gateway": {
+    "listen": "0.0.0.0:9445",
+    "certificate_chain_pem": "tls/legacy-gateway-server-chain.pem",
+    "private_key_pkcs8_pem": "secrets/legacy-gateway-server-key.pem",
+    "client_ca_bundle_pem": "tls/internal-service-client-roots.pem"
+  },
   "connector_issuer": {
     "certificate_pem": "tls/connector-issuer.pem",
     "private_key_pkcs8_pem": "secrets/connector-issuer-key.pem",

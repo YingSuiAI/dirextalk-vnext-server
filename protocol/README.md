@@ -23,6 +23,10 @@ Layout:
   MC3 offer/lease handshake: `RunClaim` acknowledges `RunAvailable`, and only
   `RunLeaseGranted` authorizes execution. `RunRelease` echoes both fences;
   checkpoint, output, completion, and failure frames remain deferred to AR3.
+  The independent `dirextalk.agent_gateway.v1` package exposes only the
+  internal-mTLS `AgentRunIngress/CreateAgentRun` method. Its request carries
+  opaque vNext UUIDs and digests, never a tenant selector, prompt, or raw
+  Matrix room/event identifier; result and completion remain separate work.
 - `test-vectors/v1` contains byte-exact public ID, plan hash, API error, and
   event-envelope fixtures.
 - `generated/dart` is an independent Dart conformance consumer. Its registry-
@@ -33,6 +37,8 @@ Layout:
   that freezes Agent Control 1.0 without changing any v1 entry.
   `baseline/v3/manifest.json` independently freezes the additive Agent Control
   1.1 source without changing the v1 or v2 artifact sets.
+  `baseline/v4/manifest.json` independently freezes the Legacy Matrix Gateway
+  run-ingress source without changing any older artifact set.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

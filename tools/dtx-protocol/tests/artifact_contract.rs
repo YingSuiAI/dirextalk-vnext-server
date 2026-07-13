@@ -58,6 +58,31 @@ fn freezing_v3_preserves_both_older_manifests() {
 }
 
 #[test]
+fn freezing_v4_preserves_every_older_manifest() {
+    let root = isolated_protocol_tree();
+    let older = [
+        root.join("protocol/baseline/v1/manifest.json"),
+        root.join("protocol/baseline/v2/manifest.json"),
+        root.join("protocol/baseline/v3/manifest.json"),
+    ];
+    let published = older
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect::<Vec<_>>();
+    let v4 = root.join("protocol/baseline/v4/manifest.json");
+    fs::remove_file(&v4).unwrap();
+
+    freeze_baseline(&root).expect("the disjoint Gateway ingress artifact freezes as v4");
+    for (path, expected) in older.iter().zip(published) {
+        assert_eq!(fs::read(path).unwrap(), expected);
+    }
+    assert!(v4.is_file());
+    check_breaking(&root).expect("all four disjoint baselines verify");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn freeze_never_regenerates_a_missing_published_v1_manifest() {
     let root = isolated_protocol_tree();
     fs::remove_file(root.join("protocol/baseline/v1/manifest.json")).unwrap();

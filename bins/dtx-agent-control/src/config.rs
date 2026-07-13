@@ -16,6 +16,7 @@ pub struct BootstrapConfig {
     pub health: HealthEndpoint,
     pub enrollment: PublicTlsEndpoint,
     pub control: ControlTlsEndpoint,
+    pub legacy_gateway: InternalServiceTlsEndpoint,
     pub connector_issuer: ConnectorIssuer,
 }
 
@@ -40,6 +41,14 @@ pub struct ControlTlsEndpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InternalServiceTlsEndpoint {
+    pub listen: SocketAddr,
+    pub certificate_chain_pem: PathBuf,
+    pub private_key_pkcs8_pem: PathBuf,
+    pub client_ca_bundle_pem: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorIssuer {
     pub certificate: PathBuf,
     pub private_key: PathBuf,
@@ -54,6 +63,7 @@ struct RawBootstrapConfig {
     health: RawHealthEndpoint,
     enrollment: RawPublicTlsEndpoint,
     control: RawControlTlsEndpoint,
+    legacy_gateway: RawControlTlsEndpoint,
     connector_issuer: RawConnectorIssuer,
 }
 
@@ -114,11 +124,14 @@ impl RawBootstrapConfig {
         }
         let enrollment_listen = parse_listen(&self.enrollment.listen)?;
         let control_listen = parse_listen(&self.control.listen)?;
+        let legacy_gateway_listen = parse_listen(&self.legacy_gateway.listen)?;
         let health_listen = parse_listen(&self.health.listen)?;
-        if enrollment_listen == control_listen
-            || enrollment_listen == health_listen
-            || control_listen == health_listen
-        {
+        if !listeners_are_distinct(&[
+            enrollment_listen,
+            control_listen,
+            legacy_gateway_listen,
+            health_listen,
+        ]) {
             return Err(ConfigError::ListenerCollision);
         }
         Ok(BootstrapConfig {
@@ -138,6 +151,18 @@ impl RawBootstrapConfig {
                 private_key_pkcs8_pem: resolve_path(base, self.control.private_key_pkcs8_pem)?,
                 client_ca_bundle_pem: resolve_path(base, self.control.client_ca_bundle_pem)?,
             },
+            legacy_gateway: InternalServiceTlsEndpoint {
+                listen: legacy_gateway_listen,
+                certificate_chain_pem: resolve_path(
+                    base,
+                    self.legacy_gateway.certificate_chain_pem,
+                )?,
+                private_key_pkcs8_pem: resolve_path(
+                    base,
+                    self.legacy_gateway.private_key_pkcs8_pem,
+                )?,
+                client_ca_bundle_pem: resolve_path(base, self.legacy_gateway.client_ca_bundle_pem)?,
+            },
             connector_issuer: ConnectorIssuer {
                 certificate: resolve_path(base, self.connector_issuer.certificate)?,
                 private_key: resolve_path(base, self.connector_issuer.private_key)?,
@@ -149,6 +174,13 @@ impl RawBootstrapConfig {
             },
         })
     }
+}
+
+fn listeners_are_distinct(listeners: &[SocketAddr]) -> bool {
+    listeners
+        .iter()
+        .enumerate()
+        .all(|(index, listener)| !listeners[index + 1..].contains(listener))
 }
 
 fn parse_listen(value: &str) -> Result<SocketAddr, ConfigError> {
@@ -222,6 +254,12 @@ mod tests {
                 "private_key_pkcs8_pem": "tls/control-key.pem",
                 "client_ca_bundle_pem": "tls/connector-roots.pem"
             },
+            "legacy_gateway": {
+                "listen": "127.0.0.1:9445",
+                "certificate_chain_pem": "tls/gateway-server-chain.pem",
+                "private_key_pkcs8_pem": "tls/gateway-server-key.pem",
+                "client_ca_bundle_pem": "tls/internal-service-roots.pem"
+            },
             "connector_issuer": {
                 "certificate_pem": "tls/issuer.pem",
                 "private_key_pkcs8_pem": "tls/issuer-key.pem"
@@ -269,6 +307,13 @@ mod tests {
         assert_eq!(
             ephemeral_health.resolve(Path::new(".")).unwrap_err(),
             ConfigError::ListenAddress
+        );
+
+        let mut gateway_collision = raw("127.0.0.1:9443", "127.0.0.1:9444");
+        gateway_collision.legacy_gateway.listen = "127.0.0.1:9443".to_owned();
+        assert_eq!(
+            gateway_collision.resolve(Path::new(".")).unwrap_err(),
+            ConfigError::ListenerCollision
         );
     }
 }

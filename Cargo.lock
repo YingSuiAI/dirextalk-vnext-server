@@ -882,6 +882,7 @@ version = "0.1.0"
 dependencies = [
  "dtx-domain",
  "dtx-wire",
+ "rcgen",
  "rustls",
  "sha2 0.11.0",
  "x509-parser",
