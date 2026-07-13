@@ -1,19 +1,32 @@
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{
+    io::{Read, Write},
+    net::{Ipv4Addr, TcpListener, TcpStream},
+    str::FromStr,
+    sync::Arc,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use dtx_domain::{HostId, JobId, JobResourceId, RequestId, RunId, TenantId, WorkerId};
-use dtx_security::{CrashRequested, ExternalEffectPhase, FaultCheckpoint, FaultHook, FaultPoint};
+use dtx_domain::{
+    HostCredentialId, HostId, JobId, JobResourceId, RequestId, Revision, RunId, TenantId, WorkerId,
+};
+use dtx_security::{
+    CertificateFingerprint, CrashRequested, ExternalEffectPhase, FaultCheckpoint, FaultHook,
+    FaultPoint, HostClientCertVerifier, HostCredentialAuthorizer, HostCredentialBinding,
+    HostWorkloadIdentity, SecretBytes, TlsClientIdentity, build_host_mtls_server_config,
+};
 use dtx_testkit::{
     AgentRuntimeError, AgentRuntimeOutput, CancelRun, CertificateAuthorizationError,
     CertificatePurpose, DestroyEphemeralGroupRequest, EnsureExecutorRequest, FakeAgentRuntime,
-    FakeAgentWorld, FakeAwsError, FakeAwsProvider, FakeAwsWorld, ObserveExecutorRequest,
-    ResourceLifecycle, ScriptedAgentOutput, ScriptedFaults, StartRun, TestCertificateAuthority,
-    TestCertificateError, WorkloadIdentity,
+    FakeAgentWorld, FakeAwsError, FakeAwsProvider, FakeAwsWorld, IssuedTestCertificate,
+    ObserveExecutorRequest, ResourceLifecycle, ScriptedAgentOutput, ScriptedFaults, StartRun,
+    TestCertificateAuthority, TestCertificateError, WorkloadIdentity,
 };
 use rustls::{
-    RootCertStore,
+    ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
     client::{WebPkiServerVerifier, danger::ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
-    server::WebPkiClientVerifier,
+    server::{WebPkiClientVerifier, danger::ClientCertVerifier},
 };
 
 fn digest(byte: u8) -> [u8; 32] {
@@ -509,6 +522,12 @@ fn test_ca_authorizes_one_typed_identity_purpose_and_time_window() {
 
     assert!(
         certificate
+            .identity_uri()
+            .starts_with(dtx_security::WORKLOAD_URI_PREFIX)
+    );
+
+    assert!(
+        certificate
             .certificate_der()
             .windows(certificate.identity_uri().len())
             .any(|window| window == certificate.identity_uri().as_bytes())
@@ -556,26 +575,22 @@ fn test_ca_authorizes_one_typed_identity_purpose_and_time_window() {
 
 #[test]
 fn test_ca_rejects_non_short_lived_certificates() {
-    let ca = TestCertificateAuthority::new(1_800_000_000_000).expect("CA created");
+    let now_millis = 1_800_000_000_000;
+    let ca = TestCertificateAuthority::new(now_millis).expect("CA created");
     let identity = WorkloadIdentity::Host {
         tenant_id: tenant("01890f00-0000-7000-8000-000000000051"),
         host_id: host("01890f00-0000-7000-8000-000000000052"),
     };
 
     assert!(matches!(
-        ca.issue(
-            &identity,
-            CertificatePurpose::ClientAuth,
-            1_800_000_000_000,
-            901
-        ),
+        ca.issue(&identity, CertificatePurpose::ClientAuth, now_millis, 901),
         Err(TestCertificateError::LifetimeTooLong)
     ));
     assert_eq!(
         ca.issue(
             &identity,
             CertificatePurpose::ClientAuth,
-            1_800_000_000_000 + 30 * 24 * 60 * 60 * 1_000,
+            now_millis + 30 * 24 * 60 * 60 * 1_000,
             300,
         )
         .expect_err("a leaf cannot outlive its CA"),
@@ -584,6 +599,17 @@ fn test_ca_rejects_non_short_lived_certificates() {
     assert!(matches!(
         TestCertificateAuthority::new(i64::MIN),
         Err(TestCertificateError::InvalidTime)
+    ));
+    assert!(matches!(
+        ca.issue(
+            &WorkloadIdentity::ControlServer {
+                dns_name: "CONTROL.dirextalk.test".to_owned(),
+            },
+            CertificatePurpose::ServerAuth,
+            now_millis,
+            300,
+        ),
+        Err(TestCertificateError::InvalidIdentity)
     ));
 }
 
@@ -652,4 +678,681 @@ fn test_ca_certificates_pass_rustls_chain_and_single_eku_verification() {
             .is_err(),
         "a client-only leaf must fail server authentication"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the complete Host certificate rejection matrix in one trust-boundary test.
+fn production_host_verifier_requires_chain_eku_one_uri_san_and_registered_binding() {
+    let now_millis = 1_800_000_000_000_i64;
+    let tenant_id = tenant("01890f00-0000-7000-8000-000000000071");
+    let host_id = host("01890f00-0000-7000-8000-000000000072");
+    let credential_id = HostCredentialId::from_str("01890f00-0000-7000-8000-000000000073")
+        .expect("valid credential fixture");
+    let host_identity = HostWorkloadIdentity::new(tenant_id, host_id);
+    let workload = WorkloadIdentity::from(host_identity);
+    let ca = TestCertificateAuthority::new(now_millis).expect("CA created");
+    let certificate = ca
+        .issue(&workload, CertificatePurpose::ClientAuth, now_millis, 300)
+        .expect("Host client certificate issued");
+    let binding = HostCredentialBinding::new(
+        host_identity,
+        credential_id,
+        certificate.certificate_fingerprint(),
+        u64::try_from(certificate.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(certificate.not_after_millis() / 1_000).expect("positive fixture"),
+        None,
+    )
+    .expect("valid binding");
+    let authorizer =
+        Arc::new(HostCredentialAuthorizer::new_initial([binding]).expect("binding snapshot"));
+    let roots = test_roots(&ca);
+    let verifier = HostClientCertVerifier::new(Arc::clone(&roots), Arc::clone(&authorizer))
+        .expect("Host verifier builds");
+    let now = UnixTime::since_unix_epoch(Duration::from_millis(
+        u64::try_from(now_millis).expect("positive fixture time"),
+    ));
+    let certificate_der = CertificateDer::from(certificate.certificate_der().to_vec());
+
+    verifier
+        .verify_client_cert(&certificate_der, &[], now)
+        .expect("registered Host client certificate is valid");
+
+    let wrong_host_binding = HostCredentialBinding::new(
+        HostWorkloadIdentity::new(tenant_id, HostId::new()),
+        credential_id,
+        certificate.certificate_fingerprint(),
+        u64::try_from(certificate.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(certificate.not_after_millis() / 1_000).expect("positive fixture"),
+        None,
+    )
+    .expect("valid wrong-host binding");
+    let wrong_host_verifier = HostClientCertVerifier::new(
+        Arc::clone(&roots),
+        Arc::new(
+            HostCredentialAuthorizer::new_initial([wrong_host_binding])
+                .expect("wrong-host snapshot"),
+        ),
+    )
+    .expect("Host verifier builds");
+    assert!(
+        wrong_host_verifier
+            .verify_client_cert(&certificate_der, &[], now)
+            .is_err(),
+        "the fingerprint cannot move to another Host identity"
+    );
+
+    let tenant_mismatch = HostCredentialBinding::new(
+        HostWorkloadIdentity::new(tenant("01890f00-0000-7000-8000-000000000076"), host_id),
+        credential_id,
+        certificate.certificate_fingerprint(),
+        u64::try_from(certificate.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(certificate.not_after_millis() / 1_000).expect("positive fixture"),
+        None,
+    )
+    .expect("valid wrong-tenant binding");
+    let tenant_mismatch_verifier = HostClientCertVerifier::new(
+        Arc::clone(&roots),
+        Arc::new(
+            HostCredentialAuthorizer::new_initial([tenant_mismatch])
+                .expect("wrong-tenant binding snapshot"),
+        ),
+    )
+    .expect("Host verifier builds");
+    assert!(
+        tenant_mismatch_verifier
+            .verify_client_cert(&certificate_der, &[], now)
+            .is_err(),
+        "the fingerprint cannot move to another tenant"
+    );
+
+    let expired_instant = UnixTime::since_unix_epoch(Duration::from_millis(
+        u64::try_from(certificate.not_after_millis() + 1_000)
+            .expect("positive expired fixture time"),
+    ));
+    assert!(
+        verifier
+            .verify_client_cert(&certificate_der, &[], expired_instant)
+            .is_err(),
+        "an expired Host certificate is rejected"
+    );
+
+    let connector = ca
+        .issue(
+            &WorkloadIdentity::Connector {
+                tenant_id,
+                connector_id: dtx_domain::ConnectorId::from_str(
+                    "01890f00-0000-7000-8000-000000000074",
+                )
+                .expect("valid connector fixture"),
+            },
+            CertificatePurpose::ClientAuth,
+            now_millis,
+            300,
+        )
+        .expect("Connector certificate issued");
+    let connector_binding = HostCredentialBinding::new(
+        host_identity,
+        credential_id,
+        connector.certificate_fingerprint(),
+        u64::try_from(connector.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(connector.not_after_millis() / 1_000).expect("positive fixture"),
+        None,
+    )
+    .expect("synthetic impersonation binding");
+    let connector_verifier = HostClientCertVerifier::new(
+        Arc::clone(&roots),
+        Arc::new(
+            HostCredentialAuthorizer::new_initial([connector_binding]).expect("binding snapshot"),
+        ),
+    )
+    .expect("Host verifier builds");
+    assert!(
+        connector_verifier
+            .verify_client_cert(
+                &CertificateDer::from(connector.certificate_der().to_vec()),
+                &[],
+                now,
+            )
+            .is_err(),
+        "a Connector URI can never impersonate a Host"
+    );
+
+    let unrestricted = ca
+        .issue_without_extended_key_usage_for_test(
+            &workload,
+            CertificatePurpose::ClientAuth,
+            now_millis,
+            300,
+        )
+        .expect("Host certificate without EKU issued");
+    let unrestricted_binding = HostCredentialBinding::new(
+        host_identity,
+        credential_id,
+        unrestricted.certificate_fingerprint(),
+        u64::try_from(unrestricted.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(unrestricted.not_after_millis() / 1_000).expect("positive fixture"),
+        None,
+    )
+    .expect("unrestricted binding");
+    let unrestricted_verifier = HostClientCertVerifier::new(
+        Arc::clone(&roots),
+        Arc::new(
+            HostCredentialAuthorizer::new_initial([unrestricted_binding])
+                .expect("unrestricted binding snapshot"),
+        ),
+    )
+    .expect("Host verifier builds");
+    assert!(
+        unrestricted_verifier
+            .verify_client_cert(
+                &CertificateDer::from(unrestricted.certificate_der().to_vec()),
+                &[],
+                now,
+            )
+            .is_err(),
+        "a Host client must carry an explicit clientAuth EKU"
+    );
+
+    let server_only = ca
+        .issue(&workload, CertificatePurpose::ServerAuth, now_millis, 300)
+        .expect("Host server-only certificate issued");
+    let server_only_binding = HostCredentialBinding::new(
+        host_identity,
+        credential_id,
+        server_only.certificate_fingerprint(),
+        u64::try_from(server_only.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(server_only.not_after_millis() / 1_000).expect("positive fixture"),
+        None,
+    )
+    .expect("server-only binding");
+    let server_only_verifier = HostClientCertVerifier::new(
+        Arc::clone(&roots),
+        Arc::new(
+            HostCredentialAuthorizer::new_initial([server_only_binding]).expect("binding snapshot"),
+        ),
+    )
+    .expect("Host verifier builds");
+    assert!(
+        server_only_verifier
+            .verify_client_cert(
+                &CertificateDer::from(server_only.certificate_der().to_vec()),
+                &[],
+                now,
+            )
+            .is_err(),
+        "serverAuth EKU cannot authenticate a Host client"
+    );
+
+    let extra_san = ca
+        .issue_with_additional_uri_san_for_test(
+            &workload,
+            CertificatePurpose::ClientAuth,
+            "spiffe://dirextalk.internal/v1/tenants/01890f00-0000-7000-8000-000000000071/hosts/01890f00-0000-7000-8000-000000000075",
+            now_millis,
+            300,
+        )
+        .expect("malformed multi-SAN certificate issued");
+    let extra_san_binding = HostCredentialBinding::new(
+        host_identity,
+        credential_id,
+        extra_san.certificate_fingerprint(),
+        u64::try_from(extra_san.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(extra_san.not_after_millis() / 1_000).expect("positive fixture"),
+        None,
+    )
+    .expect("extra-SAN binding");
+    let extra_san_verifier = HostClientCertVerifier::new(
+        roots,
+        Arc::new(
+            HostCredentialAuthorizer::new_initial([extra_san_binding]).expect("binding snapshot"),
+        ),
+    )
+    .expect("Host verifier builds");
+    assert!(
+        extra_san_verifier
+            .verify_client_cert(
+                &CertificateDer::from(extra_san.certificate_der().to_vec()),
+                &[],
+                now,
+            )
+            .is_err(),
+        "Host certificates require exactly one URI SAN and no additional SANs"
+    );
+
+    let unknown = HostClientCertVerifier::new(
+        test_roots(&ca),
+        Arc::new(HostCredentialAuthorizer::new_initial([]).expect("empty snapshot")),
+    )
+    .expect("Host verifier builds");
+    assert!(
+        unknown
+            .verify_client_cert(&certificate_der, &[], now)
+            .is_err(),
+        "an unregistered fingerprint is rejected"
+    );
+
+    let revoked_binding = HostCredentialBinding::new(
+        host_identity,
+        credential_id,
+        certificate.certificate_fingerprint(),
+        u64::try_from(certificate.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(certificate.not_after_millis() / 1_000).expect("positive fixture"),
+        Some(u64::try_from(now_millis / 1_000).expect("positive fixture")),
+    )
+    .expect("revoked binding");
+    let revoked = HostClientCertVerifier::new(
+        test_roots(&ca),
+        Arc::new(
+            HostCredentialAuthorizer::new_initial([revoked_binding]).expect("binding snapshot"),
+        ),
+    )
+    .expect("Host verifier builds");
+    assert!(
+        revoked
+            .verify_client_cert(&certificate_der, &[], now)
+            .is_err(),
+        "application revocation is enforced during the TLS handshake"
+    );
+
+    let rogue_ca = TestCertificateAuthority::new(now_millis).expect("rogue CA created");
+    let rogue_certificate = rogue_ca
+        .issue(&workload, CertificatePurpose::ClientAuth, now_millis, 300)
+        .expect("rogue certificate issued");
+    let rogue_binding = HostCredentialBinding::new(
+        host_identity,
+        credential_id,
+        rogue_certificate.certificate_fingerprint(),
+        u64::try_from(rogue_certificate.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(rogue_certificate.not_after_millis() / 1_000).expect("positive fixture"),
+        None,
+    )
+    .expect("rogue binding");
+    let untrusted = HostClientCertVerifier::new(
+        test_roots(&ca),
+        Arc::new(HostCredentialAuthorizer::new_initial([rogue_binding]).expect("binding snapshot")),
+    )
+    .expect("Host verifier builds");
+    assert!(
+        untrusted
+            .verify_client_cert(
+                &CertificateDer::from(rogue_certificate.certificate_der().to_vec()),
+                &[],
+                now,
+            )
+            .is_err(),
+        "a fingerprint binding cannot bypass the configured CA roots"
+    );
+
+    let replacement = ca
+        .issue(&workload, CertificatePurpose::ClientAuth, now_millis, 300)
+        .expect("replacement Host client certificate issued");
+    let replacement_binding = HostCredentialBinding::new(
+        host_identity,
+        HostCredentialId::from_str("01890f00-0000-7000-8000-000000000077")
+            .expect("valid replacement credential fixture"),
+        replacement.certificate_fingerprint(),
+        u64::try_from(replacement.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(replacement.not_after_millis() / 1_000).expect("positive fixture"),
+        None,
+    )
+    .expect("replacement credential binding");
+    authorizer
+        .replace(Revision::INITIAL, [replacement_binding])
+        .expect("current credential snapshot rotates atomically");
+    assert!(
+        verifier
+            .verify_client_cert(&certificate_der, &[], now)
+            .is_err(),
+        "the same verifier rejects the rotated-out Host credential"
+    );
+    verifier
+        .verify_client_cert(
+            &CertificateDer::from(replacement.certificate_der().to_vec()),
+            &[],
+            now,
+        )
+        .expect("the same verifier accepts the replacement current credential");
+    let replacement_revoked = HostCredentialBinding::new(
+        host_identity,
+        HostCredentialId::from_str("01890f00-0000-7000-8000-000000000077")
+            .expect("valid replacement credential fixture"),
+        replacement.certificate_fingerprint(),
+        u64::try_from(replacement.not_before_millis() / 1_000).expect("positive fixture"),
+        u64::try_from(replacement.not_after_millis() / 1_000).expect("positive fixture"),
+        Some(u64::try_from(now_millis / 1_000).expect("positive fixture")),
+    )
+    .expect("revoked replacement credential binding");
+    authorizer
+        .replace(
+            Revision::new(2).expect("authorization revision two"),
+            [replacement_revoked],
+        )
+        .expect("current credential revocation publishes atomically");
+    assert!(
+        verifier
+            .verify_client_cert(
+                &CertificateDer::from(replacement.certificate_der().to_vec()),
+                &[],
+                now,
+            )
+            .is_err(),
+        "the same verifier observes current credential revocation"
+    );
+
+    assert_eq!(
+        certificate.certificate_fingerprint(),
+        CertificateFingerprint::from_certificate_der(certificate.certificate_der())
+    );
+}
+
+fn test_roots(ca: &TestCertificateAuthority) -> Arc<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca.ca_certificate_der().to_vec()))
+        .expect("test root is valid");
+    Arc::new(roots)
+}
+
+#[test]
+fn tls_client_identity_consumes_a_secret_key_and_returns_redacted_configuration_errors() {
+    let now_millis = 1_800_000_000_000_i64;
+    let ca = TestCertificateAuthority::new(now_millis).expect("CA created");
+    let certificate = ca
+        .issue(
+            &WorkloadIdentity::Host {
+                tenant_id: tenant("01890f00-0000-7000-8000-000000000081"),
+                host_id: host("01890f00-0000-7000-8000-000000000082"),
+            },
+            CertificatePurpose::ClientAuth,
+            now_millis,
+            300,
+        )
+        .expect("Host certificate issued");
+    certificate
+        .into_tls_client_identity()
+        .expect("issued fixture has a valid identity boundary")
+        .into_client_config(test_roots(&ca))
+        .expect("valid PKCS#8 key configures rustls");
+
+    let key_canary = b"dirextalk-private-key-canary".to_vec();
+    let invalid = TlsClientIdentity::new_pkcs8(
+        vec![vec![1, 2, 3]],
+        SecretBytes::new(key_canary.clone()).expect("bounded secret fixture"),
+    )
+    .expect("non-empty identity boundary");
+    let error = invalid
+        .into_client_config(test_roots(&ca))
+        .expect_err("invalid private key is rejected");
+    assert!(!format!("{error:?}").contains("dirextalk-private-key-canary"));
+    assert!(!format!("{error}").contains("dirextalk-private-key-canary"));
+
+    let certificate_canary = b"dirextalk-certificate-canary".to_vec();
+    let verifier = HostClientCertVerifier::new(
+        test_roots(&ca),
+        Arc::new(HostCredentialAuthorizer::new_initial([]).expect("empty Host snapshot")),
+    )
+    .expect("Host verifier builds");
+    let Err(server_error) = build_host_mtls_server_config(
+        verifier,
+        vec![certificate_canary.clone()],
+        SecretBytes::new(key_canary.clone()).expect("bounded key canary"),
+    ) else {
+        panic!("invalid server identity must fail without logging secret material");
+    };
+    for rendered in [format!("{server_error:?}"), format!("{server_error}")] {
+        assert!(!rendered.contains("dirextalk-private-key-canary"));
+        assert!(!rendered.contains("dirextalk-certificate-canary"));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the four real handshake outcomes in one ordered credential lifecycle.
+fn loopback_rustls_mtls_enforces_live_host_identity_and_credential_state() {
+    let now_millis = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_millis(),
+    )
+    .expect("current time fits the certificate fixture boundary");
+    let now_seconds = u64::try_from(now_millis / 1_000).expect("current time is positive");
+    let ca = TestCertificateAuthority::new(now_millis).expect("loopback CA created");
+    let tenant_id = tenant("01890f00-0000-7000-8000-000000000091");
+    let host_id = host("01890f00-0000-7000-8000-000000000092");
+    let host_identity = HostWorkloadIdentity::new(tenant_id, host_id);
+    let host_workload = WorkloadIdentity::from(host_identity);
+
+    let host_certificate = ca
+        .issue(
+            &host_workload,
+            CertificatePurpose::ClientAuth,
+            now_millis,
+            300,
+        )
+        .expect("Host client certificate issued");
+    let host_credential_id = HostCredentialId::from_str("01890f00-0000-7000-8000-000000000093")
+        .expect("valid Host credential fixture");
+    let active_host =
+        loopback_host_binding(&host_certificate, host_identity, host_credential_id, None);
+    let revoked_host = loopback_host_binding(
+        &host_certificate,
+        host_identity,
+        host_credential_id,
+        Some(now_seconds),
+    );
+    let authorizer = Arc::new(
+        HostCredentialAuthorizer::new_initial([active_host])
+            .expect("current Host credential snapshot"),
+    );
+
+    let control_server = ca
+        .issue(
+            &WorkloadIdentity::ControlServer {
+                dns_name: "control.dirextalk.test".to_owned(),
+            },
+            CertificatePurpose::ServerAuth,
+            now_millis,
+            300,
+        )
+        .expect("control server certificate issued");
+    let server_config = loopback_server_config(&ca, &control_server, Arc::clone(&authorizer))
+        .expect("redacted loopback server configuration");
+    let host_client =
+        loopback_client_config(&ca, host_certificate).expect("redacted Host client configuration");
+    assert_eq!(
+        loopback_mtls_exchange(Arc::clone(&server_config), Arc::clone(&host_client)),
+        (true, true),
+        "a current Host exchanges application bytes over mTLS"
+    );
+
+    let connector_certificate = ca
+        .issue(
+            &WorkloadIdentity::Connector {
+                tenant_id,
+                connector_id: dtx_domain::ConnectorId::from_str(
+                    "01890f00-0000-7000-8000-000000000094",
+                )
+                .expect("valid Connector fixture"),
+            },
+            CertificatePurpose::ClientAuth,
+            now_millis,
+            300,
+        )
+        .expect("Connector client certificate issued");
+    let synthetic_connector_binding = loopback_host_binding(
+        &connector_certificate,
+        host_identity,
+        HostCredentialId::from_str("01890f00-0000-7000-8000-000000000095")
+            .expect("valid synthetic credential fixture"),
+        None,
+    );
+    let synthetic_authorizer = Arc::new(
+        HostCredentialAuthorizer::new_initial([synthetic_connector_binding])
+            .expect("synthetic current snapshot publishes"),
+    );
+    let synthetic_server_config =
+        loopback_server_config(&ca, &control_server, synthetic_authorizer)
+            .expect("synthetic Connector rejection server builds");
+    let connector_client = loopback_client_config(&ca, connector_certificate)
+        .expect("redacted Connector client configuration");
+    assert_eq!(
+        loopback_mtls_exchange(synthetic_server_config, connector_client),
+        (false, false),
+        "a Connector identity cannot complete a Host mTLS handshake"
+    );
+
+    authorizer
+        .replace(Revision::INITIAL, [revoked_host])
+        .expect("Host revocation publishes");
+    assert_eq!(
+        loopback_mtls_exchange(Arc::clone(&server_config), host_client),
+        (false, false),
+        "an already configured Host client is rejected after live revocation"
+    );
+
+    let server_auth_client = ca
+        .issue(
+            &host_workload,
+            CertificatePurpose::ServerAuth,
+            now_millis,
+            300,
+        )
+        .expect("serverAuth-only Host certificate issued");
+    let server_auth_binding = loopback_host_binding(
+        &server_auth_client,
+        host_identity,
+        HostCredentialId::from_str("01890f00-0000-7000-8000-000000000096")
+            .expect("valid serverAuth credential fixture"),
+        None,
+    );
+    let server_auth_authorizer = Arc::new(
+        HostCredentialAuthorizer::new_initial([server_auth_binding])
+            .expect("serverAuth synthetic current snapshot publishes"),
+    );
+    let server_auth_server_config =
+        loopback_server_config(&ca, &control_server, server_auth_authorizer)
+            .expect("serverAuth rejection server builds");
+    let server_auth_client = loopback_client_config(&ca, server_auth_client)
+        .expect("redacted serverAuth client configuration");
+    assert_eq!(
+        loopback_mtls_exchange(server_auth_server_config, server_auth_client),
+        (false, false),
+        "a serverAuth-only leaf cannot complete a client-auth handshake"
+    );
+}
+
+fn loopback_host_binding(
+    certificate: &IssuedTestCertificate,
+    identity: HostWorkloadIdentity,
+    credential_id: HostCredentialId,
+    revoked_at_unix_seconds: Option<u64>,
+) -> HostCredentialBinding {
+    HostCredentialBinding::new(
+        identity,
+        credential_id,
+        certificate.certificate_fingerprint(),
+        u64::try_from(certificate.not_before_millis() / 1_000)
+            .expect("fixture not-before is positive"),
+        u64::try_from(certificate.not_after_millis() / 1_000)
+            .expect("fixture not-after is positive"),
+        revoked_at_unix_seconds,
+    )
+    .expect("valid loopback Host credential binding")
+}
+
+fn loopback_server_config(
+    ca: &TestCertificateAuthority,
+    certificate: &IssuedTestCertificate,
+    authorizer: Arc<HostCredentialAuthorizer>,
+) -> Result<Arc<ServerConfig>, ()> {
+    let verifier = HostClientCertVerifier::new(test_roots(ca), authorizer).map_err(|_| ())?;
+    let mut configured = None;
+    certificate.expose_private_key(|private_key_der| {
+        configured = Some(
+            SecretBytes::new(private_key_der.to_vec())
+                .map_err(|_| ())
+                .and_then(|private_key| {
+                    build_host_mtls_server_config(
+                        verifier,
+                        vec![certificate.certificate_der().to_vec()],
+                        private_key,
+                    )
+                    .map_err(|_| ())
+                })
+                .map(Arc::new),
+        );
+    });
+    configured.ok_or(())?
+}
+
+fn loopback_client_config(
+    ca: &TestCertificateAuthority,
+    certificate: IssuedTestCertificate,
+) -> Result<Arc<ClientConfig>, ()> {
+    certificate
+        .into_tls_client_identity()
+        .map_err(|_| ())?
+        .into_client_config(test_roots(ca))
+        .map(Arc::new)
+        .map_err(|_| ())
+}
+
+fn loopback_mtls_exchange(
+    server_config: Arc<ServerConfig>,
+    client_config: Arc<ClientConfig>,
+) -> (bool, bool) {
+    const REQUEST: &[u8; 4] = b"ping";
+    const RESPONSE: &[u8; 4] = b"pong";
+    const IO_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("loopback listener binds without secret context");
+    let address = listener
+        .local_addr()
+        .expect("loopback listener has a local address");
+    let server = thread::spawn(move || {
+        let Ok((socket, _peer)) = listener.accept() else {
+            return false;
+        };
+        if !configure_loopback_timeout(&socket, IO_TIMEOUT) {
+            return false;
+        }
+        let Ok(connection) = ServerConnection::new(server_config) else {
+            return false;
+        };
+        let mut tls = StreamOwned::new(connection, socket);
+        let mut request = [0_u8; REQUEST.len()];
+        if tls.read_exact(&mut request).is_err() || request != *REQUEST {
+            return false;
+        }
+        tls.write_all(RESPONSE).is_ok() && tls.flush().is_ok()
+    });
+
+    let client_succeeded = (|| {
+        let Ok(socket) = TcpStream::connect(address) else {
+            return false;
+        };
+        if !configure_loopback_timeout(&socket, IO_TIMEOUT) {
+            return false;
+        }
+        let Ok(connection) = ClientConnection::new(
+            client_config,
+            ServerName::try_from("control.dirextalk.test").expect("static canonical server name"),
+        ) else {
+            return false;
+        };
+        let mut tls = StreamOwned::new(connection, socket);
+        let mut response = [0_u8; RESPONSE.len()];
+        tls.write_all(REQUEST).is_ok()
+            && tls.flush().is_ok()
+            && tls.read_exact(&mut response).is_ok()
+            && response == *RESPONSE
+    })();
+    let server_succeeded = server.join().unwrap_or(false);
+    (client_succeeded, server_succeeded)
+}
+
+fn configure_loopback_timeout(socket: &TcpStream, timeout: Duration) -> bool {
+    socket.set_read_timeout(Some(timeout)).is_ok()
+        && socket.set_write_timeout(Some(timeout)).is_ok()
 }

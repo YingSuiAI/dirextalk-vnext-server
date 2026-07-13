@@ -12,6 +12,7 @@ mod definition;
 mod error;
 mod grant;
 mod host;
+mod host_authorization;
 mod registry;
 
 pub use binding::BindingSetRepository;
@@ -20,4 +21,5 @@ pub use definition::{AgentDefinitionRepository, DefinitionInsert};
 pub use error::AgentPersistenceError;
 pub use grant::ConversationGrantRepository;
 pub use host::AgentHostRepository;
+pub use host_authorization::HostCredentialAuthorizationRepository;
 pub use registry::{AgentDeviceRepository, AgentInstallationRepository, CurrentWrite};

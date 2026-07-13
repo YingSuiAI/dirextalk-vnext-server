@@ -1,5 +1,5 @@
 [package]
-name = "dtx-agent-persistence"
+name = "dtx-agent-host-supervisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,18 +7,12 @@ publish = false
 
 [dependencies]
 dtx-agent-host = { path = "../dtx-agent-host" }
-dtx-agent-registry = { path = "../dtx-agent-registry" }
 dtx-connect-registry = { path = "../dtx-connect-registry" }
 dtx-domain = { path = "../dtx-domain" }
-dtx-security = { path = "../dtx-security" }
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
-sqlx.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-dtx-storage = { path = "../dtx-storage" }
-testcontainers-modules.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

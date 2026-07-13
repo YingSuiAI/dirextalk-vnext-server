@@ -7,94 +7,22 @@ use std::{
     sync::Mutex,
 };
 
-use dtx_domain::{ConnectorId, HostId, JobId, TenantId, WorkerId};
+use dtx_security::{
+    CertificateFingerprint, SecretBytes, TlsClientIdentity, TlsClientIdentityError,
+};
+pub use dtx_security::{InternalServiceKind, WorkloadIdentity};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, SanType, SerialNumber, string::Ia5String,
 };
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const DEFAULT_LEAF_LIFETIME_SECONDS: u64 = 5 * 60;
 const MAX_LEAF_LIFETIME_SECONDS: u64 = 15 * 60;
 const NOT_BEFORE_SKEW_MILLIS: i64 = 30_000;
 const CA_LIFETIME_MILLIS: i64 = 30 * 24 * 60 * 60 * 1_000;
-
-/// Closed workload identities issued by the test CA.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum WorkloadIdentity {
-    Connector {
-        tenant_id: TenantId,
-        connector_id: ConnectorId,
-    },
-    Host {
-        tenant_id: TenantId,
-        host_id: HostId,
-    },
-    Executor {
-        tenant_id: TenantId,
-        job_id: JobId,
-        worker_id: WorkerId,
-    },
-    InternalService {
-        tenant_id: TenantId,
-        service: InternalServiceKind,
-    },
-    ControlServer {
-        dns_name: String,
-    },
-}
-
-impl WorkloadIdentity {
-    #[must_use]
-    pub fn uri(&self) -> String {
-        match self {
-            Self::Connector {
-                tenant_id,
-                connector_id,
-            } => {
-                format!("spiffe://dirextalk.test/v1/tenants/{tenant_id}/connectors/{connector_id}")
-            }
-            Self::Host { tenant_id, host_id } => {
-                format!("spiffe://dirextalk.test/v1/tenants/{tenant_id}/hosts/{host_id}")
-            }
-            Self::Executor {
-                tenant_id,
-                job_id,
-                worker_id,
-            } => format!(
-                "spiffe://dirextalk.test/v1/tenants/{tenant_id}/jobs/{job_id}/executors/{worker_id}"
-            ),
-            Self::InternalService { tenant_id, service } => format!(
-                "spiffe://dirextalk.test/v1/tenants/{tenant_id}/services/{}",
-                service.as_str()
-            ),
-            Self::ControlServer { dns_name } => {
-                format!("spiffe://dirextalk.test/v1/control-servers/{dns_name}")
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum InternalServiceKind {
-    AgentControl,
-    AgentOrchestrator,
-    CloudBroker,
-    ResultVerifier,
-}
-
-impl InternalServiceKind {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::AgentControl => "agent-control",
-            Self::AgentOrchestrator => "agent-orchestrator",
-            Self::CloudBroker => "cloud-broker",
-            Self::ResultVerifier => "result-verifier",
-        }
-    }
-}
 
 /// A leaf certificate can be used in exactly one TLS direction.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -108,7 +36,7 @@ pub struct IssuedTestCertificate {
     issuer_fingerprint: [u8; 32],
     certificate_fingerprint: [u8; 32],
     certificate_der: Vec<u8>,
-    private_key_der: Zeroizing<Vec<u8>>,
+    private_key_der: SecretBytes,
     identity: WorkloadIdentity,
     identity_uri: String,
     purpose: CertificatePurpose,
@@ -116,8 +44,6 @@ pub struct IssuedTestCertificate {
     not_before_millis: i64,
     not_after_millis: i64,
 }
-
-impl ZeroizeOnDrop for IssuedTestCertificate {}
 
 impl fmt::Debug for IssuedTestCertificate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -159,7 +85,17 @@ impl IssuedTestCertificate {
 
     /// Exposes PKCS#8 DER only for the lifetime of a TLS configuration callback.
     pub fn expose_private_key(&self, use_key: impl FnOnce(&[u8])) {
-        use_key(self.private_key_der.as_slice());
+        self.private_key_der.expose(use_key);
+    }
+
+    /// Transfers the fixture key into the production non-cloneable TLS identity boundary.
+    pub fn into_tls_client_identity(self) -> Result<TlsClientIdentity, TlsClientIdentityError> {
+        TlsClientIdentity::new_pkcs8(vec![self.certificate_der], self.private_key_der)
+    }
+
+    #[must_use]
+    pub const fn certificate_fingerprint(&self) -> CertificateFingerprint {
+        CertificateFingerprint::from_bytes(self.certificate_fingerprint)
     }
 }
 
@@ -253,6 +189,49 @@ impl TestCertificateAuthority {
         now_millis: i64,
         lifetime_seconds: u64,
     ) -> Result<IssuedTestCertificate, TestCertificateError> {
+        self.issue_customized_leaf(identity, purpose, None, true, now_millis, lifetime_seconds)
+    }
+
+    /// Issues an intentionally non-conforming multi-SAN leaf for negative verifier tests.
+    pub fn issue_with_additional_uri_san_for_test(
+        &self,
+        identity: &WorkloadIdentity,
+        purpose: CertificatePurpose,
+        additional_uri: &str,
+        now_millis: i64,
+        lifetime_seconds: u64,
+    ) -> Result<IssuedTestCertificate, TestCertificateError> {
+        self.issue_customized_leaf(
+            identity,
+            purpose,
+            Some(additional_uri),
+            true,
+            now_millis,
+            lifetime_seconds,
+        )
+    }
+
+    /// Issues an intentionally unrestricted leaf without an EKU extension.
+    pub fn issue_without_extended_key_usage_for_test(
+        &self,
+        identity: &WorkloadIdentity,
+        purpose: CertificatePurpose,
+        now_millis: i64,
+        lifetime_seconds: u64,
+    ) -> Result<IssuedTestCertificate, TestCertificateError> {
+        self.issue_customized_leaf(identity, purpose, None, false, now_millis, lifetime_seconds)
+    }
+
+    fn issue_customized_leaf(
+        &self,
+        identity: &WorkloadIdentity,
+        purpose: CertificatePurpose,
+        additional_uri: Option<&str>,
+        include_extended_key_usage: bool,
+        now_millis: i64,
+        lifetime_seconds: u64,
+    ) -> Result<IssuedTestCertificate, TestCertificateError> {
+        let identity_uri = canonical_identity_uri(identity)?;
         let lifetime_seconds = if lifetime_seconds == 0 {
             DEFAULT_LEAF_LIFETIME_SECONDS
         } else {
@@ -285,21 +264,28 @@ impl TestCertificateAuthority {
                 .ok_or(TestCertificateError::StateUnavailable)?;
             serial
         };
-        let identity_uri = identity.uri();
         let mut params = CertificateParams::default();
         params.not_before = to_time(not_before_millis)?;
         params.not_after = to_time(not_after_millis)?;
         params.serial_number = Some(SerialNumber::from(serial));
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![match purpose {
-            CertificatePurpose::ClientAuth => ExtendedKeyUsagePurpose::ClientAuth,
-            CertificatePurpose::ServerAuth => ExtendedKeyUsagePurpose::ServerAuth,
-        }];
+        if include_extended_key_usage {
+            params.extended_key_usages = vec![match purpose {
+                CertificatePurpose::ClientAuth => ExtendedKeyUsagePurpose::ClientAuth,
+                CertificatePurpose::ServerAuth => ExtendedKeyUsagePurpose::ServerAuth,
+            }];
+        }
         params.subject_alt_names = vec![SanType::URI(
             Ia5String::try_from(identity_uri.clone())
                 .map_err(|_| TestCertificateError::InvalidIdentity)?,
         )];
+        if let Some(additional_uri) = additional_uri {
+            params.subject_alt_names.push(SanType::URI(
+                Ia5String::try_from(additional_uri)
+                    .map_err(|_| TestCertificateError::InvalidIdentity)?,
+            ));
+        }
         if let WorkloadIdentity::ControlServer { dns_name } = identity {
             params.subject_alt_names.push(SanType::DnsName(
                 Ia5String::try_from(dns_name.clone())
@@ -314,7 +300,8 @@ impl TestCertificateAuthority {
             .signed_by(&leaf_key, &issuer)
             .map_err(|_| TestCertificateError::CertificateGeneration)?;
         let certificate_der = cert.der().to_vec();
-        let private_key_der = Zeroizing::new(leaf_key.serialize_der());
+        let private_key_der = SecretBytes::new(leaf_key.serialize_der())
+            .map_err(|_| TestCertificateError::CertificateGeneration)?;
         leaf_key.zeroize();
         let certificate_fingerprint = sha256(&certificate_der);
         self.issued
@@ -402,6 +389,15 @@ impl TestCertificateAuthority {
             .map_err(|_| TestCertificateError::StateUnavailable)?
             .insert(serial);
         Ok(())
+    }
+}
+
+fn canonical_identity_uri(identity: &WorkloadIdentity) -> Result<String, TestCertificateError> {
+    let identity_uri = identity.uri();
+    if identity_uri.parse::<WorkloadIdentity>().ok().as_ref() == Some(identity) {
+        Ok(identity_uri)
+    } else {
+        Err(TestCertificateError::InvalidIdentity)
     }
 }
 

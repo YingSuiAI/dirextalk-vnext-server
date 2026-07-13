@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/dtx-agent-host",
+    "crates/dtx-agent-host-supervisor",
     "crates/dtx-agent-persistence",
     "crates/dtx-agent-registry",
     "crates/dtx-connect-registry",
@@ -24,6 +25,7 @@ ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["ring", "zeroize"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
+x509-parser = { version = "0.18.1", default-features = false }
 oas3 = { version = "0.22.0", default-features = false, features = ["yaml-spec"] }
 protox = "0.9.1"
 prost-types = "0.14.4"

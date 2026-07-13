@@ -716,6 +716,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-agent-host-supervisor"
+version = "0.1.0"
+dependencies = [
+ "dtx-agent-host",
+ "dtx-connect-registry",
+ "dtx-domain",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "uuid",
+]
+
+[[package]]
 name = "dtx-agent-persistence"
 version = "0.1.0"
 dependencies = [
@@ -723,7 +736,9 @@ dependencies = [
  "dtx-agent-registry",
  "dtx-connect-registry",
  "dtx-domain",
+ "dtx-security",
  "dtx-storage",
+ "sha2 0.11.0",
  "sqlx",
  "testcontainers-modules",
  "tokio",
@@ -779,6 +794,9 @@ version = "0.1.0"
 dependencies = [
  "dtx-domain",
  "dtx-wire",
+ "rustls",
+ "sha2 0.11.0",
+ "x509-parser",
  "zeroize",
 ]
 

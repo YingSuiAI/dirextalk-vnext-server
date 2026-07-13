@@ -8,6 +8,9 @@ publish = false
 [dependencies]
 dtx-domain = { path = "../dtx-domain" }
 dtx-wire = { path = "../dtx-wire" }
+rustls.workspace = true
+sha2.workspace = true
+x509-parser.workspace = true
 zeroize.workspace = true
 
 [lints]

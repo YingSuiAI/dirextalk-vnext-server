@@ -6,11 +6,14 @@ use uuid::Uuid;
 
 const INITIAL_MIGRATION_VERSION: i64 = 202_607_130_001;
 const AGENT_CONTROL_MIGRATION_VERSION: i64 = 202_607_130_002;
-const EXPECTED_MIGRATION_COUNT: i64 = 2;
+const HOST_AUTHORIZATION_MIGRATION_VERSION: i64 = 202_607_130_003;
+const EXPECTED_MIGRATION_COUNT: i64 = 3;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
     include_str!("../../../migrations/202607130002_agent_control_domain.down.sql");
+const HOST_AUTHORIZATION_DOWN: &str =
+    include_str!("../../../migrations/202607130003_host_credential_authorization.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,9 +38,13 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
 
-    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version IN ($1, $2)")
+    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version IN ($1, $2, $3)")
         .bind(INITIAL_MIGRATION_VERSION)
         .bind(AGENT_CONTROL_MIGRATION_VERSION)
+        .bind(HOST_AUTHORIZATION_MIGRATION_VERSION)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(HOST_AUTHORIZATION_DOWN)
         .execute(harness.admin_pool())
         .await?;
     sqlx::raw_sql(AGENT_CONTROL_DOWN)
@@ -164,6 +171,9 @@ async fn assert_append_only_tables_have_no_update(
         "agent.conversation_grant_versions",
         "agent.conversation_grant_permissions",
         "agent.conversation_grant_cloud_connections",
+        "agent.host_credential_authorization_credentials",
+        "agent.host_credential_authorization_revisions",
+        "agent.host_credential_authorization_states",
     ] {
         let can_update: bool =
             sqlx::query_scalar("SELECT has_table_privilege('dtx_runtime_test', $1, 'UPDATE')")

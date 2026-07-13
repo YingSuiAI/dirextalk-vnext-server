@@ -9,6 +9,7 @@ Run commands from this repository root.
 | test | `cargo test --workspace --locked` |
 | persistence migrations | `cargo test -p dtx-storage --test migrations --locked` |
 | persistence contracts | `cargo test -p dtx-storage --test persistence_contract --locked` |
+| Host Supervisor VM acceptance (destructive; isolated disposable Linux VM only) | `sudo DTX_DISPOSABLE_VM_ACCEPTANCE=1 bash scripts/test-host-supervisor-vm.sh` |
 | SQLx migration/prepare gate | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sqlx-prepare.ps1` |
 | testkit dependency boundary | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-testkit-boundary.ps1` |
 | build | `cargo build --workspace --locked` |
