@@ -400,7 +400,9 @@ impl AgentRunRepository {
             let eligibility = match probe {
                 Ok(eligibility) => eligibility,
                 Err(
-                    AgentPersistenceError::FenceConflict | AgentPersistenceError::ClaimRejected(_),
+                    AgentPersistenceError::FenceConflict
+                    | AgentPersistenceError::ClaimRejected(_)
+                    | AgentPersistenceError::AuthorizationRejected(_),
                 ) if run.request().dispatch_mode() == DispatchMode::Failover => {
                     run.skip_ineligible_candidate(timing.now()?)
                         .map_err(transition_error)?;
@@ -409,7 +411,9 @@ impl AgentRunRepository {
                     continue;
                 }
                 Err(
-                    AgentPersistenceError::FenceConflict | AgentPersistenceError::ClaimRejected(_),
+                    AgentPersistenceError::FenceConflict
+                    | AgentPersistenceError::ClaimRejected(_)
+                    | AgentPersistenceError::AuthorizationRejected(_),
                 ) => {
                     run.defer_unavailable(timing.now()?)
                         .map_err(transition_error)?;
@@ -785,11 +789,7 @@ impl AgentRunRepository {
         )
         .await?;
         save_head(&mut transaction, &run, expected_revision).await?;
-        timing.ensure_commit_before(
-            admission
-                .lease_expires_at_millis
-                .min(admission.control_expires_at_millis),
-        )?;
+        timing.ensure_commit_before(admission.commit_deadline_millis())?;
         transaction.commit().await?;
         Ok((disposition, run))
     }
@@ -1205,6 +1205,15 @@ struct RouteAdmission {
     evaluated_at_millis: i64,
     control_expires_at_millis: i64,
     lease_expires_at_millis: i64,
+    authorization_expires_at_millis: Option<i64>,
+}
+
+impl RouteAdmission {
+    fn commit_deadline_millis(self) -> i64 {
+        self.lease_expires_at_millis
+            .min(self.control_expires_at_millis)
+            .min(self.authorization_expires_at_millis.unwrap_or(i64::MAX))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1655,6 +1664,10 @@ async fn validate_route_eligibility(
                 b.max_concurrency AS binding_max_concurrency,
                 installation.desired_state AS installation_state,
                 device.state AS agent_device_state,
+                grant_head.current_grant_version,
+                grant_version.approved_at_ms AS grant_approved_at_ms,
+                grant_version.expires_at_ms AS grant_expires_at_ms,
+                grant_version.revoked_at_ms AS grant_revoked_at_ms,
                 c.lease_id AS claim_lease_id, c.boot_id AS claim_boot_id,
                 c.connector_generation AS claim_generation,
                 c.capability_codes, c.maximum_concurrent_runs,
@@ -1673,19 +1686,30 @@ async fn validate_route_eligibility(
              ON device.tenant_id=b.tenant_id
             AND device.agent_device_id=b.agent_device_id
             AND device.installation_id=b.installation_id
+           JOIN agent.conversation_grant_heads grant_head
+             ON grant_head.tenant_id=b.tenant_id
+            AND grant_head.conversation_id=$6
+            AND grant_head.installation_id=b.installation_id
+           JOIN agent.conversation_grant_versions grant_version
+             ON grant_version.tenant_id=grant_head.tenant_id
+            AND grant_version.conversation_id=grant_head.conversation_id
+            AND grant_version.installation_id=grant_head.installation_id
+            AND grant_version.grant_version=grant_head.current_grant_version
+            AND grant_version.grant_id=grant_head.current_grant_id
            JOIN agent.connector_runtime_claim_heads h
              ON h.tenant_id=i.tenant_id AND h.connector_id=i.connector_id
            JOIN agent.connector_runtime_claims c
              ON c.tenant_id=h.tenant_id AND c.connector_id=h.connector_id
             AND c.claim_revision=h.current_claim_revision
           WHERE i.tenant_id=$1 AND i.connector_id=$2
-          FOR SHARE OF i,l,b,installation,device,h",
+          FOR SHARE OF i,l,b,installation,device,grant_head,h",
     )
     .bind(Uuid::from(run.request().tenant_id()))
     .bind(Uuid::from(candidate.connector_id()))
     .bind(Uuid::from(fence.connector_lease_id()))
     .bind(Uuid::from(candidate.binding_id()))
     .bind(Uuid::from(run.request().installation_id()))
+    .bind(Uuid::from(run.request().conversation_id()))
     .fetch_optional(&mut *connection)
     .await?
     .ok_or(AgentPersistenceError::FenceConflict)?;
@@ -1721,6 +1745,23 @@ async fn validate_route_eligibility(
             != Some(u64::from(candidate.max_concurrency()))
     {
         return Err(AgentPersistenceError::FenceConflict);
+    }
+    let current_grant_version = positive_u64(
+        row.try_get("current_grant_version")?,
+        "Conversation Grant version",
+    )?;
+    let grant_approved_at_millis: i64 = row.try_get("grant_approved_at_ms")?;
+    let grant_expires_at_millis: Option<i64> = row.try_get("grant_expires_at_ms")?;
+    if current_grant_version != run.request().grant_version()
+        || row
+            .try_get::<Option<i64>, _>("grant_revoked_at_ms")?
+            .is_some()
+        || now_millis < grant_approved_at_millis
+        || grant_expires_at_millis.is_some_and(|expires_at| now_millis >= expires_at)
+    {
+        return Err(AgentPersistenceError::AuthorizationRejected(
+            "Conversation Grant unavailable",
+        ));
     }
     let capabilities: Vec<String> = row.try_get("capability_codes")?;
     if run
@@ -1784,7 +1825,11 @@ async fn validate_route_eligibility(
         connector_capacity,
         evaluated_at_millis: now_millis,
         control_expires_at_millis,
-        lease_expires_at_millis,
+        lease_expires_at_millis: grant_expires_at_millis
+            .map_or(lease_expires_at_millis, |grant_expires_at| {
+                lease_expires_at_millis.min(grant_expires_at)
+            }),
+        authorization_expires_at_millis: grant_expires_at_millis,
     })
 }
 
@@ -1860,7 +1905,7 @@ async fn probe_route_eligibility(
         control_expires_at_millis: row.try_get("expires_at_ms")?,
         connector_capacity: admission.connector_capacity,
         evaluated_at_millis: admission.evaluated_at_millis,
-        proposed_expires_at_millis: admission.lease_expires_at_millis,
+        proposed_expires_at_millis: admission.commit_deadline_millis(),
     })
 }
 

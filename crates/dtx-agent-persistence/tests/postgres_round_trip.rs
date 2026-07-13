@@ -153,7 +153,7 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
             [0x61; 32],
             [0x62; 32],
             fixture.installation.installation_id(),
-            ConversationId::new(),
+            fixture.grant.conversation_id(),
             EventId::new(),
             Some(connector.connector_id()),
             vec!["agent.run".to_owned()],
@@ -162,7 +162,7 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
             routing_policy.revision,
             fixture.grant.grant_version().get(),
             1_190,
-            1_101,
+            1_131,
         )?,
         vec![RouteCandidate::new(
             binding.binding_id,
@@ -192,7 +192,7 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
             [0x63; 32],
             [0x64; 32],
             fixture.installation.installation_id(),
-            ConversationId::new(),
+            fixture.grant.conversation_id(),
             EventId::new(),
             Some(connector.connector_id()),
             vec!["agent.run".to_owned()],
@@ -201,7 +201,7 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
             routing_policy.revision,
             fixture.grant.grant_version().get(),
             1_190,
-            1_102,
+            1_132,
         )?,
         vec![RouteCandidate::new(
             binding.binding_id,
@@ -230,7 +230,7 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
             run.request().run_id(),
             run.revision(),
             offer_id,
-            1_110,
+            1_140,
             1_180,
         )
         .await?;
@@ -250,7 +250,7 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
             saturated_run.request().run_id(),
             saturated_run.revision(),
             saturated_offer_id,
-            1_111,
+            1_141,
             1_180,
         )
         .await?;
@@ -272,7 +272,7 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
             offer.attempt(),
             ConnectorLeaseFence::from(fixture.first_lease_fence),
             RunLeaseId::new(),
-            1_120,
+            1_145,
             1_170,
         )
         .await;
@@ -326,7 +326,7 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
             saturated_offer.attempt(),
             router_fence,
             RunLeaseId::new(),
-            1_131,
+            1_151,
             1_170,
         )
         .await;
@@ -361,7 +361,7 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
             lease.run_lease_id(),
             lease.run_lease_epoch(),
             router_fence,
-            1_140,
+            1_160,
         )
         .await?;
     session.commit().await?;
@@ -374,6 +374,41 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
         0,
     )
     .await?;
+    let mut revoked_grant = fixture.grant.clone();
+    revoked_grant.apply(
+        &fixture.installation,
+        revoked_grant.grant_version(),
+        ConversationGrantCommand::Revoke {
+            revoked_at_ms: 1_165,
+        },
+    )?;
+    let mut session = store.begin_tenant(tenant_id).await?;
+    ConversationGrantRepository::new()
+        .save(session.connection(), &revoked_grant, 1_166)
+        .await?;
+    session.commit().await?;
+    let mut revoked_session = store.begin_tenant(tenant_id).await?;
+    let revoked_claim = repository
+        .claim(
+            revoked_session.connection(),
+            tenant_id,
+            saturated_run.request().run_id(),
+            saturated_offered_run.revision(),
+            saturated_offer.offer_id(),
+            saturated_offer.attempt(),
+            router_fence,
+            RunLeaseId::new(),
+            1_167,
+            1_175,
+        )
+        .await;
+    revoked_session.rollback().await?;
+    assert!(matches!(
+        revoked_claim,
+        Err(AgentPersistenceError::AuthorizationRejected(
+            "Conversation Grant unavailable"
+        ))
+    ));
     let mut session = store.begin_tenant(tenant_id).await?;
     let expired_offer = repository
         .expire_next_due(session.connection(), tenant_id, 1_180)
@@ -427,7 +462,7 @@ async fn claim_run(
             offer_attempt,
             connector_fence,
             run_lease_id,
-            1_130,
+            1_150,
             1_170,
         )
         .await?;

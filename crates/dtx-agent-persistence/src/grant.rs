@@ -280,6 +280,40 @@ impl ConversationGrantRepository {
             .map(Some)
             .map_err(|_| AgentPersistenceError::SnapshotRejected("Conversation Grant"))
     }
+
+    /// Locks the current grant head against concurrent revocation or replacement,
+    /// then loads the complete current grant image.
+    ///
+    /// The caller must keep the surrounding transaction open until the operation
+    /// authorized by this grant has been durably committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns database/corrupt-data errors or rejects a malformed grant snapshot.
+    pub async fn load_for_share(
+        self,
+        connection: &mut PgConnection,
+        tenant_id: TenantId,
+        conversation_id: ConversationId,
+        installation_id: InstallationId,
+    ) -> Result<Option<ConversationGrant>, AgentPersistenceError> {
+        let current: Option<i64> = sqlx::query_scalar(
+            "SELECT current_grant_version
+               FROM agent.conversation_grant_heads
+              WHERE tenant_id=$1 AND conversation_id=$2 AND installation_id=$3
+              FOR SHARE",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(conversation_id))
+        .bind(Uuid::from(installation_id))
+        .fetch_optional(&mut *connection)
+        .await?;
+        if current.is_none() {
+            return Ok(None);
+        }
+        self.load(connection, tenant_id, conversation_id, installation_id)
+            .await
+    }
 }
 
 fn validate_grant_successor(

@@ -15,10 +15,10 @@ use dtx_agent_persistence::{
     AgentRunOfferNext, AgentRunRepository, BindingSetRepository, CommandLogRepository,
     CommandReplayBatch, CommandStreamHead, ConnectorControlOperationKind,
     ConnectorControlOperationRepository, ConnectorCredentialAuthorizationRepository,
-    ConnectorRepository, DurableCommandDecoder, EnrollmentIntentRepository,
-    MAX_AGENT_RUN_EXPIRY_BATCH, MAX_AGENT_RUN_OFFER_PAGE, PendingAgentRunOffer,
-    PersistedCommandFrame, RuntimeCapacity, RuntimeClaimRecord, RuntimeClaimRepository,
-    RuntimeClaimSource,
+    ConnectorRepository, ConversationGrantRepository, DurableCommandDecoder,
+    EnrollmentIntentRepository, MAX_AGENT_RUN_EXPIRY_BATCH, MAX_AGENT_RUN_OFFER_PAGE,
+    PendingAgentRunOffer, PersistedCommandFrame, RuntimeCapacity, RuntimeClaimRecord,
+    RuntimeClaimRepository, RuntimeClaimSource,
 };
 use dtx_agent_router::{
     AgentRun, ConnectorLeaseFence, DispatchMode, MAX_ROUTE_CANDIDATES, RunOffer, RunRequest,
@@ -541,14 +541,43 @@ fn run_create_request_matches(run: &AgentRun, candidate: &CreateAgentRunRequest)
             == Some(candidate.queue_ttl_millis)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValidatedNewRunAuthority {
+    evaluated_at_millis: i64,
+    expires_at_millis: Option<i64>,
+}
+
+impl ValidatedNewRunAuthority {
+    fn ensure_commit_time(self, now_millis: i64) -> Result<(), ConnectorControlApplicationError> {
+        if now_millis < self.evaluated_at_millis
+            || self
+                .expires_at_millis
+                .is_some_and(|expires_at| now_millis >= expires_at)
+        {
+            return Err(ConnectorControlApplicationError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
 async fn validate_new_run_authority(
     connection: &mut sqlx::PgConnection,
     tenant_id: TenantId,
     installation_id: InstallationId,
+    conversation_id: ConversationId,
+    grant_version: u64,
     bindings: &BindingSet,
-) -> Result<(), ConnectorControlApplicationError> {
+    clock: &dyn Clock,
+) -> Result<ValidatedNewRunAuthority, ConnectorControlApplicationError> {
     let installation = AgentInstallationRepository::new()
         .load(connection, tenant_id, installation_id)
+        .await
+        .map_err(persistence_error)?
+        .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
+    let captured_grant_version = Revision::new(grant_version)
+        .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?;
+    let grant = ConversationGrantRepository::new()
+        .load_for_share(connection, tenant_id, conversation_id, installation_id)
         .await
         .map_err(persistence_error)?
         .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
@@ -578,7 +607,19 @@ async fn validate_new_run_authority(
     bindings
         .eligible_route_order(&installation, &device_refs)
         .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?;
-    Ok(())
+    // Sample only after the grant head and all other authorization facts have
+    // been read. A waiter must not create a Run using time captured before a
+    // concurrent grant transition completed.
+    let now_millis = clock
+        .now_utc_millis()
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+    if !grant.authorizes_version_for(&installation, now_millis, captured_grant_version) {
+        return Err(ConnectorControlApplicationError::InvalidRequest);
+    }
+    Ok(ValidatedNewRunAuthority {
+        evaluated_at_millis: now_millis,
+        expires_at_millis: grant.snapshot().expires_at_ms,
+    })
 }
 
 /// Production `PostgreSQL` implementation of the Connector enrollment/control application port.
@@ -651,7 +692,6 @@ impl PostgresConnectorControlApplication {
         &self,
         request: CreateAgentRunRequest,
     ) -> Result<CreatedAgentRun, ConnectorControlApplicationError> {
-        let now = self.now()?;
         let repository = AgentRunRepository::new();
         let mut session = self
             .store
@@ -659,7 +699,7 @@ impl PostgresConnectorControlApplication {
             .await
             .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
 
-        let (disposition, run) = if let Some(existing) = repository
+        let (disposition, run, authority) = if let Some(existing) = repository
             .load_by_identity(
                 session.connection(),
                 request.tenant_id,
@@ -672,17 +712,20 @@ impl PostgresConnectorControlApplication {
             if !run_create_request_matches(&existing, &request) {
                 return Err(ConnectorControlApplicationError::Conflict);
             }
-            (AgentRunCreate::Existing, existing)
+            (AgentRunCreate::Existing, existing, None)
         } else {
             let bindings = BindingSetRepository::new()
                 .load(session.connection(), request.tenant_id)
                 .await
                 .map_err(persistence_error)?;
-            validate_new_run_authority(
+            let authority = validate_new_run_authority(
                 session.connection(),
                 request.tenant_id,
                 request.installation_id,
+                request.conversation_id,
+                request.grant_version,
                 &bindings,
+                self.clock.as_ref(),
             )
             .await?;
             let run = build_agent_run(
@@ -690,14 +733,18 @@ impl PostgresConnectorControlApplication {
                 RunId::try_from(self.next_uuid()?)
                     .map_err(|_| ConnectorControlApplicationError::Internal)?,
                 &bindings,
-                now,
+                authority.evaluated_at_millis,
             )?;
-            repository
+            let (disposition, persisted) = repository
                 .create(session.connection(), &run)
                 .await
-                .map_err(persistence_error)?
+                .map_err(persistence_error)?;
+            (disposition, persisted, Some(authority))
         };
 
+        if let Some(authority) = authority {
+            authority.ensure_commit_time(self.now()?)?;
+        }
         session
             .commit()
             .await
@@ -3395,6 +3442,9 @@ fn persistence_error(error: AgentPersistenceError) -> ConnectorControlApplicatio
         | AgentPersistenceError::MaterializationLimitExceeded(_) => {
             ConnectorControlApplicationError::ResourceExhausted
         }
+        AgentPersistenceError::AuthorizationRejected(_) => {
+            ConnectorControlApplicationError::PermissionDenied
+        }
         AgentPersistenceError::CorruptData(_)
         | AgentPersistenceError::CommandDecodeRejected
         | AgentPersistenceError::SnapshotRejected(_) => ConnectorControlApplicationError::Internal,
@@ -3404,7 +3454,9 @@ fn persistence_error(error: AgentPersistenceError) -> ConnectorControlApplicatio
 #[allow(clippy::needless_pass_by_value)]
 fn run_persistence_error(error: AgentPersistenceError) -> ConnectorControlApplicationError {
     match error {
-        AgentPersistenceError::RevisionConflict { .. } | AgentPersistenceError::FenceConflict => {
+        AgentPersistenceError::RevisionConflict { .. }
+        | AgentPersistenceError::FenceConflict
+        | AgentPersistenceError::AuthorizationRejected(_) => {
             ConnectorControlApplicationError::StaleLease
         }
         other => persistence_error(other),
