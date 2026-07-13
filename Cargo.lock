@@ -739,6 +739,7 @@ dependencies = [
  "dtx-agent-control-proto",
  "dtx-agent-host",
  "dtx-agent-persistence",
+ "dtx-agent-router",
  "dtx-connect-registry",
  "dtx-domain",
  "dtx-security",
@@ -791,6 +792,7 @@ dependencies = [
  "dtx-agent-control",
  "dtx-agent-host",
  "dtx-agent-registry",
+ "dtx-agent-router",
  "dtx-connect-registry",
  "dtx-domain",
  "dtx-security",
@@ -809,6 +811,14 @@ version = "0.1.0"
 dependencies = [
  "dtx-domain",
  "proptest",
+]
+
+[[package]]
+name = "dtx-agent-router"
+version = "0.1.0"
+dependencies = [
+ "dtx-connect-registry",
+ "dtx-domain",
 ]
 
 [[package]]

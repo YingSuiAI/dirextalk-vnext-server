@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -569,20 +569,40 @@ fn validate_protobuf(root: &Path) -> Result<(), ProtocolToolError> {
             "protocol/proto contains no .proto files",
         ));
     }
-    let descriptors = protox::compile(protos.iter(), [&proto_root])
-        .map_err(|error| ProtocolToolError::new(format!("compile Protobuf: {error}")))?;
-    let descriptor_names = descriptors
-        .file
-        .iter()
-        .filter_map(|descriptor| descriptor.name.as_deref())
-        .collect::<BTreeSet<_>>();
+    // Full additive Agent Control artifacts intentionally retain the same
+    // package and service identity. Compile each version directory as its own
+    // source unit while compiling the rest of the protocol tree together.
+    let agent_control_root = proto_root.join("dirextalk/agent_control");
+    let mut compilation_units: BTreeMap<PathBuf, Vec<&PathBuf>> = BTreeMap::new();
+    for proto in &protos {
+        let unit = proto
+            .strip_prefix(&agent_control_root)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .map_or_else(
+                || PathBuf::from("shared"),
+                |version| PathBuf::from("agent_control").join(version.as_os_str()),
+            );
+        compilation_units.entry(unit).or_default().push(proto);
+    }
+    let mut descriptor_names = BTreeSet::new();
+    for unit in compilation_units.values() {
+        let descriptors = protox::compile(unit.iter().copied(), [&proto_root])
+            .map_err(|error| ProtocolToolError::new(format!("compile Protobuf: {error}")))?;
+        descriptor_names.extend(
+            descriptors
+                .file
+                .iter()
+                .filter_map(|descriptor| descriptor.name.as_deref().map(str::to_owned)),
+        );
+    }
     for proto in &protos {
         let relative = normalize_relative(
             proto
                 .strip_prefix(&proto_root)
                 .map_err(|_| ProtocolToolError::new("Protobuf path escaped protocol/proto"))?,
         )?;
-        if !descriptor_names.contains(relative.as_str()) {
+        if !descriptor_names.contains(&relative) {
             return Err(ProtocolToolError::new(format!(
                 "Protobuf descriptor omitted {relative}"
             )));

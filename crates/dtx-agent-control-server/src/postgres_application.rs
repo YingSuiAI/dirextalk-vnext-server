@@ -11,19 +11,27 @@ use dtx_agent_control::{
 };
 use dtx_agent_control_proto::v1;
 use dtx_agent_persistence::{
-    AgentPersistenceError, CommandLogRepository, CommandReplayBatch, CommandStreamHead,
-    ConnectorControlOperationKind, ConnectorControlOperationRepository,
-    ConnectorCredentialAuthorizationRepository, ConnectorRepository, DurableCommandDecoder,
-    EnrollmentIntentRepository, PersistedCommandFrame, RuntimeCapacity, RuntimeClaimRecord,
-    RuntimeClaimRepository, RuntimeClaimSource,
+    AgentDeviceRepository, AgentInstallationRepository, AgentPersistenceError, AgentRunCreate,
+    AgentRunOfferNext, AgentRunRepository, BindingSetRepository, CommandLogRepository,
+    CommandReplayBatch, CommandStreamHead, ConnectorControlOperationKind,
+    ConnectorControlOperationRepository, ConnectorCredentialAuthorizationRepository,
+    ConnectorRepository, DurableCommandDecoder, EnrollmentIntentRepository,
+    MAX_AGENT_RUN_EXPIRY_BATCH, MAX_AGENT_RUN_OFFER_PAGE, PendingAgentRunOffer,
+    PersistedCommandFrame, RuntimeCapacity, RuntimeClaimRecord, RuntimeClaimRepository,
+    RuntimeClaimSource,
+};
+use dtx_agent_router::{
+    AgentRun, ConnectorLeaseFence, DispatchMode, MAX_ROUTE_CANDIDATES, RunOffer, RunRequest,
+    RunRoutingState, resolve_route_plan,
 };
 use dtx_connect_registry::{
-    AdapterKind, ConnectorControlHead, ConnectorDesiredState, ConnectorFence, ConnectorLease,
-    ConnectorObservedState,
+    AdapterKind, BindingSet, BindingState, ConnectorControlHead, ConnectorDesiredState,
+    ConnectorFence, ConnectorLease, ConnectorObservedState,
 };
 use dtx_domain::{
-    Clock, ConnectorCredentialId, ConnectorId, Ed25519PublicKey, EnrollmentIntentId, HostId,
-    IdGenerator, LeaseId, RequestId, Revision, SystemClock, TenantId, UuidV7Generator,
+    Clock, ConnectorCredentialId, ConnectorId, ConversationId, Ed25519PublicKey,
+    EnrollmentIntentId, EventId, HostId, IdGenerator, InstallationId, LeaseId, RequestId, Revision,
+    RunId, RunLeaseId, RunOfferId, SystemClock, TenantId, UuidV7Generator,
 };
 use dtx_security::{AuthenticatedConnectorPeer, ConnectorWorkloadIdentity};
 use dtx_storage::PgStore;
@@ -36,15 +44,21 @@ use crate::{
     ConnectorCredentialAuthorizationIndex, CredentialRotationCompletion, EnrollmentCompletion,
     HeartbeatCompletion, OpenControlCompletion, ParsedCapacity, ParsedCommandAcknowledgement,
     ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat, ParsedHello,
-    ParsedLeaseFence, ParsedReady, ProtobufDurableCommandEncoder,
+    ParsedLeaseFence, ParsedReady, ParsedRunClaim, ParsedRunRelease, ProtobufDurableCommandEncoder,
+    RunAvailableWire, RunLeaseGrantedWire, RunOfferNotificationSubscription,
     command_notifications::ConnectorCommandNotifications,
+    run_notifications::ConnectorRunOfferNotifications,
 };
 
 const PROTOCOL_MAJOR: u32 = 1;
-const DEFAULT_PROTOCOL_MINOR: u32 = 0;
+const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 1;
 const DEFAULT_HEARTBEAT_INTERVAL_MILLIS: u32 = 10_000;
 const DEFAULT_HEARTBEAT_TTL_MILLIS: u32 = 30_000;
 const CERTIFICATE_NOT_BEFORE_SKEW_MILLIS: i64 = 30_000;
+const DEFAULT_RUN_QUEUE_TTL_MILLIS: i64 = 300_000;
+const MAX_RUN_QUEUE_TTL_MILLIS: i64 = 3_600_000;
+const DEFAULT_RUN_OFFER_TTL_MILLIS: i64 = 15_000;
+const DEFAULT_RUN_LEASE_TTL_MILLIS: i64 = 30_000;
 
 /// Validated server-owned negotiation and lease policy for Connector control.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,7 +81,8 @@ impl ConnectorControlPolicy {
         heartbeat_ttl_millis: u32,
         supported_server_capabilities: impl IntoIterator<Item = String>,
     ) -> Result<Self, ConnectorControlApplicationError> {
-        if !(1_000..=60_000).contains(&heartbeat_interval_millis)
+        if protocol_minor > DEFAULT_MAXIMUM_PROTOCOL_MINOR
+            || !(1_000..=60_000).contains(&heartbeat_interval_millis)
             || heartbeat_ttl_millis <= heartbeat_interval_millis
             || heartbeat_ttl_millis > 300_000
         {
@@ -92,12 +107,13 @@ impl ConnectorControlPolicy {
 impl Default for ConnectorControlPolicy {
     fn default() -> Self {
         Self::new(
-            DEFAULT_PROTOCOL_MINOR,
+            DEFAULT_MAXIMUM_PROTOCOL_MINOR,
             DEFAULT_HEARTBEAT_INTERVAL_MILLIS,
             DEFAULT_HEARTBEAT_TTL_MILLIS,
             [
                 "credential-rotation".to_owned(),
                 "durable-command-replay".to_owned(),
+                "run-routing".to_owned(),
                 "runtime-claims".to_owned(),
             ],
         )
@@ -362,6 +378,209 @@ pub struct CloseConnectorStreamRequest {
     pub command: CloseStreamCommand,
 }
 
+/// Owner-facing request for one explicitly targeted, idempotent Agent Run.
+///
+/// Only digests cross this control-plane boundary. Prompt and attachment bytes
+/// remain in the authorized conversation/event store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateAgentRunRequest {
+    tenant_id: TenantId,
+    request_id: RequestId,
+    idempotency_digest: [u8; 32],
+    request_digest: [u8; 32],
+    installation_id: InstallationId,
+    conversation_id: ConversationId,
+    request_event_id: EventId,
+    preferred_connector_id: Option<ConnectorId>,
+    required_capabilities: Vec<String>,
+    dispatch_mode: DispatchMode,
+    grant_version: u64,
+    queue_ttl_millis: i64,
+}
+
+impl CreateAgentRunRequest {
+    /// Creates a bounded explicit-target Run request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unsafe queue lifetime. Capability and policy validation is
+    /// performed against the current immutable Binding snapshot at creation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tenant_id: TenantId,
+        request_id: RequestId,
+        idempotency_digest: [u8; 32],
+        request_digest: [u8; 32],
+        installation_id: InstallationId,
+        conversation_id: ConversationId,
+        request_event_id: EventId,
+        preferred_connector_id: Option<ConnectorId>,
+        required_capabilities: Vec<String>,
+        dispatch_mode: DispatchMode,
+        grant_version: u64,
+        queue_ttl_millis: Option<i64>,
+    ) -> Result<Self, ConnectorControlApplicationError> {
+        let queue_ttl_millis = queue_ttl_millis.unwrap_or(DEFAULT_RUN_QUEUE_TTL_MILLIS);
+        if !(1..=MAX_RUN_QUEUE_TTL_MILLIS).contains(&queue_ttl_millis) {
+            return Err(ConnectorControlApplicationError::InvalidRequest);
+        }
+        Ok(Self {
+            tenant_id,
+            request_id,
+            idempotency_digest,
+            request_digest,
+            installation_id,
+            conversation_id,
+            request_event_id,
+            preferred_connector_id,
+            required_capabilities,
+            dispatch_mode,
+            grant_version,
+            queue_ttl_millis,
+        })
+    }
+}
+
+/// Durable result of an exact create-and-route attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatedAgentRun {
+    inserted: bool,
+    run: AgentRun,
+}
+
+impl CreatedAgentRun {
+    #[must_use]
+    pub const fn inserted(&self) -> bool {
+        self.inserted
+    }
+
+    #[must_use]
+    pub const fn run_id(&self) -> RunId {
+        self.run.request().run_id()
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> RunRoutingState {
+        self.run.state()
+    }
+
+    #[must_use]
+    pub const fn run(&self) -> &AgentRun {
+        &self.run
+    }
+}
+
+/// Bounded outcome of one tenant-local Router reconciliation pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AgentRunReconcileBatch {
+    pub processed: usize,
+    pub reoffered: usize,
+    pub expired: usize,
+    pub reconcile_required: usize,
+}
+
+fn build_agent_run(
+    request: CreateAgentRunRequest,
+    run_id: RunId,
+    binding_set: &dtx_connect_registry::BindingSet,
+    now_millis: i64,
+) -> Result<AgentRun, ConnectorControlApplicationError> {
+    let route = resolve_route_plan(
+        binding_set,
+        request.tenant_id,
+        request.installation_id,
+        request.preferred_connector_id,
+        request.dispatch_mode,
+    )
+    .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?;
+    let queue_deadline_millis = now_millis
+        .checked_add(request.queue_ttl_millis)
+        .filter(|deadline| *deadline <= Revision::MAX.cast_signed())
+        .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
+    let run_request = RunRequest::new(
+        request.tenant_id,
+        run_id,
+        request.request_id,
+        request.idempotency_digest,
+        request.request_digest,
+        request.installation_id,
+        request.conversation_id,
+        request.request_event_id,
+        request.preferred_connector_id,
+        request.required_capabilities,
+        request.dispatch_mode,
+        route.routing_policy(),
+        route.routing_policy_revision(),
+        request.grant_version,
+        queue_deadline_millis,
+        now_millis,
+    )
+    .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?;
+    AgentRun::create(run_request, route.into_candidates())
+        .map_err(|_| ConnectorControlApplicationError::InvalidRequest)
+}
+
+fn run_create_request_matches(run: &AgentRun, candidate: &CreateAgentRunRequest) -> bool {
+    let request = run.request();
+    let mut capabilities = candidate.required_capabilities.clone();
+    capabilities.sort_unstable();
+    request.tenant_id() == candidate.tenant_id
+        && request.request_id() == candidate.request_id
+        && request.idempotency_digest() == candidate.idempotency_digest
+        && request.request_digest() == candidate.request_digest
+        && request.installation_id() == candidate.installation_id
+        && request.conversation_id() == candidate.conversation_id
+        && request.request_event_id() == candidate.request_event_id
+        && request.preferred_connector_id() == candidate.preferred_connector_id
+        && request.required_capabilities() == capabilities
+        && request.dispatch_mode() == candidate.dispatch_mode
+        && request.grant_version() == candidate.grant_version
+        && request
+            .queue_deadline_millis()
+            .checked_sub(request.created_at_millis())
+            == Some(candidate.queue_ttl_millis)
+}
+
+async fn validate_new_run_authority(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    bindings: &BindingSet,
+) -> Result<(), ConnectorControlApplicationError> {
+    let installation = AgentInstallationRepository::new()
+        .load(connection, tenant_id, installation_id)
+        .await
+        .map_err(persistence_error)?
+        .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
+    let binding_snapshot = bindings.snapshot();
+    let device_ids = binding_snapshot
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding.installation_id == installation_id && binding.state == BindingState::Enabled
+        })
+        .map(|binding| binding.agent_device_id)
+        .collect::<BTreeSet<_>>();
+    if device_ids.is_empty() || device_ids.len() > MAX_ROUTE_CANDIDATES {
+        return Err(ConnectorControlApplicationError::InvalidRequest);
+    }
+    let mut devices = Vec::with_capacity(device_ids.len());
+    for device_id in device_ids {
+        devices.push(
+            AgentDeviceRepository::new()
+                .load(connection, tenant_id, device_id)
+                .await
+                .map_err(persistence_error)?
+                .ok_or(ConnectorControlApplicationError::InvalidRequest)?,
+        );
+    }
+    let device_refs = devices.iter().collect::<Vec<_>>();
+    bindings
+        .eligible_route_order(&installation, &device_refs)
+        .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?;
+    Ok(())
+}
+
 /// Production `PostgreSQL` implementation of the Connector enrollment/control application port.
 pub struct PostgresConnectorControlApplication {
     store: PgStore,
@@ -371,6 +590,7 @@ pub struct PostgresConnectorControlApplication {
     authorization_index: Arc<ConnectorCredentialAuthorizationIndex>,
     command_decoder: Arc<dyn DurableCommandDecoder>,
     command_notifications: Arc<ConnectorCommandNotifications>,
+    run_offer_notifications: Arc<ConnectorRunOfferNotifications>,
     policy: ConnectorControlPolicy,
 }
 
@@ -412,8 +632,301 @@ impl PostgresConnectorControlApplication {
             authorization_index,
             command_decoder,
             command_notifications: ConnectorCommandNotifications::new(),
+            run_offer_notifications: ConnectorRunOfferNotifications::new(),
             policy,
         }
+    }
+
+    /// Persists an explicit Agent Run before making a bounded best-effort offer.
+    ///
+    /// Exact retries return the original server-generated `run_id`, even if the
+    /// Binding policy has changed since the first commit. A currently unavailable
+    /// route remains durably queued for the Router reconciler.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an idempotency conflict, invalid target/policy, unavailable storage,
+    /// or a corrupt durable Router image.
+    pub async fn create_agent_run(
+        &self,
+        request: CreateAgentRunRequest,
+    ) -> Result<CreatedAgentRun, ConnectorControlApplicationError> {
+        let now = self.now()?;
+        let repository = AgentRunRepository::new();
+        let mut session = self
+            .store
+            .begin_tenant(request.tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+
+        let (disposition, run) = if let Some(existing) = repository
+            .load_by_identity(
+                session.connection(),
+                request.tenant_id,
+                request.request_id,
+                request.idempotency_digest,
+            )
+            .await
+            .map_err(persistence_error)?
+        {
+            if !run_create_request_matches(&existing, &request) {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+            (AgentRunCreate::Existing, existing)
+        } else {
+            let bindings = BindingSetRepository::new()
+                .load(session.connection(), request.tenant_id)
+                .await
+                .map_err(persistence_error)?;
+            validate_new_run_authority(
+                session.connection(),
+                request.tenant_id,
+                request.installation_id,
+                &bindings,
+            )
+            .await?;
+            let run = build_agent_run(
+                request.clone(),
+                RunId::try_from(self.next_uuid()?)
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?,
+                &bindings,
+                now,
+            )?;
+            repository
+                .create(session.connection(), &run)
+                .await
+                .map_err(persistence_error)?
+        };
+
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        // The durable Run commit is intentionally complete before best-effort
+        // routing. A transient routing/deadlock failure can make this response
+        // retry, but can never roll the caller's accepted Run back out of storage.
+        let run = if run.state() == RunRoutingState::Queued {
+            self.offer_agent_run(request.tenant_id, run.request().run_id())
+                .await?
+        } else {
+            run
+        };
+        Ok(CreatedAgentRun {
+            inserted: disposition == AgentRunCreate::Inserted,
+            run,
+        })
+    }
+
+    /// Reconciles one queued Run into an offer when an eligible Connector exists.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an absent Run, stale/corrupt state, or unavailable storage.
+    pub async fn offer_agent_run(
+        &self,
+        tenant_id: TenantId,
+        run_id: RunId,
+    ) -> Result<AgentRun, ConnectorControlApplicationError> {
+        let repository = AgentRunRepository::new();
+        let mut session = self
+            .store
+            .begin_tenant(tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let run = repository
+            .load(session.connection(), tenant_id, run_id)
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::NotFound)?;
+        let (run, offered_connector) = self
+            .offer_queued_run_in_connection(session.connection(), run)
+            .await?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if let Some(connector_id) = offered_connector {
+            self.run_offer_notifications
+                .publish(tenant_id, connector_id);
+        }
+        Ok(run)
+    }
+
+    /// Applies a bounded tenant-local timeout pass and immediately retries only
+    /// offers that expired before any execution lease was granted.
+    ///
+    /// Expired execution leases remain `ReconcileRequired`; they are never
+    /// silently failed over because the prior Connector may have executed work.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid batch bound, corrupt reservation state, or unavailable storage.
+    #[allow(clippy::too_many_lines)]
+    pub async fn reconcile_agent_run_timeouts(
+        &self,
+        tenant_id: TenantId,
+        limit: usize,
+    ) -> Result<AgentRunReconcileBatch, ConnectorControlApplicationError> {
+        if limit == 0 || limit > MAX_AGENT_RUN_EXPIRY_BATCH {
+            return Err(ConnectorControlApplicationError::InvalidRequest);
+        }
+        let repository = AgentRunRepository::new();
+        let mut batch = AgentRunReconcileBatch::default();
+        let mut attempted_run_ids = BTreeSet::new();
+
+        // Each due Run owns one outer transaction. Repository transactions are
+        // savepoints inside a tenant session and would otherwise retain every
+        // capacity lock until the whole batch commits, allowing opposite route
+        // orders on concurrent streams to deadlock.
+        for _ in 0..limit {
+            let mut session = self
+                .store
+                .begin_tenant(tenant_id)
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            let due = repository
+                .expire_next_due_current(session.connection(), tenant_id, self.clock.as_ref())
+                .await
+                .map_err(persistence_error)?;
+            let Some(run) = due else {
+                session
+                    .commit()
+                    .await
+                    .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                break;
+            };
+            attempted_run_ids.insert(run.request().run_id());
+            let mut offered_connector = None;
+            let state = run.state();
+            match state {
+                RunRoutingState::Queued => {
+                    let (_, connector_id) = self
+                        .offer_queued_run_in_connection(session.connection(), run)
+                        .await?;
+                    offered_connector = connector_id;
+                }
+                RunRoutingState::Expired | RunRoutingState::ReconcileRequired => {}
+                RunRoutingState::Offered | RunRoutingState::Leased => {
+                    return Err(ConnectorControlApplicationError::Internal);
+                }
+            }
+            session
+                .commit()
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            batch.processed += 1;
+            match state {
+                RunRoutingState::Queued if offered_connector.is_some() => batch.reoffered += 1,
+                RunRoutingState::Expired => batch.expired += 1,
+                RunRoutingState::ReconcileRequired => batch.reconcile_required += 1,
+                RunRoutingState::Queued | RunRoutingState::Offered | RunRoutingState::Leased => {}
+            }
+            if let Some(connector_id) = offered_connector {
+                self.run_offer_notifications
+                    .publish(tenant_id, connector_id);
+            }
+        }
+
+        let remaining = limit.saturating_sub(batch.processed);
+        if remaining > 0 {
+            let mut list_session = self
+                .store
+                .begin_tenant(tenant_id)
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            let queued = repository
+                .load_queued(list_session.connection(), tenant_id, self.now()?, remaining)
+                .await
+                .map_err(persistence_error)?;
+            list_session
+                .commit()
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            for queued_snapshot in queued {
+                if !attempted_run_ids.insert(queued_snapshot.request().run_id()) {
+                    continue;
+                }
+                let mut session = self
+                    .store
+                    .begin_tenant(tenant_id)
+                    .await
+                    .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                let current = repository
+                    .load(
+                        session.connection(),
+                        tenant_id,
+                        queued_snapshot.request().run_id(),
+                    )
+                    .await
+                    .map_err(persistence_error)?;
+                let Some(current) = current.filter(|run| run.state() == RunRoutingState::Queued)
+                else {
+                    session
+                        .commit()
+                        .await
+                        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                    batch.processed += 1;
+                    continue;
+                };
+                let offered_connector = match self
+                    .offer_queued_run_in_connection(session.connection(), current)
+                    .await
+                {
+                    Ok((_, connector_id)) => connector_id,
+                    Err(ConnectorControlApplicationError::StaleFence) => {
+                        session
+                            .rollback()
+                            .await
+                            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                        batch.processed += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                session
+                    .commit()
+                    .await
+                    .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                batch.processed += 1;
+                if let Some(connector_id) = offered_connector {
+                    batch.reoffered += 1;
+                    self.run_offer_notifications
+                        .publish(tenant_id, connector_id);
+                }
+            }
+        }
+        Ok(batch)
+    }
+
+    async fn offer_queued_run_in_connection(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        run: AgentRun,
+    ) -> Result<(AgentRun, Option<ConnectorId>), ConnectorControlApplicationError> {
+        let now_millis = self.now()?;
+        if run.state() != RunRoutingState::Queued
+            || now_millis >= run.request().queue_deadline_millis()
+        {
+            return Ok((run, None));
+        }
+        let (outcome, routed) = AgentRunRepository::new()
+            .offer_next_current(
+                connection,
+                run.request().tenant_id(),
+                run.request().run_id(),
+                run.revision(),
+                RunOfferId::try_from(self.next_uuid()?)
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?,
+                self.clock.as_ref(),
+                DEFAULT_RUN_OFFER_TTL_MILLIS,
+            )
+            .await
+            .map_err(persistence_error)?;
+        let connector_id = match outcome {
+            AgentRunOfferNext::Offered(_) => Some(routed.current_candidate().connector_id()),
+            AgentRunOfferNext::Unavailable => None,
+        };
+        Ok((routed, connector_id))
     }
 
     /// Persists one caller-owned short-lived enrollment operation for the current Connector fence.
@@ -1140,7 +1653,7 @@ impl PostgresConnectorControlApplication {
         peer: AuthenticatedConnectorPeer,
         hello: ParsedHello,
     ) -> Result<OpenControlCompletion, ConnectorControlApplicationError> {
-        self.validate_hello_policy(&hello)?;
+        let protocol_minor = self.validate_hello_policy(&hello)?;
         ensure_peer_identity(peer, hello.tenant_id, hello.connector_id)?;
         let now = self.now()?;
         let mut session = self
@@ -1300,7 +1813,7 @@ impl PostgresConnectorControlApplication {
         let _ = self.authorization_index.replace(&authorization.snapshot());
         Ok(OpenControlCompletion {
             lease,
-            protocol_minor: self.policy.protocol_minor,
+            protocol_minor,
             heartbeat_interval_millis: self.policy.heartbeat_interval_millis,
             heartbeat_ttl_millis: self.policy.heartbeat_ttl_millis,
             acknowledged_command_sequence: command_head.acknowledged_sequence(),
@@ -1663,6 +2176,204 @@ impl PostgresConnectorControlApplication {
         Ok(commands)
     }
 
+    async fn poll_run_offers_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        fence: ConnectorFence,
+        after_sequence: u64,
+    ) -> Result<Vec<RunAvailableWire>, ConnectorControlApplicationError> {
+        ensure_peer_identity(peer, fence.tenant_id(), fence.connector_id())?;
+        let parsed_fence = parsed_connector_fence(fence);
+        let now = self.now()?;
+        let mut session = self
+            .store
+            .begin_tenant(fence.tenant_id())
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let connector_head = ConnectorRepository::new()
+            .load_heartbeat_head_for_update(
+                session.connection(),
+                fence.tenant_id(),
+                fence.connector_id(),
+            )
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::StaleLease)?;
+        ensure_resolved_fence(connector_head.fence(), parsed_fence)
+            .map_err(|_| ConnectorControlApplicationError::StaleLease)?;
+        connector_head
+            .validate_fence(&fence, now)
+            .map_err(|_| ConnectorControlApplicationError::StaleLease)?;
+        require_live_current_credential(
+            session.connection(),
+            peer,
+            fence.tenant_id(),
+            fence.connector_id(),
+            fence.generation().get(),
+            now,
+        )
+        .await?;
+        let pending = AgentRunRepository::new()
+            .poll_offers(
+                session.connection(),
+                ConnectorLeaseFence::from(fence),
+                after_sequence,
+                now,
+                MAX_AGENT_RUN_OFFER_PAGE,
+            )
+            .await
+            .map_err(persistence_error)?;
+        let offers = pending
+            .iter()
+            .map(run_available_wire)
+            .collect::<Result<Vec<_>, _>>()?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        Ok(offers)
+    }
+
+    async fn claim_run_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        claim: ParsedRunClaim,
+    ) -> Result<RunLeaseGrantedWire, ConnectorControlApplicationError> {
+        ensure_peer_fence(peer, claim.connector_fence)?;
+        let tenant_id = claim.connector_fence.tenant_id;
+        let connector_id = claim.connector_id;
+        let mut session = self
+            .store
+            .begin_tenant(tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let credential_check_time = self.now()?;
+        require_live_current_credential(
+            session.connection(),
+            peer,
+            tenant_id,
+            connector_id,
+            claim.connector_fence.connector_generation,
+            credential_check_time,
+        )
+        .await?;
+        let repository = AgentRunRepository::new();
+        let run = repository
+            .load(session.connection(), tenant_id, claim.run_id)
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::StaleLease)?;
+        let offer = validate_run_claim(&run, &claim)?;
+        let connector_fence = ConnectorLeaseFence::new(
+            tenant_id,
+            connector_id,
+            claim.connector_fence.boot_id,
+            claim.connector_fence.connector_generation,
+            claim.connector_fence.lease_id,
+            claim.connector_fence.lease_epoch,
+        )
+        .map_err(|_| ConnectorControlApplicationError::StaleLease)?;
+        let (_, claimed) = repository
+            .claim_current(
+                session.connection(),
+                tenant_id,
+                claim.run_id,
+                run.revision(),
+                offer.offer_id(),
+                claim.offer_attempt,
+                connector_fence,
+                RunLeaseId::try_from(self.next_uuid()?)
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?,
+                self.clock.as_ref(),
+                DEFAULT_RUN_LEASE_TTL_MILLIS,
+            )
+            .await
+            .map_err(run_persistence_error)?;
+        require_live_current_credential(
+            session.connection(),
+            peer,
+            tenant_id,
+            connector_id,
+            claim.connector_fence.connector_generation,
+            self.now()?,
+        )
+        .await?;
+        let granted = run_lease_granted_wire(&claimed)?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        Ok(granted)
+    }
+
+    async fn release_run_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        release: ParsedRunRelease,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        ensure_peer_fence(peer, release.connector_fence)?;
+        let tenant_id = release.connector_fence.tenant_id;
+        let connector_id = release.connector_id;
+        let mut session = self
+            .store
+            .begin_tenant(tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let credential_check_time = self.now()?;
+        require_live_current_credential(
+            session.connection(),
+            peer,
+            tenant_id,
+            connector_id,
+            release.connector_fence.connector_generation,
+            credential_check_time,
+        )
+        .await?;
+        let repository = AgentRunRepository::new();
+        let run = repository
+            .load(session.connection(), tenant_id, release.run_id)
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::StaleLease)?;
+        validate_run_release(&run, &release)?;
+        let connector_fence = ConnectorLeaseFence::new(
+            tenant_id,
+            connector_id,
+            release.connector_fence.boot_id,
+            release.connector_fence.connector_generation,
+            release.connector_fence.lease_id,
+            release.connector_fence.lease_epoch,
+        )
+        .map_err(|_| ConnectorControlApplicationError::StaleLease)?;
+        repository
+            .release_current(
+                session.connection(),
+                tenant_id,
+                release.run_id,
+                run.revision(),
+                release.run_lease_id,
+                release.run_lease_epoch,
+                connector_fence,
+                self.clock.as_ref(),
+            )
+            .await
+            .map_err(run_persistence_error)?;
+        require_live_current_credential(
+            session.connection(),
+            peer,
+            tenant_id,
+            connector_id,
+            release.connector_fence.connector_generation,
+            self.now()?,
+        )
+        .await?;
+        drop(release.stable_reason);
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn rotate_operation(
         &self,
@@ -1952,20 +2663,23 @@ impl PostgresConnectorControlApplication {
     fn validate_hello_policy(
         &self,
         hello: &ParsedHello,
-    ) -> Result<(), ConnectorControlApplicationError> {
-        if !hello
-            .protocol
-            .supports(PROTOCOL_MAJOR, self.policy.protocol_minor)
-            || hello.required_server_capabilities.iter().any(|capability| {
-                !self
-                    .policy
-                    .supported_server_capabilities
-                    .contains(capability)
-            })
-        {
+    ) -> Result<u32, ConnectorControlApplicationError> {
+        let negotiated_minor = (0..=self.policy.protocol_minor)
+            .rev()
+            .find(|minor| hello.protocol.supports(PROTOCOL_MAJOR, *minor));
+        let Some(negotiated_minor) = negotiated_minor else {
+            return Err(ConnectorControlApplicationError::PermissionDenied);
+        };
+        if hello.required_server_capabilities.iter().any(|capability| {
+            !self
+                .policy
+                .supported_server_capabilities
+                .contains(capability)
+                || (capability == "run-routing" && negotiated_minor < 1)
+        }) {
             Err(ConnectorControlApplicationError::PermissionDenied)
         } else {
-            Ok(())
+            Ok(negotiated_minor)
         }
     }
 
@@ -1993,6 +2707,7 @@ impl fmt::Debug for PostgresConnectorControlApplication {
             .field("authorization_index", &"[ADVISORY AUTHORIZATION INDEX]")
             .field("command_decoder", &"[COMMAND DECODER]")
             .field("command_notifications", &"[COMMAND WAKEUP HUB]")
+            .field("run_offer_notifications", &"[RUN OFFER WAKEUP HUB]")
             .field("policy", &self.policy)
             .finish()
     }
@@ -2064,6 +2779,181 @@ impl ConnectorControlApplication for PostgresConnectorControlApplication {
     ) -> ApplicationFuture<'_, Vec<DurableServerCommand>> {
         Box::pin(self.poll_commands_operation(peer, fence, after_sequence))
     }
+
+    fn subscribe_run_offers(
+        &self,
+        tenant_id: TenantId,
+        connector_id: ConnectorId,
+    ) -> RunOfferNotificationSubscription {
+        self.run_offer_notifications
+            .subscribe(&self.store, tenant_id, connector_id)
+    }
+
+    fn poll_run_offers(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        fence: ConnectorFence,
+        after_sequence: u64,
+    ) -> ApplicationFuture<'_, Vec<RunAvailableWire>> {
+        Box::pin(self.poll_run_offers_operation(peer, fence, after_sequence))
+    }
+
+    fn reconcile_agent_run_timeouts(
+        &self,
+        tenant_id: TenantId,
+        limit: usize,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async move {
+            PostgresConnectorControlApplication::reconcile_agent_run_timeouts(
+                self, tenant_id, limit,
+            )
+            .await
+            .map(|_| ())
+        })
+    }
+
+    fn claim_run(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        claim: ParsedRunClaim,
+    ) -> ApplicationFuture<'_, RunLeaseGrantedWire> {
+        Box::pin(self.claim_run_operation(peer, claim))
+    }
+
+    fn release_run(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        release: ParsedRunRelease,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.release_run_operation(peer, release))
+    }
+}
+
+fn parsed_connector_fence(fence: ConnectorFence) -> ParsedLeaseFence {
+    ParsedLeaseFence {
+        tenant_id: fence.tenant_id(),
+        connector_id: fence.connector_id(),
+        boot_id: fence.boot_id(),
+        connector_generation: fence.generation().get(),
+        lease_id: fence.lease_id(),
+        lease_epoch: fence.lease_epoch().get(),
+    }
+}
+
+fn parsed_router_fence(fence: ConnectorLeaseFence) -> ParsedLeaseFence {
+    ParsedLeaseFence {
+        tenant_id: fence.tenant_id(),
+        connector_id: fence.connector_id(),
+        boot_id: fence.boot_id(),
+        connector_generation: fence.connector_generation(),
+        lease_id: fence.connector_lease_id(),
+        lease_epoch: fence.connector_lease_epoch(),
+    }
+}
+
+fn run_available_wire(
+    pending: &PendingAgentRunOffer,
+) -> Result<RunAvailableWire, ConnectorControlApplicationError> {
+    let run = pending.run();
+    let offer = run
+        .current_offer()
+        .filter(|_| run.state() == RunRoutingState::Offered)
+        .ok_or(ConnectorControlApplicationError::Internal)?;
+    let candidate = run.current_candidate();
+    Ok(RunAvailableWire {
+        connector_offer_sequence: pending.connector_offer_sequence(),
+        connector_fence: parsed_router_fence(offer.connector_fence()),
+        run_id: run.request().run_id(),
+        request_id: run.request().request_id(),
+        installation_id: run.request().installation_id(),
+        binding_id: candidate.binding_id(),
+        connector_id: candidate.connector_id(),
+        offer_attempt: offer.attempt(),
+        offered_at_millis: offer.offered_at_millis(),
+        offer_deadline_millis: offer.expires_at_millis(),
+        required_capabilities: run.request().required_capabilities().to_vec(),
+    })
+}
+
+fn run_lease_granted_wire(
+    run: &AgentRun,
+) -> Result<RunLeaseGrantedWire, ConnectorControlApplicationError> {
+    let lease = run
+        .current_lease()
+        .filter(|_| run.state() == RunRoutingState::Leased)
+        .ok_or(ConnectorControlApplicationError::Internal)?;
+    let candidate = run.current_candidate();
+    Ok(RunLeaseGrantedWire {
+        connector_fence: parsed_router_fence(lease.connector_fence()),
+        run_id: run.request().run_id(),
+        request_id: run.request().request_id(),
+        installation_id: run.request().installation_id(),
+        binding_id: candidate.binding_id(),
+        connector_id: candidate.connector_id(),
+        offer_attempt: lease.offer_attempt(),
+        run_lease_id: lease.run_lease_id(),
+        run_lease_epoch: lease.run_lease_epoch(),
+        granted_at_millis: lease.issued_at_millis(),
+        run_lease_deadline_millis: lease.expires_at_millis(),
+        required_capabilities: run.request().required_capabilities().to_vec(),
+    })
+}
+
+fn validate_run_claim(
+    run: &AgentRun,
+    claim: &ParsedRunClaim,
+) -> Result<RunOffer, ConnectorControlApplicationError> {
+    let offer = run
+        .current_offer()
+        .filter(|_| {
+            matches!(
+                run.state(),
+                RunRoutingState::Offered | RunRoutingState::Leased
+            )
+        })
+        .ok_or(ConnectorControlApplicationError::StaleLease)?;
+    let candidate = run.current_candidate();
+    if run.request().request_id() != claim.request_id
+        || run.request().installation_id() != claim.installation_id
+        || candidate.binding_id() != claim.binding_id
+        || candidate.connector_id() != claim.connector_id
+        || offer.attempt() != claim.offer_attempt
+        || offer.expires_at_millis() != claim.offer_deadline_millis
+        || run.request().required_capabilities() != claim.required_capabilities
+        || parsed_router_fence(offer.connector_fence()) != claim.connector_fence
+    {
+        return Err(ConnectorControlApplicationError::StaleLease);
+    }
+    Ok(offer)
+}
+
+fn validate_run_release(
+    run: &AgentRun,
+    release: &ParsedRunRelease,
+) -> Result<(), ConnectorControlApplicationError> {
+    let offer = run
+        .current_offer()
+        .ok_or(ConnectorControlApplicationError::StaleLease)?;
+    let lease = run
+        .current_lease()
+        .ok_or(ConnectorControlApplicationError::StaleLease)?;
+    let candidate = run.current_candidate();
+    if !matches!(
+        run.state(),
+        RunRoutingState::Leased | RunRoutingState::ReconcileRequired
+    ) || run.request().request_id() != release.request_id
+        || run.request().installation_id() != release.installation_id
+        || candidate.binding_id() != release.binding_id
+        || candidate.connector_id() != release.connector_id
+        || offer.attempt() != release.offer_attempt
+        || lease.run_lease_id() != release.run_lease_id
+        || lease.run_lease_epoch() != release.run_lease_epoch
+        || lease.expires_at_millis() != release.run_lease_deadline_millis
+        || parsed_router_fence(lease.connector_fence()) != release.connector_fence
+    {
+        return Err(ConnectorControlApplicationError::StaleLease);
+    }
+    Ok(())
 }
 
 fn ensure_owner_command_fence(
@@ -2501,12 +3391,23 @@ fn persistence_error(error: AgentPersistenceError) -> ConnectorControlApplicatio
         }
         AgentPersistenceError::ImmutableConflict(_) => ConnectorControlApplicationError::Conflict,
         AgentPersistenceError::Database(_) => ConnectorControlApplicationError::Unavailable,
-        AgentPersistenceError::MaterializationLimitExceeded(_) => {
+        AgentPersistenceError::ClaimRejected(_)
+        | AgentPersistenceError::MaterializationLimitExceeded(_) => {
             ConnectorControlApplicationError::ResourceExhausted
         }
         AgentPersistenceError::CorruptData(_)
         | AgentPersistenceError::CommandDecodeRejected
         | AgentPersistenceError::SnapshotRejected(_) => ConnectorControlApplicationError::Internal,
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_persistence_error(error: AgentPersistenceError) -> ConnectorControlApplicationError {
+    match error {
+        AgentPersistenceError::RevisionConflict { .. } | AgentPersistenceError::FenceConflict => {
+            ConnectorControlApplicationError::StaleLease
+        }
+        other => persistence_error(other),
     }
 }
 

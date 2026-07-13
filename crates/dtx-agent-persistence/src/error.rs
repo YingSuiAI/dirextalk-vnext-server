@@ -16,6 +16,8 @@ pub enum AgentPersistenceError {
     },
     /// A Connector generation/spec/lease fence did not match durable state.
     FenceConflict,
+    /// A currently fenced Connector cannot accept another Run.
+    ClaimRejected(&'static str),
     /// A durable command cursor was stale, ahead, or non-contiguous.
     CursorConflict {
         /// Server-committed acknowledgement cursor.
@@ -39,6 +41,7 @@ impl fmt::Display for AgentPersistenceError {
             Self::ImmutableConflict(_) => "Agent persistence immutable identity conflicted",
             Self::RevisionConflict { .. } => "Agent persistence revision conflicted",
             Self::FenceConflict => "Agent persistence fence conflicted",
+            Self::ClaimRejected(_) => "Agent Run claim was rejected",
             Self::CursorConflict { .. } => "Agent persistence cursor conflicted",
             Self::CommandDecodeRejected => "Agent persistence command bytes were rejected",
             Self::MaterializationLimitExceeded(_) => {
@@ -57,6 +60,7 @@ impl Error for AgentPersistenceError {
             | Self::ImmutableConflict(_)
             | Self::RevisionConflict { .. }
             | Self::FenceConflict
+            | Self::ClaimRejected(_)
             | Self::CursorConflict { .. }
             | Self::CommandDecodeRejected
             | Self::MaterializationLimitExceeded(_)

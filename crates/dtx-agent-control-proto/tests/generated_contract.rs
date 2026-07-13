@@ -109,6 +109,8 @@ fn descriptor_keeps_frames_commands_and_public_credentials_closed() {
             "heartbeat",
             "command_acknowledgement",
             "credential_rotation_proof",
+            "run_claim",
+            "run_release",
         ]
     );
     assert_eq!(
@@ -118,6 +120,8 @@ fn descriptor_keeps_frames_commands_and_public_credentials_closed() {
             "heartbeat_acknowledgement",
             "durable_command",
             "credential_rotation_result",
+            "run_available",
+            "run_lease_granted",
         ]
     );
     assert_eq!(

@@ -9,6 +9,7 @@ publish = false
 dtx-agent-control = { path = "../dtx-agent-control" }
 dtx-agent-host = { path = "../dtx-agent-host" }
 dtx-agent-registry = { path = "../dtx-agent-registry" }
+dtx-agent-router = { path = "../dtx-agent-router" }
 dtx-connect-registry = { path = "../dtx-connect-registry" }
 dtx-domain = { path = "../dtx-domain" }
 dtx-security = { path = "../dtx-security" }

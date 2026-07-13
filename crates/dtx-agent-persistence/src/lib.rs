@@ -18,6 +18,7 @@ mod host;
 mod host_authorization;
 mod operation;
 mod registry;
+mod run;
 mod runtime_claim;
 
 pub use binding::BindingSetRepository;
@@ -43,6 +44,11 @@ pub use operation::{
     ConnectorControlOperation, ConnectorControlOperationKind, ConnectorControlOperationRepository,
 };
 pub use registry::{AgentDeviceRepository, AgentInstallationRepository, CurrentWrite};
+pub use run::{
+    AGENT_RUN_OFFER_NOTIFY_CHANNEL, AgentRunCreate, AgentRunOfferNext, AgentRunRepository,
+    MAX_AGENT_RUN_EXPIRY_BATCH, MAX_AGENT_RUN_OFFER_PAGE, PendingAgentRunOffer,
+    agent_run_offer_notification_payload, parse_agent_run_offer_notification_payload,
+};
 pub use runtime_claim::{
     DEFAULT_RUNTIME_CLAIM_RETENTION_LIMIT, RuntimeCapacity, RuntimeClaimRecord,
     RuntimeClaimRecordError, RuntimeClaimRepository, RuntimeClaimRetentionError,

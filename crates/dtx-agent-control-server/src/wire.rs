@@ -11,8 +11,8 @@ use dtx_connect_registry::{
     AdapterKind, ConnectorFence, ConnectorLease, HeartbeatAck, LeaseStatus,
 };
 use dtx_domain::{
-    BootId, ConnectorCredentialId, ConnectorId, Ed25519PublicKey, HostId, LeaseId, RequestId,
-    Revision, RunId, TenantId,
+    BindingId, BootId, ConnectorCredentialId, ConnectorId, Ed25519PublicKey, HostId,
+    InstallationId, LeaseId, RequestId, Revision, RunId, RunLeaseId, TenantId,
 };
 use zeroize::Zeroize as _;
 
@@ -106,6 +106,70 @@ pub struct ParsedLeaseFence {
     pub connector_generation: u64,
     pub lease_id: LeaseId,
     pub lease_epoch: u64,
+}
+
+/// Validated v1.1 offer acknowledgement. It does not authorize execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedRunClaim {
+    pub connector_fence: ParsedLeaseFence,
+    pub run_id: RunId,
+    pub request_id: RequestId,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub connector_id: ConnectorId,
+    pub offer_attempt: u64,
+    pub offer_deadline_millis: i64,
+    pub required_capabilities: Vec<String>,
+}
+
+/// Validated v1.1 release carrying both the Connector and run-lease fences.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedRunRelease {
+    pub connector_fence: ParsedLeaseFence,
+    pub run_id: RunId,
+    pub request_id: RequestId,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub connector_id: ConnectorId,
+    pub offer_attempt: u64,
+    pub run_lease_id: RunLeaseId,
+    pub run_lease_epoch: u64,
+    pub run_lease_deadline_millis: i64,
+    pub stable_reason: String,
+}
+
+/// Server-owned inputs for a v1.1 capability-scoped offer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunAvailableWire {
+    /// Internal durable delivery cursor; never encoded as execution authority.
+    pub connector_offer_sequence: u64,
+    pub connector_fence: ParsedLeaseFence,
+    pub run_id: RunId,
+    pub request_id: RequestId,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub connector_id: ConnectorId,
+    pub offer_attempt: u64,
+    pub offered_at_millis: i64,
+    pub offer_deadline_millis: i64,
+    pub required_capabilities: Vec<String>,
+}
+
+/// Server-owned inputs for the sole v1.1 execution-authorizing frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunLeaseGrantedWire {
+    pub connector_fence: ParsedLeaseFence,
+    pub run_id: RunId,
+    pub request_id: RequestId,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub connector_id: ConnectorId,
+    pub offer_attempt: u64,
+    pub run_lease_id: RunLeaseId,
+    pub run_lease_epoch: u64,
+    pub granted_at_millis: i64,
+    pub run_lease_deadline_millis: i64,
+    pub required_capabilities: Vec<String>,
 }
 
 /// Validated first control-stream frame.
@@ -232,6 +296,8 @@ pub enum ParsedClientFrame {
     Heartbeat(ParsedHeartbeat),
     CommandAcknowledgement(ParsedCommandAcknowledgement),
     CredentialRotationProof(ParsedCredentialRotationProof),
+    RunClaim(ParsedRunClaim),
+    RunRelease(ParsedRunRelease),
 }
 
 /// Converts an enrollment protobuf message into proof-bound domain input.
@@ -396,6 +462,134 @@ pub fn parse_credential_rotation_proof(
     })
 }
 
+/// Validates a v1.1 run-offer acknowledgement without granting execution authority.
+///
+/// # Errors
+///
+/// Rejects missing fences, mismatched Connector identities, malformed identifiers,
+/// unsafe counters or timestamps, and invalid capability sets.
+pub fn parse_run_claim(value: v1::RunClaim) -> Result<ParsedRunClaim, WireError> {
+    let connector_fence = parse_lease_fence(&required(value.connector_fence, "connector_fence")?)?;
+    let connector_id = parse_id(&value.connector_id, "connector_id")?;
+    if connector_id != connector_fence.connector_id {
+        return Err(invalid_value("connector_id"));
+    }
+    let mut required_capabilities = value.required_capabilities;
+    normalize_capabilities(&mut required_capabilities)?;
+
+    Ok(ParsedRunClaim {
+        connector_fence,
+        run_id: parse_id(&value.run_id, "run_id")?,
+        request_id: parse_id(&value.request_id, "request_id")?,
+        installation_id: parse_id(&value.installation_id, "installation_id")?,
+        binding_id: parse_id(&value.binding_id, "binding_id")?,
+        connector_id,
+        offer_attempt: positive_safe(value.offer_attempt, "offer_attempt")?,
+        offer_deadline_millis: parse_wire_timestamp(
+            value.offer_deadline_millis,
+            "offer_deadline_millis",
+        )?,
+        required_capabilities,
+    })
+}
+
+/// Validates a v1.1 run-lease release carrying both independent fences.
+///
+/// # Errors
+///
+/// Rejects missing fences, mismatched identities, malformed identifiers,
+/// unsafe counters or timestamps, and non-stable release reasons.
+pub fn parse_run_release(value: v1::RunRelease) -> Result<ParsedRunRelease, WireError> {
+    let connector_fence = parse_lease_fence(&required(value.connector_fence, "connector_fence")?)?;
+    let connector_id = parse_id(&value.connector_id, "connector_id")?;
+    if connector_id != connector_fence.connector_id {
+        return Err(invalid_value("connector_id"));
+    }
+    if !valid_upper_stable_code(&value.stable_reason) {
+        return Err(invalid_value("stable_reason"));
+    }
+
+    Ok(ParsedRunRelease {
+        connector_fence,
+        run_id: parse_id(&value.run_id, "run_id")?,
+        request_id: parse_id(&value.request_id, "request_id")?,
+        installation_id: parse_id(&value.installation_id, "installation_id")?,
+        binding_id: parse_id(&value.binding_id, "binding_id")?,
+        connector_id,
+        offer_attempt: positive_safe(value.offer_attempt, "offer_attempt")?,
+        run_lease_id: parse_id(&value.run_lease_id, "run_lease_id")?,
+        run_lease_epoch: positive_safe(value.run_lease_epoch, "run_lease_epoch")?,
+        run_lease_deadline_millis: parse_wire_timestamp(
+            value.run_lease_deadline_millis,
+            "run_lease_deadline_millis",
+        )?,
+        stable_reason: value.stable_reason,
+    })
+}
+
+/// Builds a v1.1 offer. Receiving this frame never authorizes execution.
+///
+/// # Errors
+///
+/// Rejects an incoherent fence, identity, offer window, or capability set.
+pub fn build_run_available(mut value: RunAvailableWire) -> Result<v1::RunAvailable, WireError> {
+    positive_safe(value.connector_offer_sequence, "connector_offer_sequence")?;
+    validate_connector_identity(&value.connector_fence, value.connector_id)?;
+    let offered_at_millis = validated_timestamp(value.offered_at_millis, "offered_at_millis")?;
+    let offer_deadline_millis =
+        validated_timestamp(value.offer_deadline_millis, "offer_deadline_millis")?;
+    if offer_deadline_millis <= offered_at_millis {
+        return Err(invalid_value("offer_deadline_millis"));
+    }
+    normalize_capabilities(&mut value.required_capabilities)?;
+
+    Ok(v1::RunAvailable {
+        connector_fence: Some(build_parsed_lease_fence(value.connector_fence)?),
+        run_id: value.run_id.to_string(),
+        request_id: value.request_id.to_string(),
+        installation_id: value.installation_id.to_string(),
+        binding_id: value.binding_id.to_string(),
+        connector_id: value.connector_id.to_string(),
+        offer_attempt: positive_safe(value.offer_attempt, "offer_attempt")?,
+        offered_at_millis,
+        offer_deadline_millis,
+        required_capabilities: value.required_capabilities,
+    })
+}
+
+/// Builds the v1.1 frame that exclusively authorizes run execution.
+///
+/// # Errors
+///
+/// Rejects an incoherent Connector or run-lease fence, grant window, or capability set.
+pub fn build_run_lease_granted(
+    mut value: RunLeaseGrantedWire,
+) -> Result<v1::RunLeaseGranted, WireError> {
+    validate_connector_identity(&value.connector_fence, value.connector_id)?;
+    let granted_at_millis = validated_timestamp(value.granted_at_millis, "granted_at_millis")?;
+    let run_lease_deadline_millis =
+        validated_timestamp(value.run_lease_deadline_millis, "run_lease_deadline_millis")?;
+    if run_lease_deadline_millis <= granted_at_millis {
+        return Err(invalid_value("run_lease_deadline_millis"));
+    }
+    normalize_capabilities(&mut value.required_capabilities)?;
+
+    Ok(v1::RunLeaseGranted {
+        connector_fence: Some(build_parsed_lease_fence(value.connector_fence)?),
+        run_id: value.run_id.to_string(),
+        request_id: value.request_id.to_string(),
+        installation_id: value.installation_id.to_string(),
+        binding_id: value.binding_id.to_string(),
+        connector_id: value.connector_id.to_string(),
+        offer_attempt: positive_safe(value.offer_attempt, "offer_attempt")?,
+        run_lease_id: value.run_lease_id.to_string(),
+        run_lease_epoch: positive_safe(value.run_lease_epoch, "run_lease_epoch")?,
+        granted_at_millis,
+        run_lease_deadline_millis,
+        required_capabilities: value.required_capabilities,
+    })
+}
+
 /// Validates one known client-frame oneof member.
 ///
 /// # Errors
@@ -414,6 +608,8 @@ pub fn parse_client_frame(value: v1::ClientFrame) -> Result<ParsedClientFrame, W
         Kind::CredentialRotationProof(frame) => {
             parse_credential_rotation_proof(frame).map(ParsedClientFrame::CredentialRotationProof)
         }
+        Kind::RunClaim(frame) => parse_run_claim(frame).map(ParsedClientFrame::RunClaim),
+        Kind::RunRelease(frame) => parse_run_release(frame).map(ParsedClientFrame::RunRelease),
     }
 }
 
@@ -618,6 +814,37 @@ fn parse_lease_fence(value: &v1::LeaseFence) -> Result<ParsedLeaseFence, WireErr
     })
 }
 
+fn build_parsed_lease_fence(value: ParsedLeaseFence) -> Result<v1::LeaseFence, WireError> {
+    Ok(v1::LeaseFence {
+        tenant_id: value.tenant_id.to_string(),
+        connector_id: value.connector_id.to_string(),
+        boot_id: value.boot_id.to_string(),
+        connector_generation: positive_safe(
+            value.connector_generation,
+            "connector_fence.connector_generation",
+        )?,
+        lease_id: value.lease_id.to_string(),
+        lease_epoch: positive_safe(value.lease_epoch, "connector_fence.lease_epoch")?,
+    })
+}
+
+fn validate_connector_identity(
+    fence: &ParsedLeaseFence,
+    connector_id: ConnectorId,
+) -> Result<(), WireError> {
+    if fence.connector_id == connector_id {
+        Ok(())
+    } else {
+        Err(invalid_value("connector_id"))
+    }
+}
+
+fn normalize_capabilities(values: &mut [String]) -> Result<(), WireError> {
+    validate_stable_names(values, MAX_RUNTIME_CAPABILITIES, "required_capabilities")?;
+    values.sort_unstable();
+    Ok(())
+}
+
 fn parse_adapter_kind(value: &str) -> Result<AdapterKind, WireError> {
     match value {
         "codex" => Ok(AdapterKind::Codex),
@@ -703,6 +930,13 @@ fn validated_timestamp(value: i64, field: &'static str) -> Result<u64, WireError
     u64::try_from(value).map_err(|_| invalid_value(field))
 }
 
+fn parse_wire_timestamp(value: u64, field: &'static str) -> Result<i64, WireError> {
+    if value > Revision::MAX {
+        return Err(invalid_value(field));
+    }
+    i64::try_from(value).map_err(|_| invalid_value(field))
+}
+
 fn timestamp_to_u64(value: i64) -> u64 {
     u64::try_from(value).expect("ConnectorCredential validates non-negative timestamps")
 }
@@ -746,6 +980,19 @@ fn valid_lower_stable_name(value: &str) -> bool {
         })
 }
 
+fn valid_upper_stable_code(value: &str) -> bool {
+    (3..=64).contains(&value.len())
+        && value.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        && !value.as_bytes().windows(2).any(|window| window == b"__")
+}
+
 const fn invalid_value(field: &'static str) -> WireError {
     WireError {
         kind: WireErrorKind::InvalidValue,
@@ -756,6 +1003,16 @@ const fn invalid_value(field: &'static str) -> WireError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TENANT_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a1";
+    const CONNECTOR_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a2";
+    const BOOT_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a3";
+    const LEASE_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a4";
+    const RUN_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a5";
+    const REQUEST_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a6";
+    const INSTALLATION_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a7";
+    const BINDING_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a8";
+    const RUN_LEASE_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a9";
 
     #[test]
     fn enrollment_token_wire_buffer_is_scrubbed_on_success_and_length_error() {
@@ -804,5 +1061,134 @@ mod tests {
         })
         .expect_err("overcommitted report must be rejected");
         assert_eq!(error.field(), "capacity");
+    }
+
+    #[test]
+    fn run_claim_is_a_validated_normalized_offer_ack() {
+        let parsed = parse_client_frame(v1::ClientFrame {
+            kind: Some(v1::client_frame::Kind::RunClaim(v1::RunClaim {
+                connector_fence: Some(run_fence()),
+                run_id: RUN_ID.into(),
+                request_id: REQUEST_ID.into(),
+                installation_id: INSTALLATION_ID.into(),
+                binding_id: BINDING_ID.into(),
+                connector_id: CONNECTOR_ID.into(),
+                offer_attempt: 2,
+                offer_deadline_millis: 2_000,
+                required_capabilities: vec!["tools.web".into(), "runtime.codex".into()],
+            })),
+        })
+        .expect("complete offer acknowledgement is accepted");
+        let ParsedClientFrame::RunClaim(parsed) = parsed else {
+            panic!("run claim remains on the existing parsed client-frame stream");
+        };
+
+        assert_eq!(parsed.offer_attempt, 2);
+        assert_eq!(parsed.required_capabilities, ["runtime.codex", "tools.web"]);
+    }
+
+    #[test]
+    fn run_frames_reject_connector_identity_outside_the_fence() {
+        let error = parse_run_claim(v1::RunClaim {
+            connector_fence: Some(run_fence()),
+            run_id: RUN_ID.into(),
+            request_id: REQUEST_ID.into(),
+            installation_id: INSTALLATION_ID.into(),
+            binding_id: BINDING_ID.into(),
+            connector_id: TENANT_ID.into(),
+            offer_attempt: 1,
+            offer_deadline_millis: 2_000,
+            required_capabilities: Vec::new(),
+        })
+        .expect_err("redundant Connector identity is a checked binding");
+
+        assert_eq!(error.field(), "connector_id");
+    }
+
+    #[test]
+    fn run_release_requires_both_fences_and_a_stable_reason() {
+        let parsed = parse_run_release(v1::RunRelease {
+            connector_fence: Some(run_fence()),
+            run_id: RUN_ID.into(),
+            request_id: REQUEST_ID.into(),
+            installation_id: INSTALLATION_ID.into(),
+            binding_id: BINDING_ID.into(),
+            connector_id: CONNECTOR_ID.into(),
+            offer_attempt: 1,
+            run_lease_id: RUN_LEASE_ID.into(),
+            run_lease_epoch: 3,
+            run_lease_deadline_millis: 3_000,
+            stable_reason: "CAPACITY_REBALANCE".into(),
+        })
+        .expect("complete dual-fence release is accepted");
+        assert_eq!(parsed.run_lease_epoch, 3);
+
+        let mut invalid = v1::RunRelease {
+            connector_fence: Some(run_fence()),
+            run_id: RUN_ID.into(),
+            request_id: REQUEST_ID.into(),
+            installation_id: INSTALLATION_ID.into(),
+            binding_id: BINDING_ID.into(),
+            connector_id: CONNECTOR_ID.into(),
+            offer_attempt: 1,
+            run_lease_id: RUN_LEASE_ID.into(),
+            run_lease_epoch: 3,
+            run_lease_deadline_millis: 3_000,
+            stable_reason: "done".into(),
+        };
+        let error = parse_run_release(invalid.clone()).expect_err("free-form reason is rejected");
+        assert_eq!(error.field(), "stable_reason");
+        invalid.connector_fence = None;
+        let error = parse_run_release(invalid).expect_err("Connector fence is required");
+        assert_eq!(error.kind(), WireErrorKind::MissingField);
+    }
+
+    #[test]
+    fn only_granted_builder_emits_a_run_lease_fence() {
+        let fence = parse_lease_fence(&run_fence()).expect("test fence is valid");
+        let available = build_run_available(RunAvailableWire {
+            connector_offer_sequence: 1,
+            connector_fence: fence,
+            run_id: RUN_ID.parse().expect("run id"),
+            request_id: REQUEST_ID.parse().expect("request id"),
+            installation_id: INSTALLATION_ID.parse().expect("installation id"),
+            binding_id: BINDING_ID.parse().expect("binding id"),
+            connector_id: CONNECTOR_ID.parse().expect("connector id"),
+            offer_attempt: 1,
+            offered_at_millis: 1_000,
+            offer_deadline_millis: 2_000,
+            required_capabilities: vec!["tools.web".into()],
+        })
+        .expect("coherent offer builds");
+        assert_eq!(available.run_id, RUN_ID);
+
+        let granted = build_run_lease_granted(RunLeaseGrantedWire {
+            connector_fence: fence,
+            run_id: RUN_ID.parse().expect("run id"),
+            request_id: REQUEST_ID.parse().expect("request id"),
+            installation_id: INSTALLATION_ID.parse().expect("installation id"),
+            binding_id: BINDING_ID.parse().expect("binding id"),
+            connector_id: CONNECTOR_ID.parse().expect("connector id"),
+            offer_attempt: 1,
+            run_lease_id: RUN_LEASE_ID.parse().expect("run lease id"),
+            run_lease_epoch: 2,
+            granted_at_millis: 1_500,
+            run_lease_deadline_millis: 2_500,
+            required_capabilities: vec!["tools.web".into()],
+        })
+        .expect("coherent grant builds");
+        assert_eq!(granted.run_lease_id, RUN_LEASE_ID);
+        assert_eq!(granted.run_lease_epoch, 2);
+    }
+
+    fn run_fence() -> v1::LeaseFence {
+        v1::LeaseFence {
+            tenant_id: TENANT_ID.into(),
+            connector_id: CONNECTOR_ID.into(),
+            boot_id: BOOT_ID.into(),
+            connector_generation: 1,
+            lease_id: LEASE_ID.into(),
+            lease_epoch: 1,
+        }
     }
 }

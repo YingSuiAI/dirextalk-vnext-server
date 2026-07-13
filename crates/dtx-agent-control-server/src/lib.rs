@@ -15,6 +15,7 @@ mod command_codec;
 mod command_notifications;
 mod incoming;
 mod postgres_application;
+mod run_notifications;
 mod service;
 mod transport_admission;
 mod wire;
@@ -36,12 +37,15 @@ pub use command_codec::{
     EncodedDurableCommand, ProtobufDurableCommandDecoder, ProtobufDurableCommandEncoder,
 };
 pub use command_notifications::CommandNotificationSubscription;
+pub use dtx_agent_router::DispatchMode;
 pub use incoming::{MAX_CONCURRENT_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT, connector_tls_incoming};
 pub use postgres_application::{
-    ApplyConnectorConfigurationRequest, CloseConnectorStreamRequest, ConnectorCommandFence,
-    ConnectorControlPolicy, CreateConnectorEnrollmentRequest, CreatedConnectorEnrollment,
+    AgentRunReconcileBatch, ApplyConnectorConfigurationRequest, CloseConnectorStreamRequest,
+    ConnectorCommandFence, ConnectorControlPolicy, CreateAgentRunRequest,
+    CreateConnectorEnrollmentRequest, CreatedAgentRun, CreatedConnectorEnrollment,
     PostgresConnectorControlApplication, RotateConnectorCredentialRequest,
 };
+pub use run_notifications::RunOfferNotificationSubscription;
 pub use service::{
     COMMAND_POLL_INTERVAL, COMMAND_RECONCILE_INTERVAL, COMMAND_RECONCILE_JITTER,
     CONTROL_RESPONSE_BUFFER, CONTROL_RESPONSE_SEND_TIMEOUT, CommandReconcilePolicy,

@@ -36,6 +36,14 @@ baseline (or a separate versioned service), negotiate the minor explicitly,
 and preserve the single logical lease, command cursor, and downgrade rules
 while `1.0` remains supported.
 
+MC3 publishes that additive contract as the disjoint full
+`agent_control/v1_1` source artifact frozen by baseline v3 while retaining the
+`dirextalk.agent_control.v1` package, service name, and single logical stream.
+`RunAvailable` is an offer, `RunClaim` is only its acknowledgement, and only a
+matching `RunLeaseGranted` authorizes execution. `RunRelease` must echo both the
+live Connector fence and run-lease fence. Application dispatch and AR3 result
+frames are intentionally outside this wire-only slice.
+
 The exact Connector URI SAN is:
 
 ```text

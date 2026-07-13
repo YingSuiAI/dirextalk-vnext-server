@@ -19,6 +19,7 @@ const V1_ARTIFACT_PATHS: &[&str] = &[
     "protocol/test-vectors/v1",
 ];
 const V2_ARTIFACT_PATHS: &[&str] = &["protocol/proto/dirextalk/agent_control/v1"];
+const V3_ARTIFACT_PATHS: &[&str] = &["protocol/proto/dirextalk/agent_control/v1_1"];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -46,6 +47,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v2/manifest.json",
         includes_registries: false,
         artifact_paths: V2_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 3,
+        path: "protocol/baseline/v3/manifest.json",
+        includes_registries: false,
+        artifact_paths: V3_ARTIFACT_PATHS,
     },
 ];
 
@@ -110,7 +117,7 @@ pub fn freeze_baseline(root: &Path) -> Result<(), ProtocolToolError> {
 ///
 /// Versioned artifact sets are exact and disjoint. The v1 registry and schema
 /// set remains byte-for-byte immutable while new reviewed artifacts live only
-/// in the v2 manifest.
+/// in later disjoint manifests.
 ///
 /// # Errors
 ///
@@ -463,7 +470,10 @@ mod tests {
     fn versioned_selectors_are_disjoint() {
         let v1 = V1_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         let v2 = V2_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
+        let v3 = V3_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         assert!(v1.is_disjoint(&v2));
+        assert!(v1.is_disjoint(&v3));
+        assert!(v2.is_disjoint(&v3));
         assert!(!V1_ARTIFACT_PATHS.contains(&"protocol/proto"));
     }
 }

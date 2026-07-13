@@ -8,7 +8,8 @@ const INITIAL_MIGRATION_VERSION: i64 = 202_607_130_001;
 const AGENT_CONTROL_MIGRATION_VERSION: i64 = 202_607_130_002;
 const HOST_AUTHORIZATION_MIGRATION_VERSION: i64 = 202_607_130_003;
 const CONNECTOR_CONTROL_MIGRATION_VERSION: i64 = 202_607_130_004;
-const EXPECTED_MIGRATION_COUNT: i64 = 4;
+const AGENT_ROUTER_MIGRATION_VERSION: i64 = 202_607_130_005;
+const EXPECTED_MIGRATION_COUNT: i64 = 5;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -17,6 +18,8 @@ const HOST_AUTHORIZATION_DOWN: &str =
     include_str!("../../../migrations/202607130003_host_credential_authorization.down.sql");
 const CONNECTOR_CONTROL_DOWN: &str =
     include_str!("../../../migrations/202607130004_connector_control.down.sql");
+const AGENT_ROUTER_DOWN: &str =
+    include_str!("../../../migrations/202607130005_agent_router.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,11 +44,15 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
 
-    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version IN ($1, $2, $3, $4)")
+    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version IN ($1, $2, $3, $4, $5)")
         .bind(INITIAL_MIGRATION_VERSION)
         .bind(AGENT_CONTROL_MIGRATION_VERSION)
         .bind(HOST_AUTHORIZATION_MIGRATION_VERSION)
         .bind(CONNECTOR_CONTROL_MIGRATION_VERSION)
+        .bind(AGENT_ROUTER_MIGRATION_VERSION)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(AGENT_ROUTER_DOWN)
         .execute(harness.admin_pool())
         .await?;
     sqlx::raw_sql(CONNECTOR_CONTROL_DOWN)

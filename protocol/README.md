@@ -18,6 +18,11 @@ Layout:
   ordinary TLS enrollment off the mandatory-mTLS control listener.
   Durable commands retain their exact nested Protobuf bytes inside a bounded
   raw frame so reconnect replay does not depend on decode/re-encode behavior.
+  The disjoint full `agent_control/v1_1` source artifact retains the existing
+  `dirextalk.agent_control.v1` package and single stream while adding only the
+  MC3 offer/lease handshake: `RunClaim` acknowledges `RunAvailable`, and only
+  `RunLeaseGranted` authorizes execution. `RunRelease` echoes both fences;
+  checkpoint, output, completion, and failure frames remain deferred to AR3.
 - `test-vectors/v1` contains byte-exact public ID, plan hash, API error, and
   event-envelope fixtures.
 - `generated/dart` is an independent Dart conformance consumer. Its registry-
@@ -25,7 +30,9 @@ Layout:
   edited manually.
 - `baseline/v1/manifest.json` freezes the published registry and original v1
   artifacts by SHA-256. `baseline/v2/manifest.json` is a disjoint artifact set
-  that freezes the Agent Control Protobuf without changing any v1 entry.
+  that freezes Agent Control 1.0 without changing any v1 entry.
+  `baseline/v3/manifest.json` independently freezes the additive Agent Control
+  1.1 source without changing the v1 or v2 artifact sets.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

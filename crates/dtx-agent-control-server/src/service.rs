@@ -14,8 +14,8 @@ use crate::{
     ConnectorTransportAdmission, ConnectorTransportAdmissionConfig, ParsedClientFrame,
     SourceTransportAdmission, SourceTransportAdmissionConfig, authenticate_control_request,
     build_connect_lease, build_credential_rotation_result, build_durable_command_frame,
-    build_enrollment_response, build_heartbeat_acknowledgement, parse_client_frame,
-    parse_enrollment_request, unix_time_from_millis,
+    build_enrollment_response, build_heartbeat_acknowledgement, build_run_available,
+    build_run_lease_granted, parse_client_frame, parse_enrollment_request, unix_time_from_millis,
 };
 
 /// Maximum time an authenticated control RPC may remain silent before its first `Hello`.
@@ -35,6 +35,15 @@ pub const COMMAND_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 pub const COMMAND_RECONCILE_JITTER: Duration = Duration::from_secs(15);
 /// Backward-compatible name for the durable reconciliation cadence.
 pub const COMMAND_POLL_INTERVAL: Duration = COMMAND_RECONCILE_INTERVAL;
+/// Maximum tenant-local Router timeout rows processed by one control-stream tick.
+pub const AGENT_RUN_TIMEOUT_RECONCILE_BATCH_LIMIT: usize =
+    dtx_agent_persistence::MAX_AGENT_RUN_EXPIRY_BATCH;
+/// Router offers expire after 15 seconds, so active streams reconcile well
+/// inside that window even when a wakeup notification is lost.
+pub const AGENT_RUN_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Bound one Run-offer drain slice so Heartbeat and `RunClaim` frames regain the
+/// control loop; a coalesced local wake immediately continues the next slice.
+pub const AGENT_RUN_OFFER_DRAIN_PAGE_BUDGET: usize = 2;
 
 /// Validated bounded fallback policy for lossy command notifications.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -361,13 +370,20 @@ async fn drive_control(
         }
     };
     let stream_fence = opened.lease.fence();
+    let protocol_minor = opened.protocol_minor;
+    let router_enabled = protocol_minor >= 1;
     // Subscribe before the final durable suffix query. This ordering closes the
     // commit-between-replay-and-wait race while allowing lossy/coalesced hints.
     let mut command_notifications =
         application.subscribe_commands(stream_fence.tenant_id(), stream_fence.connector_id());
+    let mut run_offer_notifications = if router_enabled {
+        application.subscribe_run_offers(stream_fence.tenant_id(), stream_fence.connector_id())
+    } else {
+        crate::RunOfferNotificationSubscription::never()
+    };
     let lease = match build_connect_lease(
         opened.lease,
-        opened.protocol_minor,
+        protocol_minor,
         opened.heartbeat_interval_millis,
         opened.heartbeat_ttl_millis,
         opened.acknowledged_command_sequence,
@@ -411,9 +427,37 @@ async fn drive_control(
     {
         return;
     }
+    let mut run_offer_cursor = 0;
+    let (run_offer_drain_sender, mut run_offer_drain_receiver) = mpsc::channel(1);
+    if router_enabled {
+        if !reconcile_agent_run_timeouts_on_tick(
+            application.as_ref(),
+            stream_fence.tenant_id(),
+            protocol_minor,
+            &sender,
+        )
+        .await
+        {
+            return;
+        }
+        if !poll_and_deliver_run_offers(
+            application.as_ref(),
+            peer,
+            stream_fence,
+            &mut run_offer_cursor,
+            &sender,
+            &run_offer_drain_sender,
+        )
+        .await
+        {
+            return;
+        }
+    }
     let reconcile_delay = command_reconcile_policy.delay(stream_fence);
     let reconcile = tokio::time::sleep(reconcile_delay);
     tokio::pin!(reconcile);
+    let run_reconcile = tokio::time::sleep(AGENT_RUN_RECONCILE_INTERVAL);
+    tokio::pin!(run_reconcile);
     loop {
         tokio::select! {
             inbound_frame = inbound.message() => {
@@ -493,6 +537,36 @@ async fn drive_control(
                             Err(error) => Err(error),
                         }
                     }
+                    ParsedClientFrame::RunClaim(claim) => {
+                        if router_enabled {
+                            match application.claim_run(peer, claim).await {
+                                Ok(completion) => match build_run_lease_granted(completion) {
+                                    Ok(granted) => {
+                                        if !send_frame(
+                                            &sender,
+                                            v1::server_frame::Kind::RunLeaseGranted(granted),
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                        Ok(())
+                                    }
+                                    Err(error) => Err(wire_into_application(error)),
+                                },
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::RunRelease(release) => {
+                        if router_enabled {
+                            application.release_run(peer, release).await
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
                 };
                 if let Err(error) = result {
                     send_status(&sender, application_status(error)).await;
@@ -510,6 +584,30 @@ async fn drive_control(
                     return;
                 }
             }
+            () = run_offer_notifications.changed() => {
+                if !poll_and_deliver_run_offers(
+                    application.as_ref(),
+                    peer,
+                    stream_fence,
+                    &mut run_offer_cursor,
+                    &sender,
+                    &run_offer_drain_sender,
+                ).await {
+                    return;
+                }
+            }
+            drain = run_offer_drain_receiver.recv() => {
+                if drain.is_none() || !poll_and_deliver_run_offers(
+                    application.as_ref(),
+                    peer,
+                    stream_fence,
+                    &mut run_offer_cursor,
+                    &sender,
+                    &run_offer_drain_sender,
+                ).await {
+                    return;
+                }
+            }
             () = &mut reconcile => {
                 if !poll_and_deliver_commands(
                     application.as_ref(),
@@ -522,8 +620,104 @@ async fn drive_control(
                 }
                 reconcile.as_mut().reset(tokio::time::Instant::now() + reconcile_delay);
             }
+            () = &mut run_reconcile => {
+                if !reconcile_agent_run_timeouts_on_tick(
+                    application.as_ref(),
+                    stream_fence.tenant_id(),
+                    protocol_minor,
+                    &sender,
+                ).await {
+                    return;
+                }
+                if router_enabled && !poll_and_deliver_run_offers(
+                    application.as_ref(),
+                    peer,
+                    stream_fence,
+                    &mut run_offer_cursor,
+                    &sender,
+                    &run_offer_drain_sender,
+                ).await {
+                    return;
+                }
+                run_reconcile.as_mut().reset(
+                    tokio::time::Instant::now() + AGENT_RUN_RECONCILE_INTERVAL,
+                );
+            }
         }
     }
+}
+
+async fn reconcile_agent_run_timeouts_on_tick(
+    application: &dyn ConnectorControlApplication,
+    tenant_id: dtx_domain::TenantId,
+    protocol_minor: u32,
+    sender: &mpsc::Sender<Result<v1::ServerFrame, Status>>,
+) -> bool {
+    if protocol_minor < 1 {
+        return true;
+    }
+    match application
+        .reconcile_agent_run_timeouts(tenant_id, AGENT_RUN_TIMEOUT_RECONCILE_BATCH_LIMIT)
+        .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            send_status(sender, application_status(error)).await;
+            false
+        }
+    }
+}
+
+async fn poll_and_deliver_run_offers(
+    application: &dyn ConnectorControlApplication,
+    peer: AuthenticatedConnectorPeer,
+    stream_fence: dtx_connect_registry::ConnectorFence,
+    after_sequence: &mut u64,
+    sender: &mpsc::Sender<Result<v1::ServerFrame, Status>>,
+    drain_wakeup: &mpsc::Sender<()>,
+) -> bool {
+    for page in 0..AGENT_RUN_OFFER_DRAIN_PAGE_BUDGET {
+        let offers = match application
+            .poll_run_offers(peer, stream_fence, *after_sequence)
+            .await
+        {
+            Ok(offers) => offers,
+            Err(error) => {
+                send_status(sender, application_status(error)).await;
+                return false;
+            }
+        };
+        if offers.is_empty() {
+            return true;
+        }
+        for offer in offers {
+            if offer.connector_offer_sequence <= *after_sequence {
+                send_status(
+                    sender,
+                    application_status(ConnectorControlApplicationError::Internal),
+                )
+                .await;
+                return false;
+            }
+            *after_sequence = offer.connector_offer_sequence;
+            let frame = match build_run_available(offer) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    send_status(sender, wire_status(error)).await;
+                    return false;
+                }
+            };
+            if !send_frame(sender, v1::server_frame::Kind::RunAvailable(frame)).await {
+                return false;
+            }
+        }
+        if page + 1 == AGENT_RUN_OFFER_DRAIN_PAGE_BUDGET {
+            let _ = drain_wakeup.try_send(());
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    true
 }
 
 async fn poll_and_deliver_commands(
@@ -618,7 +812,8 @@ fn application_status(error: ConnectorControlApplicationError) -> Status {
         ConnectorControlApplicationError::PermissionDenied => Status::permission_denied(message),
         ConnectorControlApplicationError::NotFound => Status::not_found(message),
         ConnectorControlApplicationError::Conflict => Status::aborted(message),
-        ConnectorControlApplicationError::StaleFence => Status::failed_precondition(message),
+        ConnectorControlApplicationError::StaleFence
+        | ConnectorControlApplicationError::StaleLease => Status::failed_precondition(message),
         ConnectorControlApplicationError::ResourceExhausted => Status::resource_exhausted(message),
         ConnectorControlApplicationError::Unavailable => Status::unavailable(message),
         ConnectorControlApplicationError::Internal => Status::internal(message),
@@ -627,7 +822,94 @@ fn application_status(error: ConnectorControlApplicationError) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    struct ReconcileTickApplication {
+        calls: AtomicUsize,
+        expected_tenant_id: dtx_domain::TenantId,
+        fail: bool,
+    }
+
+    impl ReconcileTickApplication {
+        fn new(expected_tenant_id: dtx_domain::TenantId, fail: bool) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                expected_tenant_id,
+                fail,
+            }
+        }
+    }
+
+    impl ConnectorControlApplication for ReconcileTickApplication {
+        fn now_utc_millis(&self) -> Result<i64, ConnectorControlApplicationError> {
+            panic!("reconcile tick fixture does not read the clock")
+        }
+
+        fn enroll(
+            &self,
+            _request: crate::ParsedEnrollment,
+        ) -> crate::ApplicationFuture<'_, crate::EnrollmentCompletion> {
+            panic!("reconcile tick fixture does not enroll")
+        }
+
+        fn open_control(
+            &self,
+            _peer: AuthenticatedConnectorPeer,
+            _hello: crate::ParsedHello,
+        ) -> crate::ApplicationFuture<'_, crate::OpenControlCompletion> {
+            panic!("reconcile tick fixture does not open control")
+        }
+
+        fn ready(
+            &self,
+            _peer: AuthenticatedConnectorPeer,
+            _ready: crate::ParsedReady,
+        ) -> crate::ApplicationFuture<'_, ()> {
+            panic!("reconcile tick fixture does not report readiness")
+        }
+
+        fn heartbeat(
+            &self,
+            _peer: AuthenticatedConnectorPeer,
+            _heartbeat: crate::ParsedHeartbeat,
+        ) -> crate::ApplicationFuture<'_, crate::HeartbeatCompletion> {
+            panic!("reconcile tick fixture does not report heartbeats")
+        }
+
+        fn acknowledge_command(
+            &self,
+            _peer: AuthenticatedConnectorPeer,
+            _acknowledgement: crate::ParsedCommandAcknowledgement,
+        ) -> crate::ApplicationFuture<'_, ()> {
+            panic!("reconcile tick fixture does not acknowledge commands")
+        }
+
+        fn rotate_credential(
+            &self,
+            _peer: AuthenticatedConnectorPeer,
+            _proof: crate::ParsedCredentialRotationProof,
+        ) -> crate::ApplicationFuture<'_, crate::CredentialRotationCompletion> {
+            panic!("reconcile tick fixture does not rotate credentials")
+        }
+
+        fn reconcile_agent_run_timeouts(
+            &self,
+            tenant_id: dtx_domain::TenantId,
+            limit: usize,
+        ) -> crate::ApplicationFuture<'_, ()> {
+            assert_eq!(tenant_id, self.expected_tenant_id);
+            assert_eq!(limit, AGENT_RUN_TIMEOUT_RECONCILE_BATCH_LIMIT);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let result = if self.fail {
+                Err(ConnectorControlApplicationError::Unavailable)
+            } else {
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+    }
 
     struct NeverCalledApplication;
 
@@ -765,5 +1047,38 @@ mod tests {
             )
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn run_timeout_reconciliation_tick_is_minor_gated_bounded_and_fail_closed() {
+        let tenant_id = dtx_domain::TenantId::new();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let application = ReconcileTickApplication::new(tenant_id, false);
+
+        assert!(
+            reconcile_agent_run_timeouts_on_tick(&application, tenant_id, 0, &sender).await,
+            "minor zero keeps its pre-Router tick behavior",
+        );
+        assert_eq!(application.calls.load(Ordering::SeqCst), 0);
+
+        assert!(
+            reconcile_agent_run_timeouts_on_tick(&application, tenant_id, 1, &sender).await,
+            "minor one invokes one bounded tenant reconciliation batch",
+        );
+        assert_eq!(application.calls.load(Ordering::SeqCst), 1);
+
+        let failing_application = ReconcileTickApplication::new(tenant_id, true);
+        assert!(
+            !reconcile_agent_run_timeouts_on_tick(&failing_application, tenant_id, 1, &sender,)
+                .await,
+            "a reconciliation failure closes the control loop",
+        );
+        let status = receiver
+            .recv()
+            .await
+            .expect("failure emits a stable transport status")
+            .expect_err("failure is not a successful frame");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "UNAVAILABLE");
     }
 }

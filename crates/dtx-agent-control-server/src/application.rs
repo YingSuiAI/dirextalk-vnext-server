@@ -7,11 +7,12 @@ use dtx_connect_registry::{ConnectorFence, ConnectorLease, HeartbeatAck};
 use dtx_domain::{ConnectorId, TenantId};
 use dtx_security::AuthenticatedConnectorPeer;
 
-use crate::CommandNotificationSubscription;
 use crate::wire::{
     ParsedCommandAcknowledgement, ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat,
-    ParsedHello, ParsedReady,
+    ParsedHello, ParsedReady, ParsedRunClaim, ParsedRunRelease, RunAvailableWire,
+    RunLeaseGrantedWire,
 };
+use crate::{CommandNotificationSubscription, RunOfferNotificationSubscription};
 
 /// Heap-erased application future used by the object-safe transport port.
 pub type ApplicationFuture<'a, T> =
@@ -117,6 +118,57 @@ pub trait ConnectorControlApplication: Send + Sync + 'static {
     ) -> ApplicationFuture<'_, Vec<DurableServerCommand>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+
+    /// Subscribes before the stream queries its durable active-offer page.
+    fn subscribe_run_offers(
+        &self,
+        _tenant_id: TenantId,
+        _connector_id: ConnectorId,
+    ) -> RunOfferNotificationSubscription {
+        RunOfferNotificationSubscription::never()
+    }
+
+    /// Returns bounded active offers for the exact live Connector fence.
+    fn poll_run_offers(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _fence: ConnectorFence,
+        _after_sequence: u64,
+    ) -> ApplicationFuture<'_, Vec<RunAvailableWire>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Reconciles at most `limit` due Router timeouts for one exact tenant.
+    ///
+    /// The transport invokes one bounded batch on its low-frequency durable
+    /// reconciliation tick. Implementations must reject zero or unsupported
+    /// bounds and must not scan or mutate another tenant. The default fails
+    /// closed so a production Router cannot silently omit timeout progress.
+    fn reconcile_agent_run_timeouts(
+        &self,
+        _tenant_id: TenantId,
+        _limit: usize,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::Unavailable) })
+    }
+
+    /// Atomically acknowledges one offer and grants its sole execution lease.
+    fn claim_run(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _claim: ParsedRunClaim,
+    ) -> ApplicationFuture<'_, RunLeaseGrantedWire> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    /// Fences a released execution lease for reconciliation.
+    fn release_run(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _release: ParsedRunRelease,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
 }
 
 /// Stable, non-secret failure classes exposed by the control transport.
@@ -128,6 +180,7 @@ pub enum ConnectorControlApplicationError {
     NotFound,
     Conflict,
     StaleFence,
+    StaleLease,
     ResourceExhausted,
     Unavailable,
     Internal,
@@ -143,6 +196,7 @@ impl ConnectorControlApplicationError {
             Self::NotFound => "NOT_FOUND",
             Self::Conflict => "CONFLICT",
             Self::StaleFence => "STALE_FENCE",
+            Self::StaleLease => "STALE_LEASE",
             Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
             Self::Unavailable => "UNAVAILABLE",
             Self::Internal => "INTERNAL",

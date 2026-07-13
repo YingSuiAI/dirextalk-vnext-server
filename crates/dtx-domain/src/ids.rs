@@ -184,6 +184,8 @@ define_uuid_v7_id!(HostCredentialId, "agent host credential ID");
 define_uuid_v7_id!(ConsentId, "consent ID");
 define_uuid_v7_id!(ApprovalId, "approval ID");
 define_uuid_v7_id!(RunId, "agent run ID");
+define_uuid_v7_id!(RunOfferId, "agent run offer ID");
+define_uuid_v7_id!(RunLeaseId, "agent run lease ID");
 define_uuid_v7_id!(JobId, "job ID");
 define_uuid_v7_id!(JobStepId, "job step ID");
 define_uuid_v7_id!(JobEvidenceId, "job evidence ID");

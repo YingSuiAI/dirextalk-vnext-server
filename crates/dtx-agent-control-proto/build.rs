@@ -7,7 +7,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     )
     .join("../..");
     let proto_root = repository_root.join("protocol/proto");
-    let contract = proto_root.join("dirextalk/agent_control/v1/agent_control.proto");
     let descriptor = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is required")?)
         .join("agent_control_descriptor.bin");
 
@@ -15,13 +14,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     // reviewed schema cannot leave generated Rust or descriptors stale.
     println!("cargo:rerun-if-changed={}", proto_root.display());
 
+    compile_contract(
+        proto_root.join("dirextalk/agent_control/v1_1/agent_control.proto"),
+        descriptor,
+        &proto_root,
+    )?;
+
+    Ok(())
+}
+
+fn compile_contract(
+    contract: PathBuf,
+    descriptor: PathBuf,
+    proto_root: &std::path::Path,
+) -> Result<(), Box<dyn Error>> {
     let mut prost = tonic_prost_build::Config::new();
     prost.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
         .file_descriptor_set_path(descriptor)
-        .compile_with_config(prost, &[contract], &[proto_root])?;
-
+        .compile_with_config(prost, &[contract], &[proto_root.to_path_buf()])?;
     Ok(())
 }

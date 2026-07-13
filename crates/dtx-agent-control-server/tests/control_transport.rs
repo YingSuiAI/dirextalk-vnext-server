@@ -18,15 +18,16 @@ use dtx_agent_control_server::{
     ConnectorCredentialAuthorizationIndex, CredentialRotationCompletion, EnrollmentCompletion,
     HeartbeatCompletion, OpenControlCompletion, ParsedCommandAcknowledgement,
     ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat, ParsedHello,
-    ParsedLeaseFence, ParsedReady, connector_control_service, connector_tls_incoming,
+    ParsedLeaseFence, ParsedReady, ParsedRunClaim, RunAvailableWire, RunLeaseGrantedWire,
+    connector_control_service, connector_tls_incoming,
 };
 use dtx_connect_registry::{
     AdapterKind, Connector, ConnectorDesiredState, ConnectorFence, ConnectorObservedState,
     ConnectorRevisionSnapshot, ConnectorSnapshot, LeaseStatus,
 };
 use dtx_domain::{
-    BootId, ConnectorCredentialId, ConnectorId, Ed25519PublicKey, HostId, LeaseId, RequestId,
-    Revision, TenantId,
+    BindingId, BootId, ConnectorCredentialId, ConnectorId, Ed25519PublicKey, HostId,
+    InstallationId, LeaseId, RequestId, Revision, RunId, RunLeaseId, TenantId,
 };
 use dtx_security::{
     AuthenticatedConnectorPeer, ConnectorCredentialAuthorizer, ConnectorMtlsClientVerifier,
@@ -51,6 +52,16 @@ struct FakeState {
     command_log: CommandLog,
 }
 
+#[derive(Clone, Debug)]
+struct FakeRun {
+    run_id: RunId,
+    request_id: RequestId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    run_lease_id: RunLeaseId,
+    required_capabilities: Vec<String>,
+}
+
 struct FakeApplication {
     now_millis: i64,
     identity: ConnectorWorkloadIdentity,
@@ -60,7 +71,11 @@ struct FakeApplication {
     state: Mutex<FakeState>,
     heartbeat_calls: AtomicUsize,
     command_poll_calls: AtomicUsize,
+    run_claim_calls: AtomicUsize,
+    run_reconcile_calls: AtomicUsize,
     command_page_size: usize,
+    protocol_minor: u32,
+    run: Option<FakeRun>,
 }
 
 impl FakeApplication {
@@ -130,8 +145,18 @@ impl FakeApplication {
             }),
             heartbeat_calls: AtomicUsize::new(0),
             command_poll_calls: AtomicUsize::new(0),
+            run_claim_calls: AtomicUsize::new(0),
+            run_reconcile_calls: AtomicUsize::new(0),
             command_page_size: 64,
+            protocol_minor: 0,
+            run: None,
         }
+    }
+
+    fn with_router_run(mut self, run: FakeRun) -> Self {
+        self.protocol_minor = 1;
+        self.run = Some(run);
+        self
     }
 
     fn validate_peer(
@@ -221,7 +246,7 @@ impl ConnectorControlApplication for FakeApplication {
                 || hello.host_id != self.host_id
                 || hello.connector_generation != 1
                 || hello.spec_revision != Revision::INITIAL
-                || !hello.protocol.supports(1, 0)
+                || !hello.protocol.supports(1, self.protocol_minor)
                 || hello.capacity.maximum_concurrent_runs != 2
             {
                 return Err(ConnectorControlApplicationError::InvalidRequest);
@@ -263,7 +288,7 @@ impl ConnectorControlApplication for FakeApplication {
                 .collect();
             Ok(OpenControlCompletion {
                 lease,
-                protocol_minor: 0,
+                protocol_minor: self.protocol_minor,
                 heartbeat_interval_millis: HEARTBEAT_INTERVAL_MILLIS,
                 heartbeat_ttl_millis: HEARTBEAT_TTL_MILLIS,
                 acknowledged_command_sequence: state.command_log.acknowledged_sequence(),
@@ -391,6 +416,105 @@ impl ConnectorControlApplication for FakeApplication {
         });
         application_result(result)
     }
+
+    fn poll_run_offers(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        fence: ConnectorFence,
+        after_sequence: u64,
+    ) -> ApplicationFuture<'_, Vec<RunAvailableWire>> {
+        let result = (|| {
+            self.validate_peer(peer)?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            let connector_fence = parsed_fence(fence);
+            matching_fence(&state.connector, connector_fence)?;
+            let Some(run) = &self.run else {
+                return Ok(Vec::new());
+            };
+            if after_sequence >= 1 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![RunAvailableWire {
+                connector_offer_sequence: 1,
+                connector_fence,
+                run_id: run.run_id,
+                request_id: run.request_id,
+                installation_id: run.installation_id,
+                binding_id: run.binding_id,
+                connector_id: self.identity.connector_id(),
+                offer_attempt: 1,
+                offered_at_millis: self.now_millis,
+                offer_deadline_millis: self.now_millis + 60_000,
+                required_capabilities: run.required_capabilities.clone(),
+            }])
+        })();
+        application_result(result)
+    }
+
+    fn reconcile_agent_run_timeouts(
+        &self,
+        tenant_id: TenantId,
+        limit: usize,
+    ) -> ApplicationFuture<'_, ()> {
+        let result = if tenant_id == self.identity.tenant_id()
+            && limit == dtx_agent_persistence::MAX_AGENT_RUN_EXPIRY_BATCH
+        {
+            self.run_reconcile_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        } else {
+            Err(ConnectorControlApplicationError::InvalidRequest)
+        };
+        application_result(result)
+    }
+
+    fn claim_run(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        claim: ParsedRunClaim,
+    ) -> ApplicationFuture<'_, RunLeaseGrantedWire> {
+        let result = (|| {
+            self.validate_peer(peer)?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            matching_fence(&state.connector, claim.connector_fence)?;
+            let run = self
+                .run
+                .as_ref()
+                .ok_or(ConnectorControlApplicationError::NotFound)?;
+            if claim.run_id != run.run_id
+                || claim.request_id != run.request_id
+                || claim.installation_id != run.installation_id
+                || claim.binding_id != run.binding_id
+                || claim.connector_id != self.identity.connector_id()
+                || claim.offer_attempt != 1
+                || claim.offer_deadline_millis != self.now_millis + 60_000
+                || claim.required_capabilities != run.required_capabilities
+            {
+                return Err(ConnectorControlApplicationError::InvalidRequest);
+            }
+            self.run_claim_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RunLeaseGrantedWire {
+                connector_fence: claim.connector_fence,
+                run_id: claim.run_id,
+                request_id: claim.request_id,
+                installation_id: claim.installation_id,
+                binding_id: claim.binding_id,
+                connector_id: claim.connector_id,
+                offer_attempt: claim.offer_attempt,
+                run_lease_id: run.run_lease_id,
+                run_lease_epoch: 1,
+                granted_at_millis: self.now_millis + 1,
+                run_lease_deadline_millis: self.now_millis + 120_000,
+                required_capabilities: claim.required_capabilities,
+            })
+        })();
+        application_result(result)
+    }
 }
 
 fn application_result<T: Send + 'static>(
@@ -419,6 +543,17 @@ fn matching_fence(
         Ok(fence)
     } else {
         Err(ConnectorControlApplicationError::StaleFence)
+    }
+}
+
+fn parsed_fence(fence: ConnectorFence) -> ParsedLeaseFence {
+    ParsedLeaseFence {
+        tenant_id: fence.tenant_id(),
+        connector_id: fence.connector_id(),
+        boot_id: fence.boot_id(),
+        connector_generation: fence.generation().get(),
+        lease_id: fence.lease_id(),
+        lease_epoch: fence.lease_epoch().get(),
     }
 }
 
@@ -524,7 +659,12 @@ async fn real_mtls_control_uses_application_authority_not_the_local_tls_index() 
         hello(identity, host_id, first_boot, 0),
     )
     .await;
-    let first_lease = expect_lease(&mut first_responses).await;
+    let first_connect_lease = expect_connect_lease(&mut first_responses).await;
+    assert_eq!(
+        first_connect_lease.protocol_minor, 0,
+        "an agent-control/1.0 client stays on minor zero on the shared stream",
+    );
+    let first_lease = first_connect_lease.fence.expect("lease includes a fence");
     let first_command = expect_command(&mut first_responses).await;
     assert_eq!(first_command.encoded_command, expected_command);
     assert_eq!(
@@ -697,6 +837,139 @@ async fn real_mtls_control_uses_application_authority_not_the_local_tls_index() 
         .expect("control server exits cleanly");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn minor_one_offer_requires_claim_before_the_same_stream_grants_a_run_lease() {
+    let now_millis = current_time_millis();
+    let ca = TestCertificateAuthority::new(now_millis).expect("test CA created");
+    let identity = ConnectorWorkloadIdentity::new(TenantId::new(), ConnectorId::new());
+    let host_id = HostId::new();
+    let client_certificate = ca
+        .issue(
+            &WorkloadIdentity::from(identity),
+            CertificatePurpose::ClientAuth,
+            now_millis,
+            300,
+        )
+        .expect("Connector client certificate issued");
+    let server_certificate = ca
+        .issue(
+            &WorkloadIdentity::ControlServer {
+                dns_name: "localhost".to_owned(),
+            },
+            CertificatePurpose::ServerAuth,
+            now_millis,
+            300,
+        )
+        .expect("control server certificate issued");
+    let roots = test_roots(&ca);
+    let authorization_index = Arc::new(ConnectorCredentialAuthorizationIndex::new());
+    let verifier = Arc::new(
+        ConnectorMtlsClientVerifier::new(
+            roots,
+            authorization_index as Arc<dyn ConnectorCredentialAuthorizer>,
+        )
+        .expect("Connector verifier builds"),
+    );
+    let server_config = server_config(&server_certificate, verifier.as_ref().clone());
+    let client_tls = client_tls_config(&ca, &client_certificate);
+
+    let run = FakeRun {
+        run_id: RunId::new(),
+        request_id: RequestId::new(),
+        installation_id: InstallationId::new(),
+        binding_id: BindingId::new(),
+        run_lease_id: RunLeaseId::new(),
+        required_capabilities: vec!["runtime.codex".to_owned(), "tools.web".to_owned()],
+    };
+    let (operation_id, command, payload_digest, _) = exact_command();
+    let application = Arc::new(
+        FakeApplication::new(
+            now_millis,
+            identity,
+            host_id,
+            client_certificate.certificate_fingerprint(),
+            operation_id,
+            command,
+            payload_digest,
+        )
+        .with_router_run(run.clone()),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener binds");
+    let address = listener.local_addr().expect("loopback address available");
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let server_application: Arc<dyn ConnectorControlApplication> = application.clone();
+    let server_verifier = Arc::clone(&verifier);
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .serve_with_incoming_shutdown(
+                connector_control_service(server_application, server_verifier),
+                connector_tls_incoming(listener, Arc::new(server_config)),
+                async {
+                    let _ = shutdown_receiver.await;
+                },
+            )
+            .await
+    });
+
+    let (sender, mut responses) = open_control(
+        address,
+        client_tls,
+        hello_through_minor(identity, host_id, BootId::new(), 1),
+    )
+    .await;
+    let connect_lease = expect_connect_lease(&mut responses).await;
+    assert_eq!(connect_lease.protocol_minor, 1);
+    let _command = expect_command(&mut responses).await;
+    let available = expect_run_available(&mut responses).await;
+    assert_eq!(available.run_id, run.run_id.to_string());
+    assert_eq!(available.request_id, run.request_id.to_string());
+    assert_eq!(
+        application.run_claim_calls.load(Ordering::SeqCst),
+        0,
+        "RunAvailable is only an offer and cannot grant execution",
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), responses.message())
+            .await
+            .is_err(),
+        "the stream must not emit RunLeaseGranted before RunClaim",
+    );
+
+    sender
+        .send(v1::ClientFrame {
+            kind: Some(v1::client_frame::Kind::RunClaim(v1::RunClaim {
+                connector_fence: available.connector_fence.clone(),
+                run_id: available.run_id.clone(),
+                request_id: available.request_id.clone(),
+                installation_id: available.installation_id.clone(),
+                binding_id: available.binding_id.clone(),
+                connector_id: available.connector_id.clone(),
+                offer_attempt: available.offer_attempt,
+                offer_deadline_millis: available.offer_deadline_millis,
+                required_capabilities: available.required_capabilities.clone(),
+            })),
+        })
+        .await
+        .expect("RunClaim sent on the existing Control stream");
+    let granted = expect_run_lease_granted(&mut responses).await;
+    assert_eq!(granted.run_id, run.run_id.to_string());
+    assert_eq!(granted.run_lease_id, run.run_lease_id.to_string());
+    assert_eq!(granted.run_lease_epoch, 1);
+    assert_eq!(granted.connector_fence, available.connector_fence);
+    assert_eq!(application.run_claim_calls.load(Ordering::SeqCst), 1);
+
+    drop(sender);
+    drop(responses);
+    shutdown_sender.send(()).expect("server shutdown sent");
+    server
+        .await
+        .expect("control server task joins")
+        .expect("control server exits cleanly");
+}
+
 fn exact_command() -> (RequestId, Vec<u8>, Sha256Digest, Sha256Digest) {
     let payload = v1::CloseStream {
         reason: v1::CloseStreamReason::Reconnect as i32,
@@ -843,6 +1116,21 @@ fn hello(
     }
 }
 
+fn hello_through_minor(
+    identity: ConnectorWorkloadIdentity,
+    host_id: HostId,
+    boot_id: BootId,
+    maximum_minor: u32,
+) -> v1::Hello {
+    let mut value = hello(identity, host_id, boot_id, 0);
+    value
+        .protocol
+        .as_mut()
+        .expect("fixture Hello has a protocol range")
+        .maximum_minor = maximum_minor;
+    value
+}
+
 fn runtime_claims() -> v1::RuntimeClaims {
     v1::RuntimeClaims {
         runtime_kind: "codex".to_owned(),
@@ -884,15 +1172,20 @@ async fn send_heartbeat(
 }
 
 async fn expect_lease(responses: &mut Streaming<v1::ServerFrame>) -> v1::LeaseFence {
+    expect_connect_lease(responses)
+        .await
+        .fence
+        .expect("lease includes a fence")
+}
+
+async fn expect_connect_lease(responses: &mut Streaming<v1::ServerFrame>) -> v1::ConnectLease {
     match responses
         .message()
         .await
         .expect("lease response is valid")
         .and_then(|frame| frame.kind)
     {
-        Some(v1::server_frame::Kind::ConnectLease(lease)) => {
-            lease.fence.expect("lease includes a fence")
-        }
+        Some(v1::server_frame::Kind::ConnectLease(lease)) => lease,
         other => panic!("expected ConnectLease, received {other:?}"),
     }
 }
@@ -906,6 +1199,32 @@ async fn expect_command(responses: &mut Streaming<v1::ServerFrame>) -> v1::Durab
     {
         Some(v1::server_frame::Kind::DurableCommand(command)) => command,
         other => panic!("expected DurableCommand, received {other:?}"),
+    }
+}
+
+async fn expect_run_available(responses: &mut Streaming<v1::ServerFrame>) -> v1::RunAvailable {
+    match responses
+        .message()
+        .await
+        .expect("run offer response is valid")
+        .and_then(|frame| frame.kind)
+    {
+        Some(v1::server_frame::Kind::RunAvailable(available)) => available,
+        other => panic!("expected RunAvailable, received {other:?}"),
+    }
+}
+
+async fn expect_run_lease_granted(
+    responses: &mut Streaming<v1::ServerFrame>,
+) -> v1::RunLeaseGranted {
+    match responses
+        .message()
+        .await
+        .expect("run grant response is valid")
+        .and_then(|frame| frame.kind)
+    {
+        Some(v1::server_frame::Kind::RunLeaseGranted(granted)) => granted,
+        other => panic!("expected RunLeaseGranted, received {other:?}"),
     }
 }
 

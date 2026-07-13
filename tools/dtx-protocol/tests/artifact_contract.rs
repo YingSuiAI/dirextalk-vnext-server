@@ -39,6 +39,25 @@ fn freezing_a_new_version_preserves_the_published_v1_manifest() {
 }
 
 #[test]
+fn freezing_v3_preserves_both_older_manifests() {
+    let root = isolated_protocol_tree();
+    let v1 = root.join("protocol/baseline/v1/manifest.json");
+    let v2 = root.join("protocol/baseline/v2/manifest.json");
+    let v3 = root.join("protocol/baseline/v3/manifest.json");
+    let published_v1 = fs::read(&v1).unwrap();
+    let published_v2 = fs::read(&v2).unwrap();
+    fs::remove_file(&v3).unwrap();
+
+    freeze_baseline(&root).expect("the disjoint v1.1 artifact set freezes as v3");
+    assert_eq!(fs::read(&v1).unwrap(), published_v1);
+    assert_eq!(fs::read(&v2).unwrap(), published_v2);
+    assert!(v3.is_file());
+    check_breaking(&root).expect("all three disjoint baselines verify");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn freeze_never_regenerates_a_missing_published_v1_manifest() {
     let root = isolated_protocol_tree();
     fs::remove_file(root.join("protocol/baseline/v1/manifest.json")).unwrap();

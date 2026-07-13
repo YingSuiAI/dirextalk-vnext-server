@@ -3,11 +3,14 @@ mod support;
 
 use std::{error::Error, str::FromStr};
 
+use dtx_agent_control::{RuntimeClaims, Sha256Digest};
 use dtx_agent_host::{AgentHost, ReportedHealth};
 use dtx_agent_persistence::{
     AgentDefinitionRepository, AgentDeviceRepository, AgentHostRepository,
-    AgentInstallationRepository, AgentPersistenceError, BindingSetRepository, ConnectorRepository,
-    ConversationGrantRepository, CurrentWrite, DefinitionInsert,
+    AgentInstallationRepository, AgentPersistenceError, AgentRunCreate, AgentRunOfferNext,
+    AgentRunRepository, BindingSetRepository, ConnectorRepository, ConversationGrantRepository,
+    CurrentWrite, DefinitionInsert, RuntimeCapacity, RuntimeClaimRecord, RuntimeClaimRepository,
+    RuntimeClaimSource,
 };
 use dtx_agent_registry::{
     AgentConversationPermission, AgentConversationPermissions, AgentDevice, AgentDeviceCommand,
@@ -15,14 +18,18 @@ use dtx_agent_registry::{
     DescriptorDigest, DeviceCredentialFingerprint, ExecutionMode, InstallationCommand,
     PermissionExpansionConfirmation, PrivacyPolicyDigest, TriggerPolicy, VerifiedAgentDefinition,
 };
+use dtx_agent_router::{
+    AgentRun, ConnectorLeaseFence, DispatchMode, RouteCandidate, RunRequest, RunRoutingState,
+    WriteDisposition,
+};
 use dtx_connect_registry::{
     AdapterConformance, AdapterKind, BindingSet, BindingSpec, Connector, ConnectorFence,
     ConnectorObservedState, ConnectorSnapshot, LeaseStatus, RoutingPolicy, TenantRef,
 };
 use dtx_domain::{
     AgentDeviceId, AgentId, BindingId, BootId, CloudConnectionId, ConnectorId, ConversationId,
-    DeviceId, Ed25519PublicKey, GrantId, HostCredentialId, HostId, IdentityId, InstallationId,
-    LeaseId, Revision, TenantId,
+    DeviceId, Ed25519PublicKey, EventId, GrantId, HostCredentialId, HostId, IdentityId,
+    InstallationId, LeaseId, RequestId, Revision, RunId, RunLeaseId, RunOfferId, TenantId,
 };
 use dtx_storage::PgStore;
 use sqlx::PgConnection;
@@ -72,6 +79,388 @@ async fn agent_control_aggregates_round_trip_and_preserve_database_fences()
     assert_cross_tenant_rows_are_hidden(&store, foreign_tenant_id, &fixture).await?;
     assert_only_one_concurrent_replacement_lease_wins(&store, &fixture).await?;
     assert_only_one_concurrent_single_session_binding_wins(&store, &fixture).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    grant_agent_router_runtime_access(&harness).await?;
+    let store = harness.runtime_store(4).await?;
+    let tenant_id = TenantId::new();
+    provision_tenant(&store, tenant_id).await?;
+    let fixture = persist_complete_fixture(&store, tenant_id).await?;
+
+    let mut connector = fixture.connector.clone();
+    let active_fence = connector
+        .leases()
+        .last()
+        .expect("fixture has an active Connector lease")
+        .fence();
+    let before_heartbeat = connector.snapshot();
+    connector.record_heartbeat(&active_fence, 2, 1_100, ConnectorObservedState::Ready, 1, 1)?;
+    let runtime_claim = RuntimeClaimRecord::new(
+        tenant_id,
+        connector.connector_id(),
+        active_fence.lease_id(),
+        active_fence.boot_id(),
+        active_fence.generation().get(),
+        RuntimeClaimSource::Heartbeat(2),
+        RuntimeClaims::new(
+            AdapterKind::Codex,
+            "router-test".to_owned(),
+            Sha256Digest::from_bytes([0x51; 32]),
+            0,
+            Vec::new(),
+            None,
+            vec!["agent.run".to_owned()],
+        )?,
+        RuntimeCapacity::new(4, 1, 8)?,
+        Sha256Digest::from_bytes([0x52; 32]),
+        1_100,
+    )?;
+    let mut session = store.begin_tenant(tenant_id).await?;
+    ConnectorRepository::new()
+        .save(
+            session.connection(),
+            &connector,
+            Some(&before_heartbeat),
+            1_100,
+        )
+        .await?;
+    RuntimeClaimRepository::new()
+        .append(session.connection(), &runtime_claim)
+        .await?;
+    session.commit().await?;
+
+    let binding_snapshot = fixture.binding_set.snapshot();
+    let binding = binding_snapshot
+        .bindings
+        .iter()
+        .find(|binding| binding.connector_id == connector.connector_id())
+        .expect("fixture binds the active Connector");
+    let routing_policy = binding_snapshot
+        .routing_policies
+        .iter()
+        .find(|policy| policy.installation_id == fixture.installation.installation_id())
+        .expect("fixture has an Installation routing policy");
+    let run = AgentRun::create(
+        RunRequest::new(
+            tenant_id,
+            RunId::new(),
+            RequestId::new(),
+            [0x61; 32],
+            [0x62; 32],
+            fixture.installation.installation_id(),
+            ConversationId::new(),
+            EventId::new(),
+            Some(connector.connector_id()),
+            vec!["agent.run".to_owned()],
+            DispatchMode::Single,
+            routing_policy.policy,
+            routing_policy.revision,
+            fixture.grant.grant_version().get(),
+            1_190,
+            1_101,
+        )?,
+        vec![RouteCandidate::new(
+            binding.binding_id,
+            binding.connector_id,
+            binding.priority,
+            binding.max_concurrency,
+        )?],
+    )?;
+    let repository = AgentRunRepository::new();
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let (created, persisted) = repository.create(session.connection(), &run).await?;
+    session.commit().await?;
+    assert_eq!(created, AgentRunCreate::Inserted);
+    assert_eq!(persisted.snapshot(), run.snapshot());
+
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let (retried, loaded) = repository.create(session.connection(), &run).await?;
+    session.commit().await?;
+    assert_eq!(retried, AgentRunCreate::Existing);
+    assert_eq!(loaded.snapshot(), run.snapshot());
+
+    let saturated_run = AgentRun::create(
+        RunRequest::new(
+            tenant_id,
+            RunId::new(),
+            RequestId::new(),
+            [0x63; 32],
+            [0x64; 32],
+            fixture.installation.installation_id(),
+            ConversationId::new(),
+            EventId::new(),
+            Some(connector.connector_id()),
+            vec!["agent.run".to_owned()],
+            DispatchMode::Single,
+            routing_policy.policy,
+            routing_policy.revision,
+            fixture.grant.grant_version().get(),
+            1_190,
+            1_102,
+        )?,
+        vec![RouteCandidate::new(
+            binding.binding_id,
+            binding.connector_id,
+            binding.priority,
+            binding.max_concurrency,
+        )?],
+    )?;
+    let mut session = store.begin_tenant(tenant_id).await?;
+    assert_eq!(
+        repository
+            .create(session.connection(), &saturated_run)
+            .await?
+            .0,
+        AgentRunCreate::Inserted
+    );
+    session.commit().await?;
+
+    let router_fence = ConnectorLeaseFence::from(active_fence);
+    let offer_id = RunOfferId::new();
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let (offered, offered_run) = repository
+        .offer_next(
+            session.connection(),
+            tenant_id,
+            run.request().run_id(),
+            run.revision(),
+            offer_id,
+            1_110,
+            1_180,
+        )
+        .await?;
+    session.commit().await?;
+    let offer = match offered {
+        AgentRunOfferNext::Offered(WriteDisposition::Inserted(offer)) => offer,
+        other => panic!("first eligible routing attempt must insert an offer: {other:?}"),
+    };
+    assert_eq!(offered_run.state(), RunRoutingState::Offered);
+
+    let saturated_offer_id = RunOfferId::new();
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let (saturated_offered, saturated_offered_run) = repository
+        .offer_next(
+            session.connection(),
+            tenant_id,
+            saturated_run.request().run_id(),
+            saturated_run.revision(),
+            saturated_offer_id,
+            1_111,
+            1_180,
+        )
+        .await?;
+    session.commit().await?;
+    let saturated_offer = match saturated_offered {
+        AgentRunOfferNext::Offered(WriteDisposition::Inserted(offer)) => offer,
+        other => panic!("capacity is reserved at claim, so a second offer is valid: {other:?}"),
+    };
+    assert_eq!(saturated_offered_run.state(), RunRoutingState::Offered);
+
+    let mut stale_session = store.begin_tenant(tenant_id).await?;
+    let stale_claim = repository
+        .claim(
+            stale_session.connection(),
+            tenant_id,
+            run.request().run_id(),
+            offered_run.revision(),
+            offer.offer_id(),
+            offer.attempt(),
+            ConnectorLeaseFence::from(fixture.first_lease_fence),
+            RunLeaseId::new(),
+            1_120,
+            1_170,
+        )
+        .await;
+    stale_session.rollback().await?;
+    assert!(matches!(
+        stale_claim,
+        Err(AgentPersistenceError::FenceConflict)
+    ));
+
+    let left = claim_run(
+        store.clone(),
+        tenant_id,
+        run.request().run_id(),
+        offered_run.revision(),
+        offer.offer_id(),
+        offer.attempt(),
+        router_fence,
+        RunLeaseId::new(),
+    );
+    let right = claim_run(
+        store.clone(),
+        tenant_id,
+        run.request().run_id(),
+        offered_run.revision(),
+        offer.offer_id(),
+        offer.attempt(),
+        router_fence,
+        RunLeaseId::new(),
+    );
+    let (left, right) = tokio::join!(left, right);
+    let left = left?;
+    let right = right?;
+    assert!(
+        matches!(left.0, WriteDisposition::Inserted(_))
+            ^ matches!(right.0, WriteDisposition::Inserted(_))
+    );
+    assert!(
+        matches!(left.0, WriteDisposition::Existing(_))
+            ^ matches!(right.0, WriteDisposition::Existing(_))
+    );
+    assert_eq!(left.0.value(), right.0.value());
+
+    let mut saturated_session = store.begin_tenant(tenant_id).await?;
+    let saturated_claim = repository
+        .claim(
+            saturated_session.connection(),
+            tenant_id,
+            saturated_run.request().run_id(),
+            saturated_offered_run.revision(),
+            saturated_offer.offer_id(),
+            saturated_offer.attempt(),
+            router_fence,
+            RunLeaseId::new(),
+            1_131,
+            1_170,
+        )
+        .await;
+    saturated_session.rollback().await?;
+    assert!(matches!(
+        saturated_claim,
+        Err(AgentPersistenceError::ClaimRejected(_))
+    ));
+
+    assert_capacity(
+        &store,
+        tenant_id,
+        connector.connector_id(),
+        binding.binding_id,
+        1,
+    )
+    .await?;
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let leased = repository
+        .load(session.connection(), tenant_id, run.request().run_id())
+        .await?
+        .expect("claimed Run reloads");
+    session.commit().await?;
+    let lease = leased.current_lease().expect("claimed Run has a lease");
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let released = repository
+        .release(
+            session.connection(),
+            tenant_id,
+            run.request().run_id(),
+            leased.revision(),
+            lease.run_lease_id(),
+            lease.run_lease_epoch(),
+            router_fence,
+            1_140,
+        )
+        .await?;
+    session.commit().await?;
+    assert_eq!(released.state(), RunRoutingState::ReconcileRequired);
+    assert_capacity(
+        &store,
+        tenant_id,
+        connector.connector_id(),
+        binding.binding_id,
+        0,
+    )
+    .await?;
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let expired_offer = repository
+        .expire_next_due(session.connection(), tenant_id, 1_180)
+        .await?
+        .expect("the second offer is selected by its indexed deadline");
+    session.commit().await?;
+    assert_eq!(
+        expired_offer.request().run_id(),
+        saturated_run.request().run_id()
+    );
+    assert_eq!(expired_offer.state(), RunRoutingState::Queued);
+    Ok(())
+}
+
+async fn grant_agent_router_runtime_access(
+    harness: &PostgresHarness,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::raw_sql(
+        "GRANT SELECT, INSERT, UPDATE ON agent.agent_runs TO dtx_runtime_test;
+         GRANT SELECT, INSERT ON agent.agent_run_candidates TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.connector_run_capacity_heads TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.binding_run_capacity_heads TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_run_offers TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_run_leases TO dtx_runtime_test;
+         GRANT EXECUTE ON FUNCTION agent.router_stable_names(text[]) TO dtx_runtime_test;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn claim_run(
+    store: PgStore,
+    tenant_id: TenantId,
+    run_id: RunId,
+    expected_revision: Revision,
+    offer_id: RunOfferId,
+    offer_attempt: u64,
+    connector_fence: ConnectorLeaseFence,
+    run_lease_id: RunLeaseId,
+) -> Result<(WriteDisposition<dtx_agent_router::RunLease>, AgentRun), Box<dyn Error>> {
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let claimed = AgentRunRepository::new()
+        .claim(
+            session.connection(),
+            tenant_id,
+            run_id,
+            expected_revision,
+            offer_id,
+            offer_attempt,
+            connector_fence,
+            run_lease_id,
+            1_130,
+            1_170,
+        )
+        .await?;
+    session.commit().await?;
+    Ok(claimed)
+}
+
+async fn assert_capacity(
+    store: &PgStore,
+    tenant_id: TenantId,
+    connector_id: ConnectorId,
+    binding_id: BindingId,
+    expected: i64,
+) -> Result<(), Box<dyn Error>> {
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let connector: i64 = sqlx::query_scalar(
+        "SELECT active_reservation_count FROM agent.connector_run_capacity_heads
+          WHERE tenant_id=$1 AND connector_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(connector_id))
+    .fetch_one(session.connection())
+    .await?;
+    let binding: i64 = sqlx::query_scalar(
+        "SELECT active_reservation_count FROM agent.binding_run_capacity_heads
+          WHERE tenant_id=$1 AND binding_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(binding_id))
+    .fetch_one(session.connection())
+    .await?;
+    session.commit().await?;
+    assert_eq!((connector, binding), (expected, expected));
     Ok(())
 }
 

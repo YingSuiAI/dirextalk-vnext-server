@@ -1,0 +1,356 @@
+syntax = "proto3";
+
+package dirextalk.agent_control.v1;
+
+// Agent Control is connector-initiated and outbound-only. ConnectorEnrollment
+// is mounted only on the ordinary server-authenticated TLS listener;
+// ConnectorControl is mounted only on the listener that requires the exact
+// per-Connector mTLS identity from ADR-0005. Keeping separate services makes
+// the transport trust boundary explicit rather than relying on handler checks.
+//
+// Every request, response, ClientFrame, and ServerFrame is capped at 262144
+// encoded bytes. Implementations reject a frame with no known oneof member.
+// String limits are UTF-8 byte limits and strings reject C0/C1 controls. All
+// uint64 counters and millisecond timestamps are limited to
+// 0..9007199254740991; fields documented as positive reject zero.
+//
+// Cross-language signatures and digests use this exact framing:
+//   LP(x) = U64BE(byte_length(x)) || x
+//   COMMIT(domain, parts...) = SHA-256(LP(ASCII(domain)) || LP(part1) || ...)
+// UUID parts are the 16 RFC 4122 network-order bytes parsed from canonical
+// text; integer parts are their unsigned eight-byte big-endian representation.
+// The raw enrollment-token digest uses domain
+// "dirextalk.connector-enrollment-token.v1" and the token as its only part.
+//
+// Enrollment signatures cover LP("dirextalk.connector-enrollment-proof.v1")
+// followed by LP of, in order: tenant UUID, host UUID, Connector UUID,
+// generation U64BE, spec revision U64BE, request UUID, token digest, control
+// public key, and refresh public key. request_digest uses COMMIT domain
+// "dirextalk.connector-enrollment-request.v1" with the complete signing
+// transcript, control signature, and refresh signature as its three parts.
+//
+// Rotation signatures cover LP(
+// "dirextalk.connector-credential-rotation-proof.v1") followed by LP of, in
+// order: tenant UUID, Connector UUID, request UUID, authenticated current
+// credential UUID, current generation U64BE, successor generation U64BE,
+// command sequence U64BE, command payload digest, successor revision U64BE,
+// rotation nonce, and new control public key. successor generation is exactly
+// current generation + 1. request_digest uses COMMIT domain
+// "dirextalk.connector-credential-rotation-request.v1" with the complete
+// signing transcript, current refresh signature, and new control signature.
+//
+// A credential result digest uses COMMIT domain
+// "dirextalk.connector-credential-result.v1" with, in order: credential UUID,
+// tenant UUID, Connector UUID, generation U64BE, credential revision U64BE,
+// control public key, refresh public key, leaf fingerprint, certificate count
+// U64BE, each leaf-first DER certificate as its own part, valid-from U64BE, and
+// valid-until U64BE. Command payload digests use COMMIT domain
+// "dirextalk.connector-command-payload.v1" with the exact selected oneof
+// submessage bytes as the only part. Encoded-command digests use COMMIT domain
+// "dirextalk.connector-encoded-command.v1" with the complete encoded
+// DurableCommand bytes as the only part.
+service ConnectorEnrollment {
+  rpc EnrollConnector(EnrollConnectorRequest) returns (EnrollConnectorResponse);
+}
+
+service ConnectorControl {
+  rpc Control(stream ClientFrame) returns (stream ServerFrame);
+}
+
+message EnrollConnectorRequest {
+  // Exactly 32 caller-held bytes; the owner create response never echoes them.
+  bytes enrollment_token = 1;
+  string enrollment_request_id = 2; // Canonical lowercase UUIDv7 text.
+  string tenant_id = 3; // Canonical lowercase UUIDv7 text.
+  string host_id = 4; // Canonical lowercase UUIDv7 text.
+  string connector_id = 5; // Canonical lowercase UUIDv7 text.
+  uint64 connector_generation = 6; // Positive JSON-safe integer.
+  uint64 spec_revision = 7; // Positive JSON-safe integer.
+  bytes control_public_key = 8; // Exactly 32 canonical Ed25519 bytes.
+  bytes refresh_public_key = 9; // Exactly 32 canonical Ed25519 bytes.
+  bytes control_signature = 10; // Exactly 64 Ed25519 transcript-signature bytes.
+  bytes refresh_signature = 11; // Exactly 64 Ed25519 transcript-signature bytes.
+}
+
+message EnrollConnectorResponse {
+  ConnectorCredential credential = 1;
+  bytes request_digest = 2; // Exactly 32 domain-separated SHA-256 bytes.
+  bytes result_digest = 3; // Exactly 32 domain-separated SHA-256 bytes.
+}
+
+message ConnectorCredential {
+  string credential_id = 1; // Canonical lowercase UUIDv7 text.
+  uint64 credential_revision = 2; // Positive JSON-safe integer.
+  repeated bytes certificate_chain_der = 3; // 1..4 entries, each 1..16384 bytes; leaf first.
+  bytes leaf_fingerprint = 4; // Exactly 32 SHA-256 bytes.
+  uint64 valid_from_millis = 5; // JSON-safe UTC Unix milliseconds.
+  uint64 valid_until_millis = 6; // Greater than valid_from_millis.
+}
+
+message ClientFrame {
+  // Exactly one known frame kind is required. Hello must be the first frame.
+  oneof kind {
+    Hello hello = 1;
+    Ready ready = 2;
+    Heartbeat heartbeat = 3;
+    CommandAcknowledgement command_acknowledgement = 4;
+    CredentialRotationProof credential_rotation_proof = 5;
+    RunClaim run_claim = 6;
+    RunRelease run_release = 7;
+  }
+}
+
+message ServerFrame {
+  // Exactly one known frame kind is required. ConnectLease is the first
+  // successful response to Hello. Protocol failures use a bounded gRPC status.
+  oneof kind {
+    ConnectLease connect_lease = 1;
+    HeartbeatAcknowledgement heartbeat_acknowledgement = 2;
+    DurableCommandFrame durable_command = 3;
+    CredentialRotationResult credential_rotation_result = 4;
+    RunAvailable run_available = 5;
+    RunLeaseGranted run_lease_granted = 6;
+  }
+}
+
+// A capability-scoped run offer. This frame is not execution authorization;
+// only the matching RunLeaseGranted authorizes connector-side execution.
+message RunAvailable {
+  LeaseFence connector_fence = 1;
+  string run_id = 2; // Canonical lowercase UUIDv7 text.
+  string request_id = 3; // Canonical lowercase UUIDv7 text.
+  string installation_id = 4; // Canonical lowercase UUIDv7 text.
+  string binding_id = 5; // Canonical lowercase UUIDv7 text.
+  string connector_id = 6; // Must equal connector_fence.connector_id.
+  uint64 offer_attempt = 7; // Positive JSON-safe integer.
+  uint64 offered_at_millis = 8; // Server-clock UTC Unix milliseconds.
+  uint64 offer_deadline_millis = 9; // Greater than offered_at_millis.
+  repeated string required_capabilities = 10; // At most 64 unique stable names, each 1..128 bytes.
+}
+
+// Offer acknowledgement only. A RunClaim reserves no execution authority;
+// the connector must wait for the matching RunLeaseGranted.
+message RunClaim {
+  LeaseFence connector_fence = 1;
+  string run_id = 2; // Canonical lowercase UUIDv7 text.
+  string request_id = 3; // Canonical lowercase UUIDv7 text.
+  string installation_id = 4; // Canonical lowercase UUIDv7 text.
+  string binding_id = 5; // Canonical lowercase UUIDv7 text.
+  string connector_id = 6; // Must equal connector_fence.connector_id.
+  uint64 offer_attempt = 7; // Exact RunAvailable attempt.
+  uint64 offer_deadline_millis = 8; // Exact RunAvailable deadline.
+  repeated string required_capabilities = 9; // Exact normalized RunAvailable capability set.
+}
+
+// The sole v1.1 frame that authorizes execution. Both the Connector fence and
+// the run-lease fence must remain current for any resulting side effect.
+message RunLeaseGranted {
+  LeaseFence connector_fence = 1;
+  string run_id = 2; // Canonical lowercase UUIDv7 text.
+  string request_id = 3; // Canonical lowercase UUIDv7 text.
+  string installation_id = 4; // Canonical lowercase UUIDv7 text.
+  string binding_id = 5; // Canonical lowercase UUIDv7 text.
+  string connector_id = 6; // Must equal connector_fence.connector_id.
+  uint64 offer_attempt = 7; // Exact accepted RunAvailable attempt.
+  string run_lease_id = 8; // Canonical lowercase UUIDv7 text.
+  uint64 run_lease_epoch = 9; // Positive JSON-safe integer.
+  uint64 granted_at_millis = 10; // Server-clock UTC Unix milliseconds.
+  uint64 run_lease_deadline_millis = 11; // Greater than granted_at_millis.
+  repeated string required_capabilities = 12; // Exact normalized authorized capability set.
+}
+
+// Explicit release of a granted run lease. This carries both the Connector
+// fence and run-lease fence; it is not a checkpoint, output, completion, or
+// failure report.
+message RunRelease {
+  LeaseFence connector_fence = 1;
+  string run_id = 2; // Canonical lowercase UUIDv7 text.
+  string request_id = 3; // Canonical lowercase UUIDv7 text.
+  string installation_id = 4; // Canonical lowercase UUIDv7 text.
+  string binding_id = 5; // Canonical lowercase UUIDv7 text.
+  string connector_id = 6; // Must equal connector_fence.connector_id.
+  uint64 offer_attempt = 7; // Exact granted offer attempt.
+  string run_lease_id = 8; // Canonical lowercase UUIDv7 text.
+  uint64 run_lease_epoch = 9; // Positive JSON-safe integer.
+  uint64 run_lease_deadline_millis = 10; // Exact granted deadline.
+  string stable_reason = 11; // 3..64 bytes, UPPER_SNAKE_CASE.
+}
+
+message Hello {
+  string tenant_id = 1; // Canonical lowercase UUIDv7 text.
+  string connector_id = 2; // Canonical lowercase UUIDv7 text.
+  string host_id = 3; // Canonical lowercase UUIDv7 text.
+  string boot_id = 4; // Canonical lowercase UUIDv7 text; new for every process boot.
+  uint64 connector_generation = 5; // Positive JSON-safe integer.
+  uint64 spec_revision = 6; // Positive JSON-safe integer.
+  ProtocolRange protocol = 7;
+  RuntimeClaims runtime_claims = 8;
+  Capacity capacity = 9;
+  // Claimed local cursor; it never advances the server cursor without the
+  // matching digest-bearing acknowledgement and only guides exact replay.
+  uint64 last_applied_command_sequence = 10; // JSON-safe contiguous cursor; zero means none.
+  repeated string required_server_capabilities = 11; // At most 32 stable names, each 1..128 bytes.
+}
+
+message ProtocolRange {
+  uint32 minimum_major = 1; // Positive; agent-control/1 requires 1.
+  uint32 minimum_minor = 2;
+  uint32 maximum_major = 3; // Positive and not below minimum_major.
+  uint32 maximum_minor = 4;
+}
+
+message RuntimeClaims {
+  string runtime_kind = 1; // 1..64 bytes, lower stable-name syntax.
+  string runtime_version = 2; // 1..128 bytes.
+  bytes adapter_build_digest = 3; // Exactly 32 SHA-256 bytes.
+  repeated string capabilities = 4; // At most 64 unique stable names, each 1..128 bytes.
+  uint32 queue_depth = 5; // At most 1000000.
+  repeated string active_run_ids = 6; // At most 1024 canonical lowercase UUIDv7 values.
+  string stable_error_code = 7; // Empty or 3..64 bytes, UPPER_SNAKE_CASE.
+}
+
+message Capacity {
+  uint32 maximum_concurrent_runs = 1; // 1..65535.
+  uint32 available_concurrent_runs = 2; // At most maximum_concurrent_runs.
+  uint32 maximum_queue_depth = 3; // 1..1000000.
+}
+
+message LeaseFence {
+  string tenant_id = 1; // Canonical lowercase UUIDv7 text.
+  string connector_id = 2; // Canonical lowercase UUIDv7 text.
+  string boot_id = 3; // Canonical lowercase UUIDv7 text.
+  uint64 connector_generation = 4; // Positive JSON-safe integer.
+  string lease_id = 5; // Canonical lowercase UUIDv7 text.
+  uint64 lease_epoch = 6; // Positive JSON-safe integer.
+}
+
+message ConnectLease {
+  LeaseFence fence = 1;
+  uint32 protocol_major = 2; // Exactly 1 for agent-control/1.
+  uint32 protocol_minor = 3;
+  uint64 issued_at_millis = 4; // Server-clock UTC Unix milliseconds.
+  uint64 expires_at_millis = 5; // Greater than issued_at_millis.
+  uint32 heartbeat_interval_millis = 6; // 1000..60000.
+  uint32 heartbeat_ttl_millis = 7; // Greater than heartbeat_interval_millis; at most 300000.
+  uint64 acknowledged_command_sequence = 8; // Contiguous cursor; zero means none.
+}
+
+message Ready {
+  LeaseFence fence = 1;
+  uint64 applied_config_revision = 2; // Positive JSON-safe integer.
+  // Observation only; CommandAcknowledgement advances the server cursor.
+  uint64 applied_command_sequence = 3; // Contiguous cursor; zero means none.
+}
+
+message Heartbeat {
+  LeaseFence fence = 1;
+  // New values are strictly monotonic per lease; an exact retry may repeat the
+  // latest value and receives the original persisted acknowledgement.
+  uint64 heartbeat_sequence = 2; // Positive JSON-safe integer.
+  uint64 applied_config_revision = 3; // Positive JSON-safe integer.
+  // Observation only; CommandAcknowledgement advances the server cursor.
+  uint64 applied_command_sequence = 4; // Contiguous cursor; zero means none.
+  RuntimeClaims runtime_claims = 5;
+  Capacity capacity = 6; // Current live capacity; maximums must match Hello.
+}
+
+message HeartbeatAcknowledgement {
+  uint64 heartbeat_sequence = 1; // Exact accepted sequence.
+  uint64 observed_at_millis = 2; // Server-clock UTC Unix milliseconds.
+  uint64 lease_expires_at_millis = 3; // Server-clock expiry.
+}
+
+message CommandAcknowledgement {
+  LeaseFence fence = 1;
+  uint64 command_sequence = 2; // Positive and exactly one beyond the durable cursor.
+  bytes payload_digest = 3; // Exact 32-byte selected-payload digest carried by DurableCommand.
+  bytes encoded_command_digest = 4; // Exact 32-byte digest carried by DurableCommandFrame.
+}
+
+// Raw envelope for one durable command. Keeping the nested command encoded is
+// intentional: reconnect and replica failover can replay its exact reviewed
+// bytes without a decode/re-encode cycle that would discard future unknown
+// fields. Connectors verify the digest before decoding DurableCommand.
+message DurableCommandFrame {
+  bytes encoded_command = 1; // 1..196608 exact DurableCommand Protobuf bytes.
+  // Exactly 32 bytes using the encoded-command COMMIT defined above.
+  bytes encoded_command_digest = 2;
+}
+
+message DurableCommand {
+  uint64 command_sequence = 1; // Positive, monotonically increasing per Connector.
+  string operation_id = 2; // Canonical lowercase UUIDv7 text.
+  uint64 connector_generation = 3; // Positive JSON-safe integer.
+  uint64 spec_revision = 4; // Positive JSON-safe integer.
+  // Exactly 32 bytes using the command-payload COMMIT defined above over the
+  // exact selected payload submessage, excluding this enclosing message.
+  bytes payload_digest = 5;
+  // The server separately persists and replays this complete message
+  // byte-for-byte; the full wrapper is never reconstructed from the digest.
+  oneof command {
+    ApplyConfig apply_config = 10;
+    RotateCredential rotate_credential = 11;
+    CloseStream close_stream = 12;
+  }
+}
+
+enum DesiredConnectorState {
+  DESIRED_CONNECTOR_STATE_UNSPECIFIED = 0;
+  DESIRED_CONNECTOR_STATE_RUNNING = 1;
+  DESIRED_CONNECTOR_STATE_DRAINING = 2;
+  DESIRED_CONNECTOR_STATE_STOPPED = 3;
+}
+
+message ApplyConfig {
+  uint64 config_revision = 1; // Positive JSON-safe integer; strictly monotonic.
+  DesiredConnectorState desired_state = 2; // UNSPECIFIED is invalid.
+  repeated ConfigEntry adapter_config = 3; // At most 64 entries.
+  repeated ConfigEntry runtime_config = 4; // At most 64 entries.
+}
+
+message ConfigEntry {
+  string key = 1; // 1..64 bytes, unique lower stable-name syntax.
+  string value = 2; // At most 1024 non-secret UTF-8 bytes; empty is allowed.
+}
+
+message RotateCredential {
+  bytes rotation_nonce = 1; // Exactly 32 unpredictable bytes.
+  uint64 successor_revision = 2; // Positive and greater than the current revision.
+  uint64 deadline_millis = 3; // JSON-safe UTC Unix milliseconds.
+}
+
+enum CloseStreamReason {
+  CLOSE_STREAM_REASON_UNSPECIFIED = 0;
+  CLOSE_STREAM_REASON_RECONNECT = 1;
+  CLOSE_STREAM_REASON_DRAINED = 2;
+  CLOSE_STREAM_REASON_REVOKED = 3;
+  CLOSE_STREAM_REASON_PROTOCOL_UPGRADE = 4;
+}
+
+message CloseStream {
+  CloseStreamReason reason = 1; // UNSPECIFIED is invalid.
+  string stable_code = 2; // 3..64 bytes, UPPER_SNAKE_CASE.
+  string redacted_detail = 3; // At most 512 UTF-8 bytes; no secrets.
+}
+
+// A successfully committed proof is the contiguous acknowledgement for its
+// RotateCredential command; a separate CommandAcknowledgement is not sent.
+message CredentialRotationProof {
+  LeaseFence fence = 1;
+  string request_id = 2; // Canonical lowercase UUIDv7 idempotency key.
+  uint64 command_sequence = 3; // Sequence of the matching RotateCredential command.
+  bytes command_payload_digest = 4; // Exact 32-byte matching command-payload digest.
+  bytes encoded_command_digest = 5; // Exact 32-byte raw-command digest; proof also acknowledges it.
+  uint64 successor_revision = 6; // Exact requested successor revision.
+  bytes new_control_public_key = 7; // Exactly 32 canonical Ed25519 bytes.
+  bytes current_refresh_signature = 8; // Exactly 64 bytes over the complete rotation transcript.
+  bytes new_control_signature = 9; // Exactly 64 bytes over the complete rotation transcript.
+}
+
+message CredentialRotationResult {
+  string request_id = 1; // Exact request id.
+  uint64 command_sequence = 2; // Exact RotateCredential command sequence.
+  ConnectorCredential credential = 3; // Pending successor public credential.
+  bytes request_digest = 4; // Exactly 32 domain-separated SHA-256 bytes.
+  bytes result_digest = 5; // Exactly 32 domain-separated SHA-256 bytes.
+}
