@@ -177,6 +177,8 @@ define_uuid_v7_id!(ConnectorId, "connector ID");
 define_uuid_v7_id!(BootId, "connector boot ID");
 define_uuid_v7_id!(LeaseId, "lease ID");
 define_uuid_v7_id!(BindingId, "connector binding ID");
+define_uuid_v7_id!(GrantId, "conversation agent grant ID");
+define_uuid_v7_id!(HostCredentialId, "agent host credential ID");
 define_uuid_v7_id!(ConsentId, "consent ID");
 define_uuid_v7_id!(ApprovalId, "approval ID");
 define_uuid_v7_id!(RunId, "agent run ID");

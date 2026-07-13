@@ -1,0 +1,17 @@
+[package]
+name = "dtx-connect-registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dtx-agent-registry = { path = "../dtx-agent-registry" }
+dtx-agent-host = { path = "../dtx-agent-host" }
+dtx-domain = { path = "../dtx-domain" }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

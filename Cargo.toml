@@ -1,5 +1,8 @@
 [workspace]
 members = [
+    "crates/dtx-agent-host",
+    "crates/dtx-agent-registry",
+    "crates/dtx-connect-registry",
     "crates/dtx-domain",
     "crates/dtx-security",
     "crates/dtx-storage",
