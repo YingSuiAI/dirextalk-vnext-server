@@ -1,0 +1,23 @@
+[package]
+name = "dtx-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64ct.workspace = true
+dtx-domain = { path = "../dtx-domain" }
+dtx-security = { path = "../dtx-security" }
+dtx-wire = { path = "../dtx-wire" }
+rcgen.workspace = true
+sha2.workspace = true
+time.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+
+[lints]
+workspace = true

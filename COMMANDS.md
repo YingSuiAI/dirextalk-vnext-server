@@ -10,6 +10,7 @@ Run commands from this repository root.
 | persistence migrations | `cargo test -p dtx-storage --test migrations --locked` |
 | persistence contracts | `cargo test -p dtx-storage --test persistence_contract --locked` |
 | SQLx migration/prepare gate | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sqlx-prepare.ps1` |
+| testkit dependency boundary | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-testkit-boundary.ps1` |
 | build | `cargo build --workspace --locked` |
 | release-build | `cargo build --workspace --locked --release` |
 | regenerate contracts | `cargo run -p dtx-protocol --locked -- generate .` |

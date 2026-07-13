@@ -66,6 +66,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Enforce testkit dependency boundary
+        shell: pwsh
+        run: ./scripts/check-testkit-boundary.ps1
+
       - name: Lint
         run: cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 

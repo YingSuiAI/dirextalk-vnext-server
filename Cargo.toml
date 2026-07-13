@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "crates/dtx-domain",
+    "crates/dtx-security",
     "crates/dtx-storage",
+    "crates/dtx-testkit",
     "crates/dtx-wire",
     "tools/dtx-protocol",
 ]
@@ -16,6 +18,8 @@ rust-version = "1.97.0"
 base64ct = { version = "1.8.3", features = ["alloc"] }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["ring", "zeroize"] }
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
 oas3 = { version = "0.22.0", default-features = false, features = ["yaml-spec"] }
 protox = "0.9.1"
 prost-types = "0.14.4"
@@ -24,8 +28,10 @@ serde_json = "1.0.150"
 sha2 = { version = "0.11.0", default-features = false }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros", "uuid"] }
 testcontainers-modules = { version = "0.15.0", default-features = false, features = ["postgres", "ring"] }
+time = { version = "0.3.53", default-features = false }
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1.23.5", features = ["serde", "v7"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
 yaml_serde = "0.10.4"
 cddl-cat = { version = "0.7.1", default-features = false, features = ["ciborium"] }
 

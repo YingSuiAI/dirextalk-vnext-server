@@ -49,6 +49,8 @@ try {
     }
 
     Invoke-CargoChecked -CargoArguments @('fmt', '--all', '--', '--check')
+    & (Join-Path $PSScriptRoot 'check-testkit-boundary.ps1')
+    Assert-LastExitCode 'testkit dependency boundary'
     Invoke-CargoChecked -CargoArguments @('clippy', '--workspace', '--locked', '--all-targets', '--all-features', '--', '-D', 'warnings')
     Invoke-CargoChecked -CargoArguments @('test', '--workspace', '--locked')
     & (Join-Path $PSScriptRoot 'sqlx-prepare.ps1')

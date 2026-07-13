@@ -166,6 +166,7 @@ define_uuid_v7_id!(EventId, "event ID");
 define_uuid_v7_id!(RequestId, "request ID");
 define_uuid_v7_id!(AuditId, "audit event ID");
 define_uuid_v7_id!(OutboxId, "outbox message ID");
+define_uuid_v7_id!(SecretId, "secret ID");
 define_uuid_v7_id!(AggregateId, "aggregate ID");
 define_uuid_v7_id!(DeviceId, "device ID");
 define_uuid_v7_id!(ConversationId, "conversation ID");
