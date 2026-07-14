@@ -13,6 +13,7 @@ members = [
     "crates/dtx-connect-registry",
     "crates/dtx-domain",
     "crates/dtx-group-policy",
+    "crates/dtx-group-persistence",
     "crates/dtx-identity-log",
     "crates/dtx-identity-persistence",
     "crates/dtx-membership-command",

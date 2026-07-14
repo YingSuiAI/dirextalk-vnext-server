@@ -888,6 +888,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-group-persistence"
+version = "0.1.0"
+dependencies = [
+ "dtx-domain",
+ "dtx-group-policy",
+ "dtx-membership-command",
+ "dtx-storage",
+ "dtx-wire",
+ "sqlx",
+ "testcontainers-modules",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "dtx-group-policy"
 version = "0.1.0"
 dependencies = [

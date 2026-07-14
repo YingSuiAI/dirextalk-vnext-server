@@ -6,7 +6,11 @@
 //! retains the command, receipt, and Sequencer-query invariants that a durable
 //! repository must preserve around those external boundaries.
 
-use std::{collections::BTreeMap, error::Error, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+};
 
 use dtx_domain::{DeviceId, IdentityId, InviteCapabilityId, JoinRequestId, RequestId, Revision};
 use dtx_group_policy::GroupScope;
@@ -344,6 +348,12 @@ pub enum MembershipCommandPhase {
     Rejected(MembershipRejection),
 }
 
+impl MembershipCommandPhase {
+    const fn is_terminal(self) -> bool {
+        matches!(self, Self::Committed(_) | Self::Rejected(_))
+    }
+}
+
 /// A non-secret current receipt returned for exact replay and reconciliation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MembershipReceipt {
@@ -388,6 +398,13 @@ pub enum SequencerResolution {
     Committed(MembershipCommitReference),
     /// The remote Sequencer explicitly rejected the action.
     Rejected(MembershipRejection),
+    /// A linearizable lookup verified that no durable command exists remotely.
+    ///
+    /// This disposition is valid only for an exact Sequencer query after a
+    /// previously uncertain submit. It permits the same command identity and
+    /// digest to be re-armed for a new idempotent submit; a transport timeout
+    /// must never be mapped to this value.
+    Absent,
     /// The caller cannot tell whether submit happened and must query later.
     Unknown,
 }
@@ -501,6 +518,96 @@ pub enum SequencerAction {
     Query(SequencerQuery),
 }
 
+/// Stable storage-neutral command kind for one membership command record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipCommandKind {
+    /// Candidate-authored request that opens a workflow.
+    RequestJoin,
+    /// Owner/Admin command that may create a remote commit intent.
+    ApproveJoin,
+}
+
+/// Stable idempotency coordinates retained for one membership command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MembershipIdempotencyPersistence {
+    /// Scope in which this key is unique.
+    pub scope: GroupScope,
+    /// Authenticated actor that owns the key namespace.
+    pub actor_identity_id: IdentityId,
+    /// Retained hash of the caller-provided idempotency key.
+    pub idempotency_key_hash: Sha256Digest,
+}
+
+/// Storage-neutral durable representation of one membership command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MembershipCommandPersistence {
+    /// Stable command identity.
+    pub command_id: MembershipCommandId,
+    /// Request or approval command class.
+    pub kind: MembershipCommandKind,
+    /// Immutable canonical request digest.
+    pub request_digest: Sha256Digest,
+    /// Workflow this command observes, when it is not independently terminal.
+    pub workflow_id: Option<JoinRequestId>,
+    /// Independent terminal disposition, used for already-member commands.
+    pub terminal_phase: Option<MembershipCommandPhase>,
+    /// Scope/actor/key lookup used for exact replay.
+    pub idempotency: MembershipIdempotencyPersistence,
+}
+
+/// Storage-neutral state of one join workflow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipWorkflowPersistencePhase {
+    /// Candidate request is durable but still awaits approval.
+    PendingApproval,
+    /// Approval intent is durable and has not yet entered an uncertain state.
+    PendingCommit {
+        /// Command identity assigned to the approving actor.
+        approval_command_id: MembershipCommandId,
+        /// Actor/fence context that must be sent to the Sequencer.
+        approval_context: MembershipCommandContext,
+        /// Verified Owner/Admin authorization proof digest.
+        authorization_digest: Sha256Digest,
+    },
+    /// The remote effect may have happened and must be queried before submit.
+    Reconciling {
+        /// Command identity whose remote result is being reconciled.
+        approval_command_id: MembershipCommandId,
+        /// Retained so a linearizable remote absence can re-arm the same submit.
+        approval_context: MembershipCommandContext,
+        /// Retained so a re-armed submit is byte-for-byte the same intent.
+        authorization_digest: Sha256Digest,
+    },
+    /// A verified remote result admitted or already contained the candidate.
+    Committed(MembershipAdmission),
+    /// A verified remote result explicitly rejected the action.
+    Rejected(MembershipRejection),
+}
+
+/// Storage-neutral durable representation of one join workflow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MembershipWorkflowPersistence {
+    /// Stable workflow identity, equal to `context.join_request_id()`.
+    pub join_request_id: JoinRequestId,
+    /// Immutable candidate-authored request coordinates.
+    pub context: MembershipCommandContext,
+    /// Current state of the workflow.
+    pub phase: MembershipWorkflowPersistencePhase,
+}
+
+/// Complete durable image of [`MembershipCommandBook`].
+///
+/// A persistence adapter maps normalized command/workflow rows to this image,
+/// then calls [`MembershipCommandBook::try_from_snapshot`] instead of
+/// reimplementing replay and state-machine rules in SQL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MembershipCommandBookSnapshot {
+    /// Every command record with its exact replay coordinates.
+    pub commands: Vec<MembershipCommandPersistence>,
+    /// Every active or terminal join workflow.
+    pub workflows: Vec<MembershipWorkflowPersistence>,
+}
+
 /// Port that an MLS-aware Sequencer adapter will implement in a later stage.
 pub trait CommitSequencer {
     /// Adapter-specific transport or availability failure.
@@ -538,6 +645,123 @@ impl MembershipCommandBook {
             idempotency: BTreeMap::new(),
             workflows: BTreeMap::new(),
         }
+    }
+
+    /// Captures one complete storage-neutral image of replay and workflow state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an internal command no longer has exactly one
+    /// idempotency mapping. Valid reducer state always has a complete image;
+    /// surfacing a mismatch prevents a persistence adapter from silently
+    /// discarding replay protection.
+    pub fn snapshot(&self) -> Result<MembershipCommandBookSnapshot, MembershipCommandError> {
+        let mut idempotency_by_command = BTreeMap::new();
+        for (lookup, command_id) in &self.idempotency {
+            if idempotency_by_command
+                .insert(*command_id, *lookup)
+                .is_some()
+            {
+                return Err(MembershipCommandError::InvariantViolation);
+            }
+        }
+
+        let mut commands = Vec::with_capacity(self.commands.len());
+        for (command_id, command) in &self.commands {
+            let lookup = idempotency_by_command
+                .remove(command_id)
+                .ok_or(MembershipCommandError::InvariantViolation)?;
+            commands.push(MembershipCommandPersistence {
+                command_id: *command_id,
+                kind: command.kind.persistence_kind(),
+                request_digest: command.request_digest,
+                workflow_id: command.workflow_id,
+                terminal_phase: command.terminal_phase,
+                idempotency: lookup.persistence(),
+            });
+        }
+        if !idempotency_by_command.is_empty() {
+            return Err(MembershipCommandError::InvariantViolation);
+        }
+
+        let workflows = self
+            .workflows
+            .iter()
+            .map(
+                |(join_request_id, workflow)| MembershipWorkflowPersistence {
+                    join_request_id: *join_request_id,
+                    context: workflow.context,
+                    phase: workflow.phase.persistence_phase(),
+                },
+            )
+            .collect();
+        Ok(MembershipCommandBookSnapshot {
+            commands,
+            workflows,
+        })
+    }
+
+    /// Rehydrates command replay state and join workflows from durable rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicate IDs, malformed terminal shapes, missing
+    /// idempotency mappings, or a command/workflow graph that cannot be
+    /// produced by this reducer. Invalid durable data never becomes a source
+    /// of authorization or reconciliation decisions.
+    pub fn try_from_snapshot(
+        snapshot: MembershipCommandBookSnapshot,
+    ) -> Result<Self, MembershipCommandError> {
+        let mut workflows = BTreeMap::new();
+        for persisted in snapshot.workflows {
+            if persisted.join_request_id != persisted.context.join_request_id()
+                || persisted.context.actor_identity_id()
+                    != persisted.context.candidate_identity_id()
+                || workflows
+                    .insert(
+                        persisted.join_request_id,
+                        JoinWorkflow {
+                            context: persisted.context,
+                            phase: WorkflowPhase::from_persistence(&persisted.phase),
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(MembershipCommandError::InvariantViolation);
+            }
+        }
+
+        let mut commands = BTreeMap::new();
+        let mut idempotency = BTreeMap::new();
+        for persisted in snapshot.commands {
+            if persisted.idempotency.scope != scope_for_command(&persisted, &workflows)? {
+                return Err(MembershipCommandError::InvariantViolation);
+            }
+            let lookup = IdempotencyLookup::from_persistence(persisted.idempotency);
+            if idempotency.insert(lookup, persisted.command_id).is_some()
+                || commands
+                    .insert(
+                        persisted.command_id,
+                        StoredCommand {
+                            kind: CommandKind::from_persistence(persisted.kind),
+                            request_digest: persisted.request_digest,
+                            workflow_id: persisted.workflow_id,
+                            terminal_phase: persisted.terminal_phase,
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(MembershipCommandError::InvariantViolation);
+            }
+        }
+
+        let book = Self {
+            commands,
+            idempotency,
+            workflows,
+        };
+        book.validate_snapshot_graph()?;
+        Ok(book)
     }
 
     /// Records or exactly replays a candidate-authored pending join request.
@@ -744,6 +968,7 @@ impl MembershipCommandBook {
             }
             WorkflowPhase::Reconciling {
                 approval_command_id,
+                ..
             } if approval_command_id == command_id => {
                 Some(SequencerAction::Query(SequencerQuery {
                     scope: workflow.context.scope,
@@ -791,14 +1016,29 @@ impl MembershipCommandBook {
         let next_phase = match workflow.phase {
             WorkflowPhase::PendingCommit {
                 approval_command_id,
-                ..
+                approval_context,
+                authorization_digest,
             }
             | WorkflowPhase::Reconciling {
                 approval_command_id,
+                approval_context,
+                authorization_digest,
             } if approval_command_id == command_id => match resolution {
                 SequencerResolution::Unknown => WorkflowPhase::Reconciling {
                     approval_command_id: command_id,
+                    approval_context,
+                    authorization_digest,
                 },
+                SequencerResolution::Absent
+                    if matches!(workflow.phase, WorkflowPhase::Reconciling { .. }) =>
+                {
+                    WorkflowPhase::PendingCommit {
+                        approval_command_id: command_id,
+                        approval_context,
+                        authorization_digest,
+                    }
+                }
+                SequencerResolution::Absent => return Err(MembershipCommandError::CommandNotReady),
                 SequencerResolution::Rejected(rejection) => WorkflowPhase::Rejected(rejection),
                 SequencerResolution::Committed(reference) => {
                     validate_commit_reference(
@@ -834,6 +1074,70 @@ impl MembershipCommandBook {
         self.receipt_for(command_id)
     }
 
+    /// Persists a definitive local policy rejection before any Sequencer effect.
+    ///
+    /// This is valid only while a request awaits approval or while the exact
+    /// approval command has a locally durable, never-dispatched submit intent.
+    /// Once an intent is reconciling, callers must use the remote query result
+    /// instead of converting uncertainty into a local rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command/workflow is unknown or no longer in a
+    /// state that can be rejected without contradicting an external effect.
+    pub fn reject_locally(
+        &mut self,
+        command_id: MembershipCommandId,
+        rejection: MembershipRejection,
+    ) -> Result<MembershipReceipt, MembershipCommandError> {
+        let command = self
+            .commands
+            .get(&command_id)
+            .copied()
+            .ok_or(MembershipCommandError::CommandNotFound)?;
+        let workflow_id = command
+            .workflow_id
+            .ok_or(MembershipCommandError::CommandNotReady)?;
+        let workflow = self
+            .workflows
+            .get(&workflow_id)
+            .copied()
+            .ok_or(MembershipCommandError::InvariantViolation)?;
+        let locally_rejectable = match (command.kind, workflow.phase) {
+            (CommandKind::RequestJoin, WorkflowPhase::PendingApproval) => {
+                self.workflows.remove(&workflow_id);
+                self.commands.insert(
+                    command_id,
+                    StoredCommand::terminal(
+                        CommandKind::RequestJoin,
+                        command.request_digest,
+                        MembershipCommandPhase::Rejected(rejection),
+                    ),
+                );
+                return self.receipt_for(command_id);
+            }
+            (
+                CommandKind::ApproveJoin,
+                WorkflowPhase::PendingCommit {
+                    approval_command_id,
+                    ..
+                },
+            ) => approval_command_id == command_id,
+            _ => false,
+        };
+        if !locally_rejectable {
+            return Err(MembershipCommandError::CommandNotReady);
+        }
+        self.workflows.insert(
+            workflow_id,
+            JoinWorkflow {
+                phase: WorkflowPhase::Rejected(rejection),
+                ..workflow
+            },
+        );
+        self.receipt_for(command_id)
+    }
+
     /// Reads the current replayable receipt without mutating state.
     ///
     /// # Errors
@@ -845,6 +1149,67 @@ impl MembershipCommandBook {
         command_id: MembershipCommandId,
     ) -> Result<MembershipReceipt, MembershipCommandError> {
         self.receipt_for(command_id)
+    }
+
+    fn validate_snapshot_graph(&self) -> Result<(), MembershipCommandError> {
+        let mut mapped_commands = BTreeSet::new();
+        for (lookup, command_id) in &self.idempotency {
+            let command = self
+                .commands
+                .get(command_id)
+                .ok_or(MembershipCommandError::InvariantViolation)?;
+            if !mapped_commands.insert(*command_id) {
+                return Err(MembershipCommandError::InvariantViolation);
+            }
+            if let Some(scope) = scope_for_stored_command(command, &self.workflows)?
+                && lookup.scope != scope
+            {
+                return Err(MembershipCommandError::InvariantViolation);
+            }
+        }
+        if mapped_commands.len() != self.commands.len() {
+            return Err(MembershipCommandError::InvariantViolation);
+        }
+
+        for (command_id, command) in &self.commands {
+            match (command.workflow_id, command.terminal_phase) {
+                (Some(workflow_id), None) => {
+                    let workflow = self
+                        .workflows
+                        .get(&workflow_id)
+                        .ok_or(MembershipCommandError::InvariantViolation)?;
+                    validate_workflow_command(*command_id, command, workflow)?;
+                }
+                (None, Some(phase)) if phase.is_terminal() => {
+                    validate_terminal_command(command, phase)?;
+                }
+                _ => return Err(MembershipCommandError::InvariantViolation),
+            }
+        }
+
+        for (workflow_id, workflow) in &self.workflows {
+            if workflow.context.join_request_id != *workflow_id
+                || workflow.context.actor_identity_id != workflow.context.candidate_identity_id
+            {
+                return Err(MembershipCommandError::InvariantViolation);
+            }
+            let has_request = self.commands.iter().any(|(command_id, command)| {
+                command.kind == CommandKind::RequestJoin
+                    && command.workflow_id == Some(*workflow_id)
+                    && command.request_digest == workflow.context.join_request_digest()
+                    && self.idempotency.iter().any(|(lookup, mapped)| {
+                        *mapped == *command_id
+                            && *lookup == IdempotencyLookup::new(workflow.context)
+                    })
+            });
+            if !has_request {
+                return Err(MembershipCommandError::InvariantViolation);
+            }
+            workflow
+                .phase
+                .validate(*workflow_id, workflow.context, self)?;
+        }
+        Ok(())
     }
 
     fn existing_or_conflict(
@@ -912,6 +1277,22 @@ impl IdempotencyLookup {
             idempotency_key_hash: context.idempotency_key_hash,
         }
     }
+
+    const fn persistence(self) -> MembershipIdempotencyPersistence {
+        MembershipIdempotencyPersistence {
+            scope: self.scope,
+            actor_identity_id: self.actor_identity_id,
+            idempotency_key_hash: self.idempotency_key_hash,
+        }
+    }
+
+    const fn from_persistence(value: MembershipIdempotencyPersistence) -> Self {
+        Self {
+            scope: value.scope,
+            actor_identity_id: value.actor_identity_id,
+            idempotency_key_hash: value.idempotency_key_hash,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -965,11 +1346,7 @@ impl JoinWorkflow {
     }
 
     fn matches(self, context: MembershipCommandContext) -> bool {
-        self.context.scope == context.scope
-            && self.context.join_request_id == context.join_request_id
-            && self.context.candidate_identity_id == context.candidate_identity_id
-            && self.context.candidate_device_id == context.candidate_device_id
-            && self.context.invite_id == context.invite_id
+        workflow_context_matches(self.context, context)
     }
 }
 
@@ -983,6 +1360,8 @@ enum WorkflowPhase {
     },
     Reconciling {
         approval_command_id: MembershipCommandId,
+        approval_context: MembershipCommandContext,
+        authorization_digest: Sha256Digest,
     },
     Committed(MembershipAdmission),
     Rejected(MembershipRejection),
@@ -998,6 +1377,136 @@ impl WorkflowPhase {
             Self::Rejected(rejection) => MembershipCommandPhase::Rejected(rejection),
         }
     }
+
+    const fn persistence_phase(self) -> MembershipWorkflowPersistencePhase {
+        match self {
+            Self::PendingApproval => MembershipWorkflowPersistencePhase::PendingApproval,
+            Self::PendingCommit {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            } => MembershipWorkflowPersistencePhase::PendingCommit {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            },
+            Self::Reconciling {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            } => MembershipWorkflowPersistencePhase::Reconciling {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            },
+            Self::Committed(admission) => MembershipWorkflowPersistencePhase::Committed(admission),
+            Self::Rejected(rejection) => MembershipWorkflowPersistencePhase::Rejected(rejection),
+        }
+    }
+
+    const fn from_persistence(phase: &MembershipWorkflowPersistencePhase) -> Self {
+        match *phase {
+            MembershipWorkflowPersistencePhase::PendingApproval => Self::PendingApproval,
+            MembershipWorkflowPersistencePhase::PendingCommit {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            } => Self::PendingCommit {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            },
+            MembershipWorkflowPersistencePhase::Reconciling {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            } => Self::Reconciling {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            },
+            MembershipWorkflowPersistencePhase::Committed(admission) => Self::Committed(admission),
+            MembershipWorkflowPersistencePhase::Rejected(rejection) => Self::Rejected(rejection),
+        }
+    }
+
+    fn validate(
+        self,
+        workflow_id: JoinRequestId,
+        context: MembershipCommandContext,
+        book: &MembershipCommandBook,
+    ) -> Result<(), MembershipCommandError> {
+        match self {
+            Self::PendingApproval => Ok(()),
+            Self::PendingCommit {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            }
+            | Self::Reconciling {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            } => {
+                if !workflow_context_matches(context, approval_context) {
+                    return Err(MembershipCommandError::InvariantViolation);
+                }
+                let command = book
+                    .commands
+                    .get(&approval_command_id)
+                    .ok_or(MembershipCommandError::InvariantViolation)?;
+                if command.kind != CommandKind::ApproveJoin
+                    || command.workflow_id != Some(workflow_id)
+                    || command.request_digest
+                        != ApproveJoinCommand::new(approval_context, authorization_digest)
+                            .request_digest()
+                {
+                    return Err(MembershipCommandError::InvariantViolation);
+                }
+                Ok(())
+            }
+            Self::Committed(MembershipAdmission::Applied(reference)) => {
+                let Some((approval_command_id, approval)) =
+                    single_workflow_approval(book, workflow_id)?
+                else {
+                    return Err(MembershipCommandError::InvariantViolation);
+                };
+                if reference.scope() != context.scope
+                    || approval_command_id != reference.command_id()
+                    || approval.request_digest != reference.request_digest()
+                {
+                    return Err(MembershipCommandError::InvariantViolation);
+                }
+                Ok(())
+            }
+            Self::Committed(MembershipAdmission::AlreadyMember(reference)) => {
+                if reference.scope() != context.scope {
+                    return Err(MembershipCommandError::InvariantViolation);
+                }
+                single_workflow_approval(book, workflow_id)?;
+                let has_terminal_origin = book.commands.values().any(|command| {
+                    command.kind == CommandKind::ApproveJoin
+                        && command.workflow_id.is_none()
+                        && command.terminal_phase
+                            == Some(MembershipCommandPhase::Committed(
+                                MembershipAdmission::AlreadyMember(reference),
+                            ))
+                });
+                if has_terminal_origin {
+                    Ok(())
+                } else {
+                    Err(MembershipCommandError::InvariantViolation)
+                }
+            }
+            Self::Rejected(_) => {
+                if single_workflow_approval(book, workflow_id)?.is_some() {
+                    Ok(())
+                } else {
+                    Err(MembershipCommandError::InvariantViolation)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1011,6 +1520,20 @@ impl CommandKind {
         match self {
             Self::RequestJoin => 1,
             Self::ApproveJoin => 2,
+        }
+    }
+
+    const fn persistence_kind(self) -> MembershipCommandKind {
+        match self {
+            Self::RequestJoin => MembershipCommandKind::RequestJoin,
+            Self::ApproveJoin => MembershipCommandKind::ApproveJoin,
+        }
+    }
+
+    const fn from_persistence(kind: MembershipCommandKind) -> Self {
+        match kind {
+            MembershipCommandKind::RequestJoin => Self::RequestJoin,
+            MembershipCommandKind::ApproveJoin => Self::ApproveJoin,
         }
     }
 }
@@ -1069,6 +1592,119 @@ impl fmt::Display for MembershipCommandError {
 }
 
 impl Error for MembershipCommandError {}
+
+fn scope_for_command(
+    command: &MembershipCommandPersistence,
+    workflows: &BTreeMap<JoinRequestId, JoinWorkflow>,
+) -> Result<GroupScope, MembershipCommandError> {
+    command
+        .workflow_id
+        .map_or(Ok(command.idempotency.scope), |workflow_id| {
+            workflows
+                .get(&workflow_id)
+                .map(|workflow| workflow.context.scope)
+                .ok_or(MembershipCommandError::InvariantViolation)
+        })
+}
+
+fn scope_for_stored_command(
+    command: &StoredCommand,
+    workflows: &BTreeMap<JoinRequestId, JoinWorkflow>,
+) -> Result<Option<GroupScope>, MembershipCommandError> {
+    match (command.workflow_id, command.terminal_phase) {
+        (Some(workflow_id), None) => workflows
+            .get(&workflow_id)
+            .map(|workflow| Some(workflow.context.scope))
+            .ok_or(MembershipCommandError::InvariantViolation),
+        (None, Some(MembershipCommandPhase::Committed(admission))) => {
+            Ok(Some(admission.commit_reference().scope()))
+        }
+        (None, Some(MembershipCommandPhase::Rejected(_)) | None) => Ok(None),
+        _ => Err(MembershipCommandError::InvariantViolation),
+    }
+}
+
+fn validate_terminal_command(
+    command: &StoredCommand,
+    phase: MembershipCommandPhase,
+) -> Result<(), MembershipCommandError> {
+    match (command.kind, phase) {
+        (
+            CommandKind::RequestJoin,
+            MembershipCommandPhase::Rejected(_)
+            | MembershipCommandPhase::Committed(MembershipAdmission::AlreadyMember(_)),
+        )
+        | (
+            CommandKind::ApproveJoin,
+            MembershipCommandPhase::Committed(MembershipAdmission::AlreadyMember(_)),
+        ) => Ok(()),
+        _ => Err(MembershipCommandError::InvariantViolation),
+    }
+}
+
+fn validate_workflow_command(
+    command_id: MembershipCommandId,
+    command: &StoredCommand,
+    workflow: &JoinWorkflow,
+) -> Result<(), MembershipCommandError> {
+    match command.kind {
+        CommandKind::RequestJoin => {
+            if command.request_digest == workflow.context.join_request_digest() {
+                Ok(())
+            } else {
+                Err(MembershipCommandError::InvariantViolation)
+            }
+        }
+        CommandKind::ApproveJoin => match workflow.phase {
+            WorkflowPhase::PendingCommit {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            }
+            | WorkflowPhase::Reconciling {
+                approval_command_id,
+                approval_context,
+                authorization_digest,
+            } if approval_command_id == command_id
+                && workflow_context_matches(workflow.context, approval_context)
+                && command.request_digest
+                    == ApproveJoinCommand::new(approval_context, authorization_digest)
+                        .request_digest() =>
+            {
+                Ok(())
+            }
+            WorkflowPhase::Committed(_) | WorkflowPhase::Rejected(_) => Ok(()),
+            _ => Err(MembershipCommandError::InvariantViolation),
+        },
+    }
+}
+
+fn single_workflow_approval(
+    book: &MembershipCommandBook,
+    workflow_id: JoinRequestId,
+) -> Result<Option<(MembershipCommandId, &StoredCommand)>, MembershipCommandError> {
+    let mut approvals = book.commands.iter().filter_map(|(command_id, command)| {
+        (command.kind == CommandKind::ApproveJoin && command.workflow_id == Some(workflow_id))
+            .then_some((*command_id, command))
+    });
+    let approval = approvals.next();
+    if approvals.next().is_some() {
+        Err(MembershipCommandError::InvariantViolation)
+    } else {
+        Ok(approval)
+    }
+}
+
+fn workflow_context_matches(
+    request: MembershipCommandContext,
+    candidate: MembershipCommandContext,
+) -> bool {
+    request.scope == candidate.scope
+        && request.join_request_id == candidate.join_request_id
+        && request.candidate_identity_id == candidate.candidate_identity_id
+        && request.candidate_device_id == candidate.candidate_device_id
+        && request.invite_id == candidate.invite_id
+}
 
 fn validate_commit_reference(
     reference: MembershipCommitReference,

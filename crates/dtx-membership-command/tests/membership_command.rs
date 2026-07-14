@@ -5,10 +5,10 @@ use dtx_domain::{
 };
 use dtx_group_policy::GroupScope;
 use dtx_membership_command::{
-    ApproveJoinCommand, CandidateMembership, JoinRequestCommand, MembershipCommandBook,
-    MembershipCommandContext, MembershipCommandError, MembershipCommandId, MembershipCommandPhase,
-    MembershipCommitReference, MembershipFence, MembershipRejection, SequencerAction,
-    SequencerResolution,
+    ApproveJoinCommand, CandidateMembership, JoinRequestCommand, MembershipAdmission,
+    MembershipCommandBook, MembershipCommandContext, MembershipCommandError, MembershipCommandId,
+    MembershipCommandKind, MembershipCommandPhase, MembershipCommitReference, MembershipFence,
+    MembershipRejection, MembershipWorkflowPersistencePhase, SequencerAction, SequencerResolution,
 };
 use dtx_wire::Sha256Digest;
 
@@ -111,6 +111,27 @@ fn commit_reference(
     byte: u8,
 ) -> MembershipCommitReference {
     MembershipCommitReference::new(scope, command_id, request_digest, digest(byte))
+}
+
+fn assert_durable_rejection(
+    book: &MembershipCommandBook,
+    command_id: MembershipCommandId,
+    rejection: MembershipRejection,
+) {
+    let receipt = book
+        .receipt(command_id)
+        .expect("rejected command retains a receipt");
+    assert_eq!(receipt.phase(), MembershipCommandPhase::Rejected(rejection));
+    let restored = MembershipCommandBook::try_from_snapshot(
+        book.snapshot().expect("valid rejected command snapshots"),
+    )
+    .expect("rejected command rehydrates");
+    assert_eq!(
+        restored
+            .receipt(command_id)
+            .expect("restored rejection retains a receipt"),
+        receipt
+    );
 }
 
 #[test]
@@ -335,8 +356,8 @@ fn already_member_is_a_committed_success_without_sequencer_submission() {
     .expect("request records");
     let existing = commit_reference(
         approve.context().scope(),
-        approve.context().command_id(),
-        approve.request_digest(),
+        MembershipCommandId::new(request_id(6)),
+        digest(0x66),
         0x88,
     );
 
@@ -351,6 +372,24 @@ fn already_member_is_a_committed_success_without_sequencer_submission() {
         book.next_sequencer_action(approve.context().command_id())
             .expect("known approval"),
         None
+    );
+    assert_eq!(
+        MembershipCommandBook::try_from_snapshot(
+            book.snapshot()
+                .expect("valid already-member workflow snapshots"),
+        )
+        .expect("already-member workflow rehydrates"),
+        book
+    );
+    let mut missing_terminal_origin = book
+        .snapshot()
+        .expect("valid already-member workflow snapshots");
+    missing_terminal_origin
+        .commands
+        .retain(|command| command.workflow_id.is_some());
+    assert_eq!(
+        MembershipCommandBook::try_from_snapshot(missing_terminal_origin),
+        Err(MembershipCommandError::InvariantViolation)
     );
 }
 
@@ -401,6 +440,14 @@ fn discovered_member_finalizes_an_older_pending_commit_without_another_submit() 
             .expect("old approval is known"),
         None
     );
+    assert_eq!(
+        MembershipCommandBook::try_from_snapshot(
+            book.snapshot()
+                .expect("valid already-member workflow snapshots"),
+        )
+        .expect("already-member workflow rehydrates"),
+        book
+    );
 }
 
 #[test]
@@ -441,5 +488,273 @@ fn explicit_rejection_is_terminal_and_never_consumes_a_later_commit_result() {
             SequencerResolution::Committed(reference),
         ),
         Err(MembershipCommandError::TerminalResolutionConflict)
+    );
+}
+
+#[test]
+fn local_rejection_persists_pending_request_and_never_dispatched_approval() {
+    let candidate = identity(1);
+    let owner = IdentityId::from_str(OWNER).expect("fixture owner ID is canonical");
+    let join = context(0, 0x22, candidate, 1, 2, candidate, 3, 4);
+    let approval =
+        ApproveJoinCommand::new(context(5, 0x33, owner, 5, 2, candidate, 3, 4), digest(0x44));
+
+    let mut pending_request = MembershipCommandBook::new();
+    pending_request
+        .record_join_request(
+            JoinRequestCommand::new(join),
+            CandidateMembership::NotMember,
+        )
+        .expect("request records");
+    let request_receipt = pending_request
+        .reject_locally(join.command_id(), MembershipRejection::AdmissionDenied)
+        .expect("pending request can be rejected locally");
+    assert_eq!(
+        request_receipt.phase(),
+        MembershipCommandPhase::Rejected(MembershipRejection::AdmissionDenied)
+    );
+    assert_durable_rejection(
+        &pending_request,
+        join.command_id(),
+        MembershipRejection::AdmissionDenied,
+    );
+
+    let mut pending_approval = MembershipCommandBook::new();
+    pending_approval
+        .record_join_request(
+            JoinRequestCommand::new(join),
+            CandidateMembership::NotMember,
+        )
+        .expect("request records");
+    pending_approval
+        .approve_join(approval, CandidateMembership::NotMember)
+        .expect("approval records a never-dispatched intent");
+    let approval_receipt = pending_approval
+        .reject_locally(
+            approval.context().command_id(),
+            MembershipRejection::PolicyDenied,
+        )
+        .expect("pending approval can be rejected locally before dispatch");
+    assert_eq!(
+        approval_receipt.phase(),
+        MembershipCommandPhase::Rejected(MembershipRejection::PolicyDenied)
+    );
+    assert_eq!(
+        pending_approval
+            .next_sequencer_action(approval.context().command_id())
+            .expect("rejected approval remains known"),
+        None
+    );
+    assert_durable_rejection(
+        &pending_approval,
+        approval.context().command_id(),
+        MembershipRejection::PolicyDenied,
+    );
+}
+
+#[test]
+fn local_rejection_never_overrides_a_reconciling_approval() {
+    let candidate = identity(1);
+    let owner = IdentityId::from_str(OWNER).expect("fixture owner ID is canonical");
+    let join = context(0, 0x22, candidate, 1, 2, candidate, 3, 4);
+    let approval =
+        ApproveJoinCommand::new(context(5, 0x33, owner, 5, 2, candidate, 3, 4), digest(0x44));
+    let mut book = MembershipCommandBook::new();
+    book.record_join_request(
+        JoinRequestCommand::new(join),
+        CandidateMembership::NotMember,
+    )
+    .expect("request records");
+    book.approve_join(approval, CandidateMembership::NotMember)
+        .expect("approval records intent");
+    book.observe_sequencer_resolution(
+        approval.context().command_id(),
+        SequencerResolution::Unknown,
+    )
+    .expect("uncertain submit enters reconciliation");
+
+    assert_eq!(
+        book.reject_locally(
+            approval.context().command_id(),
+            MembershipRejection::PolicyDenied,
+        ),
+        Err(MembershipCommandError::CommandNotReady)
+    );
+    assert_eq!(
+        book.receipt(approval.context().command_id())
+            .expect("reconciling approval retains a receipt")
+            .phase(),
+        MembershipCommandPhase::Reconciling
+    );
+    assert!(matches!(
+        book.next_sequencer_action(approval.context().command_id())
+            .expect("reconciling approval remains known"),
+        Some(SequencerAction::Query(_))
+    ));
+}
+
+#[test]
+fn terminal_snapshot_rejects_missing_or_mismatched_approval_linkage() {
+    let candidate = identity(1);
+    let owner = IdentityId::from_str(OWNER).expect("fixture owner ID is canonical");
+    let join = context(0, 0x22, candidate, 1, 2, candidate, 3, 4);
+    let approve =
+        ApproveJoinCommand::new(context(5, 0x33, owner, 5, 2, candidate, 3, 4), digest(0x44));
+
+    let mut rejected_book = MembershipCommandBook::new();
+    rejected_book
+        .record_join_request(
+            JoinRequestCommand::new(join),
+            CandidateMembership::NotMember,
+        )
+        .expect("request records");
+    rejected_book
+        .approve_join(approve, CandidateMembership::NotMember)
+        .expect("approval records intent");
+    rejected_book
+        .observe_sequencer_resolution(
+            approve.context().command_id(),
+            SequencerResolution::Rejected(MembershipRejection::PolicyDenied),
+        )
+        .expect("remote rejection is terminal");
+    let mut missing_approval = rejected_book
+        .snapshot()
+        .expect("valid rejected workflow snapshots");
+    missing_approval
+        .commands
+        .retain(|command| command.kind != MembershipCommandKind::ApproveJoin);
+    assert_eq!(
+        MembershipCommandBook::try_from_snapshot(missing_approval),
+        Err(MembershipCommandError::InvariantViolation)
+    );
+
+    let mut applied_book = MembershipCommandBook::new();
+    applied_book
+        .record_join_request(
+            JoinRequestCommand::new(join),
+            CandidateMembership::NotMember,
+        )
+        .expect("request records");
+    let pending = applied_book
+        .approve_join(approve, CandidateMembership::NotMember)
+        .expect("approval records intent");
+    applied_book
+        .observe_sequencer_resolution(
+            approve.context().command_id(),
+            SequencerResolution::Committed(commit_reference(
+                approve.context().scope(),
+                approve.context().command_id(),
+                pending.request_digest(),
+                0x77,
+            )),
+        )
+        .expect("remote commit is terminal");
+    let mut mismatched_commit = applied_book
+        .snapshot()
+        .expect("valid committed workflow snapshots");
+    mismatched_commit.workflows[0].phase = MembershipWorkflowPersistencePhase::Committed(
+        MembershipAdmission::Applied(commit_reference(
+            approve.context().scope(),
+            MembershipCommandId::new(request_id(6)),
+            pending.request_digest(),
+            0x88,
+        )),
+    );
+    assert_eq!(
+        MembershipCommandBook::try_from_snapshot(mismatched_commit),
+        Err(MembershipCommandError::InvariantViolation)
+    );
+}
+
+#[test]
+fn terminal_snapshot_rejects_independent_terminal_shapes_the_reducer_cannot_emit() {
+    let candidate = identity(1);
+    let request = JoinRequestCommand::new(context(0, 0x22, candidate, 1, 2, candidate, 3, 4));
+    let existing = commit_reference(
+        request.context().scope(),
+        MembershipCommandId::new(request_id(5)),
+        digest(0x66),
+        0x77,
+    );
+
+    let mut already_member = MembershipCommandBook::new();
+    already_member
+        .record_join_request(request, CandidateMembership::AlreadyMember(existing))
+        .expect("already-member request records a standalone terminal receipt");
+    let mut forged_applied = already_member
+        .snapshot()
+        .expect("valid already-member snapshot");
+    forged_applied.commands[0].terminal_phase = Some(MembershipCommandPhase::Committed(
+        MembershipAdmission::Applied(existing),
+    ));
+    assert_eq!(
+        MembershipCommandBook::try_from_snapshot(forged_applied),
+        Err(MembershipCommandError::InvariantViolation)
+    );
+
+    let mut rejected_request = MembershipCommandBook::new();
+    rejected_request
+        .record_join_request(request, CandidateMembership::NotMember)
+        .expect("request records before local rejection");
+    rejected_request
+        .reject_locally(
+            request.context().command_id(),
+            MembershipRejection::PolicyDenied,
+        )
+        .expect("pending request is locally rejectable");
+    let mut forged_approval_rejection = rejected_request
+        .snapshot()
+        .expect("valid locally rejected request snapshot");
+    forged_approval_rejection.commands[0].kind = MembershipCommandKind::ApproveJoin;
+    assert_eq!(
+        MembershipCommandBook::try_from_snapshot(forged_approval_rejection),
+        Err(MembershipCommandError::InvariantViolation)
+    );
+}
+
+#[test]
+fn persisted_reconciling_command_queries_before_a_linearizable_absence_rearms_same_submit() {
+    let candidate = identity(1);
+    let owner = IdentityId::from_str(OWNER).expect("fixture owner ID is canonical");
+    let join = context(0, 0x22, candidate, 1, 2, candidate, 3, 4);
+    let approve =
+        ApproveJoinCommand::new(context(5, 0x33, owner, 5, 2, candidate, 3, 4), digest(0x44));
+    let mut book = MembershipCommandBook::new();
+    book.record_join_request(
+        JoinRequestCommand::new(join),
+        CandidateMembership::NotMember,
+    )
+    .expect("request records");
+    book.approve_join(approve, CandidateMembership::NotMember)
+        .expect("approval records intent");
+    let original_submit = book
+        .next_sequencer_action(approve.context().command_id())
+        .expect("known approval")
+        .expect("pending commit submits once");
+    assert!(matches!(&original_submit, SequencerAction::Submit(_)));
+
+    book.observe_sequencer_resolution(approve.context().command_id(), SequencerResolution::Unknown)
+        .expect("uncertain submit enters reconciliation");
+    let restored = MembershipCommandBook::try_from_snapshot(
+        book.snapshot().expect("valid reducer state snapshots"),
+    )
+    .expect("durable command image rehydrates");
+    assert_eq!(restored, book);
+    assert!(matches!(
+        restored
+            .next_sequencer_action(approve.context().command_id())
+            .expect("reconciled command exists"),
+        Some(SequencerAction::Query(_))
+    ));
+
+    let mut restored = restored;
+    restored
+        .observe_sequencer_resolution(approve.context().command_id(), SequencerResolution::Absent)
+        .expect("only a linearizable absence re-arms the command");
+    assert_eq!(
+        restored
+            .next_sequencer_action(approve.context().command_id())
+            .expect("re-armed command exists"),
+        Some(original_submit)
     );
 }

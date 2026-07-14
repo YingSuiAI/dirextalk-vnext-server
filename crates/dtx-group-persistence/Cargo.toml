@@ -1,0 +1,22 @@
+[package]
+name = "dtx-group-persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dtx-domain = { path = "../dtx-domain" }
+dtx-group-policy = { path = "../dtx-group-policy" }
+dtx-membership-command = { path = "../dtx-membership-command" }
+dtx-wire = { path = "../dtx-wire" }
+sqlx.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+dtx-storage = { path = "../dtx-storage" }
+testcontainers-modules.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

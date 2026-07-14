@@ -11,7 +11,8 @@ const CONNECTOR_CONTROL_MIGRATION_VERSION: i64 = 202_607_130_004;
 const AGENT_ROUTER_MIGRATION_VERSION: i64 = 202_607_130_005;
 const HOST_PROVISIONING_MIGRATION_VERSION: i64 = 202_607_140_006;
 const IDENTITY_LOG_MIGRATION_VERSION: i64 = 202_607_140_007;
-const EXPECTED_MIGRATION_COUNT: i64 = 7;
+const GROUP_MEMBERSHIP_MIGRATION_VERSION: i64 = 202_607_140_008;
+const EXPECTED_MIGRATION_COUNT: i64 = 8;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -26,6 +27,8 @@ const HOST_PROVISIONING_DOWN: &str =
     include_str!("../../../migrations/202607140006_host_provisioning.down.sql");
 const IDENTITY_LOG_DOWN: &str =
     include_str!("../../../migrations/202607140007_identity_log_persistence.down.sql");
+const GROUP_MEMBERSHIP_DOWN: &str =
+    include_str!("../../../migrations/202607140008_group_membership_saga.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,7 +55,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -61,8 +64,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(AGENT_ROUTER_MIGRATION_VERSION)
     .bind(HOST_PROVISIONING_MIGRATION_VERSION)
     .bind(IDENTITY_LOG_MIGRATION_VERSION)
+    .bind(GROUP_MEMBERSHIP_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(GROUP_MEMBERSHIP_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(IDENTITY_LOG_DOWN)
         .execute(harness.admin_pool())
         .await?;
@@ -97,8 +104,13 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'identity')")
             .fetch_one(harness.admin_pool())
             .await?;
+    let groups_schema_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'groups')")
+            .fetch_one(harness.admin_pool())
+            .await?;
     assert!(!agent_schema_exists);
     assert!(!identity_schema_exists);
+    assert!(!groups_schema_exists);
 
     MigrationRunner::new().run(harness.admin_pool()).await?;
 
@@ -278,7 +290,7 @@ async fn assert_object_owner_membership_is_rejected(
 
     sqlx::raw_sql(
         "REVOKE dtx_unsafe_system_owner FROM dtx_runtime_test;
-         ALTER TABLE system.unsafe_parent_owned OWNER TO dtx_test_admin;
+         ALTER TABLE system.unsafe_parent_owned OWNER TO CURRENT_USER;
          DROP TABLE system.unsafe_parent_owned;
          DROP ROLE dtx_unsafe_system_owner;
 
@@ -296,7 +308,7 @@ async fn assert_object_owner_membership_is_rejected(
     assert!(matches!(agent_owner, StorageError::UnsafeRuntimeRole));
     sqlx::raw_sql(
         "REVOKE dtx_unsafe_agent_owner FROM dtx_runtime_test;
-         ALTER TABLE agent.unsafe_parent_owned OWNER TO dtx_test_admin;
+         ALTER TABLE agent.unsafe_parent_owned OWNER TO CURRENT_USER;
          DROP TABLE agent.unsafe_parent_owned;
          DROP ROLE dtx_unsafe_agent_owner;",
     )

@@ -41,6 +41,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 audit
 
 The wrapper preserves an existing Visual Studio Developer Prompt and otherwise selects the pinned `1.97.0-x86_64-pc-windows-gnu` toolchain plus a local linker. CI and Linux use normal `cargo` commands.
 
+### Opt-in local PostgreSQL integration tests
+
+Integration tests use Testcontainers by default. To avoid container startup during
+local development, set `DTX_TEST_LOCAL_POSTGRES=1` together with literal-loopback
+`DTX_TEST_LOCAL_POSTGRES_HOST`, `DTX_TEST_LOCAL_POSTGRES_PORT`,
+`DTX_TEST_LOCAL_POSTGRES_USER`, `DTX_TEST_LOCAL_POSTGRES_PASSWORD`, and
+`DTX_TEST_LOCAL_POSTGRES_MAINTENANCE_DATABASE`. The harness creates only a unique
+`dtx_test_<uuid>` database and removes it with `DROP DATABASE ... WITH (FORCE)`
+after the test; it rejects DNS and non-loopback hosts. Keep credentials ephemeral
+in the invoking shell and never save them in tracked files.
+
 The SQLx gate uses exact PostgreSQL `18.4-alpine3.24` in an ephemeral Docker
 container. Install its pinned user-scoped CLI once when it is not already
 available:

@@ -327,6 +327,270 @@ pub struct GroupPolicySnapshot {
     pub revision: Revision,
 }
 
+/// Storage-neutral authority term retained for a group invitation or reservation.
+///
+/// This mirrors the private reducer authority marker without exposing the
+/// reducer's internal representation to SQL adapters. A historical
+/// administrator generation remains meaningful after that administrator is
+/// revoked or regranted, so it is retained rather than inferred from current
+/// role membership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupAuthorityPersistence {
+    /// The sole group owner authorized the action.
+    Owner,
+    /// An administrator authorized the action during one exact grant term.
+    Admin {
+        /// The administrator's exact authorization generation.
+        authorization_generation: Revision,
+    },
+}
+
+/// Storage-neutral durable representation of one invitation capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupInvitePersistence {
+    /// Invitation capability identity.
+    pub invite_id: InviteCapabilityId,
+    /// Actor that issued the capability.
+    pub issuer_id: IdentityId,
+    /// Optional identity restriction.
+    pub target_id: Option<IdentityId>,
+    /// Maximum total approved uses.
+    pub max_uses: u32,
+    /// Finalized uses.
+    pub use_count: u32,
+    /// Durable uses held by remote-commit intents.
+    pub reserved_use_count: u32,
+    /// Exclusive expiry time in Unix milliseconds.
+    pub expires_at_ms: i64,
+    /// Whether an authorized actor explicitly revoked the capability.
+    pub revoked: bool,
+    /// Policy revision at issuance.
+    pub policy_revision: Revision,
+    /// Exact owner or administrator term that issued the capability.
+    pub issuer_authority: GroupAuthorityPersistence,
+}
+
+/// Storage-neutral durable representation of a pending join request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupPendingJoinPersistence {
+    /// Stable join request identity.
+    pub request_id: JoinRequestId,
+    /// Candidate identity awaiting a decision.
+    pub candidate_id: IdentityId,
+    /// Invitation presented by the candidate.
+    pub invite_id: InviteCapabilityId,
+    /// Trusted server request timestamp.
+    pub requested_at_ms: i64,
+}
+
+/// Storage-neutral durable representation of an external-commit reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupReservedJoinPersistence {
+    /// Stable join request identity.
+    pub request_id: JoinRequestId,
+    /// Candidate identity awaiting the remote result.
+    pub candidate_id: IdentityId,
+    /// Invitation whose capacity is held.
+    pub invite_id: InviteCapabilityId,
+    /// Owner or administrator that created the reservation.
+    pub reserved_by: IdentityId,
+    /// Exact authority term used for the reservation.
+    pub reserved_authority: GroupAuthorityPersistence,
+    /// Trusted server reservation timestamp.
+    pub reserved_at_ms: i64,
+    /// Policy revision revalidated before external submission.
+    pub policy_revision: Revision,
+}
+
+/// Storage-neutral durable representation of a finalized admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GroupApprovedJoinPersistence {
+    /// Stable join request identity.
+    pub request_id: JoinRequestId,
+    /// Admitted identity.
+    pub candidate_id: IdentityId,
+    /// Invitation that was consumed.
+    pub invite_id: InviteCapabilityId,
+    /// Owner or administrator that approved the reservation.
+    pub approved_by: IdentityId,
+    /// Trusted server finalization timestamp.
+    pub approved_at_ms: i64,
+    /// Policy revision revalidated before the external intent.
+    pub policy_revision: Revision,
+}
+
+/// Complete storage-neutral persistence image for [`GroupPolicy`].
+///
+/// SQL adapters reconstruct this image from normalized rows, then hand it back
+/// to the pure aggregate for validation. This keeps row mapping out of the
+/// authorization reducer and prevents adapters from reimplementing invite,
+/// administrator-term, or reservation invariants.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupPolicyPersistenceImage {
+    /// Strongly typed private or controlled-public scope.
+    pub scope: GroupScope,
+    /// Sole group owner.
+    pub owner_id: IdentityId,
+    /// Current additional administrator identities.
+    pub administrators: Vec<IdentityId>,
+    /// Current and historical administrator authorization generations.
+    pub administrator_authorization_generations: Vec<(IdentityId, Revision)>,
+    /// Current identity-level member set.
+    pub members: Vec<IdentityId>,
+    /// Invitation history.
+    pub invitations: Vec<GroupInvitePersistence>,
+    /// Candidate requests awaiting a decision.
+    pub pending_joins: Vec<GroupPendingJoinPersistence>,
+    /// External membership intents awaiting a remote result.
+    pub reserved_joins: Vec<GroupReservedJoinPersistence>,
+    /// Finalized admission history.
+    pub approved_joins: Vec<GroupApprovedJoinPersistence>,
+    /// Current optimistic-concurrency revision.
+    pub revision: Revision,
+}
+
+impl GroupPolicySnapshot {
+    /// Converts this validated-in-memory image into a storage-neutral form.
+    #[must_use]
+    pub fn persistence_image(&self) -> GroupPolicyPersistenceImage {
+        GroupPolicyPersistenceImage {
+            scope: self.scope,
+            owner_id: self.owner_id,
+            administrators: self.administrators.clone(),
+            administrator_authorization_generations: self
+                .administrator_authorization_generations
+                .clone(),
+            members: self.members.clone(),
+            invitations: self
+                .invitations
+                .iter()
+                .map(|invite| GroupInvitePersistence {
+                    invite_id: invite.invite_id,
+                    issuer_id: invite.issuer_id,
+                    target_id: invite.target_id,
+                    max_uses: invite.max_uses,
+                    use_count: invite.use_count,
+                    reserved_use_count: invite.reserved_use_count,
+                    expires_at_ms: invite.expires_at_ms,
+                    revoked: invite.revoked,
+                    policy_revision: invite.policy_revision,
+                    issuer_authority: authority_persistence(invite.issuer_authority),
+                })
+                .collect(),
+            pending_joins: self
+                .pending_joins
+                .iter()
+                .map(|pending| GroupPendingJoinPersistence {
+                    request_id: pending.request_id,
+                    candidate_id: pending.candidate_id,
+                    invite_id: pending.invite_id,
+                    requested_at_ms: pending.requested_at_ms,
+                })
+                .collect(),
+            reserved_joins: self
+                .reserved_joins
+                .iter()
+                .map(|reserved| GroupReservedJoinPersistence {
+                    request_id: reserved.request_id,
+                    candidate_id: reserved.candidate_id,
+                    invite_id: reserved.invite_id,
+                    reserved_by: reserved.reserved_by,
+                    reserved_authority: authority_persistence(reserved.reserved_authority),
+                    reserved_at_ms: reserved.reserved_at_ms,
+                    policy_revision: reserved.policy_revision,
+                })
+                .collect(),
+            approved_joins: self
+                .approved_joins
+                .iter()
+                .map(|approved| GroupApprovedJoinPersistence {
+                    request_id: approved.request_id,
+                    candidate_id: approved.candidate_id,
+                    invite_id: approved.invite_id,
+                    approved_by: approved.approved_by,
+                    approved_at_ms: approved.approved_at_ms,
+                    policy_revision: approved.policy_revision,
+                })
+                .collect(),
+            revision: self.revision,
+        }
+    }
+
+    /// Rebuilds the reducer-owned snapshot from a normalized storage image.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the supplied rows cannot form one valid group
+    /// policy aggregate. The result must still be passed through
+    /// [`GroupPolicy::try_from_snapshot`] before it becomes authorization fact.
+    pub fn try_from_persistence_image(
+        image: GroupPolicyPersistenceImage,
+    ) -> Result<Self, GroupPolicySnapshotError> {
+        let snapshot = Self {
+            scope: image.scope,
+            owner_id: image.owner_id,
+            administrators: image.administrators,
+            administrator_authorization_generations: image.administrator_authorization_generations,
+            members: image.members,
+            invitations: image
+                .invitations
+                .into_iter()
+                .map(|invite| InviteCapability {
+                    invite_id: invite.invite_id,
+                    scope: image.scope,
+                    issuer_id: invite.issuer_id,
+                    target_id: invite.target_id,
+                    max_uses: invite.max_uses,
+                    use_count: invite.use_count,
+                    reserved_use_count: invite.reserved_use_count,
+                    expires_at_ms: invite.expires_at_ms,
+                    revoked: invite.revoked,
+                    policy_revision: invite.policy_revision,
+                    issuer_authority: authority_from_persistence(invite.issuer_authority),
+                })
+                .collect(),
+            pending_joins: image
+                .pending_joins
+                .into_iter()
+                .map(|pending| PendingJoinRequest {
+                    request_id: pending.request_id,
+                    candidate_id: pending.candidate_id,
+                    invite_id: pending.invite_id,
+                    requested_at_ms: pending.requested_at_ms,
+                })
+                .collect(),
+            reserved_joins: image
+                .reserved_joins
+                .into_iter()
+                .map(|reserved| ReservedJoin {
+                    request_id: reserved.request_id,
+                    candidate_id: reserved.candidate_id,
+                    invite_id: reserved.invite_id,
+                    reserved_by: reserved.reserved_by,
+                    reserved_authority: authority_from_persistence(reserved.reserved_authority),
+                    reserved_at_ms: reserved.reserved_at_ms,
+                    policy_revision: reserved.policy_revision,
+                })
+                .collect(),
+            approved_joins: image
+                .approved_joins
+                .into_iter()
+                .map(|approved| ApprovedJoin {
+                    request_id: approved.request_id,
+                    candidate_id: approved.candidate_id,
+                    invite_id: approved.invite_id,
+                    approved_by: approved.approved_by,
+                    approved_at_ms: approved.approved_at_ms,
+                    policy_revision: approved.policy_revision,
+                })
+                .collect(),
+            revision: image.revision,
+        };
+        GroupPolicy::try_from_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+}
+
 /// Rehydration failure for a malformed group-policy persistence image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GroupPolicySnapshotError {
@@ -1365,6 +1629,28 @@ fn increment_snapshot_count(
         .checked_add(1)
         .ok_or_else(|| invalid_snapshot(overflow_reason))?;
     Ok(())
+}
+
+const fn authority_persistence(authority: InviteIssuerAuthority) -> GroupAuthorityPersistence {
+    match authority {
+        InviteIssuerAuthority::Owner => GroupAuthorityPersistence::Owner,
+        InviteIssuerAuthority::Admin {
+            authorization_generation,
+        } => GroupAuthorityPersistence::Admin {
+            authorization_generation,
+        },
+    }
+}
+
+const fn authority_from_persistence(authority: GroupAuthorityPersistence) -> InviteIssuerAuthority {
+    match authority {
+        GroupAuthorityPersistence::Owner => InviteIssuerAuthority::Owner,
+        GroupAuthorityPersistence::Admin {
+            authorization_generation,
+        } => InviteIssuerAuthority::Admin {
+            authorization_generation,
+        },
+    }
 }
 
 const fn invalid_snapshot(reason: &'static str) -> GroupPolicySnapshotError {
