@@ -1,10 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
 };
 
+use base64ct::{Base64UrlUnpadded, Encoding};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ErrorRegistry, EventDefinition, EventField, EventRegistry, ProtocolToolError,
@@ -111,6 +115,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
 
     validate_identity_log_v1_1(root)?;
     validate_identity_bootstrap_v1(root)?;
+    validate_identity_session_v1(root)?;
     validate_public_descriptor_v1(root)?;
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
@@ -469,6 +474,178 @@ fn validate_identity_bootstrap_v1(root: &Path) -> Result<(), ProtocolToolError> 
         expect_value(&document, pointer, &expected)?;
     }
     Ok(())
+}
+
+fn validate_identity_session_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/identity-session/v1/device-session-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse identity-session v1 CDDL: {error}"))
+    })?;
+    let vector =
+        read_json(&root.join("protocol/test-vectors/identity-session/v1/device-session-v1.json"))?;
+    validate_vector_version(&vector, "identity-session-v1")?;
+    if json_string(&vector, "initial_enroll_path")? != "/v1/devices/initial-enroll"
+        || json_string(&vector, "challenge_path")? != "/v1/devices/sessions/challenges"
+        || json_string(&vector, "session_path")? != "/v1/devices/sessions"
+        || json_string(&vector, "session_response_content_type")?
+            != "application/vnd.dirextalk.device-session-receipt.v1+cbor"
+    {
+        return Err(ProtocolToolError::new(
+            "identity-session-v1 vector transport paths or media type drifted",
+        ));
+    }
+    for (field, expected) in [
+        ("idempotency_key_min_bytes", 16_i64),
+        ("idempotency_key_max_bytes", 128_i64),
+        ("challenge_ttl_millis", 300_000_i64),
+        ("challenge_min_interval_millis", 5_000_i64),
+        ("session_ttl_millis", 900_000_i64),
+    ] {
+        if json_i64(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "identity-session-v1 vector {field} drifted"
+            )));
+        }
+    }
+    validate_cddl_hex(
+        "device-session-receipt-v1",
+        &cddl,
+        json_string(&vector, "receipt_canonical_cbor_hex")?,
+    )?;
+    validate_identity_session_proof_vector(&cddl, &vector)?;
+    if !has_error_response(&vector, 429, "DEVICE_SESSION_CHALLENGE_RATE_LIMITED", true)? {
+        return Err(ProtocolToolError::new(
+            "identity-session-v1 vector must retain the challenge rate-limit response",
+        ));
+    }
+
+    let path = root.join("protocol/openapi/identity-session/v1/openapi.yaml");
+    let source = read(&path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse OpenAPI {}: {error}", path.display()))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "identity session OpenAPI contract must declare 3.1.0",
+        ));
+    }
+    let document: Value = yaml_serde::from_str(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse identity session OpenAPI YAML tree: {error}"))
+    })?;
+    for (pointer, expected) in [
+        (
+            "/paths/~1v1~1devices~1initial-enroll/post/operationId",
+            json!("initialEnrollDevice"),
+        ),
+        (
+            "/paths/~1v1~1devices~1sessions~1challenges/post/operationId",
+            json!("createDeviceSessionChallenge"),
+        ),
+        (
+            "/paths/~1v1~1devices~1sessions/post/operationId",
+            json!("completeDeviceSession"),
+        ),
+        (
+            "/components/parameters/GenesisIfMatch/schema/pattern",
+            json!("^\"sha256:[a-f0-9]{64}\"$"),
+        ),
+        (
+            "/paths/~1v1~1devices~1sessions~1challenges/post/responses/429/$ref",
+            json!("#/components/responses/DeviceSessionChallengeRateLimited"),
+        ),
+        (
+            "/components/responses/DeviceSessionIssued/content/application~1vnd.dirextalk.device-session-receipt.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+    ] {
+        expect_value(&document, pointer, &expected)?;
+    }
+    Ok(())
+}
+
+fn validate_identity_session_proof_vector(
+    cddl: &str,
+    vector: &Value,
+) -> Result<(), ProtocolToolError> {
+    let proof = vector
+        .get("proof")
+        .ok_or_else(|| ProtocolToolError::new("identity-session-v1 proof vector is missing"))?;
+    validate_uuid_fields(
+        vector,
+        &[
+            "/proof/device_id",
+            "/proof/challenge_id",
+            "/proof/session_id",
+        ],
+    )?;
+    let identity_id = json_string(proof, "identity_id")?;
+    if identity_id.len() != 57 || !identity_id.starts_with("dtxi1") {
+        return Err(ProtocolToolError::new(
+            "identity-session-v1 proof identity must be canonical-looking",
+        ));
+    }
+    let nonce = decode_base64url_fixed::<32>(json_string(proof, "challenge_nonce")?)?;
+    if nonce.iter().all(|byte| *byte == 0) {
+        return Err(ProtocolToolError::new(
+            "identity-session-v1 proof nonce cannot be all zero",
+        ));
+    }
+    let audience = json_string(proof, "audience")?;
+    if !(1..=256).contains(&audience.len()) || !audience.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(ProtocolToolError::new(
+            "identity-session-v1 proof audience must be bounded ASCII",
+        ));
+    }
+    let session_secret_hash = json_string(proof, "session_secret_hash")?
+        .strip_prefix("sha256:")
+        .ok_or_else(|| {
+            ProtocolToolError::new("identity-session-v1 proof secret hash must use sha256")
+        })?;
+    let _ = decode_lower_hex_fixed::<32>(session_secret_hash)?;
+    let session_expires_at = json_i64(proof, "session_expires_at_ms")?;
+    if !(-62_135_596_800_000..=253_402_300_799_999).contains(&session_expires_at) {
+        return Err(ProtocolToolError::new(
+            "identity-session-v1 proof expiry is outside UTC bounds",
+        ));
+    }
+
+    let canonical = decode_hex(json_string(proof, "canonical_cbor_hex")?)?;
+    cddl_cat::validate_cbor_bytes("device-session-proof-v1", cddl, &canonical).map_err(
+        |error| {
+            ProtocolToolError::new(format!(
+                "CDDL rejected device-session-proof-v1 golden vector: {error}"
+            ))
+        },
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"dirextalk.device-session-proof.v1\0");
+    hasher.update(&canonical);
+    let proof_hash = hasher.finalize();
+    if json_string(proof, "proof_hash_hex")? != lowercase_hex(&proof_hash) {
+        return Err(ProtocolToolError::new(
+            "identity-session-v1 proof hash does not bind canonical CBOR",
+        ));
+    }
+    let mut signature_input = b"dirextalk.device-session-signature.v1\0".to_vec();
+    signature_input.extend_from_slice(&proof_hash);
+    if json_string(proof, "signature_input_hex")? != lowercase_hex(&signature_input) {
+        return Err(ProtocolToolError::new(
+            "identity-session-v1 signature input does not bind proof hash",
+        ));
+    }
+    let public_key = decode_prefixed_base64url_fixed::<32>(
+        json_string(proof, "device_signing_public_key")?,
+        "ed25519:",
+    )?;
+    let signature =
+        decode_prefixed_base64url_fixed::<64>(json_string(proof, "signature")?, "ed25519:")?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key).map_err(|_| {
+        ProtocolToolError::new("identity-session-v1 proof public key is not an Ed25519 key")
+    })?;
+    verifying_key
+        .verify_strict(&signature_input, &Signature::from_bytes(&signature))
+        .map_err(|_| ProtocolToolError::new("identity-session-v1 proof signature does not verify"))
 }
 
 fn validate_openapi(
@@ -1176,6 +1353,71 @@ fn json_string<'a>(value: &'a Value, key: &str) -> Result<&'a str, ProtocolToolE
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| ProtocolToolError::new(format!("vector field {key} must be a string")))
+}
+
+fn json_i64(value: &Value, key: &str) -> Result<i64, ProtocolToolError> {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ProtocolToolError::new(format!("vector field {key} must be an integer")))
+}
+
+fn has_error_response(
+    vector: &Value,
+    status: i64,
+    code: &str,
+    retryable: bool,
+) -> Result<bool, ProtocolToolError> {
+    let responses = vector
+        .get("error_responses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProtocolToolError::new("error_responses must be an array"))?;
+    Ok(responses.iter().any(|response| {
+        response.get("status").and_then(Value::as_i64) == Some(status)
+            && response.get("code").and_then(Value::as_str) == Some(code)
+            && response.get("retryable").and_then(Value::as_bool) == Some(retryable)
+    }))
+}
+
+fn decode_prefixed_base64url_fixed<const LENGTH: usize>(
+    value: &str,
+    prefix: &str,
+) -> Result<[u8; LENGTH], ProtocolToolError> {
+    let encoded = value
+        .strip_prefix(prefix)
+        .ok_or_else(|| ProtocolToolError::new(format!("golden value must use {prefix} prefix")))?;
+    decode_base64url_fixed(encoded)
+}
+
+fn decode_base64url_fixed<const LENGTH: usize>(
+    value: &str,
+) -> Result<[u8; LENGTH], ProtocolToolError> {
+    let mut decoded = [0_u8; LENGTH];
+    let result = Base64UrlUnpadded::decode(value, &mut decoded)
+        .map_err(|_| ProtocolToolError::new("golden value must be unpadded base64url"))?;
+    if result.len() != LENGTH {
+        return Err(ProtocolToolError::new(
+            "golden base64url value has the wrong length",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn decode_lower_hex_fixed<const LENGTH: usize>(
+    value: &str,
+) -> Result<[u8; LENGTH], ProtocolToolError> {
+    let decoded = decode_hex(value)?;
+    decoded
+        .try_into()
+        .map_err(|_| ProtocolToolError::new("golden hexadecimal value has the wrong length"))
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(encoded, "{byte:02x}").expect("writing to String is infallible");
+    }
+    encoded
 }
 
 fn read_json(path: &Path) -> Result<Value, ProtocolToolError> {

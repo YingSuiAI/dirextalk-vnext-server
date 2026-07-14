@@ -46,6 +46,11 @@ const V10_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/identity/v1",
     "protocol/test-vectors/identity-http/v1",
 ];
+const V11_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/identity-session/v1",
+    "protocol/openapi/identity-session/v1",
+    "protocol/test-vectors/identity-session/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -121,6 +126,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v10/manifest.json",
         includes_registries: false,
         artifact_paths: V10_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 11,
+        path: "protocol/baseline/v11/manifest.json",
+        includes_registries: false,
+        artifact_paths: V11_ARTIFACT_PATHS,
     },
 ];
 

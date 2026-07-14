@@ -1,0 +1,40 @@
+; Device-session HTTP V1. The identity log remains the authority for device
+; certificates and revocation; these structures only bind one short-lived
+; transport session to an active device proof.
+
+identity-id-v1 = tstr .size 57
+uuid-v7-v1 = tstr .size 36
+sha256-digest-v1 = bstr .size 32
+ed25519-signature-v1 = bstr .size 64
+audience-v1 = tstr .size (1..256)
+utc-millis-v1 = -62135596800000..253402300799999
+positive-safe-uint-v1 = 1..9007199254740991
+
+; Canonical payload hashed under
+; "dirextalk.device-session-proof.v1\0" before its digest is prefixed by
+; "dirextalk.device-session-signature.v1\0" and signed with the current
+; active device signing key.
+device-session-proof-v1 = {
+  1: 1,
+  2: identity-id-v1,
+  3: uuid-v7-v1,
+  4: uuid-v7-v1,
+  5: bstr .size 32,
+  6: audience-v1,
+  7: uuid-v7-v1,
+  8: sha256-digest-v1,
+  9: utc-millis-v1
+}
+
+; Exact immutable receipt returned for both a new session (201) and an exact
+; idempotent retry (200). It deliberately never carries the raw session secret.
+device-session-receipt-v1 = {
+  1: 1,
+  2: identity-id-v1,
+  3: uuid-v7-v1,
+  4: uuid-v7-v1,
+  5: positive-safe-uint-v1,
+  6: sha256-digest-v1,
+  7: utc-millis-v1,
+  8: utc-millis-v1
+}

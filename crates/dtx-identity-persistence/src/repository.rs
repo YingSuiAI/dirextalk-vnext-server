@@ -160,6 +160,43 @@ impl IdentityLogRepository {
         }
     }
 
+    /// Appends the root-authorized first device after genesis.
+    ///
+    /// The first device is the only device enrollment that can be authorized
+    /// directly by the root log event: bootstrap deliberately creates no
+    /// `DeviceCertificate`, so there is no active device session yet. Later
+    /// QR enrollment must use a separately authenticated active-device session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed error unless the exact event is sequence two,
+    /// references the supplied genesis hash, and reduces from a device-empty
+    /// active identity log using the existing root authorization rules.
+    pub async fn append_initial_device(
+        self,
+        store: &IdentityPgStore,
+        idempotency_key_hash: Sha256Digest,
+        expected_genesis_hash: Sha256Digest,
+        exact_event_bytes: Vec<u8>,
+        committed_at: UtcMillis,
+    ) -> Result<IdentityAppendOutcome, IdentityPersistenceError> {
+        let event = IdentityLogEventV1::decode_and_verify(&exact_event_bytes)?;
+        validate_initial_device_shape(&event, expected_genesis_hash)?;
+        let expected_head = IdentityLogHead::new(
+            event.identity_id(),
+            IDENTITY_LOG_WIRE_VERSION,
+            SafeUint::new(1)
+                .map_err(|_| IdentityPersistenceError::CorruptData("identity genesis sequence"))?,
+            expected_genesis_hash,
+        );
+        let command = IdentityAppendCommand::new(
+            idempotency_key_hash,
+            Some(expected_head),
+            exact_event_bytes,
+        )?;
+        self.append(store, &command, committed_at).await
+    }
+
     /// Rehydrates the exact public head and pure reducer projection after a
     /// process restart. A malformed row is never treated as authorization fact.
     ///
@@ -551,6 +588,22 @@ fn validate_bootstrap_shape(
     Ok(())
 }
 
+fn validate_initial_device_shape(
+    event: &IdentityLogEventV1,
+    expected_genesis_hash: Sha256Digest,
+) -> Result<(), IdentityPersistenceError> {
+    if event.wire() != IDENTITY_LOG_WIRE_VERSION
+        || event.sequence().get() != 2
+        || event.previous_event_hash() != Some(expected_genesis_hash)
+        || !matches!(event.payload(), IdentityLogEventPayloadV1::DeviceAdd { .. })
+    {
+        return Err(IdentityPersistenceError::InvalidCommand(
+            "initial device must be an exact sequence-two device add",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_expected_shape(
     command: &IdentityAppendCommand,
     event: &IdentityLogEventV1,
@@ -575,7 +628,7 @@ fn validate_expected_shape(
     }
 }
 
-async fn lock_identity(
+pub(crate) async fn lock_identity(
     connection: &mut PgConnection,
     identity_id: IdentityId,
 ) -> Result<(), IdentityPersistenceError> {
@@ -590,6 +643,24 @@ async fn lock_identity(
         .execute(&mut *connection)
         .await?;
     Ok(())
+}
+
+/// Locks and fully rehydrates one active identity log inside an existing
+/// identity-only transaction. Authentication callers use this exact helper so
+/// a device's active status cannot be read in one transaction and consumed in
+/// a second transaction after a concurrent revoke or recovery restore.
+pub(crate) async fn lock_and_load_active_snapshot(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+) -> Result<IdentityLogSnapshot, IdentityPersistenceError> {
+    lock_identity(connection, identity_id).await?;
+    let stored = load_stored_head(connection, identity_id)
+        .await?
+        .ok_or(IdentityPersistenceError::IdentityInactive)?;
+    if stored.state != LogState::Active {
+        return Err(IdentityPersistenceError::IdentityInactive);
+    }
+    load_snapshot_for_head(connection, stored).await
 }
 
 async fn claim_bootstrap_command(

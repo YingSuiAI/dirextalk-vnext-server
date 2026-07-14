@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "initial_enroll_path": "/v1/devices/initial-enroll",
+  "challenge_path": "/v1/devices/sessions/challenges",
+  "session_path": "/v1/devices/sessions",
+  "session_request_content_type": "application/json",
+  "session_response_content_type": "application/vnd.dirextalk.device-session-receipt.v1+cbor",
+  "idempotency_key_min_bytes": 16,
+  "idempotency_key_max_bytes": 128,
+  "challenge_ttl_millis": 300000,
+  "challenge_min_interval_millis": 5000,
+  "session_ttl_millis": 900000,
+  "proof": {
+    "identity_id": "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobiq",
+    "device_id": "0190f2a5-7b1c-7abc-8def-0123456789ab",
+    "challenge_id": "0190f2a5-7b1e-7abc-8def-0123456789ab",
+    "challenge_nonce": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU",
+    "audience": "https://identity.test",
+    "session_id": "0190f2a5-7b1d-7abc-8def-0123456789ab",
+    "session_secret_hash": "sha256:5f45e79ec8c202f4138b61c6d012b7d100149dbbb49dfbc62aee129f20fb9f60",
+    "session_expires_at_ms": 902000,
+    "canonical_cbor_hex": "a901010278396474786931353570756a65627576616d766b6d6f757878366f6b6569696a6a757a6a787877346b746a6168726a79367a323766726c6f62697103782430313930663261352d376231632d376162632d386465662d30313233343536373839616204782430313930663261352d376231652d376162632d386465662d3031323334353637383961620558205555555555555555555555555555555555555555555555555555555555555555067568747470733a2f2f6964656e746974792e7465737407782430313930663261352d376231642d376162632d386465662d3031323334353637383961620858205f45e79ec8c202f4138b61c6d012b7d100149dbbb49dfbc62aee129f20fb9f60091a000dc370",
+    "proof_hash_hex": "2988ea5defca8cf5cd5a5b37a1c7f2ddde96afc763541de5e092461293c8d243",
+    "signature_input_hex": "646972657874616c6b2e6465766963652d73657373696f6e2d7369676e61747572652e7631002988ea5defca8cf5cd5a5b37a1c7f2ddde96afc763541de5e092461293c8d243",
+    "device_signing_public_key": "ed25519:7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+    "signature": "ed25519:LSxEOpmLebbbBl_sRFCxYml67TARvECH55JZEObGxnmwyi8DNw9znCUJL96y-zJDeuwhNCCfh5TmUY-0_x5wCQ"
+  },
+  "receipt_canonical_cbor_hex": "a801010278396474786931353570756a65627576616d766b6d6f757878366f6b6569696a6a757a6a787877346b746a6168726a79367a323766726c6f62697103782430313930663261352d376231632d376162632d386465662d30313233343536373839616204782430313930663261352d376231642d376162632d386465662d30313233343536373839616205020658201111111111111111111111111111111111111111111111111111111111111111071907d0081a000dc370",
+  "success_statuses": [201, 200],
+  "error_responses": [
+    {"status": 401, "code": "DEVICE_AUTHENTICATION_FAILED", "retryable": false},
+    {"status": 409, "code": "DEVICE_SESSION_CHALLENGE_CONSUMED", "retryable": false},
+    {"status": 409, "code": "DEVICE_SESSION_CHALLENGE_EXPIRED", "retryable": false},
+    {"status": 409, "code": "IDEMPOTENCY_CONFLICT", "retryable": false},
+    {"status": 422, "code": "DEVICE_SESSION_INVALID", "retryable": false},
+    {"status": 429, "code": "DEVICE_SESSION_CHALLENGE_RATE_LIMITED", "retryable": true},
+    {"status": 503, "code": "IDENTITY_SERVICE_UNAVAILABLE", "retryable": true}
+  ]
+}

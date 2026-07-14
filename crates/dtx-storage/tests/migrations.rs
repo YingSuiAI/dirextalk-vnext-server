@@ -13,7 +13,8 @@ const HOST_PROVISIONING_MIGRATION_VERSION: i64 = 202_607_140_006;
 const IDENTITY_LOG_MIGRATION_VERSION: i64 = 202_607_140_007;
 const GROUP_MEMBERSHIP_MIGRATION_VERSION: i64 = 202_607_140_008;
 const IDENTITY_BOOTSTRAP_CLAIMS_MIGRATION_VERSION: i64 = 202_607_140_009;
-const EXPECTED_MIGRATION_COUNT: i64 = 9;
+const DEVICE_SESSIONS_MIGRATION_VERSION: i64 = 202_607_140_010;
+const EXPECTED_MIGRATION_COUNT: i64 = 10;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -32,6 +33,8 @@ const GROUP_MEMBERSHIP_DOWN: &str =
     include_str!("../../../migrations/202607140008_group_membership_saga.down.sql");
 const IDENTITY_BOOTSTRAP_CLAIMS_DOWN: &str =
     include_str!("../../../migrations/202607140009_identity_bootstrap_idempotency_claims.down.sql");
+const DEVICE_SESSIONS_DOWN: &str =
+    include_str!("../../../migrations/202607140010_device_sessions.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,13 +55,17 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one reversible migration test keeps the full ordered schema teardown auditable"
+)]
 async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -69,8 +76,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(IDENTITY_LOG_MIGRATION_VERSION)
     .bind(GROUP_MEMBERSHIP_MIGRATION_VERSION)
     .bind(IDENTITY_BOOTSTRAP_CLAIMS_MIGRATION_VERSION)
+    .bind(DEVICE_SESSIONS_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(DEVICE_SESSIONS_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(IDENTITY_BOOTSTRAP_CLAIMS_DOWN)
         .execute(harness.admin_pool())
         .await?;
@@ -267,6 +278,9 @@ async fn assert_append_only_tables_have_no_update(
         "agent.host_provisioning_operations",
         "identity.log_entries",
         "identity.fork_evidence",
+        "identity.device_sessions",
+        "identity.device_session_idempotency_claims",
+        "identity.device_session_receipts",
     ] {
         let can_update: bool =
             sqlx::query_scalar("SELECT has_table_privilege('dtx_runtime_test', $1, 'UPDATE')")

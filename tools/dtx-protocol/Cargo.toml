@@ -6,7 +6,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+base64ct.workspace = true
 cddl-cat.workspace = true
+ed25519-dalek.workspace = true
 oas3.workspace = true
 prost-types.workspace = true
 protox.workspace = true

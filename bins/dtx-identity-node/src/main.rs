@@ -2,7 +2,7 @@
 
 use std::{env, fs, net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
 
-use dtx_identity_node::identity_bootstrap_router;
+use dtx_identity_node::{IdentityBootstrapState, identity_bootstrap_router_with_state};
 use dtx_identity_persistence::IdentityPgStore;
 use sqlx::postgres::PgConnectOptions;
 use tokio::net::TcpListener;
@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DATABASE_URL_FILE_ENV: &str = "DTX_IDENTITY_DATABASE_URL_FILE";
 const LISTEN_ENV: &str = "DTX_IDENTITY_LISTEN";
+const DEVICE_SESSION_AUDIENCE_ENV: &str = "DTX_IDENTITY_DEVICE_SESSION_AUDIENCE";
 const MAX_DATABASE_URL_BYTES: usize = 8_192;
 
 #[tokio::main]
@@ -26,6 +27,7 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), NodeError> {
     let listen = load_loopback_listen()?;
+    let device_session_audience = load_device_session_audience(listen)?;
     let database_options = load_database_options()?;
     let store = IdentityPgStore::connect(database_options, 8)
         .await
@@ -33,10 +35,25 @@ async fn run() -> Result<(), NodeError> {
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|_| NodeError::Bind)?;
-    axum::serve(listener, identity_bootstrap_router(store))
+    let state = IdentityBootstrapState::with_clock_and_device_session_audience(
+        store,
+        std::sync::Arc::new(dtx_domain::SystemClock),
+        device_session_audience,
+    );
+    axum::serve(listener, identity_bootstrap_router_with_state(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|_| NodeError::Serve)
+}
+
+fn load_device_session_audience(listen: SocketAddr) -> Result<String, NodeError> {
+    let audience =
+        env::var(DEVICE_SESSION_AUDIENCE_ENV).unwrap_or_else(|_| format!("http://{listen}"));
+    if !(1..=256).contains(&audience.len()) || !audience.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(NodeError::Configuration);
+    }
+    Ok(audience)
 }
 
 fn load_loopback_listen() -> Result<SocketAddr, NodeError> {

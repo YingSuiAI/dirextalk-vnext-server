@@ -36,6 +36,14 @@ pub enum IdentityPersistenceError {
     GenesisConflict,
     /// The durable head is tombstoned, forked, or otherwise not appendable.
     IdentityInactive,
+    /// A device-session request was not authorized by an active certified device.
+    DeviceAuthenticationRejected,
+    /// A one-time device-session challenge was no longer within its validity window.
+    DeviceSessionChallengeExpired,
+    /// A one-time device-session challenge already issued a session.
+    DeviceSessionChallengeConsumed,
+    /// An active device requested fresh challenges faster than the durable limit.
+    DeviceSessionChallengeRateLimited,
     /// Stored rows did not rehydrate to one exact valid identity-log projection.
     CorruptData(&'static str),
 }
@@ -64,6 +72,10 @@ impl fmt::Display for IdentityPersistenceError {
             }
             Self::GenesisConflict => "identity genesis conflicts with an existing identity log",
             Self::IdentityInactive => "identity log is not active",
+            Self::DeviceAuthenticationRejected => "device session authentication was rejected",
+            Self::DeviceSessionChallengeExpired => "device session challenge expired",
+            Self::DeviceSessionChallengeConsumed => "device session challenge was consumed",
+            Self::DeviceSessionChallengeRateLimited => "device session challenge rate limited",
             Self::CorruptData(_) => "identity persistence contained invalid durable data",
         })
     }
@@ -85,6 +97,10 @@ impl Error for IdentityPersistenceError {
             | Self::HeadConflict { .. }
             | Self::GenesisConflict
             | Self::IdentityInactive
+            | Self::DeviceAuthenticationRejected
+            | Self::DeviceSessionChallengeExpired
+            | Self::DeviceSessionChallengeConsumed
+            | Self::DeviceSessionChallengeRateLimited
             | Self::CorruptData(_) => None,
         }
     }

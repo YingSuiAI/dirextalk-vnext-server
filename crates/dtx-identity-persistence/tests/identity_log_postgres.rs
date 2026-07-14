@@ -601,7 +601,7 @@ async fn assert_identity_schema_boundary(
     )
     .fetch_one(harness.admin_pool())
     .await?;
-    assert_eq!(table_security, (6, 6));
+    assert_eq!(table_security, (10, 10));
     let public_table_grants: i64 = sqlx::query_scalar(
         "SELECT count(*)
            FROM information_schema.table_privileges
@@ -643,6 +643,31 @@ async fn assert_identity_schema_boundary(
     .fetch_one(harness.admin_pool())
     .await?;
     assert!(!can_rewrite_bootstrap_claims);
+    let session_mutation_privileges: (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege(
+             'dtx_identity_only_test',
+             'identity.device_session_challenges',
+             'UPDATE'
+         ),
+         has_table_privilege(
+             'dtx_identity_only_test',
+             'identity.device_sessions',
+             'UPDATE'
+         ),
+         has_table_privilege(
+             'dtx_identity_only_test',
+             'identity.device_session_idempotency_claims',
+             'UPDATE'
+         ),
+         has_table_privilege(
+             'dtx_identity_only_test',
+             'identity.device_session_receipts',
+             'UPDATE'
+         )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(session_mutation_privileges, (true, false, false, false));
     let has_system_usage: bool = sqlx::query_scalar(
         "SELECT has_schema_privilege('dtx_identity_only_test', 'system', 'USAGE')",
     )

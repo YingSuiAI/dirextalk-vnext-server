@@ -1,0 +1,10 @@
+{
+  "version": 11,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/identity-session/v1/device-session-v1.cddl": "sha256:7a1ab610f8bf07a2856aba616463e6cbcb5c68373a57a00ddc14298405b20afb",
+    "protocol/openapi/identity-session/v1/openapi.yaml": "sha256:467fbe05fa4747b92a272540a224d83363edb62e3419d5a90c21087c97263607",
+    "protocol/test-vectors/identity-session/v1/device-session-v1.json": "sha256:2015fe633d45a391091348650aae9c538c645b5161656e981f4831a419aaff31"
+  }
+}
