@@ -42,6 +42,17 @@ pub enum GroupRole {
     Member,
 }
 
+/// The authority term under which an invitation issuer was allowed to act.
+///
+/// Owner authority is continuous in this aggregate. Each administrator grant
+/// receives a fresh, identity-scoped generation so that revocation cannot be
+/// undone by granting the same identity a later administrator term.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InviteIssuerAuthority {
+    Owner,
+    Admin { authorization_generation: Revision },
+}
+
 /// A group-bound, non-secret invitation capability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InviteCapability {
@@ -54,6 +65,7 @@ pub struct InviteCapability {
     expires_at_ms: i64,
     revoked: bool,
     policy_revision: Revision,
+    issuer_authority: InviteIssuerAuthority,
 }
 
 impl InviteCapability {
@@ -109,6 +121,21 @@ impl InviteCapability {
     #[must_use]
     pub const fn policy_revision(self) -> Revision {
         self.policy_revision
+    }
+
+    /// Returns the administrator authorization generation bound at issuance.
+    ///
+    /// Owner-issued invitations return `None`, because an owner's authority is
+    /// not an administrator term and must not be invalidated by administrator
+    /// grants or revocations.
+    #[must_use]
+    pub const fn issuer_admin_authorization_generation(self) -> Option<Revision> {
+        match self.issuer_authority {
+            InviteIssuerAuthority::Owner => None,
+            InviteIssuerAuthority::Admin {
+                authorization_generation,
+            } => Some(authorization_generation),
+        }
     }
 }
 
@@ -308,6 +335,7 @@ pub struct GroupPolicy {
     scope: GroupScope,
     owner_id: IdentityId,
     administrators: BTreeSet<IdentityId>,
+    administrator_authorization_generations: BTreeMap<IdentityId, Revision>,
     members: BTreeSet<IdentityId>,
     invitations: BTreeMap<InviteCapabilityId, InviteCapability>,
     pending_joins: BTreeMap<JoinRequestId, PendingJoinRequest>,
@@ -325,6 +353,7 @@ impl GroupPolicy {
             scope,
             owner_id,
             administrators: BTreeSet::new(),
+            administrator_authorization_generations: BTreeMap::new(),
             members,
             invitations: BTreeMap::new(),
             pending_joins: BTreeMap::new(),
@@ -437,8 +466,12 @@ impl GroupPolicy {
         if self.administrators.len() >= MAX_ADMINS {
             return Err(GroupPolicyError::AdminLimitReached);
         }
+        let authorization_generation =
+            self.next_admin_authorization_generation(administrator_id)?;
 
         self.administrators.insert(administrator_id);
+        self.administrator_authorization_generations
+            .insert(administrator_id, authorization_generation);
         self.members.insert(administrator_id);
         self.revision = next_revision;
         Ok(next_revision)
@@ -492,7 +525,7 @@ impl GroupPolicy {
         now_ms: i64,
     ) -> Result<InviteCapability, GroupPolicyError> {
         let next_revision = self.next_mutation_revision(expected_revision)?;
-        self.ensure_invite_authority(actor_id)?;
+        let issuer_authority = self.invite_issuer_authority(actor_id)?;
         if self.invitations.contains_key(&invite_id) {
             return Err(GroupPolicyError::InviteAlreadyExists);
         }
@@ -513,6 +546,7 @@ impl GroupPolicy {
             expires_at_ms,
             revoked: false,
             policy_revision: expected_revision,
+            issuer_authority,
         };
         self.invitations.insert(invite_id, invite);
         self.revision = next_revision;
@@ -553,19 +587,23 @@ impl GroupPolicy {
     ///
     /// # Errors
     ///
-    /// Returns an error for a stale revision, an already admitted candidate,
-    /// reused request ID, or an invitation that is missing, revoked, expired,
-    /// exhausted, targeted to another identity, or issued by a no-longer
-    /// authorized actor.
+    /// Returns an error for a stale revision, a caller that does not match the
+    /// candidate, an already admitted candidate, reused request ID, or an
+    /// invitation that is missing, revoked, expired, exhausted, targeted to
+    /// another identity, or issued by a no-longer authorized actor.
     pub fn request_join(
         &mut self,
         expected_revision: Revision,
+        actor_id: IdentityId,
         candidate_id: IdentityId,
         request_id: JoinRequestId,
         invite_id: InviteCapabilityId,
         now_ms: i64,
     ) -> Result<PendingJoinRequest, GroupPolicyError> {
         let next_revision = self.next_mutation_revision(expected_revision)?;
+        if actor_id != candidate_id {
+            return Err(GroupPolicyError::Unauthorized);
+        }
         if self.members.contains(&candidate_id) {
             return Err(GroupPolicyError::AlreadyMember);
         }
@@ -711,12 +749,61 @@ impl GroupPolicy {
         {
             return Err(GroupPolicyError::InviteTargetMismatch);
         }
-        if !self.can_issue_invite(invite.issuer_id) {
+        if !self.invite_issuer_authority_is_current(invite) {
             return Err(GroupPolicyError::InviteIssuerNoLongerAuthorized);
         }
         if invite.use_count >= invite.max_uses {
             return Err(GroupPolicyError::InviteUseLimitReached);
         }
         Ok(())
+    }
+
+    fn invite_issuer_authority(
+        &self,
+        actor_id: IdentityId,
+    ) -> Result<InviteIssuerAuthority, GroupPolicyError> {
+        if actor_id == self.owner_id {
+            return Ok(InviteIssuerAuthority::Owner);
+        }
+        if self.administrators.contains(&actor_id) {
+            return self
+                .administrator_authorization_generations
+                .get(&actor_id)
+                .copied()
+                .map(|authorization_generation| InviteIssuerAuthority::Admin {
+                    authorization_generation,
+                })
+                .ok_or(GroupPolicyError::Unauthorized);
+        }
+        Err(GroupPolicyError::Unauthorized)
+    }
+
+    fn next_admin_authorization_generation(
+        &self,
+        administrator_id: IdentityId,
+    ) -> Result<Revision, GroupPolicyError> {
+        self.administrator_authorization_generations
+            .get(&administrator_id)
+            .copied()
+            .map_or(Ok(Revision::INITIAL), |generation| {
+                generation
+                    .checked_next()
+                    .map_err(|_| GroupPolicyError::CounterExhausted)
+            })
+    }
+
+    fn invite_issuer_authority_is_current(&self, invite: InviteCapability) -> bool {
+        match invite.issuer_authority {
+            InviteIssuerAuthority::Owner => invite.issuer_id == self.owner_id,
+            InviteIssuerAuthority::Admin {
+                authorization_generation,
+            } => {
+                self.administrators.contains(&invite.issuer_id)
+                    && self
+                        .administrator_authorization_generations
+                        .get(&invite.issuer_id)
+                        .is_some_and(|current| *current == authorization_generation)
+            }
+        }
     }
 }

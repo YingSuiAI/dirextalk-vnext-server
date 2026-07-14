@@ -243,7 +243,14 @@ fn approval_at_current_revision_admits_the_pending_candidate_and_is_not_reapplie
 
     let request_id = JoinRequestId::new();
     let pending = group
-        .request_join(group.revision(), candidate, request_id, invite_id, 1_500)
+        .request_join(
+            group.revision(),
+            candidate,
+            candidate,
+            request_id,
+            invite_id,
+            1_500,
+        )
         .expect("candidate creates pending join request");
     assert_eq!(pending.request_id(), request_id);
     assert_eq!(pending.candidate_id(), candidate);
@@ -265,6 +272,7 @@ fn approval_at_current_revision_admits_the_pending_candidate_and_is_not_reapplie
     assert_eq!(
         group.request_join(
             retry_revision,
+            candidate,
             candidate,
             JoinRequestId::new(),
             invite_id,
@@ -301,7 +309,14 @@ fn revoked_admin_actions_conflict_when_stale_and_are_unauthorized_when_current()
         .expect("admin issues invitation while authorized");
     let request_id = JoinRequestId::new();
     group
-        .request_join(group.revision(), candidate, request_id, invite_id, 1_500)
+        .request_join(
+            group.revision(),
+            candidate,
+            candidate,
+            request_id,
+            invite_id,
+            1_500,
+        )
         .expect("candidate creates pending request");
 
     let stale_revision = group.revision();
@@ -331,6 +346,164 @@ fn revoked_admin_actions_conflict_when_stale_and_are_unauthorized_when_current()
 }
 
 #[test]
+fn revoked_admin_invite_stays_invalid_after_regrant_while_owner_invite_stays_valid() {
+    let owner = owner();
+    let admin = identity(1);
+    let admin_invite_candidate = identity(2);
+    let owner_invite_candidate = identity(3);
+    let mut group = private_group(owner);
+    group
+        .grant_admin(group.revision(), owner, admin)
+        .expect("owner grants the initial administrator term");
+
+    let admin_invite_id = InviteCapabilityId::new();
+    group
+        .issue_invite(
+            group.revision(),
+            admin,
+            admin_invite_id,
+            Some(admin_invite_candidate),
+            1,
+            10_000,
+            1_000,
+        )
+        .expect("admin issues an invite during its first authorization term");
+    let owner_invite_id = InviteCapabilityId::new();
+    group
+        .issue_invite(
+            group.revision(),
+            owner,
+            owner_invite_id,
+            Some(owner_invite_candidate),
+            1,
+            10_000,
+            1_000,
+        )
+        .expect("owner issues an independent invite");
+
+    group
+        .revoke_admin(group.revision(), owner, admin)
+        .expect("owner revokes the first administrator term");
+    group
+        .grant_admin(group.revision(), owner, admin)
+        .expect("owner grants a distinct later administrator term");
+
+    let before_rejected_request = group.clone();
+    assert_eq!(
+        group.request_join(
+            group.revision(),
+            admin_invite_candidate,
+            admin_invite_candidate,
+            JoinRequestId::new(),
+            admin_invite_id,
+            1_500,
+        ),
+        Err(GroupPolicyError::InviteIssuerNoLongerAuthorized)
+    );
+    assert_eq!(group, before_rejected_request);
+
+    group
+        .request_join(
+            group.revision(),
+            owner_invite_candidate,
+            owner_invite_candidate,
+            JoinRequestId::new(),
+            owner_invite_id,
+            1_500,
+        )
+        .expect("owner invite remains usable across unrelated admin terms");
+}
+
+#[test]
+fn pending_join_from_revoked_admin_invite_stays_invalid_after_regrant() {
+    let owner = owner();
+    let admin = identity(4);
+    let candidate = identity(5);
+    let mut group = private_group(owner);
+    group
+        .grant_admin(group.revision(), owner, admin)
+        .expect("owner grants the initial administrator term");
+    let invite_id = InviteCapabilityId::new();
+    group
+        .issue_invite(
+            group.revision(),
+            admin,
+            invite_id,
+            Some(candidate),
+            1,
+            10_000,
+            1_000,
+        )
+        .expect("admin issues invite during its first authorization term");
+    let request_id = JoinRequestId::new();
+    group
+        .request_join(
+            group.revision(),
+            candidate,
+            candidate,
+            request_id,
+            invite_id,
+            1_500,
+        )
+        .expect("candidate submits a pending request before revocation");
+
+    group
+        .revoke_admin(group.revision(), owner, admin)
+        .expect("owner revokes the first administrator term");
+    group
+        .grant_admin(group.revision(), owner, admin)
+        .expect("owner grants a distinct later administrator term");
+
+    let before_rejected_approval = group.clone();
+    assert_eq!(
+        group.approve_join(group.revision(), owner, request_id, 2_000),
+        Err(GroupPolicyError::InviteIssuerNoLongerAuthorized)
+    );
+    assert_eq!(group, before_rejected_approval);
+    assert_eq!(
+        group
+            .pending_join(request_id)
+            .map(|pending| pending.candidate_id()),
+        Some(candidate)
+    );
+    assert!(!group.is_member(candidate));
+}
+
+#[test]
+fn caller_cannot_create_a_pending_join_for_another_identity() {
+    let owner = owner();
+    let candidate = identity(6);
+    let other_actor = identity(7);
+    let mut group = private_group(owner);
+    let invite_id = InviteCapabilityId::new();
+    group
+        .issue_invite(
+            group.revision(),
+            owner,
+            invite_id,
+            Some(candidate),
+            1,
+            10_000,
+            1_000,
+        )
+        .expect("owner issues an invite for the candidate");
+
+    let before = group.clone();
+    assert_eq!(
+        group.request_join(
+            group.revision(),
+            other_actor,
+            candidate,
+            JoinRequestId::new(),
+            invite_id,
+            1_500,
+        ),
+        Err(GroupPolicyError::Unauthorized)
+    );
+    assert_eq!(group, before);
+}
+
+#[test]
 fn join_and_approval_recheck_target_and_expiry() {
     let owner = owner();
     let target = identity(6);
@@ -352,6 +525,7 @@ fn join_and_approval_recheck_target_and_expiry() {
     assert_eq!(
         group.request_join(
             group.revision(),
+            other,
             other,
             JoinRequestId::new(),
             targeted_invite,
@@ -376,6 +550,7 @@ fn join_and_approval_recheck_target_and_expiry() {
     group
         .request_join(
             group.revision(),
+            target,
             target,
             expiring_request,
             expiring_invite,
@@ -413,6 +588,7 @@ fn join_rechecks_invitation_revocation_and_use_count() {
         group.request_join(
             group.revision(),
             other,
+            other,
             JoinRequestId::new(),
             revoked_invite,
             1_500,
@@ -437,6 +613,7 @@ fn join_rechecks_invitation_revocation_and_use_count() {
         .request_join(
             group.revision(),
             target,
+            target,
             limited_request,
             limited_invite,
             1_500,
@@ -448,6 +625,7 @@ fn join_rechecks_invitation_revocation_and_use_count() {
     assert_eq!(
         group.request_join(
             group.revision(),
+            other,
             other,
             JoinRequestId::new(),
             limited_invite,
