@@ -324,6 +324,42 @@ async fn mixed_tenant_and_identity_runtime_role_is_rejected() -> Result<(), Box<
 }
 
 #[tokio::test]
+async fn identity_writer_rejects_settable_tenant_role_and_identity_admin_option()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    sqlx::raw_sql(
+        "CREATE ROLE dtx_identity_settable_tenant NOLOGIN NOSUPERUSER NOBYPASSRLS;
+         GRANT USAGE ON SCHEMA system TO dtx_identity_settable_tenant;
+         GRANT dtx_identity_settable_tenant TO dtx_identity_only_test
+             WITH INHERIT FALSE, SET TRUE;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+
+    let settable_tenant = IdentityPgStore::connect(harness.identity_runtime_options(), 1).await;
+    assert!(matches!(
+        settable_tenant,
+        Err(IdentityPersistenceError::RuntimeRoleOverprivileged)
+    ));
+
+    sqlx::raw_sql(
+        "REVOKE dtx_identity_settable_tenant FROM dtx_identity_only_test;
+         REVOKE USAGE ON SCHEMA system FROM dtx_identity_settable_tenant;
+         DROP ROLE dtx_identity_settable_tenant;
+         REVOKE dtx_identity_runtime FROM dtx_identity_only_test;
+         GRANT dtx_identity_runtime TO dtx_identity_only_test WITH ADMIN OPTION;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    let identity_admin = IdentityPgStore::connect(harness.identity_runtime_options(), 1).await;
+    assert!(matches!(
+        identity_admin,
+        Err(IdentityPersistenceError::RuntimeRoleOverprivileged)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn identity_writer_rejects_extra_outbox_privileges_and_still_appends_after_revoke()
 -> Result<(), Box<dyn Error>> {
     let harness = support::PostgresHarness::start().await?;
@@ -352,6 +388,11 @@ async fn identity_writer_rejects_extra_outbox_privileges_and_still_appends_after
             "TRIGGER",
             "GRANT TRIGGER ON identity.log_outbox TO dtx_identity_runtime",
             "REVOKE TRIGGER ON identity.log_outbox FROM dtx_identity_runtime",
+        ),
+        (
+            "MAINTAIN",
+            "GRANT MAINTAIN ON identity.log_outbox TO dtx_identity_runtime",
+            "REVOKE MAINTAIN ON identity.log_outbox FROM dtx_identity_runtime",
         ),
     ] {
         sqlx::raw_sql(grant).execute(harness.admin_pool()).await?;
