@@ -751,12 +751,19 @@ impl DeviceSessionRepository {
         }
     }
 
-    /// Validates one device session in a caller-owned identity transaction.
+    /// Validates one device session in a caller-owned transaction.
     ///
-    /// QR enrollment uses this rather than the public [`Self::authenticate`]
-    /// wrapper so a concurrent device revoke cannot occur between credential
-    /// verification and its identity-log append.
-    pub(crate) async fn authenticate_in_transaction(
+    /// Consumers that mutate a separate durable service must invoke this in
+    /// their own transaction before reading a replay receipt or mutating their
+    /// rows. The read-only `dtx_mailbox_runtime` role is specifically allowed
+    /// to use this narrow boundary; it receives no identity write privileges.
+    /// This preserves the revoke-versus-replay invariant across service
+    /// boundaries without making a bearer-session validation result reusable.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing, expired, incorrect, or revoked device sessions.
+    pub async fn authenticate_in_transaction(
         connection: &mut PgConnection,
         credential: &DeviceSessionCredential,
         now: UtcMillis,

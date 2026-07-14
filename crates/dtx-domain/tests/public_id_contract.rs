@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
 use dtx_domain::{
-    AgentId, AggregateId, ChannelId, Ed25519PublicKey, EventId, IdentityId, PublicSubjectId,
-    RequestId, TenantId,
+    AgentId, AggregateId, ChannelId, Ed25519PublicKey, EnvelopeId, EventId, IdentityId, MailboxId,
+    PublicSubjectId, RequestId, TenantId,
 };
 use serde::Deserialize;
 
@@ -106,6 +106,8 @@ fn lifecycle_ids_require_canonical_uuid_v7_text_and_serde_round_trip() {
     let event: EventId = UUID_V7.parse().expect("canonical event UUIDv7");
     let request: RequestId = UUID_V7.parse().expect("canonical request UUIDv7");
     let aggregate: AggregateId = UUID_V7.parse().expect("canonical aggregate UUIDv7");
+    let mailbox: MailboxId = UUID_V7.parse().expect("canonical mailbox UUIDv7");
+    let envelope: EnvelopeId = UUID_V7.parse().expect("canonical envelope UUIDv7");
 
     assert_eq!(
         serde_json::to_string(&tenant).unwrap(),
@@ -114,6 +116,8 @@ fn lifecycle_ids_require_canonical_uuid_v7_text_and_serde_round_trip() {
     assert_eq!(event.to_string(), UUID_V7);
     assert_eq!(request.to_string(), UUID_V7);
     assert_eq!(aggregate.to_string(), UUID_V7);
+    assert_eq!(mailbox.to_string(), UUID_V7);
+    assert_eq!(envelope.to_string(), UUID_V7);
 
     assert!(UUID_V7.to_uppercase().parse::<TenantId>().is_err());
     assert!(UUID_V7.replace('-', "").parse::<TenantId>().is_err());

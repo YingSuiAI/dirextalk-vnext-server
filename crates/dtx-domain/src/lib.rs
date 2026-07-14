@@ -9,10 +9,10 @@ pub use ids::{
     AgentDeviceId, AggregateId, ApprovalId, AuditId, BindingId, BootId, CloudConnectionId,
     ConnectorCredentialId, ConnectorId, ConsentId, ConversationId, DeviceEnrollmentChallengeId,
     DeviceId, DeviceSessionChallengeId, DeviceSessionId, DirectoryRegistrationId,
-    EnrollmentIntentId, EventId, GrantId, HostCredentialId, HostId, IdParseError, IndexerId,
-    InstallationId, InviteCapabilityId, JobEvidenceId, JobId, JobResourceId, JobStepId,
-    JoinRequestId, KeyPackageId, LeaseId, ManagedServiceId, OutboxId, RequestId, RunId, RunLeaseId,
-    RunOfferId, SecretId, ServiceOperationId, TenantId, WorkerId,
+    EnrollmentIntentId, EnvelopeId, EventId, GrantId, HostCredentialId, HostId, IdParseError,
+    IndexerId, InstallationId, InviteCapabilityId, JobEvidenceId, JobId, JobResourceId, JobStepId,
+    JoinRequestId, KeyPackageId, LeaseId, MailboxId, ManagedServiceId, OutboxId, RequestId, RunId,
+    RunLeaseId, RunOfferId, SecretId, ServiceOperationId, TenantId, WorkerId,
 };
 pub use ports::{Clock, ClockError, IdGenerationError, IdGenerator, SystemClock, UuidV7Generator};
 pub use public_id::{

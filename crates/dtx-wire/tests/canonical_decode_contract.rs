@@ -1,4 +1,4 @@
-use dtx_domain::{InstallationId, JobEvidenceId, PublicSubjectId};
+use dtx_domain::{EnvelopeId, InstallationId, JobEvidenceId, MailboxId, PublicSubjectId};
 use dtx_wire::{
     ApiErrorCode, BoundedString, CanonicalDecode, CanonicalDecodeError, CanonicalValue, SafeUint,
     Sha256Digest, StableCode, UtcMillis, decode_struct_field, decode_struct_map,
@@ -77,6 +77,18 @@ fn primitive_decoders_enforce_declared_types_and_bounds() {
             .unwrap()
             .to_string(),
         IDENTITY_ID
+    );
+    assert_eq!(
+        MailboxId::decode_canonical(&CanonicalValue::Text(UUID_V7.to_owned()))
+            .unwrap()
+            .to_string(),
+        UUID_V7
+    );
+    assert_eq!(
+        EnvelopeId::decode_canonical(&CanonicalValue::Text(UUID_V7.to_owned()))
+            .unwrap()
+            .to_string(),
+        UUID_V7
     );
 
     assert_eq!(

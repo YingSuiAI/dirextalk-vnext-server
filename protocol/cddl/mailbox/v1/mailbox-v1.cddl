@@ -1,0 +1,90 @@
+; Opaque mailbox relay HTTP V1. The relay stores only capability hashes and
+; opaque ciphertext. It never parses MLS state, application payloads, or
+; mailbox write-capability secrets.
+
+identity-id-v1 = tstr .size 57
+uuid-v7-v1 = tstr .size 36
+write-capability-hash-v1 = bstr .size 32
+utc-millis-v1 = -62135596800000..253402300799999
+safe-uint-v1 = 0..9007199254740991
+positive-safe-uint-v1 = 1..9007199254740991
+
+; A writer hashes exactly the raw 32-byte capability with the literal ASCII
+; domain "dirextalk.mailbox-write-capability.v1\0" before registration. The
+; raw capability only appears in the DTX-Mailbox-Capability authorization
+; header and MUST NOT be persisted, logged, echoed, or placed in a fixture.
+;
+; Ciphertext remains opaque to the relay. Its maximum is 262144 bytes. A
+; registration and every envelope expiry are additionally limited to seven
+; days (604800000 milliseconds) by the semantic validator.
+opaque-ciphertext-v1 = bstr .size (1..262144)
+
+; An active owner device registers one mailbox and only a one-way write
+; capability hash. Replaying the exact body and idempotency key returns the
+; original receipt; a different reuse conflicts.
+mailbox-register-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: identity-id-v1,
+  4: uuid-v7-v1,
+  5: write-capability-hash-v1,
+  6: utc-millis-v1
+}
+
+mailbox-register-receipt-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: utc-millis-v1
+}
+
+; A capability holder appends an opaque encrypted envelope. The relay assigns
+; the monotonic delivery sequence and never accepts it from the writer.
+mailbox-envelope-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: opaque-ciphertext-v1,
+  4: utc-millis-v1
+}
+
+mailbox-envelope-receipt-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: uuid-v7-v1,
+  4: positive-safe-uint-v1,
+  5: utc-millis-v1
+}
+
+; `after_sequence` is zero for the first page. Pull and acknowledgement pages
+; are capped at 100 envelopes; that bound is part of this frozen contract.
+mailbox-pull-v1 = {
+  1: 1,
+  2: safe-uint-v1,
+  3: 1..100
+}
+
+mailbox-delivery-envelope-v1 = {
+  1: positive-safe-uint-v1,
+  2: uuid-v7-v1,
+  3: opaque-ciphertext-v1,
+  4: utc-millis-v1
+}
+
+mailbox-pull-receipt-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: safe-uint-v1,
+  4: [*100 mailbox-delivery-envelope-v1]
+}
+
+; The acknowledgement list is nonempty and contains at most 100 UUIDv7
+; envelope identifiers. No plaintext acknowledgement payload is representable.
+mailbox-acks-v1 = {
+  1: 1,
+  2: [1*100 uuid-v7-v1]
+}
+
+mailbox-acks-receipt-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: [*100 uuid-v7-v1]
+}

@@ -963,6 +963,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-mailbox"
+version = "0.1.0"
+dependencies = [
+ "dtx-domain",
+ "dtx-identity-persistence",
+ "dtx-wire",
+ "sqlx",
+ "subtle",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "dtx-mailbox-node"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64ct",
+ "dtx-domain",
+ "dtx-identity-log",
+ "dtx-identity-persistence",
+ "dtx-mailbox",
+ "dtx-storage",
+ "dtx-wire",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "testcontainers-modules",
+ "tokio",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "dtx-membership-command"
 version = "0.1.0"
 dependencies = [

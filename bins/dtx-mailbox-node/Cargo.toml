@@ -1,0 +1,34 @@
+[package]
+name = "dtx-mailbox-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "dtx-mailbox-node"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+base64ct.workspace = true
+dtx-domain = { path = "../../crates/dtx-domain" }
+dtx-identity-persistence = { path = "../../crates/dtx-identity-persistence" }
+dtx-mailbox = { path = "../../crates/dtx-mailbox" }
+dtx-wire = { path = "../../crates/dtx-wire" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+dtx-identity-log = { path = "../../crates/dtx-identity-log" }
+dtx-storage = { path = "../../crates/dtx-storage" }
+ed25519-dalek.workspace = true
+testcontainers-modules.workspace = true
+tower.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

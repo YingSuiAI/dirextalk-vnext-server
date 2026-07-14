@@ -16,7 +16,8 @@ const IDENTITY_BOOTSTRAP_CLAIMS_MIGRATION_VERSION: i64 = 202_607_140_009;
 const DEVICE_SESSIONS_MIGRATION_VERSION: i64 = 202_607_140_010;
 const DEVICE_ENROLLMENT_CHALLENGES_MIGRATION_VERSION: i64 = 202_607_140_011;
 const KEY_PACKAGES_MIGRATION_VERSION: i64 = 202_607_150_012;
-const EXPECTED_MIGRATION_COUNT: i64 = 12;
+const MAILBOXES_MIGRATION_VERSION: i64 = 202_607_150_013;
+const EXPECTED_MIGRATION_COUNT: i64 = 13;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -41,6 +42,7 @@ const DEVICE_ENROLLMENT_CHALLENGES_DOWN: &str =
     include_str!("../../../migrations/202607140011_device_enrollment_challenges.down.sql");
 const KEY_PACKAGES_DOWN: &str =
     include_str!("../../../migrations/202607150012_key_packages.down.sql");
+const MAILBOXES_DOWN: &str = include_str!("../../../migrations/202607150013_mailboxes.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -71,7 +73,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -85,8 +87,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(DEVICE_SESSIONS_MIGRATION_VERSION)
     .bind(DEVICE_ENROLLMENT_CHALLENGES_MIGRATION_VERSION)
     .bind(KEY_PACKAGES_MIGRATION_VERSION)
+    .bind(MAILBOXES_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(MAILBOXES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(KEY_PACKAGES_DOWN)
         .execute(harness.admin_pool())
         .await?;
@@ -143,6 +149,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     assert!(!agent_schema_exists);
     assert!(!identity_schema_exists);
     assert!(!groups_schema_exists);
+    let messaging_schema_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'messaging')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!messaging_schema_exists);
 
     MigrationRunner::new().run(harness.admin_pool()).await?;
 

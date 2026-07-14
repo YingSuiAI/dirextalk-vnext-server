@@ -22,6 +22,7 @@ const DATABASE: &str = "dtx_test";
 const RUNTIME_USER: &str = "dtx_runtime_test";
 const IDENTITY_RUNTIME_USER: &str = "dtx_identity_only_test";
 const GROUP_RUNTIME_USER: &str = "dtx_group_only_test";
+const MAILBOX_RUNTIME_USER: &str = "dtx_mailbox_only_test";
 const POSTGRES_TAG: &str = "18.4-alpine3.24";
 const LOCAL_POSTGRES_MODE_ENV: &str = "DTX_TEST_LOCAL_POSTGRES";
 const LOCAL_POSTGRES_HOST_ENV: &str = "DTX_TEST_LOCAL_POSTGRES_HOST";
@@ -139,6 +140,8 @@ pub struct PostgresHarness {
     identity_runtime_options: PgConnectOptions,
     group_runtime_pool: PgPool,
     group_runtime_options: PgConnectOptions,
+    mailbox_runtime_pool: PgPool,
+    mailbox_runtime_options: PgConnectOptions,
     _container: Option<ContainerAsync<Postgres>>,
     local_database: Option<LocalPostgresDatabase>,
 }
@@ -149,6 +152,7 @@ impl PostgresHarness {
         let runtime_password = random_password("runtime");
         let identity_runtime_password = random_password("identity-runtime");
         let group_runtime_password = random_password("group-runtime");
+        let mailbox_runtime_password = random_password("mailbox-runtime");
         let local_config = local_postgres_config_from_env()?;
         let mut local_database = match local_config.as_ref() {
             Some(config) => Some(LocalPostgresDatabase::create(config).await?),
@@ -212,11 +216,13 @@ impl PostgresHarness {
         sqlx::query(
             "SELECT set_config('dtx.test_runtime_password', $1, true), \
                     set_config('dtx.test_identity_runtime_password', $2, true), \
-                    set_config('dtx.test_group_runtime_password', $3, true)",
+                    set_config('dtx.test_group_runtime_password', $3, true), \
+                    set_config('dtx.test_mailbox_runtime_password', $4, true)",
         )
         .bind(&runtime_password)
         .bind(&identity_runtime_password)
         .bind(&group_runtime_password)
+        .bind(&mailbox_runtime_password)
         .execute(&mut *role_transaction)
         .await?;
         sqlx::raw_sql(
@@ -255,6 +261,17 @@ impl PostgresHarness {
                           current_setting('dtx.test_group_runtime_password')
                       );
                   END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_mailbox_only_test') THEN
+                      EXECUTE format(
+                          'CREATE ROLE dtx_mailbox_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_mailbox_runtime_password')
+                      );
+                  ELSE
+                      EXECUTE format(
+                          'ALTER ROLE dtx_mailbox_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_mailbox_runtime_password')
+                      );
+                  END IF;
                   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_identity_runtime') THEN
                       CREATE ROLE dtx_identity_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
                   ELSE
@@ -265,13 +282,25 @@ impl PostgresHarness {
                   ELSE
                       ALTER ROLE dtx_group_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
                   END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_mailbox_runtime') THEN
+                      CREATE ROLE dtx_mailbox_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  ELSE
+                      ALTER ROLE dtx_mailbox_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  END IF;
                   REVOKE dtx_identity_runtime FROM dtx_runtime_test;
                   REVOKE dtx_identity_runtime FROM dtx_identity_only_test;
                   REVOKE dtx_group_runtime FROM dtx_group_only_test;
+                  REVOKE dtx_identity_runtime FROM dtx_mailbox_runtime;
+                  REVOKE dtx_group_runtime FROM dtx_mailbox_runtime;
+                  REVOKE dtx_mailbox_runtime FROM dtx_runtime_test;
+                  REVOKE dtx_mailbox_runtime FROM dtx_identity_only_test;
+                  REVOKE dtx_mailbox_runtime FROM dtx_group_only_test;
+                  REVOKE dtx_mailbox_runtime FROM dtx_mailbox_only_test;
                   REVOKE pg_read_server_files FROM dtx_runtime_test;
                   GRANT dtx_identity_runtime TO dtx_runtime_test;
                   GRANT dtx_identity_runtime TO dtx_identity_only_test;
                   GRANT dtx_group_runtime TO dtx_group_only_test;
+                  GRANT dtx_mailbox_runtime TO dtx_mailbox_only_test;
              END
              $role$;
              GRANT USAGE ON SCHEMA system TO dtx_runtime_test;
@@ -368,7 +397,25 @@ impl PostgresHarness {
              GRANT SELECT, INSERT, UPDATE ON groups.join_records TO dtx_group_runtime;
              GRANT SELECT, INSERT ON groups.membership_commands TO dtx_group_runtime;
              GRANT SELECT, INSERT, UPDATE ON groups.membership_workflows TO dtx_group_runtime;
-             GRANT SELECT, INSERT, UPDATE ON groups.sequencer_outbox TO dtx_group_runtime;",
+             GRANT SELECT, INSERT, UPDATE ON groups.sequencer_outbox TO dtx_group_runtime;
+
+             GRANT USAGE ON SCHEMA messaging, identity TO dtx_mailbox_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.mailbox_runtime_authorized() TO dtx_mailbox_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.mailbox_owner_authorized() TO dtx_mailbox_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.is_uuid_v7(uuid) TO dtx_mailbox_runtime;
+             GRANT EXECUTE ON FUNCTION identity.identity_runtime_authorized()
+                TO dtx_mailbox_runtime;
+             GRANT EXECUTE ON FUNCTION identity.identity_owner_authorized()
+                TO dtx_mailbox_runtime;
+             GRANT EXECUTE ON FUNCTION identity.identity_mailbox_reader_authorized()
+                TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT, UPDATE ON messaging.mailboxes TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT ON messaging.mailbox_registration_claims TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT, UPDATE ON messaging.mailbox_envelopes TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT ON messaging.mailbox_enqueue_claims TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT ON messaging.mailbox_ack_claims TO dtx_mailbox_runtime;
+             GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
+                TO dtx_mailbox_runtime;",
         )
         .execute(&mut *role_transaction)
         .await?;
@@ -407,6 +454,17 @@ impl PostgresHarness {
                 .max_connections(4)
                 .connect_with(group_runtime_options.clone())
                 .await?;
+            let mailbox_runtime_options = connect_options(
+                &host,
+                port,
+                MAILBOX_RUNTIME_USER,
+                &mailbox_runtime_password,
+                &database,
+            );
+            let mailbox_runtime_pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect_with(mailbox_runtime_options.clone())
+                .await?;
 
             Ok::<Self, Box<dyn Error>>(Self {
                 admin_pool,
@@ -416,6 +474,8 @@ impl PostgresHarness {
                 identity_runtime_options,
                 group_runtime_pool,
                 group_runtime_options,
+                mailbox_runtime_pool,
+                mailbox_runtime_options,
                 _container: container,
                 local_database: local_database.take(),
             })
@@ -459,6 +519,14 @@ impl PostgresHarness {
 
     pub fn group_runtime_options(&self) -> PgConnectOptions {
         self.group_runtime_options.clone()
+    }
+
+    pub fn mailbox_runtime_pool(&self) -> &PgPool {
+        &self.mailbox_runtime_pool
+    }
+
+    pub fn mailbox_runtime_options(&self) -> PgConnectOptions {
+        self.mailbox_runtime_options.clone()
     }
 
     pub async fn runtime_store(

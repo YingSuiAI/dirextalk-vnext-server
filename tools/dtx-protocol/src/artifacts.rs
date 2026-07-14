@@ -118,6 +118,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_identity_session_v1(root)?;
     validate_identity_enrollment_v1(root)?;
     validate_key_package_v1(root)?;
+    validate_mailbox_v1(root)?;
     validate_public_descriptor_v1(root)?;
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
@@ -1096,6 +1097,304 @@ fn validate_key_package_v1(root: &Path) -> Result<(), ProtocolToolError> {
         (
             "/components/parameters/IdempotencyKey/schema/pattern",
             json!("^[A-Za-z0-9_-]{16,128}$"),
+        ),
+    ] {
+        expect_value(&document, pointer, &expected)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // One versioned contract audit keeps CDDL, vectors, and OpenAPI coupled.
+fn validate_mailbox_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/mailbox/v1/mailbox-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse mailbox v1 CDDL: {error}")))?;
+    let vector = read_json(&root.join("protocol/test-vectors/mailbox/v1/mailbox-v1.json"))?;
+    validate_vector_version(&vector, "mailbox-v1")?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "register_path_template",
+            "envelope_path_template",
+            "pull_path_template",
+            "acks_path_template",
+            "register_content_type",
+            "register_receipt_content_type",
+            "envelope_content_type",
+            "envelope_receipt_content_type",
+            "pull_content_type",
+            "pull_receipt_content_type",
+            "acks_content_type",
+            "acks_receipt_content_type",
+            "device_session_authorization_scheme",
+            "mailbox_capability_authorization_scheme",
+            "idempotency_key_min_bytes",
+            "idempotency_key_max_bytes",
+            "mailbox_capability_bytes",
+            "max_opaque_ciphertext_bytes",
+            "max_envelopes_per_page",
+            "max_envelopes_per_ack",
+            "max_ttl_ms",
+            "write_capability_hash_domain",
+            "owner_identity_id",
+            "owner_device_id",
+            "mailbox_id",
+            "envelope_id",
+            "write_capability_hash_hex",
+            "opaque_ciphertext_hex",
+            "register_expires_at_ms",
+            "envelope_expires_at_ms",
+            "delivery_sequence",
+            "after_sequence",
+            "pull_limit",
+            "next_sequence",
+            "acknowledged_envelope_ids",
+            "register_canonical_cbor_hex",
+            "register_receipt_canonical_cbor_hex",
+            "envelope_canonical_cbor_hex",
+            "envelope_receipt_canonical_cbor_hex",
+            "pull_canonical_cbor_hex",
+            "pull_receipt_canonical_cbor_hex",
+            "acks_canonical_cbor_hex",
+            "acks_receipt_canonical_cbor_hex",
+            "error_responses",
+        ],
+        "mailbox-v1 vector",
+    )?;
+
+    for (field, expected) in [
+        ("register_path_template", "/v1/mailboxes/{mailbox_id}"),
+        (
+            "envelope_path_template",
+            "/v1/mailboxes/{mailbox_id}/envelopes/{envelope_id}",
+        ),
+        ("pull_path_template", "/v1/mailboxes/{mailbox_id}/pull"),
+        ("acks_path_template", "/v1/mailboxes/{mailbox_id}/acks"),
+        (
+            "register_content_type",
+            "application/vnd.dirextalk.mailbox-register.v1+cbor",
+        ),
+        (
+            "register_receipt_content_type",
+            "application/vnd.dirextalk.mailbox-register-receipt.v1+cbor",
+        ),
+        (
+            "envelope_content_type",
+            "application/vnd.dirextalk.mailbox-envelope.v1+cbor",
+        ),
+        (
+            "envelope_receipt_content_type",
+            "application/vnd.dirextalk.mailbox-envelope-receipt.v1+cbor",
+        ),
+        (
+            "pull_content_type",
+            "application/vnd.dirextalk.mailbox-pull.v1+cbor",
+        ),
+        (
+            "pull_receipt_content_type",
+            "application/vnd.dirextalk.mailbox-pull-receipt.v1+cbor",
+        ),
+        (
+            "acks_content_type",
+            "application/vnd.dirextalk.mailbox-acks.v1+cbor",
+        ),
+        (
+            "acks_receipt_content_type",
+            "application/vnd.dirextalk.mailbox-acks-receipt.v1+cbor",
+        ),
+        ("device_session_authorization_scheme", "DTX-Device-Session"),
+        (
+            "mailbox_capability_authorization_scheme",
+            "DTX-Mailbox-Capability",
+        ),
+        (
+            "write_capability_hash_domain",
+            "dirextalk.mailbox-write-capability.v1\0",
+        ),
+    ] {
+        if json_string(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "mailbox-v1 vector {field} drifted"
+            )));
+        }
+    }
+    for (field, expected) in [
+        ("idempotency_key_min_bytes", 16_i64),
+        ("idempotency_key_max_bytes", 128_i64),
+        ("mailbox_capability_bytes", 32_i64),
+        ("max_opaque_ciphertext_bytes", 262_144_i64),
+        ("max_envelopes_per_page", 100_i64),
+        ("max_envelopes_per_ack", 100_i64),
+        ("max_ttl_ms", 604_800_000_i64),
+        ("register_expires_at_ms", 600_000_i64),
+        ("envelope_expires_at_ms", 600_001_i64),
+        ("delivery_sequence", 1_i64),
+        ("after_sequence", 0_i64),
+        ("pull_limit", 100_i64),
+        ("next_sequence", 1_i64),
+    ] {
+        if json_i64(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "mailbox-v1 vector {field} drifted"
+            )));
+        }
+    }
+
+    validate_identity_id(
+        json_string(&vector, "owner_identity_id")?,
+        "mailbox-v1 owner identity",
+    )?;
+    validate_uuid_fields(
+        &vector,
+        &[
+            "/owner_device_id",
+            "/mailbox_id",
+            "/envelope_id",
+            "/acknowledged_envelope_ids/0",
+        ],
+    )?;
+    let acknowledged = vector
+        .get("acknowledged_envelope_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProtocolToolError::new("mailbox-v1 acknowledged envelope IDs must be an array")
+        })?;
+    if acknowledged.len() != 1
+        || acknowledged.first().and_then(Value::as_str)
+            != Some(json_string(&vector, "envelope_id")?)
+    {
+        return Err(ProtocolToolError::new(
+            "mailbox-v1 acknowledgement fixture must retain its envelope ID",
+        ));
+    }
+    let _ = decode_lower_hex_fixed::<32>(json_string(&vector, "write_capability_hash_hex")?)?;
+    let ciphertext = decode_hex(json_string(&vector, "opaque_ciphertext_hex")?)?;
+    if ciphertext.is_empty() || ciphertext.len() > 262_144 {
+        return Err(ProtocolToolError::new(
+            "mailbox-v1 opaque ciphertext must be bounded and nonempty",
+        ));
+    }
+
+    for (rule, field) in [
+        ("mailbox-register-v1", "register_canonical_cbor_hex"),
+        (
+            "mailbox-register-receipt-v1",
+            "register_receipt_canonical_cbor_hex",
+        ),
+        ("mailbox-envelope-v1", "envelope_canonical_cbor_hex"),
+        (
+            "mailbox-envelope-receipt-v1",
+            "envelope_receipt_canonical_cbor_hex",
+        ),
+        ("mailbox-pull-v1", "pull_canonical_cbor_hex"),
+        ("mailbox-pull-receipt-v1", "pull_receipt_canonical_cbor_hex"),
+        ("mailbox-acks-v1", "acks_canonical_cbor_hex"),
+        ("mailbox-acks-receipt-v1", "acks_receipt_canonical_cbor_hex"),
+    ] {
+        validate_cddl_hex(rule, &cddl, json_string(&vector, field)?)?;
+    }
+    let expected_errors = [
+        (401, "DEVICE_AUTHENTICATION_FAILED", false),
+        (404, "MAILBOX_UNAVAILABLE", false),
+        (409, "MAILBOX_CONFLICT", false),
+        (409, "IDEMPOTENCY_CONFLICT", false),
+        (422, "MAILBOX_INVALID", false),
+        (429, "MAILBOX_CAPACITY_EXCEEDED", true),
+        (503, "MAILBOX_SERVICE_UNAVAILABLE", true),
+    ];
+    if vector
+        .get("error_responses")
+        .and_then(Value::as_array)
+        .is_none_or(|responses| responses.len() != expected_errors.len())
+    {
+        return Err(ProtocolToolError::new(
+            "mailbox-v1 vector error responses drifted",
+        ));
+    }
+    for (status, code, retryable) in expected_errors {
+        if !has_error_response(&vector, status, code, retryable)? {
+            return Err(ProtocolToolError::new(format!(
+                "mailbox-v1 vector must retain {status} {code}"
+            )));
+        }
+    }
+
+    let path = root.join("protocol/openapi/mailbox/v1/openapi.yaml");
+    let source = read(&path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse OpenAPI {}: {error}", path.display()))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "mailbox OpenAPI contract must declare 3.1.0",
+        ));
+    }
+    let document: Value = yaml_serde::from_str(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse mailbox OpenAPI YAML tree: {error}"))
+    })?;
+    for (pointer, expected) in [
+        (
+            "/paths/~1v1~1mailboxes~1{mailbox_id}/put/operationId",
+            json!("registerMailbox"),
+        ),
+        (
+            "/paths/~1v1~1mailboxes~1{mailbox_id}~1envelopes~1{envelope_id}/put/operationId",
+            json!("appendMailboxEnvelope"),
+        ),
+        (
+            "/paths/~1v1~1mailboxes~1{mailbox_id}~1pull/post/operationId",
+            json!("pullMailboxEnvelopes"),
+        ),
+        (
+            "/paths/~1v1~1mailboxes~1{mailbox_id}~1acks/post/operationId",
+            json!("acknowledgeMailboxEnvelopes"),
+        ),
+        (
+            "/paths/~1v1~1mailboxes~1{mailbox_id}/put/requestBody/content/application~1vnd.dirextalk.mailbox-register.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/paths/~1v1~1mailboxes~1{mailbox_id}~1envelopes~1{envelope_id}/put/requestBody/content/application~1vnd.dirextalk.mailbox-envelope.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/paths/~1v1~1mailboxes~1{mailbox_id}~1pull/post/requestBody/content/application~1vnd.dirextalk.mailbox-pull.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/paths/~1v1~1mailboxes~1{mailbox_id}~1acks/post/requestBody/content/application~1vnd.dirextalk.mailbox-acks.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/paths/~1v1~1mailboxes~1{mailbox_id}~1envelopes~1{envelope_id}/put/responses/404/$ref",
+            json!("#/components/responses/MailboxUnavailable"),
+        ),
+        (
+            "/components/parameters/IdempotencyKey/schema/pattern",
+            json!("^[A-Za-z0-9_-]{16,128}$"),
+        ),
+        (
+            "/components/parameters/DeviceSessionAuthorization/schema/pattern",
+            json!(
+                "^DTX-Device-Session [0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.[A-Za-z0-9_-]{43}$"
+            ),
+        ),
+        (
+            "/components/parameters/MailboxCapabilityAuthorization/schema/pattern",
+            json!("^DTX-Mailbox-Capability [A-Za-z0-9_-]{43}$"),
+        ),
+        (
+            "/components/schemas/ErrorEnvelopeV1/properties/error/properties/code/enum",
+            json!([
+                "DEVICE_AUTHENTICATION_FAILED",
+                "MAILBOX_UNAVAILABLE",
+                "MAILBOX_CONFLICT",
+                "IDEMPOTENCY_CONFLICT",
+                "MAILBOX_INVALID",
+                "MAILBOX_CAPACITY_EXCEEDED",
+                "MAILBOX_SERVICE_UNAVAILABLE"
+            ]),
         ),
     ] {
         expect_value(&document, pointer, &expected)?;

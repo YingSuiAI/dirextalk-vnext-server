@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Check dtx-mailbox" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+    <option name="command" value="check -p dtx-mailbox -p dtx-mailbox-node --all-targets --locked" />
+    <option name="workingDirectory" value="$PROJECT_DIR$" />
+    <method v="2" />
+  </configuration>
+</component>
