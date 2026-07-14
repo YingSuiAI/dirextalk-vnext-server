@@ -40,9 +40,12 @@ and remains replayable only. The current writer is the disjoint
 `identity-log/v1_1` wire `1.1`, frozen under baseline v6. A log establishes one
 exact wire line at genesis and rejects mixed-line append or embedded
 certificate/descriptor data. New identities write `1.1`; readers retain `1.0`
-only to verify historical logs. Both lines use RFC 8949 deterministic CBOR,
-with positive integer map keys, closed typed shapes, no unknown fields, and no
-permissive future-version path. The signed event fields are:
+only through a read-only historical import projection. The current
+`IdentityLogV1` bootstrap and append entry points reject `1.0`, so callers
+cannot obtain an append-capable legacy log. Both lines use RFC 8949
+deterministic CBOR, with positive integer map keys, closed typed shapes, no
+unknown fields, and no permissive future-version path. The signed event fields
+are:
 
 1. wire version;
 2. identity ID;
@@ -195,9 +198,11 @@ not define a second device trust model.
 
 The published v1.0 CDDL/vector and baseline v5 are never rewritten. The
 recovery co-sign requirement is published only as the current v1.1 CDDL/vector
-and baseline v6. A migration reader can replay either complete line, but it
-must not append a v1.1 event to a v1.0 log or reinterpret a historical v1.0
-recovery rotation as if it had a co-signature.
+and baseline v6. A migration reader can validate and import a complete v1.0
+line only into a read-only historical projection; it cannot append either v1.0
+or v1.1 events. Only a v1.1 genesis can create the current writable
+projection, and a historical v1.0 recovery rotation must never be reinterpreted
+as if it had a co-signature.
 
 ## Reversal cost
 

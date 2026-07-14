@@ -1167,7 +1167,7 @@ struct DeviceRecordV1 {
     status: DeviceStatusV1,
 }
 
-/// In-memory authorization projection of a verified append-only identity log.
+/// In-memory writable projection of a verified current identity log.
 ///
 /// Persistence must use a compare-and-swap on `head_sequence` and `head_hash`,
 /// a unique entry hash, and exact event bytes. This pure projection makes those
@@ -1186,13 +1186,21 @@ pub struct IdentityLogV1 {
 }
 
 impl IdentityLogV1 {
-    /// Creates the projection from its one verified immutable genesis event.
+    /// Creates the current writable projection from its immutable genesis event.
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityLogError::InvalidGenesis`] for a non-genesis event or
-    /// any error from strict event verification.
+    /// Returns [`IdentityLogError::InvalidWireVersion`] unless genesis is
+    /// current wire `1.1`, [`IdentityLogError::InvalidGenesis`] for a
+    /// non-genesis event, or any error from strict event verification.
     pub fn bootstrap(genesis: &IdentityLogEventV1) -> Result<Self, IdentityLogError> {
+        if genesis.wire() != IDENTITY_LOG_WIRE_VERSION {
+            return Err(IdentityLogError::InvalidWireVersion);
+        }
+        Self::bootstrap_projection(genesis)
+    }
+
+    fn bootstrap_projection(genesis: &IdentityLogEventV1) -> Result<Self, IdentityLogError> {
         genesis.verify()?;
         let IdentityLogEventPayloadV1::Genesis {
             root_signing_key,
@@ -1216,14 +1224,22 @@ impl IdentityLogV1 {
         })
     }
 
-    /// Atomically admits the exact next authorized event, or leaves state unchanged.
+    /// Atomically admits the exact next current-wire authorized event, or leaves state unchanged.
     ///
     /// # Errors
     ///
-    /// Returns an identity-log error for an invalid signature, identity,
-    /// sequence, predecessor, replay, authorization, certificate, rotation, or
-    /// relay transition. No state is changed on error.
+    /// Returns [`IdentityLogError::InvalidWireVersion`] for a non-current
+    /// event or projection, or an identity-log error for an invalid signature,
+    /// identity, sequence, predecessor, replay, authorization, certificate,
+    /// rotation, or relay transition. No state is changed on error.
     pub fn append(&mut self, event: &IdentityLogEventV1) -> Result<(), IdentityLogError> {
+        if self.wire != IDENTITY_LOG_WIRE_VERSION || event.wire() != IDENTITY_LOG_WIRE_VERSION {
+            return Err(IdentityLogError::InvalidWireVersion);
+        }
+        self.append_projection(event)
+    }
+
+    fn append_projection(&mut self, event: &IdentityLogEventV1) -> Result<(), IdentityLogError> {
         event.verify()?;
         if event.identity_id() != self.identity_id {
             return Err(IdentityLogError::IdentityMismatch);
@@ -1562,6 +1578,84 @@ impl IdentityLogV1 {
         self.devices
             .values()
             .any(|record| record.certificate.device_signing_key() == key)
+    }
+}
+
+/// Read-only verified projection of a frozen identity-log `1.0` history.
+///
+/// This type intentionally exposes no append operation and does not reveal its
+/// internal writable projection. Current callers must use [`IdentityLogV1`]
+/// for wire `1.1`; this import path exists only to validate and inspect exact
+/// historical records.
+#[derive(Debug)]
+pub struct HistoricalIdentityLogV1 {
+    projection: IdentityLogV1,
+}
+
+impl HistoricalIdentityLogV1 {
+    /// Verifies and imports one complete frozen wire `1.0` history.
+    ///
+    /// The first event must be the matching `1.0` genesis, and each remaining
+    /// event must be the exact next event in that same historical wire line.
+    /// The returned projection is read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityLogError::InvalidWireVersion`] for a non-`1.0`
+    /// history, [`IdentityLogError::InvalidGenesis`] for an empty or invalid
+    /// genesis history, or the relevant identity-log error for an invalid
+    /// subsequent historical event.
+    pub fn import_v1_0(events: &[IdentityLogEventV1]) -> Result<Self, IdentityLogError> {
+        let (genesis, rest) = events
+            .split_first()
+            .ok_or(IdentityLogError::InvalidGenesis)?;
+        if genesis.wire() != IDENTITY_LOG_V1_0_WIRE_VERSION {
+            return Err(IdentityLogError::InvalidWireVersion);
+        }
+        let mut projection = IdentityLogV1::bootstrap_projection(genesis)?;
+        for event in rest {
+            if event.wire() != IDENTITY_LOG_V1_0_WIRE_VERSION {
+                return Err(IdentityLogError::InvalidWireVersion);
+            }
+            projection.append_projection(event)?;
+        }
+        Ok(Self { projection })
+    }
+
+    /// Returns the permanent public identity ID.
+    #[must_use]
+    pub const fn identity_id(&self) -> IdentityId {
+        self.projection.identity_id()
+    }
+
+    /// Returns the immutable historical wire version.
+    #[must_use]
+    pub const fn wire(&self) -> WireVersion {
+        self.projection.wire()
+    }
+
+    /// Returns the historical root signing key at the imported head.
+    #[must_use]
+    pub const fn current_root_key(&self) -> SigningPublicKey {
+        self.projection.current_root_key()
+    }
+
+    /// Returns the historical recovery signing key at the imported head.
+    #[must_use]
+    pub const fn current_recovery_key(&self) -> SigningPublicKey {
+        self.projection.current_recovery_key()
+    }
+
+    /// Returns the contiguous imported head sequence.
+    #[must_use]
+    pub const fn head_sequence(&self) -> SafeUint {
+        self.projection.head_sequence()
+    }
+
+    /// Returns the exact imported head event hash.
+    #[must_use]
+    pub const fn head_hash(&self) -> Sha256Digest {
+        self.projection.head_hash()
     }
 }
 
@@ -2075,6 +2169,40 @@ mod tests {
             timestamp(expires_at),
         )
         .unwrap()
+    }
+
+    fn frozen_v1_0_root_only_recovery_chain()
+    -> (IdentityLogEventV1, IdentityLogEventV1, IdentityLogEventV1) {
+        let root = signing_key(1);
+        let recovery = signing_key(2);
+        let legacy_genesis = genesis_with_wire(IDENTITY_LOG_V1_0_WIRE_VERSION, &root, &recovery);
+        let identity_id = legacy_genesis.identity_id();
+        let legacy_head = legacy_genesis.entry_hash().unwrap();
+        let successor = signing_key(3);
+        let rotation = signed_event_with_wire(
+            IDENTITY_LOG_V1_0_WIRE_VERSION,
+            &root,
+            identity_id,
+            2,
+            Some(legacy_head),
+            1_100,
+            IdentityLogEventPayloadV1::RecoveryRotate {
+                new_recovery_signing_key: public_key(&successor),
+                acceptance_signature: signature(
+                    &successor,
+                    &key_rotation_acceptance_input(
+                        identity_id,
+                        safe(2),
+                        Some(legacy_head),
+                        KeyAcceptancePurposeV1::RecoveryRotate,
+                        public_key(&successor),
+                    )
+                    .unwrap(),
+                ),
+                recovery_authorization_signature: None,
+            },
+        );
+        (legacy_genesis, genesis(&root, &recovery), rotation)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2615,40 +2743,37 @@ mod tests {
     }
 
     #[test]
-    fn frozen_v1_0_recovery_rotation_remains_replayable() {
-        let root = signing_key(1);
-        let recovery = signing_key(2);
-        let genesis = genesis_with_wire(IDENTITY_LOG_V1_0_WIRE_VERSION, &root, &recovery);
-        let identity_id = genesis.identity_id();
-        let mut log = IdentityLogV1::bootstrap(&genesis).unwrap();
-        let successor = signing_key(3);
-        let rotation = signed_event_with_wire(
-            IDENTITY_LOG_V1_0_WIRE_VERSION,
-            &root,
-            identity_id,
-            2,
-            Some(log.head_hash()),
-            1_100,
-            IdentityLogEventPayloadV1::RecoveryRotate {
-                new_recovery_signing_key: public_key(&successor),
-                acceptance_signature: signature(
-                    &successor,
-                    &key_rotation_acceptance_input(
-                        identity_id,
-                        safe(2),
-                        Some(log.head_hash()),
-                        KeyAcceptancePurposeV1::RecoveryRotate,
-                        public_key(&successor),
-                    )
-                    .unwrap(),
-                ),
-                recovery_authorization_signature: None,
-            },
-        );
+    fn current_write_entry_rejects_v1_0_root_only_recovery_chain() {
+        let (legacy_genesis, current_genesis, rotation) = frozen_v1_0_root_only_recovery_chain();
 
-        log.append(&rotation).unwrap();
-        assert_eq!(log.wire(), IDENTITY_LOG_V1_0_WIRE_VERSION);
-        assert_eq!(log.current_recovery_key(), public_key(&successor));
+        rotation.verify().unwrap();
+        assert!(matches!(
+            IdentityLogV1::bootstrap(&legacy_genesis),
+            Err(IdentityLogError::InvalidWireVersion)
+        ));
+
+        let mut current_log = IdentityLogV1::bootstrap(&current_genesis).unwrap();
+        assert_eq!(
+            current_log.append(&rotation),
+            Err(IdentityLogError::InvalidWireVersion)
+        );
+    }
+
+    #[test]
+    fn historical_v1_0_chain_is_verified_without_current_append_access() {
+        let (legacy_genesis, _, rotation) = frozen_v1_0_root_only_recovery_chain();
+        let expected_recovery = match rotation.payload() {
+            IdentityLogEventPayloadV1::RecoveryRotate {
+                new_recovery_signing_key,
+                ..
+            } => *new_recovery_signing_key,
+            _ => unreachable!("fixture contains a recovery rotation"),
+        };
+        let historical = HistoricalIdentityLogV1::import_v1_0(&[legacy_genesis, rotation]).unwrap();
+
+        assert_eq!(historical.wire(), IDENTITY_LOG_V1_0_WIRE_VERSION);
+        assert_eq!(historical.head_sequence(), safe(2));
+        assert_eq!(historical.current_recovery_key(), expected_recovery);
     }
 
     #[test]
