@@ -888,6 +888,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-identity-log"
+version = "0.1.0"
+dependencies = [
+ "dtx-domain",
+ "dtx-wire",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dtx-protocol"
 version = "0.1.0"
 dependencies = [

@@ -21,6 +21,10 @@ const V1_ARTIFACT_PATHS: &[&str] = &[
 const V2_ARTIFACT_PATHS: &[&str] = &["protocol/proto/dirextalk/agent_control/v1"];
 const V3_ARTIFACT_PATHS: &[&str] = &["protocol/proto/dirextalk/agent_control/v1_1"];
 const V4_ARTIFACT_PATHS: &[&str] = &["protocol/proto/dirextalk/agent_gateway/v1"];
+const V5_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/identity-log/v1",
+    "protocol/test-vectors/identity-log/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -60,6 +64,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v4/manifest.json",
         includes_registries: false,
         artifact_paths: V4_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 5,
+        path: "protocol/baseline/v5/manifest.json",
+        includes_registries: false,
+        artifact_paths: V5_ARTIFACT_PATHS,
     },
 ];
 
@@ -479,12 +489,17 @@ mod tests {
         let v2 = V2_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         let v3 = V3_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         let v4 = V4_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
+        let v5 = V5_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         assert!(v1.is_disjoint(&v2));
         assert!(v1.is_disjoint(&v3));
         assert!(v1.is_disjoint(&v4));
+        assert!(v1.is_disjoint(&v5));
         assert!(v2.is_disjoint(&v3));
         assert!(v2.is_disjoint(&v4));
+        assert!(v2.is_disjoint(&v5));
         assert!(v3.is_disjoint(&v4));
+        assert!(v3.is_disjoint(&v5));
+        assert!(v4.is_disjoint(&v5));
         assert!(!V1_ARTIFACT_PATHS.contains(&"protocol/proto"));
     }
 }

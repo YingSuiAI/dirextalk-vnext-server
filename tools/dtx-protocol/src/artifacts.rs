@@ -97,6 +97,18 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     let public_ids = read_json(&vector_root.join("public-ids.json"))?;
     validate_vector_version(&public_ids, "public-ids")?;
 
+    let identity_log_cddl = read(&root.join("protocol/cddl/identity-log/v1/identity-log-v1.cddl"))?;
+    cddl_cat::parse_cddl(&identity_log_cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse identity-log v1 CDDL: {error}")))?;
+    let identity_log =
+        read_json(&root.join("protocol/test-vectors/identity-log/v1/identity-log-v1.json"))?;
+    validate_vector_version(&identity_log, "identity-log-v1")?;
+    validate_cddl_hex(
+        "identity-log-event-v1",
+        &identity_log_cddl,
+        json_string(&identity_log, "canonical_cbor_hex")?,
+    )?;
+
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
