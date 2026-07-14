@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Test dtx-keypackages" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+    <option name="command" value="test -p dtx-identity-node --test key_packages_postgres --locked" />
+    <option name="workingDirectory" value="$PROJECT_DIR$" />
+    <method v="2" />
+  </configuration>
+</component>

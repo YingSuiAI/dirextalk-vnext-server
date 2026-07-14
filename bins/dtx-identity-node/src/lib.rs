@@ -16,12 +16,12 @@ use axum::{
     extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{post, put},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{
     Clock, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionChallengeId, DeviceSessionId,
-    IdentityId, RequestId, SystemClock,
+    IdentityId, KeyPackageId, RequestId, SystemClock,
 };
 use dtx_identity_log::{
     DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1,
@@ -33,11 +33,13 @@ use dtx_identity_persistence::{
     DeviceEnrollmentChallengeState, DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository,
     DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
     DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogRepository,
-    IdentityPersistenceError, IdentityPgStore,
+    IdentityPersistenceError, IdentityPgStore, KeyPackageClaimCommand, KeyPackageClaimOutcome,
+    KeyPackagePublishCommand, KeyPackagePublishOutcome, KeyPackageRepository,
+    MAX_KEY_PACKAGE_PUBLISH_BYTES,
 };
 use dtx_wire::{
-    CanonicalEncode, CanonicalValue, Ed25519Signature, Sha256Digest, SigningPublicKey, UtcMillis,
-    decode_deterministic_cbor, encode_deterministic_cbor,
+    CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
+    UtcMillis, decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use getrandom::fill as fill_random;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -58,6 +60,10 @@ pub const DEVICE_ENROLLMENT_CHALLENGE_STATUS_PATH: &str =
     "/v1/devices/enroll/challenges/{challenge_id}";
 /// Active-device approval route for a candidate QR enrollment challenge.
 pub const DEVICE_ENROLLMENT_PATH: &str = "/v1/devices/enroll";
+/// Route template that accepts one exact opaque `KeyPackage` publish envelope.
+pub const KEY_PACKAGE_PUBLISH_PATH_TEMPLATE: &str = "/v1/key-packages/{package_id}";
+/// Route that atomically consumes one opaque `KeyPackage` for a target device.
+pub const KEY_PACKAGE_CLAIM_PATH: &str = "/v1/key-packages/claim";
 /// Required media type for exact signed V1.1 identity-log events.
 pub const IDENTITY_LOG_EVENT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.identity-log.v1.1+cbor";
@@ -76,6 +82,18 @@ pub const DEVICE_ENROLLMENT_STATUS_CONTENT_TYPE: &str =
 /// Exact active-device enrollment approval request media type.
 pub const DEVICE_ENROLLMENT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.device-enrollment.v1+cbor";
+/// Exact signed opaque `KeyPackage` publish request media type.
+pub const KEY_PACKAGE_PUBLISH_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.key-package-publish.v1+cbor";
+/// Immutable `KeyPackage` publish receipt media type.
+pub const KEY_PACKAGE_PUBLISH_RECEIPT_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.key-package-publish-receipt.v1+cbor";
+/// Exact `KeyPackage` target claim request media type.
+pub const KEY_PACKAGE_CLAIM_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.key-package-claim.v1+cbor";
+/// Exact original publish envelope returned by a one-time claim.
+pub const KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.key-package-claim-receipt.v1+cbor";
 /// Header that carries a candidate-owned status/cancellation capability.
 pub const DEVICE_ENROLLMENT_CAPABILITY_HEADER: &str = "DTX-Enrollment-Capability";
 /// Exact authorization scheme for short-lived device sessions.
@@ -88,6 +106,8 @@ pub const MAX_DEVICE_SESSION_REQUEST_BYTES: usize = 16_384;
 pub const MAX_DEVICE_ENROLLMENT_CANDIDATE_BYTES: usize = 16_384;
 /// Largest accepted exact enrollment approval body.
 pub const MAX_DEVICE_ENROLLMENT_COMPLETION_BYTES: usize = 1_048_576;
+/// Largest accepted exact `KeyPackage` target claim body.
+pub const MAX_KEY_PACKAGE_CLAIM_BYTES: usize = 16_384;
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -103,6 +123,10 @@ const HTTP_DEVICE_ENROLLMENT_CHALLENGE_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.device-enrollment-http-challenge-idempotency-key.v1\0";
 const HTTP_DEVICE_ENROLLMENT_APPROVAL_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.device-enrollment-http-approval-idempotency-key.v1\0";
+const HTTP_KEY_PACKAGE_PUBLISH_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.key-package-http-publish-idempotency-key.v1\0";
+const HTTP_KEY_PACKAGE_CLAIM_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.key-package-http-claim-idempotency-key.v1\0";
 const DEFAULT_DEVICE_SESSION_AUDIENCE: &str = "http://127.0.0.1";
 
 /// State for bootstrap, device-session, and QR device-enrollment HTTP boundaries.
@@ -112,6 +136,7 @@ pub struct IdentityBootstrapState {
     repository: IdentityLogRepository,
     device_sessions: DeviceSessionRepository,
     device_enrollments: DeviceEnrollmentRepository,
+    key_packages: KeyPackageRepository,
     clock: Arc<dyn Clock>,
     device_session_audience: Arc<str>,
 }
@@ -144,6 +169,7 @@ impl IdentityBootstrapState {
             repository: IdentityLogRepository::new(),
             device_sessions: DeviceSessionRepository,
             device_enrollments: DeviceEnrollmentRepository,
+            key_packages: KeyPackageRepository::new(),
             clock,
             device_session_audience: audience.into(),
         }
@@ -178,6 +204,8 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
                 .delete(cancel_device_enrollment_challenge),
         )
         .route(DEVICE_ENROLLMENT_PATH, post(approve_device_enrollment))
+        .route(KEY_PACKAGE_PUBLISH_PATH_TEMPLATE, put(publish_key_package))
+        .route(KEY_PACKAGE_CLAIM_PATH, post(claim_key_package))
         .with_state(state)
 }
 
@@ -288,6 +316,34 @@ async fn approve_device_enrollment(
     match state.approve_device_enrollment(&parts.headers, body).await {
         Ok(success) => device_enrollment_approval_success_response(success, request_id),
         Err(failure) => device_enrollment_failure_response(failure, request_id),
+    }
+}
+
+async fn publish_key_package(
+    State(state): State<IdentityBootstrapState>,
+    Path(package_id): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .publish_key_package(&package_id, &parts.headers, body)
+        .await
+    {
+        Ok(success) => key_package_publish_success_response(success, request_id),
+        Err(failure) => key_package_failure_response(failure, request_id),
+    }
+}
+
+async fn claim_key_package(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.claim_key_package(&parts.headers, body).await {
+        Ok(success) => key_package_claim_success_response(success, request_id),
+        Err(failure) => key_package_failure_response(failure, request_id),
     }
 }
 
@@ -620,6 +676,117 @@ impl IdentityBootstrapState {
         }
     }
 
+    async fn publish_key_package(
+        &self,
+        route_package_id: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<KeyPackagePublishSuccess, KeyPackageFailure> {
+        if !has_exact_content_type(headers, KEY_PACKAGE_PUBLISH_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+        {
+            return Err(KeyPackageFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)
+            .map_err(|_| KeyPackageFailure::AuthenticationRejected)?;
+        let idempotency_key_hash = idempotency_key_hash(
+            headers,
+            HTTP_KEY_PACKAGE_PUBLISH_IDEMPOTENCY_KEY_HASH_DOMAIN,
+        )
+        .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let route_package_id = route_package_id
+            .parse::<KeyPackageId>()
+            .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let bytes = to_bytes(body, MAX_KEY_PACKAGE_PUBLISH_BYTES)
+            .await
+            .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let publish = parse_key_package_publish(&bytes)?;
+        if publish.package_id != route_package_id {
+            return Err(KeyPackageFailure::InvalidRequest);
+        }
+        let command = KeyPackagePublishCommand::new(
+            idempotency_key_hash,
+            publish.identity_id,
+            publish.device_id,
+            publish.package_id,
+            publish.published_head_sequence,
+            publish.published_head_hash,
+            publish.expires_at,
+            publish.opaque_key_package,
+            publish.detached_signature,
+            bytes.to_vec(),
+        )
+        .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let now = self
+            .committed_at()
+            .map_err(|()| KeyPackageFailure::TemporarilyUnavailable)?;
+        match self
+            .key_packages
+            .publish(&self.store, &command, &credential, now)
+            .await
+            .map_err(|error| map_key_package_persistence_error(&error))?
+        {
+            KeyPackagePublishOutcome::Published(receipt) => Ok(KeyPackagePublishSuccess {
+                status: StatusCode::CREATED,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+            KeyPackagePublishOutcome::Replayed(receipt) => Ok(KeyPackagePublishSuccess {
+                status: StatusCode::OK,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+        }
+    }
+
+    async fn claim_key_package(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<KeyPackageClaimSuccess, KeyPackageFailure> {
+        if !has_exact_content_type(headers, KEY_PACKAGE_CLAIM_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+        {
+            return Err(KeyPackageFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)
+            .map_err(|_| KeyPackageFailure::AuthenticationRejected)?;
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_KEY_PACKAGE_CLAIM_IDEMPOTENCY_KEY_HASH_DOMAIN)
+                .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let bytes = to_bytes(body, MAX_KEY_PACKAGE_CLAIM_BYTES)
+            .await
+            .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let claim = parse_key_package_claim(&bytes)?;
+        let command = KeyPackageClaimCommand::new(
+            idempotency_key_hash,
+            claim.target_identity_id,
+            claim.target_device_id,
+            bytes.to_vec(),
+        )
+        .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let now = self
+            .committed_at()
+            .map_err(|()| KeyPackageFailure::TemporarilyUnavailable)?;
+        match self
+            .key_packages
+            .claim(&self.store, &command, &credential, now)
+            .await
+            .map_err(|error| map_key_package_persistence_error(&error))?
+        {
+            KeyPackageClaimOutcome::Claimed(receipt) => Ok(KeyPackageClaimSuccess {
+                status: StatusCode::CREATED,
+                exact_publish_bytes: receipt.exact_publish_bytes().to_vec(),
+            }),
+            KeyPackageClaimOutcome::Replayed(receipt) => Ok(KeyPackageClaimSuccess {
+                status: StatusCode::OK,
+                exact_publish_bytes: receipt.exact_publish_bytes().to_vec(),
+            }),
+        }
+    }
+
     fn committed_at(&self) -> Result<UtcMillis, ()> {
         UtcMillis::new(self.clock.now_utc_millis().map_err(|_| ())?).map_err(|_| ())
     }
@@ -708,6 +875,8 @@ fn map_persistence_error(error: &IdentityPersistenceError) -> BootstrapFailure {
         | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
         | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
         | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
+        | IdentityPersistenceError::KeyPackageUnavailable
+        | IdentityPersistenceError::KeyPackageConflict
         | IdentityPersistenceError::CorruptData(_) => BootstrapFailure::TemporarilyUnavailable,
     }
 }
@@ -736,6 +905,8 @@ fn map_initial_device_persistence_error(error: &IdentityPersistenceError) -> Ini
         | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
         | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
         | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
+        | IdentityPersistenceError::KeyPackageUnavailable
+        | IdentityPersistenceError::KeyPackageConflict
         | IdentityPersistenceError::CorruptData(_) => InitialDeviceFailure::TemporarilyUnavailable,
     }
 }
@@ -772,6 +943,8 @@ fn map_device_session_persistence_error(error: &IdentityPersistenceError) -> Dev
         | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
         | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
         | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
+        | IdentityPersistenceError::KeyPackageUnavailable
+        | IdentityPersistenceError::KeyPackageConflict
         | IdentityPersistenceError::CorruptData(_) => DeviceSessionFailure::TemporarilyUnavailable,
     }
 }
@@ -814,9 +987,41 @@ fn map_device_enrollment_persistence_error(
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
         | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::KeyPackageUnavailable
+        | IdentityPersistenceError::KeyPackageConflict
         | IdentityPersistenceError::CorruptData(_) => {
             DeviceEnrollmentFailure::TemporarilyUnavailable
         }
+    }
+}
+
+fn map_key_package_persistence_error(error: &IdentityPersistenceError) -> KeyPackageFailure {
+    match error {
+        IdentityPersistenceError::InvalidCommand(_) | IdentityPersistenceError::IdentityLog(_) => {
+            KeyPackageFailure::InvalidRequest
+        }
+        IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::IdentityInactive => KeyPackageFailure::AuthenticationRejected,
+        IdentityPersistenceError::KeyPackageUnavailable => KeyPackageFailure::Unavailable,
+        IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::HeadConflict { .. }
+        | IdentityPersistenceError::GenesisConflict => KeyPackageFailure::Conflict,
+        IdentityPersistenceError::IdempotencyConflict => KeyPackageFailure::IdempotencyConflict,
+        IdentityPersistenceError::Database(_)
+        | IdentityPersistenceError::UnsafeRuntimeRole
+        | IdentityPersistenceError::RuntimeRoleUnauthorized
+        | IdentityPersistenceError::RuntimeRoleOverprivileged
+        | IdentityPersistenceError::TenantContextLeak
+        | IdentityPersistenceError::IncompleteCommand
+        | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::DeviceSessionChallengeExpired
+        | IdentityPersistenceError::DeviceSessionChallengeConsumed
+        | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+        | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
+        | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
+        | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
+        | IdentityPersistenceError::CorruptData(_) => KeyPackageFailure::TemporarilyUnavailable,
     }
 }
 
@@ -915,6 +1120,159 @@ fn parse_device_enrollment_completion(
         capability,
         exact_device_add_bytes,
     })
+}
+
+struct KeyPackagePublishRequest {
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    package_id: KeyPackageId,
+    published_head_sequence: SafeUint,
+    published_head_hash: Sha256Digest,
+    expires_at: UtcMillis,
+    opaque_key_package: Vec<u8>,
+    detached_signature: Ed25519Signature,
+}
+
+struct KeyPackageClaimRequest {
+    target_identity_id: IdentityId,
+    target_device_id: DeviceId,
+}
+
+fn parse_key_package_publish(bytes: &[u8]) -> Result<KeyPackagePublishRequest, KeyPackageFailure> {
+    if bytes.is_empty() {
+        return Err(KeyPackageFailure::InvalidRequest);
+    }
+    let value = decode_deterministic_cbor(bytes).map_err(|_| KeyPackageFailure::InvalidRequest)?;
+    let fields = key_package_cbor_fields(&value, 9)?;
+    key_package_require_version(key_package_cbor_field(fields, 1)?)?;
+    let identity_id = key_package_parse_identity_id(key_package_cbor_field(fields, 2)?)?;
+    let device_id = key_package_parse_device_id(key_package_cbor_field(fields, 3)?)?;
+    let package_id = key_package_parse_package_id(key_package_cbor_field(fields, 4)?)?;
+    let published_head_sequence = key_package_parse_safe_uint(key_package_cbor_field(fields, 5)?)?;
+    let published_head_hash = Sha256Digest::from_bytes(key_package_parse_bytes::<32>(
+        key_package_cbor_field(fields, 6)?,
+    )?);
+    let expires_at = key_package_parse_utc_millis(key_package_cbor_field(fields, 7)?)?;
+    let opaque_key_package = match key_package_cbor_field(fields, 8)? {
+        CanonicalValue::Bytes(value) if !value.is_empty() => value.clone(),
+        _ => return Err(KeyPackageFailure::InvalidRequest),
+    };
+    let detached_signature = Ed25519Signature::from_bytes(key_package_parse_bytes::<64>(
+        key_package_cbor_field(fields, 9)?,
+    )?);
+    Ok(KeyPackagePublishRequest {
+        identity_id,
+        device_id,
+        package_id,
+        published_head_sequence,
+        published_head_hash,
+        expires_at,
+        opaque_key_package,
+        detached_signature,
+    })
+}
+
+fn parse_key_package_claim(bytes: &[u8]) -> Result<KeyPackageClaimRequest, KeyPackageFailure> {
+    if bytes.is_empty() {
+        return Err(KeyPackageFailure::InvalidRequest);
+    }
+    let value = decode_deterministic_cbor(bytes).map_err(|_| KeyPackageFailure::InvalidRequest)?;
+    let fields = key_package_cbor_fields(&value, 3)?;
+    key_package_require_version(key_package_cbor_field(fields, 1)?)?;
+    Ok(KeyPackageClaimRequest {
+        target_identity_id: key_package_parse_identity_id(key_package_cbor_field(fields, 2)?)?,
+        target_device_id: key_package_parse_device_id(key_package_cbor_field(fields, 3)?)?,
+    })
+}
+
+fn key_package_cbor_fields(
+    value: &CanonicalValue,
+    expected_count: usize,
+) -> Result<&[(CanonicalValue, CanonicalValue)], KeyPackageFailure> {
+    let CanonicalValue::Map(fields) = value else {
+        return Err(KeyPackageFailure::InvalidRequest);
+    };
+    if fields.len() != expected_count
+        || fields.iter().enumerate().any(|(index, (key, _))| {
+            key != &CanonicalValue::Unsigned(u64::try_from(index + 1).unwrap_or(u64::MAX))
+        })
+    {
+        Err(KeyPackageFailure::InvalidRequest)
+    } else {
+        Ok(fields)
+    }
+}
+
+fn key_package_cbor_field(
+    fields: &[(CanonicalValue, CanonicalValue)],
+    key: usize,
+) -> Result<&CanonicalValue, KeyPackageFailure> {
+    fields
+        .get(
+            key.checked_sub(1)
+                .ok_or(KeyPackageFailure::InvalidRequest)?,
+        )
+        .map(|(_, value)| value)
+        .ok_or(KeyPackageFailure::InvalidRequest)
+}
+
+fn key_package_require_version(value: &CanonicalValue) -> Result<(), KeyPackageFailure> {
+    if value == &CanonicalValue::Unsigned(1) {
+        Ok(())
+    } else {
+        Err(KeyPackageFailure::InvalidRequest)
+    }
+}
+
+fn key_package_parse_identity_id(value: &CanonicalValue) -> Result<IdentityId, KeyPackageFailure> {
+    let CanonicalValue::Text(value) = value else {
+        return Err(KeyPackageFailure::InvalidRequest);
+    };
+    value.parse().map_err(|_| KeyPackageFailure::InvalidRequest)
+}
+
+fn key_package_parse_device_id(value: &CanonicalValue) -> Result<DeviceId, KeyPackageFailure> {
+    let CanonicalValue::Text(value) = value else {
+        return Err(KeyPackageFailure::InvalidRequest);
+    };
+    value.parse().map_err(|_| KeyPackageFailure::InvalidRequest)
+}
+
+fn key_package_parse_package_id(value: &CanonicalValue) -> Result<KeyPackageId, KeyPackageFailure> {
+    let CanonicalValue::Text(value) = value else {
+        return Err(KeyPackageFailure::InvalidRequest);
+    };
+    value.parse().map_err(|_| KeyPackageFailure::InvalidRequest)
+}
+
+fn key_package_parse_safe_uint(value: &CanonicalValue) -> Result<SafeUint, KeyPackageFailure> {
+    let CanonicalValue::Unsigned(value) = value else {
+        return Err(KeyPackageFailure::InvalidRequest);
+    };
+    SafeUint::new(*value).map_err(|_| KeyPackageFailure::InvalidRequest)
+}
+
+fn key_package_parse_utc_millis(value: &CanonicalValue) -> Result<UtcMillis, KeyPackageFailure> {
+    let value = match value {
+        CanonicalValue::Unsigned(value) => {
+            i64::try_from(*value).map_err(|_| KeyPackageFailure::InvalidRequest)?
+        }
+        CanonicalValue::Negative(value) => *value,
+        _ => return Err(KeyPackageFailure::InvalidRequest),
+    };
+    UtcMillis::new(value).map_err(|_| KeyPackageFailure::InvalidRequest)
+}
+
+fn key_package_parse_bytes<const N: usize>(
+    value: &CanonicalValue,
+) -> Result<[u8; N], KeyPackageFailure> {
+    let CanonicalValue::Bytes(value) = value else {
+        return Err(KeyPackageFailure::InvalidRequest);
+    };
+    value
+        .as_slice()
+        .try_into()
+        .map_err(|_| KeyPackageFailure::InvalidRequest)
 }
 
 async fn parse_device_enrollment_status_request(
@@ -1190,6 +1548,16 @@ struct DeviceEnrollmentApprovalSuccess {
     exact_receipt_bytes: Vec<u8>,
 }
 
+struct KeyPackagePublishSuccess {
+    status: StatusCode,
+    exact_receipt_bytes: Vec<u8>,
+}
+
+struct KeyPackageClaimSuccess {
+    status: StatusCode,
+    exact_publish_bytes: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum DeviceEnrollmentFailure {
     InvalidRequest,
@@ -1199,6 +1567,16 @@ enum DeviceEnrollmentFailure {
     ChallengeCancelled,
     ChallengeApproved,
     IdentityConflict,
+    IdempotencyConflict,
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum KeyPackageFailure {
+    InvalidRequest,
+    AuthenticationRejected,
+    Unavailable,
+    Conflict,
     IdempotencyConflict,
     TemporarilyUnavailable,
 }
@@ -1273,6 +1651,22 @@ enum DeviceEnrollmentErrorCode {
     ChallengeApproved,
     #[serde(rename = "IDENTITY_APPEND_CONFLICT")]
     IdentityConflict,
+    #[serde(rename = "IDEMPOTENCY_CONFLICT")]
+    IdempotencyConflict,
+    #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, Serialize)]
+enum KeyPackageErrorCode {
+    #[serde(rename = "KEY_PACKAGE_INVALID")]
+    InvalidRequest,
+    #[serde(rename = "DEVICE_AUTHENTICATION_FAILED")]
+    AuthenticationRejected,
+    #[serde(rename = "KEY_PACKAGE_UNAVAILABLE")]
+    Unavailable,
+    #[serde(rename = "KEY_PACKAGE_CONFLICT")]
+    Conflict,
     #[serde(rename = "IDEMPOTENCY_CONFLICT")]
     IdempotencyConflict,
     #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
@@ -1534,6 +1928,64 @@ fn device_enrollment_failure_response(
         DeviceEnrollmentFailure::TemporarilyUnavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             DeviceEnrollmentErrorCode::TemporarilyUnavailable,
+            true,
+        ),
+    };
+    safe_error_response(status, code, retryable, request_id)
+}
+
+fn key_package_publish_success_response(
+    success: KeyPackagePublishSuccess,
+    request_id: RequestId,
+) -> Response {
+    exact_cbor_response(
+        success.status,
+        success.exact_receipt_bytes,
+        KEY_PACKAGE_PUBLISH_RECEIPT_CONTENT_TYPE,
+        request_id,
+    )
+}
+
+fn key_package_claim_success_response(
+    success: KeyPackageClaimSuccess,
+    request_id: RequestId,
+) -> Response {
+    exact_cbor_response(
+        success.status,
+        success.exact_publish_bytes,
+        KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE,
+        request_id,
+    )
+}
+
+fn key_package_failure_response(failure: KeyPackageFailure, request_id: RequestId) -> Response {
+    let (status, code, retryable) = match failure {
+        KeyPackageFailure::InvalidRequest => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            KeyPackageErrorCode::InvalidRequest,
+            false,
+        ),
+        KeyPackageFailure::AuthenticationRejected => (
+            StatusCode::UNAUTHORIZED,
+            KeyPackageErrorCode::AuthenticationRejected,
+            false,
+        ),
+        // Intentionally unify missing identities/devices, revoked targets,
+        // expired packages, and prior consumption to avoid directory probing.
+        KeyPackageFailure::Unavailable => (
+            StatusCode::NOT_FOUND,
+            KeyPackageErrorCode::Unavailable,
+            false,
+        ),
+        KeyPackageFailure::Conflict => (StatusCode::CONFLICT, KeyPackageErrorCode::Conflict, false),
+        KeyPackageFailure::IdempotencyConflict => (
+            StatusCode::CONFLICT,
+            KeyPackageErrorCode::IdempotencyConflict,
+            false,
+        ),
+        KeyPackageFailure::TemporarilyUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            KeyPackageErrorCode::TemporarilyUnavailable,
             true,
         ),
     };

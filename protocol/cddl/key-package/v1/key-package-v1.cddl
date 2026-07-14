@@ -1,0 +1,68 @@
+; Opaque MLS KeyPackage directory HTTP V1.
+; The node never parses MLS state or message content.  It stores and returns
+; exact KeyPackage bytes only after an active identity device signs their
+; binding.  Recipients validate the MLS KeyPackage and the detached device
+; signature before use.
+
+identity-id-v1 = tstr .size 57
+uuid-v7-v1 = tstr .size 36
+sha256-digest-v1 = bstr .size 32
+ed25519-signature-v1 = bstr .size 64
+utc-millis-v1 = -62135596800000..253402300799999
+positive-safe-uint-v1 = 1..9007199254740991
+opaque-key-package-v1 = bstr .size (1..65536)
+
+; The detached signature transcript is the literal ASCII bytes
+; "dirextalk.key-package-publish-signature.v1\0" followed by SHA-256 over
+; the literal ASCII bytes "dirextalk.key-package-publish-binding.v1\0" and
+; this canonical binding. Field 8 is SHA-256 over the literal ASCII bytes
+; "dirextalk.key-package-bytes.v1\0" and the opaque KeyPackage bytes. The
+; independent MLS signer key remains inside the opaque KeyPackage: clients
+; validate it through OpenMLS, while the directory never parses MLS internals.
+key-package-publish-binding-v1 = {
+  1: 1,
+  2: identity-id-v1,
+  3: uuid-v7-v1,
+  4: uuid-v7-v1,
+  5: positive-safe-uint-v1,
+  6: sha256-digest-v1,
+  7: utc-millis-v1,
+  8: sha256-digest-v1
+}
+
+; The detached device signature binds this opaque MLS object to one active
+; identity device and to the publisher's observed identity-log head.  It does
+; not make that historical head the current authorization fact: the directory
+; reloads the active device projection in every publish and claim transaction.
+key-package-publish-v1 = {
+  1: 1,
+  2: identity-id-v1,
+  3: uuid-v7-v1,
+  4: uuid-v7-v1,
+  5: positive-safe-uint-v1,
+  6: sha256-digest-v1,
+  7: utc-millis-v1,
+  8: opaque-key-package-v1,
+  9: ed25519-signature-v1
+}
+
+; A claimant receives exactly one still-available package for the named
+; identity device.  The authenticated claimant is intentionally derived from
+; the device session, rather than repeated in the public body.
+key-package-claim-v1 = {
+  1: 1,
+  2: identity-id-v1,
+  3: uuid-v7-v1
+}
+
+; Returned both for a fresh claim and an exact idempotent replay. It is the
+; publisher's exact signed binding, not a rebuilt projection.
+key-package-claim-receipt-v1 = key-package-publish-v1
+
+; Publish receipts never echo the opaque package bytes.
+key-package-publish-receipt-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: sha256-digest-v1,
+  4: utc-millis-v1
+}

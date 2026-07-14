@@ -1,0 +1,1173 @@
+use std::fmt;
+
+use dtx_domain::{DeviceId, IdentityId, KeyPackageId};
+use dtx_identity_log::DeviceStatusV1;
+use dtx_wire::{
+    CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
+    UtcMillis, encode_deterministic_cbor,
+};
+use ed25519_dalek::{Signature, VerifyingKey};
+use sqlx::{PgConnection, Row};
+use uuid::Uuid;
+
+use crate::repository::lock_and_load_active_snapshot;
+use crate::{
+    DeviceSessionCredential, DeviceSessionRepository, IdentityPersistenceError, IdentityPgStore,
+};
+
+/// Maximum opaque MLS `KeyPackage` payload accepted by the directory.
+pub const MAX_KEY_PACKAGE_BYTES: usize = 65_536;
+/// Maximum signed `KeyPackage` publish envelope retained by the directory.
+pub const MAX_KEY_PACKAGE_PUBLISH_BYTES: usize = 131_072;
+/// A publisher cannot create a package further in the future than this bound.
+pub const KEY_PACKAGE_MAX_TTL_MILLIS: i64 = 30 * 24 * 60 * 60 * 1_000;
+/// A claimed package remains replayable for this minimum response-loss window.
+pub const KEY_PACKAGE_CLAIM_REPLAY_RETENTION_MILLIS: i64 = 15 * 60 * 1_000;
+/// Domain separator for the opaque MLS bytes digest.
+pub const KEY_PACKAGE_BYTES_HASH_DOMAIN: &[u8] = b"dirextalk.key-package-bytes.v1\0";
+/// Domain separator for the publish binding canonical transcript digest.
+pub const KEY_PACKAGE_PUBLISH_BINDING_HASH_DOMAIN: &[u8] =
+    b"dirextalk.key-package-publish-binding.v1\0";
+/// Domain separator prefixed to the detached device-signature input.
+pub const KEY_PACKAGE_PUBLISH_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.key-package-publish-signature.v1\0";
+/// Domain separator for exact publish request replay identity.
+pub const KEY_PACKAGE_PUBLISH_REQUEST_HASH_DOMAIN: &[u8] =
+    b"dirextalk.key-package-publish-request.v1\0";
+/// Domain separator for the immutable publish receipt.
+pub const KEY_PACKAGE_PUBLISH_RECEIPT_HASH_DOMAIN: &[u8] =
+    b"dirextalk.key-package-publish-receipt.v1\0";
+/// Domain separator for exact claim request replay identity.
+pub const KEY_PACKAGE_CLAIM_REQUEST_HASH_DOMAIN: &[u8] =
+    b"dirextalk.key-package-claim-request.v1\0";
+/// Domain separator for the exact retained claim response envelope.
+pub const KEY_PACKAGE_CLAIM_RECEIPT_HASH_DOMAIN: &[u8] =
+    b"dirextalk.key-package-claim-receipt.v1\0";
+
+const AVAILABLE_STATE: &str = "available";
+const CLAIMED_STATE: &str = "claimed";
+const KEY_PACKAGE_PRUNE_BATCH_SIZE: i32 = 256;
+
+/// One exact, device-signed publish request. MLS bytes stay opaque: the
+/// service authenticates only this outer device binding and never deserializes
+/// the `KeyPackage` itself.
+#[derive(Clone, Eq, PartialEq)]
+pub struct KeyPackagePublishCommand {
+    idempotency_key_hash: Sha256Digest,
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    package_id: KeyPackageId,
+    published_head_sequence: SafeUint,
+    published_head_hash: Sha256Digest,
+    expires_at: UtcMillis,
+    opaque_key_package: Vec<u8>,
+    detached_signature: Ed25519Signature,
+    exact_publish_bytes: Vec<u8>,
+}
+
+impl fmt::Debug for KeyPackagePublishCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KeyPackagePublishCommand")
+            .field("idempotency_key_hash", &self.idempotency_key_hash)
+            .field("identity_id", &self.identity_id)
+            .field("device_id", &self.device_id)
+            .field("package_id", &self.package_id)
+            .field("published_head_sequence", &self.published_head_sequence)
+            .field("published_head_hash", &self.published_head_hash)
+            .field("expires_at", &self.expires_at)
+            .field("opaque_key_package", &"[OPAQUE]")
+            .field("detached_signature", &self.detached_signature)
+            .field("exact_publish_bytes", &"[OPAQUE]")
+            .finish()
+    }
+}
+
+impl KeyPackagePublishCommand {
+    /// Builds a publish command from already decoded, exact deterministic-CBOR
+    /// request bytes. The constructor rejects a body that does not exactly
+    /// re-encode to the supplied public fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bounded field is invalid or the supplied bytes
+    /// are not the exact canonical request representation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        idempotency_key_hash: Sha256Digest,
+        identity_id: IdentityId,
+        device_id: DeviceId,
+        package_id: KeyPackageId,
+        published_head_sequence: SafeUint,
+        published_head_hash: Sha256Digest,
+        expires_at: UtcMillis,
+        opaque_key_package: Vec<u8>,
+        detached_signature: Ed25519Signature,
+        exact_publish_bytes: Vec<u8>,
+    ) -> Result<Self, IdentityPersistenceError> {
+        if published_head_sequence.get() == 0 {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "key package published head sequence",
+            ));
+        }
+        if opaque_key_package.is_empty() || opaque_key_package.len() > MAX_KEY_PACKAGE_BYTES {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "key package byte length",
+            ));
+        }
+        if exact_publish_bytes.is_empty()
+            || exact_publish_bytes.len() > MAX_KEY_PACKAGE_PUBLISH_BYTES
+        {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "key package publish byte length",
+            ));
+        }
+        let command = Self {
+            idempotency_key_hash,
+            identity_id,
+            device_id,
+            package_id,
+            published_head_sequence,
+            published_head_hash,
+            expires_at,
+            opaque_key_package,
+            detached_signature,
+            exact_publish_bytes,
+        };
+        let expected = encode_deterministic_cbor(&command.to_canonical_value()).map_err(|_| {
+            IdentityPersistenceError::InvalidCommand("key package publish encoding")
+        })?;
+        if expected != command.exact_publish_bytes {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "key package publish canonical bytes",
+            ));
+        }
+        Ok(command)
+    }
+
+    /// Returns the authenticated publisher identity declared by the envelope.
+    #[must_use]
+    pub const fn identity_id(&self) -> IdentityId {
+        self.identity_id
+    }
+
+    /// Returns the publisher device declared by the envelope.
+    #[must_use]
+    pub const fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    /// Returns the caller-chosen public package identifier.
+    #[must_use]
+    pub const fn package_id(&self) -> KeyPackageId {
+        self.package_id
+    }
+
+    /// Returns the identity-log sequence which the signature binds.
+    #[must_use]
+    pub const fn published_head_sequence(&self) -> SafeUint {
+        self.published_head_sequence
+    }
+
+    /// Returns the identity-log head hash which the signature binds.
+    #[must_use]
+    pub const fn published_head_hash(&self) -> Sha256Digest {
+        self.published_head_hash
+    }
+
+    /// Returns the package expiry supplied by the signed envelope.
+    #[must_use]
+    pub const fn expires_at(&self) -> UtcMillis {
+        self.expires_at
+    }
+
+    /// Returns the opaque MLS `KeyPackage` bytes without parsing them.
+    #[must_use]
+    pub fn opaque_key_package(&self) -> &[u8] {
+        &self.opaque_key_package
+    }
+
+    /// Returns the detached active-device signature.
+    #[must_use]
+    pub const fn detached_signature(&self) -> Ed25519Signature {
+        self.detached_signature
+    }
+
+    /// Returns the exact deterministic-CBOR envelope bytes retained for a
+    /// later one-time claim response.
+    #[must_use]
+    pub fn exact_publish_bytes(&self) -> &[u8] {
+        &self.exact_publish_bytes
+    }
+
+    /// Returns the stable HTTP idempotency-key digest.
+    #[must_use]
+    pub const fn idempotency_key_hash(&self) -> Sha256Digest {
+        self.idempotency_key_hash
+    }
+
+    fn package_digest(&self) -> Sha256Digest {
+        Sha256Digest::hash_domain(KEY_PACKAGE_BYTES_HASH_DOMAIN, &self.opaque_key_package)
+    }
+
+    fn request_digest(&self) -> Sha256Digest {
+        Sha256Digest::hash_domain(
+            KEY_PACKAGE_PUBLISH_REQUEST_HASH_DOMAIN,
+            &self.exact_publish_bytes,
+        )
+    }
+
+    fn signature_input(&self) -> Result<Vec<u8>, IdentityPersistenceError> {
+        key_package_publish_signature_input(
+            self.identity_id,
+            self.device_id,
+            self.package_id,
+            self.published_head_sequence,
+            self.published_head_hash,
+            self.expires_at,
+            &self.opaque_key_package,
+        )
+    }
+}
+
+impl CanonicalEncode for KeyPackagePublishCommand {
+    fn to_canonical_value(&self) -> CanonicalValue {
+        CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(self.identity_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Text(self.device_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                CanonicalValue::Text(self.package_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(5),
+                self.published_head_sequence.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(6),
+                self.published_head_hash.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(7),
+                self.expires_at.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(8),
+                CanonicalValue::Bytes(self.opaque_key_package.clone()),
+            ),
+            (
+                CanonicalValue::Unsigned(9),
+                self.detached_signature.to_canonical_value(),
+            ),
+        ])
+    }
+}
+
+/// One exact request to atomically receive one package from a target active
+/// device. It intentionally does not name a package ID, preventing a caller
+/// from probing directory contents.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyPackageClaimCommand {
+    idempotency_key_hash: Sha256Digest,
+    target_identity_id: IdentityId,
+    target_device_id: DeviceId,
+    exact_claim_bytes: Vec<u8>,
+}
+
+impl KeyPackageClaimCommand {
+    /// Builds a claim command from its exact deterministic-CBOR body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the body exceeds its bound or is not the exact
+    /// canonical request representation.
+    pub fn new(
+        idempotency_key_hash: Sha256Digest,
+        target_identity_id: IdentityId,
+        target_device_id: DeviceId,
+        exact_claim_bytes: Vec<u8>,
+    ) -> Result<Self, IdentityPersistenceError> {
+        if exact_claim_bytes.is_empty() || exact_claim_bytes.len() > 16_384 {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "key package claim byte length",
+            ));
+        }
+        let command = Self {
+            idempotency_key_hash,
+            target_identity_id,
+            target_device_id,
+            exact_claim_bytes,
+        };
+        let expected = encode_deterministic_cbor(&command.to_canonical_value())
+            .map_err(|_| IdentityPersistenceError::InvalidCommand("key package claim encoding"))?;
+        if expected != command.exact_claim_bytes {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "key package claim canonical bytes",
+            ));
+        }
+        Ok(command)
+    }
+
+    /// Returns the target self-certifying identity.
+    #[must_use]
+    pub const fn target_identity_id(&self) -> IdentityId {
+        self.target_identity_id
+    }
+
+    /// Returns the target active device.
+    #[must_use]
+    pub const fn target_device_id(&self) -> DeviceId {
+        self.target_device_id
+    }
+
+    /// Returns the scoped HTTP idempotency-key digest.
+    #[must_use]
+    pub const fn idempotency_key_hash(&self) -> Sha256Digest {
+        self.idempotency_key_hash
+    }
+
+    fn request_digest(&self) -> Sha256Digest {
+        Sha256Digest::hash_domain(
+            KEY_PACKAGE_CLAIM_REQUEST_HASH_DOMAIN,
+            &self.exact_claim_bytes,
+        )
+    }
+}
+
+impl CanonicalEncode for KeyPackageClaimCommand {
+    fn to_canonical_value(&self) -> CanonicalValue {
+        CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(self.target_identity_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Text(self.target_device_id.to_string()),
+            ),
+        ])
+    }
+}
+
+/// Builds the canonical unsigned binding that an active device signs before a
+/// `KeyPackage` is uploaded. The MLS signer key remains inside the opaque MLS
+/// package; the outer signature binds the currently active Dirextalk device.
+///
+/// # Errors
+///
+/// Returns an error when canonical encoding cannot represent the binding.
+#[allow(clippy::too_many_arguments)]
+pub fn key_package_publish_binding_canonical_bytes(
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    package_id: KeyPackageId,
+    published_head_sequence: SafeUint,
+    published_head_hash: Sha256Digest,
+    expires_at: UtcMillis,
+    package_digest: Sha256Digest,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(package_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            published_head_sequence.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            published_head_hash.to_canonical_value(),
+        ),
+        (CanonicalValue::Unsigned(7), expires_at.to_canonical_value()),
+        (
+            CanonicalValue::Unsigned(8),
+            package_digest.to_canonical_value(),
+        ),
+    ]))
+    .map_err(|_| IdentityPersistenceError::InvalidCommand("key package binding encoding"))
+}
+
+/// Returns the exact detached-signature input for a `KeyPackage` publish
+/// envelope. It hashes the canonical binding and prefixes a distinct domain,
+/// so this signature cannot be replayed as an MLS or identity-log signature.
+///
+/// # Errors
+///
+/// Returns an error when the opaque payload is outside its bound or canonical
+/// encoding cannot represent the binding.
+#[allow(clippy::too_many_arguments)]
+pub fn key_package_publish_signature_input(
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    package_id: KeyPackageId,
+    published_head_sequence: SafeUint,
+    published_head_hash: Sha256Digest,
+    expires_at: UtcMillis,
+    opaque_key_package: &[u8],
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    if opaque_key_package.is_empty() || opaque_key_package.len() > MAX_KEY_PACKAGE_BYTES {
+        return Err(IdentityPersistenceError::InvalidCommand(
+            "key package byte length",
+        ));
+    }
+    let package_digest =
+        Sha256Digest::hash_domain(KEY_PACKAGE_BYTES_HASH_DOMAIN, opaque_key_package);
+    let canonical = key_package_publish_binding_canonical_bytes(
+        identity_id,
+        device_id,
+        package_id,
+        published_head_sequence,
+        published_head_hash,
+        expires_at,
+        package_digest,
+    )?;
+    let digest = Sha256Digest::hash_domain(KEY_PACKAGE_PUBLISH_BINDING_HASH_DOMAIN, &canonical);
+    let mut input = Vec::with_capacity(KEY_PACKAGE_PUBLISH_SIGNATURE_DOMAIN.len() + 32);
+    input.extend_from_slice(KEY_PACKAGE_PUBLISH_SIGNATURE_DOMAIN);
+    input.extend_from_slice(digest.as_bytes());
+    Ok(input)
+}
+
+/// Exact immutable publish receipt returned after successful persistence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyPackagePublishReceipt {
+    package_id: KeyPackageId,
+    package_digest: Sha256Digest,
+    expires_at: UtcMillis,
+    exact_bytes: Vec<u8>,
+}
+
+impl KeyPackagePublishReceipt {
+    fn new(
+        package_id: KeyPackageId,
+        package_digest: Sha256Digest,
+        expires_at: UtcMillis,
+    ) -> Result<Self, IdentityPersistenceError> {
+        let receipt = Self {
+            package_id,
+            package_digest,
+            expires_at,
+            exact_bytes: Vec::new(),
+        };
+        let exact_bytes = encode_deterministic_cbor(&receipt).map_err(|_| {
+            IdentityPersistenceError::InvalidCommand("key package publish receipt encoding")
+        })?;
+        Ok(Self {
+            exact_bytes,
+            ..receipt
+        })
+    }
+
+    /// Returns the durable public package ID.
+    #[must_use]
+    pub const fn package_id(&self) -> KeyPackageId {
+        self.package_id
+    }
+
+    /// Returns the opaque package digest bound to the device signature.
+    #[must_use]
+    pub const fn package_digest(&self) -> Sha256Digest {
+        self.package_digest
+    }
+
+    /// Returns the package expiry.
+    #[must_use]
+    pub const fn expires_at(&self) -> UtcMillis {
+        self.expires_at
+    }
+
+    /// Returns the exact receipt bytes replayed after response loss.
+    #[must_use]
+    pub fn exact_bytes(&self) -> &[u8] {
+        &self.exact_bytes
+    }
+
+    fn receipt_digest(&self) -> Sha256Digest {
+        Sha256Digest::hash_domain(KEY_PACKAGE_PUBLISH_RECEIPT_HASH_DOMAIN, &self.exact_bytes)
+    }
+
+    fn verify_exact_bytes(
+        &self,
+        stored_bytes: &[u8],
+        stored_digest: Sha256Digest,
+    ) -> Result<(), IdentityPersistenceError> {
+        if self.exact_bytes != stored_bytes || self.receipt_digest() != stored_digest {
+            return Err(IdentityPersistenceError::ReceiptIntegrity);
+        }
+        Ok(())
+    }
+}
+
+impl CanonicalEncode for KeyPackagePublishReceipt {
+    fn to_canonical_value(&self) -> CanonicalValue {
+        CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(self.package_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                self.package_digest.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                self.expires_at.to_canonical_value(),
+            ),
+        ])
+    }
+}
+
+/// The exact original publish envelope returned by an atomic claim.
+#[derive(Clone, Eq, PartialEq)]
+pub struct KeyPackageClaimReceipt {
+    exact_publish_bytes: Vec<u8>,
+}
+
+impl fmt::Debug for KeyPackageClaimReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("KeyPackageClaimReceipt")
+            .field("exact_publish_bytes", &"[OPAQUE]")
+            .finish()
+    }
+}
+
+impl KeyPackageClaimReceipt {
+    fn new(exact_publish_bytes: Vec<u8>) -> Result<Self, IdentityPersistenceError> {
+        if exact_publish_bytes.is_empty()
+            || exact_publish_bytes.len() > MAX_KEY_PACKAGE_PUBLISH_BYTES
+        {
+            return Err(IdentityPersistenceError::CorruptData(
+                "key package claim receipt byte length",
+            ));
+        }
+        Ok(Self {
+            exact_publish_bytes,
+        })
+    }
+
+    /// Returns the original exact publish envelope, including the publisher's
+    /// active-device signature and opaque MLS bytes.
+    #[must_use]
+    pub fn exact_publish_bytes(&self) -> &[u8] {
+        &self.exact_publish_bytes
+    }
+
+    fn receipt_digest(&self) -> Sha256Digest {
+        Sha256Digest::hash_domain(
+            KEY_PACKAGE_CLAIM_RECEIPT_HASH_DOMAIN,
+            &self.exact_publish_bytes,
+        )
+    }
+
+    fn verify_exact_bytes(
+        &self,
+        stored_bytes: &[u8],
+        stored_digest: Sha256Digest,
+    ) -> Result<(), IdentityPersistenceError> {
+        if self.exact_publish_bytes != stored_bytes || self.receipt_digest() != stored_digest {
+            return Err(IdentityPersistenceError::ReceiptIntegrity);
+        }
+        Ok(())
+    }
+}
+
+/// Durable result of a publish request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyPackagePublishOutcome {
+    /// A fresh opaque `KeyPackage` was persisted and made claimable.
+    Published(KeyPackagePublishReceipt),
+    /// The exact publish receipt was returned after response loss.
+    Replayed(KeyPackagePublishReceipt),
+}
+
+impl KeyPackagePublishOutcome {
+    /// Returns the immutable receipt in either outcome.
+    #[must_use]
+    pub const fn receipt(&self) -> &KeyPackagePublishReceipt {
+        match self {
+            Self::Published(receipt) | Self::Replayed(receipt) => receipt,
+        }
+    }
+}
+
+/// Durable result of a one-time claim request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyPackageClaimOutcome {
+    /// One available package was atomically consumed.
+    Claimed(KeyPackageClaimReceipt),
+    /// The exact original envelope was returned after response loss.
+    Replayed(KeyPackageClaimReceipt),
+}
+
+impl KeyPackageClaimOutcome {
+    /// Returns the exact opaque publish envelope in either outcome.
+    #[must_use]
+    pub const fn receipt(&self) -> &KeyPackageClaimReceipt {
+        match self {
+            Self::Claimed(receipt) | Self::Replayed(receipt) => receipt,
+        }
+    }
+}
+
+/// Identity-bound durable `KeyPackage` directory repository.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyPackageRepository;
+
+impl KeyPackageRepository {
+    /// Creates the repository handle.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Authenticates the publisher, verifies its current identity head and
+    /// device signature, then persists the opaque package and exact replay
+    /// receipt in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when session, identity-head, device-signature, exact
+    /// idempotency, expiry, or durable storage validation fails.
+    pub async fn publish(
+        self,
+        store: &IdentityPgStore,
+        command: &KeyPackagePublishCommand,
+        credential: &DeviceSessionCredential,
+        now: UtcMillis,
+    ) -> Result<KeyPackagePublishOutcome, IdentityPersistenceError> {
+        let request_digest = command.request_digest();
+        let receipt = KeyPackagePublishReceipt::new(
+            command.package_id(),
+            command.package_digest(),
+            command.expires_at(),
+        )?;
+        let mut session = store.begin().await?;
+        let result = async {
+            let authenticated = DeviceSessionRepository::authenticate_in_transaction(
+                session.connection(),
+                credential,
+                now,
+            )
+            .await?;
+            if authenticated.identity_id() != command.identity_id()
+                || authenticated.device_id() != command.device_id()
+            {
+                return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+            }
+            prune_expired_key_package_state(session.connection(), now).await?;
+            match claim_publish_command(
+                session.connection(),
+                command,
+                request_digest,
+                &receipt,
+                now,
+            )
+            .await?
+            {
+                PublishCommandClaim::Replay(receipt) => {
+                    return Ok(KeyPackagePublishOutcome::Replayed(receipt));
+                }
+                PublishCommandClaim::Execute => {}
+            }
+
+            let snapshot =
+                lock_and_load_active_snapshot(session.connection(), command.identity_id()).await?;
+            if snapshot.head().sequence() != command.published_head_sequence()
+                || snapshot.head().hash() != command.published_head_hash()
+            {
+                return Err(IdentityPersistenceError::KeyPackageConflict);
+            }
+            validate_publish_expiry(command.expires_at(), now)?;
+            let signing_key =
+                active_device_signing_key(snapshot.projection(), command.device_id())?;
+            verify_device_signature(
+                signing_key,
+                &command.signature_input()?,
+                command.detached_signature(),
+            )?;
+            insert_key_package(session.connection(), command, now).await?;
+            Ok(KeyPackagePublishOutcome::Published(receipt))
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                session.commit().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = session.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Rechecks the claimant session and target active-device projection in
+    /// one transaction, then consumes no more than one opaque package. Any
+    /// absent, expired, consumed, inactive, or revoked target state maps to
+    /// the same non-leaking unavailable error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requester session is invalid, the target is
+    /// unavailable, exact idempotency conflicts, or durable storage fails.
+    pub async fn claim(
+        self,
+        store: &IdentityPgStore,
+        command: &KeyPackageClaimCommand,
+        credential: &DeviceSessionCredential,
+        now: UtcMillis,
+    ) -> Result<KeyPackageClaimOutcome, IdentityPersistenceError> {
+        let request_digest = command.request_digest();
+        let mut session = store.begin().await?;
+        let result = async {
+            // Authentication deliberately precedes idempotent replay: a later
+            // requester-device revoke cannot keep a bearer session usable.
+            let claimant = DeviceSessionRepository::authenticate_in_transaction(
+                session.connection(),
+                credential,
+                now,
+            )
+            .await?;
+            prune_expired_key_package_state(session.connection(), now).await?;
+            match claim_claim_command(
+                session.connection(),
+                claimant.identity_id(),
+                claimant.device_id(),
+                command,
+                request_digest,
+                now,
+            )
+            .await?
+            {
+                ClaimCommandClaim::Replay(receipt) => {
+                    return Ok(KeyPackageClaimOutcome::Replayed(receipt));
+                }
+                ClaimCommandClaim::Execute => {}
+            }
+            ensure_target_active(
+                session.connection(),
+                command.target_identity_id(),
+                command.target_device_id(),
+            )
+            .await?;
+            let package = claim_available_package(
+                session.connection(),
+                claimant.identity_id(),
+                claimant.device_id(),
+                command,
+                now,
+            )
+            .await?;
+            Ok(KeyPackageClaimOutcome::Claimed(package))
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                session.commit().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = session.rollback().await;
+                Err(error)
+            }
+        }
+    }
+}
+
+enum PublishCommandClaim {
+    Execute,
+    Replay(KeyPackagePublishReceipt),
+}
+
+enum ClaimCommandClaim {
+    Execute,
+    Replay(KeyPackageClaimReceipt),
+}
+
+async fn claim_publish_command(
+    connection: &mut PgConnection,
+    command: &KeyPackagePublishCommand,
+    request_digest: Sha256Digest,
+    receipt: &KeyPackagePublishReceipt,
+    now: UtcMillis,
+) -> Result<PublishCommandClaim, IdentityPersistenceError> {
+    let inserted = sqlx::query(
+        "INSERT INTO identity.key_package_publish_claims (
+             owner_identity_id, owner_device_id, idempotency_key_hash, request_digest,
+             package_id, receipt_bytes, receipt_digest, created_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(command.identity_id().to_string())
+    .bind(*command.device_id().as_uuid())
+    .bind(command.idempotency_key_hash().as_bytes().as_slice())
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(*command.package_id().as_uuid())
+    .bind(receipt.exact_bytes())
+    .bind(receipt.receipt_digest().as_bytes().as_slice())
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    if inserted == 1 {
+        return Ok(PublishCommandClaim::Execute);
+    }
+
+    let row = sqlx::query(
+        "SELECT request_digest, package_id, receipt_bytes, receipt_digest
+           FROM identity.key_package_publish_claims
+          WHERE owner_identity_id=$1 AND owner_device_id=$2 AND idempotency_key_hash=$3",
+    )
+    .bind(command.identity_id().to_string())
+    .bind(*command.device_id().as_uuid())
+    .bind(command.idempotency_key_hash().as_bytes().as_slice())
+    .fetch_one(&mut *connection)
+    .await?;
+    let matches = digest(
+        &row.try_get::<Vec<u8>, _>("request_digest")?,
+        "key package publish request digest",
+    )? == request_digest
+        && parse_key_package_id(row.try_get("package_id")?)? == command.package_id();
+    if !matches {
+        return Err(IdentityPersistenceError::IdempotencyConflict);
+    }
+    let stored = KeyPackagePublishReceipt::new(
+        command.package_id(),
+        command.package_digest(),
+        command.expires_at(),
+    )?;
+    stored.verify_exact_bytes(
+        &row.try_get::<Vec<u8>, _>("receipt_bytes")?,
+        digest(
+            &row.try_get::<Vec<u8>, _>("receipt_digest")?,
+            "key package publish receipt digest",
+        )?,
+    )?;
+    Ok(PublishCommandClaim::Replay(stored))
+}
+
+async fn insert_key_package(
+    connection: &mut PgConnection,
+    command: &KeyPackagePublishCommand,
+    now: UtcMillis,
+) -> Result<(), IdentityPersistenceError> {
+    let inserted = sqlx::query(
+        "INSERT INTO identity.key_packages (
+             package_id, owner_identity_id, owner_device_id, published_head_sequence,
+             published_head_hash, package_digest, exact_publish_bytes, published_at_ms,
+             expires_at_ms, state, claimed_at_ms, retention_until_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,$9)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(*command.package_id().as_uuid())
+    .bind(command.identity_id().to_string())
+    .bind(*command.device_id().as_uuid())
+    .bind(to_i64(command.published_head_sequence())?)
+    .bind(command.published_head_hash().as_bytes().as_slice())
+    .bind(command.package_digest().as_bytes().as_slice())
+    .bind(command.exact_publish_bytes())
+    .bind(now.get())
+    .bind(command.expires_at().get())
+    .bind(AVAILABLE_STATE)
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    if inserted == 1 {
+        Ok(())
+    } else {
+        Err(IdentityPersistenceError::KeyPackageConflict)
+    }
+}
+
+async fn claim_claim_command(
+    connection: &mut PgConnection,
+    claimant_identity_id: IdentityId,
+    claimant_device_id: DeviceId,
+    command: &KeyPackageClaimCommand,
+    request_digest: Sha256Digest,
+    now: UtcMillis,
+) -> Result<ClaimCommandClaim, IdentityPersistenceError> {
+    let inserted = sqlx::query(
+        "INSERT INTO identity.key_package_claims (
+             claimant_identity_id, claimant_device_id, idempotency_key_hash,
+             target_identity_id, target_device_id, request_digest, created_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(claimant_identity_id.to_string())
+    .bind(*claimant_device_id.as_uuid())
+    .bind(command.idempotency_key_hash().as_bytes().as_slice())
+    .bind(command.target_identity_id().to_string())
+    .bind(*command.target_device_id().as_uuid())
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    if inserted == 1 {
+        return Ok(ClaimCommandClaim::Execute);
+    }
+
+    let row = sqlx::query(
+        "SELECT target_identity_id, target_device_id, request_digest
+           FROM identity.key_package_claims
+          WHERE claimant_identity_id=$1 AND claimant_device_id=$2 AND idempotency_key_hash=$3",
+    )
+    .bind(claimant_identity_id.to_string())
+    .bind(*claimant_device_id.as_uuid())
+    .bind(command.idempotency_key_hash().as_bytes().as_slice())
+    .fetch_one(&mut *connection)
+    .await?;
+    let matches = row.try_get::<String, _>("target_identity_id")?
+        == command.target_identity_id().to_string()
+        && parse_device_id(row.try_get("target_device_id")?)? == command.target_device_id()
+        && digest(
+            &row.try_get::<Vec<u8>, _>("request_digest")?,
+            "key package claim request digest",
+        )? == request_digest;
+    if !matches {
+        return Err(IdentityPersistenceError::IdempotencyConflict);
+    }
+    Ok(ClaimCommandClaim::Replay(
+        load_claim_receipt(
+            connection,
+            claimant_identity_id,
+            claimant_device_id,
+            command.idempotency_key_hash(),
+        )
+        .await?,
+    ))
+}
+
+async fn ensure_target_active(
+    connection: &mut PgConnection,
+    target_identity_id: IdentityId,
+    target_device_id: DeviceId,
+) -> Result<(), IdentityPersistenceError> {
+    let snapshot = match lock_and_load_active_snapshot(connection, target_identity_id).await {
+        Ok(snapshot) => snapshot,
+        Err(IdentityPersistenceError::IdentityInactive) => {
+            return Err(IdentityPersistenceError::KeyPackageUnavailable);
+        }
+        Err(error) => return Err(error),
+    };
+    if snapshot.projection().device_status(target_device_id) != Some(DeviceStatusV1::Active) {
+        return Err(IdentityPersistenceError::KeyPackageUnavailable);
+    }
+    if snapshot
+        .projection()
+        .device_certificate(target_device_id)
+        .is_none()
+    {
+        return Err(IdentityPersistenceError::CorruptData(
+            "active target device certificate missing",
+        ));
+    }
+    Ok(())
+}
+
+async fn claim_available_package(
+    connection: &mut PgConnection,
+    claimant_identity_id: IdentityId,
+    claimant_device_id: DeviceId,
+    command: &KeyPackageClaimCommand,
+    now: UtcMillis,
+) -> Result<KeyPackageClaimReceipt, IdentityPersistenceError> {
+    let row = sqlx::query(
+        "SELECT package_id, exact_publish_bytes, expires_at_ms
+           FROM identity.key_packages
+          WHERE owner_identity_id=$1
+            AND owner_device_id=$2
+            AND state='available'
+            AND expires_at_ms > $3
+          ORDER BY expires_at_ms, package_id
+          LIMIT 1
+          FOR UPDATE SKIP LOCKED",
+    )
+    .bind(command.target_identity_id().to_string())
+    .bind(*command.target_device_id().as_uuid())
+    .bind(now.get())
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or(IdentityPersistenceError::KeyPackageUnavailable)?;
+    let package_id = parse_key_package_id(row.try_get("package_id")?)?;
+    let exact_publish_bytes: Vec<u8> = row.try_get("exact_publish_bytes")?;
+    let expires_at = utc_millis(row.try_get("expires_at_ms")?, "key package expiry")?;
+    let retention_until = claim_retention_until(expires_at, now)?;
+    let updated = sqlx::query(
+        "UPDATE identity.key_packages
+            SET state=$2, claimed_at_ms=$3, retention_until_ms=$4
+          WHERE package_id=$1 AND state='available'",
+    )
+    .bind(*package_id.as_uuid())
+    .bind(CLAIMED_STATE)
+    .bind(now.get())
+    .bind(retention_until.get())
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        return Err(IdentityPersistenceError::KeyPackageUnavailable);
+    }
+    let receipt = KeyPackageClaimReceipt::new(exact_publish_bytes)?;
+    sqlx::query(
+        "INSERT INTO identity.key_package_claim_receipts (
+             claimant_identity_id, claimant_device_id, idempotency_key_hash,
+             package_id, receipt_bytes, receipt_digest, claimed_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+    )
+    .bind(claimant_identity_id.to_string())
+    .bind(*claimant_device_id.as_uuid())
+    .bind(command.idempotency_key_hash().as_bytes().as_slice())
+    .bind(*package_id.as_uuid())
+    .bind(receipt.exact_publish_bytes())
+    .bind(receipt.receipt_digest().as_bytes().as_slice())
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await?;
+    Ok(receipt)
+}
+
+async fn load_claim_receipt(
+    connection: &mut PgConnection,
+    claimant_identity_id: IdentityId,
+    claimant_device_id: DeviceId,
+    idempotency_key_hash: Sha256Digest,
+) -> Result<KeyPackageClaimReceipt, IdentityPersistenceError> {
+    let row = sqlx::query(
+        "SELECT receipt_bytes, receipt_digest
+           FROM identity.key_package_claim_receipts
+          WHERE claimant_identity_id=$1 AND claimant_device_id=$2 AND idempotency_key_hash=$3",
+    )
+    .bind(claimant_identity_id.to_string())
+    .bind(*claimant_device_id.as_uuid())
+    .bind(idempotency_key_hash.as_bytes().as_slice())
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or(IdentityPersistenceError::IncompleteCommand)?;
+    let receipt = KeyPackageClaimReceipt::new(row.try_get("receipt_bytes")?)?;
+    receipt.verify_exact_bytes(
+        receipt.exact_publish_bytes(),
+        digest(
+            &row.try_get::<Vec<u8>, _>("receipt_digest")?,
+            "key package claim receipt digest",
+        )?,
+    )?;
+    Ok(receipt)
+}
+
+fn validate_publish_expiry(
+    expires_at: UtcMillis,
+    now: UtcMillis,
+) -> Result<(), IdentityPersistenceError> {
+    let maximum = now.get().checked_add(KEY_PACKAGE_MAX_TTL_MILLIS).ok_or(
+        IdentityPersistenceError::InvalidCommand("key package maximum expiry"),
+    )?;
+    if expires_at <= now || expires_at.get() > maximum {
+        return Err(IdentityPersistenceError::InvalidCommand(
+            "key package expiry",
+        ));
+    }
+    Ok(())
+}
+
+fn claim_retention_until(
+    expires_at: UtcMillis,
+    now: UtcMillis,
+) -> Result<UtcMillis, IdentityPersistenceError> {
+    let replay_until = now
+        .get()
+        .checked_add(KEY_PACKAGE_CLAIM_REPLAY_RETENTION_MILLIS)
+        .ok_or(IdentityPersistenceError::CorruptData(
+            "key package claim retention overflow",
+        ))?;
+    UtcMillis::new(expires_at.get().max(replay_until))
+        .map_err(|_| IdentityPersistenceError::CorruptData("key package claim retention"))
+}
+
+async fn prune_expired_key_package_state(
+    connection: &mut PgConnection,
+    cutoff: UtcMillis,
+) -> Result<u64, IdentityPersistenceError> {
+    let removed: i64 = sqlx::query_scalar("SELECT identity.prune_expired_key_packages($1, $2)")
+        .bind(cutoff.get())
+        .bind(KEY_PACKAGE_PRUNE_BATCH_SIZE)
+        .fetch_one(&mut *connection)
+        .await?;
+    u64::try_from(removed)
+        .map_err(|_| IdentityPersistenceError::CorruptData("key package retention count"))
+}
+
+fn active_device_signing_key(
+    projection: &dtx_identity_log::IdentityLogV1,
+    device_id: DeviceId,
+) -> Result<SigningPublicKey, IdentityPersistenceError> {
+    if projection.device_status(device_id) != Some(DeviceStatusV1::Active) {
+        return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+    }
+    projection
+        .device_certificate(device_id)
+        .map(dtx_identity_log::DeviceCertificateV1::device_signing_key)
+        .ok_or(IdentityPersistenceError::CorruptData(
+            "active device certificate missing",
+        ))
+}
+
+fn verify_device_signature(
+    signing_key: SigningPublicKey,
+    input: &[u8],
+    signature: Ed25519Signature,
+) -> Result<(), IdentityPersistenceError> {
+    let verifying_key = VerifyingKey::from_bytes(signing_key.as_bytes())
+        .map_err(|_| IdentityPersistenceError::CorruptData("active device signing key"))?;
+    let signature = Signature::from_bytes(signature.as_bytes());
+    verifying_key
+        .verify_strict(input, &signature)
+        .map_err(|_| IdentityPersistenceError::InvalidCommand("key package device signature"))
+}
+
+fn parse_key_package_id(value: Uuid) -> Result<KeyPackageId, IdentityPersistenceError> {
+    KeyPackageId::try_from(value)
+        .map_err(|_| IdentityPersistenceError::CorruptData("key package ID"))
+}
+
+fn parse_device_id(value: Uuid) -> Result<DeviceId, IdentityPersistenceError> {
+    DeviceId::try_from(value)
+        .map_err(|_| IdentityPersistenceError::CorruptData("key package device ID"))
+}
+
+fn digest(value: &[u8], label: &'static str) -> Result<Sha256Digest, IdentityPersistenceError> {
+    let bytes: [u8; 32] = value
+        .try_into()
+        .map_err(|_| IdentityPersistenceError::CorruptData(label))?;
+    Ok(Sha256Digest::from_bytes(bytes))
+}
+
+fn utc_millis(value: i64, label: &'static str) -> Result<UtcMillis, IdentityPersistenceError> {
+    UtcMillis::new(value).map_err(|_| IdentityPersistenceError::CorruptData(label))
+}
+
+fn to_i64(value: SafeUint) -> Result<i64, IdentityPersistenceError> {
+    i64::try_from(value.get())
+        .map_err(|_| IdentityPersistenceError::CorruptData("key package safe integer"))
+}

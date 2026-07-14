@@ -52,6 +52,10 @@ pub enum IdentityPersistenceError {
     DeviceEnrollmentChallengeCancelled,
     /// A QR enrollment challenge already committed its exact device add.
     DeviceEnrollmentChallengeApproved,
+    /// No active target device has an unconsumed unexpired opaque `KeyPackage`.
+    KeyPackageUnavailable,
+    /// A `KeyPackage` ID or opaque package digest conflicts with immutable state.
+    KeyPackageConflict,
     /// Stored rows did not rehydrate to one exact valid identity-log projection.
     CorruptData(&'static str),
 }
@@ -88,6 +92,8 @@ impl fmt::Display for IdentityPersistenceError {
             Self::DeviceEnrollmentChallengeExpired => "device enrollment challenge expired",
             Self::DeviceEnrollmentChallengeCancelled => "device enrollment challenge was cancelled",
             Self::DeviceEnrollmentChallengeApproved => "device enrollment challenge was approved",
+            Self::KeyPackageUnavailable => "key package is unavailable",
+            Self::KeyPackageConflict => "key package conflicts with immutable state",
             Self::CorruptData(_) => "identity persistence contained invalid durable data",
         })
     }
@@ -117,6 +123,8 @@ impl Error for IdentityPersistenceError {
             | Self::DeviceEnrollmentChallengeExpired
             | Self::DeviceEnrollmentChallengeCancelled
             | Self::DeviceEnrollmentChallengeApproved
+            | Self::KeyPackageUnavailable
+            | Self::KeyPackageConflict
             | Self::CorruptData(_) => None,
         }
     }

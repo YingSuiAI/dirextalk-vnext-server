@@ -65,6 +65,7 @@ impl IdentityPgStore {
     }
 }
 
+#[allow(clippy::too_many_lines)] // One fail-closed audit must list every relation and privilege together.
 async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPersistenceError> {
     if session_principal_can_escalate_role(pool).await? {
         return Err(IdentityPersistenceError::RuntimeRoleOverprivileged);
@@ -95,6 +96,15 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
              AND has_table_privilege(current_user, 'identity.device_enrollment_challenges', 'SELECT') \
              AND has_table_privilege(current_user, 'identity.device_enrollment_challenges', 'INSERT') \
              AND has_table_privilege(current_user, 'identity.device_enrollment_challenges', 'UPDATE') \
+             AND has_table_privilege(current_user, 'identity.key_packages', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.key_packages', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.key_packages', 'UPDATE') \
+             AND has_table_privilege(current_user, 'identity.key_package_publish_claims', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.key_package_publish_claims', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.key_package_claims', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.key_package_claims', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.key_package_claim_receipts', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.key_package_claim_receipts', 'INSERT') \
              AND has_function_privilege( \
                  current_user, \
                  'identity.prune_expired_device_sessions(bigint, integer)', \
@@ -103,6 +113,11 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
              AND has_function_privilege( \
                  current_user, \
                  'identity.prune_expired_device_enrollment_challenges(bigint, integer)', \
+                 'EXECUTE' \
+             ) \
+             AND has_function_privilege( \
+                 current_user, \
+                 'identity.prune_expired_key_packages(bigint, integer)', \
                  'EXECUTE' \
              ) \
              AND has_table_privilege(current_user, 'identity.fork_evidence', 'SELECT') \
@@ -300,9 +315,17 @@ async fn role_has_excess_identity_privileges(
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
                         )) \
+                        OR (relation.relname = 'key_packages' AND (\
+                            has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
+                            OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
+                        )) \
                         OR (relation.relname IN (\
                             'device_sessions', 'device_session_idempotency_claims', \
-                            'device_session_receipts'\
+                            'device_session_receipts', 'key_package_publish_claims', \
+                            'key_package_claims', 'key_package_claim_receipts'\
                         ) AND (\
                             has_table_privilege(current_user, relation.oid, 'UPDATE') \
                             OR has_table_privilege(current_user, relation.oid, 'DELETE') \
@@ -332,6 +355,8 @@ async fn role_has_excess_identity_privileges(
                             'bootstrap_idempotency_claims', 'device_session_challenges', \
                             'device_sessions', 'device_session_idempotency_claims', \
                             'device_session_receipts', 'device_enrollment_challenges', \
+                            'key_packages', 'key_package_publish_claims', \
+                            'key_package_claims', 'key_package_claim_receipts', \
                             'fork_evidence', 'log_outbox'\
                         ) AND (\
                             has_table_privilege(current_user, relation.oid, 'SELECT') \

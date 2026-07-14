@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Check dtx-keypackages" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+    <option name="command" value="check -p dtx-identity-node -p dtx-identity-persistence --all-targets --locked" />
+    <option name="workingDirectory" value="$PROJECT_DIR$" />
+    <method v="2" />
+  </configuration>
+</component>

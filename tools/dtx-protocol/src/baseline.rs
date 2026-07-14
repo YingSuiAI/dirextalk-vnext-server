@@ -56,6 +56,11 @@ const V12_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/identity-enrollment/v1",
     "protocol/test-vectors/identity-enrollment/v1",
 ];
+const V13_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/key-package/v1",
+    "protocol/openapi/key-package/v1",
+    "protocol/test-vectors/key-package/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -143,6 +148,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v12/manifest.json",
         includes_registries: false,
         artifact_paths: V12_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 13,
+        path: "protocol/baseline/v13/manifest.json",
+        includes_registries: false,
+        artifact_paths: V13_ARTIFACT_PATHS,
     },
 ];
 
@@ -570,6 +581,7 @@ mod tests {
         let v10 = V10_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         let v11 = V11_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         let v12 = V12_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
+        let v13 = V13_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         assert!(v1.is_disjoint(&v2));
         assert!(v1.is_disjoint(&v3));
         assert!(v1.is_disjoint(&v4));
@@ -636,6 +648,11 @@ mod tests {
         assert!(v9.is_disjoint(&v12));
         assert!(v10.is_disjoint(&v12));
         assert!(v11.is_disjoint(&v12));
+        for prior in [
+            &v1, &v2, &v3, &v4, &v5, &v6, &v7, &v8, &v9, &v10, &v11, &v12,
+        ] {
+            assert!(prior.is_disjoint(&v13));
+        }
         assert!(!V1_ARTIFACT_PATHS.contains(&"protocol/proto"));
     }
 }

@@ -11,8 +11,8 @@ pub use ids::{
     DeviceId, DeviceSessionChallengeId, DeviceSessionId, DirectoryRegistrationId,
     EnrollmentIntentId, EventId, GrantId, HostCredentialId, HostId, IdParseError, IndexerId,
     InstallationId, InviteCapabilityId, JobEvidenceId, JobId, JobResourceId, JobStepId,
-    JoinRequestId, LeaseId, ManagedServiceId, OutboxId, RequestId, RunId, RunLeaseId, RunOfferId,
-    SecretId, ServiceOperationId, TenantId, WorkerId,
+    JoinRequestId, KeyPackageId, LeaseId, ManagedServiceId, OutboxId, RequestId, RunId, RunLeaseId,
+    RunOfferId, SecretId, ServiceOperationId, TenantId, WorkerId,
 };
 pub use ports::{Clock, ClockError, IdGenerationError, IdGenerator, SystemClock, UuidV7Generator};
 pub use public_id::{

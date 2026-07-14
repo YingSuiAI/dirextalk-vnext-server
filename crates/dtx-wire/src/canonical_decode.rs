@@ -3,8 +3,8 @@ use std::{error::Error, fmt, str::FromStr};
 use dtx_domain::{
     AgentDeviceId, AggregateId, ApprovalId, BindingId, BootId, CloudConnectionId, ConnectorId,
     ConsentId, ConversationId, DeviceId, DirectoryRegistrationId, EventId, HostId, IndexerId,
-    InstallationId, JobEvidenceId, JobId, JobResourceId, JobStepId, LeaseId, ManagedServiceId,
-    PublicSubjectId, RequestId, RunId, ServiceOperationId, TenantId, WorkerId,
+    InstallationId, JobEvidenceId, JobId, JobResourceId, JobStepId, KeyPackageId, LeaseId,
+    ManagedServiceId, PublicSubjectId, RequestId, RunId, ServiceOperationId, TenantId, WorkerId,
 };
 
 use crate::{
@@ -156,6 +156,7 @@ impl_text_decode!(
     JobId,
     JobResourceId,
     JobStepId,
+    KeyPackageId,
     LeaseId,
     ManagedServiceId,
     PublicSubjectId,

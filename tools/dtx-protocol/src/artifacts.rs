@@ -117,6 +117,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_identity_bootstrap_v1(root)?;
     validate_identity_session_v1(root)?;
     validate_identity_enrollment_v1(root)?;
+    validate_key_package_v1(root)?;
     validate_public_descriptor_v1(root)?;
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
@@ -564,6 +565,7 @@ fn validate_identity_session_v1(root: &Path) -> Result<(), ProtocolToolError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // One versioned contract audit keeps CDDL, vectors, and OpenAPI coupled.
 fn validate_identity_enrollment_v1(root: &Path) -> Result<(), ProtocolToolError> {
     let cddl =
         read(&root.join("protocol/cddl/identity-enrollment/v1/identity-enrollment-v1.cddl"))?;
@@ -905,6 +907,195 @@ fn validate_identity_enrollment_v1(root: &Path) -> Result<(), ProtocolToolError>
         (
             "/components/responses/IdentityAppendCommitted/content/application~1vnd.dirextalk.identity-append-receipt.v1+cbor/x-dirextalk-exact-cbor",
             json!(true),
+        ),
+    ] {
+        expect_value(&document, pointer, &expected)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // One versioned contract audit keeps CDDL, vectors, and OpenAPI coupled.
+fn validate_key_package_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/key-package/v1/key-package-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse key-package v1 CDDL: {error}")))?;
+    let vector = read_json(&root.join("protocol/test-vectors/key-package/v1/key-package-v1.json"))?;
+    validate_vector_version(&vector, "key-package-v1")?;
+    for (field, expected) in [
+        ("publish_path_template", "/v1/key-packages/{package_id}"),
+        ("claim_path", "/v1/key-packages/claim"),
+        (
+            "publish_content_type",
+            "application/vnd.dirextalk.key-package-publish.v1+cbor",
+        ),
+        (
+            "publish_receipt_content_type",
+            "application/vnd.dirextalk.key-package-publish-receipt.v1+cbor",
+        ),
+        (
+            "claim_content_type",
+            "application/vnd.dirextalk.key-package-claim.v1+cbor",
+        ),
+        (
+            "claim_receipt_content_type",
+            "application/vnd.dirextalk.key-package-claim-receipt.v1+cbor",
+        ),
+        ("authorization_scheme", "DTX-Device-Session"),
+    ] {
+        if json_string(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "key-package-v1 vector {field} drifted"
+            )));
+        }
+    }
+    for (field, expected) in [
+        ("idempotency_key_min_bytes", 16_i64),
+        ("idempotency_key_max_bytes", 128_i64),
+        ("max_key_package_bytes", 65_536_i64),
+    ] {
+        if json_i64(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "key-package-v1 vector {field} drifted"
+            )));
+        }
+    }
+    for (field, expected) in [
+        (
+            "opaque_key_package_hash_domain",
+            "dirextalk.key-package-bytes.v1\0",
+        ),
+        (
+            "publish_binding_hash_domain",
+            "dirextalk.key-package-publish-binding.v1\0",
+        ),
+        (
+            "publish_signature_domain",
+            "dirextalk.key-package-publish-signature.v1\0",
+        ),
+    ] {
+        if json_string(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "key-package-v1 vector {field} drifted"
+            )));
+        }
+    }
+    if vector.pointer("/publish_success_statuses") != Some(&json!([201, 200]))
+        || vector.pointer("/claim_success_statuses") != Some(&json!([201, 200]))
+    {
+        return Err(ProtocolToolError::new(
+            "key-package-v1 success statuses drifted",
+        ));
+    }
+    validate_identity_id(
+        json_string(&vector, "identity_id")?,
+        "key-package-v1 publisher identity",
+    )?;
+    validate_uuid_fields(&vector, &["/device_id", "/package_id"])?;
+    if json_i64(&vector, "published_identity_head_sequence")? != 2 {
+        return Err(ProtocolToolError::new(
+            "key-package-v1 published identity head sequence drifted",
+        ));
+    }
+    let _ =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "published_identity_head_hash_hex")?)?;
+    let opaque_key_package = decode_hex(json_string(&vector, "opaque_key_package_hex")?)?;
+    if opaque_key_package.is_empty() || opaque_key_package.len() > 65_536 {
+        return Err(ProtocolToolError::new(
+            "key-package-v1 opaque package must be bounded and nonempty",
+        ));
+    }
+    let mut package_hasher = Sha256::new();
+    package_hasher.update(b"dirextalk.key-package-bytes.v1\0");
+    package_hasher.update(&opaque_key_package);
+    if json_string(&vector, "key_package_digest_hex")? != lowercase_hex(&package_hasher.finalize())
+    {
+        return Err(ProtocolToolError::new(
+            "key-package-v1 package digest does not bind opaque bytes",
+        ));
+    }
+    let binding = decode_hex(json_string(&vector, "binding_canonical_cbor_hex")?)?;
+    let mut binding_hasher = Sha256::new();
+    binding_hasher.update(b"dirextalk.key-package-publish-binding.v1\0");
+    binding_hasher.update(&binding);
+    let mut signature_input = b"dirextalk.key-package-publish-signature.v1\0".to_vec();
+    signature_input.extend_from_slice(&binding_hasher.finalize());
+    if json_string(&vector, "publish_signature_input_hex")? != lowercase_hex(&signature_input) {
+        return Err(ProtocolToolError::new(
+            "key-package-v1 publish signature input does not bind the canonical binding",
+        ));
+    }
+    validate_cddl_hex(
+        "key-package-publish-binding-v1",
+        &cddl,
+        json_string(&vector, "binding_canonical_cbor_hex")?,
+    )?;
+    validate_cddl_hex(
+        "key-package-publish-v1",
+        &cddl,
+        json_string(&vector, "publish_canonical_cbor_hex")?,
+    )?;
+    validate_cddl_hex(
+        "key-package-claim-v1",
+        &cddl,
+        json_string(&vector, "claim_canonical_cbor_hex")?,
+    )?;
+    validate_cddl_hex(
+        "key-package-claim-receipt-v1",
+        &cddl,
+        json_string(&vector, "claim_receipt_canonical_cbor_hex")?,
+    )?;
+    for (status, code, retryable) in [
+        (401, "DEVICE_AUTHENTICATION_FAILED", false),
+        (404, "KEY_PACKAGE_UNAVAILABLE", false),
+        (409, "KEY_PACKAGE_CONFLICT", false),
+        (409, "IDEMPOTENCY_CONFLICT", false),
+        (422, "KEY_PACKAGE_INVALID", false),
+        (503, "IDENTITY_SERVICE_UNAVAILABLE", true),
+    ] {
+        if !has_error_response(&vector, status, code, retryable)? {
+            return Err(ProtocolToolError::new(format!(
+                "key-package-v1 vector must retain {status} {code}"
+            )));
+        }
+    }
+
+    let path = root.join("protocol/openapi/key-package/v1/openapi.yaml");
+    let source = read(&path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse OpenAPI {}: {error}", path.display()))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "key-package OpenAPI contract must declare 3.1.0",
+        ));
+    }
+    let document: Value = yaml_serde::from_str(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse key-package OpenAPI YAML tree: {error}"))
+    })?;
+    for (pointer, expected) in [
+        (
+            "/paths/~1v1~1key-packages~1{package_id}/put/operationId",
+            json!("publishKeyPackage"),
+        ),
+        (
+            "/paths/~1v1~1key-packages~1claim/post/operationId",
+            json!("claimKeyPackage"),
+        ),
+        (
+            "/paths/~1v1~1key-packages~1{package_id}/put/requestBody/content/application~1vnd.dirextalk.key-package-publish.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/paths/~1v1~1key-packages~1claim/post/requestBody/content/application~1vnd.dirextalk.key-package-claim.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/paths/~1v1~1key-packages~1claim/post/responses/404/$ref",
+            json!("#/components/responses/KeyPackageUnavailable"),
+        ),
+        (
+            "/components/parameters/IdempotencyKey/schema/pattern",
+            json!("^[A-Za-z0-9_-]{16,128}$"),
         ),
     ] {
         expect_value(&document, pointer, &expected)?;

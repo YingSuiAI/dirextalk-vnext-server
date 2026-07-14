@@ -171,6 +171,7 @@ define_uuid_v7_id!(AggregateId, "aggregate ID");
 define_uuid_v7_id!(DeviceId, "device ID");
 define_uuid_v7_id!(DeviceSessionChallengeId, "device session challenge ID");
 define_uuid_v7_id!(DeviceSessionId, "device session ID");
+define_uuid_v7_id!(KeyPackageId, "MLS KeyPackage ID");
 define_uuid_v7_id!(
     DeviceEnrollmentChallengeId,
     "device enrollment challenge ID"

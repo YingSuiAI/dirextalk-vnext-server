@@ -1,0 +1,10 @@
+{
+  "version": 13,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/key-package/v1/key-package-v1.cddl": "sha256:8f70de87b42be614dc2be4b9145f80cc13ba0370fc2b94963d052cb2620385f2",
+    "protocol/openapi/key-package/v1/openapi.yaml": "sha256:3c72ed4073daec84f1781e028522cb633e25285da958096229f67cd608737b6c",
+    "protocol/test-vectors/key-package/v1/key-package-v1.json": "sha256:a9abf38f1a7b37bc30f00bff497e1a6a1b653d69fd0e1b51eb51f4c518d1515b"
+  }
+}

@@ -1,0 +1,16 @@
+REVOKE ALL ON FUNCTION identity.prune_expired_key_packages(bigint, integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION identity.enforce_key_package_immutable_or_prunable() FROM PUBLIC;
+REVOKE ALL ON FUNCTION identity.enforce_key_package_transition() FROM PUBLIC;
+REVOKE ALL ON FUNCTION identity.key_package_retention_prune_authorized() FROM PUBLIC;
+DROP TRIGGER identity_key_package_claim_receipts_append_only ON identity.key_package_claim_receipts;
+DROP TRIGGER identity_key_package_claims_append_only ON identity.key_package_claims;
+DROP TRIGGER identity_key_package_publish_claims_append_only ON identity.key_package_publish_claims;
+DROP TRIGGER identity_key_packages_transition ON identity.key_packages;
+DROP FUNCTION identity.prune_expired_key_packages(bigint, integer);
+DROP FUNCTION identity.enforce_key_package_immutable_or_prunable();
+DROP FUNCTION identity.enforce_key_package_transition();
+DROP FUNCTION identity.key_package_retention_prune_authorized();
+DROP TABLE identity.key_package_claim_receipts;
+DROP TABLE identity.key_package_claims;
+DROP TABLE identity.key_package_publish_claims;
+DROP TABLE identity.key_packages;
