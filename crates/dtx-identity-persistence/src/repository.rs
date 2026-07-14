@@ -294,6 +294,32 @@ impl IdentityLogRepository {
 
         resolve_append_decision(connection, command, request_digest, committed_at, decision).await
     }
+
+    /// Runs the normal exact identity append inside a caller-owned validated
+    /// identity transaction.
+    ///
+    /// This is intentionally crate-private: higher-level durable workflows
+    /// (such as QR device enrollment) must retain their own authorization,
+    /// capability, state transition, append receipt, and outbox work in one
+    /// `PostgreSQL` transaction. HTTP callers continue to use [`Self::append`]
+    /// and never construct an [`IdentityLogHead`] themselves.
+    pub(crate) async fn append_in_transaction(
+        self,
+        connection: &mut PgConnection,
+        command: &IdentityAppendCommand,
+        committed_at: UtcMillis,
+    ) -> Result<IdentityAppendOutcome, IdentityPersistenceError> {
+        let (event, identity_id, request_digest) = prepare_append_command(command)?;
+        self.append_verified_in_transaction(
+            connection,
+            command,
+            &event,
+            identity_id,
+            request_digest,
+            committed_at,
+        )
+        .await
+    }
 }
 
 async fn resolve_append_decision(

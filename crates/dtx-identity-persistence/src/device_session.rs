@@ -738,43 +738,7 @@ impl DeviceSessionRepository {
         now: UtcMillis,
     ) -> Result<AuthenticatedDeviceSession, IdentityPersistenceError> {
         let mut session = store.begin().await?;
-        let result = async {
-            let row = sqlx::query(
-                "SELECT identity_id, device_id, session_secret_hash, expires_at_ms
-                   FROM identity.device_sessions
-                  WHERE session_id=$1",
-            )
-            .bind(*credential.session_id().as_uuid())
-            .fetch_optional(&mut *session.connection())
-            .await?
-            .ok_or(IdentityPersistenceError::DeviceAuthenticationRejected)?;
-            let stored_secret = digest(
-                &row.try_get::<Vec<u8>, _>("session_secret_hash")?,
-                "device session secret hash",
-            )?;
-            if !bool::from(
-                stored_secret
-                    .as_bytes()
-                    .ct_eq(credential.secret_hash().as_bytes()),
-            ) {
-                return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
-            }
-            let expires_at = utc_millis(row.try_get("expires_at_ms")?, "device session expiry")?;
-            if now >= expires_at {
-                return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
-            }
-            let identity_id = parse_identity_id(&row.try_get::<String, _>("identity_id")?)?;
-            let device_id = parse_device_id(row.try_get::<Uuid, _>("device_id")?)?;
-            let snapshot = lock_and_load_active_snapshot(session.connection(), identity_id).await?;
-            active_device_signing_key(snapshot.projection(), device_id)?;
-            Ok(AuthenticatedDeviceSession {
-                identity_id,
-                device_id,
-                session_id: credential.session_id(),
-                expires_at,
-            })
-        }
-        .await;
+        let result = Self::authenticate_in_transaction(session.connection(), credential, now).await;
         match result {
             Ok(authenticated) => {
                 session.commit().await?;
@@ -785,6 +749,52 @@ impl DeviceSessionRepository {
                 Err(error)
             }
         }
+    }
+
+    /// Validates one device session in a caller-owned identity transaction.
+    ///
+    /// QR enrollment uses this rather than the public [`Self::authenticate`]
+    /// wrapper so a concurrent device revoke cannot occur between credential
+    /// verification and its identity-log append.
+    pub(crate) async fn authenticate_in_transaction(
+        connection: &mut PgConnection,
+        credential: &DeviceSessionCredential,
+        now: UtcMillis,
+    ) -> Result<AuthenticatedDeviceSession, IdentityPersistenceError> {
+        let row = sqlx::query(
+            "SELECT identity_id, device_id, session_secret_hash, expires_at_ms
+               FROM identity.device_sessions
+              WHERE session_id=$1",
+        )
+        .bind(*credential.session_id().as_uuid())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or(IdentityPersistenceError::DeviceAuthenticationRejected)?;
+        let stored_secret = digest(
+            &row.try_get::<Vec<u8>, _>("session_secret_hash")?,
+            "device session secret hash",
+        )?;
+        if !bool::from(
+            stored_secret
+                .as_bytes()
+                .ct_eq(credential.secret_hash().as_bytes()),
+        ) {
+            return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+        }
+        let expires_at = utc_millis(row.try_get("expires_at_ms")?, "device session expiry")?;
+        if now >= expires_at {
+            return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+        }
+        let identity_id = parse_identity_id(&row.try_get::<String, _>("identity_id")?)?;
+        let device_id = parse_device_id(row.try_get::<Uuid, _>("device_id")?)?;
+        let snapshot = lock_and_load_active_snapshot(connection, identity_id).await?;
+        active_device_signing_key(snapshot.projection(), device_id)?;
+        Ok(AuthenticatedDeviceSession {
+            identity_id,
+            device_id,
+            session_id: credential.session_id(),
+            expires_at,
+        })
     }
 }
 

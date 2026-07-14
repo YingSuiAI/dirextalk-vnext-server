@@ -116,6 +116,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_identity_log_v1_1(root)?;
     validate_identity_bootstrap_v1(root)?;
     validate_identity_session_v1(root)?;
+    validate_identity_enrollment_v1(root)?;
     validate_public_descriptor_v1(root)?;
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
@@ -555,6 +556,354 @@ fn validate_identity_session_v1(root: &Path) -> Result<(), ProtocolToolError> {
         ),
         (
             "/components/responses/DeviceSessionIssued/content/application~1vnd.dirextalk.device-session-receipt.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+    ] {
+        expect_value(&document, pointer, &expected)?;
+    }
+    Ok(())
+}
+
+fn validate_identity_enrollment_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl =
+        read(&root.join("protocol/cddl/identity-enrollment/v1/identity-enrollment-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse identity-enrollment v1 CDDL: {error}"))
+    })?;
+    let vector = read_json(
+        &root.join("protocol/test-vectors/identity-enrollment/v1/identity-enrollment-v1.json"),
+    )?;
+    validate_vector_version(&vector, "identity-enrollment-v1")?;
+    for (field, expected) in [
+        ("challenge_path", "/v1/devices/enroll/challenges"),
+        (
+            "challenge_status_path_template",
+            "/v1/devices/enroll/challenges/{challenge_id}",
+        ),
+        ("enroll_path", "/v1/devices/enroll"),
+        (
+            "candidate_content_type",
+            "application/vnd.dirextalk.device-enrollment-candidate.v1+cbor",
+        ),
+        (
+            "challenge_status_content_type",
+            "application/vnd.dirextalk.device-enrollment-status.v1+cbor",
+        ),
+        (
+            "completion_content_type",
+            "application/vnd.dirextalk.device-enrollment.v1+cbor",
+        ),
+        (
+            "append_receipt_content_type",
+            "application/vnd.dirextalk.identity-append-receipt.v1+cbor",
+        ),
+        ("authorization_scheme", "DTX-Device-Session"),
+    ] {
+        if json_string(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "identity-enrollment-v1 vector {field} drifted"
+            )));
+        }
+    }
+    for (field, expected) in [
+        ("idempotency_key_min_bytes", 16_i64),
+        ("idempotency_key_max_bytes", 128_i64),
+        ("enrollment_capability_bytes", 32_i64),
+        ("challenge_ttl_millis", 300_000_i64),
+    ] {
+        if json_i64(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "identity-enrollment-v1 vector {field} drifted"
+            )));
+        }
+    }
+    for (state, value) in [
+        ("pending", 1_i64),
+        ("approved", 2),
+        ("cancelled", 3),
+        ("expired", 4),
+    ] {
+        if vector.pointer(&format!("/states/{state}")) != Some(&json!(value)) {
+            return Err(ProtocolToolError::new(format!(
+                "identity-enrollment-v1 vector state {state} drifted"
+            )));
+        }
+    }
+    if vector.pointer("/success_statuses/challenge") != Some(&json!([201, 200]))
+        || vector.pointer("/success_statuses/approval") != Some(&json!([201, 200]))
+        || vector.pointer("/success_statuses/cancel") != Some(&json!([200]))
+    {
+        return Err(ProtocolToolError::new(
+            "identity-enrollment-v1 vector success statuses drifted",
+        ));
+    }
+
+    validate_uuid_fields(
+        &vector,
+        &[
+            "/candidate/device_id",
+            "/challenge/challenge_id",
+            "/qr_payload/challenge_id",
+            "/qr_payload/device_id",
+        ],
+    )?;
+    let candidate = vector
+        .get("candidate")
+        .ok_or_else(|| ProtocolToolError::new("identity-enrollment-v1 candidate is missing"))?;
+    require_exact_object_keys(
+        candidate,
+        &[
+            "identity_id",
+            "device_id",
+            "device_signing_public_key",
+            "device_encryption_public_key",
+            "enrollment_capability",
+            "canonical_cbor_hex",
+        ],
+        "identity-enrollment-v1 candidate",
+    )?;
+    let identity_id = json_string(candidate, "identity_id")?;
+    validate_identity_id(identity_id, "identity-enrollment-v1 candidate identity")?;
+    let device_id = json_string(candidate, "device_id")?;
+    let device_signing_public_key =
+        decode_base64url_fixed::<32>(json_string(candidate, "device_signing_public_key")?)?;
+    let device_encryption_public_key =
+        decode_base64url_fixed::<32>(json_string(candidate, "device_encryption_public_key")?)?;
+    let enrollment_capability =
+        decode_base64url_fixed::<32>(json_string(candidate, "enrollment_capability")?)?;
+    validate_enrollment_material(
+        device_signing_public_key,
+        device_encryption_public_key,
+        enrollment_capability,
+    )?;
+    let expected_candidate = encode_device_enrollment_candidate(
+        identity_id,
+        device_id,
+        device_signing_public_key,
+        device_encryption_public_key,
+        enrollment_capability,
+    )?;
+    validate_exact_cddl_bytes(
+        "device-enrollment-candidate-v1",
+        &cddl,
+        json_string(candidate, "canonical_cbor_hex")?,
+        &expected_candidate,
+    )?;
+
+    let challenge = vector
+        .get("challenge")
+        .ok_or_else(|| ProtocolToolError::new("identity-enrollment-v1 challenge is missing"))?;
+    require_exact_object_keys(
+        challenge,
+        &[
+            "challenge_id",
+            "expires_at_ms",
+            "pending_status_canonical_cbor_hex",
+        ],
+        "identity-enrollment-v1 challenge",
+    )?;
+    let challenge_id = json_string(challenge, "challenge_id")?;
+    let expires_at_ms = json_i64(challenge, "expires_at_ms")?;
+    validate_enrollment_expiry(expires_at_ms)?;
+    let expected_status =
+        encode_device_enrollment_status(challenge_id, identity_id, device_id, 1, expires_at_ms)?;
+    validate_exact_cddl_bytes(
+        "device-enrollment-challenge-status-v1",
+        &cddl,
+        json_string(challenge, "pending_status_canonical_cbor_hex")?,
+        &expected_status,
+    )?;
+
+    let qr_payload = vector
+        .get("qr_payload")
+        .ok_or_else(|| ProtocolToolError::new("identity-enrollment-v1 QR payload is missing"))?;
+    require_exact_object_keys(
+        qr_payload,
+        &[
+            "https_origin",
+            "identity_id",
+            "challenge_id",
+            "device_id",
+            "device_signing_public_key",
+            "device_encryption_public_key",
+            "enrollment_capability",
+            "expires_at_ms",
+            "canonical_cbor_hex",
+        ],
+        "identity-enrollment-v1 QR payload",
+    )?;
+    let qr_origin = json_string(qr_payload, "https_origin")?;
+    validate_strict_https_origin(qr_origin)?;
+    for (field, expected) in [
+        ("identity_id", identity_id),
+        ("challenge_id", challenge_id),
+        ("device_id", device_id),
+        (
+            "device_signing_public_key",
+            json_string(candidate, "device_signing_public_key")?,
+        ),
+        (
+            "device_encryption_public_key",
+            json_string(candidate, "device_encryption_public_key")?,
+        ),
+        (
+            "enrollment_capability",
+            json_string(candidate, "enrollment_capability")?,
+        ),
+    ] {
+        if json_string(qr_payload, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "identity-enrollment-v1 QR payload {field} does not bind the challenge candidate"
+            )));
+        }
+    }
+    if json_i64(qr_payload, "expires_at_ms")? != expires_at_ms {
+        return Err(ProtocolToolError::new(
+            "identity-enrollment-v1 QR payload expiry does not bind the challenge",
+        ));
+    }
+    let expected_qr = encode_device_enrollment_qr(
+        qr_origin,
+        identity_id,
+        challenge_id,
+        device_id,
+        device_signing_public_key,
+        device_encryption_public_key,
+        enrollment_capability,
+        expires_at_ms,
+    )?;
+    validate_exact_cddl_bytes(
+        "device-enrollment-qr-v1",
+        &cddl,
+        json_string(qr_payload, "canonical_cbor_hex")?,
+        &expected_qr,
+    )?;
+
+    let completion = vector
+        .get("completion")
+        .ok_or_else(|| ProtocolToolError::new("identity-enrollment-v1 completion is missing"))?;
+    require_exact_object_keys(
+        completion,
+        &[
+            "if_match",
+            "device_add_event_canonical_cbor_hex",
+            "canonical_cbor_hex",
+        ],
+        "identity-enrollment-v1 completion",
+    )?;
+    validate_quoted_sha256_if_match(json_string(completion, "if_match")?)?;
+    let device_add_bytes = decode_hex(json_string(
+        completion,
+        "device_add_event_canonical_cbor_hex",
+    )?)?;
+    let identity_log_cddl =
+        read(&root.join("protocol/cddl/identity-log/v1_1/identity-log-v1-1.cddl"))?;
+    cddl_cat::validate_cbor_bytes(
+        "identity-log-device-add-event-v1-1",
+        &identity_log_cddl,
+        &device_add_bytes,
+    )
+    .map_err(|error| {
+        ProtocolToolError::new(format!(
+            "CDDL rejected identity-enrollment-v1 exact DeviceAdd event: {error}"
+        ))
+    })?;
+    let expected_completion = encode_device_enrollment_completion(
+        challenge_id,
+        enrollment_capability,
+        &device_add_bytes,
+    )?;
+    validate_exact_cddl_bytes(
+        "device-enrollment-completion-v1",
+        &cddl,
+        json_string(completion, "canonical_cbor_hex")?,
+        &expected_completion,
+    )?;
+
+    let receipt_cddl =
+        read(&root.join("protocol/cddl/identity-http/v1/identity-bootstrap-v1.cddl"))?;
+    validate_cddl_hex(
+        "identity-bootstrap-append-receipt-v1",
+        &receipt_cddl,
+        json_string(&vector, "append_receipt_canonical_cbor_hex")?,
+    )?;
+    for (status, code, retryable) in [
+        (401, "DEVICE_ENROLLMENT_CAPABILITY_INVALID", false),
+        (401, "DEVICE_AUTHENTICATION_FAILED", false),
+        (409, "DEVICE_ENROLLMENT_CHALLENGE_EXPIRED", false),
+        (409, "DEVICE_ENROLLMENT_CHALLENGE_CANCELLED", false),
+        (409, "DEVICE_ENROLLMENT_CHALLENGE_ALREADY_APPROVED", false),
+        (409, "IDEMPOTENCY_CONFLICT", false),
+        (422, "DEVICE_ENROLLMENT_INVALID", false),
+        (503, "IDENTITY_SERVICE_UNAVAILABLE", true),
+    ] {
+        if !has_error_response(&vector, status, code, retryable)? {
+            return Err(ProtocolToolError::new(format!(
+                "identity-enrollment-v1 vector must retain {status} {code}"
+            )));
+        }
+    }
+
+    let path = root.join("protocol/openapi/identity-enrollment/v1/openapi.yaml");
+    let source = read(&path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse OpenAPI {}: {error}", path.display()))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "identity enrollment OpenAPI contract must declare 3.1.0",
+        ));
+    }
+    let document: Value = yaml_serde::from_str(&source).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse identity enrollment OpenAPI YAML tree: {error}"
+        ))
+    })?;
+    for (pointer, expected) in [
+        (
+            "/paths/~1v1~1devices~1enroll~1challenges/post/operationId",
+            json!("createDeviceEnrollmentChallenge"),
+        ),
+        (
+            "/paths/~1v1~1devices~1enroll~1challenges~1{challenge_id}/get/operationId",
+            json!("getDeviceEnrollmentChallenge"),
+        ),
+        (
+            "/paths/~1v1~1devices~1enroll~1challenges~1{challenge_id}/delete/operationId",
+            json!("cancelDeviceEnrollmentChallenge"),
+        ),
+        (
+            "/paths/~1v1~1devices~1enroll/post/operationId",
+            json!("approveDeviceEnrollment"),
+        ),
+        (
+            "/paths/~1v1~1devices~1enroll~1challenges/post/requestBody/content/application~1vnd.dirextalk.device-enrollment-candidate.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/paths/~1v1~1devices~1enroll/post/requestBody/content/application~1vnd.dirextalk.device-enrollment.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/components/parameters/EnrollmentCapability/name",
+            json!("DTX-Enrollment-Capability"),
+        ),
+        (
+            "/components/parameters/DeviceSessionAuthorization/schema/pattern",
+            json!(
+                "^DTX-Device-Session [0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.[A-Za-z0-9_-]{43}$"
+            ),
+        ),
+        (
+            "/components/parameters/IdentityHeadIfMatch/schema/pattern",
+            json!("^\"sha256:[a-f0-9]{64}\"$"),
+        ),
+        (
+            "/components/responses/EnrollmentChallengeStatus/content/application~1vnd.dirextalk.device-enrollment-status.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/components/responses/IdentityAppendCommitted/content/application~1vnd.dirextalk.identity-append-receipt.v1+cbor/x-dirextalk-exact-cbor",
             json!(true),
         ),
     ] {
@@ -1278,6 +1627,262 @@ fn encode_cbor_length(output: &mut Vec<u8>, major: u8, length: u64) {
             output.extend_from_slice(&length.to_be_bytes());
         }
     }
+}
+
+fn require_exact_object_keys(
+    value: &Value,
+    expected: &[&str],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ProtocolToolError::new(format!("{label} must be an object")))?;
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ProtocolToolError::new(format!(
+            "{label} field set does not match the frozen contract"
+        )))
+    }
+}
+
+fn validate_identity_id(value: &str, label: &str) -> Result<(), ProtocolToolError> {
+    let bytes = value.as_bytes();
+    if bytes.len() == 57
+        && bytes.starts_with(b"dtxi1")
+        && bytes[5..]
+            .iter()
+            .all(|byte| matches!(*byte, b'a'..=b'z' | b'2'..=b'7'))
+    {
+        Ok(())
+    } else {
+        Err(ProtocolToolError::new(format!(
+            "{label} must be a canonical self-certifying identity ID"
+        )))
+    }
+}
+
+fn validate_enrollment_material(
+    device_signing_public_key: [u8; 32],
+    device_encryption_public_key: [u8; 32],
+    enrollment_capability: [u8; 32],
+) -> Result<(), ProtocolToolError> {
+    VerifyingKey::from_bytes(&device_signing_public_key).map_err(|_| {
+        ProtocolToolError::new("identity-enrollment-v1 signing key is not an Ed25519 key")
+    })?;
+    if device_encryption_public_key.iter().all(|byte| *byte == 0) {
+        return Err(ProtocolToolError::new(
+            "identity-enrollment-v1 encryption key cannot be all zero",
+        ));
+    }
+    if device_signing_public_key == device_encryption_public_key {
+        return Err(ProtocolToolError::new(
+            "identity-enrollment-v1 signing and encryption keys must be distinct",
+        ));
+    }
+    if enrollment_capability.iter().all(|byte| *byte == 0) {
+        return Err(ProtocolToolError::new(
+            "identity-enrollment-v1 capability cannot be all zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_enrollment_expiry(value: i64) -> Result<(), ProtocolToolError> {
+    if (1..=253_402_300_799_999).contains(&value) {
+        Ok(())
+    } else {
+        Err(ProtocolToolError::new(
+            "identity-enrollment-v1 expiry must be a positive UTC millisecond value",
+        ))
+    }
+}
+
+fn validate_strict_https_origin(value: &str) -> Result<(), ProtocolToolError> {
+    let authority = value.strip_prefix("https://").ok_or_else(|| {
+        ProtocolToolError::new("identity-enrollment-v1 QR origin must use lowercase HTTPS")
+    })?;
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.bytes().any(|byte| !byte.is_ascii_graphic())
+    {
+        return Err(ProtocolToolError::new(
+            "identity-enrollment-v1 QR origin must be a strict HTTPS origin without userinfo or path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_quoted_sha256_if_match(value: &str) -> Result<(), ProtocolToolError> {
+    let digest = value
+        .strip_prefix("\"sha256:")
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "identity-enrollment-v1 If-Match must be quoted lowercase sha256",
+            )
+        })?;
+    let _ = decode_lower_hex_fixed::<32>(digest)?;
+    Ok(())
+}
+
+fn validate_exact_cddl_bytes(
+    rule: &str,
+    cddl: &str,
+    encoded: &str,
+    expected: &[u8],
+) -> Result<(), ProtocolToolError> {
+    let actual = decode_hex(encoded)?;
+    if actual != expected {
+        return Err(ProtocolToolError::new(format!(
+            "{rule} golden vector does not preserve its exact canonical fields"
+        )));
+    }
+    cddl_cat::validate_cbor_bytes(rule, cddl, &actual)
+        .map_err(|error| ProtocolToolError::new(format!("CDDL rejected {rule}: {error}")))
+}
+
+fn encode_device_enrollment_candidate(
+    identity_id: &str,
+    device_id: &str,
+    device_signing_public_key: [u8; 32],
+    device_encryption_public_key: [u8; 32],
+    enrollment_capability: [u8; 32],
+) -> Result<Vec<u8>, ProtocolToolError> {
+    let mut encoded = Vec::new();
+    encode_cbor_length(&mut encoded, 5, 6);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 2);
+    append_cbor_text(&mut encoded, identity_id)?;
+    append_cbor_unsigned(&mut encoded, 3);
+    append_cbor_text(&mut encoded, device_id)?;
+    append_cbor_unsigned(&mut encoded, 4);
+    append_cbor_bytes(&mut encoded, &device_signing_public_key)?;
+    append_cbor_unsigned(&mut encoded, 5);
+    append_cbor_bytes(&mut encoded, &device_encryption_public_key)?;
+    append_cbor_unsigned(&mut encoded, 6);
+    append_cbor_bytes(&mut encoded, &enrollment_capability)?;
+    Ok(encoded)
+}
+
+fn encode_device_enrollment_status(
+    challenge_id: &str,
+    identity_id: &str,
+    device_id: &str,
+    state: u8,
+    expires_at_ms: i64,
+) -> Result<Vec<u8>, ProtocolToolError> {
+    if !(1..=4).contains(&state) {
+        return Err(ProtocolToolError::new(
+            "identity-enrollment-v1 state must be a known frozen value",
+        ));
+    }
+    validate_enrollment_expiry(expires_at_ms)?;
+    let mut encoded = Vec::new();
+    encode_cbor_length(&mut encoded, 5, 6);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 2);
+    append_cbor_text(&mut encoded, challenge_id)?;
+    append_cbor_unsigned(&mut encoded, 3);
+    append_cbor_text(&mut encoded, identity_id)?;
+    append_cbor_unsigned(&mut encoded, 4);
+    append_cbor_text(&mut encoded, device_id)?;
+    append_cbor_unsigned(&mut encoded, 5);
+    append_cbor_unsigned(&mut encoded, u64::from(state));
+    append_cbor_unsigned(&mut encoded, 6);
+    append_cbor_unsigned(
+        &mut encoded,
+        u64::try_from(expires_at_ms)
+            .map_err(|_| ProtocolToolError::new("identity-enrollment-v1 expiry is negative"))?,
+    );
+    Ok(encoded)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_device_enrollment_qr(
+    origin: &str,
+    identity_id: &str,
+    challenge_id: &str,
+    device_id: &str,
+    device_signing_public_key: [u8; 32],
+    device_encryption_public_key: [u8; 32],
+    enrollment_capability: [u8; 32],
+    expires_at_ms: i64,
+) -> Result<Vec<u8>, ProtocolToolError> {
+    validate_strict_https_origin(origin)?;
+    validate_enrollment_expiry(expires_at_ms)?;
+    let mut encoded = Vec::new();
+    encode_cbor_length(&mut encoded, 5, 9);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 2);
+    append_cbor_text(&mut encoded, origin)?;
+    append_cbor_unsigned(&mut encoded, 3);
+    append_cbor_text(&mut encoded, identity_id)?;
+    append_cbor_unsigned(&mut encoded, 4);
+    append_cbor_text(&mut encoded, challenge_id)?;
+    append_cbor_unsigned(&mut encoded, 5);
+    append_cbor_text(&mut encoded, device_id)?;
+    append_cbor_unsigned(&mut encoded, 6);
+    append_cbor_bytes(&mut encoded, &device_signing_public_key)?;
+    append_cbor_unsigned(&mut encoded, 7);
+    append_cbor_bytes(&mut encoded, &device_encryption_public_key)?;
+    append_cbor_unsigned(&mut encoded, 8);
+    append_cbor_bytes(&mut encoded, &enrollment_capability)?;
+    append_cbor_unsigned(&mut encoded, 9);
+    append_cbor_unsigned(
+        &mut encoded,
+        u64::try_from(expires_at_ms)
+            .map_err(|_| ProtocolToolError::new("identity-enrollment-v1 expiry is negative"))?,
+    );
+    Ok(encoded)
+}
+
+fn encode_device_enrollment_completion(
+    challenge_id: &str,
+    enrollment_capability: [u8; 32],
+    device_add_bytes: &[u8],
+) -> Result<Vec<u8>, ProtocolToolError> {
+    if device_add_bytes.is_empty() || device_add_bytes.len() > 1_048_576 {
+        return Err(ProtocolToolError::new(
+            "identity-enrollment-v1 exact DeviceAdd has an invalid length",
+        ));
+    }
+    let mut encoded = Vec::new();
+    encode_cbor_length(&mut encoded, 5, 4);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 2);
+    append_cbor_text(&mut encoded, challenge_id)?;
+    append_cbor_unsigned(&mut encoded, 3);
+    append_cbor_bytes(&mut encoded, &enrollment_capability)?;
+    append_cbor_unsigned(&mut encoded, 4);
+    append_cbor_bytes(&mut encoded, device_add_bytes)?;
+    Ok(encoded)
+}
+
+fn append_cbor_unsigned(output: &mut Vec<u8>, value: u64) {
+    encode_cbor_length(output, 0, value);
+}
+
+fn append_cbor_text(output: &mut Vec<u8>, value: &str) -> Result<(), ProtocolToolError> {
+    let length = u64::try_from(value.len())
+        .map_err(|_| ProtocolToolError::new("CBOR text length exceeds u64"))?;
+    encode_cbor_length(output, 3, length);
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn append_cbor_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), ProtocolToolError> {
+    let length = u64::try_from(value.len())
+        .map_err(|_| ProtocolToolError::new("CBOR byte string length exceeds u64"))?;
+    encode_cbor_length(output, 2, length);
+    output.extend_from_slice(value);
+    Ok(())
 }
 
 fn validate_vector_version(vector: &Value, name: &str) -> Result<(), ProtocolToolError> {

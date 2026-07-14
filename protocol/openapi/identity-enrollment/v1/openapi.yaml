@@ -1,0 +1,259 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk QR Additional Device Enrollment Contract
+  version: 1.0.0
+  description: >-
+    A candidate device creates a five-minute, capability-gated QR enrollment
+    challenge. Approval requires both the current active-device session and an
+    exact root-signed DeviceAdd event; the server never accepts a permanent
+    owner bearer credential or emits private root/session material.
+paths:
+  /v1/devices/enroll/challenges:
+    post:
+      operationId: createDeviceEnrollmentChallenge
+      summary: Create or exactly replay a five-minute candidate enrollment challenge.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.device-enrollment-candidate.v1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 16384
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          $ref: '#/components/responses/EnrollmentChallengeCreated'
+        '200':
+          $ref: '#/components/responses/EnrollmentChallengeReplayed'
+        '409':
+          $ref: '#/components/responses/EnrollmentConflict'
+        '422':
+          $ref: '#/components/responses/EnrollmentInvalid'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/devices/enroll/challenges/{challenge_id}:
+    parameters:
+      - $ref: '#/components/parameters/ChallengeId'
+      - $ref: '#/components/parameters/EnrollmentCapability'
+    get:
+      operationId: getDeviceEnrollmentChallenge
+      summary: Read a capability-gated enrollment state without revealing the capability.
+      responses:
+        '200':
+          $ref: '#/components/responses/EnrollmentChallengeStatus'
+        '401':
+          $ref: '#/components/responses/EnrollmentCapabilityRejected'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      operationId: cancelDeviceEnrollmentChallenge
+      summary: Cancel a pending challenge; a repeated cancellation returns cancelled state.
+      responses:
+        '200':
+          $ref: '#/components/responses/EnrollmentChallengeCancelled'
+        '401':
+          $ref: '#/components/responses/EnrollmentCapabilityRejected'
+        '409':
+          $ref: '#/components/responses/EnrollmentConflict'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/devices/enroll:
+    post:
+      operationId: approveDeviceEnrollment
+      summary: Approve one pending QR enrollment with an active device session.
+      description: >-
+        The request's exact DeviceAdd bytes must match the candidate keys and
+        identity, be signed under the current root, and append at the current
+        quoted identity-log head. The session identity must equal the challenge
+        identity. A response-loss retry reuses the same Idempotency-Key, exact
+        body, If-Match, and authorization credential.
+      parameters:
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IdentityHeadIfMatch'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.device-enrollment.v1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 1048576
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          $ref: '#/components/responses/IdentityAppendCommitted'
+        '200':
+          $ref: '#/components/responses/IdentityAppendReplayed'
+        '401':
+          $ref: '#/components/responses/DeviceAuthenticationFailed'
+        '409':
+          $ref: '#/components/responses/EnrollmentConflict'
+        '422':
+          $ref: '#/components/responses/EnrollmentInvalid'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+        pattern: '^[A-Za-z0-9_-]{16,128}$'
+    ChallengeId:
+      name: challenge_id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/UuidV7'
+    EnrollmentCapability:
+      name: DTX-Enrollment-Capability
+      in: header
+      required: true
+      description: Exactly 32 URL-safe base64url bytes held by the candidate device.
+      schema:
+        $ref: '#/components/schemas/Base64Url32'
+    DeviceSessionAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      description: >-
+        Exact active-device session form: DTX-Device-Session
+        <canonical UUIDv7>.<43-char unpadded base64url secret>.
+      schema:
+        type: string
+        pattern: '^DTX-Device-Session [0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$'
+    IdentityHeadIfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: Exact quoted SHA-256 hash of the current identity-log head.
+      schema:
+        type: string
+        pattern: '^"sha256:[a-f0-9]{64}"$'
+  headers:
+    CacheControlNoStore:
+      schema:
+        type: string
+        const: no-store
+    XContentTypeOptions:
+      schema:
+        type: string
+        const: nosniff
+    XRequestId:
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  responses:
+    EnrollmentChallengeCreated:
+      description: A new pending challenge was committed once.
+      $ref: '#/components/responses/EnrollmentChallengeStatus'
+    EnrollmentChallengeReplayed:
+      description: Exact candidate retry returned the original pending challenge.
+      $ref: '#/components/responses/EnrollmentChallengeStatus'
+    EnrollmentChallengeStatus:
+      description: A capability-gated pending, approved, cancelled, or expired state.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/vnd.dirextalk.device-enrollment-status.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema:
+            type: string
+            format: binary
+    EnrollmentChallengeCancelled:
+      description: The capability cancelled the pending challenge or replayed its cancelled state.
+      $ref: '#/components/responses/EnrollmentChallengeStatus'
+    IdentityAppendCommitted:
+      description: The exact candidate-matching DeviceAdd appended once.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/vnd.dirextalk.identity-append-receipt.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema:
+            type: string
+            format: binary
+    IdentityAppendReplayed:
+      description: Exact approval retry returned the original append receipt.
+      $ref: '#/components/responses/IdentityAppendCommitted'
+    EnrollmentCapabilityRejected:
+      description: Missing, malformed, or wrong capability; never reveals challenge existence.
+      $ref: '#/components/responses/ErrorResponse'
+    DeviceAuthenticationFailed:
+      description: The active device session is missing, expired, revoked, or for another identity.
+      $ref: '#/components/responses/ErrorResponse'
+    EnrollmentConflict:
+      description: The challenge is not pending, the head changed, or the idempotency key was reused differently.
+      $ref: '#/components/responses/ErrorResponse'
+    EnrollmentInvalid:
+      description: Candidate, QR approval body, or exact DeviceAdd validation failed.
+      $ref: '#/components/responses/ErrorResponse'
+    ServiceUnavailable:
+      description: Durable identity storage is temporarily unavailable.
+      $ref: '#/components/responses/ErrorResponse'
+    ErrorResponse:
+      description: A redacted non-cacheable error.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelopeV1'
+  schemas:
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    Base64Url32:
+      type: string
+      minLength: 43
+      maxLength: 43
+      pattern: '^[A-Za-z0-9_-]{43}$'
+    ErrorEnvelopeV1:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, request_id, retryable]
+          properties:
+            code:
+              type: string
+              enum:
+                - DEVICE_ENROLLMENT_INVALID
+                - DEVICE_ENROLLMENT_CAPABILITY_INVALID
+                - DEVICE_ENROLLMENT_CHALLENGE_EXPIRED
+                - DEVICE_ENROLLMENT_CHALLENGE_CANCELLED
+                - DEVICE_ENROLLMENT_CHALLENGE_ALREADY_APPROVED
+                - DEVICE_AUTHENTICATION_FAILED
+                - IDENTITY_APPEND_CONFLICT
+                - IDEMPOTENCY_CONFLICT
+                - IDENTITY_SERVICE_UNAVAILABLE
+            request_id:
+              $ref: '#/components/headers/XRequestId/schema'
+            retryable:
+              type: boolean

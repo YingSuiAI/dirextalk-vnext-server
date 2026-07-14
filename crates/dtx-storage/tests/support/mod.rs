@@ -343,6 +343,10 @@ impl PostgresHarness {
              GRANT SELECT, INSERT ON identity.device_session_receipts TO dtx_identity_runtime;
              GRANT EXECUTE ON FUNCTION identity.prune_expired_device_sessions(bigint, integer)
                 TO dtx_identity_runtime;
+             GRANT SELECT, INSERT, UPDATE ON identity.device_enrollment_challenges
+                TO dtx_identity_runtime;
+             GRANT EXECUTE ON FUNCTION identity.prune_expired_device_enrollment_challenges(bigint, integer)
+                TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.fork_evidence TO dtx_identity_runtime;
               GRANT SELECT, INSERT ON identity.log_outbox TO dtx_identity_runtime;
 

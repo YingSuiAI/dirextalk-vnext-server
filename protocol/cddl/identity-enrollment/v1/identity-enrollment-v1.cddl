@@ -1,0 +1,68 @@
+; QR-mediated additional-device enrollment HTTP V1.
+; The candidate owns the 32-byte enrollment capability.  It is a short-lived
+; lookup/cancellation capability only: approval still requires a currently
+; active device session and the exact root-signed identity-log DeviceAdd event.
+
+identity-id-v1 = tstr .size 57
+uuid-v7-v1 = tstr .size 36
+ed25519-public-key-v1 = bstr .size 32
+device-encryption-public-key-v1 = bstr .size 32
+enrollment-capability-v1 = bstr .size 32
+utc-millis-v1 = -62135596800000..253402300799999
+
+; The semantic validator rejects userinfo, paths other than the empty root,
+; queries, fragments, and non-HTTPS schemes.  CDDL retains only its bounded
+; transport representation.
+https-origin-v1 = tstr .size (9..512)
+
+; pending / approved / cancelled / expired.  These are terminal except
+; pending, and a capability never becomes an approval credential.
+device-enrollment-state-v1 = 1 / 2 / 3 / 4
+
+; Exact request retained for a response-loss retry of challenge creation.
+device-enrollment-candidate-v1 = {
+  1: 1,
+  2: identity-id-v1,
+  3: uuid-v7-v1,
+  4: ed25519-public-key-v1,
+  5: device-encryption-public-key-v1,
+  6: enrollment-capability-v1
+}
+
+; Returned for creation, lookup, and successful cancellation.  It deliberately
+; omits the capability and the candidate public keys: the candidate already has
+; them and a status response must not amplify a QR capability leak.
+device-enrollment-challenge-status-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: identity-id-v1,
+  4: uuid-v7-v1,
+  5: device-enrollment-state-v1,
+  6: utc-millis-v1
+}
+
+; Canonical bytes encoded in the QR.  It contains only the candidate's public
+; device material, a five-minute capability, and public routing/identity facts.
+; It MUST NOT contain a root private key, recovery key, active-device session,
+; session secret, or any other private signing material.
+device-enrollment-qr-v1 = {
+  1: 1,
+  2: https-origin-v1,
+  3: identity-id-v1,
+  4: uuid-v7-v1,
+  5: uuid-v7-v1,
+  6: ed25519-public-key-v1,
+  7: device-encryption-public-key-v1,
+  8: enrollment-capability-v1,
+  9: utc-millis-v1
+}
+
+; Field 4 is the exact, already-canonical V1.1 identity-log DeviceAdd event
+; bytes.  The enrollment endpoint validates and appends those bytes verbatim;
+; it must never decode and re-encode them before durable idempotency comparison.
+device-enrollment-completion-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: enrollment-capability-v1,
+  4: bstr .size (1..1048576)
+}

@@ -14,7 +14,8 @@ const IDENTITY_LOG_MIGRATION_VERSION: i64 = 202_607_140_007;
 const GROUP_MEMBERSHIP_MIGRATION_VERSION: i64 = 202_607_140_008;
 const IDENTITY_BOOTSTRAP_CLAIMS_MIGRATION_VERSION: i64 = 202_607_140_009;
 const DEVICE_SESSIONS_MIGRATION_VERSION: i64 = 202_607_140_010;
-const EXPECTED_MIGRATION_COUNT: i64 = 10;
+const DEVICE_ENROLLMENT_CHALLENGES_MIGRATION_VERSION: i64 = 202_607_140_011;
+const EXPECTED_MIGRATION_COUNT: i64 = 11;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -35,6 +36,8 @@ const IDENTITY_BOOTSTRAP_CLAIMS_DOWN: &str =
     include_str!("../../../migrations/202607140009_identity_bootstrap_idempotency_claims.down.sql");
 const DEVICE_SESSIONS_DOWN: &str =
     include_str!("../../../migrations/202607140010_device_sessions.down.sql");
+const DEVICE_ENROLLMENT_CHALLENGES_DOWN: &str =
+    include_str!("../../../migrations/202607140011_device_enrollment_challenges.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,7 +68,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -77,8 +80,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(GROUP_MEMBERSHIP_MIGRATION_VERSION)
     .bind(IDENTITY_BOOTSTRAP_CLAIMS_MIGRATION_VERSION)
     .bind(DEVICE_SESSIONS_MIGRATION_VERSION)
+    .bind(DEVICE_ENROLLMENT_CHALLENGES_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(DEVICE_ENROLLMENT_CHALLENGES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(DEVICE_SESSIONS_DOWN)
         .execute(harness.admin_pool())
         .await?;

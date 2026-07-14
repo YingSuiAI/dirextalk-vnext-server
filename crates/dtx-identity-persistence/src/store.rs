@@ -92,9 +92,17 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
              AND has_table_privilege(current_user, 'identity.device_session_idempotency_claims', 'INSERT') \
              AND has_table_privilege(current_user, 'identity.device_session_receipts', 'SELECT') \
              AND has_table_privilege(current_user, 'identity.device_session_receipts', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.device_enrollment_challenges', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.device_enrollment_challenges', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.device_enrollment_challenges', 'UPDATE') \
              AND has_function_privilege( \
                  current_user, \
                  'identity.prune_expired_device_sessions(bigint, integer)', \
+                 'EXECUTE' \
+             ) \
+             AND has_function_privilege( \
+                 current_user, \
+                 'identity.prune_expired_device_enrollment_challenges(bigint, integer)', \
                  'EXECUTE' \
              ) \
              AND has_table_privilege(current_user, 'identity.fork_evidence', 'SELECT') \
@@ -285,6 +293,13 @@ async fn role_has_excess_identity_privileges(
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
                         )) \
+                        OR (relation.relname = 'device_enrollment_challenges' AND (\
+                            has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
+                            OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
+                        )) \
                         OR (relation.relname IN (\
                             'device_sessions', 'device_session_idempotency_claims', \
                             'device_session_receipts'\
@@ -316,7 +331,8 @@ async fn role_has_excess_identity_privileges(
                             'log_heads', 'log_entries', 'command_receipts', \
                             'bootstrap_idempotency_claims', 'device_session_challenges', \
                             'device_sessions', 'device_session_idempotency_claims', \
-                            'device_session_receipts', 'fork_evidence', 'log_outbox'\
+                            'device_session_receipts', 'device_enrollment_challenges', \
+                            'fork_evidence', 'log_outbox'\
                         ) AND (\
                             has_table_privilege(current_user, relation.oid, 'SELECT') \
                             OR has_table_privilege(current_user, relation.oid, 'INSERT') \

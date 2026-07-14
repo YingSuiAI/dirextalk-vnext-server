@@ -171,6 +171,10 @@ define_uuid_v7_id!(AggregateId, "aggregate ID");
 define_uuid_v7_id!(DeviceId, "device ID");
 define_uuid_v7_id!(DeviceSessionChallengeId, "device session challenge ID");
 define_uuid_v7_id!(DeviceSessionId, "device session ID");
+define_uuid_v7_id!(
+    DeviceEnrollmentChallengeId,
+    "device enrollment challenge ID"
+);
 define_uuid_v7_id!(ConversationId, "conversation ID");
 define_uuid_v7_id!(InstallationId, "agent installation ID");
 define_uuid_v7_id!(InviteCapabilityId, "invite capability ID");

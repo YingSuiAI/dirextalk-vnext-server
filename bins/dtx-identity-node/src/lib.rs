@@ -2,33 +2,43 @@
 
 //! First self-authenticated HTTP boundary for the vNext identity service.
 //!
-//! This crate exposes only the self-authenticated genesis, the root-authorized
-//! first device, and active-device short sessions. QR enrollment and other
-//! non-genesis appends need their own durable challenge and credential
-//! contracts; accepting a generic bearer token here would weaken the
-//! self-certifying identity boundary.
+//! This crate exposes the self-authenticated genesis, root-authorized first
+//! device, active-device short sessions, and capability-gated QR enrollment
+//! for one additional device. Other non-genesis appends still need their own
+//! durable challenge and credential contracts; accepting a generic bearer
+//! token here would weaken the self-certifying identity boundary.
 
 use std::{str::FromStr, sync::Arc};
 
 use axum::{
     Router,
     body::{Body, to_bytes},
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::post,
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{
-    Clock, DeviceId, DeviceSessionChallengeId, DeviceSessionId, IdentityId, RequestId, SystemClock,
+    Clock, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionChallengeId, DeviceSessionId,
+    IdentityId, RequestId, SystemClock,
 };
-use dtx_identity_log::{IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1, IdentityLogEventV1};
+use dtx_identity_log::{
+    DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1,
+    IdentityLogEventV1,
+};
 use dtx_identity_persistence::{
+    CreateDeviceEnrollmentChallengeCommand, DeviceEnrollmentApprovalCommand,
+    DeviceEnrollmentCapability, DeviceEnrollmentChallenge, DeviceEnrollmentChallengeOutcome,
+    DeviceEnrollmentChallengeState, DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository,
     DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
     DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogRepository,
     IdentityPersistenceError, IdentityPgStore,
 };
-use dtx_wire::{Ed25519Signature, Sha256Digest, UtcMillis};
+use dtx_wire::{
+    CanonicalEncode, CanonicalValue, Ed25519Signature, Sha256Digest, SigningPublicKey, UtcMillis,
+    decode_deterministic_cbor, encode_deterministic_cbor,
+};
 use getrandom::fill as fill_random;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::Zeroize;
@@ -41,6 +51,13 @@ pub const INITIAL_DEVICE_ENROLL_PATH: &str = "/v1/devices/initial-enroll";
 pub const DEVICE_SESSION_CHALLENGE_PATH: &str = "/v1/devices/sessions/challenges";
 /// Route that exchanges a device signature for a short-lived session.
 pub const DEVICE_SESSION_PATH: &str = "/v1/devices/sessions";
+/// Candidate-created five-minute QR enrollment challenge route.
+pub const DEVICE_ENROLLMENT_CHALLENGE_PATH: &str = "/v1/devices/enroll/challenges";
+/// Capability-gated QR enrollment status and cancellation route.
+pub const DEVICE_ENROLLMENT_CHALLENGE_STATUS_PATH: &str =
+    "/v1/devices/enroll/challenges/{challenge_id}";
+/// Active-device approval route for a candidate QR enrollment challenge.
+pub const DEVICE_ENROLLMENT_PATH: &str = "/v1/devices/enroll";
 /// Required media type for exact signed V1.1 identity-log events.
 pub const IDENTITY_LOG_EVENT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.identity-log.v1.1+cbor";
@@ -50,12 +67,27 @@ pub const IDENTITY_APPEND_RECEIPT_CONTENT_TYPE: &str =
 /// Response media type for immutable canonical device-session receipts.
 pub const DEVICE_SESSION_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.device-session-receipt.v1+cbor";
+/// Exact candidate challenge request media type.
+pub const DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.device-enrollment-candidate.v1+cbor";
+/// Capability-gated enrollment status response media type.
+pub const DEVICE_ENROLLMENT_STATUS_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.device-enrollment-status.v1+cbor";
+/// Exact active-device enrollment approval request media type.
+pub const DEVICE_ENROLLMENT_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.device-enrollment.v1+cbor";
+/// Header that carries a candidate-owned status/cancellation capability.
+pub const DEVICE_ENROLLMENT_CAPABILITY_HEADER: &str = "DTX-Enrollment-Capability";
 /// Exact authorization scheme for short-lived device sessions.
 pub const DEVICE_SESSION_AUTHORIZATION_SCHEME: &str = "DTX-Device-Session";
 /// Largest accepted exact genesis event body.
 pub const MAX_IDENTITY_BOOTSTRAP_EVENT_BYTES: usize = 1_048_576;
 /// Largest accepted JSON device-session request body.
 pub const MAX_DEVICE_SESSION_REQUEST_BYTES: usize = 16_384;
+/// Largest accepted exact candidate enrollment request body.
+pub const MAX_DEVICE_ENROLLMENT_CANDIDATE_BYTES: usize = 16_384;
+/// Largest accepted exact enrollment approval body.
+pub const MAX_DEVICE_ENROLLMENT_COMPLETION_BYTES: usize = 1_048_576;
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -67,14 +99,19 @@ const HTTP_INITIAL_DEVICE_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.identity-initial-device-http-idempotency-key.v1\0";
 const HTTP_DEVICE_SESSION_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.device-session-http-idempotency-key.v1\0";
+const HTTP_DEVICE_ENROLLMENT_CHALLENGE_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.device-enrollment-http-challenge-idempotency-key.v1\0";
+const HTTP_DEVICE_ENROLLMENT_APPROVAL_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.device-enrollment-http-approval-idempotency-key.v1\0";
 const DEFAULT_DEVICE_SESSION_AUDIENCE: &str = "http://127.0.0.1";
 
-/// State for bootstrap, first-device, and short device-session HTTP boundaries.
+/// State for bootstrap, device-session, and QR device-enrollment HTTP boundaries.
 #[derive(Clone)]
 pub struct IdentityBootstrapState {
     store: IdentityPgStore,
     repository: IdentityLogRepository,
     device_sessions: DeviceSessionRepository,
+    device_enrollments: DeviceEnrollmentRepository,
     clock: Arc<dyn Clock>,
     device_session_audience: Arc<str>,
 }
@@ -106,6 +143,7 @@ impl IdentityBootstrapState {
             store,
             repository: IdentityLogRepository::new(),
             device_sessions: DeviceSessionRepository,
+            device_enrollments: DeviceEnrollmentRepository,
             clock,
             device_session_audience: audience.into(),
         }
@@ -130,6 +168,16 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
             post(create_device_session_challenge),
         )
         .route(DEVICE_SESSION_PATH, post(complete_device_session))
+        .route(
+            DEVICE_ENROLLMENT_CHALLENGE_PATH,
+            post(create_device_enrollment_challenge),
+        )
+        .route(
+            DEVICE_ENROLLMENT_CHALLENGE_STATUS_PATH,
+            axum::routing::get(get_device_enrollment_challenge)
+                .delete(cancel_device_enrollment_challenge),
+        )
+        .route(DEVICE_ENROLLMENT_PATH, post(approve_device_enrollment))
         .with_state(state)
 }
 
@@ -181,6 +229,65 @@ async fn complete_device_session(
     match state.complete_device_session(&parts.headers, body).await {
         Ok(success) => device_session_success_response(success, request_id),
         Err(failure) => device_session_failure_response(failure, request_id),
+    }
+}
+
+async fn create_device_enrollment_challenge(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .create_device_enrollment_challenge(&parts.headers, body)
+        .await
+    {
+        Ok(success) => device_enrollment_challenge_success_response(&success, request_id),
+        Err(failure) => device_enrollment_failure_response(failure, request_id),
+    }
+}
+
+async fn get_device_enrollment_challenge(
+    State(state): State<IdentityBootstrapState>,
+    Path(challenge_id): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .get_device_enrollment_challenge(&challenge_id, &parts.headers, body)
+        .await
+    {
+        Ok(status) => device_enrollment_status_response(status, request_id),
+        Err(failure) => device_enrollment_failure_response(failure, request_id),
+    }
+}
+
+async fn cancel_device_enrollment_challenge(
+    State(state): State<IdentityBootstrapState>,
+    Path(challenge_id): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .cancel_device_enrollment_challenge(&challenge_id, &parts.headers, body)
+        .await
+    {
+        Ok(status) => device_enrollment_status_response(status, request_id),
+        Err(failure) => device_enrollment_failure_response(failure, request_id),
+    }
+}
+
+async fn approve_device_enrollment(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.approve_device_enrollment(&parts.headers, body).await {
+        Ok(success) => device_enrollment_approval_success_response(success, request_id),
+        Err(failure) => device_enrollment_failure_response(failure, request_id),
     }
 }
 
@@ -371,14 +478,160 @@ impl IdentityBootstrapState {
         }
     }
 
+    async fn create_device_enrollment_challenge(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<DeviceEnrollmentChallengeSuccess, DeviceEnrollmentFailure> {
+        if !has_exact_content_type(headers, DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(header::AUTHORIZATION)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+        {
+            return Err(DeviceEnrollmentFailure::InvalidRequest);
+        }
+        let idempotency_key_hash = idempotency_key_hash(
+            headers,
+            HTTP_DEVICE_ENROLLMENT_CHALLENGE_IDEMPOTENCY_KEY_HASH_DOMAIN,
+        )
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+        let bytes = to_bytes(body, MAX_DEVICE_ENROLLMENT_CANDIDATE_BYTES)
+            .await
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+        let candidate = parse_device_enrollment_candidate(&bytes)?;
+        let command = CreateDeviceEnrollmentChallengeCommand::new(
+            idempotency_key_hash,
+            candidate.identity_id,
+            candidate.target_device_id,
+            candidate.target_device_signing_key,
+            candidate.target_device_encryption_key,
+            candidate.capability,
+        )
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+        let now = self
+            .committed_at()
+            .map_err(|()| DeviceEnrollmentFailure::TemporarilyUnavailable)?;
+        match self
+            .device_enrollments
+            .create_challenge(&self.store, command, now)
+            .await
+            .map_err(|error| map_device_enrollment_persistence_error(&error))?
+        {
+            DeviceEnrollmentChallengeOutcome::Created(challenge) => {
+                Ok(DeviceEnrollmentChallengeSuccess {
+                    status: StatusCode::CREATED,
+                    challenge,
+                })
+            }
+            DeviceEnrollmentChallengeOutcome::Replayed(challenge) => {
+                Ok(DeviceEnrollmentChallengeSuccess {
+                    status: StatusCode::OK,
+                    challenge,
+                })
+            }
+        }
+    }
+
+    async fn get_device_enrollment_challenge(
+        &self,
+        challenge_id: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<DeviceEnrollmentChallengeStatus, DeviceEnrollmentFailure> {
+        let (challenge_id, capability) =
+            parse_device_enrollment_status_request(challenge_id, headers, body).await?;
+        let now = self
+            .committed_at()
+            .map_err(|()| DeviceEnrollmentFailure::TemporarilyUnavailable)?;
+        self.device_enrollments
+            .status(&self.store, challenge_id, capability, now)
+            .await
+            .map_err(|error| map_device_enrollment_persistence_error(&error))
+    }
+
+    async fn cancel_device_enrollment_challenge(
+        &self,
+        challenge_id: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<DeviceEnrollmentChallengeStatus, DeviceEnrollmentFailure> {
+        let (challenge_id, capability) =
+            parse_device_enrollment_status_request(challenge_id, headers, body).await?;
+        let now = self
+            .committed_at()
+            .map_err(|()| DeviceEnrollmentFailure::TemporarilyUnavailable)?;
+        self.device_enrollments
+            .cancel(&self.store, challenge_id, capability, now)
+            .await
+            .map_err(|error| map_device_enrollment_persistence_error(&error))
+    }
+
+    async fn approve_device_enrollment(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<DeviceEnrollmentApprovalSuccess, DeviceEnrollmentFailure> {
+        if !has_exact_content_type(headers, DEVICE_ENROLLMENT_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+        {
+            return Err(DeviceEnrollmentFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)
+            .map_err(|_| DeviceEnrollmentFailure::AuthenticationRejected)?;
+        let approval_idempotency_key_hash = idempotency_key_hash(
+            headers,
+            HTTP_DEVICE_ENROLLMENT_APPROVAL_IDEMPOTENCY_KEY_HASH_DOMAIN,
+        )
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+        let expected_head_hash =
+            expected_genesis_hash(headers).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+        let bytes = to_bytes(body, MAX_DEVICE_ENROLLMENT_COMPLETION_BYTES)
+            .await
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+        let completion = parse_device_enrollment_completion(&bytes)?;
+        let command = DeviceEnrollmentApprovalCommand::new(
+            approval_idempotency_key_hash,
+            completion.challenge_id,
+            completion.capability,
+            expected_head_hash,
+            completion.exact_device_add_bytes,
+        )
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+        let now = self
+            .committed_at()
+            .map_err(|()| DeviceEnrollmentFailure::TemporarilyUnavailable)?;
+        match self
+            .device_enrollments
+            .approve(&self.store, command, credential, now)
+            .await
+            .map_err(|error| map_device_enrollment_persistence_error(&error))?
+        {
+            IdentityAppendOutcome::Committed(receipt) => Ok(DeviceEnrollmentApprovalSuccess {
+                status: StatusCode::CREATED,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+            IdentityAppendOutcome::Replayed(receipt) => Ok(DeviceEnrollmentApprovalSuccess {
+                status: StatusCode::OK,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+            IdentityAppendOutcome::Forked { .. } => Err(DeviceEnrollmentFailure::IdentityConflict),
+        }
+    }
+
     fn committed_at(&self) -> Result<UtcMillis, ()> {
         UtcMillis::new(self.clock.now_utc_millis().map_err(|_| ())?).map_err(|_| ())
     }
 }
 
 fn has_exact_event_content_type(headers: &HeaderMap) -> bool {
+    has_exact_content_type(headers, IDENTITY_LOG_EVENT_CONTENT_TYPE)
+}
+
+fn has_exact_content_type(headers: &HeaderMap, expected: &'static str) -> bool {
     let mut values = headers.get_all(header::CONTENT_TYPE).iter();
-    matches!(values.next(), Some(value) if value.as_bytes() == IDENTITY_LOG_EVENT_CONTENT_TYPE.as_bytes())
+    matches!(values.next(), Some(value) if value.as_bytes() == expected.as_bytes())
         && values.next().is_none()
 }
 
@@ -421,9 +674,7 @@ fn expected_genesis_hash(headers: &HeaderMap) -> Result<Sha256Digest, InitialDev
 }
 
 fn has_exact_json_content_type(headers: &HeaderMap) -> bool {
-    let mut values = headers.get_all(header::CONTENT_TYPE).iter();
-    matches!(values.next(), Some(value) if value.as_bytes() == b"application/json")
-        && values.next().is_none()
+    has_exact_content_type(headers, "application/json")
 }
 
 const fn is_base64url_byte(value: u8) -> bool {
@@ -453,6 +704,10 @@ fn map_persistence_error(error: &IdentityPersistenceError) -> BootstrapFailure {
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
         | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+        | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
+        | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
+        | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
         | IdentityPersistenceError::CorruptData(_) => BootstrapFailure::TemporarilyUnavailable,
     }
 }
@@ -477,6 +732,10 @@ fn map_initial_device_persistence_error(error: &IdentityPersistenceError) -> Ini
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
         | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+        | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
+        | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
+        | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
         | IdentityPersistenceError::CorruptData(_) => InitialDeviceFailure::TemporarilyUnavailable,
     }
 }
@@ -509,7 +768,55 @@ fn map_device_session_persistence_error(error: &IdentityPersistenceError) -> Dev
         | IdentityPersistenceError::TenantContextLeak
         | IdentityPersistenceError::IncompleteCommand
         | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+        | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
+        | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
+        | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
         | IdentityPersistenceError::CorruptData(_) => DeviceSessionFailure::TemporarilyUnavailable,
+    }
+}
+
+fn map_device_enrollment_persistence_error(
+    error: &IdentityPersistenceError,
+) -> DeviceEnrollmentFailure {
+    match error {
+        IdentityPersistenceError::InvalidCommand(_) | IdentityPersistenceError::IdentityLog(_) => {
+            DeviceEnrollmentFailure::InvalidRequest
+        }
+        IdentityPersistenceError::IdempotencyConflict => {
+            DeviceEnrollmentFailure::IdempotencyConflict
+        }
+        IdentityPersistenceError::DeviceAuthenticationRejected => {
+            DeviceEnrollmentFailure::AuthenticationRejected
+        }
+        IdentityPersistenceError::DeviceEnrollmentCapabilityRejected => {
+            DeviceEnrollmentFailure::CapabilityRejected
+        }
+        IdentityPersistenceError::DeviceEnrollmentChallengeExpired => {
+            DeviceEnrollmentFailure::ChallengeExpired
+        }
+        IdentityPersistenceError::DeviceEnrollmentChallengeCancelled => {
+            DeviceEnrollmentFailure::ChallengeCancelled
+        }
+        IdentityPersistenceError::DeviceEnrollmentChallengeApproved => {
+            DeviceEnrollmentFailure::ChallengeApproved
+        }
+        IdentityPersistenceError::HeadConflict { .. }
+        | IdentityPersistenceError::GenesisConflict
+        | IdentityPersistenceError::IdentityInactive => DeviceEnrollmentFailure::IdentityConflict,
+        IdentityPersistenceError::Database(_)
+        | IdentityPersistenceError::UnsafeRuntimeRole
+        | IdentityPersistenceError::RuntimeRoleUnauthorized
+        | IdentityPersistenceError::RuntimeRoleOverprivileged
+        | IdentityPersistenceError::TenantContextLeak
+        | IdentityPersistenceError::IncompleteCommand
+        | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::DeviceSessionChallengeExpired
+        | IdentityPersistenceError::DeviceSessionChallengeConsumed
+        | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::CorruptData(_) => {
+            DeviceEnrollmentFailure::TemporarilyUnavailable
+        }
     }
 }
 
@@ -539,6 +846,199 @@ fn decode_base64url_32(value: &str) -> Result<[u8; 32], DeviceSessionFailure> {
     }
     let result = buffer;
     Ok(result)
+}
+
+struct DeviceEnrollmentCandidateRequest {
+    identity_id: IdentityId,
+    target_device_id: DeviceId,
+    target_device_signing_key: SigningPublicKey,
+    target_device_encryption_key: DeviceEncryptionPublicKey,
+    capability: DeviceEnrollmentCapability,
+}
+
+struct DeviceEnrollmentCompletionRequest {
+    challenge_id: DeviceEnrollmentChallengeId,
+    capability: DeviceEnrollmentCapability,
+    exact_device_add_bytes: Vec<u8>,
+}
+
+fn parse_device_enrollment_candidate(
+    bytes: &[u8],
+) -> Result<DeviceEnrollmentCandidateRequest, DeviceEnrollmentFailure> {
+    if bytes.is_empty() {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let value =
+        decode_deterministic_cbor(bytes).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 6)?;
+    require_cbor_version(cbor_field(fields, 1)?)?;
+    let identity_id = parse_cbor_identity_id(cbor_field(fields, 2)?)?;
+    let target_device_id = parse_cbor_device_id(cbor_field(fields, 3)?)?;
+    let target_device_signing_key =
+        SigningPublicKey::try_from(parse_cbor_bytes::<32>(cbor_field(fields, 4)?)?)
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let target_device_encryption_key =
+        DeviceEncryptionPublicKey::try_from(parse_cbor_bytes::<32>(cbor_field(fields, 5)?)?)
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let capability =
+        DeviceEnrollmentCapability::new(parse_cbor_bytes::<32>(cbor_field(fields, 6)?)?)
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    Ok(DeviceEnrollmentCandidateRequest {
+        identity_id,
+        target_device_id,
+        target_device_signing_key,
+        target_device_encryption_key,
+        capability,
+    })
+}
+
+fn parse_device_enrollment_completion(
+    bytes: &[u8],
+) -> Result<DeviceEnrollmentCompletionRequest, DeviceEnrollmentFailure> {
+    if bytes.is_empty() {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let value =
+        decode_deterministic_cbor(bytes).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 4)?;
+    require_cbor_version(cbor_field(fields, 1)?)?;
+    let challenge_id = parse_cbor_challenge_id(cbor_field(fields, 2)?)?;
+    let capability =
+        DeviceEnrollmentCapability::new(parse_cbor_bytes::<32>(cbor_field(fields, 3)?)?)
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let exact_device_add_bytes = match cbor_field(fields, 4)? {
+        CanonicalValue::Bytes(value) if !value.is_empty() => value.clone(),
+        _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+    };
+    Ok(DeviceEnrollmentCompletionRequest {
+        challenge_id,
+        capability,
+        exact_device_add_bytes,
+    })
+}
+
+async fn parse_device_enrollment_status_request(
+    challenge_id: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<(DeviceEnrollmentChallengeId, DeviceEnrollmentCapability), DeviceEnrollmentFailure> {
+    if headers.contains_key(header::CONTENT_TYPE)
+        || headers.contains_key(header::CONTENT_ENCODING)
+        || headers.contains_key(header::IF_MATCH)
+        || headers.contains_key(header::AUTHORIZATION)
+        || headers.contains_key(IDEMPOTENCY_KEY_HEADER)
+    {
+        return Err(DeviceEnrollmentFailure::CapabilityRejected);
+    }
+    let body = to_bytes(body, 1)
+        .await
+        .map_err(|_| DeviceEnrollmentFailure::CapabilityRejected)?;
+    if !body.is_empty() {
+        return Err(DeviceEnrollmentFailure::CapabilityRejected);
+    }
+    let challenge_id = challenge_id
+        .parse()
+        .map_err(|_| DeviceEnrollmentFailure::CapabilityRejected)?;
+    let capability = parse_device_enrollment_capability(headers)?;
+    Ok((challenge_id, capability))
+}
+
+fn parse_device_enrollment_capability(
+    headers: &HeaderMap,
+) -> Result<DeviceEnrollmentCapability, DeviceEnrollmentFailure> {
+    let mut values = headers.get_all(DEVICE_ENROLLMENT_CAPABILITY_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Err(DeviceEnrollmentFailure::CapabilityRejected);
+    };
+    if values.next().is_some() {
+        return Err(DeviceEnrollmentFailure::CapabilityRejected);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| DeviceEnrollmentFailure::CapabilityRejected)?;
+    let bytes =
+        decode_base64url_32(value).map_err(|_| DeviceEnrollmentFailure::CapabilityRejected)?;
+    DeviceEnrollmentCapability::new(bytes).map_err(|_| DeviceEnrollmentFailure::CapabilityRejected)
+}
+
+fn exact_cbor_fields(
+    value: &CanonicalValue,
+    expected_count: usize,
+) -> Result<&[(CanonicalValue, CanonicalValue)], DeviceEnrollmentFailure> {
+    let CanonicalValue::Map(fields) = value else {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    };
+    if fields.len() != expected_count
+        || fields.iter().enumerate().any(|(index, (key, _))| {
+            key != &CanonicalValue::Unsigned(u64::try_from(index + 1).unwrap_or(u64::MAX))
+        })
+    {
+        Err(DeviceEnrollmentFailure::InvalidRequest)
+    } else {
+        Ok(fields)
+    }
+}
+
+fn cbor_field(
+    fields: &[(CanonicalValue, CanonicalValue)],
+    key: usize,
+) -> Result<&CanonicalValue, DeviceEnrollmentFailure> {
+    fields
+        .get(
+            key.checked_sub(1)
+                .ok_or(DeviceEnrollmentFailure::InvalidRequest)?,
+        )
+        .map(|(_, value)| value)
+        .ok_or(DeviceEnrollmentFailure::InvalidRequest)
+}
+
+fn require_cbor_version(value: &CanonicalValue) -> Result<(), DeviceEnrollmentFailure> {
+    if value == &CanonicalValue::Unsigned(1) {
+        Ok(())
+    } else {
+        Err(DeviceEnrollmentFailure::InvalidRequest)
+    }
+}
+
+fn parse_cbor_identity_id(value: &CanonicalValue) -> Result<IdentityId, DeviceEnrollmentFailure> {
+    let CanonicalValue::Text(value) = value else {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    };
+    value
+        .parse()
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)
+}
+
+fn parse_cbor_device_id(value: &CanonicalValue) -> Result<DeviceId, DeviceEnrollmentFailure> {
+    let CanonicalValue::Text(value) = value else {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    };
+    value
+        .parse()
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)
+}
+
+fn parse_cbor_challenge_id(
+    value: &CanonicalValue,
+) -> Result<DeviceEnrollmentChallengeId, DeviceEnrollmentFailure> {
+    let CanonicalValue::Text(value) = value else {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    };
+    value
+        .parse()
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)
+}
+
+fn parse_cbor_bytes<const N: usize>(
+    value: &CanonicalValue,
+) -> Result<[u8; N], DeviceEnrollmentFailure> {
+    let CanonicalValue::Bytes(value) = value else {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    };
+    value
+        .as_slice()
+        .try_into()
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)
 }
 
 /// Strictly parses an opaque short-lived device-session capability.
@@ -680,6 +1180,29 @@ enum DeviceSessionFailure {
     TemporarilyUnavailable,
 }
 
+struct DeviceEnrollmentChallengeSuccess {
+    status: StatusCode,
+    challenge: DeviceEnrollmentChallenge,
+}
+
+struct DeviceEnrollmentApprovalSuccess {
+    status: StatusCode,
+    exact_receipt_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DeviceEnrollmentFailure {
+    InvalidRequest,
+    CapabilityRejected,
+    AuthenticationRejected,
+    ChallengeExpired,
+    ChallengeCancelled,
+    ChallengeApproved,
+    IdentityConflict,
+    IdempotencyConflict,
+    TemporarilyUnavailable,
+}
+
 #[derive(Serialize)]
 struct BootstrapErrorEnvelope {
     error: BootstrapErrorBody,
@@ -728,6 +1251,28 @@ enum DeviceSessionErrorCode {
     ChallengeConsumed,
     #[serde(rename = "DEVICE_SESSION_CHALLENGE_RATE_LIMITED")]
     ChallengeRateLimited,
+    #[serde(rename = "IDEMPOTENCY_CONFLICT")]
+    IdempotencyConflict,
+    #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, Serialize)]
+enum DeviceEnrollmentErrorCode {
+    #[serde(rename = "DEVICE_ENROLLMENT_INVALID")]
+    InvalidRequest,
+    #[serde(rename = "DEVICE_ENROLLMENT_CAPABILITY_INVALID")]
+    CapabilityRejected,
+    #[serde(rename = "DEVICE_AUTHENTICATION_FAILED")]
+    AuthenticationRejected,
+    #[serde(rename = "DEVICE_ENROLLMENT_CHALLENGE_EXPIRED")]
+    ChallengeExpired,
+    #[serde(rename = "DEVICE_ENROLLMENT_CHALLENGE_CANCELLED")]
+    ChallengeCancelled,
+    #[serde(rename = "DEVICE_ENROLLMENT_CHALLENGE_ALREADY_APPROVED")]
+    ChallengeApproved,
+    #[serde(rename = "IDENTITY_APPEND_CONFLICT")]
+    IdentityConflict,
     #[serde(rename = "IDEMPOTENCY_CONFLICT")]
     IdempotencyConflict,
     #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
@@ -905,6 +1450,150 @@ fn device_session_failure_response(
     safe_error_response(status, code, retryable, request_id)
 }
 
+fn device_enrollment_challenge_success_response(
+    success: &DeviceEnrollmentChallengeSuccess,
+    request_id: RequestId,
+) -> Response {
+    exact_cbor_response(
+        success.status,
+        encode_device_enrollment_challenge(&success.challenge),
+        DEVICE_ENROLLMENT_STATUS_CONTENT_TYPE,
+        request_id,
+    )
+}
+
+fn device_enrollment_status_response(
+    status: DeviceEnrollmentChallengeStatus,
+    request_id: RequestId,
+) -> Response {
+    exact_cbor_response(
+        StatusCode::OK,
+        encode_device_enrollment_status(status),
+        DEVICE_ENROLLMENT_STATUS_CONTENT_TYPE,
+        request_id,
+    )
+}
+
+fn device_enrollment_approval_success_response(
+    success: DeviceEnrollmentApprovalSuccess,
+    request_id: RequestId,
+) -> Response {
+    exact_cbor_response(
+        success.status,
+        success.exact_receipt_bytes,
+        IDENTITY_APPEND_RECEIPT_CONTENT_TYPE,
+        request_id,
+    )
+}
+
+fn device_enrollment_failure_response(
+    failure: DeviceEnrollmentFailure,
+    request_id: RequestId,
+) -> Response {
+    let (status, code, retryable) = match failure {
+        DeviceEnrollmentFailure::InvalidRequest => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            DeviceEnrollmentErrorCode::InvalidRequest,
+            false,
+        ),
+        DeviceEnrollmentFailure::CapabilityRejected => (
+            StatusCode::UNAUTHORIZED,
+            DeviceEnrollmentErrorCode::CapabilityRejected,
+            false,
+        ),
+        DeviceEnrollmentFailure::AuthenticationRejected => (
+            StatusCode::UNAUTHORIZED,
+            DeviceEnrollmentErrorCode::AuthenticationRejected,
+            false,
+        ),
+        DeviceEnrollmentFailure::ChallengeExpired => (
+            StatusCode::CONFLICT,
+            DeviceEnrollmentErrorCode::ChallengeExpired,
+            false,
+        ),
+        DeviceEnrollmentFailure::ChallengeCancelled => (
+            StatusCode::CONFLICT,
+            DeviceEnrollmentErrorCode::ChallengeCancelled,
+            false,
+        ),
+        DeviceEnrollmentFailure::ChallengeApproved => (
+            StatusCode::CONFLICT,
+            DeviceEnrollmentErrorCode::ChallengeApproved,
+            false,
+        ),
+        DeviceEnrollmentFailure::IdentityConflict => (
+            StatusCode::CONFLICT,
+            DeviceEnrollmentErrorCode::IdentityConflict,
+            false,
+        ),
+        DeviceEnrollmentFailure::IdempotencyConflict => (
+            StatusCode::CONFLICT,
+            DeviceEnrollmentErrorCode::IdempotencyConflict,
+            false,
+        ),
+        DeviceEnrollmentFailure::TemporarilyUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            DeviceEnrollmentErrorCode::TemporarilyUnavailable,
+            true,
+        ),
+    };
+    safe_error_response(status, code, retryable, request_id)
+}
+
+fn encode_device_enrollment_status(status: DeviceEnrollmentChallengeStatus) -> Vec<u8> {
+    let state = match status.state() {
+        DeviceEnrollmentChallengeState::Open => 1,
+        DeviceEnrollmentChallengeState::Approved => 2,
+        DeviceEnrollmentChallengeState::Cancelled => 3,
+        DeviceEnrollmentChallengeState::Expired => 4,
+    };
+    encode_device_enrollment_status_fields(
+        status.challenge_id().to_string(),
+        status.identity_id().to_string(),
+        status.target_device_id().to_string(),
+        state,
+        status.expires_at(),
+    )
+}
+
+fn encode_device_enrollment_challenge(challenge: &DeviceEnrollmentChallenge) -> Vec<u8> {
+    encode_device_enrollment_status_fields(
+        challenge.challenge_id().to_string(),
+        challenge.identity_id().to_string(),
+        challenge.target_device_id().to_string(),
+        1,
+        challenge.expires_at(),
+    )
+}
+
+fn encode_device_enrollment_status_fields(
+    challenge_id: String,
+    identity_id: String,
+    target_device_id: String,
+    state: u64,
+    expires_at: UtcMillis,
+) -> Vec<u8> {
+    let value = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(challenge_id),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(identity_id),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(target_device_id),
+        ),
+        (CanonicalValue::Unsigned(5), CanonicalValue::Unsigned(state)),
+        (CanonicalValue::Unsigned(6), expires_at.to_canonical_value()),
+    ]);
+    encode_deterministic_cbor(&value)
+        .expect("trusted device enrollment status always has a bounded canonical representation")
+}
+
 fn exact_cbor_response(
     status: StatusCode,
     exact_bytes: Vec<u8>,
@@ -956,4 +1645,79 @@ fn with_common_headers(mut response: Response, request_id: RequestId) -> Respons
         .expect("a canonical UUIDv7 request ID is a valid HTTP header value");
     response.headers_mut().insert(REQUEST_ID_HEADER, request_id);
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn enrollment_cbor_boundary_is_exact_and_status_does_not_echo_capability() {
+        let signing_key = SigningKey::from_bytes(&[4; 32]);
+        let signing_public_key = SigningPublicKey::try_from(signing_key.verifying_key().to_bytes())
+            .expect("test signing key is a valid Ed25519 key");
+        let identity_id = IdentityId::derive(signing_public_key.as_domain_key());
+        let device_id: DeviceId = "0190f2a5-7b1c-7abc-8def-0123456789ab"
+            .parse()
+            .expect("fixed test UUIDv7 is valid");
+        let capability = [9; 32];
+        let candidate = CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(identity_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Text(device_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                CanonicalValue::Bytes(signing_public_key.as_bytes().to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(5),
+                CanonicalValue::Bytes(vec![7; 32]),
+            ),
+            (
+                CanonicalValue::Unsigned(6),
+                CanonicalValue::Bytes(capability.to_vec()),
+            ),
+        ]);
+        let candidate_bytes =
+            encode_deterministic_cbor(&candidate).expect("fixed candidate encodes canonically");
+        let parsed = parse_device_enrollment_candidate(&candidate_bytes)
+            .expect("exact frozen candidate shape is accepted");
+        assert_eq!(parsed.identity_id, identity_id);
+        assert_eq!(parsed.target_device_id, device_id);
+        assert_eq!(parsed.capability.as_bytes(), &capability);
+
+        let challenge_id: DeviceEnrollmentChallengeId = "0190f2a5-7b1e-7abc-8def-0123456789ab"
+            .parse()
+            .expect("fixed test UUIDv7 is valid");
+        let status = encode_device_enrollment_status_fields(
+            challenge_id.to_string(),
+            identity_id.to_string(),
+            device_id.to_string(),
+            1,
+            UtcMillis::new(902_000).expect("fixed expiry is valid"),
+        );
+        let decoded = decode_deterministic_cbor(&status).expect("generated status is canonical");
+        let fields = exact_cbor_fields(&decoded, 6).expect("generated status has frozen fields");
+        assert_eq!(
+            cbor_field(fields, 5).expect("generated state field exists"),
+            &CanonicalValue::Unsigned(1)
+        );
+        assert_eq!(
+            cbor_field(fields, 6).expect("generated expiry field exists"),
+            &CanonicalValue::Unsigned(902_000)
+        );
+        assert!(
+            !status
+                .windows(capability.len())
+                .any(|window| window == capability.as_slice())
+        );
+    }
 }

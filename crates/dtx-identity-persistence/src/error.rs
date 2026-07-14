@@ -44,6 +44,14 @@ pub enum IdentityPersistenceError {
     DeviceSessionChallengeConsumed,
     /// An active device requested fresh challenges faster than the durable limit.
     DeviceSessionChallengeRateLimited,
+    /// A QR enrollment capability did not authenticate the requested challenge.
+    DeviceEnrollmentCapabilityRejected,
+    /// A QR enrollment challenge passed its deadline before approval.
+    DeviceEnrollmentChallengeExpired,
+    /// The candidate cancelled a QR enrollment challenge before approval.
+    DeviceEnrollmentChallengeCancelled,
+    /// A QR enrollment challenge already committed its exact device add.
+    DeviceEnrollmentChallengeApproved,
     /// Stored rows did not rehydrate to one exact valid identity-log projection.
     CorruptData(&'static str),
 }
@@ -76,6 +84,10 @@ impl fmt::Display for IdentityPersistenceError {
             Self::DeviceSessionChallengeExpired => "device session challenge expired",
             Self::DeviceSessionChallengeConsumed => "device session challenge was consumed",
             Self::DeviceSessionChallengeRateLimited => "device session challenge rate limited",
+            Self::DeviceEnrollmentCapabilityRejected => "device enrollment capability was rejected",
+            Self::DeviceEnrollmentChallengeExpired => "device enrollment challenge expired",
+            Self::DeviceEnrollmentChallengeCancelled => "device enrollment challenge was cancelled",
+            Self::DeviceEnrollmentChallengeApproved => "device enrollment challenge was approved",
             Self::CorruptData(_) => "identity persistence contained invalid durable data",
         })
     }
@@ -101,6 +113,10 @@ impl Error for IdentityPersistenceError {
             | Self::DeviceSessionChallengeExpired
             | Self::DeviceSessionChallengeConsumed
             | Self::DeviceSessionChallengeRateLimited
+            | Self::DeviceEnrollmentCapabilityRejected
+            | Self::DeviceEnrollmentChallengeExpired
+            | Self::DeviceEnrollmentChallengeCancelled
+            | Self::DeviceEnrollmentChallengeApproved
             | Self::CorruptData(_) => None,
         }
     }
