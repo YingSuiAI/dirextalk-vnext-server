@@ -1,0 +1,93 @@
+; Current signed public Channel and Agent descriptor V1.1.
+; This contract supersedes V1.0 for writing. V1.0 remains frozen under V7 for
+; explicit historical reads only because its endpoint field allowed a path.
+; `public-subject-id-v1-1` is constrained by the Rust verifier to a
+; kind-matching self-certifying dtxc1 or dtxa1 ID derived from
+; subject-genesis-signing-key-v1-1. It is never an internal tenant UUID,
+; Matrix room ID, alias, feed path, or endpoint.
+; V1.1 requires subject-genesis-signing-key-v1-1 to equal
+; publisher-identity-genesis-signing-key-v1-1, so the publisher signature
+; proves possession of the self-certifying subject authority.
+
+public-descriptor-v1-1-protocol-version = {
+  1: 1,
+  2: 1
+}
+
+public-descriptor-v1-1-wire-version = {
+  1: public-descriptor-v1-1-protocol-version,
+  2: public-descriptor-v1-1-protocol-version
+}
+
+public-subject-id-v1-1 = tstr .size 57
+identity-id-v1-1 = tstr .size 57
+sha256-digest-v1-1 = bstr .size 32
+ed25519-public-key-v1-1 = bstr .size 32
+ed25519-signature-v1-1 = bstr .size 64
+utc-millis-v1-1 = -62135596800000..253402300799999
+positive-safe-uint-v1-1 = 1..9007199254740991
+; Literal `https://host[:port]` or `https://host[:port]/` only. The Rust
+; verifier rejects userinfo, query, fragment, backslash, non-HTTPS, and every
+; non-root path. The fixed public feed path is:
+; /.well-known/dirextalk/public/v1/{public-subject-id-v1-1}
+public-feed-origin-v1-1 = tstr .size (1..512)
+
+channel-payload-v1-1 = {
+  1: public-feed-origin-v1-1,
+  2: sha256-digest-v1-1
+}
+
+agent-payload-v1-1 = {
+  1: public-feed-origin-v1-1,
+  2: sha256-digest-v1-1,
+  3: sha256-digest-v1-1
+}
+
+tombstone-payload-v1-1 = {}
+
+public-descriptor-common-v1-1 = (
+  1: public-descriptor-v1-1-wire-version,
+  3: public-subject-id-v1-1,
+  4: ed25519-public-key-v1-1,
+  5: identity-id-v1-1,
+  6: ed25519-public-key-v1-1,
+  7: positive-safe-uint-v1-1,
+  8: sha256-digest-v1-1 / null,
+  9: utc-millis-v1-1,
+  10: utc-millis-v1-1,
+  13: ed25519-signature-v1-1
+)
+
+public-descriptor-v1-1 =
+  public-channel-descriptor-v1-1 /
+  public-agent-descriptor-v1-1 /
+  public-channel-tombstone-v1-1 /
+  public-agent-tombstone-v1-1
+
+public-channel-descriptor-v1-1 = {
+  public-descriptor-common-v1-1,
+  2: 1,
+  11: 1,
+  12: channel-payload-v1-1
+}
+
+public-agent-descriptor-v1-1 = {
+  public-descriptor-common-v1-1,
+  2: 2,
+  11: 2,
+  12: agent-payload-v1-1
+}
+
+public-channel-tombstone-v1-1 = {
+  public-descriptor-common-v1-1,
+  2: 1,
+  11: 3,
+  12: tombstone-payload-v1-1
+}
+
+public-agent-tombstone-v1-1 = {
+  public-descriptor-common-v1-1,
+  2: 2,
+  11: 3,
+  12: agent-payload-v1-1
+}

@@ -111,6 +111,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
 
     validate_identity_log_v1_1(root)?;
     validate_public_descriptor_v1(root)?;
+    validate_public_descriptor_v1_1(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
@@ -155,6 +156,86 @@ fn validate_public_descriptor_v1(root: &Path) -> Result<(), ProtocolToolError> {
             &cddl,
             json_string(descriptor, "canonical_cbor_hex")?,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_public_descriptor_v1_1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl =
+        read(&root.join("protocol/cddl/public-descriptor/v1_1/public-descriptor-v1-1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse public-descriptor v1.1 CDDL: {error}"))
+    })?;
+    let vector = read_json(
+        &root.join("protocol/test-vectors/public-descriptor/v1_1/public-descriptor-v1-1.json"),
+    )?;
+    validate_vector_version(&vector, "public-descriptor-v1.1")?;
+    if json_string(&vector, "wire_version")? != "1.1" {
+        return Err(ProtocolToolError::new(
+            "public-descriptor-v1.1 vector wire_version must be 1.1",
+        ));
+    }
+    if json_string(&vector, "feed_path_template")?
+        != "/.well-known/dirextalk/public/v1/{subject_id}"
+    {
+        return Err(ProtocolToolError::new(
+            "public-descriptor-v1.1 vector feed_path_template must use the fixed subject path",
+        ));
+    }
+    let descriptors = vector
+        .get("descriptors")
+        .and_then(Value::as_array)
+        .filter(|descriptors| !descriptors.is_empty())
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "public-descriptor-v1.1 vector descriptors must be a nonempty array",
+            )
+        })?;
+    for descriptor in descriptors {
+        let name = json_string(descriptor, "descriptor")?;
+        let subject_id = json_string(descriptor, "subject_id")?;
+        let entry_hash = json_string(descriptor, "entry_hash")?;
+        if !entry_hash.starts_with("sha256:") {
+            return Err(ProtocolToolError::new(format!(
+                "public-descriptor-v1.1 descriptor {name} entry_hash must use sha256"
+            )));
+        }
+        validate_cddl_hex(
+            "public-descriptor-v1-1",
+            &cddl,
+            json_string(descriptor, "canonical_cbor_hex")?,
+        )?;
+        let tombstone = descriptor
+            .get("tombstone")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                ProtocolToolError::new(format!(
+                    "public-descriptor-v1.1 descriptor {name} tombstone must be a boolean"
+                ))
+            })?;
+        if tombstone {
+            if descriptor.get("feed_origin").is_some()
+                || descriptor.get("public_feed_url").is_some()
+            {
+                return Err(ProtocolToolError::new(format!(
+                    "public-descriptor-v1.1 tombstone {name} must not carry a feed origin or URL"
+                )));
+            }
+        } else {
+            let origin = json_string(descriptor, "feed_origin")?;
+            let public_feed_url = json_string(descriptor, "public_feed_url")?;
+            let expected_url = format!(
+                "{}{}{}",
+                origin.trim_end_matches('/'),
+                "/.well-known/dirextalk/public/v1/",
+                subject_id
+            );
+            if public_feed_url != expected_url {
+                return Err(ProtocolToolError::new(format!(
+                    "public-descriptor-v1.1 descriptor {name} public_feed_url must derive from its origin and subject"
+                )));
+            }
+        }
     }
     Ok(())
 }

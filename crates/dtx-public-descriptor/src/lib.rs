@@ -2,11 +2,14 @@
 
 //! Signed public Channel and Agent descriptor primitives.
 //!
-//! This crate is deliberately a pure protocol/reducer boundary. It has no
-//! tenant, database, Matrix, HTTP, indexer, mailbox, token, or private-key
-//! dependency. Public `dtxc1`/`dtxa1` subject IDs are self-certifying values
-//! derived from a descriptor subject genesis key; they are never an internal
-//! control-plane UUID, alias, or endpoint.
+//! Current V1.1 descriptors expose only an authority-only HTTPS `feed_origin`;
+//! clients derive the fixed subject path themselves. Frozen V1.0 endpoint bytes
+//! can be decoded only through [`HistoricalPublicDescriptorV1_0`]. This crate
+//! is deliberately a pure protocol/reducer boundary. It has no tenant,
+//! database, Matrix, HTTP, indexer, mailbox, token, or private-key dependency.
+//! Public `dtxc1`/`dtxa1` subject IDs are self-certifying values derived from a
+//! descriptor subject genesis key; they are never an internal control-plane
+//! UUID, alias, or endpoint.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,9 +25,16 @@ use dtx_wire::{
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 
-/// Exact V1 protocol version for public signed descriptors.
-pub const PUBLIC_DESCRIPTOR_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
-/// Exact V1 writer and reader version for public signed descriptors.
+/// Frozen public-descriptor `1.0` protocol version retained only for history reads.
+pub const PUBLIC_DESCRIPTOR_V1_0_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+/// Exact frozen public-descriptor `1.0` wire version.
+pub const PUBLIC_DESCRIPTOR_V1_0_WIRE_VERSION: WireVersion = WireVersion::new(
+    PUBLIC_DESCRIPTOR_V1_0_PROTOCOL_VERSION,
+    PUBLIC_DESCRIPTOR_V1_0_PROTOCOL_VERSION,
+);
+/// Current writable public-descriptor protocol version.
+pub const PUBLIC_DESCRIPTOR_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
+/// Exact current writer and reader version for public signed descriptors.
 pub const PUBLIC_DESCRIPTOR_WIRE_VERSION: WireVersion = WireVersion::new(
     PUBLIC_DESCRIPTOR_PROTOCOL_VERSION,
     PUBLIC_DESCRIPTOR_PROTOCOL_VERSION,
@@ -38,6 +48,14 @@ pub const PUBLIC_DESCRIPTOR_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.public-descrip
 pub const PUBLIC_DESCRIPTOR_ENTRY_HASH_DOMAIN: &[u8] = b"dirextalk.public-descriptor-entry.v1\0";
 
 const MAX_FEED_ENDPOINT_BYTES: usize = 512;
+/// Fixed public feed document root. V1.1 derives a subject-specific path under it.
+pub const PUBLIC_FEED_WELL_KNOWN_PATH_PREFIX: &str = "/.well-known/dirextalk/public/v1/";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicDescriptorWireLine {
+    FrozenV1_0,
+    CurrentV1_1,
+}
 
 /// Public descriptor admission or reduction failed without exposing a secret.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,8 +74,10 @@ pub enum PublicDescriptorError {
     SubjectPublisherBindingMismatch,
     /// The sequence, predecessor, expiry relation, or tombstone shape is invalid.
     InvalidDescriptorShape,
-    /// A public feed endpoint is unsafe, ambiguous, or outside V1 bounds.
+    /// A frozen V1.0 feed endpoint is malformed for historical verification.
     InvalidFeedEndpoint,
+    /// A current V1.1 public feed origin is unsafe, ambiguous, or outside bounds.
+    InvalidFeedOrigin,
     /// A live descriptor is expired at the caller's trusted clock.
     Expired,
     /// A descriptor starts after the caller's trusted clock.
@@ -92,7 +112,8 @@ impl fmt::Display for PublicDescriptorError {
                 "public descriptor publisher does not control the subject genesis key"
             }
             Self::InvalidDescriptorShape => "public descriptor has an invalid shape",
-            Self::InvalidFeedEndpoint => "public descriptor feed endpoint is invalid",
+            Self::InvalidFeedEndpoint => "historical public descriptor feed endpoint is invalid",
+            Self::InvalidFeedOrigin => "public descriptor feed origin is invalid",
             Self::Expired => "public descriptor is expired",
             Self::NotYetValid => "public descriptor is not active yet",
             Self::Replay => "public descriptor was already accepted",
@@ -138,15 +159,15 @@ impl PublicDescriptorKindV1 {
 pub enum PublicDescriptorPayloadV1 {
     /// A live public Channel descriptor.
     Channel {
-        /// Literal HTTPS endpoint of the Channel's signed public feed.
-        feed_endpoint: String,
+        /// HTTPS authority-only origin of the Channel's signed public feed.
+        feed_origin: String,
         /// SHA-256 digest of the Channel capability declaration.
         capability_digest: Sha256Digest,
     },
     /// A live discoverable Agent descriptor.
     Agent {
-        /// Literal HTTPS endpoint of the Agent's signed public feed.
-        feed_endpoint: String,
+        /// HTTPS authority-only origin of the Agent's signed public feed.
+        feed_origin: String,
         /// SHA-256 digest of the Agent capability declaration.
         capability_digest: Sha256Digest,
         /// SHA-256 digest of the Agent manifest or provenance document.
@@ -154,13 +175,31 @@ pub enum PublicDescriptorPayloadV1 {
     },
     /// Permanent public subject revocation with no live endpoint or artifact reference.
     Tombstone,
+    /// Frozen V1.0 Channel payload, available only to the historical decoder.
+    #[doc(hidden)]
+    LegacyChannelV1_0 {
+        /// Exact historical endpoint bytes, never accepted by the current writer.
+        feed_endpoint: String,
+        /// SHA-256 digest of the historical Channel capability declaration.
+        capability_digest: Sha256Digest,
+    },
+    /// Frozen V1.0 Agent payload, available only to the historical decoder.
+    #[doc(hidden)]
+    LegacyAgentV1_0 {
+        /// Exact historical endpoint bytes, never accepted by the current writer.
+        feed_endpoint: String,
+        /// SHA-256 digest of the historical Agent capability declaration.
+        capability_digest: Sha256Digest,
+        /// SHA-256 digest of the historical Agent manifest or provenance document.
+        manifest_digest: Sha256Digest,
+    },
 }
 
 impl PublicDescriptorPayloadV1 {
     const fn code(&self) -> u64 {
         match self {
-            Self::Channel { .. } => 1,
-            Self::Agent { .. } => 2,
+            Self::Channel { .. } | Self::LegacyChannelV1_0 { .. } => 1,
+            Self::Agent { .. } | Self::LegacyAgentV1_0 { .. } => 2,
             Self::Tombstone => 3,
         }
     }
@@ -168,6 +207,38 @@ impl PublicDescriptorPayloadV1 {
     fn to_canonical_value(&self) -> CanonicalValue {
         match self {
             Self::Channel {
+                feed_origin,
+                capability_digest,
+            } => CanonicalValue::Map(vec![
+                (
+                    CanonicalValue::Unsigned(1),
+                    CanonicalValue::Text(feed_origin.clone()),
+                ),
+                (
+                    CanonicalValue::Unsigned(2),
+                    capability_digest.to_canonical_value(),
+                ),
+            ]),
+            Self::Agent {
+                feed_origin,
+                capability_digest,
+                manifest_digest,
+            } => CanonicalValue::Map(vec![
+                (
+                    CanonicalValue::Unsigned(1),
+                    CanonicalValue::Text(feed_origin.clone()),
+                ),
+                (
+                    CanonicalValue::Unsigned(2),
+                    capability_digest.to_canonical_value(),
+                ),
+                (
+                    CanonicalValue::Unsigned(3),
+                    manifest_digest.to_canonical_value(),
+                ),
+            ]),
+            Self::Tombstone => CanonicalValue::Map(Vec::new()),
+            Self::LegacyChannelV1_0 {
                 feed_endpoint,
                 capability_digest,
             } => CanonicalValue::Map(vec![
@@ -180,7 +251,7 @@ impl PublicDescriptorPayloadV1 {
                     capability_digest.to_canonical_value(),
                 ),
             ]),
-            Self::Agent {
+            Self::LegacyAgentV1_0 {
                 feed_endpoint,
                 capability_digest,
                 manifest_digest,
@@ -198,12 +269,20 @@ impl PublicDescriptorPayloadV1 {
                     manifest_digest.to_canonical_value(),
                 ),
             ]),
-            Self::Tombstone => CanonicalValue::Map(Vec::new()),
         }
     }
 
     const fn is_tombstone(&self) -> bool {
         matches!(self, Self::Tombstone)
+    }
+
+    fn feed_origin(&self) -> Option<&str> {
+        match self {
+            Self::Channel { feed_origin, .. } | Self::Agent { feed_origin, .. } => {
+                Some(feed_origin)
+            }
+            Self::Tombstone | Self::LegacyChannelV1_0 { .. } | Self::LegacyAgentV1_0 { .. } => None,
+        }
     }
 }
 
@@ -224,7 +303,7 @@ pub struct UnsignedPublicDescriptorV1 {
 }
 
 impl UnsignedPublicDescriptorV1 {
-    /// Creates strictly validated V1 unsigned descriptor content.
+    /// Creates strictly validated current V1.1 unsigned descriptor content.
     ///
     /// `subject_id` must be `dtxc1` for Channel or `dtxa1` for Agent and must
     /// derive from `subject_genesis_signing_key`. The publisher identity is
@@ -235,9 +314,43 @@ impl UnsignedPublicDescriptorV1 {
     ///
     /// Returns a descriptor error for an unsupported wire line, mismatched
     /// self-certifying ID, invalid sequence or expiry shape, or invalid public
-    /// payload endpoint.
+    /// payload origin. Frozen V1.0 is deliberately not a writer input.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        wire: WireVersion,
+        kind: PublicDescriptorKindV1,
+        subject_id: PublicSubjectId,
+        subject_genesis_signing_key: SigningPublicKey,
+        publisher_identity_id: IdentityId,
+        publisher_identity_genesis_signing_key: SigningPublicKey,
+        sequence: SafeUint,
+        previous_descriptor_hash: Option<Sha256Digest>,
+        issued_at: UtcMillis,
+        expires_at: UtcMillis,
+        payload: PublicDescriptorPayloadV1,
+    ) -> Result<Self, PublicDescriptorError> {
+        if wire != PUBLIC_DESCRIPTOR_WIRE_VERSION {
+            return Err(PublicDescriptorError::InvalidWireVersion);
+        }
+        let descriptor = Self {
+            wire,
+            kind,
+            subject_id,
+            subject_genesis_signing_key,
+            publisher_identity_id,
+            publisher_identity_genesis_signing_key,
+            sequence,
+            previous_descriptor_hash,
+            issued_at,
+            expires_at,
+            payload,
+        };
+        descriptor.validate_static_current()?;
+        Ok(descriptor)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_decoded(
         wire: WireVersion,
         kind: PublicDescriptorKindV1,
         subject_id: PublicSubjectId,
@@ -263,7 +376,7 @@ impl UnsignedPublicDescriptorV1 {
             expires_at,
             payload,
         };
-        descriptor.validate_static()?;
+        descriptor.validate_static_any()?;
         Ok(descriptor)
     }
 
@@ -290,10 +403,15 @@ impl UnsignedPublicDescriptorV1 {
         ))
     }
 
-    fn validate_static(&self) -> Result<(), PublicDescriptorError> {
-        if self.wire != PUBLIC_DESCRIPTOR_WIRE_VERSION {
+    fn validate_static_current(&self) -> Result<(), PublicDescriptorError> {
+        if public_descriptor_wire_line(self.wire)? != PublicDescriptorWireLine::CurrentV1_1 {
             return Err(PublicDescriptorError::InvalidWireVersion);
         }
+        self.validate_static_any()
+    }
+
+    fn validate_static_any(&self) -> Result<(), PublicDescriptorError> {
+        let wire_line = public_descriptor_wire_line(self.wire)?;
         match (self.kind, self.subject_id) {
             (PublicDescriptorKindV1::Channel, PublicSubjectId::Channel(id)) => id
                 .verify_subject_key(self.subject_genesis_signing_key.as_domain_key())
@@ -322,25 +440,46 @@ impl UnsignedPublicDescriptorV1 {
         {
             return Err(PublicDescriptorError::InvalidDescriptorShape);
         }
-        match (&self.kind, &self.payload) {
+        match (wire_line, &self.kind, &self.payload) {
             (
+                PublicDescriptorWireLine::CurrentV1_1,
                 PublicDescriptorKindV1::Channel,
-                PublicDescriptorPayloadV1::Channel { feed_endpoint, .. },
+                PublicDescriptorPayloadV1::Channel { feed_origin, .. },
             )
             | (
+                PublicDescriptorWireLine::CurrentV1_1,
                 PublicDescriptorKindV1::Agent,
-                PublicDescriptorPayloadV1::Agent { feed_endpoint, .. },
+                PublicDescriptorPayloadV1::Agent { feed_origin, .. },
             ) => {
                 if self.expires_at <= self.issued_at {
                     return Err(PublicDescriptorError::InvalidDescriptorShape);
                 }
-                if valid_public_feed_endpoint(feed_endpoint) {
+                if valid_public_feed_origin(feed_origin) {
+                    Ok(())
+                } else {
+                    Err(PublicDescriptorError::InvalidFeedOrigin)
+                }
+            }
+            (
+                PublicDescriptorWireLine::FrozenV1_0,
+                PublicDescriptorKindV1::Channel,
+                PublicDescriptorPayloadV1::LegacyChannelV1_0 { feed_endpoint, .. },
+            )
+            | (
+                PublicDescriptorWireLine::FrozenV1_0,
+                PublicDescriptorKindV1::Agent,
+                PublicDescriptorPayloadV1::LegacyAgentV1_0 { feed_endpoint, .. },
+            ) => {
+                if self.expires_at <= self.issued_at {
+                    return Err(PublicDescriptorError::InvalidDescriptorShape);
+                }
+                if valid_historical_feed_endpoint(feed_endpoint) {
                     Ok(())
                 } else {
                     Err(PublicDescriptorError::InvalidFeedEndpoint)
                 }
             }
-            (_, PublicDescriptorPayloadV1::Tombstone) => {
+            (_, _, PublicDescriptorPayloadV1::Tombstone) => {
                 if self.sequence.get() == 1 || self.expires_at != self.issued_at {
                     Err(PublicDescriptorError::InvalidDescriptorShape)
                 } else {
@@ -431,7 +570,7 @@ impl SignedPublicDescriptorV1 {
         Ok(descriptor)
     }
 
-    /// Decodes one exact canonical CBOR descriptor and verifies its signature.
+    /// Decodes one exact canonical current V1.1 CBOR descriptor and verifies its signature.
     ///
     /// Unknown fields, non-preferred CBOR, malformed IDs, noncanonical public
     /// keys, and a decode/re-encode mismatch are all rejected.
@@ -439,12 +578,24 @@ impl SignedPublicDescriptorV1 {
     /// # Errors
     ///
     /// Returns a descriptor error when bytes or their cryptographic proof are
-    /// not exactly valid V1 descriptor data.
+    /// not exactly valid current V1.1 descriptor data. Frozen V1.0 bytes must
+    /// use [`HistoricalPublicDescriptorV1_0`].
     pub fn decode_and_verify(bytes: &[u8]) -> Result<Self, PublicDescriptorError> {
+        Self::decode_and_verify_for_line(bytes, PublicDescriptorWireLine::CurrentV1_1)
+    }
+
+    fn decode_and_verify_for_line(
+        bytes: &[u8],
+        expected_wire_line: PublicDescriptorWireLine,
+    ) -> Result<Self, PublicDescriptorError> {
         let value = decode_deterministic_cbor(bytes)
             .map_err(|_| PublicDescriptorError::InvalidCanonical)?;
         let fields = exact_fields(&value, 13)?;
         let wire = decode_wire_version(field(fields, 1)?)?;
+        let wire_line = public_descriptor_wire_line(wire)?;
+        if wire_line != expected_wire_line {
+            return Err(PublicDescriptorError::InvalidWireVersion);
+        }
         let kind = PublicDescriptorKindV1::from_code(decode_unsigned(field(fields, 2)?)?)?;
         let subject_id = decode_subject_id(field(fields, 3)?)?;
         let subject_genesis_signing_key = decode_signing_key(field(fields, 4)?)?;
@@ -455,9 +606,9 @@ impl SignedPublicDescriptorV1 {
         let issued_at = decode_utc_millis(field(fields, 9)?)?;
         let expires_at = decode_utc_millis(field(fields, 10)?)?;
         let payload_code = decode_unsigned(field(fields, 11)?)?;
-        let payload = decode_payload(kind, payload_code, field(fields, 12)?)?;
+        let payload = decode_payload(wire_line, kind, payload_code, field(fields, 12)?)?;
         let signature = decode_signature(field(fields, 13)?)?;
-        let unsigned = UnsignedPublicDescriptorV1::new(
+        let unsigned = UnsignedPublicDescriptorV1::from_decoded(
             wire,
             kind,
             subject_id,
@@ -470,20 +621,33 @@ impl SignedPublicDescriptorV1 {
             expires_at,
             payload,
         )?;
-        let descriptor = Self::signed(unsigned, signature)?;
+        let descriptor = Self {
+            unsigned,
+            signature,
+        };
+        descriptor.verify_any()?;
         if descriptor.to_deterministic_cbor()? != bytes {
             return Err(PublicDescriptorError::InvalidCanonical);
         }
         Ok(descriptor)
     }
 
-    /// Re-verifies static V1 constraints and the strict Ed25519 proof.
+    /// Re-verifies current V1.1 constraints and the strict Ed25519 proof.
     ///
     /// # Errors
     ///
     /// Returns an error when any exact binding or the publisher signature is invalid.
     pub fn verify(&self) -> Result<(), PublicDescriptorError> {
-        self.unsigned.validate_static()?;
+        self.unsigned.validate_static_current()?;
+        self.verify_signature()
+    }
+
+    fn verify_any(&self) -> Result<(), PublicDescriptorError> {
+        self.unsigned.validate_static_any()?;
+        self.verify_signature()
+    }
+
+    fn verify_signature(&self) -> Result<(), PublicDescriptorError> {
         verify_signature(
             self.unsigned.publisher_identity_genesis_signing_key,
             &self.unsigned.signature_input()?,
@@ -507,6 +671,12 @@ impl SignedPublicDescriptorV1 {
     /// Returns an error only if canonical encoding cannot represent this descriptor.
     pub fn entry_hash(&self) -> Result<Sha256Digest, PublicDescriptorError> {
         canonical_hash(PUBLIC_DESCRIPTOR_ENTRY_HASH_DOMAIN, self)
+    }
+
+    /// Returns the exact descriptor wire version.
+    #[must_use]
+    pub const fn wire(&self) -> WireVersion {
+        self.unsigned.wire
     }
 
     /// Returns the stable public Channel or Agent subject ID.
@@ -569,6 +739,31 @@ impl SignedPublicDescriptorV1 {
         &self.unsigned.payload
     }
 
+    /// Returns the V1.1 authority-only public feed origin for a live descriptor.
+    #[must_use]
+    pub fn feed_origin(&self) -> Option<&str> {
+        self.unsigned.payload.feed_origin()
+    }
+
+    /// Returns the fixed subject-specific public feed path for a live descriptor.
+    #[must_use]
+    pub fn public_feed_path(&self) -> Option<String> {
+        self.feed_origin()
+            .map(|_| format!("{PUBLIC_FEED_WELL_KNOWN_PATH_PREFIX}{}", self.subject_id()))
+    }
+
+    /// Returns the fixed subject-specific public feed URL for a live descriptor.
+    #[must_use]
+    pub fn public_feed_url(&self) -> Option<String> {
+        self.feed_origin().map(|origin| {
+            format!(
+                "{}{PUBLIC_FEED_WELL_KNOWN_PATH_PREFIX}{}",
+                origin.trim_end_matches('/'),
+                self.subject_id()
+            )
+        })
+    }
+
     /// Returns whether this entry is a permanent tombstone.
     #[must_use]
     pub const fn is_tombstone(&self) -> bool {
@@ -596,6 +791,86 @@ impl CanonicalEncode for SignedPublicDescriptorV1 {
             self.signature.to_canonical_value(),
         ));
         CanonicalValue::Map(fields)
+    }
+}
+
+/// Read-only verified wrapper for frozen public-descriptor wire `1.0` bytes.
+///
+/// V1.0 allowed an arbitrary endpoint path and is therefore never returned by
+/// the current decoder, writer, or reducer. This wrapper is intentionally only
+/// for exact historical inspection and migration diagnostics; it exposes no
+/// payload endpoint, write constructor, or append operation.
+#[derive(Clone, Eq, PartialEq)]
+pub struct HistoricalPublicDescriptorV1_0 {
+    descriptor: SignedPublicDescriptorV1,
+}
+
+impl HistoricalPublicDescriptorV1_0 {
+    /// Decodes and strictly verifies one frozen V1.0 descriptor for history reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PublicDescriptorError::InvalidWireVersion`] for current or
+    /// unknown bytes, and the relevant strict canonical or signature error for
+    /// an invalid historical descriptor.
+    pub fn decode_and_verify(bytes: &[u8]) -> Result<Self, PublicDescriptorError> {
+        let descriptor = SignedPublicDescriptorV1::decode_and_verify_for_line(
+            bytes,
+            PublicDescriptorWireLine::FrozenV1_0,
+        )?;
+        if descriptor.wire() != PUBLIC_DESCRIPTOR_V1_0_WIRE_VERSION {
+            return Err(PublicDescriptorError::InvalidWireVersion);
+        }
+        Ok(Self { descriptor })
+    }
+
+    /// Returns the frozen historical wire version.
+    #[must_use]
+    pub const fn wire(&self) -> WireVersion {
+        self.descriptor.wire()
+    }
+
+    /// Returns the stable historical public Channel or Agent subject ID.
+    #[must_use]
+    pub const fn subject_id(&self) -> PublicSubjectId {
+        self.descriptor.subject_id()
+    }
+
+    /// Returns the self-certifying historical publisher identity ID.
+    #[must_use]
+    pub const fn publisher_identity_id(&self) -> IdentityId {
+        self.descriptor.publisher_identity_id()
+    }
+
+    /// Returns the historical descriptor sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> SafeUint {
+        self.descriptor.sequence()
+    }
+
+    /// Returns whether the historical entry is a tombstone.
+    #[must_use]
+    pub const fn is_tombstone(&self) -> bool {
+        self.descriptor.is_tombstone()
+    }
+
+    /// Returns exact deterministic historical descriptor bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the bounded deterministic profile cannot encode
+    /// this already verified historical descriptor.
+    pub fn to_deterministic_cbor(&self) -> Result<Vec<u8>, PublicDescriptorError> {
+        self.descriptor.to_deterministic_cbor()
+    }
+
+    /// Returns the complete historical descriptor hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if canonical encoding cannot represent the entry.
+    pub fn entry_hash(&self) -> Result<Sha256Digest, PublicDescriptorError> {
+        self.descriptor.entry_hash()
     }
 }
 
@@ -811,7 +1086,7 @@ fn verify_signature(
         .map_err(|_| PublicDescriptorError::InvalidSignature)
 }
 
-fn valid_public_feed_endpoint(value: &str) -> bool {
+fn valid_historical_feed_endpoint(value: &str) -> bool {
     if value.len() > MAX_FEED_ENDPOINT_BYTES
         || !value.is_ascii()
         || !value.starts_with("https://")
@@ -832,6 +1107,70 @@ fn valid_public_feed_endpoint(value: &str) -> bool {
                 || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
         })
         && authority.bytes().any(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn valid_public_feed_origin(value: &str) -> bool {
+    if value.len() > MAX_FEED_ENDPOINT_BYTES
+        || !value.is_ascii()
+        || !value.starts_with("https://")
+        || value.contains(['@', '?', '#', '\\'])
+        || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return false;
+    }
+    let authority_and_root = &value["https://".len()..];
+    let authority = if let Some(authority) = authority_and_root.strip_suffix('/') {
+        authority
+    } else {
+        authority_and_root
+    };
+    !authority.is_empty() && !authority.contains('/') && valid_public_feed_authority(authority)
+}
+
+fn valid_public_feed_authority(authority: &str) -> bool {
+    if let Some(ipv6) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = ipv6.split_once(']') else {
+            return false;
+        };
+        if host.is_empty()
+            || !host.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b':' | b'.')
+            })
+            || std::net::Ipv6Addr::from_str(host).is_err()
+        {
+            return false;
+        }
+        return suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_public_feed_port);
+    }
+
+    if authority.contains(['[', ']']) || authority.matches(':').count() > 1 {
+        return false;
+    }
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    valid_public_feed_host(host) && port.is_none_or(valid_public_feed_port)
+}
+
+fn valid_public_feed_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.ends_with('.')
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn valid_public_feed_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|parsed| parsed != 0)
 }
 
 fn exact_fields(
@@ -874,8 +1213,16 @@ fn decode_wire_version(value: &CanonicalValue) -> Result<WireVersion, PublicDesc
         decode_protocol_version(field(fields, 1)?)?,
         decode_protocol_version(field(fields, 2)?)?,
     );
-    if wire == PUBLIC_DESCRIPTOR_WIRE_VERSION {
-        Ok(wire)
+    public_descriptor_wire_line(wire).map(|_| wire)
+}
+
+fn public_descriptor_wire_line(
+    wire: WireVersion,
+) -> Result<PublicDescriptorWireLine, PublicDescriptorError> {
+    if wire == PUBLIC_DESCRIPTOR_V1_0_WIRE_VERSION {
+        Ok(PublicDescriptorWireLine::FrozenV1_0)
+    } else if wire == PUBLIC_DESCRIPTOR_WIRE_VERSION {
+        Ok(PublicDescriptorWireLine::CurrentV1_1)
     } else {
         Err(PublicDescriptorError::InvalidWireVersion)
     }
@@ -957,27 +1304,43 @@ fn decode_signature(value: &CanonicalValue) -> Result<Ed25519Signature, PublicDe
 }
 
 fn decode_payload(
+    wire_line: PublicDescriptorWireLine,
     kind: PublicDescriptorKindV1,
     code: u64,
     value: &CanonicalValue,
 ) -> Result<PublicDescriptorPayloadV1, PublicDescriptorError> {
-    match (kind, code) {
-        (PublicDescriptorKindV1::Channel, 1) => {
+    match (wire_line, kind, code) {
+        (PublicDescriptorWireLine::CurrentV1_1, PublicDescriptorKindV1::Channel, 1) => {
             let fields = exact_fields(value, 2)?;
             Ok(PublicDescriptorPayloadV1::Channel {
+                feed_origin: decode_text(field(fields, 1)?)?,
+                capability_digest: decode_digest(field(fields, 2)?)?,
+            })
+        }
+        (PublicDescriptorWireLine::CurrentV1_1, PublicDescriptorKindV1::Agent, 2) => {
+            let fields = exact_fields(value, 3)?;
+            Ok(PublicDescriptorPayloadV1::Agent {
+                feed_origin: decode_text(field(fields, 1)?)?,
+                capability_digest: decode_digest(field(fields, 2)?)?,
+                manifest_digest: decode_digest(field(fields, 3)?)?,
+            })
+        }
+        (PublicDescriptorWireLine::FrozenV1_0, PublicDescriptorKindV1::Channel, 1) => {
+            let fields = exact_fields(value, 2)?;
+            Ok(PublicDescriptorPayloadV1::LegacyChannelV1_0 {
                 feed_endpoint: decode_text(field(fields, 1)?)?,
                 capability_digest: decode_digest(field(fields, 2)?)?,
             })
         }
-        (PublicDescriptorKindV1::Agent, 2) => {
+        (PublicDescriptorWireLine::FrozenV1_0, PublicDescriptorKindV1::Agent, 2) => {
             let fields = exact_fields(value, 3)?;
-            Ok(PublicDescriptorPayloadV1::Agent {
+            Ok(PublicDescriptorPayloadV1::LegacyAgentV1_0 {
                 feed_endpoint: decode_text(field(fields, 1)?)?,
                 capability_digest: decode_digest(field(fields, 2)?)?,
                 manifest_digest: decode_digest(field(fields, 3)?)?,
             })
         }
-        (_, 3) => {
+        (_, _, 3) => {
             exact_fields(value, 0)?;
             Ok(PublicDescriptorPayloadV1::Tombstone)
         }

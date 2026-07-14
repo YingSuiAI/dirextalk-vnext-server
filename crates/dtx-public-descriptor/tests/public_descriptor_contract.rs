@@ -1,10 +1,13 @@
 use dtx_domain::{AgentId, ChannelId, IdentityId, PublicSubjectId};
 use dtx_public_descriptor::{
-    DescriptorHeadV1, PUBLIC_DESCRIPTOR_WIRE_VERSION, PublicDescriptorError,
-    PublicDescriptorKindV1, PublicDescriptorPayloadV1, SignedPublicDescriptorV1,
-    UnsignedPublicDescriptorV1,
+    DescriptorHeadV1, HistoricalPublicDescriptorV1_0, PUBLIC_DESCRIPTOR_WIRE_VERSION,
+    PublicDescriptorError, PublicDescriptorKindV1, PublicDescriptorPayloadV1,
+    SignedPublicDescriptorV1, UnsignedPublicDescriptorV1,
 };
-use dtx_wire::{Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey, UtcMillis};
+use dtx_wire::{
+    Ed25519Signature, ProtocolVersion, SafeUint, Sha256Digest, SigningPublicKey, UtcMillis,
+    WireVersion,
+};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::Deserialize;
 
@@ -12,6 +15,7 @@ use serde::Deserialize;
 struct PublicDescriptorVector {
     version: u16,
     wire_version: String,
+    feed_path_template: Option<String>,
     descriptors: Vec<PublicDescriptorVectorEntry>,
 }
 
@@ -20,6 +24,8 @@ struct PublicDescriptorVectorEntry {
     descriptor: String,
     subject_id: String,
     publisher_identity_id: String,
+    feed_origin: Option<String>,
+    public_feed_url: Option<String>,
     tombstone: bool,
     canonical_cbor_hex: String,
     entry_hash: String,
@@ -53,7 +59,7 @@ fn unsigned_channel(
         PublicDescriptorPayloadV1::Tombstone
     } else {
         PublicDescriptorPayloadV1::Channel {
-            feed_endpoint: "https://feed.example/channel".to_owned(),
+            feed_origin: "https://feed.example".to_owned(),
             capability_digest: Sha256Digest::from_bytes([33; 32]),
         }
     };
@@ -112,7 +118,7 @@ fn rejects_a_subject_id_that_does_not_bind_the_declared_genesis_key() {
         utc(1_700_000_000_000),
         utc(1_700_000_100_000),
         PublicDescriptorPayloadV1::Channel {
-            feed_endpoint: "https://feed.example/channel".to_owned(),
+            feed_origin: "https://feed.example".to_owned(),
             capability_digest: Sha256Digest::from_bytes([33; 32]),
         },
     );
@@ -138,13 +144,121 @@ fn rejects_a_publisher_that_does_not_control_the_subject_genesis_key() {
         utc(1_700_000_000_000),
         utc(1_700_000_100_000),
         PublicDescriptorPayloadV1::Channel {
-            feed_endpoint: "https://feed.example/channel".to_owned(),
+            feed_origin: "https://feed.example".to_owned(),
             capability_digest: Sha256Digest::from_bytes([33; 32]),
         },
     );
     assert_eq!(
         result.unwrap_err(),
         PublicDescriptorError::SubjectPublisherBindingMismatch
+    );
+}
+
+#[test]
+fn current_writes_reject_capability_paths_and_frozen_v1_0() {
+    let publisher = key(22);
+    let publisher_key = public(&publisher);
+    let subject_id = ChannelId::derive(publisher_key.as_domain_key());
+    let publisher_identity_id = IdentityId::derive(publisher_key.as_domain_key());
+    let path_bearing = UnsignedPublicDescriptorV1::new(
+        PUBLIC_DESCRIPTOR_WIRE_VERSION,
+        PublicDescriptorKindV1::Channel,
+        PublicSubjectId::Channel(subject_id),
+        publisher_key,
+        publisher_identity_id,
+        publisher_key,
+        SafeUint::new(1).expect("sequence"),
+        None,
+        utc(1_700_000_000_000),
+        utc(1_700_000_100_000),
+        PublicDescriptorPayloadV1::Channel {
+            feed_origin: "https://feed.example/capability-token".to_owned(),
+            capability_digest: Sha256Digest::from_bytes([33; 32]),
+        },
+    );
+    assert_eq!(path_bearing, Err(PublicDescriptorError::InvalidFeedOrigin));
+
+    let frozen_v1_0 = UnsignedPublicDescriptorV1::new(
+        WireVersion::new(ProtocolVersion::new(1, 0), ProtocolVersion::new(1, 0)),
+        PublicDescriptorKindV1::Channel,
+        PublicSubjectId::Channel(subject_id),
+        publisher_key,
+        publisher_identity_id,
+        publisher_key,
+        SafeUint::new(1).expect("sequence"),
+        None,
+        utc(1_700_000_000_000),
+        utc(1_700_000_100_000),
+        PublicDescriptorPayloadV1::Channel {
+            feed_origin: "https://feed.example".to_owned(),
+            capability_digest: Sha256Digest::from_bytes([33; 32]),
+        },
+    );
+    assert_eq!(frozen_v1_0, Err(PublicDescriptorError::InvalidWireVersion));
+}
+
+#[test]
+fn current_feed_origins_allow_only_an_https_authority_or_root_slash() {
+    let publisher = key(22);
+    let publisher_key = public(&publisher);
+    let subject_id = ChannelId::derive(publisher_key.as_domain_key());
+    let publisher_identity_id = IdentityId::derive(publisher_key.as_domain_key());
+    for invalid_origin in [
+        "https://feed.example/capability-token",
+        "https://token@feed.example",
+        "https://feed.example?capability=token",
+        "https://feed.example#capability-token",
+        "http://feed.example",
+        "https://feed.example//",
+        "https://feed.example:invalid",
+    ] {
+        let result = UnsignedPublicDescriptorV1::new(
+            PUBLIC_DESCRIPTOR_WIRE_VERSION,
+            PublicDescriptorKindV1::Channel,
+            PublicSubjectId::Channel(subject_id),
+            publisher_key,
+            publisher_identity_id,
+            publisher_key,
+            SafeUint::new(1).expect("sequence"),
+            None,
+            utc(1_700_000_000_000),
+            utc(1_700_000_100_000),
+            PublicDescriptorPayloadV1::Channel {
+                feed_origin: invalid_origin.to_owned(),
+                capability_digest: Sha256Digest::from_bytes([33; 32]),
+            },
+        );
+        assert_eq!(result, Err(PublicDescriptorError::InvalidFeedOrigin));
+    }
+
+    assert!(
+        UnsignedPublicDescriptorV1::new(
+            PUBLIC_DESCRIPTOR_WIRE_VERSION,
+            PublicDescriptorKindV1::Channel,
+            PublicSubjectId::Channel(subject_id),
+            publisher_key,
+            publisher_identity_id,
+            publisher_key,
+            SafeUint::new(1).expect("sequence"),
+            None,
+            utc(1_700_000_000_000),
+            utc(1_700_000_100_000),
+            PublicDescriptorPayloadV1::Channel {
+                feed_origin: "https://feed.example/".to_owned(),
+                capability_digest: Sha256Digest::from_bytes([33; 32]),
+            },
+        )
+        .is_ok()
+    );
+
+    let (unsigned, signer) = unsigned_channel(1, None, 1_700_000_000_000, 1_700_000_100_000, false);
+    let descriptor = sign(unsigned, &signer);
+    assert_eq!(
+        descriptor.public_feed_url(),
+        Some(format!(
+            "https://feed.example/.well-known/dirextalk/public/v1/{}",
+            descriptor.subject_id()
+        ))
     );
 }
 
@@ -245,13 +359,17 @@ fn reducer_fails_closed_for_an_expired_live_descriptor_and_for_tombstoned_subjec
 }
 
 #[test]
-fn frozen_public_vector_is_byte_exact_and_reduces_to_the_expected_heads() {
+fn current_v1_1_vector_is_byte_exact_and_reduces_to_the_expected_heads() {
     let vector: PublicDescriptorVector = serde_json::from_str(include_str!(
-        "../../../protocol/test-vectors/public-descriptor/v1/public-descriptor-v1.json"
+        "../../../protocol/test-vectors/public-descriptor/v1_1/public-descriptor-v1-1.json"
     ))
     .expect("public descriptor vector is valid JSON");
     assert_eq!(vector.version, 1);
-    assert_eq!(vector.wire_version, "1.0");
+    assert_eq!(vector.wire_version, "1.1");
+    assert_eq!(
+        vector.feed_path_template.as_deref(),
+        Some("/.well-known/dirextalk/public/v1/{subject_id}")
+    );
 
     let mut channel_genesis = None;
     let mut channel_tombstone = None;
@@ -267,6 +385,11 @@ fn frozen_public_vector_is_byte_exact_and_reduces_to_the_expected_heads() {
             descriptor.publisher_identity_id().to_string(),
             entry.publisher_identity_id
         );
+        assert_eq!(
+            descriptor.feed_origin().map(str::to_owned),
+            entry.feed_origin
+        );
+        assert_eq!(descriptor.public_feed_url(), entry.public_feed_url);
         assert_eq!(descriptor.is_tombstone(), entry.tombstone);
         assert_eq!(
             descriptor.entry_hash().expect("entry hash").to_string(),
@@ -300,6 +423,51 @@ fn frozen_public_vector_is_byte_exact_and_reduces_to_the_expected_heads() {
     let agent_genesis = agent_genesis.expect("agent genesis vector");
     DescriptorHeadV1::bootstrap_at(&agent_genesis, utc(1_700_000_000_001))
         .expect("agent vector genesis is live");
+}
+
+#[test]
+fn frozen_v1_0_vector_is_read_only_and_cannot_enter_the_current_decoder() {
+    let vector: PublicDescriptorVector = serde_json::from_str(include_str!(
+        "../../../protocol/test-vectors/public-descriptor/v1/public-descriptor-v1.json"
+    ))
+    .expect("historical public descriptor vector is valid JSON");
+    assert_eq!(vector.version, 1);
+    assert_eq!(vector.wire_version, "1.0");
+    assert_eq!(vector.feed_path_template, None);
+
+    for entry in vector.descriptors {
+        let bytes = decode_hex(&entry.canonical_cbor_hex);
+        assert_eq!(
+            SignedPublicDescriptorV1::decode_and_verify(&bytes),
+            Err(PublicDescriptorError::InvalidWireVersion)
+        );
+        let descriptor =
+            HistoricalPublicDescriptorV1_0::decode_and_verify(&bytes).unwrap_or_else(|error| {
+                panic!(
+                    "{} historical vector is invalid: {error:?}",
+                    entry.descriptor
+                )
+            });
+        assert_eq!(descriptor.subject_id().to_string(), entry.subject_id);
+        assert_eq!(
+            descriptor.publisher_identity_id().to_string(),
+            entry.publisher_identity_id
+        );
+        assert_eq!(descriptor.is_tombstone(), entry.tombstone);
+        assert_eq!(
+            descriptor
+                .entry_hash()
+                .expect("historical hash")
+                .to_string(),
+            entry.entry_hash
+        );
+        assert_eq!(
+            descriptor
+                .to_deterministic_cbor()
+                .expect("historical bytes"),
+            bytes
+        );
+    }
 }
 
 fn decode_hex(value: &str) -> Vec<u8> {

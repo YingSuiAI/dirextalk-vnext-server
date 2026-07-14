@@ -43,12 +43,19 @@ Layout:
   source for read-only historical validation/import only.
   `baseline/v6/manifest.json` freezes the disjoint current identity-log wire
   1.1 source, including the recovery-rotation co-sign requirement; neither
-  baseline rewrites the other. `baseline/v7/manifest.json` independently
-  freezes public descriptor V1: self-certifying `dtxc1`/`dtxa1` subject IDs,
-  publisher identity binding, canonical signed sequence heads, bounded public
-  feed references, artifact digests, expiry, and permanent tombstones. It does
-  not introduce an Indexer, public feed transport, delegation, or a
-  control-plane UUID alias for a public subject.
+  baseline rewrites the other. `baseline/v7/manifest.json` freezes the original
+  public descriptor 1.0 wire for explicit historical reads only. Its endpoint
+  field allowed an arbitrary path and it must never enter the current writer,
+  reducer, registration, or Indexer path. `baseline/v8/manifest.json`
+  independently freezes current public descriptor 1.1: self-certifying
+  `dtxc1`/`dtxa1` subject IDs, publisher identity binding, canonical signed
+  sequence heads, a strict authority-only `feed_origin`, artifact digests,
+  expiry, and permanent tombstones. Clients and PD2 derive the fixed public
+  document path `/.well-known/dirextalk/public/v1/{subject_id}` from that
+  origin; a capability, token, userinfo, query, fragment, or custom path is
+  not representable in a current descriptor. Neither version introduces an
+  Indexer, public feed transport, delegation, or a control-plane UUID alias for
+  a public subject.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen
