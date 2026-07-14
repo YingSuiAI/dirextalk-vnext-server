@@ -83,25 +83,7 @@ async fn run() -> Result<(), ProvisionError> {
     validate_and_sort_plan(&mut plan)?;
     let normalized_plan = serde_json::to_vec(&plan).map_err(|_| ProvisionError::Plan)?;
     let plan_digest = domain_digest(PLAN_DIGEST_DOMAIN, &normalized_plan);
-    let now_millis = now_millis()?;
-
-    let (mut handoff, handoff_was_new) = match fs::symlink_metadata(&arguments.handoff_file) {
-        Ok(_) => {
-            let bytes = Zeroizing::new(read_regular_bounded(
-                &arguments.handoff_file,
-                MAX_JSON_BYTES,
-                true,
-            )?);
-            (parse_handoff(&bytes)?, false)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let handoff = generate_pending_handoff(&plan, now_millis)?;
-            atomic_write_handoff(&arguments.handoff_file, &handoff)?;
-            (handoff, true)
-        }
-        Err(_) => return Err(ProvisionError::Handoff),
-    };
-    validate_handoff(&handoff, &plan, now_millis)?;
+    let mut handoff_file = LockedHandoff::acquire(&plan, &arguments.handoff_file)?;
 
     let database_url = Zeroizing::new(read_regular_bounded(
         &arguments.database_url_file,
@@ -124,16 +106,13 @@ async fn run() -> Result<(), ProvisionError> {
         return Err(ProvisionError::Database);
     }
 
-    let request = provisioning_request(&plan, &handoff, plan_digest)?;
+    let request = provisioning_request(&plan, &handoff_file.handoff, plan_digest)?;
     let result = ensure_host_provisioning(&store, request)
         .await
         .map_err(|_| ProvisionError::Provisioning)?;
-    verify_result(&result, &handoff)?;
-    if handoff.state == HandoffState::Pending {
-        handoff.state = HandoffState::Ready;
-        atomic_write_handoff(&arguments.handoff_file, &handoff)?;
-    }
-    report_success(&result, handoff_was_new)
+    verify_result(&result, &handoff_file.handoff)?;
+    handoff_file.mark_ready()?;
+    report_success(&result, handoff_file.was_new)
 }
 
 #[allow(
@@ -270,6 +249,69 @@ struct HandoffConnector {
     ttl_millis: i64,
     expires_at_millis: i64,
     enrollment_token: SecretToken,
+}
+
+/// Keeps the parent-directory process lock alive from handoff inspection through ready publish.
+///
+/// All normal provisioning writers use this same lock, so a retry either observes the exact
+/// pending handoff written by the prior process or its ready form; it never generates a second
+/// token set for the same handoff path.
+struct LockedHandoff {
+    _lock: HandoffParentLock,
+    path: PathBuf,
+    handoff: ProvisioningHandoff,
+    was_new: bool,
+}
+
+impl LockedHandoff {
+    fn acquire(plan: &ProvisioningPlan, path: &Path) -> Result<Self, ProvisionError> {
+        let lock = HandoffParentLock::acquire(path)?;
+        let now_millis = now_millis()?;
+        let (handoff, was_new) = match fs::symlink_metadata(path) {
+            Ok(_) => {
+                let bytes = Zeroizing::new(read_regular_bounded(path, MAX_JSON_BYTES, true)?);
+                (parse_handoff(&bytes)?, false)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let handoff = generate_pending_handoff(plan, now_millis)?;
+                atomic_create_handoff(path, &handoff)?;
+                (handoff, true)
+            }
+            Err(_) => return Err(ProvisionError::Handoff),
+        };
+        validate_handoff(&handoff, plan, now_millis)?;
+        Ok(Self {
+            _lock: lock,
+            path: path.to_path_buf(),
+            handoff,
+            was_new,
+        })
+    }
+
+    fn mark_ready(&mut self) -> Result<(), ProvisionError> {
+        if self.handoff.state == HandoffState::Pending {
+            self.handoff.state = HandoffState::Ready;
+            atomic_replace_handoff(&self.path, &self.handoff)?;
+        }
+        Ok(())
+    }
+}
+
+/// An OS-managed exclusive lock. Dropping the file descriptor, including on process exit,
+/// releases the lock without a stale lock-file recovery path.
+struct HandoffParentLock {
+    _file: File,
+}
+
+impl HandoffParentLock {
+    fn acquire(handoff_path: &Path) -> Result<Self, ProvisionError> {
+        let parent = handoff_path.parent().ok_or(ProvisionError::Handoff)?;
+        validate_handoff_parent(parent)?;
+        let file = open_handoff_parent_for_lock(parent)?;
+        file.lock().map_err(|_| ProvisionError::File)?;
+        validate_handoff_parent(parent)?;
+        Ok(Self { _file: file })
+    }
 }
 
 struct SecretToken([u8; 32]);
@@ -607,7 +649,41 @@ fn validate_same_file(_: &fs::Metadata, after: &fs::Metadata) -> Result<(), Prov
     }
 }
 
-fn atomic_write_handoff(path: &Path, handoff: &ProvisioningHandoff) -> Result<(), ProvisionError> {
+fn atomic_create_handoff(path: &Path, handoff: &ProvisioningHandoff) -> Result<(), ProvisionError> {
+    let (parent, temp_path) = write_handoff_temp(path, handoff)?;
+    let result = (|| {
+        // Linking a complete temporary file publishes it only if the destination does not
+        // already exist. This protects the first-pending transition even if a non-cooperating
+        // writer bypasses the process lock.
+        fs::hard_link(&temp_path, path).map_err(|_| ProvisionError::File)?;
+        fs::remove_file(&temp_path).map_err(|_| ProvisionError::File)?;
+        sync_parent(&parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn atomic_replace_handoff(
+    path: &Path,
+    handoff: &ProvisioningHandoff,
+) -> Result<(), ProvisionError> {
+    let (parent, temp_path) = write_handoff_temp(path, handoff)?;
+    let result = (|| {
+        fs::rename(&temp_path, path).map_err(|_| ProvisionError::File)?;
+        sync_parent(&parent)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_handoff_temp(
+    path: &Path,
+    handoff: &ProvisioningHandoff,
+) -> Result<(PathBuf, PathBuf), ProvisionError> {
     let bytes = Zeroizing::new(serde_json::to_vec(handoff).map_err(|_| ProvisionError::Handoff)?);
     if bytes.is_empty() || bytes.len() > usize::try_from(MAX_JSON_BYTES).unwrap_or(usize::MAX) {
         return Err(ProvisionError::Handoff);
@@ -620,9 +696,7 @@ fn atomic_write_handoff(path: &Path, handoff: &ProvisioningHandoff) -> Result<()
         file.write_all(&bytes).map_err(|_| ProvisionError::File)?;
         file.sync_all().map_err(|_| ProvisionError::File)?;
         drop(file);
-        fs::rename(&temp_path, path).map_err(|_| ProvisionError::File)?;
-        sync_parent(parent)?;
-        Ok(())
+        Ok((parent.to_path_buf(), temp_path.clone()))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -670,9 +744,50 @@ fn create_secret_file(path: &Path) -> Result<File, ProvisionError> {
 }
 
 #[cfg(unix)]
+fn open_handoff_parent_for_lock(parent: &Path) -> Result<File, ProvisionError> {
+    use rustix::fs::{Mode, OFlags, open};
+    let file = open(
+        parent,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|_| ProvisionError::FilePermissions)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ProvisionError::FilePermissions)?;
+    validate_handoff_parent_metadata(&metadata)?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_handoff_parent_for_lock(parent: &Path) -> Result<File, ProvisionError> {
+    use std::fs::OpenOptions;
+
+    let lock_path = parent.join(".dtx-agent-provision.lock");
+    if let Ok(metadata) = fs::symlink_metadata(&lock_path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(ProvisionError::FilePermissions);
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|_| ProvisionError::File)
+}
+
+#[cfg(unix)]
 fn validate_handoff_parent(parent: &Path) -> Result<(), ProvisionError> {
-    use std::os::unix::fs::MetadataExt;
     let metadata = fs::symlink_metadata(parent).map_err(|_| ProvisionError::FilePermissions)?;
+    validate_handoff_parent_metadata(&metadata)
+}
+
+#[cfg(unix)]
+fn validate_handoff_parent_metadata(metadata: &fs::Metadata) -> Result<(), ProvisionError> {
+    use std::os::unix::fs::MetadataExt;
     if metadata.file_type().is_symlink()
         || !metadata.is_dir()
         || metadata.mode() & 0o777 != 0o700
@@ -789,6 +904,12 @@ impl fmt::Display for ProvisionError {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     const PLAN: &str = r#"{
       "schema":"dirextalk.host-provisioning-plan",
       "version":1,
@@ -827,5 +948,78 @@ mod tests {
             parse_plan(duplicate.as_bytes()).err(),
             Some(ProvisionError::Plan)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_handoff_checks_parent_permissions_before_reading() {
+        let directory = TemporaryDirectory::new(0o755);
+        let handoff_path = directory.path.join("handoff.json");
+        fs::write(&handoff_path, b"not valid json").unwrap();
+        let mut plan = parse_plan(PLAN.as_bytes()).unwrap();
+        validate_and_sort_plan(&mut plan).unwrap();
+
+        assert_eq!(
+            LockedHandoff::acquire(&plan, &handoff_path).err(),
+            Some(ProvisionError::FilePermissions)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_parent_lock_excludes_a_second_file_descriptor() {
+        let directory = TemporaryDirectory::new(0o700);
+        let handoff_path = directory.path.join("handoff.json");
+        let _lock = HandoffParentLock::acquire(&handoff_path).unwrap();
+        let second = File::open(&directory.path).unwrap();
+
+        assert!(matches!(
+            second.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_handoff_creation_never_overwrites_an_existing_file() {
+        let directory = TemporaryDirectory::new(0o700);
+        let handoff_path = directory.path.join("handoff.json");
+        fs::write(&handoff_path, b"already exists").unwrap();
+        let mut plan = parse_plan(PLAN.as_bytes()).unwrap();
+        validate_and_sort_plan(&mut plan).unwrap();
+        let handoff = generate_pending_handoff(&plan, 1_800_000_000_000).unwrap();
+
+        assert_eq!(
+            atomic_create_handoff(&handoff_path, &handoff).err(),
+            Some(ProvisionError::File)
+        );
+        assert_eq!(fs::read(&handoff_path).unwrap(), b"already exists");
+    }
+
+    #[cfg(unix)]
+    struct TemporaryDirectory {
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl TemporaryDirectory {
+        fn new(mode: u32) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = env::temp_dir().join(format!(
+                "dtx-agent-provision-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            Self { path }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }

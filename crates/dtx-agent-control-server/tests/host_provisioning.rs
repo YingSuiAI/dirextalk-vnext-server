@@ -1,11 +1,16 @@
 #[path = "../../dtx-storage/tests/support/mod.rs"]
 mod support;
 
-use std::{error::Error, str::FromStr};
+use std::{
+    error::Error,
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use dtx_agent_control::{EnrollmentToken, Sha256Digest};
 use dtx_agent_control_server::{
-    HostProvisioningConnectorRequest, HostProvisioningRequest, ensure_host_provisioning,
+    HostProvisioningConnectorRequest, HostProvisioningError, HostProvisioningRequest,
+    ensure_host_provisioning,
 };
 use dtx_connect_registry::AdapterKind;
 use dtx_domain::{
@@ -59,6 +64,25 @@ async fn host_provisioning_is_atomic_sorted_and_exactly_replayable() -> Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn host_provisioning_rolls_back_when_intents_expire_before_commit()
+-> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let store = harness.runtime_store(2).await?;
+    let ids = FixtureIds::new()?;
+    let expired_created_at = current_millis()? - 300_001;
+
+    let error = ensure_host_provisioning(
+        &store,
+        request_at(&ids, [0x44; 32], false, expired_created_at)?,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, HostProvisioningError::Expired));
+    assert_eq!(durable_counts(&harness, ids.tenant_id).await?, (0, 0, 0, 0));
+    Ok(())
+}
+
 struct FixtureIds {
     tenant_id: TenantId,
     operation_id: RequestId,
@@ -96,6 +120,15 @@ fn request(
     ids: &FixtureIds,
     plan_digest: [u8; 32],
     fail_after_first_connector: bool,
+) -> Result<HostProvisioningRequest, Box<dyn Error>> {
+    request_at(ids, plan_digest, fail_after_first_connector, NOW_MILLIS)
+}
+
+fn request_at(
+    ids: &FixtureIds,
+    plan_digest: [u8; 32],
+    fail_after_first_connector: bool,
+    created_at_millis: i64,
 ) -> Result<HostProvisioningRequest, Box<dyn Error>> {
     let (operation_id, host_id, host_credential_id, connector_ids, request_ids, intent_ids) =
         if fail_after_first_connector {
@@ -153,8 +186,14 @@ fn request(
         IdentityId::from_str(OWNER_ID)?,
         host_credential_id,
         Sha256Digest::from_bytes(plan_digest),
-        NOW_MILLIS,
+        created_at_millis,
         connectors,
+    )?)
+}
+
+fn current_millis() -> Result<i64, Box<dyn Error>> {
+    Ok(i64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
     )?)
 }
 

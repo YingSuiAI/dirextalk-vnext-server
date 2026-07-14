@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{
+    collections::BTreeSet,
+    error::Error,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use dtx_agent_control::{
     EnrollmentError, EnrollmentIntent, EnrollmentToken, MAX_ENROLLMENT_TTL_MILLIS, Sha256Digest,
@@ -161,7 +166,12 @@ pub async fn ensure_host_provisioning(
     request: HostProvisioningRequest,
 ) -> Result<HostProvisioningResult, HostProvisioningError> {
     let mut session = store.begin_tenant(request.tenant_id).await?;
-    let result = ensure_in_transaction(session.connection(), request).await;
+    let result = ensure_in_transaction(session.connection(), request)
+        .await
+        .and_then(|result| {
+            validate_provisioned_intents_not_expired(&result, current_millis()?)?;
+            Ok(result)
+        });
     match result {
         Ok(result) => {
             session.commit().await?;
@@ -172,6 +182,28 @@ pub async fn ensure_host_provisioning(
             Err(error)
         }
     }
+}
+
+fn validate_provisioned_intents_not_expired(
+    result: &HostProvisioningResult,
+    now_millis: i64,
+) -> Result<(), HostProvisioningError> {
+    if result
+        .connectors
+        .iter()
+        .all(|connector| now_millis < connector.expires_at_millis)
+    {
+        Ok(())
+    } else {
+        Err(HostProvisioningError::Expired)
+    }
+}
+
+fn current_millis() -> Result<i64, HostProvisioningError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| HostProvisioningError::Clock)?;
+    i64::try_from(elapsed.as_millis()).map_err(|_| HostProvisioningError::Clock)
 }
 
 async fn ensure_in_transaction(
@@ -294,6 +326,8 @@ fn same_intent_creation(left: &EnrollmentIntent, right: &EnrollmentIntent) -> bo
 #[derive(Debug)]
 pub enum HostProvisioningError {
     InvalidPlan,
+    Expired,
+    Clock,
     Storage(StorageError),
     Persistence(AgentPersistenceError),
     Host(HostError),
@@ -306,6 +340,8 @@ impl fmt::Display for HostProvisioningError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidPlan => "Host provisioning plan is invalid",
+            Self::Expired => "Host provisioning enrollment intent expired before commit",
+            Self::Clock => "Host provisioning clock is unavailable",
             Self::Storage(_) | Self::Database(_) => "Host provisioning storage is unavailable",
             Self::Persistence(_) => "Host provisioning state conflicts with durable state",
             Self::Host(_) | Self::Connector(_) | Self::Enrollment(_) => {
@@ -318,7 +354,7 @@ impl fmt::Display for HostProvisioningError {
 impl Error for HostProvisioningError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidPlan => None,
+            Self::InvalidPlan | Self::Expired | Self::Clock => None,
             Self::Storage(error) => Some(error),
             Self::Persistence(error) => Some(error),
             Self::Host(error) => Some(error),
