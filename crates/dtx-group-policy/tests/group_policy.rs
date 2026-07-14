@@ -634,3 +634,229 @@ fn join_rechecks_invitation_revocation_and_use_count() {
         Err(GroupPolicyError::InviteUseLimitReached)
     );
 }
+
+#[test]
+fn reservation_holds_one_invite_use_without_admitting_until_remote_commit_finalizes() {
+    let owner = owner();
+    let admin = identity(1);
+    let candidate = identity(2);
+    let competing_candidate = identity(3);
+    let mut group = private_group(owner);
+    group
+        .grant_admin(group.revision(), owner, admin)
+        .expect("owner grants administrator authority");
+    let invite_id = InviteCapabilityId::new();
+    group
+        .issue_invite(group.revision(), owner, invite_id, None, 1, 10_000, 1_000)
+        .expect("owner issues one-use invitation");
+    let request_id = JoinRequestId::new();
+    group
+        .request_join(
+            group.revision(),
+            candidate,
+            candidate,
+            request_id,
+            invite_id,
+            1_500,
+        )
+        .expect("candidate creates request");
+
+    let reservation = group
+        .reserve_join(group.revision(), admin, request_id, 1_600)
+        .expect("admin records durable membership intent");
+    assert_eq!(reservation.request_id(), request_id);
+    assert_eq!(reservation.candidate_id(), candidate);
+    assert_eq!(reservation.reserved_by(), admin);
+    assert!(!group.is_member(candidate));
+    assert!(group.pending_join(request_id).is_none());
+    assert_eq!(
+        group
+            .invite(invite_id)
+            .expect("invite remains auditable")
+            .reserved_use_count(),
+        1
+    );
+    assert_eq!(
+        group.request_join(
+            group.revision(),
+            competing_candidate,
+            competing_candidate,
+            JoinRequestId::new(),
+            invite_id,
+            1_700,
+        ),
+        Err(GroupPolicyError::InviteUseLimitReached)
+    );
+
+    let approved = group
+        .finalize_reserved_join(group.revision(), request_id, 1_800)
+        .expect("verified remote commit finalizes the local policy");
+    assert_eq!(approved.candidate_id(), candidate);
+    assert_eq!(approved.approved_by(), admin);
+    assert!(group.is_member(candidate));
+    assert!(group.reserved_join(request_id).is_none());
+    let invite = group.invite(invite_id).expect("invite remains auditable");
+    assert_eq!(invite.reserved_use_count(), 0);
+    assert_eq!(invite.use_count(), 1);
+}
+
+#[test]
+fn explicit_rejection_releases_the_reservation_without_consuming_the_invite() {
+    let owner = owner();
+    let candidate = identity(2);
+    let retry_candidate = identity(3);
+    let mut group = private_group(owner);
+    let invite_id = InviteCapabilityId::new();
+    group
+        .issue_invite(group.revision(), owner, invite_id, None, 1, 10_000, 1_000)
+        .expect("owner issues one-use invitation");
+    let request_id = JoinRequestId::new();
+    group
+        .request_join(
+            group.revision(),
+            candidate,
+            candidate,
+            request_id,
+            invite_id,
+            1_500,
+        )
+        .expect("candidate creates request");
+    group
+        .reserve_join(group.revision(), owner, request_id, 1_600)
+        .expect("owner reserves the invitation for a pending remote commit");
+
+    let released = group
+        .release_join_reservation(group.revision(), request_id)
+        .expect("definite remote rejection releases the reservation");
+    assert_eq!(released.candidate_id(), candidate);
+    assert!(!group.is_member(candidate));
+    let invite = group.invite(invite_id).expect("invite remains auditable");
+    assert_eq!(invite.reserved_use_count(), 0);
+    assert_eq!(invite.use_count(), 0);
+    group
+        .request_join(
+            group.revision(),
+            retry_candidate,
+            retry_candidate,
+            JoinRequestId::new(),
+            invite_id,
+            1_700,
+        )
+        .expect("released invitation use is available to a later request");
+}
+
+#[test]
+fn one_candidate_cannot_open_competing_pending_or_reserved_admissions() {
+    let owner = owner();
+    let candidate = identity(2);
+    let mut group = private_group(owner);
+    let first_invite = InviteCapabilityId::new();
+    let second_invite = InviteCapabilityId::new();
+    for invite_id in [first_invite, second_invite] {
+        group
+            .issue_invite(
+                group.revision(),
+                owner,
+                invite_id,
+                Some(candidate),
+                1,
+                10_000,
+                1_000,
+            )
+            .expect("owner issues distinct candidate invitation");
+    }
+    let request_id = JoinRequestId::new();
+    group
+        .request_join(
+            group.revision(),
+            candidate,
+            candidate,
+            request_id,
+            first_invite,
+            1_500,
+        )
+        .expect("first candidate request records");
+
+    assert_eq!(
+        group.request_join(
+            group.revision(),
+            candidate,
+            candidate,
+            JoinRequestId::new(),
+            second_invite,
+            1_600,
+        ),
+        Err(GroupPolicyError::CandidateJoinInFlight)
+    );
+    group
+        .reserve_join(group.revision(), owner, request_id, 1_700)
+        .expect("owner reserves the only active candidate request");
+    assert_eq!(
+        group.request_join(
+            group.revision(),
+            candidate,
+            candidate,
+            JoinRequestId::new(),
+            second_invite,
+            1_800,
+        ),
+        Err(GroupPolicyError::CandidateJoinInFlight)
+    );
+}
+
+#[test]
+fn snapshot_rehydrates_revoked_admin_history_and_an_active_reservation() {
+    let owner = owner();
+    let admin = identity(1);
+    let candidate = identity(2);
+    let mut group = private_group(owner);
+    group
+        .grant_admin(group.revision(), owner, admin)
+        .expect("owner grants the initial administrator term");
+    let invite_id = InviteCapabilityId::new();
+    group
+        .issue_invite(
+            group.revision(),
+            admin,
+            invite_id,
+            Some(candidate),
+            1,
+            10_000,
+            1_000,
+        )
+        .expect("admin issues invitation during its current authority term");
+    let request_id = JoinRequestId::new();
+    group
+        .request_join(
+            group.revision(),
+            candidate,
+            candidate,
+            request_id,
+            invite_id,
+            1_500,
+        )
+        .expect("candidate creates request");
+    group
+        .reserve_join(group.revision(), admin, request_id, 1_600)
+        .expect("admin reserves the request before remote submission");
+    group
+        .revoke_admin(group.revision(), owner, admin)
+        .expect("owner revokes the administrator after reservation");
+    group
+        .grant_admin(group.revision(), owner, admin)
+        .expect("owner grants a distinct later administrator term");
+
+    let snapshot = group.snapshot();
+    assert_eq!(
+        GroupPolicy::try_from_snapshot(&snapshot).expect("snapshot is self-consistent"),
+        group
+    );
+
+    let mut corrupt = snapshot.clone();
+    corrupt.administrators.push(owner);
+    assert!(GroupPolicy::try_from_snapshot(&corrupt).is_err());
+
+    let mut member_with_reservation = snapshot;
+    member_with_reservation.members.push(candidate);
+    assert!(GroupPolicy::try_from_snapshot(&member_with_reservation).is_err());
+}

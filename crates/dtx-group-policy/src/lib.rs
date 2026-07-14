@@ -62,6 +62,7 @@ pub struct InviteCapability {
     target_id: Option<IdentityId>,
     max_uses: u32,
     use_count: u32,
+    reserved_use_count: u32,
     expires_at_ms: i64,
     revoked: bool,
     policy_revision: Revision,
@@ -103,6 +104,12 @@ impl InviteCapability {
     #[must_use]
     pub const fn use_count(self) -> u32 {
         self.use_count
+    }
+
+    /// Returns the number of uses durably reserved for a pending membership commit.
+    #[must_use]
+    pub const fn reserved_use_count(self) -> u32 {
+        self.reserved_use_count
     }
 
     /// Returns the exclusive capability expiry in Unix milliseconds.
@@ -174,6 +181,75 @@ impl PendingJoinRequest {
     }
 }
 
+/// A durable invitation-use reservation made before an external membership commit.
+///
+/// The candidate is not yet a member while this record exists. A later
+/// Sequencer result must either finalize it into [`ApprovedJoin`] or explicitly
+/// release it; timeout and response loss must leave it reserved for recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReservedJoin {
+    request_id: JoinRequestId,
+    candidate_id: IdentityId,
+    invite_id: InviteCapabilityId,
+    reserved_by: IdentityId,
+    reserved_authority: InviteIssuerAuthority,
+    reserved_at_ms: i64,
+    policy_revision: Revision,
+}
+
+impl ReservedJoin {
+    /// Returns the original candidate request identity.
+    #[must_use]
+    pub const fn request_id(self) -> JoinRequestId {
+        self.request_id
+    }
+
+    /// Returns the candidate identity whose membership is pending remotely.
+    #[must_use]
+    pub const fn candidate_id(self) -> IdentityId {
+        self.candidate_id
+    }
+
+    /// Returns the invitation whose one use is reserved.
+    #[must_use]
+    pub const fn invite_id(self) -> InviteCapabilityId {
+        self.invite_id
+    }
+
+    /// Returns the Owner/Admin identity that authorized the reservation.
+    #[must_use]
+    pub const fn reserved_by(self) -> IdentityId {
+        self.reserved_by
+    }
+
+    /// Returns the administrator authority generation when an Admin reserved it.
+    ///
+    /// Owner reservations return `None`; a retained generation lets snapshot
+    /// rehydration distinguish a historical valid Admin term from an invented
+    /// reservation after that identity was revoked or regranted.
+    #[must_use]
+    pub const fn reserved_admin_authorization_generation(self) -> Option<Revision> {
+        match self.reserved_authority {
+            InviteIssuerAuthority::Owner => None,
+            InviteIssuerAuthority::Admin {
+                authorization_generation,
+            } => Some(authorization_generation),
+        }
+    }
+
+    /// Returns the trusted server timestamp at reservation time.
+    #[must_use]
+    pub const fn reserved_at_ms(self) -> i64 {
+        self.reserved_at_ms
+    }
+
+    /// Returns the group policy revision revalidated for the external intent.
+    #[must_use]
+    pub const fn policy_revision(self) -> Revision {
+        self.policy_revision
+    }
+}
+
 /// Immutable record that a pending request has already admitted its candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApprovedJoin {
@@ -223,6 +299,53 @@ impl ApprovedJoin {
     }
 }
 
+/// Complete, non-secret persistence image of one group-policy aggregate.
+///
+/// Collections are sorted when produced by [`GroupPolicy::snapshot`], and are
+/// fully validated before [`GroupPolicy::try_from_snapshot`] accepts them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupPolicySnapshot {
+    /// Strongly typed private or controlled-public scope.
+    pub scope: GroupScope,
+    /// Sole owner identity.
+    pub owner_id: IdentityId,
+    /// Current additional administrator identities, excluding the owner.
+    pub administrators: Vec<IdentityId>,
+    /// Current and retired administrator authority generations.
+    pub administrator_authorization_generations: Vec<(IdentityId, Revision)>,
+    /// Current identity-level member set.
+    pub members: Vec<IdentityId>,
+    /// All issued invitation capabilities, including expired or revoked history.
+    pub invitations: Vec<InviteCapability>,
+    /// Candidate requests awaiting an Owner/Admin decision.
+    pub pending_joins: Vec<PendingJoinRequest>,
+    /// Durable membership intents awaiting a remote result.
+    pub reserved_joins: Vec<ReservedJoin>,
+    /// Immutable finalized admission history.
+    pub approved_joins: Vec<ApprovedJoin>,
+    /// Current policy revision.
+    pub revision: Revision,
+}
+
+/// Rehydration failure for a malformed group-policy persistence image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupPolicySnapshotError {
+    /// The stored state cannot represent one unambiguous valid policy aggregate.
+    InvalidSnapshot(&'static str),
+}
+
+impl fmt::Display for GroupPolicySnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSnapshot(reason) => {
+                write!(formatter, "invalid group policy snapshot: {reason}")
+            }
+        }
+    }
+}
+
+impl Error for GroupPolicySnapshotError {}
+
 /// Stable rejection from the group-role authorization aggregate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GroupPolicyError {
@@ -257,10 +380,18 @@ pub enum GroupPolicyError {
     AlreadyMember,
     /// The request identity is already pending for a candidate.
     JoinRequestAlreadyPending,
+    /// The candidate already has another pending or reserved admission workflow.
+    CandidateJoinInFlight,
     /// No pending request exists for the supplied identity.
     PendingJoinNotFound,
     /// The request has already been approved and cannot admit another member.
     AlreadyApproved,
+    /// An Owner/Admin has already reserved this request for an external commit.
+    JoinAlreadyReserved,
+    /// No durable reservation exists for the supplied request identity.
+    ReservedJoinNotFound,
+    /// A rehydrated reservation count cannot be reconciled with invitation state.
+    ReservationInvariantViolation,
     /// A targeted invitation was presented by a different candidate identity.
     InviteTargetMismatch,
     /// The invitation is expired at the supplied trusted time.
@@ -308,10 +439,22 @@ impl fmt::Display for GroupPolicyError {
             Self::JoinRequestAlreadyPending => {
                 formatter.write_str("group join request is already pending")
             }
+            Self::CandidateJoinInFlight => {
+                formatter.write_str("candidate already has an active group admission workflow")
+            }
             Self::PendingJoinNotFound => {
                 formatter.write_str("pending group join request was not found")
             }
             Self::AlreadyApproved => formatter.write_str("group join request is already approved"),
+            Self::JoinAlreadyReserved => {
+                formatter.write_str("group join request already has a membership reservation")
+            }
+            Self::ReservedJoinNotFound => {
+                formatter.write_str("group membership reservation was not found")
+            }
+            Self::ReservationInvariantViolation => {
+                formatter.write_str("group invitation reservation state is inconsistent")
+            }
             Self::InviteTargetMismatch => {
                 formatter.write_str("group invitation is bound to a different candidate")
             }
@@ -339,6 +482,7 @@ pub struct GroupPolicy {
     members: BTreeSet<IdentityId>,
     invitations: BTreeMap<InviteCapabilityId, InviteCapability>,
     pending_joins: BTreeMap<JoinRequestId, PendingJoinRequest>,
+    reserved_joins: BTreeMap<JoinRequestId, ReservedJoin>,
     approved_joins: BTreeMap<JoinRequestId, ApprovedJoin>,
     revision: Revision,
 }
@@ -357,6 +501,7 @@ impl GroupPolicy {
             members,
             invitations: BTreeMap::new(),
             pending_joins: BTreeMap::new(),
+            reserved_joins: BTreeMap::new(),
             approved_joins: BTreeMap::new(),
             revision: Revision::INITIAL,
         }
@@ -433,10 +578,49 @@ impl GroupPolicy {
         self.pending_joins.get(&request_id)
     }
 
+    /// Looks up a durable membership reservation awaiting a remote result.
+    #[must_use]
+    pub fn reserved_join(&self, request_id: JoinRequestId) -> Option<&ReservedJoin> {
+        self.reserved_joins.get(&request_id)
+    }
+
     /// Looks up an immutable approval record.
     #[must_use]
     pub fn approved_join(&self, request_id: JoinRequestId) -> Option<&ApprovedJoin> {
         self.approved_joins.get(&request_id)
+    }
+
+    /// Captures a complete, deterministic, non-secret persistence image.
+    #[must_use]
+    pub fn snapshot(&self) -> GroupPolicySnapshot {
+        GroupPolicySnapshot {
+            scope: self.scope,
+            owner_id: self.owner_id,
+            administrators: self.administrators.iter().copied().collect(),
+            administrator_authorization_generations: self
+                .administrator_authorization_generations
+                .iter()
+                .map(|(identity_id, generation)| (*identity_id, *generation))
+                .collect(),
+            members: self.members.iter().copied().collect(),
+            invitations: self.invitations.values().copied().collect(),
+            pending_joins: self.pending_joins.values().copied().collect(),
+            reserved_joins: self.reserved_joins.values().copied().collect(),
+            approved_joins: self.approved_joins.values().copied().collect(),
+            revision: self.revision,
+        }
+    }
+
+    /// Rehydrates a validated policy aggregate without replaying external effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for duplicated, cross-linked, or otherwise inconsistent
+    /// durable facts. It never silently repairs an authorization image.
+    pub fn try_from_snapshot(
+        snapshot: &GroupPolicySnapshot,
+    ) -> Result<Self, GroupPolicySnapshotError> {
+        group_policy_from_snapshot(snapshot)
     }
 
     /// Grants one additional administrator slot to an identity.
@@ -543,6 +727,7 @@ impl GroupPolicy {
             target_id,
             max_uses,
             use_count: 0,
+            reserved_use_count: 0,
             expires_at_ms,
             revoked: false,
             policy_revision: expected_revision,
@@ -610,8 +795,14 @@ impl GroupPolicy {
         if self.pending_joins.contains_key(&request_id) {
             return Err(GroupPolicyError::JoinRequestAlreadyPending);
         }
+        if self.reserved_joins.contains_key(&request_id) {
+            return Err(GroupPolicyError::JoinAlreadyReserved);
+        }
         if self.approved_joins.contains_key(&request_id) {
             return Err(GroupPolicyError::AlreadyApproved);
+        }
+        if self.candidate_has_active_join(candidate_id) {
+            return Err(GroupPolicyError::CandidateJoinInFlight);
         }
         let invite = self
             .invitations
@@ -629,6 +820,163 @@ impl GroupPolicy {
         self.pending_joins.insert(request_id, pending);
         self.revision = next_revision;
         Ok(pending)
+    }
+
+    /// Reserves exactly one invitation use before an external membership commit.
+    ///
+    /// This is the durable-intent authorization boundary: the candidate remains
+    /// outside the member set and the invitation remains unconsumed until a
+    /// verified Sequencer result calls [`Self::finalize_reserved_join`]. A
+    /// timeout or response loss must retain this reservation for reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale revision, unauthorized actor, missing or
+    /// terminal request, already admitted candidate, or currently invalid or
+    /// exhausted invitation.
+    pub fn reserve_join(
+        &mut self,
+        expected_revision: Revision,
+        actor_id: IdentityId,
+        request_id: JoinRequestId,
+        now_ms: i64,
+    ) -> Result<ReservedJoin, GroupPolicyError> {
+        let next_revision = self.next_mutation_revision(expected_revision)?;
+        self.ensure_approval_authority(actor_id)?;
+        let reservation_authority = self.invite_issuer_authority(actor_id)?;
+        if self.approved_joins.contains_key(&request_id) {
+            return Err(GroupPolicyError::AlreadyApproved);
+        }
+        if self.reserved_joins.contains_key(&request_id) {
+            return Err(GroupPolicyError::JoinAlreadyReserved);
+        }
+        let pending = self
+            .pending_joins
+            .get(&request_id)
+            .copied()
+            .ok_or(GroupPolicyError::PendingJoinNotFound)?;
+        if self.members.contains(&pending.candidate_id) {
+            return Err(GroupPolicyError::AlreadyMember);
+        }
+        let invite = self
+            .invitations
+            .get(&pending.invite_id)
+            .copied()
+            .ok_or(GroupPolicyError::InviteNotFound)?;
+        self.ensure_invite_usable(invite, pending.candidate_id, now_ms)?;
+
+        let invite = self
+            .invitations
+            .get_mut(&pending.invite_id)
+            .ok_or(GroupPolicyError::InviteNotFound)?;
+        invite.reserved_use_count = invite
+            .reserved_use_count
+            .checked_add(1)
+            .ok_or(GroupPolicyError::InviteUseLimitReached)?;
+        self.pending_joins.remove(&request_id);
+        let reservation = ReservedJoin {
+            request_id,
+            candidate_id: pending.candidate_id,
+            invite_id: pending.invite_id,
+            reserved_by: actor_id,
+            reserved_authority: reservation_authority,
+            reserved_at_ms: now_ms,
+            policy_revision: expected_revision,
+        };
+        self.reserved_joins.insert(request_id, reservation);
+        self.revision = next_revision;
+        Ok(reservation)
+    }
+
+    /// Finalizes a verified remote membership commit without rechecking invite expiry.
+    ///
+    /// The caller must validate the remote commit's exact command, candidate,
+    /// and predecessor fence before this transition. A reservation survives
+    /// invite expiry or revocation because it was already authorized and held
+    /// capacity; only a definite remote rejection may release it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale revision, absent reservation, already
+    /// admitted candidate, duplicate finalization, or inconsistent invitation
+    /// reservation state.
+    pub fn finalize_reserved_join(
+        &mut self,
+        expected_revision: Revision,
+        request_id: JoinRequestId,
+        finalized_at_ms: i64,
+    ) -> Result<ApprovedJoin, GroupPolicyError> {
+        let next_revision = self.next_mutation_revision(expected_revision)?;
+        if self.approved_joins.contains_key(&request_id) {
+            return Err(GroupPolicyError::AlreadyApproved);
+        }
+        let reservation = self
+            .reserved_joins
+            .get(&request_id)
+            .copied()
+            .ok_or(GroupPolicyError::ReservedJoinNotFound)?;
+        if self.members.contains(&reservation.candidate_id) {
+            return Err(GroupPolicyError::AlreadyMember);
+        }
+        let invite = self
+            .invitations
+            .get_mut(&reservation.invite_id)
+            .ok_or(GroupPolicyError::ReservationInvariantViolation)?;
+        invite.reserved_use_count = invite
+            .reserved_use_count
+            .checked_sub(1)
+            .ok_or(GroupPolicyError::ReservationInvariantViolation)?;
+        invite.use_count = invite
+            .use_count
+            .checked_add(1)
+            .ok_or(GroupPolicyError::InviteUseLimitReached)?;
+        self.reserved_joins.remove(&request_id);
+        self.members.insert(reservation.candidate_id);
+        let approved = ApprovedJoin {
+            request_id,
+            candidate_id: reservation.candidate_id,
+            invite_id: reservation.invite_id,
+            approved_by: reservation.reserved_by,
+            approved_at_ms: finalized_at_ms,
+            policy_revision: reservation.policy_revision,
+        };
+        self.approved_joins.insert(request_id, approved);
+        self.revision = next_revision;
+        Ok(approved)
+    }
+
+    /// Releases a reservation only after a definite non-commit outcome.
+    ///
+    /// This does not re-open the original request. The membership-command saga
+    /// retains the terminal rejection receipt and any later user action must
+    /// create a fresh request ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale revision, absent reservation, or an
+    /// inconsistent invitation reservation count.
+    pub fn release_join_reservation(
+        &mut self,
+        expected_revision: Revision,
+        request_id: JoinRequestId,
+    ) -> Result<ReservedJoin, GroupPolicyError> {
+        let next_revision = self.next_mutation_revision(expected_revision)?;
+        let reservation = self
+            .reserved_joins
+            .get(&request_id)
+            .copied()
+            .ok_or(GroupPolicyError::ReservedJoinNotFound)?;
+        let invite = self
+            .invitations
+            .get_mut(&reservation.invite_id)
+            .ok_or(GroupPolicyError::ReservationInvariantViolation)?;
+        invite.reserved_use_count = invite
+            .reserved_use_count
+            .checked_sub(1)
+            .ok_or(GroupPolicyError::ReservationInvariantViolation)?;
+        self.reserved_joins.remove(&request_id);
+        self.revision = next_revision;
+        Ok(reservation)
     }
 
     /// Revalidates and approves one pending request, admitting its candidate.
@@ -731,6 +1079,16 @@ impl GroupPolicy {
         }
     }
 
+    fn candidate_has_active_join(&self, candidate_id: IdentityId) -> bool {
+        self.pending_joins
+            .values()
+            .any(|pending| pending.candidate_id == candidate_id)
+            || self
+                .reserved_joins
+                .values()
+                .any(|reserved| reserved.candidate_id == candidate_id)
+    }
+
     fn ensure_invite_usable(
         &self,
         invite: InviteCapability,
@@ -752,7 +1110,11 @@ impl GroupPolicy {
         if !self.invite_issuer_authority_is_current(invite) {
             return Err(GroupPolicyError::InviteIssuerNoLongerAuthorized);
         }
-        if invite.use_count >= invite.max_uses {
+        let occupied_uses = invite
+            .use_count
+            .checked_add(invite.reserved_use_count)
+            .ok_or(GroupPolicyError::InviteUseLimitReached)?;
+        if occupied_uses >= invite.max_uses {
             return Err(GroupPolicyError::InviteUseLimitReached);
         }
         Ok(())
@@ -806,4 +1168,205 @@ impl GroupPolicy {
             }
         }
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sequential validator makes every cross-collection invariant visible at rehydration"
+)]
+fn group_policy_from_snapshot(
+    snapshot: &GroupPolicySnapshot,
+) -> Result<GroupPolicy, GroupPolicySnapshotError> {
+    let members = collect_snapshot_set(&snapshot.members, "duplicate member")?;
+    if !members.contains(&snapshot.owner_id) {
+        return Err(invalid_snapshot("owner is not a member"));
+    }
+    let administrators = collect_snapshot_set(&snapshot.administrators, "duplicate administrator")?;
+    if administrators.len() > MAX_ADMINS {
+        return Err(invalid_snapshot("administrator limit exceeded"));
+    }
+    if administrators.contains(&snapshot.owner_id) {
+        return Err(invalid_snapshot("owner is an administrator"));
+    }
+    if !administrators.is_subset(&members) {
+        return Err(invalid_snapshot("administrator is not a member"));
+    }
+
+    let mut administrator_authorization_generations = BTreeMap::new();
+    for (identity_id, generation) in &snapshot.administrator_authorization_generations {
+        if *identity_id == snapshot.owner_id
+            || administrator_authorization_generations
+                .insert(*identity_id, *generation)
+                .is_some()
+        {
+            return Err(invalid_snapshot(
+                "duplicate or owner administrator generation",
+            ));
+        }
+    }
+    if administrators
+        .iter()
+        .any(|identity_id| !administrator_authorization_generations.contains_key(identity_id))
+    {
+        return Err(invalid_snapshot("administrator lacks authority generation"));
+    }
+
+    let mut invitations = BTreeMap::new();
+    for invite in &snapshot.invitations {
+        if invite.scope != snapshot.scope || invite.max_uses == 0 {
+            return Err(invalid_snapshot("invalid invitation scope or use limit"));
+        }
+        let occupied_uses = invite
+            .use_count
+            .checked_add(invite.reserved_use_count)
+            .ok_or_else(|| invalid_snapshot("invitation use count overflow"))?;
+        if occupied_uses > invite.max_uses || invite.policy_revision > snapshot.revision {
+            return Err(invalid_snapshot(
+                "invalid invitation use or policy revision",
+            ));
+        }
+        match invite.issuer_authority {
+            InviteIssuerAuthority::Owner if invite.issuer_id != snapshot.owner_id => {
+                return Err(invalid_snapshot("owner invitation has another issuer"));
+            }
+            InviteIssuerAuthority::Owner => {}
+            InviteIssuerAuthority::Admin {
+                authorization_generation,
+            } => {
+                if administrator_authorization_generations
+                    .get(&invite.issuer_id)
+                    .is_none_or(|current| *current < authorization_generation)
+                {
+                    return Err(invalid_snapshot("invitation authority generation mismatch"));
+                }
+            }
+        }
+        if invitations.insert(invite.invite_id, *invite).is_some() {
+            return Err(invalid_snapshot("duplicate invitation"));
+        }
+    }
+
+    let mut seen_join_ids = BTreeSet::new();
+    let mut active_candidates = BTreeSet::new();
+    let mut pending_joins = BTreeMap::new();
+    for pending in &snapshot.pending_joins {
+        if !seen_join_ids.insert(pending.request_id)
+            || !invitations.contains_key(&pending.invite_id)
+            || members.contains(&pending.candidate_id)
+            || !active_candidates.insert(pending.candidate_id)
+        {
+            return Err(invalid_snapshot("invalid pending join"));
+        }
+        pending_joins.insert(pending.request_id, *pending);
+    }
+
+    let mut expected_reservations = BTreeMap::<InviteCapabilityId, u32>::new();
+    let mut reserved_joins = BTreeMap::new();
+    for reserved in &snapshot.reserved_joins {
+        if !seen_join_ids.insert(reserved.request_id)
+            || !invitations.contains_key(&reserved.invite_id)
+            || members.contains(&reserved.candidate_id)
+            || !active_candidates.insert(reserved.candidate_id)
+            || reserved.policy_revision > snapshot.revision
+        {
+            return Err(invalid_snapshot("invalid membership reservation"));
+        }
+        match reserved.reserved_authority {
+            InviteIssuerAuthority::Owner if reserved.reserved_by != snapshot.owner_id => {
+                return Err(invalid_snapshot("owner reservation has another issuer"));
+            }
+            InviteIssuerAuthority::Owner => {}
+            InviteIssuerAuthority::Admin {
+                authorization_generation,
+            } => {
+                if administrator_authorization_generations
+                    .get(&reserved.reserved_by)
+                    .is_none_or(|current| *current < authorization_generation)
+                {
+                    return Err(invalid_snapshot(
+                        "reservation authority generation mismatch",
+                    ));
+                }
+            }
+        }
+        increment_snapshot_count(
+            &mut expected_reservations,
+            reserved.invite_id,
+            "reservation count overflow",
+        )?;
+        reserved_joins.insert(reserved.request_id, *reserved);
+    }
+
+    let mut expected_uses = BTreeMap::<InviteCapabilityId, u32>::new();
+    let mut approved_joins = BTreeMap::new();
+    for approved in &snapshot.approved_joins {
+        if !seen_join_ids.insert(approved.request_id)
+            || !invitations.contains_key(&approved.invite_id)
+            || !members.contains(&approved.candidate_id)
+            || approved.policy_revision > snapshot.revision
+        {
+            return Err(invalid_snapshot("invalid approved join"));
+        }
+        increment_snapshot_count(
+            &mut expected_uses,
+            approved.invite_id,
+            "approved use count overflow",
+        )?;
+        approved_joins.insert(approved.request_id, *approved);
+    }
+
+    for (invite_id, invite) in &invitations {
+        if expected_reservations.get(invite_id).copied().unwrap_or(0) != invite.reserved_use_count
+            || expected_uses.get(invite_id).copied().unwrap_or(0) != invite.use_count
+        {
+            return Err(invalid_snapshot(
+                "invitation counters do not match join history",
+            ));
+        }
+    }
+
+    Ok(GroupPolicy {
+        scope: snapshot.scope,
+        owner_id: snapshot.owner_id,
+        administrators,
+        administrator_authorization_generations,
+        members,
+        invitations,
+        pending_joins,
+        reserved_joins,
+        approved_joins,
+        revision: snapshot.revision,
+    })
+}
+
+fn collect_snapshot_set<T>(
+    values: &[T],
+    duplicate_reason: &'static str,
+) -> Result<BTreeSet<T>, GroupPolicySnapshotError>
+where
+    T: Copy + Ord,
+{
+    let mut values_by_key = BTreeSet::new();
+    for value in values {
+        if !values_by_key.insert(*value) {
+            return Err(invalid_snapshot(duplicate_reason));
+        }
+    }
+    Ok(values_by_key)
+}
+
+fn increment_snapshot_count(
+    counts: &mut BTreeMap<InviteCapabilityId, u32>,
+    invite_id: InviteCapabilityId,
+    overflow_reason: &'static str,
+) -> Result<(), GroupPolicySnapshotError> {
+    let count = counts.entry(invite_id).or_insert(0);
+    *count = count
+        .checked_add(1)
+        .ok_or_else(|| invalid_snapshot(overflow_reason))?;
+    Ok(())
+}
+
+const fn invalid_snapshot(reason: &'static str) -> GroupPolicySnapshotError {
+    GroupPolicySnapshotError::InvalidSnapshot(reason)
 }
