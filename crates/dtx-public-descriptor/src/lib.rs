@@ -2,11 +2,11 @@
 
 //! Signed public Channel and Agent descriptor primitives.
 //!
-//! Current V1.1 descriptors expose only an authority-only HTTPS `feed_origin`;
-//! clients derive the fixed subject path themselves. Frozen V1.0 endpoint bytes
-//! can be decoded only through [`HistoricalPublicDescriptorV1_0`]. This crate
-//! is deliberately a pure protocol/reducer boundary. It has no tenant,
-//! database, Matrix, HTTP, indexer, mailbox, token, or private-key dependency.
+//! Current V1.2 descriptors expose only a canonical DNS HTTPS `feed_origin`;
+//! clients derive the fixed subject path themselves. Frozen V1.0/V1.1 bytes can
+//! be decoded only through their explicit historical wrappers. This crate is
+//! deliberately a pure protocol/reducer boundary. It has no tenant, database,
+//! Matrix, HTTP, indexer, mailbox, token, or private-key dependency.
 //! Public `dtxc1`/`dtxa1` subject IDs are self-certifying values derived from a
 //! descriptor subject genesis key; they are never an internal control-plane
 //! UUID, alias, or endpoint.
@@ -32,8 +32,15 @@ pub const PUBLIC_DESCRIPTOR_V1_0_WIRE_VERSION: WireVersion = WireVersion::new(
     PUBLIC_DESCRIPTOR_V1_0_PROTOCOL_VERSION,
     PUBLIC_DESCRIPTOR_V1_0_PROTOCOL_VERSION,
 );
+/// Frozen public-descriptor `1.1` protocol version retained only for history reads.
+pub const PUBLIC_DESCRIPTOR_V1_1_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
+/// Exact frozen public-descriptor `1.1` wire version.
+pub const PUBLIC_DESCRIPTOR_V1_1_WIRE_VERSION: WireVersion = WireVersion::new(
+    PUBLIC_DESCRIPTOR_V1_1_PROTOCOL_VERSION,
+    PUBLIC_DESCRIPTOR_V1_1_PROTOCOL_VERSION,
+);
 /// Current writable public-descriptor protocol version.
-pub const PUBLIC_DESCRIPTOR_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
+pub const PUBLIC_DESCRIPTOR_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 2);
 /// Exact current writer and reader version for public signed descriptors.
 pub const PUBLIC_DESCRIPTOR_WIRE_VERSION: WireVersion = WireVersion::new(
     PUBLIC_DESCRIPTOR_PROTOCOL_VERSION,
@@ -48,13 +55,14 @@ pub const PUBLIC_DESCRIPTOR_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.public-descrip
 pub const PUBLIC_DESCRIPTOR_ENTRY_HASH_DOMAIN: &[u8] = b"dirextalk.public-descriptor-entry.v1\0";
 
 const MAX_FEED_ENDPOINT_BYTES: usize = 512;
-/// Fixed public feed document root. V1.1 derives a subject-specific path under it.
+/// Fixed public feed document root. V1.2 derives a subject-specific path under it.
 pub const PUBLIC_FEED_WELL_KNOWN_PATH_PREFIX: &str = "/.well-known/dirextalk/public/v1/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublicDescriptorWireLine {
     FrozenV1_0,
-    CurrentV1_1,
+    FrozenV1_1,
+    CurrentV1_2,
 }
 
 /// Public descriptor admission or reduction failed without exposing a secret.
@@ -76,7 +84,7 @@ pub enum PublicDescriptorError {
     InvalidDescriptorShape,
     /// A frozen V1.0 feed endpoint is malformed for historical verification.
     InvalidFeedEndpoint,
-    /// A current V1.1 public feed origin is unsafe, ambiguous, or outside bounds.
+    /// A current V1.2 public feed origin is unsafe, ambiguous, or outside bounds.
     InvalidFeedOrigin,
     /// A live descriptor is expired at the caller's trusted clock.
     Expired,
@@ -193,13 +201,33 @@ pub enum PublicDescriptorPayloadV1 {
         /// SHA-256 digest of the historical Agent manifest or provenance document.
         manifest_digest: Sha256Digest,
     },
+    /// Frozen V1.1 Channel payload, available only to the historical decoder.
+    #[doc(hidden)]
+    LegacyChannelV1_1 {
+        /// Exact historical origin bytes, never accepted by the current writer.
+        feed_origin: String,
+        /// SHA-256 digest of the historical Channel capability declaration.
+        capability_digest: Sha256Digest,
+    },
+    /// Frozen V1.1 Agent payload, available only to the historical decoder.
+    #[doc(hidden)]
+    LegacyAgentV1_1 {
+        /// Exact historical origin bytes, never accepted by the current writer.
+        feed_origin: String,
+        /// SHA-256 digest of the historical Agent capability declaration.
+        capability_digest: Sha256Digest,
+        /// SHA-256 digest of the historical Agent manifest or provenance document.
+        manifest_digest: Sha256Digest,
+    },
 }
 
 impl PublicDescriptorPayloadV1 {
     const fn code(&self) -> u64 {
         match self {
-            Self::Channel { .. } | Self::LegacyChannelV1_0 { .. } => 1,
-            Self::Agent { .. } | Self::LegacyAgentV1_0 { .. } => 2,
+            Self::Channel { .. }
+            | Self::LegacyChannelV1_0 { .. }
+            | Self::LegacyChannelV1_1 { .. } => 1,
+            Self::Agent { .. } | Self::LegacyAgentV1_0 { .. } | Self::LegacyAgentV1_1 { .. } => 2,
             Self::Tombstone => 3,
         }
     }
@@ -207,6 +235,10 @@ impl PublicDescriptorPayloadV1 {
     fn to_canonical_value(&self) -> CanonicalValue {
         match self {
             Self::Channel {
+                feed_origin,
+                capability_digest,
+            }
+            | Self::LegacyChannelV1_1 {
                 feed_origin,
                 capability_digest,
             } => CanonicalValue::Map(vec![
@@ -220,6 +252,11 @@ impl PublicDescriptorPayloadV1 {
                 ),
             ]),
             Self::Agent {
+                feed_origin,
+                capability_digest,
+                manifest_digest,
+            }
+            | Self::LegacyAgentV1_1 {
                 feed_origin,
                 capability_digest,
                 manifest_digest,
@@ -281,7 +318,11 @@ impl PublicDescriptorPayloadV1 {
             Self::Channel { feed_origin, .. } | Self::Agent { feed_origin, .. } => {
                 Some(feed_origin)
             }
-            Self::Tombstone | Self::LegacyChannelV1_0 { .. } | Self::LegacyAgentV1_0 { .. } => None,
+            Self::Tombstone
+            | Self::LegacyChannelV1_0 { .. }
+            | Self::LegacyAgentV1_0 { .. }
+            | Self::LegacyChannelV1_1 { .. }
+            | Self::LegacyAgentV1_1 { .. } => None,
         }
     }
 }
@@ -303,7 +344,7 @@ pub struct UnsignedPublicDescriptorV1 {
 }
 
 impl UnsignedPublicDescriptorV1 {
-    /// Creates strictly validated current V1.1 unsigned descriptor content.
+    /// Creates strictly validated current V1.2 unsigned descriptor content.
     ///
     /// `subject_id` must be `dtxc1` for Channel or `dtxa1` for Agent and must
     /// derive from `subject_genesis_signing_key`. The publisher identity is
@@ -314,7 +355,7 @@ impl UnsignedPublicDescriptorV1 {
     ///
     /// Returns a descriptor error for an unsupported wire line, mismatched
     /// self-certifying ID, invalid sequence or expiry shape, or invalid public
-    /// payload origin. Frozen V1.0 is deliberately not a writer input.
+    /// payload origin. Frozen V1.0/V1.1 are deliberately not writer inputs.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         wire: WireVersion,
@@ -404,7 +445,7 @@ impl UnsignedPublicDescriptorV1 {
     }
 
     fn validate_static_current(&self) -> Result<(), PublicDescriptorError> {
-        if public_descriptor_wire_line(self.wire)? != PublicDescriptorWireLine::CurrentV1_1 {
+        if public_descriptor_wire_line(self.wire)? != PublicDescriptorWireLine::CurrentV1_2 {
             return Err(PublicDescriptorError::InvalidWireVersion);
         }
         self.validate_static_any()
@@ -442,12 +483,12 @@ impl UnsignedPublicDescriptorV1 {
         }
         match (wire_line, &self.kind, &self.payload) {
             (
-                PublicDescriptorWireLine::CurrentV1_1,
+                PublicDescriptorWireLine::CurrentV1_2,
                 PublicDescriptorKindV1::Channel,
                 PublicDescriptorPayloadV1::Channel { feed_origin, .. },
             )
             | (
-                PublicDescriptorWireLine::CurrentV1_1,
+                PublicDescriptorWireLine::CurrentV1_2,
                 PublicDescriptorKindV1::Agent,
                 PublicDescriptorPayloadV1::Agent { feed_origin, .. },
             ) => {
@@ -455,6 +496,25 @@ impl UnsignedPublicDescriptorV1 {
                     return Err(PublicDescriptorError::InvalidDescriptorShape);
                 }
                 if valid_public_feed_origin(feed_origin) {
+                    Ok(())
+                } else {
+                    Err(PublicDescriptorError::InvalidFeedOrigin)
+                }
+            }
+            (
+                PublicDescriptorWireLine::FrozenV1_1,
+                PublicDescriptorKindV1::Channel,
+                PublicDescriptorPayloadV1::LegacyChannelV1_1 { feed_origin, .. },
+            )
+            | (
+                PublicDescriptorWireLine::FrozenV1_1,
+                PublicDescriptorKindV1::Agent,
+                PublicDescriptorPayloadV1::LegacyAgentV1_1 { feed_origin, .. },
+            ) => {
+                if self.expires_at <= self.issued_at {
+                    return Err(PublicDescriptorError::InvalidDescriptorShape);
+                }
+                if valid_historical_feed_origin(feed_origin) {
                     Ok(())
                 } else {
                     Err(PublicDescriptorError::InvalidFeedOrigin)
@@ -570,7 +630,7 @@ impl SignedPublicDescriptorV1 {
         Ok(descriptor)
     }
 
-    /// Decodes one exact canonical current V1.1 CBOR descriptor and verifies its signature.
+    /// Decodes one exact canonical current V1.2 CBOR descriptor and verifies its signature.
     ///
     /// Unknown fields, non-preferred CBOR, malformed IDs, noncanonical public
     /// keys, and a decode/re-encode mismatch are all rejected.
@@ -578,10 +638,10 @@ impl SignedPublicDescriptorV1 {
     /// # Errors
     ///
     /// Returns a descriptor error when bytes or their cryptographic proof are
-    /// not exactly valid current V1.1 descriptor data. Frozen V1.0 bytes must
-    /// use [`HistoricalPublicDescriptorV1_0`].
+    /// not exactly valid current V1.2 descriptor data. Frozen V1.0/V1.1 bytes
+    /// must use their explicit historical wrappers.
     pub fn decode_and_verify(bytes: &[u8]) -> Result<Self, PublicDescriptorError> {
-        Self::decode_and_verify_for_line(bytes, PublicDescriptorWireLine::CurrentV1_1)
+        Self::decode_and_verify_for_line(bytes, PublicDescriptorWireLine::CurrentV1_2)
     }
 
     fn decode_and_verify_for_line(
@@ -632,7 +692,7 @@ impl SignedPublicDescriptorV1 {
         Ok(descriptor)
     }
 
-    /// Re-verifies current V1.1 constraints and the strict Ed25519 proof.
+    /// Re-verifies current V1.2 constraints and the strict Ed25519 proof.
     ///
     /// # Errors
     ///
@@ -739,7 +799,7 @@ impl SignedPublicDescriptorV1 {
         &self.unsigned.payload
     }
 
-    /// Returns the V1.1 authority-only public feed origin for a live descriptor.
+    /// Returns the V1.2 canonical DNS HTTPS feed origin for a live descriptor.
     #[must_use]
     pub fn feed_origin(&self) -> Option<&str> {
         self.unsigned.payload.feed_origin()
@@ -819,6 +879,86 @@ impl HistoricalPublicDescriptorV1_0 {
             PublicDescriptorWireLine::FrozenV1_0,
         )?;
         if descriptor.wire() != PUBLIC_DESCRIPTOR_V1_0_WIRE_VERSION {
+            return Err(PublicDescriptorError::InvalidWireVersion);
+        }
+        Ok(Self { descriptor })
+    }
+
+    /// Returns the frozen historical wire version.
+    #[must_use]
+    pub const fn wire(&self) -> WireVersion {
+        self.descriptor.wire()
+    }
+
+    /// Returns the stable historical public Channel or Agent subject ID.
+    #[must_use]
+    pub const fn subject_id(&self) -> PublicSubjectId {
+        self.descriptor.subject_id()
+    }
+
+    /// Returns the self-certifying historical publisher identity ID.
+    #[must_use]
+    pub const fn publisher_identity_id(&self) -> IdentityId {
+        self.descriptor.publisher_identity_id()
+    }
+
+    /// Returns the historical descriptor sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> SafeUint {
+        self.descriptor.sequence()
+    }
+
+    /// Returns whether the historical entry is a tombstone.
+    #[must_use]
+    pub const fn is_tombstone(&self) -> bool {
+        self.descriptor.is_tombstone()
+    }
+
+    /// Returns exact deterministic historical descriptor bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the bounded deterministic profile cannot encode
+    /// this already verified historical descriptor.
+    pub fn to_deterministic_cbor(&self) -> Result<Vec<u8>, PublicDescriptorError> {
+        self.descriptor.to_deterministic_cbor()
+    }
+
+    /// Returns the complete historical descriptor hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if canonical encoding cannot represent the entry.
+    pub fn entry_hash(&self) -> Result<Sha256Digest, PublicDescriptorError> {
+        self.descriptor.entry_hash()
+    }
+}
+
+/// Read-only verified wrapper for frozen public-descriptor wire `1.1` bytes.
+///
+/// V1.1 is superseded by the canonical-DNS origin rules in V1.2 and is never
+/// returned by the current decoder, writer, or reducer. This wrapper is only
+/// for exact historical inspection and migration diagnostics; it exposes no
+/// payload origin, write constructor, append operation, or current feed URL.
+#[derive(Clone, Eq, PartialEq)]
+pub struct HistoricalPublicDescriptorV1_1 {
+    descriptor: SignedPublicDescriptorV1,
+}
+
+impl HistoricalPublicDescriptorV1_1 {
+    /// Decodes and strictly verifies one frozen V1.1 descriptor for history reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PublicDescriptorError::InvalidWireVersion`] for current,
+    /// V1.0, or unknown bytes, and the relevant strict canonical or signature
+    /// error for an invalid historical descriptor.
+    pub fn decode_and_verify(bytes: &[u8]) -> Result<Self, PublicDescriptorError> {
+        let descriptor = SignedPublicDescriptorV1::decode_and_verify_for_line(
+            bytes,
+            PublicDescriptorWireLine::FrozenV1_1,
+        )?;
+        if descriptor.wire() != PUBLIC_DESCRIPTOR_V1_1_WIRE_VERSION {
             return Err(PublicDescriptorError::InvalidWireVersion);
         }
         Ok(Self { descriptor })
@@ -1109,7 +1249,10 @@ fn valid_historical_feed_endpoint(value: &str) -> bool {
         && authority.bytes().any(|byte| byte.is_ascii_alphanumeric())
 }
 
-fn valid_public_feed_origin(value: &str) -> bool {
+/// V1.1 accepted an HTTPS origin with a broader authority grammar. Keep that
+/// exact admission boundary only for authenticating frozen historical bytes;
+/// current V1.2 writes use [`valid_public_feed_origin`] below.
+fn valid_historical_feed_origin(value: &str) -> bool {
     if value.len() > MAX_FEED_ENDPOINT_BYTES
         || !value.is_ascii()
         || !value.starts_with("https://")
@@ -1124,10 +1267,10 @@ fn valid_public_feed_origin(value: &str) -> bool {
     } else {
         authority_and_root
     };
-    !authority.is_empty() && !authority.contains('/') && valid_public_feed_authority(authority)
+    !authority.is_empty() && !authority.contains('/') && valid_historical_feed_authority(authority)
 }
 
-fn valid_public_feed_authority(authority: &str) -> bool {
+fn valid_historical_feed_authority(authority: &str) -> bool {
     if let Some(ipv6) = authority.strip_prefix('[') {
         let Some((host, suffix)) = ipv6.split_once(']') else {
             return false;
@@ -1140,7 +1283,10 @@ fn valid_public_feed_authority(authority: &str) -> bool {
         {
             return false;
         }
-        return suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_public_feed_port);
+        return suffix.is_empty()
+            || suffix
+                .strip_prefix(':')
+                .is_some_and(valid_historical_feed_port);
     }
 
     if authority.contains(['[', ']']) || authority.matches(':').count() > 1 {
@@ -1149,10 +1295,10 @@ fn valid_public_feed_authority(authority: &str) -> bool {
     let (host, port) = authority
         .split_once(':')
         .map_or((authority, None), |(host, port)| (host, Some(port)));
-    valid_public_feed_host(host) && port.is_none_or(valid_public_feed_port)
+    valid_historical_feed_host(host) && port.is_none_or(valid_historical_feed_port)
 }
 
-fn valid_public_feed_host(host: &str) -> bool {
+fn valid_historical_feed_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
         && !host.ends_with('.')
@@ -1167,10 +1313,85 @@ fn valid_public_feed_host(host: &str) -> bool {
         })
 }
 
-fn valid_public_feed_port(port: &str) -> bool {
+fn valid_historical_feed_port(port: &str) -> bool {
     !port.is_empty()
         && port.bytes().all(|byte| byte.is_ascii_digit())
         && port.parse::<u16>().is_ok_and(|parsed| parsed != 0)
+}
+
+/// V1.2 requires one canonical lower-case ASCII DNS origin. In particular,
+/// it deliberately never accepts an IP literal or a WHATWG IPv4-looking host
+/// whose URL interpretation could vary between clients.
+fn valid_public_feed_origin(value: &str) -> bool {
+    let Some(authority) = feed_origin_authority(value) else {
+        return false;
+    };
+    valid_canonical_dns_authority(authority)
+}
+
+fn feed_origin_authority(value: &str) -> Option<&str> {
+    if value.len() > MAX_FEED_ENDPOINT_BYTES
+        || !value.is_ascii()
+        || !value.starts_with("https://")
+        || value.contains(['@', '?', '#', '\\'])
+        || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return None;
+    }
+    let authority_and_root = &value["https://".len()..];
+    let authority = authority_and_root
+        .strip_suffix('/')
+        .unwrap_or(authority_and_root);
+    (!authority.is_empty() && !authority.contains('/')).then_some(authority)
+}
+
+fn valid_canonical_dns_authority(authority: &str) -> bool {
+    if authority.contains(['[', ']']) || authority.matches(':').count() > 1 {
+        return false;
+    }
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    valid_canonical_dns_host(host) && port.is_none_or(valid_canonical_dns_port)
+}
+
+fn valid_canonical_dns_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.ends_with('.')
+        && host.bytes().any(|byte| byte.is_ascii_lowercase())
+        && !looks_like_whatwg_ipv4_host(host)
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn looks_like_whatwg_ipv4_host(host: &str) -> bool {
+    host.split('.').all(|part| {
+        !part.is_empty()
+            && (part.bytes().all(|byte| byte.is_ascii_digit())
+                || part.strip_prefix("0x").is_some_and(|hex| {
+                    !hex.is_empty()
+                        && hex
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }))
+    })
+}
+
+fn valid_canonical_dns_port(port: &str) -> bool {
+    !port.is_empty()
+        && !port.starts_with('0')
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port
+            .parse::<u16>()
+            .is_ok_and(|parsed| parsed != 0 && parsed != 443)
 }
 
 fn exact_fields(
@@ -1221,8 +1442,10 @@ fn public_descriptor_wire_line(
 ) -> Result<PublicDescriptorWireLine, PublicDescriptorError> {
     if wire == PUBLIC_DESCRIPTOR_V1_0_WIRE_VERSION {
         Ok(PublicDescriptorWireLine::FrozenV1_0)
+    } else if wire == PUBLIC_DESCRIPTOR_V1_1_WIRE_VERSION {
+        Ok(PublicDescriptorWireLine::FrozenV1_1)
     } else if wire == PUBLIC_DESCRIPTOR_WIRE_VERSION {
-        Ok(PublicDescriptorWireLine::CurrentV1_1)
+        Ok(PublicDescriptorWireLine::CurrentV1_2)
     } else {
         Err(PublicDescriptorError::InvalidWireVersion)
     }
@@ -1310,14 +1533,14 @@ fn decode_payload(
     value: &CanonicalValue,
 ) -> Result<PublicDescriptorPayloadV1, PublicDescriptorError> {
     match (wire_line, kind, code) {
-        (PublicDescriptorWireLine::CurrentV1_1, PublicDescriptorKindV1::Channel, 1) => {
+        (PublicDescriptorWireLine::CurrentV1_2, PublicDescriptorKindV1::Channel, 1) => {
             let fields = exact_fields(value, 2)?;
             Ok(PublicDescriptorPayloadV1::Channel {
                 feed_origin: decode_text(field(fields, 1)?)?,
                 capability_digest: decode_digest(field(fields, 2)?)?,
             })
         }
-        (PublicDescriptorWireLine::CurrentV1_1, PublicDescriptorKindV1::Agent, 2) => {
+        (PublicDescriptorWireLine::CurrentV1_2, PublicDescriptorKindV1::Agent, 2) => {
             let fields = exact_fields(value, 3)?;
             Ok(PublicDescriptorPayloadV1::Agent {
                 feed_origin: decode_text(field(fields, 1)?)?,
@@ -1336,6 +1559,21 @@ fn decode_payload(
             let fields = exact_fields(value, 3)?;
             Ok(PublicDescriptorPayloadV1::LegacyAgentV1_0 {
                 feed_endpoint: decode_text(field(fields, 1)?)?,
+                capability_digest: decode_digest(field(fields, 2)?)?,
+                manifest_digest: decode_digest(field(fields, 3)?)?,
+            })
+        }
+        (PublicDescriptorWireLine::FrozenV1_1, PublicDescriptorKindV1::Channel, 1) => {
+            let fields = exact_fields(value, 2)?;
+            Ok(PublicDescriptorPayloadV1::LegacyChannelV1_1 {
+                feed_origin: decode_text(field(fields, 1)?)?,
+                capability_digest: decode_digest(field(fields, 2)?)?,
+            })
+        }
+        (PublicDescriptorWireLine::FrozenV1_1, PublicDescriptorKindV1::Agent, 2) => {
+            let fields = exact_fields(value, 3)?;
+            Ok(PublicDescriptorPayloadV1::LegacyAgentV1_1 {
+                feed_origin: decode_text(field(fields, 1)?)?,
                 capability_digest: decode_digest(field(fields, 2)?)?,
                 manifest_digest: decode_digest(field(fields, 3)?)?,
             })

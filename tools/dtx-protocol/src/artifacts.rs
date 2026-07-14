@@ -112,6 +112,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_identity_log_v1_1(root)?;
     validate_public_descriptor_v1(root)?;
     validate_public_descriptor_v1_1(root)?;
+    validate_public_descriptor_v1_2(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
@@ -238,6 +239,129 @@ fn validate_public_descriptor_v1_1(root: &Path) -> Result<(), ProtocolToolError>
         }
     }
     Ok(())
+}
+
+fn validate_public_descriptor_v1_2(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl =
+        read(&root.join("protocol/cddl/public-descriptor/v1_2/public-descriptor-v1-2.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse public-descriptor v1.2 CDDL: {error}"))
+    })?;
+    let vector = read_json(
+        &root.join("protocol/test-vectors/public-descriptor/v1_2/public-descriptor-v1-2.json"),
+    )?;
+    validate_vector_version(&vector, "public-descriptor-v1.2")?;
+    if json_string(&vector, "wire_version")? != "1.2" {
+        return Err(ProtocolToolError::new(
+            "public-descriptor-v1.2 vector wire_version must be 1.2",
+        ));
+    }
+    if json_string(&vector, "feed_path_template")?
+        != "/.well-known/dirextalk/public/v1/{subject_id}"
+    {
+        return Err(ProtocolToolError::new(
+            "public-descriptor-v1.2 vector feed_path_template must use the fixed subject path",
+        ));
+    }
+    validate_public_descriptor_v1_2_invalid_origins(&vector)?;
+    let descriptors = vector
+        .get("descriptors")
+        .and_then(Value::as_array)
+        .filter(|descriptors| !descriptors.is_empty())
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "public-descriptor-v1.2 vector descriptors must be a nonempty array",
+            )
+        })?;
+    let mut names = BTreeSet::new();
+    for descriptor in descriptors {
+        let name = json_string(descriptor, "descriptor")?;
+        if !names.insert(name.to_owned()) {
+            return Err(ProtocolToolError::new(format!(
+                "public-descriptor-v1.2 vector has duplicate descriptor {name}"
+            )));
+        }
+        let subject_id = json_string(descriptor, "subject_id")?;
+        let entry_hash = json_string(descriptor, "entry_hash")?;
+        if !entry_hash.starts_with("sha256:") {
+            return Err(ProtocolToolError::new(format!(
+                "public-descriptor-v1.2 descriptor {name} entry_hash must use sha256"
+            )));
+        }
+        validate_cddl_hex(
+            "public-descriptor-v1-2",
+            &cddl,
+            json_string(descriptor, "canonical_cbor_hex")?,
+        )?;
+        let tombstone = descriptor
+            .get("tombstone")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                ProtocolToolError::new(format!(
+                    "public-descriptor-v1.2 descriptor {name} tombstone must be a boolean"
+                ))
+            })?;
+        if tombstone {
+            if descriptor.get("feed_origin").is_some()
+                || descriptor.get("public_feed_url").is_some()
+            {
+                return Err(ProtocolToolError::new(format!(
+                    "public-descriptor-v1.2 tombstone {name} must not carry a feed origin or URL"
+                )));
+            }
+        } else {
+            let origin = json_string(descriptor, "feed_origin")?;
+            let public_feed_url = json_string(descriptor, "public_feed_url")?;
+            let expected_url = format!(
+                "{}{}{}",
+                origin.trim_end_matches('/'),
+                "/.well-known/dirextalk/public/v1/",
+                subject_id
+            );
+            if public_feed_url != expected_url {
+                return Err(ProtocolToolError::new(format!(
+                    "public-descriptor-v1.2 descriptor {name} public_feed_url must derive from its origin and subject"
+                )));
+            }
+        }
+    }
+    for required in [
+        "channel_genesis",
+        "channel_tombstone",
+        "agent_genesis",
+        "agent_tombstone",
+    ] {
+        if !names.contains(required) {
+            return Err(ProtocolToolError::new(format!(
+                "public-descriptor-v1.2 vector must include {required}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_descriptor_v1_2_invalid_origins(
+    vector: &Value,
+) -> Result<(), ProtocolToolError> {
+    let invalid_origins = vector
+        .get("invalid_feed_origins")
+        .and_then(Value::as_array)
+        .filter(|origins| !origins.is_empty())
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "public-descriptor-v1.2 vector invalid_feed_origins must be a nonempty array",
+            )
+        })?;
+    if invalid_origins
+        .iter()
+        .any(|origin| origin.as_str().is_none())
+    {
+        Err(ProtocolToolError::new(
+            "public-descriptor-v1.2 vector invalid_feed_origins must contain strings",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_identity_log_v1_1(root: &Path) -> Result<(), ProtocolToolError> {

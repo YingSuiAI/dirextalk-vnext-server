@@ -1,8 +1,8 @@
 use dtx_domain::{AgentId, ChannelId, IdentityId, PublicSubjectId};
 use dtx_public_descriptor::{
-    DescriptorHeadV1, HistoricalPublicDescriptorV1_0, PUBLIC_DESCRIPTOR_WIRE_VERSION,
-    PublicDescriptorError, PublicDescriptorKindV1, PublicDescriptorPayloadV1,
-    SignedPublicDescriptorV1, UnsignedPublicDescriptorV1,
+    DescriptorHeadV1, HistoricalPublicDescriptorV1_0, HistoricalPublicDescriptorV1_1,
+    PUBLIC_DESCRIPTOR_WIRE_VERSION, PublicDescriptorError, PublicDescriptorKindV1,
+    PublicDescriptorPayloadV1, SignedPublicDescriptorV1, UnsignedPublicDescriptorV1,
 };
 use dtx_wire::{
     Ed25519Signature, ProtocolVersion, SafeUint, Sha256Digest, SigningPublicKey, UtcMillis,
@@ -16,6 +16,8 @@ struct PublicDescriptorVector {
     version: u16,
     wire_version: String,
     feed_path_template: Option<String>,
+    #[serde(default)]
+    invalid_feed_origins: Vec<String>,
     descriptors: Vec<PublicDescriptorVectorEntry>,
 }
 
@@ -155,7 +157,7 @@ fn rejects_a_publisher_that_does_not_control_the_subject_genesis_key() {
 }
 
 #[test]
-fn current_writes_reject_capability_paths_and_frozen_v1_0() {
+fn current_writes_reject_capability_paths_and_frozen_v1_0_or_v1_1() {
     let publisher = key(22);
     let publisher_key = public(&publisher);
     let subject_id = ChannelId::derive(publisher_key.as_domain_key());
@@ -195,6 +197,24 @@ fn current_writes_reject_capability_paths_and_frozen_v1_0() {
         },
     );
     assert_eq!(frozen_v1_0, Err(PublicDescriptorError::InvalidWireVersion));
+
+    let frozen_v1_1 = UnsignedPublicDescriptorV1::new(
+        WireVersion::new(ProtocolVersion::new(1, 1), ProtocolVersion::new(1, 1)),
+        PublicDescriptorKindV1::Channel,
+        PublicSubjectId::Channel(subject_id),
+        publisher_key,
+        publisher_identity_id,
+        publisher_key,
+        SafeUint::new(1).expect("sequence"),
+        None,
+        utc(1_700_000_000_000),
+        utc(1_700_000_100_000),
+        PublicDescriptorPayloadV1::Channel {
+            feed_origin: "https://feed.example".to_owned(),
+            capability_digest: Sha256Digest::from_bytes([33; 32]),
+        },
+    );
+    assert_eq!(frozen_v1_1, Err(PublicDescriptorError::InvalidWireVersion));
 }
 
 #[test]
@@ -211,6 +231,15 @@ fn current_feed_origins_allow_only_an_https_authority_or_root_slash() {
         "http://feed.example",
         "https://feed.example//",
         "https://feed.example:invalid",
+        "https://0177.0.0.1",
+        "https://0x7f000001",
+        "https://2130706433",
+        "https://127.0.0.1",
+        "https://FEED.example",
+        "https://feed.example.",
+        "https://[::1]",
+        "https://feed.example:443",
+        "https://feed.example:0444",
     ] {
         let result = UnsignedPublicDescriptorV1::new(
             PUBLIC_DESCRIPTOR_WIRE_VERSION,
@@ -359,21 +388,50 @@ fn reducer_fails_closed_for_an_expired_live_descriptor_and_for_tombstoned_subjec
 }
 
 #[test]
-fn current_v1_1_vector_is_byte_exact_and_reduces_to_the_expected_heads() {
+fn current_v1_2_vector_is_byte_exact_rejects_ambiguous_origins_and_reduces_tombstones() {
     let vector: PublicDescriptorVector = serde_json::from_str(include_str!(
-        "../../../protocol/test-vectors/public-descriptor/v1_1/public-descriptor-v1-1.json"
+        "../../../protocol/test-vectors/public-descriptor/v1_2/public-descriptor-v1-2.json"
     ))
     .expect("public descriptor vector is valid JSON");
     assert_eq!(vector.version, 1);
-    assert_eq!(vector.wire_version, "1.1");
+    assert_eq!(vector.wire_version, "1.2");
     assert_eq!(
         vector.feed_path_template.as_deref(),
         Some("/.well-known/dirextalk/public/v1/{subject_id}")
     );
 
+    let publisher = key(22);
+    let publisher_key = public(&publisher);
+    let subject_id = ChannelId::derive(publisher_key.as_domain_key());
+    let publisher_identity_id = IdentityId::derive(publisher_key.as_domain_key());
+    for invalid_origin in vector.invalid_feed_origins {
+        let result = UnsignedPublicDescriptorV1::new(
+            PUBLIC_DESCRIPTOR_WIRE_VERSION,
+            PublicDescriptorKindV1::Channel,
+            PublicSubjectId::Channel(subject_id),
+            publisher_key,
+            publisher_identity_id,
+            publisher_key,
+            SafeUint::new(1).expect("sequence"),
+            None,
+            utc(1_700_000_000_000),
+            utc(1_700_000_100_000),
+            PublicDescriptorPayloadV1::Channel {
+                feed_origin: invalid_origin.clone(),
+                capability_digest: Sha256Digest::from_bytes([33; 32]),
+            },
+        );
+        assert_eq!(
+            result,
+            Err(PublicDescriptorError::InvalidFeedOrigin),
+            "V1.2 vector invalid origin must be rejected: {invalid_origin}"
+        );
+    }
+
     let mut channel_genesis = None;
     let mut channel_tombstone = None;
     let mut agent_genesis = None;
+    let mut agent_tombstone = None;
     for entry in vector.descriptors {
         let bytes = decode_hex(&entry.canonical_cbor_hex);
         let descriptor =
@@ -403,6 +461,7 @@ fn current_v1_1_vector_is_byte_exact_and_reduces_to_the_expected_heads() {
             "channel_genesis" => channel_genesis = Some(descriptor),
             "channel_tombstone" => channel_tombstone = Some(descriptor),
             "agent_genesis" => agent_genesis = Some(descriptor),
+            "agent_tombstone" => agent_tombstone = Some(descriptor),
             other => panic!("unexpected public descriptor vector entry: {other}"),
         }
     }
@@ -421,8 +480,61 @@ fn current_v1_1_vector_is_byte_exact_and_reduces_to_the_expected_heads() {
     );
 
     let agent_genesis = agent_genesis.expect("agent genesis vector");
-    DescriptorHeadV1::bootstrap_at(&agent_genesis, utc(1_700_000_000_001))
+    let agent_tombstone = agent_tombstone.expect("agent tombstone vector");
+    let mut agent_head = DescriptorHeadV1::bootstrap_at(&agent_genesis, utc(1_700_000_000_001))
         .expect("agent vector genesis is live");
+    agent_head
+        .append_at(&agent_tombstone, utc(1_700_000_000_011))
+        .expect("agent vector tombstone is accepted");
+    assert!(
+        agent_head
+            .active_descriptor_at(utc(1_700_000_000_011))
+            .is_none()
+    );
+}
+
+#[test]
+fn frozen_v1_1_vector_is_read_only_and_cannot_enter_the_current_decoder() {
+    let vector: PublicDescriptorVector = serde_json::from_str(include_str!(
+        "../../../protocol/test-vectors/public-descriptor/v1_1/public-descriptor-v1-1.json"
+    ))
+    .expect("historical public descriptor vector is valid JSON");
+    assert_eq!(vector.version, 1);
+    assert_eq!(vector.wire_version, "1.1");
+
+    for entry in vector.descriptors {
+        let bytes = decode_hex(&entry.canonical_cbor_hex);
+        assert_eq!(
+            SignedPublicDescriptorV1::decode_and_verify(&bytes),
+            Err(PublicDescriptorError::InvalidWireVersion)
+        );
+        let descriptor =
+            HistoricalPublicDescriptorV1_1::decode_and_verify(&bytes).unwrap_or_else(|error| {
+                panic!(
+                    "{} historical vector is invalid: {error:?}",
+                    entry.descriptor
+                )
+            });
+        assert_eq!(descriptor.subject_id().to_string(), entry.subject_id);
+        assert_eq!(
+            descriptor.publisher_identity_id().to_string(),
+            entry.publisher_identity_id
+        );
+        assert_eq!(descriptor.is_tombstone(), entry.tombstone);
+        assert_eq!(
+            descriptor
+                .entry_hash()
+                .expect("historical hash")
+                .to_string(),
+            entry.entry_hash
+        );
+        assert_eq!(
+            descriptor
+                .to_deterministic_cbor()
+                .expect("historical bytes"),
+            bytes
+        );
+    }
 }
 
 #[test]

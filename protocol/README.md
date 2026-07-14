@@ -47,15 +47,20 @@ Layout:
   public descriptor 1.0 wire for explicit historical reads only. Its endpoint
   field allowed an arbitrary path and it must never enter the current writer,
   reducer, registration, or Indexer path. `baseline/v8/manifest.json`
-  independently freezes current public descriptor 1.1: self-certifying
-  `dtxc1`/`dtxa1` subject IDs, publisher identity binding, canonical signed
-  sequence heads, a strict authority-only `feed_origin`, artifact digests,
-  expiry, and permanent tombstones. Clients and PD2 derive the fixed public
-  document path `/.well-known/dirextalk/public/v1/{subject_id}` from that
-  origin; a capability, token, userinfo, query, fragment, or custom path is
-  not representable in a current descriptor. Neither version introduces an
-  Indexer, public feed transport, delegation, or a control-plane UUID alias for
-  a public subject.
+  independently freezes the superseded public descriptor 1.1 wire for explicit
+  historical reads only. `baseline/v9/manifest.json` freezes the current public
+  descriptor 1.2 wire: self-certifying `dtxc1`/`dtxa1` subject IDs, publisher
+  identity binding, canonical signed sequence heads, canonical lower-case DNS
+  HTTPS `feed_origin` values, artifact digests, expiry, and permanent
+  tombstones. V1.2 excludes IP literals and URL-parser-ambiguous numeric host
+  forms, and its Channel and Agent tombstones both use the empty payload map.
+  Clients and PD2 derive the fixed public document path
+  `/.well-known/dirextalk/public/v1/{subject_id}` from that origin; a
+  capability, token, userinfo, query, fragment, or custom path is not
+  representable in a current descriptor. V1.0 and V1.1 never enter a current
+  writer, decoder, reducer, registration, or Indexer path. No version
+  introduces an Indexer, public feed transport, delegation, or a control-plane
+  UUID alias for a public subject.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen
