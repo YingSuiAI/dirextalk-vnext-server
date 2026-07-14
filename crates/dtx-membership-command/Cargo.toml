@@ -1,0 +1,14 @@
+[package]
+name = "dtx-membership-command"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dtx-domain = { path = "../dtx-domain" }
+dtx-group-policy = { path = "../dtx-group-policy" }
+dtx-wire = { path = "../dtx-wire" }
+
+[lints]
+workspace = true

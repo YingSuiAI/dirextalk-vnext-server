@@ -15,6 +15,7 @@ members = [
     "crates/dtx-group-policy",
     "crates/dtx-identity-log",
     "crates/dtx-identity-persistence",
+    "crates/dtx-membership-command",
     "crates/dtx-public-descriptor",
     "crates/dtx-security",
     "crates/dtx-storage",
