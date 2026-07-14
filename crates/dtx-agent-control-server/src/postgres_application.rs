@@ -2688,6 +2688,7 @@ impl PostgresConnectorControlApplication {
             .checked_sub(CERTIFICATE_NOT_BEFORE_SKEW_MILLIS)
             .filter(|value| *value >= 0)
             .ok_or(ConnectorControlApplicationError::Internal)?;
+        let valid_from = valid_from - valid_from.rem_euclid(1_000);
         let valid_until = valid_from
             .checked_add(MAX_CONNECTOR_CREDENTIAL_VALIDITY_MILLIS)
             .ok_or(ConnectorControlApplicationError::Internal)?;

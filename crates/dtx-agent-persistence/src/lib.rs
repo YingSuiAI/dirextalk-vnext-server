@@ -16,6 +16,7 @@ mod error;
 mod grant;
 mod host;
 mod host_authorization;
+mod host_provisioning;
 mod operation;
 mod registry;
 mod run;
@@ -40,6 +41,7 @@ pub use error::AgentPersistenceError;
 pub use grant::ConversationGrantRepository;
 pub use host::AgentHostRepository;
 pub use host_authorization::HostCredentialAuthorizationRepository;
+pub use host_provisioning::{HostProvisioningOperation, HostProvisioningOperationRepository};
 pub use operation::{
     ConnectorControlOperation, ConnectorControlOperationKind, ConnectorControlOperationRepository,
 };

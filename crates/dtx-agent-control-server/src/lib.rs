@@ -19,6 +19,7 @@ mod gateway_service;
 mod gateway_wire;
 mod incoming;
 mod postgres_application;
+mod provisioning;
 mod run_notifications;
 mod service;
 mod transport_admission;
@@ -62,6 +63,7 @@ pub use postgres_application::{
     CreateConnectorEnrollmentRequest, CreatedAgentRun, CreatedConnectorEnrollment,
     PostgresConnectorControlApplication, RotateConnectorCredentialRequest,
 };
+pub use provisioning::*;
 pub use run_notifications::RunOfferNotificationSubscription;
 pub use service::{
     COMMAND_POLL_INTERVAL, COMMAND_RECONCILE_INTERVAL, COMMAND_RECONCILE_JITTER,

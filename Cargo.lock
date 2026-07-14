@@ -717,6 +717,9 @@ dependencies = [
  "dtx-connect-registry",
  "dtx-domain",
  "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "zeroize",
 ]
@@ -726,12 +729,19 @@ name = "dtx-agent-control-bin"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64ct",
+ "dtx-agent-control",
  "dtx-agent-control-server",
+ "dtx-connect-registry",
+ "dtx-domain",
  "dtx-security",
  "dtx-storage",
+ "getrandom 0.4.3",
+ "rustix 1.1.4",
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tonic",
@@ -781,6 +791,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "uuid",
+ "x509-parser",
  "zeroize",
 ]
 

@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 dtx-agent-control = { path = "../dtx-agent-control" }
 dtx-agent-control-proto = { path = "../dtx-agent-control-proto" }
+dtx-agent-host = { path = "../dtx-agent-host" }
 dtx-agent-persistence = { path = "../dtx-agent-persistence" }
 dtx-agent-router = { path = "../dtx-agent-router" }
 dtx-connect-registry = { path = "../dtx-connect-registry" }
@@ -31,10 +32,10 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-dtx-agent-host = { path = "../dtx-agent-host" }
 dtx-testkit = { path = "../dtx-testkit" }
 ed25519-dalek.workspace = true
 testcontainers-modules.workspace = true
+x509-parser.workspace = true
 
 [lints]
 workspace = true

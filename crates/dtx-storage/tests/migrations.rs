@@ -208,6 +208,7 @@ async fn assert_append_only_tables_have_no_update(
         "agent.connector_control_credential_rotations",
         "agent.connector_runtime_claims",
         "agent.connector_control_commands",
+        "agent.host_provisioning_operations",
     ] {
         let can_update: bool =
             sqlx::query_scalar("SELECT has_table_privilege('dtx_runtime_test', $1, 'UPDATE')")

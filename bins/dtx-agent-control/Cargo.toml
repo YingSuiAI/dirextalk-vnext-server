@@ -9,14 +9,25 @@ publish = false
 name = "dtx-agent-control"
 path = "src/main.rs"
 
+[[bin]]
+name = "dtx-agent-provision"
+path = "src/provision.rs"
+
 [dependencies]
 axum.workspace = true
+base64ct.workspace = true
+dtx-agent-control = { path = "../../crates/dtx-agent-control" }
 dtx-agent-control-server = { path = "../../crates/dtx-agent-control-server" }
+dtx-connect-registry = { path = "../../crates/dtx-connect-registry" }
+dtx-domain = { path = "../../crates/dtx-domain" }
 dtx-security = { path = "../../crates/dtx-security" }
 dtx-storage = { path = "../../crates/dtx-storage" }
+getrandom.workspace = true
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tonic.workspace = true

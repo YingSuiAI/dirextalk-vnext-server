@@ -103,6 +103,9 @@ impl ConnectorCertificateAuthority {
         valid_until_millis: i64,
     ) -> Result<IssuedConnectorCertificate, ConnectorCertificateIssueError> {
         validate_validity(valid_from_millis, valid_until_millis)?;
+        let valid_from_millis = floor_to_certificate_second(valid_from_millis);
+        let valid_until_millis = floor_to_certificate_second(valid_until_millis);
+        validate_validity(valid_from_millis, valid_until_millis)?;
         let uri = identity
             .uri()
             .try_into()
@@ -138,6 +141,10 @@ impl ConnectorCertificateAuthority {
             valid_until_millis,
         })
     }
+}
+
+const fn floor_to_certificate_second(unix_millis: i64) -> i64 {
+    unix_millis - unix_millis.rem_euclid(1_000)
 }
 
 impl fmt::Debug for ConnectorCertificateAuthority {
@@ -241,3 +248,58 @@ impl fmt::Display for ConnectorCertificateIssueError {
 }
 
 impl Error for ConnectorCertificateIssueError {}
+
+#[cfg(test)]
+mod tests {
+    use std::{error::Error, str::FromStr};
+
+    use dtx_domain::{ConnectorId, Ed25519PublicKey, TenantId};
+    use dtx_security::{ConnectorWorkloadIdentity, SecretBytes};
+    use ed25519_dalek::SigningKey;
+    use rcgen::{
+        BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519,
+    };
+    use x509_parser::parse_x509_certificate;
+
+    use super::ConnectorCertificateAuthority;
+
+    #[test]
+    fn issued_millis_equal_der_second_resolution() -> Result<(), Box<dyn Error>> {
+        let issuer_key = KeyPair::generate_for(&PKCS_ED25519)?;
+        let mut issuer_params = CertificateParams::default();
+        issuer_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        issuer_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let issuer_certificate = issuer_params.self_signed(&issuer_key)?;
+        let authority = ConnectorCertificateAuthority::from_ed25519_pkcs8(
+            issuer_certificate.der().to_vec(),
+            SecretBytes::new(issuer_key.serialize_der())?,
+            Vec::new(),
+        )?;
+        let control_key = SigningKey::from_bytes(&[0x31; 32]).verifying_key();
+        let issued = authority.issue(
+            ConnectorWorkloadIdentity::new(
+                TenantId::from_str("01890f47-5fd4-7cc2-8f8f-5f9476f4f002")?,
+                ConnectorId::from_str("01890f47-5fd4-7cc2-8f8f-5f9476f4f004")?,
+            ),
+            Ed25519PublicKey::try_from(control_key.to_bytes())?,
+            [0x42; 16],
+            1_800_000_000_123,
+            1_800_086_400_123,
+        )?;
+        let (_, leaf) = parse_x509_certificate(&issued.certificate_chain_der()[0])?;
+        assert_eq!(issued.valid_from_millis(), 1_800_000_000_000);
+        assert_eq!(issued.valid_until_millis(), 1_800_086_400_000);
+        assert_eq!(
+            leaf.validity().not_before.timestamp() * 1_000,
+            issued.valid_from_millis()
+        );
+        assert_eq!(
+            leaf.validity().not_after.timestamp() * 1_000,
+            issued.valid_until_millis()
+        );
+        Ok(())
+    }
+}
