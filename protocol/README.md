@@ -43,7 +43,12 @@ Layout:
   source for read-only historical validation/import only.
   `baseline/v6/manifest.json` freezes the disjoint current identity-log wire
   1.1 source, including the recovery-rotation co-sign requirement; neither
-  baseline rewrites the other.
+  baseline rewrites the other. `baseline/v7/manifest.json` independently
+  freezes public descriptor V1: self-certifying `dtxc1`/`dtxa1` subject IDs,
+  publisher identity binding, canonical signed sequence heads, bounded public
+  feed references, artifact digests, expiry, and permanent tombstones. It does
+  not introduce an Indexer, public feed transport, delegation, or a
+  control-plane UUID alias for a public subject.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

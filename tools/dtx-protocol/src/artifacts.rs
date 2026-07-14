@@ -110,11 +110,52 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     )?;
 
     validate_identity_log_v1_1(root)?;
+    validate_public_descriptor_v1(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_public_descriptor_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/public-descriptor/v1/public-descriptor-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse public-descriptor v1 CDDL: {error}"))
+    })?;
+    let vector = read_json(
+        &root.join("protocol/test-vectors/public-descriptor/v1/public-descriptor-v1.json"),
+    )?;
+    validate_vector_version(&vector, "public-descriptor-v1")?;
+    if json_string(&vector, "wire_version")? != "1.0" {
+        return Err(ProtocolToolError::new(
+            "public-descriptor-v1 vector wire_version must be 1.0",
+        ));
+    }
+    let descriptors = vector
+        .get("descriptors")
+        .and_then(Value::as_array)
+        .filter(|descriptors| !descriptors.is_empty())
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "public-descriptor-v1 vector descriptors must be a nonempty array",
+            )
+        })?;
+    for descriptor in descriptors {
+        let name = json_string(descriptor, "descriptor")?;
+        let entry_hash = json_string(descriptor, "entry_hash")?;
+        if !entry_hash.starts_with("sha256:") {
+            return Err(ProtocolToolError::new(format!(
+                "public-descriptor-v1 descriptor {name} entry_hash must use sha256"
+            )));
+        }
+        validate_cddl_hex(
+            "public-descriptor-v1",
+            &cddl,
+            json_string(descriptor, "canonical_cbor_hex")?,
+        )?;
+    }
     Ok(())
 }
 

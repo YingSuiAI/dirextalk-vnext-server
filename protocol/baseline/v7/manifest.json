@@ -1,0 +1,9 @@
+{
+  "version": 7,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/public-descriptor/v1/public-descriptor-v1.cddl": "sha256:ae622aa614ef709ed7ea7a1068f04654e1ab8eabc9ea1b7974dcdad4301fd9c7",
+    "protocol/test-vectors/public-descriptor/v1/public-descriptor-v1.json": "sha256:c8c506f4d7f3326869df25f46f75c252e4fed8d7ab5699e4a51fcc3e4c14439c"
+  }
+}

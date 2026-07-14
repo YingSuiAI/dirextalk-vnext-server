@@ -1,0 +1,88 @@
+; Independent signed public Channel and Agent descriptor V1.
+; `public-subject-id-v1` is constrained by the Rust verifier to a kind-matching
+; self-certifying dtxc1 or dtxa1 ID derived from subject-genesis-signing-key-v1.
+; It is never an internal tenant UUID, Matrix room ID, alias, or feed endpoint.
+; V1 additionally requires subject-genesis-signing-key-v1 to equal
+; publisher-identity-genesis-signing-key-v1, so the publisher signature proves
+; possession of the self-certifying subject authority. Delegation is a future
+; versioned co-signature or identity-log-proof extension.
+
+public-descriptor-v1-protocol-version = {
+  1: 1,
+  2: 0
+}
+
+public-descriptor-v1-wire-version = {
+  1: public-descriptor-v1-protocol-version,
+  2: public-descriptor-v1-protocol-version
+}
+
+public-subject-id-v1 = tstr .size 57
+identity-id-v1 = tstr .size 57
+sha256-digest-v1 = bstr .size 32
+ed25519-public-key-v1 = bstr .size 32
+ed25519-signature-v1 = bstr .size 64
+utc-millis-v1 = -62135596800000..253402300799999
+safe-uint-v1 = 0..9007199254740991
+positive-safe-uint-v1 = 1..9007199254740991
+public-feed-endpoint-v1 = tstr .size (1..512)
+
+channel-payload-v1 = {
+  1: public-feed-endpoint-v1,
+  2: sha256-digest-v1
+}
+
+agent-payload-v1 = {
+  1: public-feed-endpoint-v1,
+  2: sha256-digest-v1,
+  3: sha256-digest-v1
+}
+
+tombstone-payload-v1 = {}
+
+public-descriptor-common-v1 = (
+  1: public-descriptor-v1-wire-version,
+  3: public-subject-id-v1,
+  4: ed25519-public-key-v1,
+  5: identity-id-v1,
+  6: ed25519-public-key-v1,
+  7: positive-safe-uint-v1,
+  8: sha256-digest-v1 / null,
+  9: utc-millis-v1,
+  10: utc-millis-v1,
+  13: ed25519-signature-v1
+)
+
+public-descriptor-v1 =
+  public-channel-descriptor-v1 /
+  public-agent-descriptor-v1 /
+  public-channel-tombstone-v1 /
+  public-agent-tombstone-v1
+
+public-channel-descriptor-v1 = {
+  public-descriptor-common-v1,
+  2: 1,
+  11: 1,
+  12: channel-payload-v1
+}
+
+public-agent-descriptor-v1 = {
+  public-descriptor-common-v1,
+  2: 2,
+  11: 2,
+  12: agent-payload-v1
+}
+
+public-channel-tombstone-v1 = {
+  public-descriptor-common-v1,
+  2: 1,
+  11: 3,
+  12: tombstone-payload-v1
+}
+
+public-agent-tombstone-v1 = {
+  public-descriptor-common-v1,
+  2: 2,
+  11: 3,
+  12: tombstone-payload-v1
+}
