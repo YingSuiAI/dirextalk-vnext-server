@@ -16,7 +16,7 @@ use axum::{
     extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{post, put},
+    routing::{get, post, put},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{
@@ -25,17 +25,17 @@ use dtx_domain::{
 };
 use dtx_identity_log::{
     DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1,
-    IdentityLogEventV1,
+    IdentityLogEventV1, IdentityLogPageV1, MAX_IDENTITY_LOG_PAGE_EVENTS,
 };
 use dtx_identity_persistence::{
     CreateDeviceEnrollmentChallengeCommand, DeviceEnrollmentApprovalCommand,
     DeviceEnrollmentCapability, DeviceEnrollmentChallenge, DeviceEnrollmentChallengeOutcome,
     DeviceEnrollmentChallengeState, DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository,
     DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
-    DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogRepository,
-    IdentityPersistenceError, IdentityPgStore, KeyPackageClaimCommand, KeyPackageClaimOutcome,
-    KeyPackagePublishCommand, KeyPackagePublishOutcome, KeyPackageRepository,
-    MAX_KEY_PACKAGE_PUBLISH_BYTES,
+    DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome,
+    IdentityLogPageReadOutcome, IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
+    KeyPackageClaimCommand, KeyPackageClaimOutcome, KeyPackagePublishCommand,
+    KeyPackagePublishOutcome, KeyPackageRepository, MAX_KEY_PACKAGE_PUBLISH_BYTES,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -64,9 +64,14 @@ pub const DEVICE_ENROLLMENT_PATH: &str = "/v1/devices/enroll";
 pub const KEY_PACKAGE_PUBLISH_PATH_TEMPLATE: &str = "/v1/key-packages/{package_id}";
 /// Route that atomically consumes one opaque `KeyPackage` for a target device.
 pub const KEY_PACKAGE_CLAIM_PATH: &str = "/v1/key-packages/claim";
+/// Public read-only route template for exact signed identity-log pages.
+pub const IDENTITY_LOG_PAGE_PATH_TEMPLATE: &str = "/v1/identities/{identity_id}/log";
 /// Required media type for exact signed V1.1 identity-log events.
 pub const IDENTITY_LOG_EVENT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.identity-log.v1.1+cbor";
+/// Exact deterministic-CBOR media type for a verified identity-log page.
+pub const IDENTITY_LOG_PAGE_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.identity-log-page.v1+cbor";
 /// Response media type for immutable canonical append receipts.
 pub const IDENTITY_APPEND_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.identity-append-receipt.v1+cbor";
@@ -108,6 +113,8 @@ pub const MAX_DEVICE_ENROLLMENT_CANDIDATE_BYTES: usize = 16_384;
 pub const MAX_DEVICE_ENROLLMENT_COMPLETION_BYTES: usize = 1_048_576;
 /// Largest accepted exact `KeyPackage` target claim body.
 pub const MAX_KEY_PACKAGE_CLAIM_BYTES: usize = 16_384;
+
+const DEFAULT_IDENTITY_LOG_PAGE_LIMIT: usize = 32;
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -188,6 +195,7 @@ pub fn identity_bootstrap_router(store: IdentityPgStore) -> Router {
 pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Router {
     Router::new()
         .route(IDENTITY_BOOTSTRAP_PATH, post(bootstrap_identity))
+        .route(IDENTITY_LOG_PAGE_PATH_TEMPLATE, get(get_identity_log_page))
         .route(INITIAL_DEVICE_ENROLL_PATH, post(enroll_initial_device))
         .route(
             DEVICE_SESSION_CHALLENGE_PATH,
@@ -218,6 +226,22 @@ async fn bootstrap_identity(
     match state.bootstrap(&parts.headers, body).await {
         Ok(success) => bootstrap_success_response(success, request_id),
         Err(failure) => bootstrap_failure_response(failure, request_id),
+    }
+}
+
+async fn get_identity_log_page(
+    State(state): State<IdentityBootstrapState>,
+    Path(route_identity_id): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .get_identity_log_page(&route_identity_id, parts.uri.query(), &parts.headers, body)
+        .await
+    {
+        Ok(page) => identity_log_page_success_response(&page, request_id),
+        Err(failure) => identity_log_page_failure_response(failure, request_id),
     }
 }
 
@@ -348,6 +372,37 @@ async fn claim_key_package(
 }
 
 impl IdentityBootstrapState {
+    async fn get_identity_log_page(
+        &self,
+        route_identity_id: &str,
+        query: Option<&str>,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<IdentityLogPageV1, IdentityLogPageFailure> {
+        if headers.contains_key(header::CONTENT_ENCODING) {
+            return Err(IdentityLogPageFailure::InvalidRequest);
+        }
+        let body = to_bytes(body, 1)
+            .await
+            .map_err(|_| IdentityLogPageFailure::InvalidRequest)?;
+        if !body.is_empty() {
+            return Err(IdentityLogPageFailure::InvalidRequest);
+        }
+        let (identity_id, after_sequence, limit) =
+            parse_identity_log_page_request(route_identity_id, query)?;
+        match self
+            .repository
+            .read_page(&self.store, identity_id, after_sequence, limit)
+            .await
+        {
+            Ok(IdentityLogPageReadOutcome::Page(page)) => Ok(page),
+            Ok(IdentityLogPageReadOutcome::NotFound) => Err(IdentityLogPageFailure::NotFound),
+            Ok(IdentityLogPageReadOutcome::Inactive) => Err(IdentityLogPageFailure::Inactive),
+            Ok(IdentityLogPageReadOutcome::CursorAhead) => Err(IdentityLogPageFailure::CursorAhead),
+            Err(error) => Err(map_identity_log_page_persistence_error(&error)),
+        }
+    }
+
     async fn bootstrap(
         &self,
         headers: &HeaderMap,
@@ -844,11 +899,75 @@ fn has_exact_json_content_type(headers: &HeaderMap) -> bool {
     has_exact_content_type(headers, "application/json")
 }
 
+fn parse_identity_log_page_request(
+    route_identity_id: &str,
+    query: Option<&str>,
+) -> Result<(IdentityId, u64, usize), IdentityLogPageFailure> {
+    let identity_id = IdentityId::from_str(route_identity_id)
+        .map_err(|_| IdentityLogPageFailure::InvalidRequest)?;
+    let mut after_sequence = None;
+    let mut limit = None;
+    if let Some(query) = query {
+        if query.is_empty() {
+            return Err(IdentityLogPageFailure::InvalidRequest);
+        }
+        for segment in query.split('&') {
+            let Some((name, value)) = segment.split_once('=') else {
+                return Err(IdentityLogPageFailure::InvalidRequest);
+            };
+            match name {
+                "after" if after_sequence.is_none() => {
+                    after_sequence = Some(parse_canonical_safe_uint(value)?);
+                }
+                "limit" if limit.is_none() => {
+                    let value = parse_canonical_safe_uint(value)?;
+                    let value = usize::try_from(value)
+                        .map_err(|_| IdentityLogPageFailure::InvalidRequest)?;
+                    if value == 0 || value > MAX_IDENTITY_LOG_PAGE_EVENTS {
+                        return Err(IdentityLogPageFailure::InvalidRequest);
+                    }
+                    limit = Some(value);
+                }
+                _ => return Err(IdentityLogPageFailure::InvalidRequest),
+            }
+        }
+    }
+    Ok((
+        identity_id,
+        after_sequence.unwrap_or(0),
+        limit.unwrap_or(DEFAULT_IDENTITY_LOG_PAGE_LIMIT),
+    ))
+}
+
+fn parse_canonical_safe_uint(value: &str) -> Result<u64, IdentityLogPageFailure> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(IdentityLogPageFailure::InvalidRequest);
+    }
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| IdentityLogPageFailure::InvalidRequest)?;
+    SafeUint::new(value).map_err(|_| IdentityLogPageFailure::InvalidRequest)?;
+    Ok(value)
+}
+
 const fn is_base64url_byte(value: u8) -> bool {
     value.is_ascii_uppercase()
         || value.is_ascii_lowercase()
         || value.is_ascii_digit()
         || matches!(value, b'-' | b'_')
+}
+
+fn map_identity_log_page_persistence_error(
+    error: &IdentityPersistenceError,
+) -> IdentityLogPageFailure {
+    match error {
+        IdentityPersistenceError::InvalidCommand(_) => IdentityLogPageFailure::InvalidRequest,
+        IdentityPersistenceError::IdentityInactive => IdentityLogPageFailure::Inactive,
+        _ => IdentityLogPageFailure::TemporarilyUnavailable,
+    }
 }
 
 fn map_persistence_error(error: &IdentityPersistenceError) -> BootstrapFailure {
@@ -1501,6 +1620,15 @@ struct BootstrapSuccess {
     exact_receipt_bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum IdentityLogPageFailure {
+    InvalidRequest,
+    NotFound,
+    CursorAhead,
+    Inactive,
+    TemporarilyUnavailable,
+}
+
 #[derive(Clone, Copy)]
 enum BootstrapFailure {
     InvalidBootstrap,
@@ -1606,6 +1734,20 @@ enum BootstrapErrorCode {
 }
 
 #[derive(Clone, Copy, Serialize)]
+enum IdentityLogPageErrorCode {
+    #[serde(rename = "IDENTITY_LOG_PAGE_INVALID")]
+    InvalidRequest,
+    #[serde(rename = "IDENTITY_LOG_NOT_FOUND")]
+    NotFound,
+    #[serde(rename = "IDENTITY_LOG_CURSOR_AHEAD")]
+    CursorAhead,
+    #[serde(rename = "IDENTITY_LOG_INACTIVE")]
+    Inactive,
+    #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, Serialize)]
 enum InitialDeviceErrorCode {
     #[serde(rename = "INITIAL_DEVICE_ENROLL_INVALID")]
     InvalidInitialDevice,
@@ -1692,6 +1834,53 @@ fn bootstrap_success_response(success: BootstrapSuccess, request_id: RequestId) 
         HeaderValue::from_static(IDENTITY_APPEND_RECEIPT_CONTENT_TYPE),
     );
     with_common_headers(response, request_id)
+}
+
+fn identity_log_page_success_response(page: &IdentityLogPageV1, request_id: RequestId) -> Response {
+    match page.to_deterministic_cbor() {
+        Ok(exact_page_bytes) => exact_cbor_response(
+            StatusCode::OK,
+            exact_page_bytes,
+            IDENTITY_LOG_PAGE_CONTENT_TYPE,
+            request_id,
+        ),
+        Err(_) => identity_log_page_failure_response(
+            IdentityLogPageFailure::TemporarilyUnavailable,
+            request_id,
+        ),
+    }
+}
+
+fn identity_log_page_failure_response(
+    failure: IdentityLogPageFailure,
+    request_id: RequestId,
+) -> Response {
+    let (status, code, retryable) = match failure {
+        IdentityLogPageFailure::InvalidRequest => (
+            StatusCode::BAD_REQUEST,
+            IdentityLogPageErrorCode::InvalidRequest,
+            false,
+        ),
+        IdentityLogPageFailure::NotFound => (
+            StatusCode::NOT_FOUND,
+            IdentityLogPageErrorCode::NotFound,
+            false,
+        ),
+        IdentityLogPageFailure::CursorAhead => (
+            StatusCode::CONFLICT,
+            IdentityLogPageErrorCode::CursorAhead,
+            false,
+        ),
+        IdentityLogPageFailure::Inactive => {
+            (StatusCode::GONE, IdentityLogPageErrorCode::Inactive, false)
+        }
+        IdentityLogPageFailure::TemporarilyUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            IdentityLogPageErrorCode::TemporarilyUnavailable,
+            true,
+        ),
+    };
+    safe_error_response(status, code, retryable, request_id)
 }
 
 fn bootstrap_failure_response(failure: BootstrapFailure, request_id: RequestId) -> Response {

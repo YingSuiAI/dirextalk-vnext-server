@@ -1,6 +1,7 @@
 use dtx_domain::IdentityId;
 use dtx_identity_log::{
-    IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1, IdentityLogEventV1, IdentityLogV1,
+    IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1, IdentityLogEventV1, IdentityLogPageV1,
+    IdentityLogV1, MAX_IDENTITY_LOG_PAGE_EVENTS,
 };
 use dtx_wire::{SafeUint, Sha256Digest, UtcMillis, WireVersion};
 use sqlx::{PgConnection, Row};
@@ -51,6 +52,23 @@ enum CommandClaim {
 enum AppendDecision {
     Appended(IdentityLogHead),
     Forked(IdentityForkEvidence),
+}
+
+/// Public outcome of a bounded read-only identity-log page request.
+///
+/// Not-found, inactive, and ahead-of-source are intentionally distinct only
+/// for the HTTP boundary's documented status mapping; no durable state is
+/// mutated by a read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentityLogPageReadOutcome {
+    /// The requested active log produced one exact canonical page.
+    Page(IdentityLogPageV1),
+    /// No identity log exists for the requested self-certifying ID.
+    NotFound,
+    /// The durable log is tombstoned or has fork evidence.
+    Inactive,
+    /// The caller's cursor is newer than the source's committed head.
+    CursorAhead,
 }
 
 /// Durable repository for the exact current identity-log wire line.
@@ -227,6 +245,191 @@ impl IdentityLogRepository {
             Ok(snapshot) => {
                 session.commit().await?;
                 Ok(snapshot)
+            }
+            Err(error) => {
+                let _ = session.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads one bounded immutable prefix of an active identity log.
+    ///
+    /// The identity advisory lock holds the head and returned event range
+    /// stable for this transaction. Exact rows are re-verified before they are
+    /// emitted so a corrupt persistence row never becomes a remote trust fact.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or corruption error. Semantic read outcomes are
+    /// represented explicitly so the transport can return its stable public
+    /// statuses without treating a missing log as a database failure.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction keeps head locking, durable-row validation, and bounded page construction auditable together"
+    )]
+    pub async fn read_page(
+        self,
+        store: &IdentityPgStore,
+        identity_id: IdentityId,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<IdentityLogPageReadOutcome, IdentityPersistenceError> {
+        if SafeUint::new(after_sequence).is_err()
+            || limit == 0
+            || limit > MAX_IDENTITY_LOG_PAGE_EVENTS
+        {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "identity log page range",
+            ));
+        }
+
+        let mut session = store.begin().await?;
+        let result = async {
+            lock_identity(session.connection(), identity_id).await?;
+            let Some(stored) = load_stored_head(session.connection(), identity_id).await? else {
+                return Ok(IdentityLogPageReadOutcome::NotFound);
+            };
+            if stored.state != LogState::Active {
+                return Ok(IdentityLogPageReadOutcome::Inactive);
+            }
+            if after_sequence > stored.head.sequence().get() {
+                return Ok(IdentityLogPageReadOutcome::CursorAhead);
+            }
+
+            // The advertised head is itself a remote trust fact, including
+            // for an empty terminal page. Rehydrate its exact row before
+            // emitting it so a stale/corrupt head projection fails closed.
+            let stored_head_entry =
+                load_entry_by_sequence(session.connection(), identity_id, stored.head.sequence())
+                    .await?
+                    .ok_or(IdentityPersistenceError::CorruptData(
+                        "identity log page head entry",
+                    ))?;
+            if stored_head_entry.entry_hash != stored.head.hash() {
+                return Err(IdentityPersistenceError::CorruptData(
+                    "identity log page head hash",
+                ));
+            }
+
+            // `IdentityLogPageV1` can validate the links within a page, but
+            // it deliberately has no hidden predecessor input. Validate the
+            // persisted cursor row here so the first returned event cannot
+            // cross a corrupted page boundary.
+            let mut previous_entry_hash = if after_sequence == 0 {
+                None
+            } else if after_sequence == stored.head.sequence().get() {
+                Some(stored_head_entry.entry_hash)
+            } else {
+                let cursor = SafeUint::new(after_sequence).map_err(|_| {
+                    IdentityPersistenceError::InvalidCommand("identity log page cursor")
+                })?;
+                let predecessor = load_entry_by_sequence(session.connection(), identity_id, cursor)
+                    .await?
+                    .ok_or(IdentityPersistenceError::CorruptData(
+                        "identity log page predecessor entry",
+                    ))?;
+                Some(predecessor.entry_hash)
+            };
+
+            let rows =
+                sqlx::query(
+                    "SELECT sequence, entry_hash, previous_hash,
+                        protocol_major, protocol_minor,
+                        minimum_reader_major, minimum_reader_minor,
+                        event_bytes
+                   FROM identity.log_entries
+                  WHERE identity_id=$1
+                    AND sequence > $2
+                    AND sequence <= $3
+                  ORDER BY sequence ASC
+                  LIMIT $4",
+                )
+                .bind(identity_id.to_string())
+                .bind(to_i64(SafeUint::new(after_sequence).map_err(|_| {
+                    IdentityPersistenceError::InvalidCommand("identity log page cursor")
+                })?)?)
+                .bind(to_i64(stored.head.sequence())?)
+                .bind(i64::try_from(limit).map_err(|_| {
+                    IdentityPersistenceError::InvalidCommand("identity log page limit")
+                })?)
+                .fetch_all(&mut *session.connection())
+                .await?;
+
+            if rows.is_empty() && after_sequence < stored.head.sequence().get() {
+                return Err(IdentityPersistenceError::CorruptData(
+                    "identity log page entries",
+                ));
+            }
+
+            let mut exact_events = Vec::with_capacity(rows.len());
+            let mut page = None;
+            for row in rows {
+                let entry = decode_entry_row(&row, identity_id)?;
+                if let Some(expected_previous_hash) = previous_entry_hash
+                    && entry.event.previous_event_hash() != Some(expected_previous_hash)
+                {
+                    return Err(IdentityPersistenceError::CorruptData(
+                        "identity log page predecessor link",
+                    ));
+                }
+                previous_entry_hash = Some(entry.entry_hash);
+                exact_events.push(entry.exact_bytes);
+                let next_after_sequence = after_sequence
+                    .checked_add(u64::try_from(exact_events.len()).map_err(|_| {
+                        IdentityPersistenceError::CorruptData("identity log page event count")
+                    })?)
+                    .ok_or(IdentityPersistenceError::CorruptData(
+                        "identity log page next cursor",
+                    ))?;
+                let has_more = next_after_sequence < stored.head.sequence().get();
+                match IdentityLogPageV1::new(
+                    identity_id,
+                    stored.head.sequence(),
+                    stored.head.hash(),
+                    after_sequence,
+                    exact_events.clone(),
+                    next_after_sequence,
+                    has_more,
+                ) {
+                    Ok(candidate) => page = Some(candidate),
+                    Err(dtx_identity_log::IdentityLogPageError::PageTooLarge) => {
+                        let _ = exact_events.pop();
+                        break;
+                    }
+                    Err(_) => {
+                        return Err(IdentityPersistenceError::CorruptData(
+                            "identity log page projection",
+                        ));
+                    }
+                }
+            }
+
+            let page = match page {
+                Some(page) => page,
+                None if after_sequence == stored.head.sequence().get() => IdentityLogPageV1::new(
+                    identity_id,
+                    stored.head.sequence(),
+                    stored.head.hash(),
+                    after_sequence,
+                    Vec::new(),
+                    after_sequence,
+                    false,
+                )
+                .map_err(|_| IdentityPersistenceError::CorruptData("identity log empty page"))?,
+                None => {
+                    return Err(IdentityPersistenceError::CorruptData(
+                        "identity log page size",
+                    ));
+                }
+            };
+            Ok(IdentityLogPageReadOutcome::Page(page))
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                session.commit().await?;
+                Ok(outcome)
             }
             Err(error) => {
                 let _ = session.rollback().await;
@@ -1125,6 +1328,28 @@ async fn load_snapshot_for_head(
 struct DecodedEntry {
     event: IdentityLogEventV1,
     exact_bytes: Vec<u8>,
+    entry_hash: Sha256Digest,
+}
+
+async fn load_entry_by_sequence(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+    sequence: SafeUint,
+) -> Result<Option<DecodedEntry>, IdentityPersistenceError> {
+    let row = sqlx::query(
+        "SELECT sequence, entry_hash, previous_hash,
+                protocol_major, protocol_minor,
+                minimum_reader_major, minimum_reader_minor,
+                event_bytes
+           FROM identity.log_entries
+          WHERE identity_id=$1 AND sequence=$2",
+    )
+    .bind(identity_id.to_string())
+    .bind(to_i64(sequence)?)
+    .fetch_optional(&mut *connection)
+    .await?;
+    row.map(|row| decode_entry_row(&row, identity_id))
+        .transpose()
 }
 
 fn decode_entry_row(
@@ -1157,7 +1382,11 @@ fn decode_entry_row(
             "identity log entry projection",
         ));
     }
-    Ok(DecodedEntry { event, exact_bytes })
+    Ok(DecodedEntry {
+        event,
+        exact_bytes,
+        entry_hash: stored_hash,
+    })
 }
 
 async fn current_head_conflict(

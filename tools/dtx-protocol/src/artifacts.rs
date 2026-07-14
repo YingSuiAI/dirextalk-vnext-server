@@ -114,6 +114,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     )?;
 
     validate_identity_log_v1_1(root)?;
+    validate_identity_log_page_v1(root)?;
     validate_identity_bootstrap_v1(root)?;
     validate_identity_session_v1(root)?;
     validate_identity_enrollment_v1(root)?;
@@ -406,6 +407,140 @@ fn validate_identity_log_v1_1(root: &Path) -> Result<(), ProtocolToolError> {
             &cddl,
             json_string(event, "canonical_cbor_hex")?,
         )?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one auditable validator keeps every frozen V15 identity-log page constraint together"
+)]
+fn validate_identity_log_page_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/identity-log-page/v1/identity-log-page-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse identity-log-page v1 CDDL: {error}"))
+    })?;
+    let vector = read_json(
+        &root.join("protocol/test-vectors/identity-log-page/v1/identity-log-page-v1.json"),
+    )?;
+    validate_vector_version(&vector, "identity-log-page-v1")?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "path_template",
+            "content_type",
+            "max_page_bytes",
+            "max_events",
+            "identity_id",
+            "advertised_head_sequence",
+            "advertised_head_hash",
+            "requested_after_sequence",
+            "next_after_sequence",
+            "has_more",
+            "event_fixture",
+            "canonical_cbor_hex",
+            "error_responses",
+        ],
+        "identity-log-page-v1 vector",
+    )?;
+    for (field, expected) in [
+        ("path_template", "/v1/identities/{identity_id}/log"),
+        (
+            "content_type",
+            "application/vnd.dirextalk.identity-log-page.v1+cbor",
+        ),
+        ("event_fixture", "identity-log/v1_1/genesis"),
+    ] {
+        if json_string(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "identity-log-page-v1 vector {field} drifted"
+            )));
+        }
+    }
+    for (field, expected) in [
+        ("max_page_bytes", 2_097_152_i64),
+        ("max_events", 64_i64),
+        ("advertised_head_sequence", 1_i64),
+        ("requested_after_sequence", 0_i64),
+        ("next_after_sequence", 1_i64),
+    ] {
+        if json_i64(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "identity-log-page-v1 vector {field} drifted"
+            )));
+        }
+    }
+    if vector.get("has_more").and_then(Value::as_bool) != Some(false) {
+        return Err(ProtocolToolError::new(
+            "identity-log-page-v1 terminal fixture must not have more pages",
+        ));
+    }
+    validate_identity_id(
+        json_string(&vector, "identity_id")?,
+        "identity-log-page-v1 identity",
+    )?;
+    let advertised_head_hash = json_string(&vector, "advertised_head_hash")?
+        .strip_prefix("sha256:")
+        .ok_or_else(|| ProtocolToolError::new("identity-log-page-v1 head hash must use sha256"))?;
+    let _ = decode_lower_hex_fixed::<32>(advertised_head_hash)?;
+    validate_cddl_hex(
+        "identity-log-page-v1",
+        &cddl,
+        json_string(&vector, "canonical_cbor_hex")?,
+    )?;
+    for (status, code, retryable) in [
+        (400, "IDENTITY_LOG_PAGE_INVALID", false),
+        (404, "IDENTITY_LOG_NOT_FOUND", false),
+        (409, "IDENTITY_LOG_CURSOR_AHEAD", false),
+        (410, "IDENTITY_LOG_INACTIVE", false),
+        (503, "IDENTITY_SERVICE_UNAVAILABLE", true),
+    ] {
+        if !has_error_response(&vector, status, code, retryable)? {
+            return Err(ProtocolToolError::new(format!(
+                "identity-log-page-v1 vector must retain {status} {code}"
+            )));
+        }
+    }
+
+    let path = root.join("protocol/openapi/identity-log-page/v1/openapi.yaml");
+    let source = read(&path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse identity-log-page OpenAPI {}: {error}",
+            path.display()
+        ))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "identity-log-page OpenAPI contract must declare 3.1.0",
+        ));
+    }
+    let document: Value = yaml_serde::from_str(&source).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse identity-log-page OpenAPI YAML tree: {error}"
+        ))
+    })?;
+    for (pointer, expected) in [
+        (
+            "/paths/~1v1~1identities~1{identity_id}~1log/get/operationId",
+            json!("getIdentityLogPage"),
+        ),
+        (
+            "/paths/~1v1~1identities~1{identity_id}~1log/get/responses/200/$ref",
+            json!("#/components/responses/IdentityLogPage"),
+        ),
+        (
+            "/components/responses/IdentityLogPage/content/application~1vnd.dirextalk.identity-log-page.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/paths/~1v1~1identities~1{identity_id}~1log/get/responses/409/$ref",
+            json!("#/components/responses/IdentityLogCursorAhead"),
+        ),
+        ("/components/parameters/PageLimit/schema/maximum", json!(64)),
+    ] {
+        expect_value(&document, pointer, &expected)?;
     }
     Ok(())
 }

@@ -1,0 +1,33 @@
+; Read-only identity-log pagination HTTP V1.
+; Every item in `exact_events` is the original, independently signed canonical
+; identity-log V1.1 event. The page itself is not a new authority: a client
+; trusts `advertised_head_*` only after it has verified a continuous event
+; chain through that exact head.
+
+identity-id-v1 = tstr .size 57
+sha256-digest-v1 = bstr .size 32
+positive-safe-uint-v1 = 1..9007199254740991
+nonnegative-safe-uint-v1 = 0..9007199254740991
+
+; Field 1 is protocol major and field 2 is protocol minor. This page wire is
+; independent of the embedded, frozen identity-log V1.1 event wire.
+identity-log-page-wire-v1 = {
+  1: 1,
+  2: 1
+}
+
+; Exact canonical bytes of one signed identity-log V1.1 event. Consumers must
+; decode, verify, and reduce every byte string with the identity-log V1.1
+; verifier; a page must never be treated as a server-signed snapshot.
+exact-identity-log-event-v1-1 = bstr .size (1..1048576)
+
+identity-log-page-v1 = {
+  1: identity-log-page-wire-v1,
+  2: identity-id-v1,
+  3: positive-safe-uint-v1,      ; advertised_head_sequence
+  4: sha256-digest-v1,           ; advertised_head_hash
+  5: nonnegative-safe-uint-v1,   ; requested_after_sequence
+  6: [* exact-identity-log-event-v1-1],
+  7: nonnegative-safe-uint-v1,   ; next_after_sequence
+  8: bool                        ; has_more
+}

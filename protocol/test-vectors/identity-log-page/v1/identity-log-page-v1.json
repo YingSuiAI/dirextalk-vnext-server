@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "path_template": "/v1/identities/{identity_id}/log",
+  "content_type": "application/vnd.dirextalk.identity-log-page.v1+cbor",
+  "max_page_bytes": 2097152,
+  "max_events": 64,
+  "identity_id": "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobiq",
+  "advertised_head_sequence": 1,
+  "advertised_head_hash": "sha256:658daacbc87f5fa5d19ee7164499106d6618a5554e5ec586229ec02507da3660",
+  "requested_after_sequence": 0,
+  "next_after_sequence": 1,
+  "has_more": false,
+  "event_fixture": "identity-log/v1_1/genesis",
+  "canonical_cbor_hex": "a801a2010102010278396474786931353570756a65627576616d766b6d6f757878366f6b6569696a6a757a6a787877346b746a6168726a79367a323766726c6f6269710301045820658daacbc87f5fa5d19ee7164499106d6618a5554e5ec586229ec02507da366005000681590146a901a201a20101020102a2010102010278396474786931353570756a65627576616d766b6d6f757878366f6b6569696a6a757a6a787877346b746a6168726a79367a323766726c6f626971030104f6051903e8060107a30158208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0258208139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39403584075a960368130d7028c230478c4909b03f5c8d6572d2f879423b4d54fc487e5d5c1d45e67a189a8611c33be76fd1299b7c6ef01476998ec465d9b54891f2560060858208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c095840dd67a004a9b17c7d631e1d7c901afe5455fb3f1ca55f9f9335ce6021320e7cfa064e69b651bfe0281e99da830badb85ae2c1c53635a74cd3fc5f98429211f300070108f4",
+  "error_responses": [
+    { "status": 400, "code": "IDENTITY_LOG_PAGE_INVALID", "retryable": false },
+    { "status": 404, "code": "IDENTITY_LOG_NOT_FOUND", "retryable": false },
+    { "status": 409, "code": "IDENTITY_LOG_CURSOR_AHEAD", "retryable": false },
+    { "status": 410, "code": "IDENTITY_LOG_INACTIVE", "retryable": false },
+    { "status": 503, "code": "IDENTITY_SERVICE_UNAVAILABLE", "retryable": true }
+  ]
+}

@@ -66,6 +66,11 @@ const V14_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/mailbox/v1",
     "protocol/test-vectors/mailbox/v1",
 ];
+const V15_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/identity-log-page/v1",
+    "protocol/openapi/identity-log-page/v1",
+    "protocol/test-vectors/identity-log-page/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -165,6 +170,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v14/manifest.json",
         includes_registries: false,
         artifact_paths: V14_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 15,
+        path: "protocol/baseline/v15/manifest.json",
+        includes_registries: false,
+        artifact_paths: V15_ARTIFACT_PATHS,
     },
 ];
 

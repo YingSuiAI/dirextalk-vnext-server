@@ -1,0 +1,10 @@
+{
+  "version": 15,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/identity-log-page/v1/identity-log-page-v1.cddl": "sha256:e798bbf12c5648fa05e368811ca5c80470d00ace75f1bb414fb7b7d941deada1",
+    "protocol/openapi/identity-log-page/v1/openapi.yaml": "sha256:559659454dff8d332e09205743d0c9ad0127ff222d012f825d62a15e48879c9b",
+    "protocol/test-vectors/identity-log-page/v1/identity-log-page-v1.json": "sha256:dfd83a879a35113dfc00ca9a4e91e416cba9ca4f47447311e4bcd1848f6357c4"
+  }
+}

@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Test IM1h identity log page" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+    <option name="command" value="test -p dtx-identity-log -p dtx-identity-persistence -p dtx-identity-node --locked" />
+    <option name="workingDirectory" value="$PROJECT_DIR$" />
+    <method v="2" />
+  </configuration>
+</component>

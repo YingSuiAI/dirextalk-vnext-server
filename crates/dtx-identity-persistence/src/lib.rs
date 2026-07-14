@@ -40,7 +40,7 @@ pub use key_package::{
     MAX_KEY_PACKAGE_PUBLISH_BYTES, key_package_publish_binding_canonical_bytes,
     key_package_publish_signature_input,
 };
-pub use repository::IdentityLogRepository;
+pub use repository::{IdentityLogPageReadOutcome, IdentityLogRepository};
 pub use store::{IdentityPgStore, IdentitySession};
 pub use types::{
     IDENTITY_APPEND_RECEIPT_HASH_DOMAIN, IDENTITY_APPEND_REQUEST_HASH_DOMAIN,
