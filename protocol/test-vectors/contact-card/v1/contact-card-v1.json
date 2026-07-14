@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "qr_prefix": "dtxc1:",
+  "max_decoded_cbor_bytes": 4096,
+  "identity_id": "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobiq",
+  "canonical_https_origin": "https://a.co/",
+  "canonical_cbor_hex": "a301a2010102010278396474786931353570756a65627576616d766b6d6f757878366f6b6569696a6a757a6a787877346b746a6168726a79367a323766726c6f626971036d68747470733a2f2f612e636f2f",
+  "qr_payload": "dtxc1:owGiAQECAQJ4OWR0eGkxNTVwdWplYnV2YW12a21vdXh4Nm9rZWlpamp1emp4eHc0a3RqYWhyank2ejI3ZnJsb2JpcQNtaHR0cHM6Ly9hLmNvLw",
+  "invalid_https_origins": [
+    "http://a.co/",
+    "https://a.co",
+    "https://user@a.co/",
+    "https://a.co/path",
+    "https://a.co/?q=1",
+    "https://a.co/#fragment",
+    "https://a.co//",
+    "HTTPS://a.co/",
+    "https://A.co/",
+    "https://a.co:443/",
+    "https://a.co:0444/",
+    "https://a.co:0/",
+    "https://a.co:65536/",
+    "https://127.0.0.1/",
+    "https://[::1]/",
+    "https://xn--bcher-kva.example/",
+    "https://a.co./"
+  ]
+}

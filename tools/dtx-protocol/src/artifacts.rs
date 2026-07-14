@@ -16,6 +16,12 @@ use crate::{
 };
 
 const SAFE_UINT_MAX: u64 = 9_007_199_254_740_991;
+const CONTACT_CARD_QR_PREFIX: &str = "dtxc1:";
+const CONTACT_CARD_MAX_DECODED_CBOR_BYTES: usize = 4_096;
+const CONTACT_CARD_MAX_UNPADDED_BASE64URL_CHARS: usize =
+    unpadded_base64url_character_count(CONTACT_CARD_MAX_DECODED_CBOR_BYTES);
+const CONTACT_CARD_MAX_QR_PAYLOAD_CHARS: usize =
+    CONTACT_CARD_QR_PREFIX.len() + CONTACT_CARD_MAX_UNPADDED_BASE64URL_CHARS;
 
 /// Parses every source schema and validates committed CBOR golden vectors.
 ///
@@ -115,6 +121,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
 
     validate_identity_log_v1_1(root)?;
     validate_identity_log_page_v1(root)?;
+    validate_contact_card_v1(root)?;
     validate_identity_bootstrap_v1(root)?;
     validate_identity_session_v1(root)?;
     validate_identity_enrollment_v1(root)?;
@@ -541,6 +548,124 @@ fn validate_identity_log_page_v1(root: &Path) -> Result<(), ProtocolToolError> {
         ("/components/parameters/PageLimit/schema/maximum", json!(64)),
     ] {
         expect_value(&document, pointer, &expected)?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one auditable validator keeps every frozen V16 contact-card constraint together"
+)]
+fn validate_contact_card_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/contact-card/v1/contact-card-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse contact-card v1 CDDL: {error}")))?;
+    let vector =
+        read_json(&root.join("protocol/test-vectors/contact-card/v1/contact-card-v1.json"))?;
+    validate_vector_version(&vector, "contact-card-v1")?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "qr_prefix",
+            "max_decoded_cbor_bytes",
+            "identity_id",
+            "canonical_https_origin",
+            "canonical_cbor_hex",
+            "qr_payload",
+            "invalid_https_origins",
+        ],
+        "contact-card-v1 vector",
+    )?;
+    if json_string(&vector, "qr_prefix")? != CONTACT_CARD_QR_PREFIX {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 QR prefix must be dtxc1:",
+        ));
+    }
+    if json_i64(&vector, "max_decoded_cbor_bytes")?
+        != i64::try_from(CONTACT_CARD_MAX_DECODED_CBOR_BYTES)
+            .expect("contact card maximum fits i64")
+    {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 decoded CBOR maximum drifted",
+        ));
+    }
+
+    let identity_id = json_string(&vector, "identity_id")?;
+    validate_identity_id(identity_id, "contact-card-v1 identity")?;
+    let origin = json_string(&vector, "canonical_https_origin")?;
+    validate_contact_card_https_origin(origin)?;
+    let invalid_origins = vector
+        .get("invalid_https_origins")
+        .and_then(Value::as_array)
+        .filter(|origins| !origins.is_empty())
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "contact-card-v1 vector invalid_https_origins must be a nonempty array",
+            )
+        })?;
+    for invalid_origin in invalid_origins {
+        let invalid_origin = invalid_origin.as_str().ok_or_else(|| {
+            ProtocolToolError::new(
+                "contact-card-v1 vector invalid_https_origins must contain strings",
+            )
+        })?;
+        if validate_contact_card_https_origin(invalid_origin).is_ok() {
+            return Err(ProtocolToolError::new(format!(
+                "contact-card-v1 invalid origin was accepted: {invalid_origin}"
+            )));
+        }
+    }
+
+    let expected_cbor = encode_contact_card(identity_id, origin)?;
+    if expected_cbor.len() > CONTACT_CARD_MAX_DECODED_CBOR_BYTES {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 fixture exceeds the decoded CBOR limit",
+        ));
+    }
+    validate_exact_cddl_bytes(
+        "contact-card-v1",
+        &cddl,
+        json_string(&vector, "canonical_cbor_hex")?,
+        &expected_cbor,
+    )?;
+    let qr_payload = json_string(&vector, "qr_payload")?;
+    if qr_payload.len() > CONTACT_CARD_MAX_QR_PAYLOAD_CHARS {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 QR payload exceeds the pre-decode size limit",
+        ));
+    }
+    let encoded_payload = qr_payload
+        .strip_prefix(CONTACT_CARD_QR_PREFIX)
+        .ok_or_else(|| ProtocolToolError::new("contact-card-v1 QR payload has the wrong prefix"))?;
+    if encoded_payload.is_empty()
+        || encoded_payload.len() > CONTACT_CARD_MAX_UNPADDED_BASE64URL_CHARS
+        || encoded_payload.contains('=')
+        || !encoded_payload
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 QR payload must be bounded unpadded base64url",
+        ));
+    }
+    let decoded_payload = Base64UrlUnpadded::decode_vec(encoded_payload).map_err(|_| {
+        ProtocolToolError::new("contact-card-v1 QR payload is not valid unpadded base64url")
+    })?;
+    if decoded_payload.len() > CONTACT_CARD_MAX_DECODED_CBOR_BYTES {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 QR payload exceeds the post-decode size limit",
+        ));
+    }
+    if Base64UrlUnpadded::encode_string(&decoded_payload) != encoded_payload {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 QR payload must reject non-canonical base64url aliases",
+        ));
+    }
+    if decoded_payload != expected_cbor {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 QR payload does not preserve canonical CBOR",
+        ));
     }
     Ok(())
 }
@@ -2280,12 +2405,23 @@ fn validate_identity_id(value: &str, label: &str) -> Result<(), ProtocolToolErro
         && bytes[5..]
             .iter()
             .all(|byte| matches!(*byte, b'a'..=b'z' | b'2'..=b'7'))
+        // 52 base32 symbols encode the 256-bit digest plus four unused tail
+        // bits. Canonical public IDs require those tail bits to be zero.
+        && base32_lower_value(bytes[56]).is_some_and(|value| value.trailing_zeros() >= 4)
     {
         Ok(())
     } else {
         Err(ProtocolToolError::new(format!(
             "{label} must be a canonical self-certifying identity ID"
         )))
+    }
+}
+
+const fn base32_lower_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'a'..=b'z' => Some(byte - b'a'),
+        b'2'..=b'7' => Some(byte - b'2' + 26),
+        _ => None,
     }
 }
 
@@ -2340,6 +2476,79 @@ fn validate_strict_https_origin(value: &str) -> Result<(), ProtocolToolError> {
     Ok(())
 }
 
+fn validate_contact_card_https_origin(value: &str) -> Result<(), ProtocolToolError> {
+    if value.len() > 512 || !value.is_ascii() {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 origin must be a bounded ASCII HTTPS root origin",
+        ));
+    }
+    let authority = value
+        .strip_prefix("https://")
+        .and_then(|authority_and_root| authority_and_root.strip_suffix('/'))
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "contact-card-v1 origin must use lowercase HTTPS and an explicit root slash",
+            )
+        })?;
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@', '\\', '%', '[', ']']) {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 origin must be one canonical HTTPS authority and root slash",
+        ));
+    }
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    if authority.matches(':').count() > 1
+        || !valid_contact_card_dns_host(host)
+        || port.is_some_and(|port| !valid_contact_card_port(port))
+    {
+        return Err(ProtocolToolError::new(
+            "contact-card-v1 origin must use a canonical lowercase DNS authority",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_contact_card_dns_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.ends_with('.')
+        && host.bytes().any(|byte| byte.is_ascii_lowercase())
+        && !looks_like_whatwg_ipv4_host(host)
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && !label.starts_with("xn--")
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn valid_contact_card_port(port: &str) -> bool {
+    !port.is_empty()
+        && !port.starts_with('0')
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port
+            .parse::<u16>()
+            .is_ok_and(|parsed| parsed != 0 && parsed != 443)
+}
+
+fn looks_like_whatwg_ipv4_host(host: &str) -> bool {
+    host.split('.').next_back().is_some_and(is_whatwg_ipv4_number)
+}
+
+fn is_whatwg_ipv4_number(part: &str) -> bool {
+    !part.is_empty()
+        && (part.bytes().all(|byte| byte.is_ascii_digit())
+            || part.strip_prefix("0x").is_some_and(|hex| {
+                hex.bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }))
+}
+
 fn validate_quoted_sha256_if_match(value: &str) -> Result<(), ProtocolToolError> {
     let digest = value
         .strip_prefix("\"sha256:")
@@ -2390,6 +2599,24 @@ fn encode_device_enrollment_candidate(
     append_cbor_bytes(&mut encoded, &device_encryption_public_key)?;
     append_cbor_unsigned(&mut encoded, 6);
     append_cbor_bytes(&mut encoded, &enrollment_capability)?;
+    Ok(encoded)
+}
+
+fn encode_contact_card(identity_id: &str, origin: &str) -> Result<Vec<u8>, ProtocolToolError> {
+    validate_identity_id(identity_id, "contact-card-v1 identity")?;
+    validate_contact_card_https_origin(origin)?;
+    let mut encoded = Vec::new();
+    encode_cbor_length(&mut encoded, 5, 3);
+    append_cbor_unsigned(&mut encoded, 1);
+    encode_cbor_length(&mut encoded, 5, 2);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 2);
+    append_cbor_unsigned(&mut encoded, 1);
+    append_cbor_unsigned(&mut encoded, 2);
+    append_cbor_text(&mut encoded, identity_id)?;
+    append_cbor_unsigned(&mut encoded, 3);
+    append_cbor_text(&mut encoded, origin)?;
     Ok(encoded)
 }
 
@@ -2619,6 +2846,17 @@ fn decode_prefixed_base64url_fixed<const LENGTH: usize>(
     decode_base64url_fixed(encoded)
 }
 
+const fn unpadded_base64url_character_count(input_bytes: usize) -> usize {
+    let complete_chunks = input_bytes / 3;
+    let remainder = input_bytes % 3;
+    complete_chunks * 4
+        + match remainder {
+            0 => 0,
+            1 => 2,
+            _ => 3,
+        }
+}
+
 fn decode_base64url_fixed<const LENGTH: usize>(
     value: &str,
 ) -> Result<[u8; LENGTH], ProtocolToolError> {
@@ -2799,6 +3037,51 @@ mod tests {
             encoded.extend([0x61, b'a' + index, 0xf4]);
         }
         encoded
+    }
+
+    #[test]
+    fn contact_card_origin_only_accepts_canonical_dns_https_roots() {
+        for valid in ["https://a.co/", "https://node.example:8443/"] {
+            assert!(
+                validate_contact_card_https_origin(valid).is_ok(),
+                "rejected {valid}"
+            );
+        }
+        for invalid in [
+            "HTTPS://a.co/",
+            "https://A.co/",
+            "https://a.co",
+            "https://a.co:443/",
+            "https://a.co:0444/",
+            "https://127.0.0.1/",
+            "https://a.1/",
+            "https://foo.0x7f/",
+            "https://foo.0x/",
+            "https://[::1]/",
+            "https://xn--bcher-kva.example/",
+            "https://a.co./",
+        ] {
+            assert!(
+                validate_contact_card_https_origin(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        assert_eq!(CONTACT_CARD_MAX_UNPADDED_BASE64URL_CHARS, 5_462);
+        assert_eq!(CONTACT_CARD_MAX_QR_PAYLOAD_CHARS, 5_468);
+    }
+
+    #[test]
+    fn identity_id_rejects_noncanonical_base32_tail_bits() {
+        assert!(validate_identity_id(
+            "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobiq",
+            "test identity"
+        )
+        .is_ok());
+        assert!(validate_identity_id(
+            "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobir",
+            "test identity"
+        )
+        .is_err());
     }
 
     #[test]

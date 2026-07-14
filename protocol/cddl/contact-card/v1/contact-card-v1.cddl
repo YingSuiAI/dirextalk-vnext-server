@@ -1,0 +1,31 @@
+; Direct-contact QR Card V1.
+;
+; The rendered QR text is exactly `dtxc1:` followed by the unpadded base64url
+; encoding of the canonical CBOR value below. Decoders must reject QR text
+; longer than 5468 characters before base64 decoding, cap decoded CBOR at
+; 4096 bytes, then re-encode it and require byte-for-byte identical unpadded
+; base64url text to reject aliases. The `dtxc1:` text prefix is a QR payload
+; discriminator, not a public Channel ID.
+;
+; The semantic verifier requires identity-id-v1 to be the canonical lower-case
+; self-certifying dtxi1 ID. canonical-https-root-origin-v1 is exactly one
+; lowercase ASCII DNS host (never an IP/IPv6/IDNA/trailing-dot host), optionally
+; followed by a non-default decimal port 1..65535 with no leading zero, and
+; then `/`. It never carries userinfo, a query, fragment, or non-root path.
+
+identity-id-v1 = tstr .size 57
+canonical-https-root-origin-v1 = tstr .size (10..512)
+
+contact-card-wire-v1 = {
+  1: 1,
+  2: 1
+}
+
+; This is deliberately an exact three-field map. It does not represent an
+; InviteCapability, mailbox capability, profile, secret, or a pinned identity
+; log head: static cards must remain valid as the signed identity log advances.
+contact-card-v1 = {
+  1: contact-card-wire-v1,
+  2: identity-id-v1,
+  3: canonical-https-root-origin-v1
+}
