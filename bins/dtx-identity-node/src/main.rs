@@ -1,0 +1,107 @@
+#![forbid(unsafe_code)]
+
+use std::{env, fs, net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
+
+use dtx_identity_node::identity_bootstrap_router;
+use dtx_identity_persistence::IdentityPgStore;
+use sqlx::postgres::PgConnectOptions;
+use tokio::net::TcpListener;
+use zeroize::Zeroizing;
+
+const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
+const DATABASE_URL_FILE_ENV: &str = "DTX_IDENTITY_DATABASE_URL_FILE";
+const LISTEN_ENV: &str = "DTX_IDENTITY_LISTEN";
+const MAX_DATABASE_URL_BYTES: usize = 8_192;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("dtx-identity-node: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), NodeError> {
+    let listen = load_loopback_listen()?;
+    let database_options = load_database_options()?;
+    let store = IdentityPgStore::connect(database_options, 8)
+        .await
+        .map_err(|_| NodeError::Database)?;
+    let listener = TcpListener::bind(listen)
+        .await
+        .map_err(|_| NodeError::Bind)?;
+    axum::serve(listener, identity_bootstrap_router(store))
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|_| NodeError::Serve)
+}
+
+fn load_loopback_listen() -> Result<SocketAddr, NodeError> {
+    let value = env::var(LISTEN_ENV).unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
+    let address: SocketAddr = value.parse().map_err(|_| NodeError::Configuration)?;
+    if !address.ip().is_loopback() {
+        return Err(NodeError::Configuration);
+    }
+    Ok(address)
+}
+
+fn load_database_options() -> Result<PgConnectOptions, NodeError> {
+    let path = env::var_os(DATABASE_URL_FILE_ENV)
+        .map(PathBuf::from)
+        .ok_or(NodeError::Configuration)?;
+    let metadata = fs::metadata(&path).map_err(|_| NodeError::Configuration)?;
+    if !metadata.is_file() || metadata.len() > MAX_DATABASE_URL_BYTES as u64 {
+        return Err(NodeError::Configuration);
+    }
+    let raw = Zeroizing::new(fs::read(path).map_err(|_| NodeError::Configuration)?);
+    if raw.is_empty() || raw.len() > MAX_DATABASE_URL_BYTES {
+        return Err(NodeError::Configuration);
+    }
+    let raw = String::from_utf8(raw.to_vec()).map_err(|_| NodeError::Configuration)?;
+    let raw = Zeroizing::new(raw);
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(NodeError::Configuration);
+    }
+    PgConnectOptions::from_str(value).map_err(|_| NodeError::Configuration)
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut termination =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(_) => return,
+        };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = termination.recv() => {},
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[derive(Clone, Copy)]
+enum NodeError {
+    Configuration,
+    Database,
+    Bind,
+    Serve,
+}
+
+impl std::fmt::Display for NodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Configuration => "invalid local identity node configuration",
+            Self::Database => "identity database initialization failed",
+            Self::Bind => "identity loopback listener could not bind",
+            Self::Serve => "identity HTTP server failed",
+        })
+    }
+}

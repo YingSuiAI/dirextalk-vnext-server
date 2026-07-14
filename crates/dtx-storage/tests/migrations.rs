@@ -12,7 +12,8 @@ const AGENT_ROUTER_MIGRATION_VERSION: i64 = 202_607_130_005;
 const HOST_PROVISIONING_MIGRATION_VERSION: i64 = 202_607_140_006;
 const IDENTITY_LOG_MIGRATION_VERSION: i64 = 202_607_140_007;
 const GROUP_MEMBERSHIP_MIGRATION_VERSION: i64 = 202_607_140_008;
-const EXPECTED_MIGRATION_COUNT: i64 = 8;
+const IDENTITY_BOOTSTRAP_CLAIMS_MIGRATION_VERSION: i64 = 202_607_140_009;
+const EXPECTED_MIGRATION_COUNT: i64 = 9;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -29,6 +30,8 @@ const IDENTITY_LOG_DOWN: &str =
     include_str!("../../../migrations/202607140007_identity_log_persistence.down.sql");
 const GROUP_MEMBERSHIP_DOWN: &str =
     include_str!("../../../migrations/202607140008_group_membership_saga.down.sql");
+const IDENTITY_BOOTSTRAP_CLAIMS_DOWN: &str =
+    include_str!("../../../migrations/202607140009_identity_bootstrap_idempotency_claims.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,7 +58,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -65,8 +68,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(HOST_PROVISIONING_MIGRATION_VERSION)
     .bind(IDENTITY_LOG_MIGRATION_VERSION)
     .bind(GROUP_MEMBERSHIP_MIGRATION_VERSION)
+    .bind(IDENTITY_BOOTSTRAP_CLAIMS_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(IDENTITY_BOOTSTRAP_CLAIMS_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(GROUP_MEMBERSHIP_DOWN)
         .execute(harness.admin_pool())
         .await?;
@@ -371,6 +378,10 @@ async fn assert_predefined_role_membership_is_rejected(
         .await
         .expect_err("dangerous predefined role membership must be rejected");
     assert!(matches!(predefined_role, StorageError::UnsafeRuntimeRole));
+    sqlx::query("REVOKE pg_read_server_files FROM dtx_runtime_test")
+        .execute(harness.admin_pool())
+        .await?;
+    harness.runtime_store(1).await?;
     Ok(())
 }
 

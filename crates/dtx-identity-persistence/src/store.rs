@@ -81,6 +81,8 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
              AND has_table_privilege(current_user, 'identity.command_receipts', 'SELECT') \
              AND has_table_privilege(current_user, 'identity.command_receipts', 'INSERT') \
              AND has_table_privilege(current_user, 'identity.command_receipts', 'UPDATE') \
+             AND has_table_privilege(current_user, 'identity.bootstrap_idempotency_claims', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.bootstrap_idempotency_claims', 'INSERT') \
              AND has_table_privilege(current_user, 'identity.fork_evidence', 'SELECT') \
              AND has_table_privilege(current_user, 'identity.fork_evidence', 'INSERT') \
              AND has_table_privilege(current_user, 'identity.log_outbox', 'SELECT') \
@@ -250,6 +252,14 @@ async fn role_has_excess_identity_privileges(
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
                         )) \
+                        OR (relation.relname = 'bootstrap_idempotency_claims' AND (\
+                            has_table_privilege(current_user, relation.oid, 'UPDATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
+                            OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
+                        )) \
                         OR (relation.relname = 'fork_evidence' AND (\
                             has_table_privilege(current_user, relation.oid, 'UPDATE') \
                             OR has_table_privilege(current_user, relation.oid, 'DELETE') \
@@ -267,7 +277,8 @@ async fn role_has_excess_identity_privileges(
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
                         )) \
                         OR (relation.relname NOT IN (\
-                            'log_heads', 'log_entries', 'command_receipts', 'fork_evidence', 'log_outbox'\
+                            'log_heads', 'log_entries', 'command_receipts', \
+                            'bootstrap_idempotency_claims', 'fork_evidence', 'log_outbox'\
                         ) AND (\
                             has_table_privilege(current_user, relation.oid, 'SELECT') \
                             OR has_table_privilege(current_user, relation.oid, 'INSERT') \

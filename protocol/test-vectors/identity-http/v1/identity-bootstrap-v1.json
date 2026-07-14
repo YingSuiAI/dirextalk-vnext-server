@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "request_content_type": "application/vnd.dirextalk.identity-log.v1.1+cbor",
+  "response_content_type": "application/vnd.dirextalk.identity-append-receipt.v1+cbor",
+  "idempotency_key": "bootstrap-key-0001",
+  "idempotency_key_min_bytes": 16,
+  "idempotency_key_max_bytes": 128,
+  "request_event_fixture": "identity-log/v1_1/genesis",
+  "success_statuses": [
+    201,
+    200
+  ],
+  "error_responses": [
+    {
+      "status": 409,
+      "code": "IDEMPOTENCY_CONFLICT",
+      "retryable": false
+    },
+    {
+      "status": 409,
+      "code": "IDENTITY_BOOTSTRAP_CONFLICT",
+      "retryable": false
+    },
+    {
+      "status": 422,
+      "code": "IDENTITY_BOOTSTRAP_INVALID",
+      "retryable": false
+    },
+    {
+      "status": 503,
+      "code": "IDENTITY_SERVICE_UNAVAILABLE",
+      "retryable": true
+    }
+  ],
+  "receipt_canonical_cbor_hex": "a801010278396474786931353570756a65627576616d766b6d6f757878366f6b6569696a6a757a6a787877346b746a6168726a79367a323766726c6f62697103a201a20101020102a2010102010401055820111111111111111111111111111111111111111111111111111111111111111106582022222222222222222222222222222222222222222222222222222222222222220702081b0000018bcfe56800"
+}

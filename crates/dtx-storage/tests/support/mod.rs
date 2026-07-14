@@ -268,6 +268,7 @@ impl PostgresHarness {
                   REVOKE dtx_identity_runtime FROM dtx_runtime_test;
                   REVOKE dtx_identity_runtime FROM dtx_identity_only_test;
                   REVOKE dtx_group_runtime FROM dtx_group_only_test;
+                  REVOKE pg_read_server_files FROM dtx_runtime_test;
                   GRANT dtx_identity_runtime TO dtx_runtime_test;
                   GRANT dtx_identity_runtime TO dtx_identity_only_test;
                   GRANT dtx_group_runtime TO dtx_group_only_test;
@@ -335,6 +336,7 @@ impl PostgresHarness {
              GRANT SELECT, INSERT, UPDATE ON identity.log_heads TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.log_entries TO dtx_identity_runtime;
              GRANT SELECT, INSERT, UPDATE ON identity.command_receipts TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.bootstrap_idempotency_claims TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.fork_evidence TO dtx_identity_runtime;
               GRANT SELECT, INSERT ON identity.log_outbox TO dtx_identity_runtime;
 

@@ -2,6 +2,7 @@
 members = [
     "bins/dtx-agent-control",
     "bins/dtx-agent-host-supervisor",
+    "bins/dtx-identity-node",
     "crates/dtx-agent-control",
     "crates/dtx-agent-control-proto",
     "crates/dtx-agent-control-server",
@@ -59,6 +60,7 @@ tokio-stream = { version = "0.1.18", features = ["net"] }
 tonic = { version = "0.14.6", default-features = false, features = ["codegen", "transport", "tls-ring"] }
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 uuid = { version = "1.23.5", features = ["serde", "v7"] }
 zeroize = { version = "1.9.0", features = ["derive"] }
 yaml_serde = "0.10.4"

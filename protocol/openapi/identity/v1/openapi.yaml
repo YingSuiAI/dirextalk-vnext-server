@@ -1,0 +1,152 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Identity Bootstrap Contract
+  version: 1.0.0
+  description: Self-authenticated bootstrap for a new self-certifying identity.
+paths:
+  /v1/identity/bootstrap:
+    post:
+      operationId: bootstrapIdentity
+      summary: Commit one exact signed identity-log V1.1 genesis event.
+      description: >-
+        The request body is the exact canonical CBOR event bytes; the server
+        verifies its signatures before durable append. This route does not
+        issue or accept an owner bearer token. Idempotency-Key is mandatory;
+        If-Match and Content-Encoding are rejected.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.identity-log.v1.1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 1048576
+            schema:
+              $ref: '#/components/schemas/ExactIdentityLogGenesisV1_1'
+      responses:
+        '201':
+          $ref: '#/components/responses/IdentityBootstrapCommitted'
+        '200':
+          $ref: '#/components/responses/IdentityBootstrapReplayed'
+        '409':
+          $ref: '#/components/responses/IdentityBootstrapConflict'
+        '422':
+          $ref: '#/components/responses/IdentityBootstrapInvalid'
+        '503':
+          $ref: '#/components/responses/IdentityBootstrapUnavailable'
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: A single opaque base64url value in the global bootstrap key namespace. Reuse it only to retry the exact same bootstrap body; a different identity or body is a conflict.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+        pattern: '^[A-Za-z0-9_-]{16,128}$'
+  headers:
+    CacheControlNoStore:
+      description: Bootstrap responses are never cacheable.
+      schema:
+        type: string
+        const: no-store
+    XContentTypeOptions:
+      description: Prevents content-type sniffing.
+      schema:
+        type: string
+        const: nosniff
+    XRequestId:
+      description: Opaque request correlation ID. It never includes request credentials or event bytes.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  responses:
+    IdentityBootstrapCommitted:
+      description: The genesis event committed durably for the first time.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/vnd.dirextalk.identity-append-receipt.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema:
+            $ref: '#/components/schemas/IdentityAppendReceiptCborV1'
+    IdentityBootstrapReplayed:
+      description: The same Idempotency-Key and exact event body replay the immutable original receipt.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/vnd.dirextalk.identity-append-receipt.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema:
+            $ref: '#/components/schemas/IdentityAppendReceiptCborV1'
+    IdentityBootstrapConflict:
+      description: A divergent reuse of Idempotency-Key or a non-bootstrap identity head conflict.
+      $ref: '#/components/responses/IdentityBootstrapError'
+    IdentityBootstrapInvalid:
+      description: The headers or exact signed genesis event are invalid.
+      $ref: '#/components/responses/IdentityBootstrapError'
+    IdentityBootstrapUnavailable:
+      description: The durable identity store is temporarily unavailable. Retry only with the same Idempotency-Key and exact event bytes.
+      $ref: '#/components/responses/IdentityBootstrapError'
+    IdentityBootstrapError:
+      description: A bounded bootstrap failure envelope.
+      headers:
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+        X-Content-Type-Options:
+          $ref: '#/components/headers/XContentTypeOptions'
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IdentityBootstrapErrorEnvelopeV1'
+  schemas:
+    ExactIdentityLogGenesisV1_1:
+      type: string
+      format: binary
+      description: Exact canonical CBOR bytes of a signed identity-log V1.1 genesis event.
+    IdentityAppendReceiptCborV1:
+      type: string
+      format: binary
+      description: Exact canonical CBOR IdentityAppendReceipt V1 bytes.
+    IdentityBootstrapErrorEnvelopeV1:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          $ref: '#/components/schemas/IdentityBootstrapErrorV1'
+    IdentityBootstrapErrorV1:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - request_id
+        - retryable
+      properties:
+        code:
+          type: string
+          enum:
+            - IDENTITY_BOOTSTRAP_INVALID
+            - IDEMPOTENCY_CONFLICT
+            - IDENTITY_BOOTSTRAP_CONFLICT
+            - IDENTITY_SERVICE_UNAVAILABLE
+        request_id:
+          type: string
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+        retryable:
+          type: boolean

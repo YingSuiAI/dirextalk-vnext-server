@@ -1,0 +1,1 @@
+DROP TABLE identity.bootstrap_idempotency_claims;

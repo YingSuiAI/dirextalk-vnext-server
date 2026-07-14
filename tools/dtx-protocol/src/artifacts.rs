@@ -110,6 +110,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     )?;
 
     validate_identity_log_v1_1(root)?;
+    validate_identity_bootstrap_v1(root)?;
     validate_public_descriptor_v1(root)?;
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
@@ -397,6 +398,75 @@ fn validate_identity_log_v1_1(root: &Path) -> Result<(), ProtocolToolError> {
             &cddl,
             json_string(event, "canonical_cbor_hex")?,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_identity_bootstrap_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/identity-http/v1/identity-bootstrap-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse identity-bootstrap v1 CDDL: {error}"))
+    })?;
+    let vector =
+        read_json(&root.join("protocol/test-vectors/identity-http/v1/identity-bootstrap-v1.json"))?;
+    validate_vector_version(&vector, "identity-bootstrap-v1")?;
+    if json_string(&vector, "request_content_type")?
+        != "application/vnd.dirextalk.identity-log.v1.1+cbor"
+        || json_string(&vector, "response_content_type")?
+            != "application/vnd.dirextalk.identity-append-receipt.v1+cbor"
+    {
+        return Err(ProtocolToolError::new(
+            "identity-bootstrap-v1 vector media types drifted",
+        ));
+    }
+    validate_cddl_hex(
+        "identity-bootstrap-append-receipt-v1",
+        &cddl,
+        json_string(&vector, "receipt_canonical_cbor_hex")?,
+    )?;
+
+    let path = root.join("protocol/openapi/identity/v1/openapi.yaml");
+    let source = read(&path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse OpenAPI {}: {error}", path.display()))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "identity bootstrap OpenAPI contract must declare 3.1.0",
+        ));
+    }
+    let document: Value = yaml_serde::from_str(&source).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse identity bootstrap OpenAPI YAML tree: {error}"
+        ))
+    })?;
+    for (pointer, expected) in [
+        (
+            "/paths/~1v1~1identity~1bootstrap/post/operationId",
+            json!("bootstrapIdentity"),
+        ),
+        (
+            "/paths/~1v1~1identity~1bootstrap/post/requestBody/content/application~1vnd.dirextalk.identity-log.v1.1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+        (
+            "/components/parameters/IdempotencyKey/schema/pattern",
+            json!("^[A-Za-z0-9_-]{16,128}$"),
+        ),
+        (
+            "/components/parameters/IdempotencyKey/schema/minLength",
+            json!(16),
+        ),
+        (
+            "/components/parameters/IdempotencyKey/schema/maxLength",
+            json!(128),
+        ),
+        (
+            "/components/responses/IdentityBootstrapCommitted/content/application~1vnd.dirextalk.identity-append-receipt.v1+cbor/x-dirextalk-exact-cbor",
+            json!(true),
+        ),
+    ] {
+        expect_value(&document, pointer, &expected)?;
     }
     Ok(())
 }

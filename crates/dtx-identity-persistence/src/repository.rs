@@ -1,5 +1,7 @@
 use dtx_domain::IdentityId;
-use dtx_identity_log::{IDENTITY_LOG_WIRE_VERSION, IdentityLogEventV1, IdentityLogV1};
+use dtx_identity_log::{
+    IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1, IdentityLogEventV1, IdentityLogV1,
+};
 use dtx_wire::{SafeUint, Sha256Digest, UtcMillis, WireVersion};
 use sqlx::{PgConnection, Row};
 
@@ -79,10 +81,73 @@ impl IdentityLogRepository {
         command: &IdentityAppendCommand,
         committed_at: UtcMillis,
     ) -> Result<IdentityAppendOutcome, IdentityPersistenceError> {
+        let (event, identity_id, request_digest) = prepare_append_command(command)?;
         let mut session = store.begin().await?;
         let outcome = self
-            .append_in_transaction(session.connection(), command, committed_at)
+            .append_verified_in_transaction(
+                session.connection(),
+                command,
+                &event,
+                identity_id,
+                request_digest,
+                committed_at,
+            )
             .await;
+        match outcome {
+            Ok(outcome) => {
+                session.commit().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = session.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Appends a self-authenticated genesis event with a bootstrap-only,
+    /// globally scoped idempotency claim in the same transaction as the
+    /// identity head, receipt, and outbox row.
+    ///
+    /// Ordinary identity-log appends deliberately retain their established
+    /// per-identity idempotency scope; only the anonymous bootstrap transport
+    /// needs to prevent a response-loss retry from creating a second identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed error when the command is not an exact V1.1
+    /// genesis, its bootstrap key was reused for a different body or identity,
+    /// or the atomic append cannot complete.
+    pub async fn append_bootstrap(
+        self,
+        store: &IdentityPgStore,
+        command: &IdentityAppendCommand,
+        committed_at: UtcMillis,
+    ) -> Result<IdentityAppendOutcome, IdentityPersistenceError> {
+        let (event, identity_id, request_digest) = prepare_append_command(command)?;
+        validate_bootstrap_shape(command, &event)?;
+
+        let mut session = store.begin().await?;
+        let outcome = async {
+            claim_bootstrap_command(
+                session.connection(),
+                identity_id,
+                command.idempotency_key_hash(),
+                request_digest,
+                committed_at,
+            )
+            .await?;
+            self.append_verified_in_transaction(
+                session.connection(),
+                command,
+                &event,
+                identity_id,
+                request_digest,
+                committed_at,
+            )
+            .await
+        }
+        .await;
         match outcome {
             Ok(outcome) => {
                 session.commit().await?;
@@ -133,22 +198,15 @@ impl IdentityLogRepository {
         }
     }
 
-    async fn append_in_transaction(
+    async fn append_verified_in_transaction(
         self,
         connection: &mut PgConnection,
         command: &IdentityAppendCommand,
+        event: &IdentityLogEventV1,
+        identity_id: IdentityId,
+        request_digest: Sha256Digest,
         committed_at: UtcMillis,
     ) -> Result<IdentityAppendOutcome, IdentityPersistenceError> {
-        let event = IdentityLogEventV1::decode_and_verify(command.exact_event_bytes())?;
-        if event.wire() != IDENTITY_LOG_WIRE_VERSION {
-            return Err(IdentityPersistenceError::IdentityLog(
-                dtx_identity_log::IdentityLogError::InvalidWireVersion,
-            ));
-        }
-        validate_expected_shape(command, &event)?;
-        let identity_id = event.identity_id();
-        let request_digest = request_digest(command, identity_id)?;
-
         lock_identity(connection, identity_id).await?;
         match claim_command(
             connection,
@@ -181,19 +239,14 @@ impl IdentityLogRepository {
 
         let decision = match load_stored_head(connection, identity_id).await? {
             None => AppendDecision::Appended(
-                bootstrap_identity(
-                    connection,
-                    &event,
-                    command.exact_event_bytes(),
-                    committed_at,
-                )
-                .await?,
+                bootstrap_identity(connection, event, command.exact_event_bytes(), committed_at)
+                    .await?,
             ),
             Some(stored) => {
                 append_existing_identity(
                     connection,
                     command,
-                    &event,
+                    event,
                     command.exact_event_bytes(),
                     stored,
                     committed_at,
@@ -467,6 +520,37 @@ async fn mark_log_forked(
     }
 }
 
+fn prepare_append_command(
+    command: &IdentityAppendCommand,
+) -> Result<(IdentityLogEventV1, IdentityId, Sha256Digest), IdentityPersistenceError> {
+    let event = IdentityLogEventV1::decode_and_verify(command.exact_event_bytes())?;
+    if event.wire() != IDENTITY_LOG_WIRE_VERSION {
+        return Err(IdentityPersistenceError::IdentityLog(
+            dtx_identity_log::IdentityLogError::InvalidWireVersion,
+        ));
+    }
+    validate_expected_shape(command, &event)?;
+    let identity_id = event.identity_id();
+    let request_digest = request_digest(command, identity_id)?;
+    Ok((event, identity_id, request_digest))
+}
+
+fn validate_bootstrap_shape(
+    command: &IdentityAppendCommand,
+    event: &IdentityLogEventV1,
+) -> Result<(), IdentityPersistenceError> {
+    if command.expected_head().is_some()
+        || event.sequence().get() != 1
+        || event.previous_event_hash().is_some()
+        || !matches!(event.payload(), IdentityLogEventPayloadV1::Genesis { .. })
+    {
+        return Err(IdentityPersistenceError::InvalidCommand(
+            "identity bootstrap must be an exact genesis",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_expected_shape(
     command: &IdentityAppendCommand,
     event: &IdentityLogEventV1,
@@ -505,6 +589,52 @@ async fn lock_identity(
         .bind(key)
         .execute(&mut *connection)
         .await?;
+    Ok(())
+}
+
+async fn claim_bootstrap_command(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+    idempotency_key_hash: Sha256Digest,
+    request_digest: Sha256Digest,
+    created_at: UtcMillis,
+) -> Result<(), IdentityPersistenceError> {
+    let inserted = sqlx::query(
+        "INSERT INTO identity.bootstrap_idempotency_claims (
+             idempotency_key_hash, identity_id, request_digest, created_at_ms
+         ) VALUES ($1,$2,$3,$4)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(idempotency_key_hash.as_bytes().as_slice())
+    .bind(identity_id.to_string())
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(created_at.get())
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    if inserted == 1 {
+        return Ok(());
+    }
+
+    // `INSERT .. ON CONFLICT DO NOTHING` has already waited for the unique
+    // claim transaction. At read committed the durable conflicting row is now
+    // visible, so an immutable claim needs no `FOR UPDATE` lock or UPDATE grant.
+    let row = sqlx::query(
+        "SELECT identity_id, request_digest
+           FROM identity.bootstrap_idempotency_claims
+          WHERE idempotency_key_hash=$1",
+    )
+    .bind(idempotency_key_hash.as_bytes().as_slice())
+    .fetch_one(&mut *connection)
+    .await?;
+    let stored_identity: String = row.try_get("identity_id")?;
+    let stored_request = digest(
+        &row.try_get::<Vec<u8>, _>("request_digest")?,
+        "bootstrap claim request digest",
+    )?;
+    if stored_identity != identity_id.to_string() || stored_request != request_digest {
+        return Err(IdentityPersistenceError::IdempotencyConflict);
+    }
     Ok(())
 }
 
