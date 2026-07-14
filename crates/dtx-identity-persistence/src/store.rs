@@ -143,20 +143,19 @@ async fn session_principal_can_escalate_role(
     pool: &PgPool,
 ) -> Result<bool, IdentityPersistenceError> {
     sqlx::query_scalar(
-        "WITH RECURSIVE settable_role(role_oid) AS (\
+        "WITH RECURSIVE reachable_role(role_oid) AS (\
              SELECT candidate.oid \
                FROM pg_roles AS candidate \
               WHERE candidate.rolname = session_user \
              UNION \
              SELECT membership.roleid \
                FROM pg_auth_members AS membership \
-               JOIN settable_role AS parent ON parent.role_oid = membership.member \
-              WHERE membership.set_option\
+               JOIN reachable_role AS parent ON parent.role_oid = membership.member\
          ) \
          SELECT current_user <> session_user \
              OR EXISTS (\
                  SELECT 1 \
-                   FROM settable_role \
+                   FROM reachable_role \
                   WHERE role_oid <> (\
                       SELECT candidate.oid FROM pg_roles AS candidate \
                        WHERE candidate.rolname = session_user\
@@ -166,12 +165,9 @@ async fn session_principal_can_escalate_role(
              OR EXISTS (\
                  SELECT 1 \
                    FROM pg_auth_members AS membership \
-                  WHERE membership.roleid = to_regrole('dtx_identity_runtime') \
-                    AND membership.member = (\
-                        SELECT candidate.oid FROM pg_roles AS candidate \
-                         WHERE candidate.rolname = session_user\
-                    ) \
-                    AND membership.admin_option\
+                   JOIN reachable_role AS member_role \
+                     ON member_role.role_oid = membership.member \
+                  WHERE membership.admin_option\
              )",
     )
     .fetch_one(pool)
