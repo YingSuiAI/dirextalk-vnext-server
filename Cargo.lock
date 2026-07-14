@@ -888,6 +888,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-group-policy"
+version = "0.1.0"
+dependencies = [
+ "dtx-domain",
+]
+
+[[package]]
 name = "dtx-identity-log"
 version = "0.1.0"
 dependencies = [

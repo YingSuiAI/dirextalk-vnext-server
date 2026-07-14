@@ -12,6 +12,7 @@ members = [
     "crates/dtx-agent-router",
     "crates/dtx-connect-registry",
     "crates/dtx-domain",
+    "crates/dtx-group-policy",
     "crates/dtx-identity-log",
     "crates/dtx-identity-persistence",
     "crates/dtx-public-descriptor",
