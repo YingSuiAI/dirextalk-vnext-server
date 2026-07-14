@@ -13,6 +13,8 @@ pub enum IdentityPersistenceError {
     UnsafeRuntimeRole,
     /// The configured principal is not a member of the identity writer group.
     RuntimeRoleUnauthorized,
+    /// The configured principal has privileges outside the identity-writer boundary.
+    RuntimeRoleOverprivileged,
     /// A pooled connection retained a tenant-scoped transaction setting.
     TenantContextLeak,
     /// The submitted command cannot be represented by the bounded durable contract.
@@ -46,6 +48,9 @@ impl fmt::Display for IdentityPersistenceError {
                 "identity runtime database role violates the ownership boundary"
             }
             Self::RuntimeRoleUnauthorized => "identity runtime database role is not authorized",
+            Self::RuntimeRoleOverprivileged => {
+                "identity runtime database role exceeds the identity-only boundary"
+            }
             Self::TenantContextLeak => "identity transaction retained tenant context",
             Self::InvalidCommand(_) => "identity append command is invalid",
             Self::IdentityLog(_) => "identity log event was rejected",
@@ -71,6 +76,7 @@ impl Error for IdentityPersistenceError {
             Self::IdentityLog(source) => Some(source),
             Self::UnsafeRuntimeRole
             | Self::RuntimeRoleUnauthorized
+            | Self::RuntimeRoleOverprivileged
             | Self::TenantContextLeak
             | Self::InvalidCommand(_)
             | Self::IdempotencyConflict

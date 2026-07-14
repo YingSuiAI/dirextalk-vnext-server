@@ -69,16 +69,27 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
     let authorized: bool = sqlx::query_scalar(
         "SELECT identity.identity_runtime_authorized() \
              AND has_schema_privilege(current_user, 'identity', 'USAGE') \
-             AND has_table_privilege(current_user, 'identity.log_heads', 'SELECT,INSERT,UPDATE') \
-             AND has_table_privilege(current_user, 'identity.log_entries', 'SELECT,INSERT') \
-             AND has_table_privilege(current_user, 'identity.command_receipts', 'SELECT,INSERT,UPDATE') \
-             AND has_table_privilege(current_user, 'identity.fork_evidence', 'SELECT,INSERT') \
-             AND has_table_privilege(current_user, 'identity.log_outbox', 'SELECT,INSERT')",
+             AND has_table_privilege(current_user, 'identity.log_heads', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.log_heads', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.log_heads', 'UPDATE') \
+             AND has_table_privilege(current_user, 'identity.log_entries', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.log_entries', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.command_receipts', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.command_receipts', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.command_receipts', 'UPDATE') \
+             AND has_table_privilege(current_user, 'identity.fork_evidence', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.fork_evidence', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.log_outbox', 'SELECT') \
+             AND has_table_privilege(current_user, 'identity.log_outbox', 'INSERT')",
     )
     .fetch_one(pool)
     .await?;
     if !authorized {
         return Err(IdentityPersistenceError::RuntimeRoleUnauthorized);
+    }
+    if role_has_cross_scope_access(pool).await? || role_has_excess_identity_privileges(pool).await?
+    {
+        return Err(IdentityPersistenceError::RuntimeRoleOverprivileged);
     }
 
     let unsafe_role: bool = sqlx::query_scalar(
@@ -122,6 +133,122 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
     } else {
         Ok(())
     }
+}
+
+async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, IdentityPersistenceError> {
+    sqlx::query_scalar(
+        "SELECT has_schema_privilege(current_user, 'system', 'USAGE') \
+             OR has_schema_privilege(current_user, 'system', 'CREATE') \
+             OR has_schema_privilege(current_user, 'agent', 'USAGE') \
+             OR has_schema_privilege(current_user, 'agent', 'CREATE') \
+             OR EXISTS (\
+                 SELECT 1 \
+                   FROM pg_class AS relation \
+                   JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+                  WHERE namespace.nspname IN ('system', 'agent') \
+                    AND relation.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                    AND (\
+                        has_table_privilege(current_user, relation.oid, 'SELECT') \
+                        OR has_table_privilege(current_user, relation.oid, 'INSERT') \
+                        OR has_table_privilege(current_user, relation.oid, 'UPDATE') \
+                        OR has_table_privilege(current_user, relation.oid, 'DELETE') \
+                        OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                        OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                        OR has_table_privilege(current_user, relation.oid, 'TRIGGER')\
+                    )\
+             ) \
+             OR EXISTS (\
+                 SELECT 1 \
+                   FROM pg_class AS relation \
+                   JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+                  WHERE namespace.nspname IN ('system', 'agent') \
+                    AND relation.relkind = 'S' \
+                    AND (\
+                        has_sequence_privilege(current_user, relation.oid, 'USAGE') \
+                        OR has_sequence_privilege(current_user, relation.oid, 'SELECT') \
+                        OR has_sequence_privilege(current_user, relation.oid, 'UPDATE')\
+                    )\
+             )",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(Into::into)
+}
+
+async fn role_has_excess_identity_privileges(
+    pool: &PgPool,
+) -> Result<bool, IdentityPersistenceError> {
+    sqlx::query_scalar(
+        "SELECT has_schema_privilege(current_user, 'identity', 'CREATE') \
+             OR EXISTS (\
+                 SELECT 1 \
+                   FROM pg_class AS relation \
+                   JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+                  WHERE namespace.nspname = 'identity' \
+                    AND relation.relkind IN ('r', 'p', 'v', 'm', 'f') \
+                    AND (\
+                        (relation.relname = 'log_heads' AND (\
+                            has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER')\
+                        )) \
+                        OR (relation.relname = 'log_entries' AND (\
+                            has_table_privilege(current_user, relation.oid, 'UPDATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER')\
+                        )) \
+                        OR (relation.relname = 'command_receipts' AND (\
+                            has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER')\
+                        )) \
+                        OR (relation.relname = 'fork_evidence' AND (\
+                            has_table_privilege(current_user, relation.oid, 'UPDATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER')\
+                        )) \
+                        OR (relation.relname = 'log_outbox' AND (\
+                            has_table_privilege(current_user, relation.oid, 'UPDATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER')\
+                        )) \
+                        OR (relation.relname NOT IN (\
+                            'log_heads', 'log_entries', 'command_receipts', 'fork_evidence', 'log_outbox'\
+                        ) AND (\
+                            has_table_privilege(current_user, relation.oid, 'SELECT') \
+                            OR has_table_privilege(current_user, relation.oid, 'INSERT') \
+                            OR has_table_privilege(current_user, relation.oid, 'UPDATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER')\
+                        ))\
+                    )\
+             ) \
+             OR EXISTS (\
+                 SELECT 1 \
+                   FROM pg_class AS relation \
+                   JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+                  WHERE namespace.nspname = 'identity' \
+                    AND relation.relkind = 'S' \
+                    AND (\
+                        has_sequence_privilege(current_user, relation.oid, 'USAGE') \
+                        OR has_sequence_privilege(current_user, relation.oid, 'SELECT') \
+                        OR has_sequence_privilege(current_user, relation.oid, 'UPDATE')\
+                    )\
+             )",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(Into::into)
 }
 
 /// Non-cloneable identity-log database transaction.

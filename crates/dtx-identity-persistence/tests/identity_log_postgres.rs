@@ -310,6 +310,78 @@ async fn postgres_identity_log_is_exact_idempotent_cas_rehydratable_and_atomic()
     Ok(())
 }
 
+#[tokio::test]
+async fn mixed_tenant_and_identity_runtime_role_is_rejected() -> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+
+    let mixed = IdentityPgStore::connect(harness.runtime_options(), 1).await;
+
+    assert!(matches!(
+        mixed,
+        Err(IdentityPersistenceError::RuntimeRoleOverprivileged)
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn identity_writer_rejects_extra_outbox_privileges_and_still_appends_after_revoke()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    for (privilege, grant, revoke) in [
+        (
+            "UPDATE",
+            "GRANT UPDATE ON identity.log_outbox TO dtx_identity_runtime",
+            "REVOKE UPDATE ON identity.log_outbox FROM dtx_identity_runtime",
+        ),
+        (
+            "DELETE",
+            "GRANT DELETE ON identity.log_outbox TO dtx_identity_runtime",
+            "REVOKE DELETE ON identity.log_outbox FROM dtx_identity_runtime",
+        ),
+        (
+            "TRUNCATE",
+            "GRANT TRUNCATE ON identity.log_outbox TO dtx_identity_runtime",
+            "REVOKE TRUNCATE ON identity.log_outbox FROM dtx_identity_runtime",
+        ),
+        (
+            "REFERENCES",
+            "GRANT REFERENCES ON identity.log_outbox TO dtx_identity_runtime",
+            "REVOKE REFERENCES ON identity.log_outbox FROM dtx_identity_runtime",
+        ),
+        (
+            "TRIGGER",
+            "GRANT TRIGGER ON identity.log_outbox TO dtx_identity_runtime",
+            "REVOKE TRIGGER ON identity.log_outbox FROM dtx_identity_runtime",
+        ),
+    ] {
+        sqlx::raw_sql(grant).execute(harness.admin_pool()).await?;
+        let overprivileged = IdentityPgStore::connect(harness.identity_runtime_options(), 1).await;
+        assert!(
+            matches!(
+                overprivileged,
+                Err(IdentityPersistenceError::RuntimeRoleOverprivileged)
+            ),
+            "identity writer with extra outbox {privilege} must be rejected"
+        );
+        sqlx::raw_sql(revoke).execute(harness.admin_pool()).await?;
+    }
+
+    let has_system_usage: bool = sqlx::query_scalar(
+        "SELECT has_schema_privilege('dtx_identity_only_test', 'system', 'USAGE')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!has_system_usage);
+    let store = IdentityPgStore::connect(harness.identity_runtime_options(), 1).await?;
+    let root = signing_key(70);
+    let event = genesis(&root, &signing_key(71));
+    let outcome = IdentityLogRepository::new()
+        .append(&store, &command(70, None, &event)?, timestamp(7_000))
+        .await?;
+    assert!(matches!(outcome, IdentityAppendOutcome::Committed(_)));
+    Ok(())
+}
+
 fn command(
     seed: u8,
     expected_head: Option<IdentityLogHead>,
