@@ -899,6 +899,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-identity-persistence"
+version = "0.1.0"
+dependencies = [
+ "dtx-domain",
+ "dtx-identity-log",
+ "dtx-storage",
+ "dtx-wire",
+ "ed25519-dalek",
+ "sqlx",
+ "testcontainers-modules",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "dtx-protocol"
 version = "0.1.0"
 dependencies = [

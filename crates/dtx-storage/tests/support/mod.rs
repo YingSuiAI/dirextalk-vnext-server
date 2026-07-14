@@ -20,12 +20,15 @@ use dtx_storage::MigrationRunner;
 const ADMIN_USER: &str = "dtx_test_admin";
 const DATABASE: &str = "dtx_test";
 const RUNTIME_USER: &str = "dtx_runtime_test";
+const IDENTITY_RUNTIME_USER: &str = "dtx_identity_only_test";
 const POSTGRES_TAG: &str = "18.4-alpine3.24";
 
 pub struct PostgresHarness {
     admin_pool: PgPool,
     runtime_pool: PgPool,
     runtime_options: PgConnectOptions,
+    identity_runtime_pool: PgPool,
+    identity_runtime_options: PgConnectOptions,
     _container: ContainerAsync<Postgres>,
 }
 
@@ -34,6 +37,7 @@ impl PostgresHarness {
     pub async fn start() -> Result<Self, Box<dyn Error>> {
         let admin_password = random_password("admin");
         let runtime_password = random_password("runtime");
+        let identity_runtime_password = random_password("identity-runtime");
         let container = Postgres::default()
             .with_db_name(DATABASE)
             .with_user(ADMIN_USER)
@@ -57,10 +61,14 @@ impl PostgresHarness {
         MigrationRunner::new().run(&admin_pool).await?;
 
         let mut role_transaction = admin_pool.begin().await?;
-        sqlx::query("SELECT set_config('dtx.test_runtime_password', $1, true)")
-            .bind(&runtime_password)
-            .execute(&mut *role_transaction)
-            .await?;
+        sqlx::query(
+            "SELECT set_config('dtx.test_runtime_password', $1, true), \
+                    set_config('dtx.test_identity_runtime_password', $2, true)",
+        )
+        .bind(&runtime_password)
+        .bind(&identity_runtime_password)
+        .execute(&mut *role_transaction)
+        .await?;
         sqlx::raw_sql(
             "DO $role$
              BEGIN
@@ -68,6 +76,13 @@ impl PostgresHarness {
                      'CREATE ROLE dtx_runtime_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
                      current_setting('dtx.test_runtime_password')
                  );
+                 EXECUTE format(
+                     'CREATE ROLE dtx_identity_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                     current_setting('dtx.test_identity_runtime_password')
+                 );
+                 CREATE ROLE dtx_identity_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                 GRANT dtx_identity_runtime TO dtx_runtime_test;
+                 GRANT dtx_identity_runtime TO dtx_identity_only_test;
              END
              $role$;
              GRANT USAGE ON SCHEMA system TO dtx_runtime_test;
@@ -125,7 +140,15 @@ impl PostgresHarness {
              GRANT SELECT, INSERT ON agent.conversation_grant_versions TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.conversation_grant_heads TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.conversation_grant_permissions TO dtx_runtime_test;
-             GRANT SELECT, INSERT ON agent.conversation_grant_cloud_connections TO dtx_runtime_test;",
+             GRANT SELECT, INSERT ON agent.conversation_grant_cloud_connections TO dtx_runtime_test;
+
+             GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
+             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA identity TO dtx_identity_runtime;
+             GRANT SELECT, INSERT, UPDATE ON identity.log_heads TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.log_entries TO dtx_identity_runtime;
+             GRANT SELECT, INSERT, UPDATE ON identity.command_receipts TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.fork_evidence TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.log_outbox TO dtx_identity_runtime;",
         )
         .execute(&mut *role_transaction)
         .await?;
@@ -136,11 +159,23 @@ impl PostgresHarness {
             .max_connections(4)
             .connect_with(runtime_options.clone())
             .await?;
+        let identity_runtime_options = connect_options(
+            &host,
+            port,
+            IDENTITY_RUNTIME_USER,
+            &identity_runtime_password,
+        );
+        let identity_runtime_pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(identity_runtime_options.clone())
+            .await?;
 
         Ok(Self {
             admin_pool,
             runtime_pool,
             runtime_options,
+            identity_runtime_pool,
+            identity_runtime_options,
             _container: container,
         })
     }
@@ -155,6 +190,14 @@ impl PostgresHarness {
 
     pub fn runtime_options(&self) -> PgConnectOptions {
         self.runtime_options.clone()
+    }
+
+    pub fn identity_runtime_pool(&self) -> &PgPool {
+        &self.identity_runtime_pool
+    }
+
+    pub fn identity_runtime_options(&self) -> PgConnectOptions {
+        self.identity_runtime_options.clone()
     }
 
     pub async fn runtime_store(

@@ -1,0 +1,22 @@
+[package]
+name = "dtx-identity-persistence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dtx-domain = { path = "../dtx-domain" }
+dtx-identity-log = { path = "../dtx-identity-log" }
+dtx-wire = { path = "../dtx-wire" }
+sqlx.workspace = true
+
+[dev-dependencies]
+dtx-storage = { path = "../dtx-storage" }
+ed25519-dalek.workspace = true
+testcontainers-modules.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

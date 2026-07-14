@@ -13,6 +13,7 @@ members = [
     "crates/dtx-connect-registry",
     "crates/dtx-domain",
     "crates/dtx-identity-log",
+    "crates/dtx-identity-persistence",
     "crates/dtx-public-descriptor",
     "crates/dtx-security",
     "crates/dtx-storage",

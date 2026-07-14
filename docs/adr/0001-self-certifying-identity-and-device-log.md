@@ -1,8 +1,10 @@
 # ADR-0001: Self-certifying identity and device log
 
-- Status: Accepted for IM1a
+- Status: Accepted for IM1a and IM1b durable persistence
 - Date: 2026-07-14
-- Owners: `dtx-domain`, `dtx-identity-log`, and `protocol/cddl/identity-log/{v1,v1_1}`
+- Owners: `dtx-domain`, `dtx-identity-log`, `dtx-identity-persistence`,
+  `migrations/202607140007_identity_log_persistence.*.sql`, and
+  `protocol/cddl/identity-log/{v1,v1_1}`
 
 ## Context
 
@@ -14,9 +16,10 @@ PostgreSQL, client synchronization, MLS, mailbox, and public directory
 boundaries; accepting implementation-defined bytes here would make key control
 ambiguous.
 
-This ADR covers the IM1a canonical identity-log core only. It does not add the
-HTTP endpoints, PostgreSQL persistence, handle registration/search, recovery
-UI, QR transport, MLS state, mailbox storage, or relay network fetches.
+This ADR covers the IM1a canonical identity-log core and the IM1b durable
+`PostgreSQL` boundary. It does not add HTTP endpoints, handle
+registration/search, recovery UI, QR transport, MLS state, mailbox storage,
+or relay network fetches.
 
 ## Decision
 
@@ -152,6 +155,55 @@ The event timestamp merely rejects a descriptor that was already expired when
 the signer created that event. It is signer-provided historical metadata and
 must never stand in for the trusted current clock.
 
+### Durable identity-log boundary
+
+IM1b retains the exact already-verified canonical signed event bytes in the
+separate `identity` schema. `identity_id` text is the primary key; it is never
+replaced by a tenant UUID, `EventEnvelopeV1`, a server stream sequence, or a
+mutable account row. `identity.log_entries` is append-only and retains the
+identity, positive sequence, exact predecessor hash, entry hash, exact V1.1
+wire components, exact event bytes, and server record time. The head contains
+the same public identity, current V1.1 wire, sequence/hash, and an explicit
+`active`/`tombstoned`/`forked` state. A database constraint trigger rejects a
+gap, predecessor mismatch, missing genesis, or head that does not match the
+last immutable entry; Rust rehydrates every entry through `IdentityLogV1` and
+fails closed if stored bytes cannot recreate that exact projection.
+
+One append transaction first takes an identity-specific transaction advisory
+lock, then also performs the mandatory SQL compare-and-swap on
+`(head_sequence, head_hash)`. It verifies the event/reducer before it writes
+the immutable entry, advances the head, writes `identity.log_outbox`, and
+completes an immutable command receipt. The receipt key is
+`(identity_id, idempotency_key_hash)` and binds an internally computed
+canonical request digest over identity, expected head, and exact event bytes.
+An exact retry returns the original exact receipt; the same key with another
+digest conflicts. A response loss cannot create a second event. A verified
+different genesis or signed sibling at a common persisted predecessor is
+retained in immutable `identity.fork_evidence`, never inserted into the
+canonical sequence, and atomically changes the identity to `forked`. The
+resolution receipt is terminal `reconciling` and exact retries return that same
+receipt plus the same candidate proof; later appends and projection reads fail
+closed until manual recovery. An unverified stale input remains a normal head
+conflict and cannot cause this state transition.
+
+The receipt is deliberately an explicit lifecycle envelope with
+`pending`/`committed`/`reconciling` vocabulary. IM1b returns `committed` for a
+canonical append and `reconciling` only for a verified identity fork; future
+membership transport must add its own durable reconciliation facts and must
+not infer them from a WebSocket, local projection, or this identity receipt
+alone.
+
+The migration owner owns `identity`; `PUBLIC` has no schema, table, or
+function grant. Runtime connections must be non-owner members of the separate
+`dtx_identity_runtime` database group, have only the relation privileges used
+by this repository, and pass RLS plus role-owner checks at `IdentityPgStore`
+startup. Database operator provisioning of that group and its grants is an
+explicit deployment contract to automate later; this code stage deliberately
+does not modify install/release scripts. The identity role is separate from
+tenant RLS sessions, and a pooled identity transaction rejects any retained
+`dtx.tenant_id` setting. The identity outbox has no dependency on `system`
+schema functions or tenant grants, so this role can remain identity-only.
+
 ## Alternatives considered
 
 - A centrally mutable account record was rejected because relay migration and
@@ -167,10 +219,10 @@ must never stand in for the trusted current clock.
 ## Security and privacy consequences
 
 The relay can retain, relay, and serve exact public log bytes but cannot forge
-a root, recovery, or device proof. The expected-head check is mandatory in the
-future storage transaction; a unique `(identity_id, sequence)`, unique entry
-hash, and compare-and-swap on `(head_sequence, head_hash)` are required to
-prevent concurrent forks. Exact bytes, not a re-serialized object, are the
+a root, recovery, or device proof. IM1b now enforces the expected-head check,
+unique `(identity_id, sequence)`, unique entry hash, exact event-byte replay,
+and compare-and-swap on `(head_sequence, head_hash)` in one durable
+transaction. Exact bytes, not an application-object serialization, are the
 durable audit record.
 
 An identity ID, public keys, certificate timestamps, revocation history, and
@@ -189,12 +241,14 @@ issuing fresh root certificates. A contact migration can carry both old and
 new verification material until explicit confirmation; it must not silently
 map `@user:server` to a new `identity_id`.
 
-The later `/v1/identity/*` and `/v1/devices/*` APIs persist the exact canonical
-event and update the authorization head in one transaction. They must expose
-expected-head conflicts as an idempotent retry boundary, not choose a winning
-fork in application memory. QR enrollment supplies transport and user consent
-around the same root certificate and active-device event authorization; it does
-not define a second device trust model.
+The later `/v1/identity/*` and `/v1/devices/*` APIs must call the IM1b
+repository rather than create another persistence path. It already persists
+the exact canonical event and updates the authorization head, outbox, and
+receipt in one transaction. APIs must expose expected-head conflicts as an
+idempotent retry boundary, not choose a winning fork in application memory. QR
+enrollment supplies transport and user consent around the same root certificate
+and active-device event authorization; it does not define a second device
+trust model.
 
 The published v1.0 CDDL/vector and baseline v5 are never rewritten. The
 recovery co-sign requirement is published only as the current v1.1 CDDL/vector

@@ -1,0 +1,155 @@
+use std::fmt;
+
+use sqlx::{
+    PgConnection, PgPool, Postgres, Transaction,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
+
+use crate::IdentityPersistenceError;
+
+/// Validated non-owner pool dedicated to self-certifying identity-log storage.
+#[derive(Clone)]
+pub struct IdentityPgStore {
+    pool: PgPool,
+}
+
+impl fmt::Debug for IdentityPgStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdentityPgStore")
+            .field("pool", &self.pool)
+            .finish()
+    }
+}
+
+impl IdentityPgStore {
+    /// Opens an identity-only pool after enforcing the non-owner writer-role boundary.
+    ///
+    /// The caller must provision the `dtx_identity_runtime` group membership
+    /// separately from tenant-scoped service roles. Connection options are not
+    /// retained in a debuggable field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the pool cannot connect or the configured role is
+    /// unauthorized, privileged, or lacks a required identity relation grant.
+    pub async fn connect(
+        options: PgConnectOptions,
+        max_connections: u32,
+    ) -> Result<Self, IdentityPersistenceError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections.max(1))
+            .connect_with(options)
+            .await?;
+        validate_identity_runtime_role(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    /// Begins a transaction isolated from tenant-scoped RLS context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a database failure or a leaked tenant setting on a
+    /// pooled connection.
+    pub async fn begin(&self) -> Result<IdentitySession<'_>, IdentityPersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT NULLIF(current_setting('dtx.tenant_id', true), '')")
+                .fetch_one(&mut *transaction)
+                .await?;
+        if existing.is_some() {
+            transaction.rollback().await?;
+            return Err(IdentityPersistenceError::TenantContextLeak);
+        }
+        Ok(IdentitySession { transaction })
+    }
+}
+
+async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPersistenceError> {
+    let authorized: bool = sqlx::query_scalar(
+        "SELECT identity.identity_runtime_authorized() \
+             AND has_schema_privilege(current_user, 'identity', 'USAGE') \
+             AND has_table_privilege(current_user, 'identity.log_heads', 'SELECT,INSERT,UPDATE') \
+             AND has_table_privilege(current_user, 'identity.log_entries', 'SELECT,INSERT') \
+             AND has_table_privilege(current_user, 'identity.command_receipts', 'SELECT,INSERT,UPDATE') \
+             AND has_table_privilege(current_user, 'identity.fork_evidence', 'SELECT,INSERT') \
+             AND has_table_privilege(current_user, 'identity.log_outbox', 'SELECT,INSERT')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !authorized {
+        return Err(IdentityPersistenceError::RuntimeRoleUnauthorized);
+    }
+
+    let unsafe_role: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM pg_roles AS candidate \
+             WHERE pg_has_role(current_user, candidate.oid, 'MEMBER') \
+               AND (candidate.rolsuper OR candidate.rolbypassrls \
+                 OR candidate.rolcreatedb OR candidate.rolcreaterole \
+                 OR candidate.rolreplication OR left(candidate.rolname, 3) = 'pg_' \
+                 OR EXISTS (\
+                     SELECT 1 FROM pg_database \
+                     WHERE datname = current_database() AND datdba = candidate.oid\
+                 ) \
+                 OR EXISTS (\
+                     SELECT 1 FROM pg_namespace AS namespace \
+                     WHERE namespace.nspname = 'identity' \
+                       AND (namespace.nspowner = candidate.oid \
+                         OR has_schema_privilege(candidate.oid, namespace.oid, 'CREATE'))\
+                 ) OR EXISTS (\
+                     SELECT 1 FROM pg_class AS relation \
+                     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+                     WHERE namespace.nspname = 'identity' \
+                       AND relation.relowner = candidate.oid\
+                 ) OR EXISTS (\
+                     SELECT 1 FROM pg_proc AS procedure \
+                     JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace \
+                     WHERE namespace.nspname = 'identity' \
+                       AND procedure.proowner = candidate.oid\
+                 ) OR EXISTS (\
+                     SELECT 1 FROM pg_type AS data_type \
+                     JOIN pg_namespace AS namespace ON namespace.oid = data_type.typnamespace \
+                     WHERE namespace.nspname = 'identity' \
+                       AND data_type.typowner = candidate.oid\
+                 ))\
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if unsafe_role {
+        Err(IdentityPersistenceError::UnsafeRuntimeRole)
+    } else {
+        Ok(())
+    }
+}
+
+/// Non-cloneable identity-log database transaction.
+pub struct IdentitySession<'pool> {
+    transaction: Transaction<'pool, Postgres>,
+}
+
+impl IdentitySession<'_> {
+    /// Gives the repository access to this already role-validated transaction.
+    pub fn connection(&mut self) -> &mut PgConnection {
+        &mut self.transaction
+    }
+
+    /// Commits all immutable log, head, receipt, and outbox changes atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or deferred-constraint failure.
+    pub async fn commit(self) -> Result<(), IdentityPersistenceError> {
+        self.transaction.commit().await.map_err(Into::into)
+    }
+
+    /// Explicitly abandons the current identity transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if rollback itself cannot complete.
+    pub async fn rollback(self) -> Result<(), IdentityPersistenceError> {
+        self.transaction.rollback().await.map_err(Into::into)
+    }
+}
