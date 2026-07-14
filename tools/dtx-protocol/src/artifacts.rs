@@ -109,10 +109,49 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
         json_string(&identity_log, "canonical_cbor_hex")?,
     )?;
 
+    validate_identity_log_v1_1(root)?;
+
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_identity_log_v1_1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/identity-log/v1_1/identity-log-v1-1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse identity-log v1.1 CDDL: {error}"))
+    })?;
+    let vector =
+        read_json(&root.join("protocol/test-vectors/identity-log/v1_1/identity-log-v1_1.json"))?;
+    validate_vector_version(&vector, "identity-log-v1.1")?;
+    if json_string(&vector, "wire_version")? != "1.1" {
+        return Err(ProtocolToolError::new(
+            "identity-log-v1.1 vector wire_version must be 1.1",
+        ));
+    }
+    let events = vector
+        .get("events")
+        .and_then(Value::as_array)
+        .filter(|events| !events.is_empty())
+        .ok_or_else(|| {
+            ProtocolToolError::new("identity-log-v1.1 vector events must be a nonempty array")
+        })?;
+    for event in events {
+        let event_name = json_string(event, "event")?;
+        let entry_hash = json_string(event, "entry_hash")?;
+        if !entry_hash.starts_with("sha256:") {
+            return Err(ProtocolToolError::new(format!(
+                "identity-log-v1.1 event {event_name} entry_hash must use sha256"
+            )));
+        }
+        validate_cddl_hex(
+            "identity-log-event-v1-1",
+            &cddl,
+            json_string(event, "canonical_cbor_hex")?,
+        )?;
+    }
     Ok(())
 }
 

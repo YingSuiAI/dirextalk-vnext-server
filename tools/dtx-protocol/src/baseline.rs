@@ -25,6 +25,10 @@ const V5_ARTIFACT_PATHS: &[&str] = &[
     "protocol/cddl/identity-log/v1",
     "protocol/test-vectors/identity-log/v1",
 ];
+const V6_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/identity-log/v1_1",
+    "protocol/test-vectors/identity-log/v1_1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -70,6 +74,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v5/manifest.json",
         includes_registries: false,
         artifact_paths: V5_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 6,
+        path: "protocol/baseline/v6/manifest.json",
+        includes_registries: false,
+        artifact_paths: V6_ARTIFACT_PATHS,
     },
 ];
 
@@ -490,16 +500,22 @@ mod tests {
         let v3 = V3_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         let v4 = V4_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         let v5 = V5_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
+        let v6 = V6_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
         assert!(v1.is_disjoint(&v2));
         assert!(v1.is_disjoint(&v3));
         assert!(v1.is_disjoint(&v4));
         assert!(v1.is_disjoint(&v5));
+        assert!(v1.is_disjoint(&v6));
         assert!(v2.is_disjoint(&v3));
         assert!(v2.is_disjoint(&v4));
         assert!(v2.is_disjoint(&v5));
+        assert!(v2.is_disjoint(&v6));
         assert!(v3.is_disjoint(&v4));
         assert!(v3.is_disjoint(&v5));
+        assert!(v3.is_disjoint(&v6));
         assert!(v4.is_disjoint(&v5));
+        assert!(v4.is_disjoint(&v6));
+        assert!(v5.is_disjoint(&v6));
         assert!(!V1_ARTIFACT_PATHS.contains(&"protocol/proto"));
     }
 }

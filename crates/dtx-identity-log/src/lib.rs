@@ -20,9 +20,16 @@ use dtx_wire::{
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 
-/// The only readable and writable identity-log wire version in this release.
-pub const IDENTITY_LOG_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
-/// Exact identity-log writer and minimum-reader version.
+/// Frozen original identity-log writer version retained for replay-only reads.
+pub const IDENTITY_LOG_V1_0_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+/// Exact frozen original identity-log wire version.
+pub const IDENTITY_LOG_V1_0_WIRE_VERSION: WireVersion = WireVersion::new(
+    IDENTITY_LOG_V1_0_PROTOCOL_VERSION,
+    IDENTITY_LOG_V1_0_PROTOCOL_VERSION,
+);
+/// The current writable identity-log wire version.
+pub const IDENTITY_LOG_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
+/// Exact current identity-log writer and minimum-reader version.
 pub const IDENTITY_LOG_WIRE_VERSION: WireVersion =
     WireVersion::new(IDENTITY_LOG_PROTOCOL_VERSION, IDENTITY_LOG_PROTOCOL_VERSION);
 
@@ -49,9 +56,21 @@ pub const KEY_ROTATION_ACCEPTANCE_HASH_DOMAIN: &[u8] =
 /// Domain separator for successor root or recovery key acceptance signatures.
 pub const KEY_ROTATION_ACCEPTANCE_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.identity-log-key-acceptance-signature.v1\0";
+/// Domain separator for current-recovery authorization of a recovery rotation.
+pub const RECOVERY_ROTATION_AUTHORIZATION_HASH_DOMAIN: &[u8] =
+    b"dirextalk.identity-log-recovery-rotation-authorization.v1\0";
+/// Domain separator for the current-recovery authorization signature.
+pub const RECOVERY_ROTATION_AUTHORIZATION_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.identity-log-recovery-rotation-authorization-signature.v1\0";
 
 const MAX_RELAY_URLS: usize = 8;
 const MAX_RELAY_URL_BYTES: usize = 512;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityLogWireLine {
+    FrozenV1_0,
+    CurrentV1_1,
+}
 
 /// Identity-log admission failed without revealing private key or storage state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -327,6 +346,12 @@ impl DeviceCertificateV1 {
         encode_deterministic_cbor(self).map_err(|_| IdentityLogError::InvalidCanonical)
     }
 
+    /// Returns the exact wire version authenticated by this certificate.
+    #[must_use]
+    pub const fn wire(&self) -> WireVersion {
+        self.unsigned.wire
+    }
+
     /// Returns the identity named by this certificate.
     #[must_use]
     pub const fn identity_id(&self) -> IdentityId {
@@ -424,6 +449,12 @@ impl RelayDescriptorV1 {
         &self.relay_urls
     }
 
+    /// Returns the exact wire version carried by this descriptor.
+    #[must_use]
+    pub const fn wire(&self) -> WireVersion {
+        self.wire
+    }
+
     /// Returns the descriptor expiration timestamp.
     #[must_use]
     pub const fn expires_at(&self) -> UtcMillis {
@@ -496,6 +527,8 @@ pub enum IdentityLogEventPayloadV1 {
         new_recovery_signing_key: SigningPublicKey,
         /// Proof of possession by the successor key.
         acceptance_signature: Ed25519Signature,
+        /// Authorization by the current recovery key, required by wire `1.1`.
+        recovery_authorization_signature: Option<Ed25519Signature>,
     },
     /// Uses recovery to rotate both authority keys and revoke all devices.
     RecoveryRestore {
@@ -527,10 +560,10 @@ impl IdentityLogEventPayloadV1 {
             Self::RelayDescriptor { .. } => IdentityLogEventKindV1::RelayDescriptor,
         }
     }
-}
 
-impl CanonicalEncode for IdentityLogEventPayloadV1 {
-    fn to_canonical_value(&self) -> CanonicalValue {
+    fn to_canonical_value_for_wire(&self, wire: WireVersion) -> CanonicalValue {
+        let line = identity_log_wire_line(wire)
+            .expect("identity-log events are constructed only with a supported wire version");
         match self {
             Self::Genesis {
                 root_signing_key,
@@ -561,10 +594,6 @@ impl CanonicalEncode for IdentityLogEventPayloadV1 {
             Self::RootRotate {
                 new_root_signing_key,
                 acceptance_signature,
-            }
-            | Self::RecoveryRotate {
-                new_recovery_signing_key: new_root_signing_key,
-                acceptance_signature,
             } => CanonicalValue::Map(vec![
                 (
                     CanonicalValue::Unsigned(1),
@@ -575,6 +604,31 @@ impl CanonicalEncode for IdentityLogEventPayloadV1 {
                     acceptance_signature.to_canonical_value(),
                 ),
             ]),
+            Self::RecoveryRotate {
+                new_recovery_signing_key,
+                acceptance_signature,
+                recovery_authorization_signature,
+            } => {
+                let mut fields = vec![
+                    (
+                        CanonicalValue::Unsigned(1),
+                        new_recovery_signing_key.to_canonical_value(),
+                    ),
+                    (
+                        CanonicalValue::Unsigned(2),
+                        acceptance_signature.to_canonical_value(),
+                    ),
+                ];
+                if line == IdentityLogWireLine::CurrentV1_1 {
+                    fields.push((
+                        CanonicalValue::Unsigned(3),
+                        recovery_authorization_signature
+                            .expect("current recovery rotation requires a recovery signature")
+                            .to_canonical_value(),
+                    ));
+                }
+                CanonicalValue::Map(fields)
+            }
             Self::RecoveryRestore {
                 new_root_signing_key,
                 new_recovery_signing_key,
@@ -698,7 +752,7 @@ impl UnsignedIdentityLogEventV1 {
     }
 
     fn validate_static(&self) -> Result<(), IdentityLogError> {
-        validate_wire_version(self.wire)?;
+        let wire_line = identity_log_wire_line(self.wire)?;
         if self.sequence.get() == 0 {
             return Err(IdentityLogError::InvalidEventShape);
         }
@@ -734,17 +788,40 @@ impl UnsignedIdentityLogEventV1 {
                 if self.sequence.get() == 1 || self.previous_event_hash.is_none() {
                     return Err(IdentityLogError::InvalidEventShape);
                 }
+                if descriptor.wire() != self.wire {
+                    return Err(IdentityLogError::InvalidWireVersion);
+                }
                 descriptor.validate_for_event(self.occurred_at)
             }
             IdentityLogEventPayloadV1::DeviceAdd { certificate } => {
                 if self.sequence.get() == 1 || self.previous_event_hash.is_none() {
                     return Err(IdentityLogError::InvalidEventShape);
                 }
+                if certificate.wire() != self.wire {
+                    return Err(IdentityLogError::InvalidWireVersion);
+                }
                 certificate.verify()
+            }
+            IdentityLogEventPayloadV1::RecoveryRotate {
+                recovery_authorization_signature,
+                ..
+            } => {
+                if self.sequence.get() == 1 || self.previous_event_hash.is_none() {
+                    return Err(IdentityLogError::InvalidEventShape);
+                }
+                match (wire_line, recovery_authorization_signature.is_some()) {
+                    (IdentityLogWireLine::FrozenV1_0, false)
+                    | (IdentityLogWireLine::CurrentV1_1, true) => Ok(()),
+                    (IdentityLogWireLine::FrozenV1_0, true) => {
+                        Err(IdentityLogError::InvalidCanonical)
+                    }
+                    (IdentityLogWireLine::CurrentV1_1, false) => {
+                        Err(IdentityLogError::InvalidRotation)
+                    }
+                }
             }
             IdentityLogEventPayloadV1::DeviceRevoke { .. }
             | IdentityLogEventPayloadV1::RootRotate { .. }
-            | IdentityLogEventPayloadV1::RecoveryRotate { .. }
             | IdentityLogEventPayloadV1::RecoveryRestore { .. } => {
                 if self.sequence.get() == 1 || self.previous_event_hash.is_none() {
                     return Err(IdentityLogError::InvalidEventShape);
@@ -782,7 +859,7 @@ impl CanonicalEncode for UnsignedIdentityLogEventV1 {
             ),
             (
                 CanonicalValue::Unsigned(7),
-                self.payload.to_canonical_value(),
+                self.payload.to_canonical_value_for_wire(self.wire),
             ),
             (
                 CanonicalValue::Unsigned(8),
@@ -834,7 +911,7 @@ impl IdentityLogEventV1 {
         let previous_event_hash = decode_optional_digest(field(fields, 4)?)?;
         let occurred_at = decode_utc_millis(field(fields, 5)?)?;
         let kind = IdentityLogEventKindV1::from_code(decode_unsigned(field(fields, 6)?)?)?;
-        let payload = decode_payload(kind, field(fields, 7)?)?;
+        let payload = decode_payload(kind, field(fields, 7)?, wire)?;
         let signer = decode_signing_key(field(fields, 8)?)?;
         let signature = decode_signature(field(fields, 9)?)?;
         let unsigned = UnsignedIdentityLogEventV1::new(
@@ -892,6 +969,12 @@ impl IdentityLogEventV1 {
     #[must_use]
     pub const fn identity_id(&self) -> IdentityId {
         self.unsigned.identity_id
+    }
+
+    /// Returns the exact wire version of this event.
+    #[must_use]
+    pub const fn wire(&self) -> WireVersion {
+        self.unsigned.wire
     }
 
     /// Returns the immutable log sequence.
@@ -1013,6 +1096,62 @@ pub fn key_rotation_acceptance_input(
     ))
 }
 
+/// Returns the exact bytes the current recovery key signs for a recovery rotation.
+///
+/// # Errors
+///
+/// Returns [`IdentityLogError::InvalidWireVersion`] unless `wire` is current
+/// identity-log `1.1`, or [`IdentityLogError::InvalidCanonical`] if the bounded
+/// deterministic input cannot be encoded.
+#[allow(clippy::too_many_arguments)]
+pub fn recovery_rotation_authorization_input(
+    wire: WireVersion,
+    identity_id: IdentityId,
+    sequence: SafeUint,
+    previous_event_hash: Option<Sha256Digest>,
+    occurred_at: UtcMillis,
+    root_signer: SigningPublicKey,
+    successor_key: SigningPublicKey,
+    successor_acceptance_signature: Ed25519Signature,
+) -> Result<Vec<u8>, IdentityLogError> {
+    if identity_log_wire_line(wire)? != IdentityLogWireLine::CurrentV1_1 {
+        return Err(IdentityLogError::InvalidWireVersion);
+    }
+    if sequence.get() == 0 {
+        return Err(IdentityLogError::InvalidRotation);
+    }
+    let value = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), wire.to_canonical_value()),
+        (CanonicalValue::Unsigned(2), identity_value(identity_id)),
+        (CanonicalValue::Unsigned(3), sequence.to_canonical_value()),
+        (
+            CanonicalValue::Unsigned(4),
+            previous_event_hash.map_or(CanonicalValue::Null, |value| value.to_canonical_value()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            occurred_at.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            root_signer.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            successor_key.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            successor_acceptance_signature.to_canonical_value(),
+        ),
+    ]);
+    let digest = canonical_hash(RECOVERY_ROTATION_AUTHORIZATION_HASH_DOMAIN, &value)?;
+    Ok(signature_input(
+        RECOVERY_ROTATION_AUTHORIZATION_SIGNATURE_DOMAIN,
+        digest,
+    ))
+}
+
 /// Current enrollment status for a device certificate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeviceStatusV1 {
@@ -1035,6 +1174,7 @@ struct DeviceRecordV1 {
 /// storage semantics testable before the HTTP and `PostgreSQL` layers arrive.
 #[derive(Clone, Debug)]
 pub struct IdentityLogV1 {
+    wire: WireVersion,
     identity_id: IdentityId,
     current_root_key: SigningPublicKey,
     current_recovery_key: SigningPublicKey,
@@ -1064,6 +1204,7 @@ impl IdentityLogV1 {
         };
         let entry_hash = genesis.entry_hash()?;
         Ok(Self {
+            wire: genesis.wire(),
             identity_id: genesis.identity_id(),
             current_root_key: *root_signing_key,
             current_recovery_key: *recovery_signing_key,
@@ -1086,6 +1227,9 @@ impl IdentityLogV1 {
         event.verify()?;
         if event.identity_id() != self.identity_id {
             return Err(IdentityLogError::IdentityMismatch);
+        }
+        if event.wire() != self.wire {
+            return Err(IdentityLogError::InvalidWireVersion);
         }
         let entry_hash = event.entry_hash()?;
         if self.seen_entry_hashes.contains(&entry_hash) {
@@ -1117,6 +1261,12 @@ impl IdentityLogV1 {
     #[must_use]
     pub const fn identity_id(&self) -> IdentityId {
         self.identity_id
+    }
+
+    /// Returns the immutable wire version established by genesis.
+    #[must_use]
+    pub const fn wire(&self) -> WireVersion {
+        self.wire
     }
 
     /// Returns the current root signing key.
@@ -1157,10 +1307,21 @@ impl IdentityLogV1 {
             .map(|record| &record.certificate)
     }
 
-    /// Returns the latest currently valid signed relay descriptor.
+    /// Returns the latest signed relay descriptor, including expired history.
     #[must_use]
-    pub fn relay_descriptor(&self) -> Option<&RelayDescriptorV1> {
+    pub fn latest_relay_descriptor(&self) -> Option<&RelayDescriptorV1> {
         self.relay_descriptor.as_ref()
+    }
+
+    /// Returns the latest descriptor only when it is active at trusted `now`.
+    ///
+    /// Callers must obtain `now` from their trusted clock rather than the event
+    /// timestamp, which is signer-provided historical metadata.
+    #[must_use]
+    pub fn active_relay_descriptor(&self, now: UtcMillis) -> Option<&RelayDescriptorV1> {
+        self.relay_descriptor
+            .as_ref()
+            .filter(|descriptor| descriptor.expires_at() > now)
     }
 
     fn apply_authorized(&mut self, event: &IdentityLogEventV1) -> Result<(), IdentityLogError> {
@@ -1190,10 +1351,12 @@ impl IdentityLogV1 {
             IdentityLogEventPayloadV1::RecoveryRotate {
                 new_recovery_signing_key,
                 acceptance_signature,
+                recovery_authorization_signature,
             } => self.apply_recovery_rotation(
                 event,
                 *new_recovery_signing_key,
                 *acceptance_signature,
+                *recovery_authorization_signature,
             ),
             IdentityLogEventPayloadV1::RecoveryRestore {
                 new_root_signing_key,
@@ -1288,6 +1451,7 @@ impl IdentityLogV1 {
         event: &IdentityLogEventV1,
         successor: SigningPublicKey,
         acceptance_signature: Ed25519Signature,
+        recovery_authorization_signature: Option<Ed25519Signature>,
     ) -> Result<(), IdentityLogError> {
         if event.signer() != self.current_root_key {
             return Err(IdentityLogError::UnauthorizedSigner);
@@ -1304,6 +1468,32 @@ impl IdentityLogV1 {
             successor,
             acceptance_signature,
         )?;
+        match (
+            identity_log_wire_line(event.wire())?,
+            recovery_authorization_signature,
+        ) {
+            (IdentityLogWireLine::FrozenV1_0, None) => {}
+            (IdentityLogWireLine::CurrentV1_1, Some(signature)) => {
+                let authorization_input = recovery_rotation_authorization_input(
+                    event.wire(),
+                    self.identity_id,
+                    event.sequence(),
+                    event.previous_event_hash(),
+                    event.occurred_at(),
+                    event.signer(),
+                    successor,
+                    acceptance_signature,
+                )?;
+                verify_signature(self.current_recovery_key, &authorization_input, signature)
+                    .map_err(|_| IdentityLogError::InvalidRotation)?;
+            }
+            (IdentityLogWireLine::FrozenV1_0, Some(_)) => {
+                return Err(IdentityLogError::InvalidCanonical);
+            }
+            (IdentityLogWireLine::CurrentV1_1, None) => {
+                return Err(IdentityLogError::InvalidRotation);
+            }
+        }
         self.current_recovery_key = successor;
         Ok(())
     }
@@ -1375,12 +1565,18 @@ impl IdentityLogV1 {
     }
 }
 
-fn validate_wire_version(wire: WireVersion) -> Result<(), IdentityLogError> {
-    if wire == IDENTITY_LOG_WIRE_VERSION {
-        Ok(())
+fn identity_log_wire_line(wire: WireVersion) -> Result<IdentityLogWireLine, IdentityLogError> {
+    if wire == IDENTITY_LOG_V1_0_WIRE_VERSION {
+        Ok(IdentityLogWireLine::FrozenV1_0)
+    } else if wire == IDENTITY_LOG_WIRE_VERSION {
+        Ok(IdentityLogWireLine::CurrentV1_1)
     } else {
         Err(IdentityLogError::InvalidWireVersion)
     }
+}
+
+fn validate_wire_version(wire: WireVersion) -> Result<(), IdentityLogError> {
+    identity_log_wire_line(wire).map(|_| ())
 }
 
 fn identity_value(identity_id: IdentityId) -> CanonicalValue {
@@ -1492,6 +1688,7 @@ fn field(
 fn decode_payload(
     kind: IdentityLogEventKindV1,
     value: &CanonicalValue,
+    wire: WireVersion,
 ) -> Result<IdentityLogEventPayloadV1, IdentityLogError> {
     match kind {
         IdentityLogEventKindV1::Genesis => {
@@ -1522,10 +1719,21 @@ fn decode_payload(
             })
         }
         IdentityLogEventKindV1::RecoveryRotate => {
-            let fields = exact_fields(value, 2)?;
+            let wire_line = identity_log_wire_line(wire)?;
+            let fields = exact_fields(
+                value,
+                match wire_line {
+                    IdentityLogWireLine::FrozenV1_0 => 2,
+                    IdentityLogWireLine::CurrentV1_1 => 3,
+                },
+            )?;
             Ok(IdentityLogEventPayloadV1::RecoveryRotate {
                 new_recovery_signing_key: decode_signing_key(field(fields, 1)?)?,
                 acceptance_signature: decode_signature(field(fields, 2)?)?,
+                recovery_authorization_signature: match wire_line {
+                    IdentityLogWireLine::FrozenV1_0 => None,
+                    IdentityLogWireLine::CurrentV1_1 => Some(decode_signature(field(fields, 3)?)?),
+                },
             })
         }
         IdentityLogEventKindV1::RecoveryRestore => {
@@ -1694,6 +1902,7 @@ mod tests {
 
     use ed25519_dalek::{Signer, SigningKey};
     use serde::Deserialize;
+    use serde_json::json;
 
     use super::*;
 
@@ -1705,6 +1914,21 @@ mod tests {
     struct IdentityLogVector {
         version: u16,
         identity_id: String,
+        canonical_cbor_hex: String,
+        entry_hash: String,
+    }
+
+    #[derive(Deserialize)]
+    struct IdentityLogV1_1Vector {
+        version: u16,
+        wire_version: String,
+        identity_id: String,
+        events: Vec<IdentityLogVectorEvent>,
+    }
+
+    #[derive(Deserialize)]
+    struct IdentityLogVectorEvent {
+        event: String,
         canonical_cbor_hex: String,
         entry_hash: String,
     }
@@ -1741,8 +1965,29 @@ mod tests {
         occurred_at: i64,
         payload: IdentityLogEventPayloadV1,
     ) -> IdentityLogEventV1 {
-        let unsigned = UnsignedIdentityLogEventV1::new(
+        signed_event_with_wire(
             IDENTITY_LOG_WIRE_VERSION,
+            signer,
+            identity_id,
+            sequence,
+            previous_event_hash,
+            occurred_at,
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn signed_event_with_wire(
+        wire: WireVersion,
+        signer: &SigningKey,
+        identity_id: IdentityId,
+        sequence: u64,
+        previous_event_hash: Option<Sha256Digest>,
+        occurred_at: i64,
+        payload: IdentityLogEventPayloadV1,
+    ) -> IdentityLogEventV1 {
+        let unsigned = UnsignedIdentityLogEventV1::new(
+            wire,
             identity_id,
             safe(sequence),
             previous_event_hash,
@@ -1762,6 +2007,14 @@ mod tests {
     }
 
     fn genesis(root: &SigningKey, recovery: &SigningKey) -> IdentityLogEventV1 {
+        genesis_with_wire(IDENTITY_LOG_WIRE_VERSION, root, recovery)
+    }
+
+    fn genesis_with_wire(
+        wire: WireVersion,
+        root: &SigningKey,
+        recovery: &SigningKey,
+    ) -> IdentityLogEventV1 {
         let root_key = public_key(root);
         let recovery_key = public_key(recovery);
         let identity_id = IdentityId::derive(root_key.as_domain_key());
@@ -1769,7 +2022,8 @@ mod tests {
             recovery,
             &genesis_recovery_acceptance_input(identity_id, root_key, recovery_key).unwrap(),
         );
-        signed_event(
+        signed_event_with_wire(
+            wire,
             root,
             identity_id,
             1,
@@ -1823,6 +2077,193 @@ mod tests {
         .unwrap()
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn current_v1_1_chain() -> Vec<(&'static str, IdentityLogEventV1)> {
+        let root = signing_key(1);
+        let recovery = signing_key(2);
+        let genesis = genesis(&root, &recovery);
+        let identity_id = genesis.identity_id();
+        let mut log = IdentityLogV1::bootstrap(&genesis).unwrap();
+        let mut events = vec![("genesis", genesis)];
+
+        let first_device = signing_key(3);
+        let first_certificate = device_certificate(
+            &root,
+            identity_id,
+            &first_device,
+            device_id(DEVICE_A),
+            31,
+            1_050,
+        );
+        let device_add = signed_event(
+            &root,
+            identity_id,
+            2,
+            Some(log.head_hash()),
+            1_100,
+            IdentityLogEventPayloadV1::DeviceAdd {
+                certificate: first_certificate,
+            },
+        );
+        log.append(&device_add).unwrap();
+        events.push(("device_add", device_add));
+
+        let relay_descriptor = signed_event(
+            &root,
+            identity_id,
+            3,
+            Some(log.head_hash()),
+            1_200,
+            IdentityLogEventPayloadV1::RelayDescriptor {
+                descriptor: descriptor(2_000),
+            },
+        );
+        log.append(&relay_descriptor).unwrap();
+        events.push(("relay_descriptor", relay_descriptor));
+
+        let next_root = signing_key(4);
+        let root_acceptance_signature = signature(
+            &next_root,
+            &key_rotation_acceptance_input(
+                identity_id,
+                safe(4),
+                Some(log.head_hash()),
+                KeyAcceptancePurposeV1::RootRotate,
+                public_key(&next_root),
+            )
+            .unwrap(),
+        );
+        let root_rotate = signed_event(
+            &root,
+            identity_id,
+            4,
+            Some(log.head_hash()),
+            1_300,
+            IdentityLogEventPayloadV1::RootRotate {
+                new_root_signing_key: public_key(&next_root),
+                acceptance_signature: root_acceptance_signature,
+            },
+        );
+        log.append(&root_rotate).unwrap();
+        events.push(("root_rotate", root_rotate));
+
+        let next_recovery = signing_key(5);
+        let recovery_acceptance_signature = signature(
+            &next_recovery,
+            &key_rotation_acceptance_input(
+                identity_id,
+                safe(5),
+                Some(log.head_hash()),
+                KeyAcceptancePurposeV1::RecoveryRotate,
+                public_key(&next_recovery),
+            )
+            .unwrap(),
+        );
+        let recovery_rotation_authorization_signature = signature(
+            &recovery,
+            &recovery_rotation_authorization_input(
+                IDENTITY_LOG_WIRE_VERSION,
+                identity_id,
+                safe(5),
+                Some(log.head_hash()),
+                timestamp(1_400),
+                public_key(&next_root),
+                public_key(&next_recovery),
+                recovery_acceptance_signature,
+            )
+            .unwrap(),
+        );
+        let recovery_rotate = signed_event(
+            &next_root,
+            identity_id,
+            5,
+            Some(log.head_hash()),
+            1_400,
+            IdentityLogEventPayloadV1::RecoveryRotate {
+                new_recovery_signing_key: public_key(&next_recovery),
+                acceptance_signature: recovery_acceptance_signature,
+                recovery_authorization_signature: Some(recovery_rotation_authorization_signature),
+            },
+        );
+        log.append(&recovery_rotate).unwrap();
+        events.push(("recovery_rotate", recovery_rotate));
+
+        let device_revoke = signed_event(
+            &next_root,
+            identity_id,
+            6,
+            Some(log.head_hash()),
+            1_500,
+            IdentityLogEventPayloadV1::DeviceRevoke {
+                device_id: device_id(DEVICE_A),
+            },
+        );
+        log.append(&device_revoke).unwrap();
+        events.push(("device_revoke", device_revoke));
+
+        let restored_root = signing_key(6);
+        let restored_recovery = signing_key(7);
+        let recovery_restore = signed_event(
+            &next_recovery,
+            identity_id,
+            7,
+            Some(log.head_hash()),
+            1_600,
+            IdentityLogEventPayloadV1::RecoveryRestore {
+                new_root_signing_key: public_key(&restored_root),
+                new_recovery_signing_key: public_key(&restored_recovery),
+                root_acceptance_signature: signature(
+                    &restored_root,
+                    &key_rotation_acceptance_input(
+                        identity_id,
+                        safe(7),
+                        Some(log.head_hash()),
+                        KeyAcceptancePurposeV1::RecoveryRestoreRoot,
+                        public_key(&restored_root),
+                    )
+                    .unwrap(),
+                ),
+                recovery_acceptance_signature: signature(
+                    &restored_recovery,
+                    &key_rotation_acceptance_input(
+                        identity_id,
+                        safe(7),
+                        Some(log.head_hash()),
+                        KeyAcceptancePurposeV1::RecoveryRestoreRecovery,
+                        public_key(&restored_recovery),
+                    )
+                    .unwrap(),
+                ),
+            },
+        );
+        log.append(&recovery_restore).unwrap();
+        events.push(("recovery_restore", recovery_restore));
+        events
+    }
+
+    fn render_current_v1_1_vector() -> String {
+        let events = current_v1_1_chain();
+        let identity_id = events[0].1.identity_id().to_string();
+        let events = events
+            .into_iter()
+            .map(|(event, value)| {
+                json!({
+                    "event": event,
+                    "canonical_cbor_hex": encode_hex(&value.to_deterministic_cbor().unwrap()),
+                    "entry_hash": value.entry_hash().unwrap().to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_string_pretty(&json!({
+            "version": 1,
+            "wire_version": "1.1",
+            "identity_id": identity_id,
+            "events": events,
+        }))
+        .unwrap()
+            + "\n"
+    }
+
     fn decode_hex(value: &str) -> Vec<u8> {
         assert_eq!(value.len() % 2, 0);
         (0..value.len())
@@ -1846,13 +2287,20 @@ mod tests {
         .unwrap()
     }
 
+    fn current_v1_1_vector() -> IdentityLogV1_1Vector {
+        serde_json::from_str(include_str!(
+            "../../../protocol/test-vectors/identity-log/v1_1/identity-log-v1_1.json"
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn canonical_genesis_vector_is_exact_and_independently_verifiable() {
         let vector = vector();
         assert_eq!(vector.version, 1);
         let root = signing_key(1);
         let recovery = signing_key(2);
-        let expected = genesis(&root, &recovery);
+        let expected = genesis_with_wire(IDENTITY_LOG_V1_0_WIRE_VERSION, &root, &recovery);
         assert_eq!(expected.identity_id().to_string(), vector.identity_id);
         assert_eq!(
             encode_hex(&expected.to_deterministic_cbor().unwrap()),
@@ -1867,6 +2315,69 @@ mod tests {
         let decoded = IdentityLogEventV1::decode_and_verify(&bytes).unwrap();
         assert_eq!(decoded, expected);
         assert_eq!(decoded.to_deterministic_cbor().unwrap(), bytes);
+    }
+
+    #[test]
+    fn canonical_v1_1_vector_is_full_replayable_contract() {
+        let vector = current_v1_1_vector();
+        let expected = current_v1_1_chain();
+        let expected_event_names = [
+            "genesis",
+            "device_add",
+            "relay_descriptor",
+            "root_rotate",
+            "recovery_rotate",
+            "device_revoke",
+            "recovery_restore",
+        ];
+
+        assert_eq!(vector.version, 1);
+        assert_eq!(vector.wire_version, "1.1");
+        assert_eq!(
+            vector
+                .events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            expected_event_names
+        );
+        assert_eq!(expected.len(), expected_event_names.len());
+        assert_eq!(vector.identity_id, expected[0].1.identity_id().to_string());
+        assert_eq!(
+            render_current_v1_1_vector(),
+            include_str!("../../../protocol/test-vectors/identity-log/v1_1/identity-log-v1_1.json")
+        );
+
+        let decoded = vector
+            .events
+            .iter()
+            .zip(expected.iter())
+            .map(|(fixture, (expected_name, expected_event))| {
+                assert_eq!(fixture.event, *expected_name);
+                let bytes = decode_hex(&fixture.canonical_cbor_hex);
+                let decoded = IdentityLogEventV1::decode_and_verify(&bytes).unwrap();
+                assert_eq!(&decoded, expected_event);
+                assert_eq!(decoded.to_deterministic_cbor().unwrap(), bytes);
+                assert_eq!(
+                    decoded.entry_hash().unwrap().to_string(),
+                    fixture.entry_hash
+                );
+                decoded
+            })
+            .collect::<Vec<_>>();
+
+        let mut log = IdentityLogV1::bootstrap(&decoded[0]).unwrap();
+        assert_eq!(log.wire(), IDENTITY_LOG_WIRE_VERSION);
+        for event in decoded.iter().skip(1) {
+            log.append(event).unwrap();
+        }
+        assert_eq!(log.head_sequence(), safe(7));
+        assert_eq!(
+            log.device_status(device_id(DEVICE_A)),
+            Some(DeviceStatusV1::Revoked)
+        );
+        assert!(log.active_relay_descriptor(timestamp(1_999)).is_some());
+        assert!(log.active_relay_descriptor(timestamp(2_000)).is_none());
     }
 
     #[test]
@@ -1935,7 +2446,7 @@ mod tests {
         );
         log.append(&relay_update).unwrap();
         assert_eq!(
-            log.relay_descriptor().unwrap().relay_urls(),
+            log.latest_relay_descriptor().unwrap().relay_urls(),
             ["https://relay-a.example/v1", "https://relay-b.example/v1"]
         );
 
@@ -1981,9 +2492,6 @@ mod tests {
         log.append(&update).unwrap();
         let head_before = (log.head_sequence(), log.head_hash());
 
-        assert_eq!(log.append(&update), Err(IdentityLogError::Replay));
-        assert_eq!((log.head_sequence(), log.head_hash()), head_before);
-
         let skipped_sequence = signed_event(
             &root,
             identity_id,
@@ -1994,12 +2502,6 @@ mod tests {
                 descriptor: descriptor(2_100),
             },
         );
-        assert_eq!(
-            log.append(&skipped_sequence),
-            Err(IdentityLogError::SequenceMismatch)
-        );
-        assert_eq!((log.head_sequence(), log.head_hash()), head_before);
-
         let fork = signed_event(
             &root,
             identity_id,
@@ -2010,18 +2512,244 @@ mod tests {
                 descriptor: descriptor(2_100),
             },
         );
-        assert_eq!(
-            log.append(&fork),
-            Err(IdentityLogError::PreviousHashMismatch)
-        );
-        assert_eq!((log.head_sequence(), log.head_hash()), head_before);
+        for (candidate, expected_error) in [
+            (update.clone(), IdentityLogError::Replay),
+            (skipped_sequence, IdentityLogError::SequenceMismatch),
+            (fork, IdentityLogError::PreviousHashMismatch),
+        ] {
+            assert_eq!(log.append(&candidate), Err(expected_error));
+            assert_eq!((log.head_sequence(), log.head_hash()), head_before);
+        }
 
-        let mut tampered = update.to_deterministic_cbor().unwrap();
+        let signed_bytes = update.to_deterministic_cbor().unwrap();
+        let mut tampered = signed_bytes.clone();
         *tampered.last_mut().unwrap() ^= 1;
-        assert_eq!(
-            IdentityLogEventV1::decode_and_verify(&tampered),
-            Err(IdentityLogError::InvalidSignature)
+        let mut trailing = signed_bytes;
+        trailing.push(0);
+        for (bytes, expected_error) in [
+            (tampered, IdentityLogError::InvalidSignature),
+            (trailing, IdentityLogError::InvalidCanonical),
+        ] {
+            assert_eq!(
+                IdentityLogEventV1::decode_and_verify(&bytes),
+                Err(expected_error)
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_rotation_rejects_a_root_only_authorization() {
+        let root = signing_key(1);
+        let recovery = signing_key(2);
+        let genesis = genesis(&root, &recovery);
+        let identity_id = genesis.identity_id();
+        let mut log = IdentityLogV1::bootstrap(&genesis).unwrap();
+        let successor = signing_key(3);
+        let root_only_rotation = UnsignedIdentityLogEventV1::new(
+            IDENTITY_LOG_WIRE_VERSION,
+            identity_id,
+            safe(2),
+            Some(log.head_hash()),
+            timestamp(1_100),
+            IdentityLogEventPayloadV1::RecoveryRotate {
+                new_recovery_signing_key: public_key(&successor),
+                acceptance_signature: signature(
+                    &successor,
+                    &key_rotation_acceptance_input(
+                        identity_id,
+                        safe(2),
+                        Some(log.head_hash()),
+                        KeyAcceptancePurposeV1::RecoveryRotate,
+                        public_key(&successor),
+                    )
+                    .unwrap(),
+                ),
+                recovery_authorization_signature: None,
+            },
+            public_key(&root),
         );
+
+        assert_eq!(root_only_rotation, Err(IdentityLogError::InvalidRotation));
+
+        let successor_acceptance_signature = signature(
+            &successor,
+            &key_rotation_acceptance_input(
+                identity_id,
+                safe(2),
+                Some(log.head_hash()),
+                KeyAcceptancePurposeV1::RecoveryRotate,
+                public_key(&successor),
+            )
+            .unwrap(),
+        );
+        let forged_recovery_authorization = signed_event(
+            &root,
+            identity_id,
+            2,
+            Some(log.head_hash()),
+            1_100,
+            IdentityLogEventPayloadV1::RecoveryRotate {
+                new_recovery_signing_key: public_key(&successor),
+                acceptance_signature: successor_acceptance_signature,
+                recovery_authorization_signature: Some(signature(
+                    &root,
+                    &recovery_rotation_authorization_input(
+                        IDENTITY_LOG_WIRE_VERSION,
+                        identity_id,
+                        safe(2),
+                        Some(log.head_hash()),
+                        timestamp(1_100),
+                        public_key(&root),
+                        public_key(&successor),
+                        successor_acceptance_signature,
+                    )
+                    .unwrap(),
+                )),
+            },
+        );
+        assert_eq!(
+            log.append(&forged_recovery_authorization),
+            Err(IdentityLogError::InvalidRotation)
+        );
+        assert_eq!(log.current_recovery_key(), public_key(&recovery));
+    }
+
+    #[test]
+    fn frozen_v1_0_recovery_rotation_remains_replayable() {
+        let root = signing_key(1);
+        let recovery = signing_key(2);
+        let genesis = genesis_with_wire(IDENTITY_LOG_V1_0_WIRE_VERSION, &root, &recovery);
+        let identity_id = genesis.identity_id();
+        let mut log = IdentityLogV1::bootstrap(&genesis).unwrap();
+        let successor = signing_key(3);
+        let rotation = signed_event_with_wire(
+            IDENTITY_LOG_V1_0_WIRE_VERSION,
+            &root,
+            identity_id,
+            2,
+            Some(log.head_hash()),
+            1_100,
+            IdentityLogEventPayloadV1::RecoveryRotate {
+                new_recovery_signing_key: public_key(&successor),
+                acceptance_signature: signature(
+                    &successor,
+                    &key_rotation_acceptance_input(
+                        identity_id,
+                        safe(2),
+                        Some(log.head_hash()),
+                        KeyAcceptancePurposeV1::RecoveryRotate,
+                        public_key(&successor),
+                    )
+                    .unwrap(),
+                ),
+                recovery_authorization_signature: None,
+            },
+        );
+
+        log.append(&rotation).unwrap();
+        assert_eq!(log.wire(), IDENTITY_LOG_V1_0_WIRE_VERSION);
+        assert_eq!(log.current_recovery_key(), public_key(&successor));
+    }
+
+    #[test]
+    fn relay_history_replays_but_active_lookup_uses_trusted_now() {
+        let root = signing_key(1);
+        let recovery = signing_key(2);
+        let genesis = genesis(&root, &recovery);
+        let identity_id = genesis.identity_id();
+        let mut log = IdentityLogV1::bootstrap(&genesis).unwrap();
+
+        let backdated_descriptor = signed_event(
+            &root,
+            identity_id,
+            2,
+            Some(log.head_hash()),
+            1_050,
+            IdentityLogEventPayloadV1::RelayDescriptor {
+                descriptor: descriptor(1_100),
+            },
+        );
+        log.append(&backdated_descriptor).unwrap();
+        assert!(log.latest_relay_descriptor().is_some());
+        assert!(log.active_relay_descriptor(timestamp(1_099)).is_some());
+        assert!(log.active_relay_descriptor(timestamp(1_100)).is_none());
+        assert!(log.active_relay_descriptor(timestamp(1_500)).is_none());
+
+        let already_expired_at_event_time = UnsignedIdentityLogEventV1::new(
+            IDENTITY_LOG_WIRE_VERSION,
+            identity_id,
+            safe(3),
+            Some(log.head_hash()),
+            timestamp(1_200),
+            IdentityLogEventPayloadV1::RelayDescriptor {
+                descriptor: descriptor(1_100),
+            },
+            public_key(&root),
+        );
+        assert_eq!(
+            already_expired_at_event_time,
+            Err(IdentityLogError::InvalidRelayDescriptor)
+        );
+    }
+
+    #[test]
+    fn current_wire_rejects_legacy_embedded_contracts() {
+        let root = signing_key(1);
+        let recovery = signing_key(2);
+        let genesis = genesis(&root, &recovery);
+        let identity_id = genesis.identity_id();
+        let legacy_device = signing_key(3);
+        let legacy_certificate_unsigned = UnsignedDeviceCertificateV1::new(
+            IDENTITY_LOG_V1_0_WIRE_VERSION,
+            identity_id,
+            device_id(DEVICE_A),
+            public_key(&legacy_device),
+            DeviceEncryptionPublicKey::try_from([31; 32]).unwrap(),
+            public_key(&root),
+            timestamp(1_050),
+        )
+        .unwrap();
+        let legacy_certificate = DeviceCertificateV1::signed(
+            legacy_certificate_unsigned.clone(),
+            signature(
+                &root,
+                &device_certificate_signature_input(
+                    legacy_certificate_unsigned.signing_digest().unwrap(),
+                ),
+            ),
+        )
+        .unwrap();
+
+        let device_add = UnsignedIdentityLogEventV1::new(
+            IDENTITY_LOG_WIRE_VERSION,
+            identity_id,
+            safe(2),
+            Some(genesis.entry_hash().unwrap()),
+            timestamp(1_100),
+            IdentityLogEventPayloadV1::DeviceAdd {
+                certificate: legacy_certificate,
+            },
+            public_key(&root),
+        );
+        assert_eq!(device_add, Err(IdentityLogError::InvalidWireVersion));
+
+        let relay_update = UnsignedIdentityLogEventV1::new(
+            IDENTITY_LOG_WIRE_VERSION,
+            identity_id,
+            safe(2),
+            Some(genesis.entry_hash().unwrap()),
+            timestamp(1_100),
+            IdentityLogEventPayloadV1::RelayDescriptor {
+                descriptor: RelayDescriptorV1::new(
+                    IDENTITY_LOG_V1_0_WIRE_VERSION,
+                    vec!["https://relay-a.example/v1".to_owned()],
+                    timestamp(2_000),
+                )
+                .unwrap(),
+            },
+            public_key(&root),
+        );
+        assert_eq!(relay_update, Err(IdentityLogError::InvalidWireVersion));
     }
 
     #[test]
@@ -2147,6 +2875,48 @@ mod tests {
         );
 
         let next_recovery = signing_key(5);
+        let recovery_successor_acceptance_signature = signature(
+            &next_recovery,
+            &key_rotation_acceptance_input(
+                identity_id,
+                safe(4),
+                Some(log.head_hash()),
+                KeyAcceptancePurposeV1::RecoveryRotate,
+                public_key(&next_recovery),
+            )
+            .unwrap(),
+        );
+        let old_root_recovery_rotation = signed_event(
+            &root,
+            identity_id,
+            4,
+            Some(log.head_hash()),
+            1_300,
+            IdentityLogEventPayloadV1::RecoveryRotate {
+                new_recovery_signing_key: public_key(&next_recovery),
+                acceptance_signature: recovery_successor_acceptance_signature,
+                recovery_authorization_signature: Some(signature(
+                    &recovery,
+                    &recovery_rotation_authorization_input(
+                        IDENTITY_LOG_WIRE_VERSION,
+                        identity_id,
+                        safe(4),
+                        Some(log.head_hash()),
+                        timestamp(1_300),
+                        public_key(&root),
+                        public_key(&next_recovery),
+                        recovery_successor_acceptance_signature,
+                    )
+                    .unwrap(),
+                )),
+            },
+        );
+        assert_eq!(
+            log.append(&old_root_recovery_rotation),
+            Err(IdentityLogError::UnauthorizedSigner)
+        );
+        assert_eq!(log.current_recovery_key(), public_key(&recovery));
+
         let recovery_rotation = signed_event(
             &next_root,
             identity_id,
@@ -2155,17 +2925,21 @@ mod tests {
             1_300,
             IdentityLogEventPayloadV1::RecoveryRotate {
                 new_recovery_signing_key: public_key(&next_recovery),
-                acceptance_signature: signature(
-                    &next_recovery,
-                    &key_rotation_acceptance_input(
+                acceptance_signature: recovery_successor_acceptance_signature,
+                recovery_authorization_signature: Some(signature(
+                    &recovery,
+                    &recovery_rotation_authorization_input(
+                        IDENTITY_LOG_WIRE_VERSION,
                         identity_id,
                         safe(4),
                         Some(log.head_hash()),
-                        KeyAcceptancePurposeV1::RecoveryRotate,
+                        timestamp(1_300),
+                        public_key(&next_root),
                         public_key(&next_recovery),
+                        recovery_successor_acceptance_signature,
                     )
                     .unwrap(),
-                ),
+                )),
             },
         );
         log.append(&recovery_rotation).unwrap();

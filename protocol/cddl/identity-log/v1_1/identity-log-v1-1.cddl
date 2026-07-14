@@ -1,0 +1,165 @@
+; Current self-certifying identity-log wire 1.1.
+; The frozen v1.0 artifact remains separately replayable under identity-log/v1.
+
+identity-log-v1-1-protocol-version = {
+  1: 1,
+  2: 1
+}
+
+identity-log-v1-1-wire-version = {
+  1: identity-log-v1-1-protocol-version,
+  2: identity-log-v1-1-protocol-version
+}
+
+identity-id-v1-1 = tstr .size 57
+uuid-v7-v1-1 = tstr .size 36
+sha256-digest-v1-1 = bstr .size 32
+ed25519-public-key-v1-1 = bstr .size 32
+device-encryption-public-key-v1-1 = bstr .size 32
+ed25519-signature-v1-1 = bstr .size 64
+utc-millis-v1-1 = -62135596800000..253402300799999
+safe-uint-v1-1 = 0..9007199254740991
+positive-safe-uint-v1-1 = 1..9007199254740991
+relay-url-v1-1 = tstr .size (1..512)
+key-acceptance-purpose-v1-1 = 1 / 2 / 3 / 4
+
+genesis-recovery-acceptance-v1-1 = {
+  1: identity-id-v1-1,
+  2: ed25519-public-key-v1-1,
+  3: ed25519-public-key-v1-1
+}
+
+key-rotation-acceptance-v1-1 = {
+  1: identity-id-v1-1,
+  2: positive-safe-uint-v1-1,
+  3: sha256-digest-v1-1 / null,
+  4: key-acceptance-purpose-v1-1,
+  5: ed25519-public-key-v1-1
+}
+
+; Exact current-recovery co-sign input for recovery-key rotation. Its digest is
+; authenticated with the recovery-rotation-authorization signature domain.
+recovery-rotation-authorization-v1-1 = {
+  1: identity-log-v1-1-wire-version,
+  2: identity-id-v1-1,
+  3: positive-safe-uint-v1-1,
+  4: sha256-digest-v1-1 / null,
+  5: utc-millis-v1-1,
+  6: ed25519-public-key-v1-1,
+  7: ed25519-public-key-v1-1,
+  8: ed25519-signature-v1-1
+}
+
+device-certificate-v1-1 = {
+  1: identity-log-v1-1-wire-version,
+  2: identity-id-v1-1,
+  3: uuid-v7-v1-1,
+  4: ed25519-public-key-v1-1,
+  5: device-encryption-public-key-v1-1,
+  6: ed25519-public-key-v1-1,
+  7: utc-millis-v1-1,
+  8: ed25519-signature-v1-1
+}
+
+relay-descriptor-v1-1 = {
+  1: identity-log-v1-1-wire-version,
+  2: [1*8 relay-url-v1-1],
+  3: utc-millis-v1-1
+}
+
+genesis-payload-v1-1 = {
+  1: ed25519-public-key-v1-1,
+  2: ed25519-public-key-v1-1,
+  3: ed25519-signature-v1-1
+}
+
+device-add-payload-v1-1 = {
+  1: device-certificate-v1-1
+}
+
+device-revoke-payload-v1-1 = {
+  1: uuid-v7-v1-1
+}
+
+key-rotation-payload-v1-1 = {
+  1: ed25519-public-key-v1-1,
+  2: ed25519-signature-v1-1
+}
+
+recovery-rotate-payload-v1-1 = {
+  1: ed25519-public-key-v1-1,
+  2: ed25519-signature-v1-1,
+  3: ed25519-signature-v1-1
+}
+
+recovery-restore-payload-v1-1 = {
+  1: ed25519-public-key-v1-1,
+  2: ed25519-public-key-v1-1,
+  3: ed25519-signature-v1-1,
+  4: ed25519-signature-v1-1
+}
+
+relay-descriptor-payload-v1-1 = {
+  1: relay-descriptor-v1-1
+}
+
+identity-log-event-common-v1-1 = (
+  1: identity-log-v1-1-wire-version,
+  2: identity-id-v1-1,
+  3: positive-safe-uint-v1-1,
+  4: sha256-digest-v1-1 / null,
+  5: utc-millis-v1-1,
+  8: ed25519-public-key-v1-1,
+  9: ed25519-signature-v1-1
+)
+
+identity-log-event-v1-1 =
+  identity-log-genesis-event-v1-1 /
+  identity-log-device-add-event-v1-1 /
+  identity-log-device-revoke-event-v1-1 /
+  identity-log-root-rotate-event-v1-1 /
+  identity-log-recovery-rotate-event-v1-1 /
+  identity-log-recovery-restore-event-v1-1 /
+  identity-log-relay-descriptor-event-v1-1
+
+identity-log-genesis-event-v1-1 = {
+  identity-log-event-common-v1-1,
+  6: 1,
+  7: genesis-payload-v1-1
+}
+
+identity-log-device-add-event-v1-1 = {
+  identity-log-event-common-v1-1,
+  6: 2,
+  7: device-add-payload-v1-1
+}
+
+identity-log-device-revoke-event-v1-1 = {
+  identity-log-event-common-v1-1,
+  6: 3,
+  7: device-revoke-payload-v1-1
+}
+
+identity-log-root-rotate-event-v1-1 = {
+  identity-log-event-common-v1-1,
+  6: 4,
+  7: key-rotation-payload-v1-1
+}
+
+identity-log-recovery-rotate-event-v1-1 = {
+  identity-log-event-common-v1-1,
+  6: 5,
+  7: recovery-rotate-payload-v1-1
+}
+
+identity-log-recovery-restore-event-v1-1 = {
+  identity-log-event-common-v1-1,
+  6: 6,
+  7: recovery-restore-payload-v1-1
+}
+
+identity-log-relay-descriptor-event-v1-1 = {
+  identity-log-event-common-v1-1,
+  6: 7,
+  7: relay-descriptor-payload-v1-1
+}

@@ -2,7 +2,7 @@
 
 - Status: Accepted for IM1a
 - Date: 2026-07-14
-- Owners: `dtx-domain`, `dtx-identity-log`, and `protocol/identity-log/v1`
+- Owners: `dtx-domain`, `dtx-identity-log`, and `protocol/cddl/identity-log/{v1,v1_1}`
 
 ## Context
 
@@ -31,13 +31,16 @@ dtxi1 + base32lower(
 ```
 
 The genesis root key is immutable for this derivation. Root rotation changes
-authority, not the public identity ID. The identity log has a separate,
-non-tenant `identity-log/v1` CDDL artifact and baseline; it must not reuse
-`EventEnvelopeV1`, tenant IDs, server sequence values, or the frozen S0.3 v1
-artifact set.
+authority, not the public identity ID. The identity log has separate,
+non-tenant CDDL artifacts and baselines; it must not reuse `EventEnvelopeV1`,
+tenant IDs, server sequence values, or the frozen S0.3 v1 artifact set.
 
-Every identity-log event and embedded device certificate carries exact writer
-and minimum-reader version `1.0`. Its bytes are RFC 8949 deterministic CBOR,
+The original exact `identity-log/v1` wire `1.0` is frozen under baseline v5
+and remains replayable only. The current writer is the disjoint
+`identity-log/v1_1` wire `1.1`, frozen under baseline v6. A log establishes one
+exact wire line at genesis and rejects mixed-line append or embedded
+certificate/descriptor data. New identities write `1.1`; readers retain `1.0`
+only to verify historical logs. Both lines use RFC 8949 deterministic CBOR,
 with positive integer map keys, closed typed shapes, no unknown fields, and no
 permissive future-version path. The signed event fields are:
 
@@ -88,6 +91,18 @@ Successor acceptance uses `{1: identity_id, 2: sequence, 3: predecessor_or_null,
 `1 = root_rotate`, `2 = recovery_rotate`, `3 = recovery_restore_root`, and
 `4 = recovery_restore_recovery`.
 
+Wire `1.1` strengthens `RecoveryRotate`: the current root signs the event, the
+current recovery key co-signs the exact transition, and the successor recovery
+key supplies its separate possession proof. The recovery co-sign body is
+`{1: wire_version, 2: identity_id, 3: sequence, 4: predecessor_or_null,
+5: occurred_at, 6: root_signer, 7: successor_recovery_key,
+8: successor_acceptance_signature}`. It is hashed with
+`dirextalk.identity-log-recovery-rotation-authorization.v1\0` and signed as
+`dirextalk.identity-log-recovery-rotation-authorization-signature.v1\0 ||
+digest`. This binds both current authorities and all successor evidence;
+neither a root-only event nor a signature made by a breached former recovery
+key can rotate the recovery authority.
+
 ### Authority matrix
 
 The projection admits only the next sequence with the exact current entry hash
@@ -102,7 +117,7 @@ ambiguous role transitions fail closed.
 | Device add | current root or current active device | Certificate is signed by the current root, names this identity, and binds a fresh device ID plus distinct signing/encryption keys. |
 | Device revoke | current root | Existing active device becomes permanently revoked. |
 | Root rotate | current root | New root signs a transition-, sequence-, and parent-bound possession proof. |
-| Recovery rotate | current root | New recovery key signs a transition-, sequence-, and parent-bound possession proof. |
+| Recovery rotate | current root | Current recovery co-signs the exact transition, and the successor recovery key signs a transition-, sequence-, and parent-bound possession proof. |
 | Recovery restore | current recovery | Both new root and new recovery keys sign transition-, sequence-, and parent-bound proofs; all prior devices are revoked. |
 | Relay descriptor update | current root | Bounded, ordered, unique literal HTTPS relay descriptor has not expired at the event time. |
 
@@ -126,6 +141,13 @@ query, fragment, control character, or backslash. The protocol deliberately
 does not invent cross-runtime URL normalization; the signed literal strings are
 the authority. Publishing or indexing a descriptor is a later opt-in policy;
 there is no implicit global directory or human-readable handle in IM1a.
+
+The projection retains the latest signed descriptor for replay and audit even
+after it expires. A caller that needs a usable route must query the active
+descriptor with a trusted `now`; it is active only when `expires_at > now`.
+The event timestamp merely rejects a descriptor that was already expired when
+the signer created that event. It is signer-provided historical metadata and
+must never stand in for the trusted current clock.
 
 ## Alternatives considered
 
@@ -170,6 +192,12 @@ expected-head conflicts as an idempotent retry boundary, not choose a winning
 fork in application memory. QR enrollment supplies transport and user consent
 around the same root certificate and active-device event authorization; it does
 not define a second device trust model.
+
+The published v1.0 CDDL/vector and baseline v5 are never rewritten. The
+recovery co-sign requirement is published only as the current v1.1 CDDL/vector
+and baseline v6. A migration reader can replay either complete line, but it
+must not append a v1.1 event to a v1.0 log or reinterpret a historical v1.0
+recovery rotation as if it had a co-signature.
 
 ## Reversal cost
 

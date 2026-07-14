@@ -39,6 +39,10 @@ Layout:
   1.1 source without changing the v1 or v2 artifact sets.
   `baseline/v4/manifest.json` independently freezes the Legacy Matrix Gateway
   run-ingress source without changing any older artifact set.
+  `baseline/v5/manifest.json` freezes the original replay-only identity-log
+  wire 1.0 source. `baseline/v6/manifest.json` freezes the disjoint current
+  identity-log wire 1.1 source, including the recovery-rotation co-sign
+  requirement; neither baseline rewrites the other.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen
