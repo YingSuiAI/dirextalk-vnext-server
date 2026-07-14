@@ -877,6 +877,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-dev-migrate"
+version = "0.1.0"
+dependencies = [
+ "dtx-storage",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "dtx-domain"
 version = "0.1.0"
 dependencies = [

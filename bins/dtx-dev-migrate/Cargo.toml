@@ -1,0 +1,18 @@
+[package]
+name = "dtx-dev-migrate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "dtx-dev-migrate"
+path = "src/main.rs"
+
+[dependencies]
+dtx-storage = { path = "../../crates/dtx-storage" }
+sqlx.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

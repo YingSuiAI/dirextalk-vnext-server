@@ -1,0 +1,157 @@
+name: dirextalk-vnext-local
+
+x-dev-image: &dev-image
+  image: dirextalk-vnext-local:dev
+
+services:
+  postgres:
+    image: postgres:18.4-alpine3.24
+    environment:
+      POSTGRES_DB: dtx_admin
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_USER: postgres
+    volumes:
+      - dtx-local-postgres:/var/lib/postgresql
+      - ./docker/local/postgres/00-local-cluster.sql:/docker-entrypoint-initdb.d/00-local-cluster.sql:ro
+    ports:
+      - "127.0.0.1:15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d dtx_admin"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  migrate-a:
+    <<: *dev-image
+    build:
+      context: .
+      dockerfile: docker/local/Dockerfile
+    command: ["/usr/local/bin/dtx-dev-migrate"]
+    environment:
+      DTX_DATABASE_URL: postgres://postgres@postgres:5432/dtx_node_a?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  migrate-b:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-dev-migrate"]
+    environment:
+      DTX_DATABASE_URL: postgres://postgres@postgres:5432/dtx_node_b?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  provision-a:
+    image: postgres:18.4-alpine3.24
+    command:
+      [
+        "psql",
+        "--set=ON_ERROR_STOP=1",
+        "--username=postgres",
+        "--dbname=postgres://postgres@postgres:5432/dtx_node_a?sslmode=disable",
+        "--file=/bootstrap/20-local-runtime-grants.sql",
+      ]
+    volumes:
+      - ./docker/local/postgres/20-local-runtime-grants.sql:/bootstrap/20-local-runtime-grants.sql:ro
+    depends_on:
+      migrate-a:
+        condition: service_completed_successfully
+    restart: "no"
+
+  provision-b:
+    image: postgres:18.4-alpine3.24
+    command:
+      [
+        "psql",
+        "--set=ON_ERROR_STOP=1",
+        "--username=postgres",
+        "--dbname=postgres://postgres@postgres:5432/dtx_node_b?sslmode=disable",
+        "--file=/bootstrap/20-local-runtime-grants.sql",
+      ]
+    volumes:
+      - ./docker/local/postgres/20-local-runtime-grants.sql:/bootstrap/20-local-runtime-grants.sql:ro
+    depends_on:
+      migrate-b:
+        condition: service_completed_successfully
+    restart: "no"
+
+  identity-a:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-identity-local"]
+    environment:
+      DTX_DEV_DATABASE_URL: postgres://dtx_identity_node@postgres:5432/dtx_node_a?sslmode=disable
+      DTX_IDENTITY_DEVICE_SESSION_AUDIENCE: http://identity-a:8080
+      DTX_IDENTITY_LISTEN: 127.0.0.1:9080
+    depends_on:
+      provision-a:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:18080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8080; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+
+  identity-b:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-identity-local"]
+    environment:
+      DTX_DEV_DATABASE_URL: postgres://dtx_identity_node@postgres:5432/dtx_node_b?sslmode=disable
+      DTX_IDENTITY_DEVICE_SESSION_AUDIENCE: http://identity-b:8080
+      DTX_IDENTITY_LISTEN: 127.0.0.1:9080
+    depends_on:
+      provision-b:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:18081:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8080; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+
+  mailbox-a:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-mailbox-node"]
+    environment:
+      DTX_DATABASE_URL: postgres://dtx_mailbox_node@postgres:5432/dtx_node_a?sslmode=disable
+      DTX_MAILBOX_BIND: 0.0.0.0:4812
+    depends_on:
+      provision-a:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:14812:4812"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/4812; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+
+  mailbox-b:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-mailbox-node"]
+    environment:
+      DTX_DATABASE_URL: postgres://dtx_mailbox_node@postgres:5432/dtx_node_b?sslmode=disable
+      DTX_MAILBOX_BIND: 0.0.0.0:4812
+    depends_on:
+      provision-b:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:14813:4812"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/4812; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+
+volumes:
+  dtx-local-postgres:

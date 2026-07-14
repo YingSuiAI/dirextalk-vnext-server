@@ -2,6 +2,7 @@
 members = [
     "bins/dtx-agent-control",
     "bins/dtx-agent-host-supervisor",
+    "bins/dtx-dev-migrate",
     "bins/dtx-identity-node",
     "bins/dtx-mailbox-node",
     "crates/dtx-agent-control",
