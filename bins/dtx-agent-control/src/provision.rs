@@ -195,6 +195,7 @@ struct PlanConnector {
 #[serde(rename_all = "snake_case")]
 enum AdapterCode {
     Codex,
+    #[serde(rename = "openclaw_acp")]
     OpenClawAcp,
     Eino,
     Rig,
@@ -926,6 +927,12 @@ mod tests {
         "request_id":"01890f47-5fd4-7cc2-8f8f-5f9476f4f005",
         "max_concurrency":1,
         "ttl_millis":300000
+      },{
+        "connector_id":"01890f47-5fd4-7cc2-8f8f-5f9476f4f008",
+        "adapter_kind":"openclaw_acp",
+        "request_id":"01890f47-5fd4-7cc2-8f8f-5f9476f4f009",
+        "max_concurrency":1,
+        "ttl_millis":300000
       }]
     }"#;
 
@@ -935,6 +942,11 @@ mod tests {
         validate_and_sort_plan(&mut plan).unwrap();
         let handoff = generate_pending_handoff(&plan, 1_800_000_000_000).unwrap();
         let encoded = Zeroizing::new(serde_json::to_vec(&handoff).unwrap());
+        assert!(
+            std::str::from_utf8(&encoded)
+                .unwrap()
+                .contains("\"adapter_kind\":\"openclaw_acp\"")
+        );
         let decoded = parse_handoff(&encoded).unwrap();
         validate_handoff(&decoded, &plan, 1_800_000_000_001).unwrap();
 
