@@ -24,11 +24,11 @@ pub use mls_sequencer::{
     MLS_CANDIDATE_PROOF_DIGEST_DOMAIN, MLS_CANDIDATE_PROOF_SIGNATURE_DOMAIN,
     MLS_CONTROLLER_CONSENT_DIGEST_DOMAIN, MLS_CONTROLLER_CONSENT_SIGNATURE_DOMAIN,
     MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, MlsCommitAuthorization, MlsCommitCommand, MlsCommitExecution,
-    MlsCommitReceipt, MlsCommitSequencerRepository, MlsDeviceJoinConfirmation,
-    MlsDeviceMemberState, mls_candidate_proof_digest, mls_candidate_proof_signature_input,
-    mls_controller_consent_digest, mls_controller_consent_signature_input,
-    mls_device_confirmation_signature_input, mls_device_proof_transcript_canonical_bytes,
-    mls_opaque_commit_digest,
+    MlsCommitFeedItem, MlsCommitFeedPage, MlsCommitReceipt, MlsCommitSequencerRepository,
+    MlsDeviceJoinConfirmation, MlsDeviceMemberState, mls_candidate_proof_digest,
+    mls_candidate_proof_signature_input, mls_controller_consent_digest,
+    mls_controller_consent_signature_input, mls_device_confirmation_signature_input,
+    mls_device_proof_transcript_canonical_bytes, mls_opaque_commit_digest,
 };
 pub use repository::{
     GroupMembershipRepository, MembershipCommandExecution, PendingJoinRequest,

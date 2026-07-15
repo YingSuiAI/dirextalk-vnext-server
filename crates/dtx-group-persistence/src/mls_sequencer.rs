@@ -19,7 +19,10 @@ use uuid::Uuid;
 
 use crate::{
     GroupPersistenceError, GroupPgStore,
-    repository::{begin_authenticated_with_signing_key, resolve_mls_commit_in_transaction, settle},
+    repository::{
+        VerifiedDeviceActor, begin_authenticated_with_signing_key,
+        resolve_mls_commit_in_transaction, settle,
+    },
 };
 
 const COMMIT_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-opaque-commit.v1\0";
@@ -734,6 +737,49 @@ pub struct MlsCommitExecution {
     replayed: bool,
 }
 
+/// One immutable V30 commit-feed item. The signed receipt and opaque commit
+/// bytes are loaded from the same durable sequencer intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlsCommitFeedItem {
+    receipt: MlsCommitReceipt,
+    commit_bytes: Vec<u8>,
+}
+
+impl MlsCommitFeedItem {
+    /// Exact signed receipt facts for the admitted commit.
+    #[must_use]
+    pub fn receipt(&self) -> &MlsCommitReceipt {
+        &self.receipt
+    }
+
+    /// Exact opaque MLS Commit bytes submitted for this epoch.
+    #[must_use]
+    pub fn commit_bytes(&self) -> &[u8] {
+        &self.commit_bytes
+    }
+}
+
+/// Bounded keyset page of consecutive V30 commits after one known epoch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlsCommitFeedPage {
+    after_epoch: u64,
+    items: Vec<MlsCommitFeedItem>,
+}
+
+impl MlsCommitFeedPage {
+    /// Epoch supplied by the caller.
+    #[must_use]
+    pub const fn after_epoch(&self) -> u64 {
+        self.after_epoch
+    }
+
+    /// Consecutive V30 commits ordered by admitted epoch.
+    #[must_use]
+    pub fn items(&self) -> &[MlsCommitFeedItem] {
+        &self.items
+    }
+}
+
 impl MlsCommitExecution {
     /// Immutable receipt.
     #[must_use]
@@ -772,6 +818,87 @@ pub struct MlsCommitSequencerRepository;
 
 #[allow(clippy::missing_errors_doc, clippy::too_many_arguments)]
 impl MlsCommitSequencerRepository {
+    /// Authenticates a local active member device, verifies its fresh
+    /// route/query proof, and returns a bounded consecutive V30 commit page.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_feed_authenticated_with_proof<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        actor_identity_id: IdentityId,
+        actor_device_id: DeviceId,
+        scope: GroupScope,
+        after_epoch: u64,
+        limit: usize,
+        now_ms: i64,
+        expected_signing_key: SigningPublicKey,
+        verify_proof: F,
+    ) -> Result<MlsCommitFeedPage, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        let (mut session, authenticated) =
+            begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
+        let result = async {
+            if authenticated.session().identity_id() != actor_identity_id
+                || authenticated.session().device_id() != actor_device_id
+            {
+                return Err(GroupPersistenceError::DeviceAuthenticationRejected);
+            }
+            verify_proof(authenticated.signing_key())?;
+            load_commit_feed_in_transaction(
+                session.connection(),
+                tenant_id,
+                scope,
+                actor_identity_id,
+                actor_device_id,
+                after_epoch,
+                limit,
+                expected_signing_key,
+            )
+            .await
+        }
+        .await;
+        settle(session, result).await
+    }
+
+    /// Verifies a federated active device's fresh route/query proof, then
+    /// rechecks local active membership before reading the V30 commit page.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_feed_verified_with_proof<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        actor: VerifiedDeviceActor,
+        scope: GroupScope,
+        after_epoch: u64,
+        limit: usize,
+        expected_signing_key: SigningPublicKey,
+        verify_proof: F,
+    ) -> Result<MlsCommitFeedPage, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        let mut session = store.begin(tenant_id).await?;
+        let result = async {
+            verify_proof(actor.signing_key())?;
+            load_commit_feed_in_transaction(
+                session.connection(),
+                tenant_id,
+                scope,
+                actor.identity_id(),
+                actor.device_id(),
+                after_epoch,
+                limit,
+                expected_signing_key,
+            )
+            .await
+        }
+        .await;
+        settle(session, result).await
+    }
+
     /// Authenticates the exact actor, recomputes both V2 proof transcripts,
     /// persists the sequencer receipt, and (for an approved identity join)
     /// finalizes the canonical GM1 workflow in the same transaction.
@@ -1915,6 +2042,109 @@ async fn load_receipt(
       .fetch_optional(&mut *connection).await?;
     row.map(|row| receipt_from_row(submission_id, scope, expected_signing_key, &row))
         .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_commit_feed_in_transaction(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    scope: GroupScope,
+    actor_identity_id: IdentityId,
+    actor_device_id: DeviceId,
+    after_epoch: u64,
+    limit: usize,
+    expected_signing_key: SigningPublicKey,
+) -> Result<MlsCommitFeedPage, GroupPersistenceError> {
+    const MAX_PAGE_SIZE: usize = 64;
+
+    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+        return Err(GroupPersistenceError::CorruptData(
+            "invalid MLS commit feed page size",
+        ));
+    }
+    let after_epoch = i64::try_from(after_epoch)
+        .map_err(|_| GroupPersistenceError::CorruptData("MLS commit feed epoch"))?;
+    let limit = i64::try_from(limit)
+        .map_err(|_| GroupPersistenceError::CorruptData("MLS commit feed page size"))?;
+    let (kind, id) = scope_columns(scope);
+    let active_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM groups.members member
+             JOIN groups.mls_device_members device
+               USING (tenant_id,scope_kind,scope_id,identity_id)
+              WHERE member.tenant_id=$1 AND member.scope_kind=$2 AND member.scope_id=$3
+                AND member.identity_id=$4 AND device.device_id=$5 AND device.state='active')",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(kind)
+    .bind(&id)
+    .bind(actor_identity_id.to_string())
+    .bind(Uuid::from(actor_device_id))
+    .fetch_one(&mut *connection)
+    .await?;
+    if !active_member {
+        return Err(GroupPersistenceError::DeviceAuthenticationRejected);
+    }
+
+    let rows = sqlx::query(
+        "SELECT intent.submission_id,intent.protocol_version,intent.request_digest,
+                intent.admitted_epoch,intent.commit_bytes,intent.commit_digest,intent.welcome_digest,
+                intent.candidate_identity_id,intent.candidate_device_id,
+                intent.candidate_key_package_digest,intent.join_request_digest,
+                intent.approval_request_digest,intent.result_head_digest,
+                receipt.receipt_cbor,receipt.receipt_digest,receipt.signing_public_key,
+                receipt.signature
+           FROM groups.mls_commit_intents intent
+           JOIN groups.mls_commit_receipts receipt USING (tenant_id,submission_id)
+          WHERE intent.tenant_id=$1 AND intent.scope_kind=$2 AND intent.scope_id=$3
+            AND intent.admitted_epoch>$4 AND intent.protocol_version=3
+          ORDER BY intent.admitted_epoch
+          LIMIT $5",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(kind)
+    .bind(&id)
+    .bind(after_epoch)
+    .bind(limit)
+    .fetch_all(&mut *connection)
+    .await?;
+
+    let mut expected_epoch = u64::try_from(after_epoch)
+        .map_err(|_| GroupPersistenceError::CorruptData("MLS commit feed epoch"))?
+        .checked_add(1)
+        .ok_or(GroupPersistenceError::CorruptData(
+            "MLS commit feed epoch overflow",
+        ))?;
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let submission_id = RequestId::try_from(row.try_get::<Uuid, _>("submission_id")?)
+            .map_err(|_| GroupPersistenceError::CorruptData("MLS submission ID"))?;
+        let receipt = receipt_from_row(submission_id, scope, expected_signing_key, &row)?;
+        if receipt.protocol_version() != 3 || receipt.admitted_epoch() != expected_epoch {
+            return Err(GroupPersistenceError::CorruptData(
+                "non-consecutive MLS commit feed",
+            ));
+        }
+        let commit_bytes: Vec<u8> = row.try_get("commit_bytes")?;
+        if mls_opaque_commit_digest(&commit_bytes) != receipt.commit_digest() {
+            return Err(GroupPersistenceError::CorruptData("MLS commit feed bytes"));
+        }
+        items.push(MlsCommitFeedItem {
+            receipt,
+            commit_bytes,
+        });
+        expected_epoch =
+            expected_epoch
+                .checked_add(1)
+                .ok_or(GroupPersistenceError::CorruptData(
+                    "MLS commit feed epoch overflow",
+                ))?;
+    }
+    Ok(MlsCommitFeedPage {
+        after_epoch: u64::try_from(after_epoch)
+            .map_err(|_| GroupPersistenceError::CorruptData("MLS commit feed epoch"))?,
+        items,
+    })
 }
 
 fn receipt_from_row(
