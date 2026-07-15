@@ -30,7 +30,8 @@ const CONTACT_DELIVERY_MIGRATION_VERSION: i64 = 202_607_160_023;
 const OPAQUE_ATTACHMENTS_MIGRATION_VERSION: i64 = 202_607_160_024;
 const GROUP_MEMBERSHIP_DISCOVERY_MIGRATION_VERSION: i64 = 202_607_160_025;
 const PEER_ADMISSION_V30_MIGRATION_VERSION: i64 = 202_607_160_026;
-const EXPECTED_MIGRATION_COUNT: i64 = 26;
+const CONVERSATION_GRANT_OWNER_API_MIGRATION_VERSION: i64 = 202_607_160_027;
+const EXPECTED_MIGRATION_COUNT: i64 = 27;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -81,6 +82,8 @@ const GROUP_MEMBERSHIP_DISCOVERY_DOWN: &str =
     include_str!("../../../migrations/202607160025_group_membership_discovery.down.sql");
 const PEER_ADMISSION_V30_DOWN: &str =
     include_str!("../../../migrations/202607160026_peer_admission_v30.down.sql");
+const CONVERSATION_GRANT_OWNER_API_DOWN: &str =
+    include_str!("../../../migrations/202607160027_conversation_grant_owner_api.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -111,7 +114,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -139,8 +142,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(OPAQUE_ATTACHMENTS_MIGRATION_VERSION)
     .bind(GROUP_MEMBERSHIP_DISCOVERY_MIGRATION_VERSION)
     .bind(PEER_ADMISSION_V30_MIGRATION_VERSION)
+    .bind(CONVERSATION_GRANT_OWNER_API_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(CONVERSATION_GRANT_OWNER_API_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(PEER_ADMISSION_V30_DOWN)
         .execute(harness.admin_pool())
         .await?;
@@ -350,6 +357,26 @@ async fn runtime_role_is_non_owner_rls_bound_and_has_no_ddl()
     .fetch_one(harness.admin_pool())
     .await?;
     assert_eq!(dangerous_table_grants, 0);
+
+    let direct_group_table_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM information_schema.table_privileges
+          WHERE grantee = 'dtx_runtime_test'
+            AND table_schema = 'groups'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(direct_group_table_grants, 0);
+    let private_owner_assertion_available: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege(
+                    'dtx_runtime_test',
+                    'groups.private_conversation_owner_authorized(uuid,uuid,text)'::regprocedure,
+                    'EXECUTE'
+                )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(private_owner_assertion_available);
     assert_append_only_tables_have_no_update(&harness).await?;
 
     assert!(

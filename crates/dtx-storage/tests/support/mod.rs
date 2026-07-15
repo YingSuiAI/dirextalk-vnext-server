@@ -365,6 +365,15 @@ impl PostgresHarness {
              GRANT SELECT, INSERT ON agent.conversation_grant_permissions TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.conversation_grant_cloud_connections TO dtx_runtime_test;
 
+             -- V27 grants the production agent role this one owner-assertion
+             -- function. The test runtime gets the same narrow capability,
+             -- never direct access to groups.policy_heads.
+             GRANT USAGE ON SCHEMA groups TO dtx_runtime_test;
+             GRANT EXECUTE ON FUNCTION groups.private_conversation_owner_authorized(uuid, uuid, text)
+                TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.conversation_grant_owner_operations
+                TO dtx_runtime_test;
+
              GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
              GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA identity TO dtx_identity_runtime;
              GRANT SELECT, INSERT, UPDATE ON identity.log_heads TO dtx_identity_runtime;
