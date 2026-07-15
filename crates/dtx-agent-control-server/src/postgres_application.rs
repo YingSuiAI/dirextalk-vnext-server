@@ -20,6 +20,7 @@ use dtx_agent_persistence::{
     PendingAgentRunOffer, PersistedCommandFrame, RuntimeCapacity, RuntimeClaimRecord,
     RuntimeClaimRepository, RuntimeClaimSource,
 };
+use dtx_agent_registry::{AgentConversationPermission, AgentConversationPermissions};
 use dtx_agent_router::{
     AgentRun, ConnectorLeaseFence, DispatchMode, MAX_ROUTE_CANDIDATES, RunOffer, RunRequest,
     RunRoutingState, resolve_route_plan,
@@ -572,22 +573,24 @@ impl ValidatedNewRunAuthority {
 
 async fn validate_new_run_authority(
     connection: &mut sqlx::PgConnection,
-    tenant_id: TenantId,
-    installation_id: InstallationId,
-    conversation_id: ConversationId,
-    grant_version: u64,
+    request: &CreateAgentRunRequest,
     bindings: &BindingSet,
     clock: &dyn Clock,
 ) -> Result<ValidatedNewRunAuthority, ConnectorControlApplicationError> {
     let installation = AgentInstallationRepository::new()
-        .load(connection, tenant_id, installation_id)
+        .load(connection, request.tenant_id, request.installation_id)
         .await
         .map_err(persistence_error)?
         .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
-    let captured_grant_version = Revision::new(grant_version)
+    let captured_grant_version = Revision::new(request.grant_version)
         .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?;
     let grant = ConversationGrantRepository::new()
-        .load_for_share(connection, tenant_id, conversation_id, installation_id)
+        .load_for_share(
+            connection,
+            request.tenant_id,
+            request.conversation_id,
+            request.installation_id,
+        )
         .await
         .map_err(persistence_error)?
         .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
@@ -596,7 +599,8 @@ async fn validate_new_run_authority(
         .bindings
         .iter()
         .filter(|binding| {
-            binding.installation_id == installation_id && binding.state == BindingState::Enabled
+            binding.installation_id == request.installation_id
+                && binding.state == BindingState::Enabled
         })
         .map(|binding| binding.agent_device_id)
         .collect::<BTreeSet<_>>();
@@ -607,7 +611,7 @@ async fn validate_new_run_authority(
     for device_id in device_ids {
         devices.push(
             AgentDeviceRepository::new()
-                .load(connection, tenant_id, device_id)
+                .load(connection, request.tenant_id, device_id)
                 .await
                 .map_err(persistence_error)?
                 .ok_or(ConnectorControlApplicationError::InvalidRequest)?,
@@ -625,6 +629,9 @@ async fn validate_new_run_authority(
         .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
     if !grant.authorizes_version_for(&installation, now_millis, captured_grant_version) {
         return Err(ConnectorControlApplicationError::InvalidRequest);
+    }
+    if !permissions_authorize_run(grant.permissions(), &request.required_capabilities) {
+        return Err(ConnectorControlApplicationError::PermissionDenied);
     }
     Ok(ValidatedNewRunAuthority {
         evaluated_at_millis: now_millis,
@@ -730,10 +737,7 @@ impl PostgresConnectorControlApplication {
                 .map_err(persistence_error)?;
             let authority = validate_new_run_authority(
                 session.connection(),
-                request.tenant_id,
-                request.installation_id,
-                request.conversation_id,
-                request.grant_version,
+                &request,
                 &bindings,
                 self.clock.as_ref(),
             )
@@ -2754,6 +2758,42 @@ impl PostgresConnectorControlApplication {
     }
 }
 
+fn permissions_authorize_run(
+    permissions: &AgentConversationPermissions,
+    required_capabilities: &[String],
+) -> bool {
+    if !permissions.contains(AgentConversationPermission::ReadFutureMessages)
+        || !permissions.contains(AgentConversationPermission::SendMessages)
+    {
+        return false;
+    }
+
+    required_capabilities.iter().all(|capability| {
+        if matches!(
+            capability.as_str(),
+            "agent.run" | "chat.streaming" | "run.resume"
+        ) {
+            return true;
+        }
+        if capability.starts_with("tool.") || capability.starts_with("mcp.") {
+            return permissions.contains(AgentConversationPermission::InvokeTools);
+        }
+        if capability == "attachment.read" {
+            return permissions.contains(AgentConversationPermission::ReadAttachments);
+        }
+        if capability == "channel.comment" {
+            return permissions.contains(AgentConversationPermission::CreateChannelComments);
+        }
+        if capability == "job.start" {
+            return permissions.contains(AgentConversationPermission::StartServerJobs);
+        }
+        // Cloud capabilities need an exact typed CloudConnection grant, which
+        // the current Run request does not carry. Unknown capability families
+        // are denied until their policy mapping is explicit.
+        false
+    })
+}
+
 impl fmt::Debug for PostgresConnectorControlApplication {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -3482,4 +3522,57 @@ fn stable_name(value: &str) -> bool {
                 || byte.is_ascii_digit() && index > 0
                 || matches!(byte, b'-' | b'_' | b'.') && index > 0
         })
+}
+
+#[cfg(test)]
+mod run_permission_tests {
+    use dtx_agent_registry::{AgentConversationPermission, AgentConversationPermissions};
+
+    use super::permissions_authorize_run;
+
+    fn chat_permissions() -> AgentConversationPermissions {
+        AgentConversationPermissions::none()
+            .with(AgentConversationPermission::ReadFutureMessages)
+            .with(AgentConversationPermission::SendMessages)
+    }
+
+    #[test]
+    fn run_capabilities_are_deny_by_default_and_require_typed_authority() {
+        let chat = chat_permissions();
+        assert!(permissions_authorize_run(
+            &chat,
+            &["chat.streaming".to_owned(), "run.resume".to_owned()]
+        ));
+        assert!(!permissions_authorize_run(&chat, &["tool.read".to_owned()]));
+        assert!(!permissions_authorize_run(
+            &chat,
+            &["future.unknown".to_owned()]
+        ));
+        assert!(!permissions_authorize_run(
+            &chat,
+            &["attachment.write".to_owned()]
+        ));
+
+        let tools = chat.with(AgentConversationPermission::InvokeTools);
+        assert!(permissions_authorize_run(
+            &tools,
+            &["tool.read".to_owned(), "mcp.session".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn every_run_requires_read_and_reply_authority() {
+        let read_only = AgentConversationPermissions::none()
+            .with(AgentConversationPermission::ReadFutureMessages);
+        let send_only =
+            AgentConversationPermissions::none().with(AgentConversationPermission::SendMessages);
+        assert!(!permissions_authorize_run(
+            &read_only,
+            &["agent.run".to_owned()]
+        ));
+        assert!(!permissions_authorize_run(
+            &send_only,
+            &["agent.run".to_owned()]
+        ));
+    }
 }

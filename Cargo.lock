@@ -779,6 +779,7 @@ dependencies = [
  "dtx-agent-control-proto",
  "dtx-agent-host",
  "dtx-agent-persistence",
+ "dtx-agent-registry",
  "dtx-agent-router",
  "dtx-connect-registry",
  "dtx-domain",

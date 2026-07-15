@@ -10,6 +10,7 @@ dtx-agent-control = { path = "../dtx-agent-control" }
 dtx-agent-control-proto = { path = "../dtx-agent-control-proto" }
 dtx-agent-host = { path = "../dtx-agent-host" }
 dtx-agent-persistence = { path = "../dtx-agent-persistence" }
+dtx-agent-registry = { path = "../dtx-agent-registry" }
 dtx-agent-router = { path = "../dtx-agent-router" }
 dtx-connect-registry = { path = "../dtx-connect-registry" }
 dtx-domain = { path = "../dtx-domain" }
