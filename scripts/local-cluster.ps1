@@ -81,15 +81,15 @@ function Confirm-LocalContractRoute {
 
 function Confirm-LocalClusterEndpoints {
     $requests = @(
-        @{ Name = 'identity-a'; Method = 'Post'; Uri = 'http://127.0.0.1:18080/v1/identity/bootstrap' },
-        @{ Name = 'mailbox-a'; Method = 'Put'; Uri = 'http://127.0.0.1:14812/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
-        @{ Name = 'group-a'; Method = 'Put'; Uri = 'http://127.0.0.1:14814/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
-        @{ Name = 'identity-b'; Method = 'Post'; Uri = 'http://127.0.0.1:18081/v1/identity/bootstrap' },
-        @{ Name = 'mailbox-b'; Method = 'Put'; Uri = 'http://127.0.0.1:14813/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
-        @{ Name = 'group-b'; Method = 'Put'; Uri = 'http://127.0.0.1:14815/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
-        @{ Name = 'identity-c'; Method = 'Post'; Uri = 'http://127.0.0.1:18082/v1/identity/bootstrap' },
-        @{ Name = 'mailbox-c'; Method = 'Put'; Uri = 'http://127.0.0.1:14816/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
-        @{ Name = 'group-c'; Method = 'Put'; Uri = 'http://127.0.0.1:14817/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' }
+        @{ Name = 'node-a identity'; Method = 'Post'; Uri = 'http://127.0.0.1:18080/v1/identity/bootstrap' },
+        @{ Name = 'node-a mailbox'; Method = 'Put'; Uri = 'http://127.0.0.1:18080/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
+        @{ Name = 'node-a group'; Method = 'Put'; Uri = 'http://127.0.0.1:18080/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
+        @{ Name = 'node-b identity'; Method = 'Post'; Uri = 'http://127.0.0.1:18081/v1/identity/bootstrap' },
+        @{ Name = 'node-b mailbox'; Method = 'Put'; Uri = 'http://127.0.0.1:18081/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
+        @{ Name = 'node-b group'; Method = 'Put'; Uri = 'http://127.0.0.1:18081/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
+        @{ Name = 'node-c identity'; Method = 'Post'; Uri = 'http://127.0.0.1:18082/v1/identity/bootstrap' },
+        @{ Name = 'node-c mailbox'; Method = 'Put'; Uri = 'http://127.0.0.1:18082/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
+        @{ Name = 'node-c group'; Method = 'Put'; Uri = 'http://127.0.0.1:18082/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' }
     )
 
     foreach ($request in $requests) {
@@ -99,7 +99,7 @@ function Confirm-LocalClusterEndpoints {
 
 switch ($Action) {
     'up' {
-        $composeArguments = @('up', '--detach', '--wait', '--wait-timeout', '300')
+        $composeArguments = @('up', '--detach', '--wait', '--wait-timeout', '300', '--remove-orphans')
         if (-not $NoBuild) {
             $composeArguments += '--build'
         }

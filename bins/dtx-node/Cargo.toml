@@ -1,0 +1,22 @@
+[package]
+name = "dtx-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+dtx-domain = { path = "../../crates/dtx-domain" }
+dtx-group-node = { path = "../dtx-group-node" }
+dtx-group-persistence = { path = "../../crates/dtx-group-persistence" }
+dtx-identity-node = { path = "../dtx-identity-node" }
+dtx-identity-persistence = { path = "../../crates/dtx-identity-persistence" }
+dtx-mailbox = { path = "../../crates/dtx-mailbox" }
+dtx-mailbox-node = { path = "../dtx-mailbox-node" }
+sqlx.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

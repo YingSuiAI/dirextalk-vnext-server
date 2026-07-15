@@ -1055,6 +1055,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-node"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dtx-domain",
+ "dtx-group-node",
+ "dtx-group-persistence",
+ "dtx-identity-node",
+ "dtx-identity-persistence",
+ "dtx-mailbox",
+ "dtx-mailbox-node",
+ "sqlx",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "dtx-protocol"
 version = "0.1.0"
 dependencies = [

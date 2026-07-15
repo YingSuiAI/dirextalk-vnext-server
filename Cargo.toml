@@ -6,6 +6,7 @@ members = [
     "bins/dtx-group-node",
     "bins/dtx-identity-node",
     "bins/dtx-mailbox-node",
+    "bins/dtx-node",
     "crates/dtx-agent-control",
     "crates/dtx-agent-control-proto",
     "crates/dtx-agent-control-server",
