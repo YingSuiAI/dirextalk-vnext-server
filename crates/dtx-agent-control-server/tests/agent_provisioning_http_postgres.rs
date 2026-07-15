@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     body::{Body, to_bytes},
-    http::{Request, StatusCode, header},
+    http::{Method, Request, StatusCode, header},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_agent_control::{
@@ -30,7 +30,7 @@ use dtx_agent_host::AgentHost;
 use dtx_agent_persistence::{
     AgentDefinitionRepository, AgentDeviceRepository, AgentHostRepository,
     AgentInstallationRepository, BindingSetRepository, ConnectorRepository, CurrentWrite,
-    DefinitionInsert,
+    ConversationGrantRepository, DefinitionInsert,
 };
 use dtx_agent_registry::{
     AgentDevice, AgentDeviceCommand, AgentDeviceState, AgentInstallation, DescriptorDigest,
@@ -40,10 +40,10 @@ use dtx_connect_registry::{
     AdapterConformance, AdapterKind, BindingSet, BindingSpec, Connector, RoutingPolicy, TenantRef,
 };
 use dtx_domain::{
-    AgentDeviceId, AgentId, BindingId, BootId, Clock, ConnectorId, DeviceId, DeviceSessionId,
-    Ed25519PublicKey, HostCredentialId, HostId, IdGenerator, IdentityId, InstallationId,
-    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, SystemClock, TenantId,
-    UuidV7Generator,
+    AgentDeviceId, AgentId, BindingId, BootId, Clock, ConnectorId, ConversationId, DeviceId,
+    DeviceSessionId, Ed25519PublicKey, HostCredentialId, HostId, IdGenerator, IdentityId,
+    InstallationId, ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision,
+    SystemClock, TenantId, UuidV7Generator,
 };
 use dtx_identity_log::{
     DeviceCertificateV1, DeviceEncryptionPublicKey, IdentityLogEventPayloadV1, IdentityLogEventV1,
@@ -568,6 +568,238 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
     Ok(())
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persisted_grant()
+-> Result<(), Box<dyn Error>> {
+    TEST_NOW.get_or_init(|| {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis(),
+        )
+        .expect("current time fits i64")
+    });
+    let harness = PostgresHarness::start().await?;
+    let store = harness.runtime_store(12).await?;
+    let tenant_id = TenantId::new();
+    provision_tenant(&store, tenant_id).await?;
+
+    let owner_root = key(80);
+    let owner_device_key = key(81);
+    let owner_device_id = DeviceId::new();
+    let (owner_id, owner_head, _) = provision_identity(
+        &harness,
+        &owner_root,
+        &owner_device_key,
+        owner_device_id,
+        82,
+    )
+    .await?;
+    let (owner_credential, owner_authorization) = provision_owner_session(
+        &harness,
+        owner_id,
+        owner_device_id,
+        owner_head,
+        [0x83; 32],
+    )
+    .await?;
+
+    let non_owner_root = key(84);
+    let non_owner_device_key = key(85);
+    let non_owner_device_id = DeviceId::new();
+    let (non_owner_id, non_owner_head, non_owner_certificate) = provision_identity(
+        &harness,
+        &non_owner_root,
+        &non_owner_device_key,
+        non_owner_device_id,
+        86,
+    )
+    .await?;
+    let (non_owner_credential, non_owner_authorization) = provision_owner_session(
+        &harness,
+        non_owner_id,
+        non_owner_device_id,
+        non_owner_head,
+        [0x87; 32],
+    )
+    .await?;
+
+    let (_, connector) = provision_host_and_connector(&store, tenant_id, owner_id).await?;
+    let installation_id = InstallationId::new();
+    let agent_device_id = AgentDeviceId::new();
+    let binding_id = BindingId::new();
+    let fingerprint = DeviceCredentialFingerprint::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-device-credential-fingerprint.v1\0",
+            &non_owner_certificate.to_deterministic_cbor()?,
+        )
+        .as_bytes(),
+    );
+    provision_installation_binding(
+        &store,
+        tenant_id,
+        owner_id,
+        installation_id,
+        agent_device_id,
+        non_owner_device_id,
+        fingerprint,
+        binding_id,
+        &connector,
+    )
+    .await?;
+    let conversation_id = ConversationId::new();
+    provision_private_conversation_owner(&harness, tenant_id, conversation_id, owner_id).await?;
+
+    let (issuer, _) = certificate_issuer(now())?;
+    let app = Arc::new(application(
+        store.clone(),
+        issuer,
+        Arc::new(ConnectorCredentialAuthorizationIndex::new()),
+    ));
+    let router = agent_provisioning_owner_router(Arc::new(
+        PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app),
+    ));
+    let uri = format!("/v1/conversations/{conversation_id}/agent-grants/{installation_id}");
+    let grant_operation = RequestId::new();
+    let first_grant_body = conversation_grant_body(
+        1,
+        grant_operation,
+        tenant_id,
+        conversation_id,
+        installation_id,
+        None,
+        owner_id,
+        owner_device_id,
+        &owner_device_key,
+        Some(now() + 600_000),
+        Some([0x91; 32]),
+    )?;
+    let first = owner_conversation_grant_mutation(
+        router.clone(),
+        Method::PUT,
+        &uri,
+        &owner_authorization,
+        grant_operation,
+        "\"g0\"",
+        first_grant_body.clone(),
+    )
+    .await?;
+    assert_eq!(first.0, StatusCode::CREATED);
+
+    let replay = owner_conversation_grant_mutation(
+        router.clone(),
+        Method::PUT,
+        &uri,
+        &owner_authorization,
+        grant_operation,
+        "\"g0\"",
+        first_grant_body,
+    )
+    .await?;
+    assert_eq!(replay.0, StatusCode::OK);
+    assert_eq!(replay.1, first.1);
+
+    let changed_same_operation_body = conversation_grant_body(
+        1,
+        grant_operation,
+        tenant_id,
+        conversation_id,
+        installation_id,
+        None,
+        owner_id,
+        owner_device_id,
+        &owner_device_key,
+        Some(now() + 600_000),
+        Some([0x92; 32]),
+    )?;
+    let conflicting_retry = owner_conversation_grant_mutation(
+        router.clone(),
+        Method::PUT,
+        &uri,
+        &owner_authorization,
+        grant_operation,
+        "\"g0\"",
+        changed_same_operation_body,
+    )
+    .await?;
+    assert_eq!(conflicting_retry.0, StatusCode::CONFLICT);
+
+    let non_owner_operation = RequestId::new();
+    let non_owner_attempt = owner_conversation_grant_mutation(
+        router.clone(),
+        Method::PUT,
+        &uri,
+        &non_owner_authorization,
+        non_owner_operation,
+        "\"g1\"",
+        conversation_grant_body(
+            1,
+            non_owner_operation,
+            tenant_id,
+            conversation_id,
+            installation_id,
+            Some(Revision::INITIAL),
+            non_owner_id,
+            non_owner_device_id,
+            &non_owner_device_key,
+            Some(now() + 600_000),
+            Some([0x93; 32]),
+        )?,
+    )
+    .await?;
+    assert_eq!(non_owner_attempt.0, StatusCode::FORBIDDEN);
+
+    let revoke_operation = RequestId::new();
+    let revoked = owner_conversation_grant_mutation(
+        router.clone(),
+        Method::DELETE,
+        &uri,
+        &owner_authorization,
+        revoke_operation,
+        "\"g1\"",
+        conversation_grant_body(
+            2,
+            revoke_operation,
+            tenant_id,
+            conversation_id,
+            installation_id,
+            Some(Revision::INITIAL),
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            None,
+            None,
+        )?,
+    )
+    .await?;
+    assert_eq!(revoked.0, StatusCode::OK);
+
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let installation = AgentInstallationRepository::new()
+        .load(session.connection(), tenant_id, installation_id)
+        .await?
+        .expect("target installation persists");
+    let grant = ConversationGrantRepository::new()
+        .load_for_share(
+            session.connection(),
+            tenant_id,
+            conversation_id,
+            installation_id,
+        )
+        .await?
+        .expect("grant persists after owner revoke");
+    assert_eq!(grant.grant_version(), Revision::new(2)?);
+    assert!(grant.snapshot().revoked_at_ms.is_some());
+    assert!(!grant.authorizes_version_for(&installation, now(), Revision::INITIAL));
+    session.rollback().await?;
+
+    drop(non_owner_credential);
+    drop(owner_credential);
+    Ok(())
+}
+
 async fn owner_post(
     router: axum::Router,
     uri: &str,
@@ -615,6 +847,37 @@ async fn owner_lifecycle_post(
     ))
 }
 
+async fn owner_conversation_grant_mutation(
+    router: axum::Router,
+    method: Method,
+    uri: &str,
+    authorization: &str,
+    operation_id: RequestId,
+    if_match: &str,
+    body: Vec<u8>,
+) -> Result<(StatusCode, Vec<u8>), Box<dyn Error>> {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, authorization)
+                .header("idempotency-key", operation_id.to_string())
+                .header(header::IF_MATCH, if_match)
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.dirextalk.conversation-agent-grant.v1+cbor",
+                )
+                .body(Body::from(body))?,
+        )
+        .await?;
+    let status = response.status();
+    Ok((
+        status,
+        to_bytes(response.into_body(), 1_000_000).await?.to_vec(),
+    ))
+}
+
 async fn owner_get(
     router: axum::Router,
     uri: &str,
@@ -641,6 +904,27 @@ async fn provision_tenant(store: &PgStore, tenant_id: TenantId) -> Result<(), Bo
         .execute(session.connection())
         .await?;
     session.commit().await?;
+    Ok(())
+}
+
+async fn provision_private_conversation_owner(
+    harness: &PostgresHarness,
+    tenant_id: TenantId,
+    conversation_id: ConversationId,
+    owner_identity_id: IdentityId,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::query(
+        "INSERT INTO groups.policy_heads (
+             tenant_id, scope_kind, scope_id, owner_identity_id, policy_revision,
+             created_at_ms, updated_at_ms
+         ) VALUES ($1, 'private_conversation', $2, $3, 1, $4, $4)",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(conversation_id.to_string())
+    .bind(owner_identity_id.to_string())
+    .bind(now() - 1_000)
+    .execute(harness.admin_pool())
+    .await?;
     Ok(())
 }
 
@@ -912,6 +1196,54 @@ fn parsed_fence(fence: dtx_connect_registry::ConnectorFence) -> ParsedLeaseFence
         lease_id: fence.lease_id(),
         lease_epoch: fence.lease_epoch().get(),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conversation_grant_body(
+    action: u64,
+    operation_id: RequestId,
+    tenant_id: TenantId,
+    conversation_id: ConversationId,
+    installation_id: InstallationId,
+    expected_grant_version: Option<Revision>,
+    owner_id: IdentityId,
+    owner_device_id: DeviceId,
+    owner_key: &SigningKey,
+    grant_expires_at: Option<i64>,
+    privacy_policy_hash: Option<[u8; 32]>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let grant_expires_at = match grant_expires_at {
+        Some(expires_at) => UtcMillis::new(expires_at)?.to_canonical_value(),
+        None => CanonicalValue::Null,
+    };
+    let privacy_policy_hash = match privacy_policy_hash {
+        Some(digest) => bytes(&digest),
+        None => CanonicalValue::Null,
+    };
+    let binding = CanonicalValue::Map(vec![
+        (u(1), u(1)),
+        (u(2), u(action)),
+        (u(3), text(tenant_id)),
+        (u(4), text(conversation_id)),
+        (u(5), text(installation_id)),
+        (u(6), text(operation_id)),
+        (
+            u(7),
+            u(expected_grant_version.map_or(0, |version| version.get())),
+        ),
+        (u(8), text(owner_id)),
+        (u(9), text(owner_device_id)),
+        (u(10), UtcMillis::new(now() + 300_000)?.to_canonical_value()),
+        (u(11), grant_expires_at),
+        (u(12), privacy_policy_hash),
+    ]);
+    signed_owner_body(
+        binding,
+        b"dirextalk.conversation-agent-grant-binding.v1\0",
+        b"dirextalk.conversation-agent-grant-signature.v1\0",
+        owner_key,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
