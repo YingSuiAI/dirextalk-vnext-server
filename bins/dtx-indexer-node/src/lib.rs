@@ -11,7 +11,7 @@ use axum::{
     routing::{get, post},
 };
 use dtx_domain::{DirectoryRegistrationId, IndexerId, PublicSubjectId, TenantId};
-use dtx_http_cache::{CachedBody, ResponseCache};
+use dtx_http_cache::{CachedBody, CachedLookup, ResponseCache};
 use dtx_indexer::{
     IndexRegistrationRequestV1, IndexerError, PinnedOriginV1, RegistrationStatusV1,
     VerifiedPublicBundleV1,
@@ -46,6 +46,9 @@ const MAX_PAGE_BYTES: usize = 1_048_576;
 const MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PAGES: usize = 64;
 const RATE_LIMIT: u32 = 120;
+const CACHE_NAMESPACE: &str = "public-conditional-cache-v1";
+const PUBLIC_NOT_FOUND_TTL: Duration = Duration::from_secs(2);
+const PUBLIC_NOT_FOUND_CACHE_CONTROL: &str = "public, max-age=2, must-revalidate";
 
 #[derive(Debug)]
 pub enum NodeError {
@@ -751,6 +754,7 @@ async fn register(State(state): State<AppState>, request: Request) -> Response {
     else {
         return failure(StatusCode::INTERNAL_SERVER_ERROR);
     };
+    let subject = descriptor.subject_id();
     let fetch_descriptor = if descriptor.is_tombstone() {
         admission
             .accepted_descriptor
@@ -780,7 +784,14 @@ async fn register(State(state): State<AppState>, request: Request) -> Response {
         .await
     {
         Ok(value) => {
-            state.cache.invalidate_prefix(&cache_prefix(&state)).await;
+            state
+                .cache
+                .invalidate(&format!("{}subject:{subject}", cache_prefix(&state)))
+                .await;
+            state
+                .cache
+                .invalidate_prefix(&format!("{}search:", cache_prefix(&state)))
+                .await;
             receipt_response(StatusCode::CREATED, &value)
         }
         Err(error) => map_error(&error),
@@ -806,6 +817,9 @@ async fn search(
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> Response {
+    if validated_if_none_match(&headers).is_err() || query.q.len() > 256 {
+        return failure(StatusCode::BAD_REQUEST);
+    }
     let Ok(indexer) = query.indexer_id.parse() else {
         return failure(StatusCode::BAD_REQUEST);
     };
@@ -819,17 +833,25 @@ async fn search(
         _ => return failure(StatusCode::BAD_REQUEST),
     };
     let normalized = normalize_query(&query.q);
+    if normalized.is_empty() || normalized.len() > 256 {
+        return failure(StatusCode::BAD_REQUEST);
+    }
+    if !shared_cache_eligible(&headers) {
+        return match search_bytes(&state, indexer, &normalized, kind).await {
+            Ok(bytes) => conditional_success(
+                &headers,
+                SEARCH_CONTENT_TYPE,
+                &CachedBody::new(bytes),
+                "no-store",
+            ),
+            Err(error) => map_error(&error),
+        };
+    }
     let key = format!("{}search:{normalized}:{kind:?}", cache_prefix(&state));
     match state
         .cache
         .load(key, Duration::from_secs(15), || async {
-            state
-                .store
-                .search(state.tenant, indexer, &normalized, kind)
-                .await
-                .and_then(|v| {
-                    encode_deterministic_cbor(&SearchPage(v)).map_err(|_| NodeError::Conflict)
-                })
+            search_bytes(&state, indexer, &normalized, kind).await
         })
         .await
     {
@@ -852,6 +874,9 @@ async fn get_subject(
     Path(id): Path<String>,
     Query(query): Query<SubjectQuery>,
 ) -> Response {
+    if validated_if_none_match(&headers).is_err() {
+        return failure(StatusCode::BAD_REQUEST);
+    }
     let Ok(indexer) = query.indexer_id.parse() else {
         return failure(StatusCode::BAD_REQUEST);
     };
@@ -861,25 +886,60 @@ async fn get_subject(
     let Ok(subject) = id.parse() else {
         return failure(StatusCode::BAD_REQUEST);
     };
+    if !shared_cache_eligible(&headers) {
+        return match state.store.subject(state.tenant, indexer, subject).await {
+            Ok(bytes) => conditional_success(
+                &headers,
+                DESCRIPTOR_CONTENT_TYPE,
+                &CachedBody::new(bytes),
+                "no-store",
+            ),
+            Err(error) => map_error(&error),
+        };
+    }
     let key = format!("{}subject:{subject}", cache_prefix(&state));
     match state
         .cache
-        .load(key, Duration::from_mins(1), || async {
-            state.store.subject(state.tenant, indexer, subject).await
-        })
+        .load_optional(
+            key,
+            Duration::from_mins(1),
+            PUBLIC_NOT_FOUND_TTL,
+            || async {
+                match state.store.subject(state.tenant, indexer, subject).await {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(NodeError::NotFound) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            },
+        )
         .await
     {
-        Ok(body) => conditional_success(
+        Ok(CachedLookup::Found(body)) => conditional_success(
             &headers,
             DESCRIPTOR_CONTENT_TYPE,
             &body,
             "public, max-age=60, must-revalidate",
         ),
+        Ok(CachedLookup::NotFound) => public_not_found(),
         Err(error) => map_error(&error),
     }
 }
+async fn search_bytes(
+    state: &AppState,
+    indexer: IndexerId,
+    normalized: &str,
+    kind: Option<i16>,
+) -> Result<Vec<u8>, NodeError> {
+    state
+        .store
+        .search(state.tenant, indexer, normalized, kind)
+        .await
+        .and_then(|results| {
+            encode_deterministic_cbor(&SearchPage(results)).map_err(|_| NodeError::Conflict)
+        })
+}
 fn cache_prefix(state: &AppState) -> String {
-    format!("{}:{}:", state.tenant, state.indexer_id)
+    format!("{}:{}:{CACHE_NAMESPACE}:", state.tenant, state.indexer_id)
 }
 fn normalize_query(value: &str) -> String {
     value
@@ -916,16 +976,24 @@ fn conditional_success(
     response
 }
 fn if_none_match(headers: &HeaderMap, etag: &str) -> Result<bool, ()> {
+    Ok(validated_if_none_match(headers)?.is_some_and(|value| value == etag))
+}
+fn validated_if_none_match(headers: &HeaderMap) -> Result<Option<&str>, ()> {
     let mut values = headers.get_all(header::IF_NONE_MATCH).iter();
     let Some(value) = values.next() else {
-        return Ok(false);
+        return Ok(None);
     };
     if values.next().is_some() {
         return Err(());
     }
     let value = value.to_str().map_err(|_| ())?;
     validate_strong_etag(value)?;
-    Ok(value == etag)
+    Ok(Some(value))
+}
+fn shared_cache_eligible(headers: &HeaderMap) -> bool {
+    !headers.contains_key(header::AUTHORIZATION)
+        && !headers.contains_key(header::COOKIE)
+        && !headers.contains_key("proxy-authorization")
 }
 fn validate_strong_etag(value: &str) -> Result<(), ()> {
     let digest = value
@@ -971,6 +1039,18 @@ fn failure(status: StatusCode) -> Response {
     value
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    value
+}
+fn public_not_found() -> Response {
+    let mut value = StatusCode::NOT_FOUND.into_response();
+    value.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(PUBLIC_NOT_FOUND_CACHE_CONTROL),
+    );
+    value.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     value
 }
 fn map_error(error: &NodeError) -> Response {

@@ -405,14 +405,86 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
         (first_app.clone(), first_indexer, first_registration),
         (second_app.clone(), second_indexer, second_registration),
     ] {
+        let subject_path = format!("/v1/public-subjects/{subject}?indexer_id={indexer}");
+        for private_header in [header::AUTHORIZATION, header::COOKIE] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&subject_path)
+                        .header(private_header, "opaque")
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&subject_path)
+                        .header(header::IF_NONE_MATCH, "*")
+                        .body(Body::empty())?,
+                )
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "invalid conditional input must be rejected before a cache lookup"
+        );
+        let missing = app
+            .clone()
+            .oneshot(Request::builder().uri(&subject_path).body(Body::empty())?)
+            .await?;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=2, must-revalidate")
+        );
         let request =
             IndexRegistrationRequestV1::new(registration, indexer, v1.to_deterministic_cbor()?)?;
         assert_eq!(
-            app.oneshot(post("/v1/index-registrations", request.encode()?, now))
+            app.clone()
+                .oneshot(post("/v1/index-registrations", request.encode()?, now))
                 .await?
                 .status(),
             StatusCode::CREATED
         );
+        assert_eq!(
+            app.clone()
+                .oneshot(Request::builder().uri(&subject_path).body(Body::empty())?,)
+                .await?
+                .status(),
+            StatusCode::OK,
+            "publish must invalidate the exact local subject miss"
+        );
+        let private_read = app
+            .oneshot(
+                Request::builder()
+                    .uri(subject_path)
+                    .header(header::COOKIE, "opaque")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(private_read.status(), StatusCode::OK);
+        assert_eq!(
+            private_read
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "credential-bearing reads must bypass the shared cache"
+        );
+        assert!(private_read.headers().contains_key(header::ETAG));
     }
 
     let v2 = descriptor_version(now, 2, Some(v1.entry_hash()?), false);
@@ -552,6 +624,24 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
         return Err("receipt must be a map".into());
     };
     assert_eq!(field(&fields, 5), &CanonicalValue::Unsigned(5));
+    let revoked_subject = first_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/public-subjects/{subject}?indexer_id={first_indexer}"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(revoked_subject.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        revoked_subject
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=2, must-revalidate")
+    );
     assert_eq!(
         search_count(first_app.clone(), first_indexer, "alpha").await?,
         0

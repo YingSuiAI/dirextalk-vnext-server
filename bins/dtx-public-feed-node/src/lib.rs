@@ -17,7 +17,7 @@ use axum::{
     routing::get,
 };
 use dtx_domain::{PublicSubjectId, TenantId};
-use dtx_http_cache::{CachedBody, ResponseCache};
+use dtx_http_cache::{CachedBody, CachedLookup, ResponseCache};
 use dtx_public_descriptor::{DescriptorHeadV1, PublicDescriptorKindV1, SignedPublicDescriptorV1};
 use dtx_public_feed::{PublicFeedCursorV1, PublicFeedError, SignedPublicFeedEventV1};
 use dtx_wire::{
@@ -37,6 +37,9 @@ pub const PAGE_CONTENT_TYPE: &str = "application/vnd.dirextalk.public-feed-page.
 const MAX_EVENT_BODY: usize = 65_536;
 const MAX_CURSOR_CHARS: usize = 512;
 const MAX_DEADLINE_AHEAD_MS: i64 = 30_000;
+const CACHE_NAMESPACE: &str = "public-conditional-cache-v1";
+const PUBLIC_NOT_FOUND_TTL: Duration = Duration::from_secs(2);
+const PUBLIC_NOT_FOUND_CACHE_CONTROL: &str = "public, max-age=2, must-revalidate";
 
 #[derive(Clone)]
 pub struct PublicFeedPgStore {
@@ -499,23 +502,47 @@ async fn get_descriptor(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
+    if validated_if_none_match(&headers).is_err() {
+        return failure(StatusCode::BAD_REQUEST);
+    }
     let Ok(subject) = parse_subject(&id) else {
         return failure(StatusCode::BAD_REQUEST);
     };
-    let key = format!("{}:{subject}:descriptor", s.tenant);
+    if !shared_cache_eligible(&headers) {
+        return match s.store.descriptor(s.tenant, &subject).await {
+            Ok(bytes) => conditional_success(
+                &headers,
+                DESCRIPTOR_CONTENT_TYPE,
+                &CachedBody::new(bytes),
+                "no-store",
+            ),
+            Err(error) => map_error(&error),
+        };
+    }
+    let key = format!("{}:{CACHE_NAMESPACE}:{subject}:descriptor", s.tenant);
     match s
         .cache
-        .load(key, Duration::from_mins(1), || async {
-            s.store.descriptor(s.tenant, &subject).await
-        })
+        .load_optional(
+            key,
+            Duration::from_mins(1),
+            PUBLIC_NOT_FOUND_TTL,
+            || async {
+                match s.store.descriptor(s.tenant, &subject).await {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(StoreError::NotFound) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            },
+        )
         .await
     {
-        Ok(body) => conditional_success(
+        Ok(CachedLookup::Found(body)) => conditional_success(
             &headers,
             DESCRIPTOR_CONTENT_TYPE,
             &body,
             "public, max-age=60, must-revalidate",
         ),
+        Ok(CachedLookup::NotFound) => public_not_found(),
         Err(e) => map_error(&e),
     }
 }
@@ -563,7 +590,7 @@ async fn put_descriptor(
     };
     if response.status().is_success() {
         s.cache
-            .invalidate_prefix(&format!("{}:{subject}:", s.tenant))
+            .invalidate_prefix(&format!("{}:{CACHE_NAMESPACE}:{subject}:", s.tenant))
             .await;
     }
     response
@@ -574,12 +601,37 @@ async fn get_page(
     Path(id): Path<String>,
     Query(q): Query<PageQuery>,
 ) -> Response {
+    if validated_if_none_match(&headers).is_err() {
+        return failure(StatusCode::BAD_REQUEST);
+    }
     let Ok(subject) = parse_subject(&id) else {
         return failure(StatusCode::BAD_REQUEST);
     };
     let limit = q.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) {
         return failure(StatusCode::BAD_REQUEST);
+    }
+    if q.cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.len() > MAX_CURSOR_CHARS)
+    {
+        return failure(StatusCode::BAD_REQUEST);
+    }
+    if !shared_cache_eligible(&headers) {
+        return match s
+            .store
+            .page(s.tenant, &subject, q.cursor.as_deref(), limit)
+            .await
+            .and_then(|page| page.encode())
+        {
+            Ok(bytes) => conditional_success(
+                &headers,
+                PAGE_CONTENT_TYPE,
+                &CachedBody::new(bytes),
+                "no-store",
+            ),
+            Err(error) => map_error(&error),
+        };
     }
     let cursor = q.cursor.clone().unwrap_or_default();
     let ttl = if q.cursor.is_some() { 300 } else { 10 };
@@ -588,18 +640,40 @@ async fn get_page(
     } else {
         "public, max-age=10, must-revalidate"
     };
-    let key = format!("{}:{subject}:feed:{cursor}:{limit}", s.tenant);
+    let page_kind = if q.cursor.is_some() {
+        "snapshot"
+    } else {
+        "root"
+    };
+    let key = format!(
+        "{}:{CACHE_NAMESPACE}:{subject}:feed:{page_kind}:{cursor}:{limit}",
+        s.tenant
+    );
     match s
         .cache
-        .load(key, Duration::from_secs(ttl), || async {
-            s.store
-                .page(s.tenant, &subject, q.cursor.as_deref(), limit)
-                .await
-                .and_then(|v| v.encode())
-        })
+        .load_optional(
+            key,
+            Duration::from_secs(ttl),
+            PUBLIC_NOT_FOUND_TTL,
+            || async {
+                match s
+                    .store
+                    .page(s.tenant, &subject, q.cursor.as_deref(), limit)
+                    .await
+                    .and_then(|v| v.encode())
+                {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(StoreError::NotFound) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            },
+        )
         .await
     {
-        Ok(body) => conditional_success(&headers, PAGE_CONTENT_TYPE, &body, cache_control),
+        Ok(CachedLookup::Found(body)) => {
+            conditional_success(&headers, PAGE_CONTENT_TYPE, &body, cache_control)
+        }
+        Ok(CachedLookup::NotFound) => public_not_found(),
         Err(e) => map_error(&e),
     }
 }
@@ -641,7 +715,10 @@ async fn append_event(
     };
     if response.status().is_success() {
         s.cache
-            .invalidate_prefix(&format!("{}:{subject}:", s.tenant))
+            .invalidate_prefix(&format!(
+                "{}:{CACHE_NAMESPACE}:{subject}:feed:root:",
+                s.tenant
+            ))
             .await;
     }
     response
@@ -726,16 +803,24 @@ fn conditional_success(
     response
 }
 fn if_none_match(headers: &HeaderMap, etag: &str) -> Result<bool, ()> {
+    Ok(validated_if_none_match(headers)?.is_some_and(|value| value == etag))
+}
+fn validated_if_none_match(headers: &HeaderMap) -> Result<Option<&str>, ()> {
     let mut values = headers.get_all(header::IF_NONE_MATCH).iter();
     let Some(value) = values.next() else {
-        return Ok(false);
+        return Ok(None);
     };
     if values.next().is_some() {
         return Err(());
     }
     let value = value.to_str().map_err(|_| ())?;
     validate_strong_etag(value)?;
-    Ok(value == etag)
+    Ok(Some(value))
+}
+fn shared_cache_eligible(headers: &HeaderMap) -> bool {
+    !headers.contains_key(header::AUTHORIZATION)
+        && !headers.contains_key(header::COOKIE)
+        && !headers.contains_key("proxy-authorization")
 }
 fn validate_strong_etag(value: &str) -> Result<(), ()> {
     let digest = value
@@ -756,6 +841,18 @@ fn failure(status: StatusCode) -> Response {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+fn public_not_found() -> Response {
+    let mut response = StatusCode::NOT_FOUND.into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(PUBLIC_NOT_FOUND_CACHE_CONTROL),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     response
 }
 fn map_error(e: &StoreError) -> Response {

@@ -129,6 +129,37 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
     let subject = descriptor.subject_id();
     let root = format!("/.well-known/dirextalk/public/v1/{subject}");
     let feed = format!("{root}/feed");
+    for private_header in [header::AUTHORIZATION, header::COOKIE] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&root)
+                    .header(private_header, "opaque")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+    }
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(&root).body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=2, must-revalidate")
+    );
     let response = app
         .clone()
         .oneshot(write_request(
@@ -140,6 +171,49 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         ))
         .await?;
     assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        app.clone()
+            .oneshot(Request::builder().uri(&root).body(Body::empty())?)
+            .await?
+            .status(),
+        StatusCode::OK,
+        "descriptor publish must invalidate the local negative cache"
+    );
+    let private_read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&root)
+                .header(header::AUTHORIZATION, "opaque")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(private_read.status(), StatusCode::OK);
+    assert_eq!(
+        private_read
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store"),
+        "credential-bearing reads must bypass the shared cache"
+    );
+    assert!(private_read.headers().contains_key(header::ETAG));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{feed}?limit=1"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=2, must-revalidate")
+    );
     let first = event(
         subject,
         1,

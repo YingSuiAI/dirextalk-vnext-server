@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! Small bounded response cache with per-key miss coalescing.
+//! Small bounded response cache with per-key miss coalescing and mutation fences.
 
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -17,6 +17,12 @@ pub struct CachedBody {
     etag: Arc<str>,
 }
 impl CachedBody {
+    /// Builds an exact representation and its strong validator without inserting it.
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        cached_body(bytes)
+    }
+
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -24,6 +30,24 @@ impl CachedBody {
     #[must_use]
     pub fn etag(&self) -> &str {
         &self.etag
+    }
+}
+
+/// A public lookup result that may safely retain a short-lived stable miss.
+#[derive(Clone, Debug)]
+pub enum CachedLookup {
+    /// Exact response bytes and their strong validator.
+    Found(CachedBody),
+    /// The public resource did not exist when the loader ran.
+    NotFound,
+}
+
+impl CachedLookup {
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Found(body) => body.bytes.len(),
+            Self::NotFound => 0,
+        }
     }
 }
 
@@ -40,7 +64,7 @@ struct CacheState {
     bytes: usize,
 }
 struct CacheEntry {
-    body: CachedBody,
+    value: CachedLookup,
     expires: Instant,
     touched: u64,
 }
@@ -73,6 +97,54 @@ impl ResponseCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<Vec<u8>, E>>,
     {
+        let scoped_key = format!("{key}\0body");
+        let result = self
+            .load_lookup_inner(scoped_key, ttl, Duration::ZERO, || async {
+                loader().await.map(Some)
+            })
+            .await?;
+        match result {
+            CachedLookup::Found(body) => Ok(body),
+            CachedLookup::NotFound => {
+                unreachable!("a body-only cache loader cannot produce a negative entry")
+            }
+        }
+    }
+
+    /// Loads a public resource, coalescing both successful and stable missing lookups.
+    ///
+    /// `None` must only mean a caller-independent public 404. Authentication,
+    /// authorization, validation, and transient loader failures must stay in `Err`
+    /// so they are never cached.
+    ///
+    /// # Errors
+    /// Returns the loader error without caching it.
+    pub async fn load_optional<E, F, Fut>(
+        &self,
+        key: String,
+        found_ttl: Duration,
+        not_found_ttl: Duration,
+        loader: F,
+    ) -> Result<CachedLookup, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<Vec<u8>>, E>>,
+    {
+        self.load_lookup_inner(format!("{key}\0optional"), found_ttl, not_found_ttl, loader)
+            .await
+    }
+
+    async fn load_lookup_inner<E, F, Fut>(
+        &self,
+        key: String,
+        found_ttl: Duration,
+        not_found_ttl: Duration,
+        loader: F,
+    ) -> Result<CachedLookup, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<Vec<u8>>, E>>,
+    {
         if let Some(value) = self.fresh(&key).await {
             return Ok(value);
         }
@@ -89,7 +161,7 @@ impl ResponseCache {
             }
         };
         let Some(gate) = gate else {
-            return loader().await.map(cached_body);
+            return loader().await.map(cached_lookup);
         };
         let _guard = gate.lock().await;
         let mut cleanup =
@@ -98,24 +170,36 @@ impl ResponseCache {
             cleanup.finish().await;
             return Ok(value);
         }
-        let bytes = match loader().await {
+        let maybe_bytes = match loader().await {
             Ok(value) => value,
             Err(error) => {
                 cleanup.finish().await;
                 return Err(error);
             }
         };
-        let body = cached_body(bytes);
+        let value = cached_lookup(maybe_bytes);
+        let ttl = match &value {
+            CachedLookup::Found(_) => found_ttl,
+            CachedLookup::NotFound => not_found_ttl,
+        };
         let mut state = self.inner.lock().await;
-        if body.bytes.len() > self.max_bytes {
-            state.flights.remove(&key);
+        if !state
+            .flights
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &gate))
+        {
             cleanup.disarm();
-            return Ok(body);
+            return Ok(value);
+        }
+        if ttl.is_zero() || value.byte_len() > self.max_bytes {
+            remove_matching_flight(&mut state, &key, &gate);
+            cleanup.disarm();
+            return Ok(value);
         }
         state.clock = state.clock.wrapping_add(1);
         let touched = state.clock;
         while state.entries.len() >= self.capacity
-            || state.bytes.saturating_add(body.bytes.len()) > self.max_bytes
+            || state.bytes.saturating_add(value.byte_len()) > self.max_bytes
         {
             let Some(oldest) = state
                 .entries
@@ -126,43 +210,50 @@ impl ResponseCache {
                 break;
             };
             if let Some(removed) = state.entries.remove(&oldest) {
-                state.bytes = state.bytes.saturating_sub(removed.body.bytes.len());
+                state.bytes = state.bytes.saturating_sub(removed.value.byte_len());
             }
         }
-        state.bytes = state.bytes.saturating_add(body.bytes.len());
+        state.bytes = state.bytes.saturating_add(value.byte_len());
         state.entries.insert(
             key.clone(),
             CacheEntry {
-                body: body.clone(),
+                value: value.clone(),
                 expires: Instant::now() + ttl,
                 touched,
             },
         );
-        state.flights.remove(&key);
+        remove_matching_flight(&mut state, &key, &gate);
         cleanup.disarm();
-        Ok(body)
+        Ok(value)
     }
 
+    /// Invalidates one logical key without evicting adjacent resources.
+    pub async fn invalidate(&self, key: &str) {
+        self.invalidate_prefix(&format!("{key}\0")).await;
+    }
+
+    /// Invalidates all logical keys starting with `prefix`.
     pub async fn invalidate_prefix(&self, prefix: &str) {
         let mut state = self.inner.lock().await;
         let removed = state
             .entries
             .iter()
             .filter(|(key, _)| key.starts_with(prefix))
-            .map(|(_, value)| value.body.bytes.len())
+            .map(|(_, value)| value.value.byte_len())
             .sum::<usize>();
         state.entries.retain(|key, _| !key.starts_with(prefix));
+        state.flights.retain(|key, _| !key.starts_with(prefix));
         state.bytes = state.bytes.saturating_sub(removed);
     }
 
-    async fn fresh(&self, key: &str) -> Option<CachedBody> {
+    async fn fresh(&self, key: &str) -> Option<CachedLookup> {
         let mut state = self.inner.lock().await;
         let now = Instant::now();
         let value = state
             .entries
             .get(key)
             .filter(|value| value.expires > now)
-            .map(|value| value.body.clone());
+            .map(|value| value.value.clone());
         if value.is_some() {
             state.clock = state.clock.wrapping_add(1);
             let touched = state.clock;
@@ -170,7 +261,7 @@ impl ResponseCache {
                 entry.touched = touched;
             }
         } else if let Some(removed) = state.entries.remove(key) {
-            state.bytes = state.bytes.saturating_sub(removed.body.bytes.len());
+            state.bytes = state.bytes.saturating_sub(removed.value.byte_len());
         }
         value
     }
@@ -246,10 +337,15 @@ fn cached_body(bytes: Vec<u8>) -> CachedBody {
         bytes: Arc::from(bytes),
     }
 }
+fn cached_lookup(bytes: Option<Vec<u8>>) -> CachedLookup {
+    bytes.map_or(CachedLookup::NotFound, |bytes| {
+        CachedLookup::Found(cached_body(bytes))
+    })
+}
 
 #[cfg(test)]
 mod tests {
-    use super::ResponseCache;
+    use super::{CachedLookup, ResponseCache};
     use std::{
         sync::{
             Arc,
@@ -280,6 +376,120 @@ mod tests {
             assert_eq!(task.await.expect("join").expect("load").bytes(), b"body");
         }
         assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_public_misses_are_coalesced_and_exactly_invalidated() {
+        let cache = ResponseCache::new(4, 1024);
+        let loads = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let cache = cache.clone();
+            let loads = Arc::clone(&loads);
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .load_optional(
+                        "tenant:v1:missing".to_owned(),
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                        || async move {
+                            loads.fetch_add(1, Ordering::SeqCst);
+                            tokio::task::yield_now().await;
+                            Ok::<_, ()>(None)
+                        },
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            assert!(matches!(
+                task.await.expect("join").expect("load"),
+                CachedLookup::NotFound
+            ));
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+        cache.invalidate("tenant:v1:missing").await;
+        let value = cache
+            .load_optional(
+                "tenant:v1:missing".to_owned(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                || async { Ok::<_, ()>(Some(b"created".to_vec())) },
+            )
+            .await
+            .expect("load after mutation");
+        let CachedLookup::Found(value) = value else {
+            panic!("local mutation must invalidate a cached public miss")
+        };
+        assert_eq!(value.bytes(), b"created");
+    }
+
+    #[tokio::test]
+    async fn optional_loader_errors_are_never_cached() {
+        let cache = ResponseCache::new(2, 16);
+        let loads = AtomicUsize::new(0);
+        for _ in 0..2 {
+            assert!(
+                cache
+                    .load_optional(
+                        "unstable".to_owned(),
+                        Duration::from_secs(1),
+                        Duration::from_secs(1),
+                        || async {
+                            loads.fetch_add(1, Ordering::SeqCst);
+                            Err::<Option<Vec<u8>>, _>(())
+                        },
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.counts().await, (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn invalidation_fences_an_in_flight_stale_loader() {
+        let cache = ResponseCache::new(2, 32);
+        let task_cache = cache.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let stale = tokio::spawn(async move {
+            task_cache
+                .load_optional(
+                    "subject".to_owned(),
+                    Duration::from_secs(30),
+                    Duration::from_secs(2),
+                    || async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        Ok::<_, ()>(Some(b"stale".to_vec()))
+                    },
+                )
+                .await
+        });
+        started_rx.await.expect("loader started");
+        cache.invalidate("subject").await;
+        release_tx.send(()).expect("release loader");
+        assert!(matches!(
+            stale.await.expect("join").expect("stale request"),
+            CachedLookup::Found(body) if body.bytes() == b"stale"
+        ));
+
+        let fresh = cache
+            .load_optional(
+                "subject".to_owned(),
+                Duration::from_secs(30),
+                Duration::from_secs(2),
+                || async { Ok::<_, ()>(Some(b"fresh".to_vec())) },
+            )
+            .await
+            .expect("fresh request");
+        assert!(matches!(
+            fresh,
+            CachedLookup::Found(body) if body.bytes() == b"fresh"
+        ));
     }
 
     #[tokio::test]
