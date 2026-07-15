@@ -639,7 +639,7 @@ async fn owner_admin_discovery_is_bound_paged_cached_and_restart_safe() -> Resul
 #[tokio::test]
 #[ignore = "requires the disposable three-node Docker Compose cluster"]
 #[allow(clippy::too_many_lines)]
-async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recovery()
+async fn three_node_compose_runs_v30_peer_admission_and_exact_recovery()
 -> Result<(), Box<dyn Error>> {
     if std::env::var("DTX_THREE_NODE_COMPOSE_ACCEPTANCE").as_deref() != Ok("1") {
         return Err(
@@ -648,6 +648,29 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
     }
 
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let admin_a =
+        sqlx::PgPool::connect("postgres://postgres@127.0.0.1:15432/dtx_node_a?sslmode=disable")
+            .await?;
+    let admin_b =
+        sqlx::PgPool::connect("postgres://postgres@127.0.0.1:15432/dtx_node_b?sslmode=disable")
+            .await?;
+    let admin_c =
+        sqlx::PgPool::connect("postgres://postgres@127.0.0.1:15432/dtx_node_c?sslmode=disable")
+            .await?;
+    for (node, pool) in [("A", &admin_a), ("B", &admin_b), ("C", &admin_c)] {
+        let migration_026_applied: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM public._sqlx_migrations
+                  WHERE version=202607160026 AND success)",
+        )
+        .fetch_one(pool)
+        .await?;
+        assert!(
+            migration_026_applied,
+            "node {node} must apply migration 026"
+        );
+    }
+
     let identity_a = IdentityPgStore::connect(
         PgConnectOptions::from_str(
             "postgres://dtx_identity_node@127.0.0.1:15432/dtx_node_a?sslmode=disable",
@@ -662,16 +685,8 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
         2,
     )
     .await?;
-    let identity_c = IdentityPgStore::connect(
-        PgConnectOptions::from_str(
-            "postgres://dtx_identity_node@127.0.0.1:15432/dtx_node_c?sslmode=disable",
-        )?,
-        2,
-    )
-    .await?;
     let owner = enroll_active_device_at(&identity_a, 151, 152, 153, [154; 32], now).await?;
-    let admin = enroll_active_device_at(&identity_b, 161, 162, 163, [164; 32], now).await?;
-    let candidate = enroll_active_device_at(&identity_c, 171, 172, 173, [174; 32], now).await?;
+    let candidate = enroll_active_device_at(&identity_b, 161, 162, 163, [164; 32], now).await?;
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
@@ -684,6 +699,11 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
         (18_081, "http://node-b:8080"),
         (18_082, "http://node-c:8080"),
     ] {
+        let health = client
+            .get(format!("http://127.0.0.1:{port}/local-health"))
+            .send()
+            .await?;
+        assert_eq!(health.status(), StatusCode::NO_CONTENT);
         let response = client
             .get(format!(
                 "http://127.0.0.1:{port}{GROUP_SERVICE_DESCRIPTOR_PATH}"
@@ -710,10 +730,11 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
             &descriptor[5].1,
             CanonicalValue::Bytes(key) if key.len() == 32
         ));
+        assert_eq!(descriptor[3].1, CanonicalValue::Unsigned(5));
+        assert_eq!(descriptor[4].1, CanonicalValue::Unsigned(64));
     }
     let group_origin = "http://127.0.0.1:18080";
-    let admin_identity_origin = "http://node-b:8080";
-    let candidate_identity_origin = "http://node-c:8080";
+    let candidate_identity_origin = "http://node-b:8080";
     let scope = GroupScope::PrivateConversation(ConversationId::new());
     let scope_path = scope_path(scope);
 
@@ -735,32 +756,43 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
     .await?;
     assert_eq!(create.status(), StatusCode::CREATED);
 
-    let grant_path = format!("{scope_path}/admins/{}", admin.identity_id);
-    let grant_key = "compose-federated-grant-0001";
-    let grant = send_network_mutation(
+    let bootstrap_submission = RequestId::new();
+    let bootstrap_path = format!("{scope_path}/mls-commits/{bootstrap_submission}");
+    let bootstrap_key = "compose-v30-owner-bootstrap-0001";
+    let bootstrap = send_network_mutation(
         &client,
         group_origin,
-        reqwest::Method::PUT,
-        &grant_path,
-        "application/vnd.dirextalk.group-grant-admin.v1+cbor",
-        grant_key,
+        reqwest::Method::POST,
+        &bootstrap_path,
+        MLS_COMMIT_CONTENT_TYPE,
+        bootstrap_key,
         Some(device_session_authorization(
             owner.session_id,
             owner.session_secret,
         )),
         None,
-        grant_admin_body(
+        mls_commit_body(
+            &owner,
             &owner,
             scope,
-            &grant_path,
-            grant_key,
-            now,
-            Revision::INITIAL,
-            admin.identity_id,
+            bootstrap_submission,
+            bootstrap_key,
+            0,
+            Sha256Digest::from_bytes([0; 32]),
+            vec![0x41; 48],
+            MlsCommitAuthorization::OwnerBootstrap,
         )?,
     )
     .await?;
-    assert_eq!(grant.status(), StatusCode::CREATED);
+    assert_eq!(bootstrap.status(), StatusCode::CREATED);
+    assert_eq!(
+        bootstrap
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(MLS_COMMIT_RECEIPT_CONTENT_TYPE)
+    );
+    let bootstrap_head = mls_receipt_head(&bootstrap.bytes().await?)?;
 
     let invite_id = InviteCapabilityId::new();
     let invite_path = format!("{scope_path}/invites/{invite_id}");
@@ -772,16 +804,18 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
         &invite_path,
         GROUP_ISSUE_INVITE_CONTENT_TYPE,
         invite_key,
+        Some(device_session_authorization(
+            owner.session_id,
+            owner.session_secret,
+        )),
         None,
-        Some(admin_identity_origin),
-        federated_issue_invite_body(
-            &admin,
-            admin_identity_origin,
+        issue_invite_body(
+            &owner,
             scope,
             &invite_path,
             invite_key,
             now,
-            Revision::new(2)?,
+            Revision::INITIAL,
             Some(candidate.identity_id),
             1,
             now + 600_000,
@@ -793,17 +827,18 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
     let join_request_id = JoinRequestId::new();
     let join_command_id = RequestId::new();
     let join_path = format!("{scope_path}/join-requests/{join_request_id}");
-    let join_key = "compose-federated-join-0001";
+    let join_key = "compose-v30-federated-join-0001";
+    let candidate_key_package_digest = test_candidate_key_package_digest(&candidate);
     let join = send_network_mutation(
         &client,
         group_origin,
         reqwest::Method::PUT,
         &join_path,
-        GROUP_JOIN_REQUEST_CONTENT_TYPE,
+        GROUP_JOIN_REQUEST_V2_CONTENT_TYPE,
         join_key,
         None,
         Some(candidate_identity_origin),
-        federated_join_request_body(
+        federated_join_request_body_v2(
             &candidate,
             candidate_identity_origin,
             scope,
@@ -812,66 +847,181 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
             now,
             join_command_id,
             invite_id,
-            Revision::new(3)?,
-            Sha256Digest::hash_domain(b"compose-group-head\0", b"join"),
+            Revision::new(2)?,
+            bootstrap_head,
+            candidate_key_package_digest,
         )?,
     )
     .await?;
     assert_eq!(join.status(), StatusCode::ACCEPTED);
-    assert_membership_phase(&join.bytes().await?, 1)?;
-
-    let join_receipt_path = format!("{scope_path}/membership-receipts/{join_command_id}");
-    let recovered_join = send_network_receipt_query(
-        &client,
-        group_origin,
-        &join_receipt_path,
-        candidate_identity_origin,
-        receipt_query_proof(
-            &candidate,
-            candidate_identity_origin,
-            scope,
-            &join_receipt_path,
-            join_command_id,
-            now + 1,
-        )?,
-    )
-    .await?;
-    assert_eq!(recovered_join.status(), StatusCode::OK);
-    assert_membership_phase(&recovered_join.bytes().await?, 1)?;
+    assert_eq!(
+        join.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE)
+    );
+    let join_receipt = join.bytes().await?;
+    assert_membership_phase(&join_receipt, 1)?;
+    let join_request_digest = membership_receipt_request_digest(&join_receipt)?;
 
     let approval_command_id = RequestId::new();
     let approval_path = format!("{join_path}/approvals");
-    let approval_key = "compose-federated-approval-0001";
+    let approval_key = "compose-v30-owner-approval-0001";
+    let approval_body = approve_join_body_v2(
+        &owner,
+        scope,
+        &approval_path,
+        approval_key,
+        now,
+        approval_command_id,
+        candidate.identity_id,
+        candidate.device_id,
+        invite_id,
+        Revision::new(3)?,
+        bootstrap_head,
+        candidate_key_package_digest,
+    )?;
+    let authorization_digest = action_proof_binding_digest(&approval_body)?;
     let approval = send_network_mutation(
         &client,
         group_origin,
         reqwest::Method::POST,
         &approval_path,
-        GROUP_APPROVE_JOIN_CONTENT_TYPE,
+        GROUP_APPROVE_JOIN_V2_CONTENT_TYPE,
         approval_key,
+        Some(device_session_authorization(
+            owner.session_id,
+            owner.session_secret,
+        )),
         None,
-        Some(admin_identity_origin),
-        federated_approve_join_body(
-            &admin,
-            admin_identity_origin,
-            scope,
-            &approval_path,
-            approval_key,
-            now,
-            approval_command_id,
-            candidate.identity_id,
-            candidate.device_id,
-            invite_id,
-            Revision::new(4)?,
-            Sha256Digest::hash_domain(b"compose-group-head\0", b"approval"),
-        )?,
+        approval_body,
     )
     .await?;
     assert_eq!(approval.status(), StatusCode::ACCEPTED);
-    assert_membership_phase(&approval.bytes().await?, 2)?;
+    assert_eq!(
+        approval
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE)
+    );
+    let approval_receipt = approval.bytes().await?;
+    assert_membership_phase(&approval_receipt, 2)?;
+    let approval_request_digest = membership_receipt_request_digest(&approval_receipt)?;
+
+    let join_submission = RequestId::new();
+    let join_commit_path = format!("{scope_path}/mls-commits/{join_submission}");
+    let join_commit_key = "compose-v30-approved-join-0001";
+    let join_commit_body = mls_commit_body_v3(
+        &owner,
+        &candidate,
+        scope,
+        join_submission,
+        1,
+        bootstrap_head,
+        vec![0x52; 48],
+        dtx_membership_command::MembershipCommandId::new(approval_command_id),
+        authorization_digest,
+        join_request_digest,
+        approval_request_digest,
+        candidate_key_package_digest,
+    )?;
+    let committed = send_network_mutation(
+        &client,
+        group_origin,
+        reqwest::Method::POST,
+        &join_commit_path,
+        MLS_COMMIT_V3_CONTENT_TYPE,
+        join_commit_key,
+        Some(device_session_authorization(
+            owner.session_id,
+            owner.session_secret,
+        )),
+        None,
+        join_commit_body.clone(),
+    )
+    .await?;
+    assert_eq!(committed.status(), StatusCode::CREATED);
+    assert_eq!(
+        committed
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some(MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE)
+    );
+    let committed_receipt = committed.bytes().await?.to_vec();
+
+    // Model a lost POST response after GM1 has already committed. The exact
+    // replay must converge to the original signed receipt, not an expired
+    // invite or missing-application error.
+    let recovered_commit = send_network_mutation(
+        &client,
+        group_origin,
+        reqwest::Method::POST,
+        &join_commit_path,
+        MLS_COMMIT_V3_CONTENT_TYPE,
+        join_commit_key,
+        Some(device_session_authorization(
+            owner.session_id,
+            owner.session_secret,
+        )),
+        None,
+        join_commit_body,
+    )
+    .await?;
+    assert_eq!(recovered_commit.status(), StatusCode::OK);
+    assert_eq!(recovered_commit.bytes().await?.as_ref(), committed_receipt);
+
+    let (receipt_digest, committed_head) = mls_receipt_facts(&committed_receipt)?;
+    let confirmation_path = format!("{join_commit_path}/confirmations/{}", candidate.device_id);
+    let confirmation_body =
+        mls_confirmation_body(&candidate, join_submission, receipt_digest, committed_head)?;
+    let first_confirmation = send_network_federated_confirmation(
+        &client,
+        group_origin,
+        &confirmation_path,
+        candidate_identity_origin,
+        mls_confirmation_proof(
+            &candidate,
+            candidate_identity_origin,
+            scope,
+            &confirmation_path,
+            join_submission,
+            &confirmation_body,
+            now + 3,
+        )?,
+        confirmation_body.clone(),
+    )
+    .await?;
+    assert_eq!(first_confirmation.status(), StatusCode::NO_CONTENT);
+    let recovered_confirmation = send_network_federated_confirmation(
+        &client,
+        group_origin,
+        &confirmation_path,
+        candidate_identity_origin,
+        mls_confirmation_proof(
+            &candidate,
+            candidate_identity_origin,
+            scope,
+            &confirmation_path,
+            join_submission,
+            &confirmation_body,
+            now + 4,
+        )?,
+        confirmation_body,
+    )
+    .await?;
+    assert_eq!(recovered_confirmation.status(), StatusCode::NO_CONTENT);
+    let confirmation_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM groups.mls_join_confirmations WHERE submission_id::text=$1",
+    )
+    .bind(join_submission.to_string())
+    .fetch_one(&admin_a)
+    .await?;
+    assert_eq!(confirmation_count, 1, "fresh-proof replay keeps one leaf");
 
     let approval_receipt_path = format!("{scope_path}/membership-receipts/{approval_command_id}");
-    let recovered_approval = send_network_receipt_query(
+    let committed_membership = send_network_receipt_query(
         &client,
         group_origin,
         &approval_receipt_path,
@@ -882,12 +1032,26 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
             scope,
             &approval_receipt_path,
             approval_command_id,
-            now + 2,
+            now + 5,
         )?,
     )
     .await?;
-    assert_eq!(recovered_approval.status(), StatusCode::OK);
-    assert_membership_phase(&recovered_approval.bytes().await?, 2)?;
+    assert_eq!(committed_membership.status(), StatusCode::OK);
+    assert_membership_phase(&committed_membership.bytes().await?, 4)?;
+
+    let scope_id = scope_path.rsplit('/').next().ok_or("scope ID")?;
+    for (node, pool, expected) in [
+        ("A", &admin_a, 1_i64),
+        ("B", &admin_b, 0_i64),
+        ("C", &admin_c, 0_i64),
+    ] {
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM groups.policy_heads WHERE scope_id=$1")
+                .bind(scope_id)
+                .fetch_one(pool)
+                .await?;
+        assert_eq!(count, expected, "group scope isolation on node {node}");
+    }
     Ok(())
 }
 
@@ -1856,6 +2020,49 @@ fn federated_join_request_body(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn federated_join_request_body_v2(
+    active: &ActiveDevice,
+    identity_origin: &str,
+    scope: GroupScope,
+    path: &str,
+    idempotency_key: &str,
+    issued_at: i64,
+    command_id: RequestId,
+    invite_id: InviteCapabilityId,
+    expected_revision: Revision,
+    sequencer_head: Sha256Digest,
+    candidate_key_package_digest: Sha256Digest,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let signable = numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        CanonicalValue::Text(command_id.to_string()),
+        CanonicalValue::Text(invite_id.to_string()),
+        CanonicalValue::Unsigned(expected_revision.get()),
+        sequencer_head.to_canonical_value(),
+        candidate_key_package_digest.to_canonical_value(),
+    ]);
+    let proof = federated_action_proof(
+        6,
+        active,
+        identity_origin,
+        scope,
+        path,
+        idempotency_key,
+        &signable,
+        issued_at,
+    )?;
+    encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        CanonicalValue::Text(command_id.to_string()),
+        CanonicalValue::Text(invite_id.to_string()),
+        CanonicalValue::Unsigned(expected_revision.get()),
+        sequencer_head.to_canonical_value(),
+        candidate_key_package_digest.to_canonical_value(),
+        proof,
+    ]))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn approve_join_body_v2(
     active: &ActiveDevice,
     scope: GroupScope,
@@ -2256,6 +2463,27 @@ async fn send_network_mutation(
     Ok(request.send().await?)
 }
 
+async fn send_network_federated_confirmation(
+    client: &reqwest::Client,
+    group_origin: &str,
+    path: &str,
+    identity_origin: &str,
+    proof: String,
+    body: Vec<u8>,
+) -> Result<reqwest::Response, Box<dyn Error>> {
+    Ok(client
+        .post(format!("{group_origin}{path}"))
+        .header(
+            header::CONTENT_TYPE.as_str(),
+            MLS_CONFIRMATION_V3_CONTENT_TYPE,
+        )
+        .header(IDENTITY_ORIGIN_HEADER, identity_origin)
+        .header(MLS_CONFIRMATION_PROOF_HEADER, proof)
+        .body(body)
+        .send()
+        .await?)
+}
+
 async fn send_network_receipt_query(
     client: &reqwest::Client,
     group_origin: &str,
@@ -2265,6 +2493,7 @@ async fn send_network_receipt_query(
 ) -> Result<reqwest::Response, Box<dyn Error>> {
     Ok(client
         .get(format!("{group_origin}{path}"))
+        .header(header::ACCEPT.as_str(), MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE)
         .header(IDENTITY_ORIGIN_HEADER, identity_origin)
         .header(RECEIPT_QUERY_PROOF_HEADER, proof)
         .send()
