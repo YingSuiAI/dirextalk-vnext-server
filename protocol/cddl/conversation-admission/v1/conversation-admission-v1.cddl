@@ -1,0 +1,77 @@
+; Dirextalk peer conversation admission capsule V1 (baseline V30).
+; The mailbox stores only the prefixed opaque envelope. It never decrypts an
+; offer or welcome. `DTXPA1\0` precedes peer-admission-envelope-v1 bytes.
+
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+sha256 = bstr .size 32
+ed25519-key = bstr .size 32
+ed25519-signature = bstr .size 64
+safe-uint = 0..9007199254740991
+positive-safe-uint = 1..9007199254740991
+utc-millis = -62135596800000..253402300799999
+canonical-origin = tstr .size (10..512)
+
+; HPKE AAD is the exact encoding of this map. HPKE info is literal
+; `dirextalk.peer-admission-hpke.v1\0`.
+peer-admission-hpke-aad-v1 = {
+  1: 1,
+  2: uuid-v7                 ; envelope_id
+}
+
+peer-admission-envelope-v1 = {
+  1: 1,
+  2: uuid-v7,                ; envelope_id
+  3: bstr .size (1..262016)  ; opaque HPKE sealed bytes
+}
+
+; Field 21 signs exact canonical fields 1..20 with domain
+; `dirextalk.peer-admission-offer-signature.v1\0`.
+peer-admission-offer-v1 = {
+  1: 1,
+  2: 1,                      ; offer
+  3: uuid-v7,                ; admission_id
+  4: uuid-v7,                ; contact_request_id
+  5: uuid-v7,                ; conversation_id
+  6: identity-id,            ; owner identity
+  7: uuid-v7,                ; owner device
+  8: canonical-origin,       ; owner identity origin
+  9: identity-id,            ; peer identity
+  10: uuid-v7,               ; peer device
+  11: canonical-origin,      ; group origin
+  12: ed25519-key,           ; Sequencer receipt key
+  13: uuid-v7,               ; invite_id
+  14: positive-safe-uint,    ; policy revision
+  15: safe-uint,             ; MLS epoch
+  16: sha256,                ; MLS head
+  17: uuid-v7,               ; candidate KeyPackage ID
+  18: sha256,                ; candidate KeyPackage digest
+  19: utc-millis,
+  20: utc-millis,
+  21: ed25519-signature
+}
+
+; Field 20 signs exact canonical fields 1..19 with domain
+; `dirextalk.peer-admission-welcome-signature.v1\0`.
+peer-admission-welcome-v1 = {
+  1: 1,
+  2: 2,                      ; welcome
+  3: uuid-v7,                ; admission_id
+  4: uuid-v7,                ; conversation_id
+  5: identity-id,            ; owner identity
+  6: uuid-v7,                ; owner device
+  7: identity-id,            ; peer identity
+  8: uuid-v7,                ; peer device
+  9: canonical-origin,       ; group origin
+  10: ed25519-key,           ; Sequencer receipt key
+  11: uuid-v7,               ; V3 submission_id
+  12: uuid-v7,               ; V2 approval command_id
+  13: sha256,                ; V2 join request digest
+  14: sha256,                ; candidate KeyPackage digest
+  15: bstr .size (1..245760), ; exact signed V3 receipt
+  16: bstr .size (1..245760), ; exact MLS Commit
+  17: bstr .size (1..245760), ; exact MLS Welcome
+  18: utc-millis,
+  19: utc-millis,
+  20: ed25519-signature
+}

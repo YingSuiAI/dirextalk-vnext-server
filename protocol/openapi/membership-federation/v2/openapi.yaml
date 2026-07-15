@@ -1,0 +1,55 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Federated Membership V2
+  version: 2.0.0
+  description: >-
+    Cross-node use of membership V2. Authorization is never forwarded. The
+    V18 proof shape remains stable while its business digest covers the V2
+    body and candidate KeyPackage digest. Revoked devices fail the active-log
+    check before mutation or discovery.
+paths:
+  /v1/groups/{scope_kind}/{scope_id}/join-requests/{join_request_id}:
+    put:
+      operationId: requestFederatedJoinV2
+      parameters:
+        - $ref: '#/components/parameters/IdentityOrigin'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.group-join-request.v2+cbor:
+            schema: {$ref: '#/components/schemas/ExactCbor'}
+      responses:
+        '202': {description: Durable candidate join accepted.}
+        '401': {description: Origin, active device, lifetime, or signature rejected.}
+  /v1/groups/{scope_kind}/{scope_id}/join-requests:
+    get:
+      operationId: listFederatedJoinRequestsV2
+      parameters:
+        - $ref: '#/components/parameters/IdentityOrigin'
+        - name: DTX-Group-Query-Proof
+          in: header
+          required: true
+          schema: {type: string, pattern: '^[A-Za-z0-9_-]+$'}
+        - name: Accept
+          in: header
+          required: true
+          schema: {type: string, const: application/vnd.dirextalk.group-join-request-page.v2+cbor}
+      responses:
+        '200':
+          description: Owner/Admin page with the package digest on every item.
+          content:
+            application/vnd.dirextalk.group-join-request-page.v2+cbor:
+              schema: {$ref: '#/components/schemas/ExactCbor'}
+        '401': {description: Fresh query proof or active device rejected.}
+components:
+  parameters:
+    IdentityOrigin:
+      name: DTX-Identity-Origin
+      in: header
+      required: true
+      schema: {type: string, pattern: '^https?://[^/?#]+$'}
+  schemas:
+    ExactCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true

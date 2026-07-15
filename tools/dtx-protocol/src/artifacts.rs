@@ -147,12 +147,333 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_membership_federation_v1(root)?;
     validate_group_membership_discovery_v1(root)?;
     validate_private_messaging_artifacts(root)?;
+    validate_v30_peer_admission(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_v30_peer_admission(root: &Path) -> Result<(), ProtocolToolError> {
+    let conversation_cddl =
+        read(&root.join("protocol/cddl/conversation-admission/v1/conversation-admission-v1.cddl"))?;
+    let membership_cddl = read(&root.join("protocol/cddl/membership/v2/membership-v2.cddl"))?;
+    let federation_cddl =
+        read(&root.join("protocol/cddl/membership-federation/v2/membership-federation-v2.cddl"))?;
+    let mls_cddl = read(&root.join("protocol/cddl/mls-sequencer/v3/mls-sequencer-v3.cddl"))?;
+    for (name, cddl) in [
+        ("conversation-admission V1", &conversation_cddl),
+        ("membership V2", &membership_cddl),
+        ("membership-federation V2", &federation_cddl),
+        ("MLS Sequencer V3", &mls_cddl),
+    ] {
+        cddl_cat::parse_cddl(cddl)
+            .map_err(|error| ProtocolToolError::new(format!("parse {name} CDDL: {error}")))?;
+    }
+    for relative in [
+        "protocol/openapi/membership/v2/openapi.yaml",
+        "protocol/openapi/membership-federation/v2/openapi.yaml",
+        "protocol/openapi/mls-sequencer/v3/openapi.yaml",
+    ] {
+        let source = read(&root.join(relative))?;
+        let spec = oas3::from_yaml(&source)
+            .map_err(|error| ProtocolToolError::new(format!("parse {relative}: {error}")))?;
+        if spec.openapi != "3.1.0" {
+            return Err(ProtocolToolError::new(format!(
+                "{relative} must declare OpenAPI 3.1.0"
+            )));
+        }
+    }
+
+    let conversation = read_json(
+        &root
+            .join("protocol/test-vectors/conversation-admission/v1/conversation-admission-v1.json"),
+    )?;
+    require_v30_vector(&conversation, 1, "conversation-admission-v1")?;
+    for (field, expected) in [
+        ("outer_prefix_hex", "44545850413100"),
+        ("hpke_info", "dirextalk.peer-admission-hpke.v1\0"),
+        (
+            "offer_signature_domain",
+            "dirextalk.peer-admission-offer-signature.v1\0",
+        ),
+        (
+            "welcome_signature_domain",
+            "dirextalk.peer-admission-welcome-signature.v1\0",
+        ),
+    ] {
+        if json_string(&conversation, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "conversation-admission-v1 {field} drift"
+            )));
+        }
+    }
+    validate_uuid_fields(&conversation, &["/envelope_id"])?;
+    validate_cddl_hex(
+        "peer-admission-hpke-aad-v1",
+        &conversation_cddl,
+        json_string(&conversation, "aad_canonical_cbor_hex")?,
+    )?;
+    let envelope = decode_hex(json_string(&conversation, "prefixed_envelope_hex")?)?;
+    let prefix = decode_hex(json_string(&conversation, "outer_prefix_hex")?)?;
+    if envelope.len() > 262_144 || !envelope.starts_with(&prefix) {
+        return Err(ProtocolToolError::new(
+            "conversation-admission-v1 envelope prefix/size drift",
+        ));
+    }
+    cddl_cat::validate_cbor_bytes(
+        "peer-admission-envelope-v1",
+        &conversation_cddl,
+        &envelope[prefix.len()..],
+    )
+    .map_err(|error| ProtocolToolError::new(format!("CDDL rejected V30 envelope: {error}")))?;
+    validate_cddl_hex(
+        "peer-admission-offer-v1",
+        &conversation_cddl,
+        json_string(&conversation, "offer_canonical_cbor_hex")?,
+    )?;
+    validate_cddl_hex(
+        "peer-admission-welcome-v1",
+        &conversation_cddl,
+        json_string(&conversation, "welcome_canonical_cbor_hex")?,
+    )?;
+    let owner_key =
+        decode_lower_hex_fixed::<32>(json_string(&conversation, "owner_public_key_hex")?)?;
+    verify_signed_map_vector(
+        json_string(&conversation, "offer_canonical_cbor_hex")?,
+        21,
+        b"dirextalk.peer-admission-offer-signature.v1\0",
+        owner_key,
+        decode_lower_hex_fixed::<64>(json_string(&conversation, "offer_signature_hex")?)?,
+    )?;
+    verify_signed_map_vector(
+        json_string(&conversation, "welcome_canonical_cbor_hex")?,
+        20,
+        b"dirextalk.peer-admission-welcome-signature.v1\0",
+        owner_key,
+        decode_lower_hex_fixed::<64>(json_string(&conversation, "welcome_signature_hex")?)?,
+    )?;
+
+    let membership =
+        read_json(&root.join("protocol/test-vectors/membership/v2/membership-v2.json"))?;
+    require_v30_vector(&membership, 2, "membership-v2")?;
+    for (rule, field) in [
+        (
+            "join-request-signable-v2",
+            "join_signable_canonical_cbor_hex",
+        ),
+        ("join-request-command-v2", "join_command_canonical_cbor_hex"),
+        (
+            "membership-command-digest-transcript-v2",
+            "membership_command_digest_transcript_canonical_cbor_hex",
+        ),
+        ("pending-join-page-v2", "pending_page_canonical_cbor_hex"),
+    ] {
+        validate_cddl_hex(rule, &membership_cddl, json_string(&membership, field)?)?;
+    }
+    ensure_domain_digest(
+        b"dirextalk.membership-command-request.v2\0",
+        json_string(
+            &membership,
+            "membership_command_digest_transcript_canonical_cbor_hex",
+        )?,
+        json_string(&membership, "membership_command_digest_hex")?,
+        "membership V2 request",
+    )?;
+    let _ = decode_lower_hex_fixed::<32>(json_string(
+        &membership,
+        "candidate_key_package_digest_hex",
+    )?)?;
+
+    let federation = read_json(
+        &root.join("protocol/test-vectors/membership-federation/v2/membership-federation-v2.json"),
+    )?;
+    require_v30_vector(&federation, 2, "membership-federation-v2")?;
+    validate_cddl_hex(
+        "federated-device-action-binding-v2",
+        &federation_cddl,
+        json_string(&federation, "binding_canonical_cbor_hex")?,
+    )?;
+    validate_cddl_hex(
+        "federated-device-action-proof-v2",
+        &federation_cddl,
+        json_string(&federation, "proof_canonical_cbor_hex")?,
+    )?;
+    ensure_domain_digest(
+        b"dirextalk.membership-action-binding.v2\0",
+        json_string(&federation, "binding_canonical_cbor_hex")?,
+        json_string(&federation, "binding_digest_hex")?,
+        "federated membership V2 binding",
+    )?;
+    verify_domain_digest_signature(
+        decode_lower_hex_fixed::<32>(json_string(&federation, "candidate_public_key_hex")?)?,
+        b"dirextalk.membership-action-signature.v2\0",
+        decode_lower_hex_fixed::<32>(json_string(&federation, "binding_digest_hex")?)?,
+        decode_lower_hex_fixed::<64>(json_string(&federation, "signature_hex")?)?,
+        "federated membership V2",
+    )?;
+
+    let mls =
+        read_json(&root.join("protocol/test-vectors/mls-sequencer/v3/mls-sequencer-v3.json"))?;
+    require_v30_vector(&mls, 3, "mls-sequencer-v3")?;
+    for (rule, field) in [
+        ("mls-commit-request-v3", "request_canonical_cbor_hex"),
+        (
+            "mls-request-digest-transcript-v3",
+            "request_digest_transcript_canonical_cbor_hex",
+        ),
+        ("mls-commit-receipt-v3", "receipt_inner_canonical_cbor_hex"),
+        (
+            "signed-mls-commit-receipt-v3",
+            "signed_receipt_canonical_cbor_hex",
+        ),
+        (
+            "mls-device-join-confirmation-v3",
+            "confirmation_canonical_cbor_hex",
+        ),
+        (
+            "mls-confirmation-binding-v3",
+            "confirmation_binding_canonical_cbor_hex",
+        ),
+        (
+            "mls-confirmation-proof-v3",
+            "confirmation_proof_canonical_cbor_hex",
+        ),
+    ] {
+        validate_cddl_hex(rule, &mls_cddl, json_string(&mls, field)?)?;
+    }
+    for (domain, exact_field, digest_field, label) in [
+        (
+            b"dirextalk.mls-commit-request.v3\0".as_slice(),
+            "request_digest_transcript_canonical_cbor_hex",
+            "request_digest_hex",
+            "MLS V3 request",
+        ),
+        (
+            b"dirextalk.mls-commit-receipt.v3\0".as_slice(),
+            "receipt_inner_canonical_cbor_hex",
+            "receipt_digest_hex",
+            "MLS V3 receipt",
+        ),
+        (
+            b"dirextalk.mls-confirmation-body.v3\0".as_slice(),
+            "confirmation_canonical_cbor_hex",
+            "confirmation_body_digest_hex",
+            "MLS V3 confirmation body",
+        ),
+        (
+            b"dirextalk.mls-confirmation-binding.v3\0".as_slice(),
+            "confirmation_binding_canonical_cbor_hex",
+            "confirmation_binding_digest_hex",
+            "MLS V3 confirmation binding",
+        ),
+    ] {
+        ensure_domain_digest(
+            domain,
+            json_string(&mls, exact_field)?,
+            json_string(&mls, digest_field)?,
+            label,
+        )?;
+    }
+    verify_domain_digest_signature(
+        decode_lower_hex_fixed::<32>(json_string(&mls, "owner_public_key_hex")?)?,
+        b"dirextalk.mls-commit-receipt-signature.v3\0",
+        decode_lower_hex_fixed::<32>(json_string(&mls, "receipt_digest_hex")?)?,
+        decode_lower_hex_fixed::<64>(json_string(&mls, "receipt_signature_hex")?)?,
+        "MLS V3 receipt",
+    )?;
+    verify_domain_digest_signature(
+        decode_lower_hex_fixed::<32>(json_string(&mls, "candidate_public_key_hex")?)?,
+        b"dirextalk.mls-confirmation-proof-signature.v3\0",
+        decode_lower_hex_fixed::<32>(json_string(&mls, "confirmation_binding_digest_hex")?)?,
+        decode_lower_hex_fixed::<64>(json_string(&mls, "confirmation_proof_signature_hex")?)?,
+        "MLS V3 confirmation proof",
+    )?;
+    Ok(())
+}
+
+fn require_v30_vector(vector: &Value, version: u64, name: &str) -> Result<(), ProtocolToolError> {
+    if vector.get("version").and_then(Value::as_u64) == Some(version)
+        && vector.get("baseline").and_then(Value::as_u64) == Some(30)
+    {
+        Ok(())
+    } else {
+        Err(ProtocolToolError::new(format!(
+            "{name} version/baseline must be {version}/30"
+        )))
+    }
+}
+
+fn ensure_domain_digest(
+    domain: &[u8],
+    exact_hex: &str,
+    expected_hex: &str,
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    let exact = decode_hex(exact_hex)?;
+    decode_deterministic_cbor(&exact)
+        .map_err(|error| ProtocolToolError::new(format!("decode {label}: {error}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(exact);
+    let actual: [u8; 32] = hasher.finalize().into();
+    if lowercase_hex(&actual) == expected_hex {
+        Ok(())
+    } else {
+        Err(ProtocolToolError::new(format!("{label} digest drift")))
+    }
+}
+
+fn verify_domain_digest_signature(
+    public_key: [u8; 32],
+    domain: &[u8],
+    digest: [u8; 32],
+    signature: [u8; 64],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    let mut input = Vec::with_capacity(domain.len() + digest.len());
+    input.extend_from_slice(domain);
+    input.extend_from_slice(&digest);
+    VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| ProtocolToolError::new(format!("{label} public key invalid")))?
+        .verify_strict(&input, &Signature::from_bytes(&signature))
+        .map_err(|_| ProtocolToolError::new(format!("{label} signature invalid")))
+}
+
+fn verify_signed_map_vector(
+    signed_hex: &str,
+    signature_key: u64,
+    domain: &[u8],
+    public_key: [u8; 32],
+    expected_signature: [u8; 64],
+) -> Result<(), ProtocolToolError> {
+    let exact = decode_hex(signed_hex)?;
+    let value = decode_deterministic_cbor(&exact)
+        .map_err(|error| ProtocolToolError::new(format!("decode signed V30 map: {error}")))?;
+    let CanonicalValue::Map(mut fields) = value else {
+        return Err(ProtocolToolError::new("signed V30 vector must be a map"));
+    };
+    let Some((CanonicalValue::Unsigned(key), CanonicalValue::Bytes(signature))) = fields.pop()
+    else {
+        return Err(ProtocolToolError::new(
+            "signed V30 vector must end with a byte signature",
+        ));
+    };
+    if key != signature_key || signature.as_slice() != expected_signature {
+        return Err(ProtocolToolError::new("signed V30 vector signature drift"));
+    }
+    let unsigned = encode_deterministic_cbor(&CanonicalValue::Map(fields))
+        .map_err(|_| ProtocolToolError::new("encode unsigned V30 vector"))?;
+    let mut input = Vec::with_capacity(domain.len() + unsigned.len());
+    input.extend_from_slice(domain);
+    input.extend_from_slice(&unsigned);
+    VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| ProtocolToolError::new("V30 owner public key invalid"))?
+        .verify_strict(&input, &Signature::from_bytes(&expected_signature))
+        .map_err(|_| ProtocolToolError::new("V30 owner signature invalid"))
 }
 
 fn validate_contact_delivery_v1(root: &Path) -> Result<(), ProtocolToolError> {

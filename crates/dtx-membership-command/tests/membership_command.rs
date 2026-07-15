@@ -87,7 +87,7 @@ fn context(
 }
 
 fn with_fence(
-    context: MembershipCommandContext,
+    context: &MembershipCommandContext,
     replacement: MembershipFence,
 ) -> MembershipCommandContext {
     MembershipCommandContext::new(
@@ -150,6 +150,45 @@ fn request_digest_is_stable_and_binds_each_membership_coordinate() {
     assert_ne!(
         base.join_request_digest(),
         changed_actor.join_request_digest()
+    );
+}
+
+#[test]
+fn v2_request_and_approval_digests_bind_the_candidate_key_package() {
+    let candidate = identity(1);
+    let legacy = context(0, 0x22, candidate, 1, 2, candidate, 3, 4);
+    let first = MembershipCommandContext::new_v2(
+        legacy.command_id(),
+        legacy.idempotency_key_hash(),
+        legacy.scope(),
+        legacy.actor_identity_id(),
+        legacy.actor_device_id(),
+        legacy.join_request_id(),
+        legacy.candidate_identity_id(),
+        legacy.candidate_device_id(),
+        legacy.invite_id(),
+        legacy.fence(),
+        digest(0x41),
+    );
+    let second = MembershipCommandContext::new_v2(
+        legacy.command_id(),
+        legacy.idempotency_key_hash(),
+        legacy.scope(),
+        legacy.actor_identity_id(),
+        legacy.actor_device_id(),
+        legacy.join_request_id(),
+        legacy.candidate_identity_id(),
+        legacy.candidate_device_id(),
+        legacy.invite_id(),
+        legacy.fence(),
+        digest(0x42),
+    );
+
+    assert_ne!(legacy.join_request_digest(), first.join_request_digest());
+    assert_ne!(first.join_request_digest(), second.join_request_digest());
+    assert_ne!(
+        ApproveJoinCommand::new(first, digest(0x51)).request_digest(),
+        ApproveJoinCommand::new(second, digest(0x51)).request_digest()
     );
 }
 
@@ -258,7 +297,7 @@ fn approval_uses_its_current_fence_without_requiring_the_pending_request_fence()
     let owner = IdentityId::from_str(OWNER).expect("fixture owner ID is canonical");
     let join = context(0, 0x22, candidate, 1, 2, candidate, 3, 4);
     let approval_context = with_fence(
-        context(5, 0x33, owner, 5, 2, candidate, 3, 4),
+        &context(5, 0x33, owner, 5, 2, candidate, 3, 4),
         MembershipFence::new(Revision::new(8).expect("fixture revision"), digest(0x12)),
     );
     let approval = ApproveJoinCommand::new(approval_context, digest(0x44));

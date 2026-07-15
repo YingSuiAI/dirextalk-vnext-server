@@ -27,6 +27,9 @@ const REQUEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-request.v1\0";
 const HEAD_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-sequencer-head.v1\0";
 const RECEIPT_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt.v1\0";
 const RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt-signature.v1\0";
+const V3_REQUEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-request.v3\0";
+const V3_RECEIPT_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt.v3\0";
+const V3_RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt-signature.v3\0";
 const DEVICE_CONFIRMATION_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-device-join-confirmation.v1\0";
 /// V2 candidate possession transcript digest domain.
 pub const MLS_CANDIDATE_PROOF_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-candidate-proof-digest.v2\0";
@@ -98,6 +101,18 @@ pub enum MlsCommitAuthorization {
         /// Stable authorization digest produced when Owner/Admin approved.
         authorization_digest: Sha256Digest,
     },
+    /// V30 first leaf authorized exclusively by durable candidate join and
+    /// Owner/Admin approval facts. The owner never signs as the candidate.
+    ApprovedIdentityJoinV3 {
+        /// Durable Owner/Admin approval command.
+        membership_command_id: MembershipCommandId,
+        /// Fresh approval action-proof binding retained by GM1.
+        authorization_digest: Sha256Digest,
+        /// Candidate-authored V2 membership request digest.
+        join_request_digest: Sha256Digest,
+        /// Owner/Admin-authored V2 approval request digest.
+        approval_request_digest: Sha256Digest,
+    },
     /// Additional leaf for an identity already represented in group policy.
     ExistingMemberDeviceAdd {
         /// Existing active MLS device that signed the exact device-add consent.
@@ -110,6 +125,7 @@ pub enum MlsCommitAuthorization {
 /// Fully proof-verified MLS commit submission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MlsCommitCommand {
+    protocol_version: u8,
     submission_id: RequestId,
     scope: GroupScope,
     actor_identity_id: IdentityId,
@@ -160,6 +176,7 @@ impl MlsCommitCommand {
             return Err(GroupPersistenceError::MlsAuthorizationRejected);
         }
         let mut command = Self {
+            protocol_version: 2,
             submission_id,
             scope,
             actor_identity_id,
@@ -181,6 +198,62 @@ impl MlsCommitCommand {
         Ok(command)
     }
 
+    /// Constructs a V30 approved-identity commit. Candidate possession was
+    /// already verified by the durable V2 join request, so this request does
+    /// not accept or require a candidate signature over the final Commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded canonical V3 request cannot be
+    /// encoded or the delegated V2 command invariants are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v3_approved_identity_join(
+        submission_id: RequestId,
+        scope: GroupScope,
+        actor_identity_id: IdentityId,
+        actor_device_id: DeviceId,
+        candidate_identity_id: IdentityId,
+        candidate_device_id: DeviceId,
+        candidate_key_package_digest: Sha256Digest,
+        idempotency_key_hash: Sha256Digest,
+        expected_epoch: u64,
+        expected_head: Sha256Digest,
+        commit_bytes: Vec<u8>,
+        commit_digest: Sha256Digest,
+        welcome_digest: Sha256Digest,
+        membership_command_id: MembershipCommandId,
+        authorization_digest: Sha256Digest,
+        join_request_digest: Sha256Digest,
+        approval_request_digest: Sha256Digest,
+    ) -> Result<Self, GroupPersistenceError> {
+        let mut command = Self::new(
+            submission_id,
+            scope,
+            actor_identity_id,
+            actor_device_id,
+            candidate_identity_id,
+            candidate_device_id,
+            candidate_key_package_digest,
+            Sha256Digest::from_bytes([0; 32]),
+            idempotency_key_hash,
+            expected_epoch,
+            expected_head,
+            commit_bytes,
+            commit_digest,
+            welcome_digest,
+            MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                membership_command_id,
+                authorization_digest,
+                join_request_digest,
+                approval_request_digest,
+            },
+        )?;
+        command.protocol_version = 3;
+        command.request_digest = command.compute_request_digest()?;
+        Ok(command)
+    }
+
+    #[allow(clippy::too_many_lines)] // Keeping the versioned canonical field order contiguous makes transcript review safer.
     fn compute_request_digest(&self) -> Result<Sha256Digest, GroupPersistenceError> {
         let (authorization_code, command_id, authorization_digest, controller_device, consent) =
             match self.authorization {
@@ -194,6 +267,11 @@ impl MlsCommitCommand {
                 MlsCommitAuthorization::ApprovedIdentityJoin {
                     membership_command_id,
                     authorization_digest,
+                }
+                | MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                    membership_command_id,
+                    authorization_digest,
+                    ..
                 } => (
                     1,
                     CanonicalValue::Text(membership_command_id.request_id().to_string()),
@@ -212,8 +290,11 @@ impl MlsCommitCommand {
                     controller_consent_digest.to_canonical_value(),
                 ),
             };
-        let canonical = CanonicalValue::Map(vec![
-            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        let mut fields = vec![
+            (
+                CanonicalValue::Unsigned(1),
+                CanonicalValue::Unsigned(u64::from(self.protocol_version)),
+            ),
             (
                 CanonicalValue::Unsigned(2),
                 CanonicalValue::Text(self.submission_id.to_string()),
@@ -267,9 +348,34 @@ impl MlsCommitCommand {
             (CanonicalValue::Unsigned(16), authorization_digest),
             (CanonicalValue::Unsigned(17), controller_device),
             (CanonicalValue::Unsigned(18), consent),
-        ]);
+        ];
+        if let MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+            join_request_digest,
+            approval_request_digest,
+            ..
+        } = self.authorization
+        {
+            fields.push((
+                CanonicalValue::Unsigned(19),
+                join_request_digest.to_canonical_value(),
+            ));
+            fields.push((
+                CanonicalValue::Unsigned(20),
+                approval_request_digest.to_canonical_value(),
+            ));
+        }
+        let canonical = CanonicalValue::Map(fields);
         encode_deterministic_cbor(&canonical)
-            .map(|bytes| Sha256Digest::hash_domain(REQUEST_DIGEST_DOMAIN, &bytes))
+            .map(|bytes| {
+                Sha256Digest::hash_domain(
+                    if self.protocol_version == 3 {
+                        V3_REQUEST_DIGEST_DOMAIN
+                    } else {
+                        REQUEST_DIGEST_DOMAIN
+                    },
+                    &bytes,
+                )
+            })
             .map_err(|_| GroupPersistenceError::CorruptData("MLS request encoding"))
     }
 
@@ -277,6 +383,11 @@ impl MlsCommitCommand {
     #[must_use]
     pub const fn submission_id(&self) -> RequestId {
         self.submission_id
+    }
+    /// Frozen Sequencer protocol version used for this request.
+    #[must_use]
+    pub const fn protocol_version(&self) -> u8 {
+        self.protocol_version
     }
     /// Immutable canonical request digest.
     #[must_use]
@@ -362,6 +473,11 @@ fn mls_device_proof_transcript(command: &MlsCommitCommand) -> CanonicalValue {
             MlsCommitAuthorization::ApprovedIdentityJoin {
                 membership_command_id,
                 authorization_digest,
+            }
+            | MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                membership_command_id,
+                authorization_digest,
+                ..
             } => (
                 2,
                 CanonicalValue::Text(membership_command_id.request_id().to_string()),
@@ -522,12 +638,16 @@ pub fn mls_controller_consent_signature_input(
 /// Immutable signed receipt returned after one CAS-accepted opaque commit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MlsCommitReceipt {
+    protocol_version: u8,
     submission_id: RequestId,
     request_digest: Sha256Digest,
     admitted_epoch: u64,
     head_digest: Sha256Digest,
     commit_digest: Sha256Digest,
     welcome_digest: Sha256Digest,
+    candidate_key_package_digest: Sha256Digest,
+    join_request_digest: Option<Sha256Digest>,
+    approval_request_digest: Option<Sha256Digest>,
     canonical_cbor: Vec<u8>,
     receipt_digest: Sha256Digest,
     signing_public_key: SigningPublicKey,
@@ -535,6 +655,11 @@ pub struct MlsCommitReceipt {
 }
 
 impl MlsCommitReceipt {
+    /// Frozen protocol version of the stored receipt.
+    #[must_use]
+    pub const fn protocol_version(&self) -> u8 {
+        self.protocol_version
+    }
     /// Stable submission ID used to query after response loss.
     #[must_use]
     pub const fn submission_id(&self) -> RequestId {
@@ -564,6 +689,21 @@ impl MlsCommitReceipt {
     #[must_use]
     pub const fn welcome_digest(&self) -> Sha256Digest {
         self.welcome_digest
+    }
+    /// Exact candidate `KeyPackage` admitted by this receipt.
+    #[must_use]
+    pub const fn candidate_key_package_digest(&self) -> Sha256Digest {
+        self.candidate_key_package_digest
+    }
+    /// Candidate-authored V2 join request digest for V3 receipts.
+    #[must_use]
+    pub const fn join_request_digest(&self) -> Option<Sha256Digest> {
+        self.join_request_digest
+    }
+    /// Owner/Admin V2 approval request digest for V3 receipts.
+    #[must_use]
+    pub const fn approval_request_digest(&self) -> Option<Sha256Digest> {
+        self.approval_request_digest
     }
     /// Canonical unsigned receipt bytes signed by the server.
     #[must_use]
@@ -753,6 +893,75 @@ impl MlsCommitSequencerRepository {
         settle(session, result).await
     }
 
+    /// Authenticates the Owner/Admin actor and accepts a V30 approved join
+    /// using only the durable candidate join and approval facts. No candidate
+    /// signature or private authority is accepted at this boundary.
+    pub async fn submit_authenticated_v3<FS>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        command: &MlsCommitCommand,
+        now_ms: i64,
+        sequencer_signing_key: SigningPublicKey,
+        sign_receipt: FS,
+    ) -> Result<MlsCommitExecution, GroupPersistenceError>
+    where
+        FS: FnOnce(&[u8]) -> Result<Ed25519Signature, GroupPersistenceError>,
+    {
+        if command.protocol_version != 3
+            || !matches!(
+                command.authorization,
+                MlsCommitAuthorization::ApprovedIdentityJoinV3 { .. }
+            )
+        {
+            return Err(GroupPersistenceError::MlsAuthorizationRejected);
+        }
+        let (mut session, authenticated) =
+            begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
+        if authenticated.session().identity_id() != command.actor_identity_id
+            || authenticated.session().device_id() != command.actor_device_id
+        {
+            return settle(
+                session,
+                Err(GroupPersistenceError::DeviceAuthenticationRejected),
+            )
+            .await;
+        }
+        let result = async {
+            let execution = submit_in_transaction(
+                session.connection(),
+                tenant_id,
+                command,
+                now_ms,
+                sequencer_signing_key,
+                |_| Ok(()),
+                |_| Ok(()),
+                sign_receipt,
+            )
+            .await?;
+            let MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                membership_command_id,
+                ..
+            } = command.authorization
+            else {
+                return Err(GroupPersistenceError::MlsAuthorizationRejected);
+            };
+            resolve_mls_commit_in_transaction(
+                session.connection(),
+                tenant_id,
+                command.scope,
+                membership_command_id,
+                execution.receipt.receipt_digest,
+                now_ms,
+            )
+            .await?;
+            Ok(execution)
+        }
+        .await;
+        settle(session, result).await
+    }
+
     /// Authenticates an actor or candidate before returning an immutable receipt.
     pub async fn receipt_authenticated(
         self,
@@ -826,6 +1035,28 @@ impl MlsCommitSequencerRepository {
             confirmation,
             now_ms,
             authenticated.signing_key(),
+        )
+        .await;
+        settle(session, result).await
+    }
+
+    /// Confirms a V30 leaf after the Group Node has freshly resolved the exact
+    /// federated candidate device and verified its route/body-bound proof.
+    pub async fn confirm_verified(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        confirmation: MlsDeviceJoinConfirmation,
+        now_ms: i64,
+        candidate_signing_key: SigningPublicKey,
+    ) -> Result<bool, GroupPersistenceError> {
+        let mut session = store.begin(tenant_id).await?;
+        let result = confirm_in_transaction(
+            session.connection(),
+            tenant_id,
+            confirmation,
+            now_ms,
+            candidate_signing_key,
         )
         .await;
         settle(session, result).await
@@ -983,6 +1214,10 @@ where
     if let MlsCommitAuthorization::ApprovedIdentityJoin {
         membership_command_id,
         ..
+    }
+    | MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+        membership_command_id,
+        ..
     } = command.authorization
     {
         locks.push(format!(
@@ -1084,8 +1319,15 @@ where
       .execute(&mut *connection).await?;
 
     let canonical_cbor = receipt_cbor(command, admitted_epoch, head_digest)?;
-    let receipt_digest = Sha256Digest::hash_domain(RECEIPT_DIGEST_DOMAIN, &canonical_cbor);
-    let signature_input = receipt_signature_input(receipt_digest);
+    let receipt_digest = Sha256Digest::hash_domain(
+        if command.protocol_version == 3 {
+            V3_RECEIPT_DIGEST_DOMAIN
+        } else {
+            RECEIPT_DIGEST_DOMAIN
+        },
+        &canonical_cbor,
+    );
+    let signature_input = receipt_signature_input(command.protocol_version, receipt_digest);
     let signature = sign_receipt(&signature_input)?;
     verify_signature(sequencer_signing_key, &signature_input, signature)?;
     sqlx::query(
@@ -1137,12 +1379,28 @@ where
 
     Ok(MlsCommitExecution {
         receipt: MlsCommitReceipt {
+            protocol_version: command.protocol_version,
             submission_id: command.submission_id,
             request_digest: command.request_digest,
             admitted_epoch,
             head_digest,
             commit_digest: command.commit_digest,
             welcome_digest: command.welcome_digest,
+            candidate_key_package_digest: command.candidate_key_package_digest,
+            join_request_digest: match command.authorization {
+                MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                    join_request_digest,
+                    ..
+                } => Some(join_request_digest),
+                _ => None,
+            },
+            approval_request_digest: match command.authorization {
+                MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                    approval_request_digest,
+                    ..
+                } => Some(approval_request_digest),
+                _ => None,
+            },
             canonical_cbor,
             receipt_digest,
             signing_public_key: sequencer_signing_key,
@@ -1226,6 +1484,62 @@ async fn authorize(
                 return Err(GroupPersistenceError::MlsAuthorizationRejected);
             }
         }
+        MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+            membership_command_id,
+            authorization_digest,
+            join_request_digest,
+            approval_request_digest,
+        } => {
+            let matches: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1
+                       FROM groups.membership_workflows AS workflow
+                       JOIN groups.membership_commands AS approval
+                         ON approval.tenant_id=workflow.tenant_id
+                        AND approval.scope_kind=workflow.scope_kind
+                        AND approval.scope_id=workflow.scope_id
+                        AND approval.command_id=workflow.approval_command_id
+                        AND approval.kind='approve_join'
+                       JOIN groups.membership_commands AS request
+                         ON request.tenant_id=workflow.tenant_id
+                        AND request.scope_kind=workflow.scope_kind
+                        AND request.scope_id=workflow.scope_id
+                        AND request.workflow_id=workflow.request_id
+                        AND request.kind='request_join'
+                      WHERE workflow.tenant_id=$1
+                        AND workflow.scope_kind=$2 AND workflow.scope_id=$3
+                        AND workflow.approval_command_id=$4
+                        AND workflow.state='pending_commit'
+                        AND workflow.candidate_identity_id=$5
+                        AND workflow.candidate_device_id=$6
+                        AND workflow.candidate_identity_origin IS NOT NULL
+                        AND workflow.candidate_key_package_digest=$7
+                        AND workflow.approval_actor_identity_id=$8
+                        AND workflow.approval_actor_device_id=$9
+                        AND workflow.approval_sequencer_head=$10
+                        AND workflow.authorization_digest=$11
+                        AND request.request_digest=$12
+                        AND approval.request_digest=$13)",
+            )
+            .bind(Uuid::from(tenant_id))
+            .bind(kind)
+            .bind(&id)
+            .bind(Uuid::from(membership_command_id.request_id()))
+            .bind(command.candidate_identity_id.to_string())
+            .bind(Uuid::from(command.candidate_device_id))
+            .bind(command.candidate_key_package_digest.as_bytes().as_slice())
+            .bind(command.actor_identity_id.to_string())
+            .bind(Uuid::from(command.actor_device_id))
+            .bind(command.expected_head.as_bytes().as_slice())
+            .bind(authorization_digest.as_bytes().as_slice())
+            .bind(join_request_digest.as_bytes().as_slice())
+            .bind(approval_request_digest.as_bytes().as_slice())
+            .fetch_one(&mut *connection)
+            .await?;
+            if !matches {
+                return Err(GroupPersistenceError::MlsAuthorizationRejected);
+            }
+        }
         MlsCommitAuthorization::ExistingMemberDeviceAdd {
             controller_device_id,
             ..
@@ -1283,8 +1597,12 @@ async fn insert_intent(
         authorization_digest,
         controller_device_id,
         controller_consent_digest,
+        join_request_digest,
+        approval_request_digest,
     ) = match command.authorization {
-        MlsCommitAuthorization::OwnerBootstrap => ("owner_bootstrap", None, None, None, None),
+        MlsCommitAuthorization::OwnerBootstrap => {
+            ("owner_bootstrap", None, None, None, None, None, None)
+        }
         MlsCommitAuthorization::ApprovedIdentityJoin {
             membership_command_id,
             authorization_digest,
@@ -1294,6 +1612,22 @@ async fn insert_intent(
             Some(authorization_digest.as_bytes().to_vec()),
             None,
             None,
+            None,
+            None,
+        ),
+        MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+            membership_command_id,
+            authorization_digest,
+            join_request_digest,
+            approval_request_digest,
+        } => (
+            "approved_identity_join",
+            Some(Uuid::from(membership_command_id.request_id())),
+            Some(authorization_digest.as_bytes().to_vec()),
+            None,
+            None,
+            Some(join_request_digest.as_bytes().to_vec()),
+            Some(approval_request_digest.as_bytes().to_vec()),
         ),
         MlsCommitAuthorization::ExistingMemberDeviceAdd {
             controller_device_id,
@@ -1304,6 +1638,8 @@ async fn insert_intent(
             None,
             Some(Uuid::from(controller_device_id)),
             Some(controller_consent_digest.as_bytes().to_vec()),
+            None,
+            None,
         ),
     };
     sqlx::query(
@@ -1312,8 +1648,9 @@ async fn insert_intent(
            actor_identity_id,actor_device_id,candidate_identity_id,candidate_device_id,
            candidate_key_package_digest,candidate_proof_digest,controller_device_id,
            controller_consent_digest,idempotency_key_hash,request_digest,authorization_digest,
-           parent_epoch,parent_head_digest,admitted_epoch,result_head_digest,commit_bytes,commit_digest,welcome_digest,created_at_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)",
+           parent_epoch,parent_head_digest,admitted_epoch,result_head_digest,commit_bytes,commit_digest,welcome_digest,created_at_ms,
+           protocol_version,join_request_digest,approval_request_digest)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)",
     ).bind(Uuid::from(tenant_id)).bind(Uuid::from(command.submission_id)).bind(membership_command_id)
       .bind(kind).bind(id).bind(authorization_kind).bind(command.actor_identity_id.to_string())
       .bind(Uuid::from(command.actor_device_id)).bind(command.candidate_identity_id.to_string())
@@ -1326,6 +1663,7 @@ async fn insert_intent(
       .bind(i64::try_from(admitted_epoch).map_err(|_| GroupPersistenceError::StaleMlsHead)?)
       .bind(result_head_digest.as_bytes().as_slice()).bind(&command.commit_bytes).bind(command.commit_digest.as_bytes().as_slice())
       .bind(command.welcome_digest.as_bytes().as_slice()).bind(now_ms)
+      .bind(i16::from(command.protocol_version)).bind(join_request_digest).bind(approval_request_digest)
       .execute(&mut *connection).await?;
     Ok(())
 }
@@ -1530,12 +1868,17 @@ async fn membership_command_was_admitted(
     tenant_id: TenantId,
     command: &MlsCommitCommand,
 ) -> Result<bool, GroupPersistenceError> {
-    let MlsCommitAuthorization::ApprovedIdentityJoin {
-        membership_command_id,
-        ..
-    } = command.authorization
-    else {
-        return Ok(false);
+    let membership_command_id = match command.authorization {
+        MlsCommitAuthorization::ApprovedIdentityJoin {
+            membership_command_id,
+            ..
+        }
+        | MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+            membership_command_id,
+            ..
+        } => membership_command_id,
+        MlsCommitAuthorization::OwnerBootstrap
+        | MlsCommitAuthorization::ExistingMemberDeviceAdd { .. } => return Ok(false),
     };
     let (kind, id) = scope_columns(command.scope);
     sqlx::query_scalar(
@@ -1560,8 +1903,9 @@ async fn load_receipt(
 ) -> Result<Option<MlsCommitReceipt>, GroupPersistenceError> {
     let (kind, id) = scope_columns(scope);
     let row=sqlx::query(
-        "SELECT intent.request_digest,intent.admitted_epoch,intent.commit_digest,intent.welcome_digest,
-                intent.candidate_identity_id,intent.candidate_device_id,
+        "SELECT intent.protocol_version,intent.request_digest,intent.admitted_epoch,intent.commit_digest,intent.welcome_digest,
+                intent.candidate_identity_id,intent.candidate_device_id,intent.candidate_key_package_digest,
+                intent.join_request_digest,intent.approval_request_digest,
                 intent.result_head_digest,receipt.receipt_cbor,receipt.receipt_digest,
                 receipt.signing_public_key,receipt.signature
            FROM groups.mls_commit_intents intent
@@ -1592,6 +1936,11 @@ fn receipt_from_row(
     if signing_public_key != expected_signing_key {
         return Err(GroupPersistenceError::CorruptData("MLS receipt signer"));
     }
+    let protocol_version = u8::try_from(row.try_get::<i16, _>("protocol_version")?)
+        .map_err(|_| GroupPersistenceError::CorruptData("MLS protocol version"))?;
+    if !matches!(protocol_version, 2 | 3) {
+        return Err(GroupPersistenceError::CorruptData("MLS protocol version"));
+    }
     let request_digest = digest(row.try_get("request_digest")?, "MLS request")?;
     let admitted_epoch = u64::try_from(row.try_get::<i64, _>("admitted_epoch")?)
         .map_err(|_| GroupPersistenceError::CorruptData("MLS admitted epoch"))?;
@@ -1604,8 +1953,21 @@ fn receipt_from_row(
         .map_err(|_| GroupPersistenceError::CorruptData("MLS candidate identity"))?;
     let candidate_device_id = DeviceId::try_from(row.try_get::<Uuid, _>("candidate_device_id")?)
         .map_err(|_| GroupPersistenceError::CorruptData("MLS candidate device"))?;
+    let candidate_key_package_digest = digest(
+        row.try_get("candidate_key_package_digest")?,
+        "MLS candidate KeyPackage",
+    )?;
+    let join_request_digest = row
+        .try_get::<Option<Vec<u8>>, _>("join_request_digest")?
+        .map(|value| digest(value, "MLS join request"))
+        .transpose()?;
+    let approval_request_digest = row
+        .try_get::<Option<Vec<u8>>, _>("approval_request_digest")?
+        .map(|value| digest(value, "MLS approval request"))
+        .transpose()?;
     let canonical_cbor: Vec<u8> = row.try_get("receipt_cbor")?;
     let expected_cbor = receipt_cbor_facts(
+        protocol_version,
         submission_id,
         scope,
         request_digest,
@@ -1615,6 +1977,9 @@ fn receipt_from_row(
         welcome_digest,
         candidate_identity_id,
         candidate_device_id,
+        candidate_key_package_digest,
+        join_request_digest,
+        approval_request_digest,
     )?;
     if canonical_cbor != expected_cbor {
         return Err(GroupPersistenceError::CorruptData(
@@ -1622,22 +1987,35 @@ fn receipt_from_row(
         ));
     }
     let receipt_digest = digest(row.try_get("receipt_digest")?, "MLS receipt")?;
-    if receipt_digest != Sha256Digest::hash_domain(RECEIPT_DIGEST_DOMAIN, &canonical_cbor) {
+    if receipt_digest
+        != Sha256Digest::hash_domain(
+            if protocol_version == 3 {
+                V3_RECEIPT_DIGEST_DOMAIN
+            } else {
+                RECEIPT_DIGEST_DOMAIN
+            },
+            &canonical_cbor,
+        )
+    {
         return Err(GroupPersistenceError::CorruptData("MLS receipt digest"));
     }
     let signature = Ed25519Signature::from_bytes(signature);
     verify_signature(
         signing_public_key,
-        &receipt_signature_input(receipt_digest),
+        &receipt_signature_input(protocol_version, receipt_digest),
         signature,
     )?;
     Ok(MlsCommitReceipt {
+        protocol_version,
         submission_id,
         request_digest,
         admitted_epoch,
         head_digest,
         commit_digest,
         welcome_digest,
+        candidate_key_package_digest,
+        join_request_digest,
+        approval_request_digest,
         canonical_cbor,
         receipt_digest,
         signing_public_key,
@@ -1697,6 +2075,7 @@ fn receipt_cbor(
     head: Sha256Digest,
 ) -> Result<Vec<u8>, GroupPersistenceError> {
     receipt_cbor_facts(
+        command.protocol_version,
         command.submission_id,
         command.scope,
         command.request_digest,
@@ -1706,11 +2085,27 @@ fn receipt_cbor(
         command.welcome_digest,
         command.candidate_identity_id,
         command.candidate_device_id,
+        command.candidate_key_package_digest,
+        match command.authorization {
+            MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                join_request_digest,
+                ..
+            } => Some(join_request_digest),
+            _ => None,
+        },
+        match command.authorization {
+            MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                approval_request_digest,
+                ..
+            } => Some(approval_request_digest),
+            _ => None,
+        },
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn receipt_cbor_facts(
+    protocol_version: u8,
     submission_id: RequestId,
     scope: GroupScope,
     request_digest: Sha256Digest,
@@ -1720,9 +2115,15 @@ fn receipt_cbor_facts(
     welcome_digest: Sha256Digest,
     candidate_identity_id: IdentityId,
     candidate_device_id: DeviceId,
+    candidate_key_package_digest: Sha256Digest,
+    join_request_digest: Option<Sha256Digest>,
+    approval_request_digest: Option<Sha256Digest>,
 ) -> Result<Vec<u8>, GroupPersistenceError> {
-    encode_deterministic_cbor(&CanonicalValue::Map(vec![
-        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+    let mut fields = vec![
+        (
+            CanonicalValue::Unsigned(1),
+            CanonicalValue::Unsigned(if protocol_version == 3 { 3 } else { 1 }),
+        ),
         (
             CanonicalValue::Unsigned(2),
             CanonicalValue::Text(submission_id.to_string()),
@@ -1750,13 +2151,45 @@ fn receipt_cbor_facts(
             CanonicalValue::Unsigned(10),
             CanonicalValue::Text(candidate_device_id.to_string()),
         ),
-    ]))
-    .map_err(|_| GroupPersistenceError::CorruptData("MLS receipt encoding"))
+    ];
+    match (
+        protocol_version,
+        join_request_digest,
+        approval_request_digest,
+    ) {
+        (3, Some(join_request_digest), Some(approval_request_digest)) => {
+            fields.push((
+                CanonicalValue::Unsigned(11),
+                candidate_key_package_digest.to_canonical_value(),
+            ));
+            fields.push((
+                CanonicalValue::Unsigned(12),
+                join_request_digest.to_canonical_value(),
+            ));
+            fields.push((
+                CanonicalValue::Unsigned(13),
+                approval_request_digest.to_canonical_value(),
+            ));
+        }
+        (2, None, None) => {}
+        _ => {
+            return Err(GroupPersistenceError::CorruptData(
+                "MLS receipt V3 bindings",
+            ));
+        }
+    }
+    encode_deterministic_cbor(&CanonicalValue::Map(fields))
+        .map_err(|_| GroupPersistenceError::CorruptData("MLS receipt encoding"))
 }
 
-fn receipt_signature_input(digest: Sha256Digest) -> Vec<u8> {
-    let mut input = Vec::with_capacity(RECEIPT_SIGNATURE_DOMAIN.len() + 32);
-    input.extend_from_slice(RECEIPT_SIGNATURE_DOMAIN);
+fn receipt_signature_input(protocol_version: u8, digest: Sha256Digest) -> Vec<u8> {
+    let domain = if protocol_version == 3 {
+        V3_RECEIPT_SIGNATURE_DOMAIN
+    } else {
+        RECEIPT_SIGNATURE_DOMAIN
+    };
+    let mut input = Vec::with_capacity(domain.len() + 32);
+    input.extend_from_slice(domain);
     input.extend_from_slice(digest.as_bytes());
     input
 }

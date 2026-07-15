@@ -89,6 +89,11 @@ Layout:
   handoff. Agent Control 1.3 adds only a Connector-signed sidecar recipient,
   the durable sealed-capsule delivery command, and installed/rejected results;
   it does not add secrets or plaintext to Run grants.
+  `baseline/v30/manifest.json` freezes peer conversation admission, Membership
+  V2, federated Membership V2, and MLS Sequencer V3. Candidate `KeyPackage`,
+  join, and approval digests are bound end to end; the server treats admission
+  capsules and MLS payloads as opaque, and response-loss retries converge on
+  the original durable receipt or confirmation leaf.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

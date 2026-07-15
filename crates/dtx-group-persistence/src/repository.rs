@@ -95,6 +95,7 @@ pub struct PendingJoinRequest {
     requested_at: UtcMillis,
     request_command_id: MembershipCommandId,
     request_digest: Sha256Digest,
+    candidate_key_package_digest: Option<Sha256Digest>,
 }
 
 impl PendingJoinRequest {
@@ -144,6 +145,13 @@ impl PendingJoinRequest {
     #[must_use]
     pub const fn request_digest(&self) -> Sha256Digest {
         self.request_digest
+    }
+
+    /// Returns the V30 candidate `KeyPackage` digest. Historical V17/V18
+    /// workflows return `None` and must fail closed on the V2 discovery path.
+    #[must_use]
+    pub const fn candidate_key_package_digest(&self) -> Option<Sha256Digest> {
+        self.candidate_key_package_digest
     }
 }
 
@@ -349,7 +357,7 @@ impl GroupMembershipRepository {
         let (mut session, authenticated) =
             begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
         let result = async {
-            ensure_authenticated_actor(authenticated.session(), command.context())?;
+            ensure_authenticated_actor(authenticated.session(), &command.context())?;
             verify_proof(authenticated.signing_key())?;
             request_join_in_transaction(
                 session.connection(),
@@ -383,7 +391,7 @@ impl GroupMembershipRepository {
     {
         let mut session = store.begin(tenant_id).await?;
         let result = async {
-            ensure_verified_actor(actor, command.context())?;
+            ensure_verified_actor(actor, &command.context())?;
             verify_proof(actor.signing_key())?;
             request_join_in_transaction(
                 session.connection(),
@@ -439,7 +447,7 @@ impl GroupMembershipRepository {
         let (mut session, authenticated) =
             begin_authenticated(store, tenant_id, credential, now_ms).await?;
         let result = async {
-            ensure_authenticated_actor(authenticated, command.context())?;
+            ensure_authenticated_actor(authenticated, &command.context())?;
             approve_join_in_transaction(
                 session.connection(),
                 tenant_id,
@@ -501,7 +509,7 @@ impl GroupMembershipRepository {
         let (mut session, authenticated) =
             begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
         let result = async {
-            ensure_authenticated_actor(authenticated.session(), command.context())?;
+            ensure_authenticated_actor(authenticated.session(), &command.context())?;
             verify_proof(authenticated.signing_key())?;
             approve_join_in_transaction(
                 session.connection(),
@@ -533,7 +541,7 @@ impl GroupMembershipRepository {
     {
         let mut session = store.begin(tenant_id).await?;
         let result = async {
-            ensure_verified_actor(actor, command.context())?;
+            ensure_verified_actor(actor, &command.context())?;
             verify_proof(actor.signing_key())?;
             approve_join_in_transaction(
                 session.connection(),
@@ -1055,6 +1063,7 @@ async fn list_pending_join_requests_in_transaction(
                 workflow.candidate_identity_id,
                 workflow.candidate_device_id,
                 workflow.candidate_identity_origin,
+                workflow.candidate_key_package_digest,
                 workflow.invite_id,
                 command.command_id AS request_command_id,
                 command.request_digest
@@ -1181,6 +1190,10 @@ fn pending_join_request_from_row(
             .map_err(|_| GroupPersistenceError::CorruptData("pending request time"))?,
         request_command_id: membership_command_id(request_command_id)?,
         request_digest: digest(request_digest, "pending request digest")?,
+        candidate_key_package_digest: row
+            .try_get::<Option<Vec<u8>>, _>("candidate_key_package_digest")?
+            .map(|value| digest(value, "candidate KeyPackage digest"))
+            .transpose()?,
     })
 }
 
@@ -1283,7 +1296,7 @@ fn map_identity_authentication_error(error: IdentityPersistenceError) -> GroupPe
 
 fn ensure_authenticated_actor(
     authenticated: AuthenticatedDeviceSession,
-    context: MembershipCommandContext,
+    context: &MembershipCommandContext,
 ) -> Result<(), GroupPersistenceError> {
     if authenticated.identity_id() == context.actor_identity_id()
         && authenticated.device_id() == context.actor_device_id()
@@ -1296,7 +1309,7 @@ fn ensure_authenticated_actor(
 
 fn ensure_verified_actor(
     actor: VerifiedDeviceActor,
-    context: MembershipCommandContext,
+    context: &MembershipCommandContext,
 ) -> Result<(), GroupPersistenceError> {
     if actor.identity_id() == context.actor_identity_id()
         && actor.device_id() == context.actor_device_id()
@@ -1332,7 +1345,7 @@ fn ensure_candidate_identity_origin(origin: &str) -> Result<(), GroupPersistence
 async fn persist_new_candidate_identity_origin(
     connection: &mut PgConnection,
     tenant_id: TenantId,
-    context: MembershipCommandContext,
+    context: &MembershipCommandContext,
     execution: MembershipCommandExecution,
     candidate_identity_origin: &str,
 ) -> Result<(), GroupPersistenceError> {
@@ -1447,7 +1460,7 @@ async fn request_join_in_transaction(
     persist_new_candidate_identity_origin(
         connection,
         tenant_id,
-        context,
+        &context,
         execution,
         candidate_identity_origin,
     )
@@ -1866,6 +1879,7 @@ async fn load_book(
         "SELECT request_id, request_actor_identity_id, request_actor_device_id,
                 request_idempotency_key_hash, request_policy_revision,
                 request_sequencer_head, candidate_identity_id, candidate_device_id,
+                candidate_key_package_digest,
                 invite_id, state, approval_command_id, approval_actor_identity_id,
                 approval_actor_device_id, approval_idempotency_key_hash,
                 approval_policy_revision, approval_sequencer_head, authorization_digest,
@@ -1939,27 +1953,48 @@ fn workflow_from_row(
         GroupPersistenceError::CorruptData("workflow request command missing"),
     )?;
     let request_actor_identity_id = identity_id(row.try_get("request_actor_identity_id")?)?;
-    let request_context = MembershipCommandContext::new(
-        request_command.command_id,
+    let request_idempotency_key_hash = digest(
+        row.try_get("request_idempotency_key_hash")?,
+        "workflow request idempotency key",
+    )?;
+    let request_actor_device_id = device_id(row.try_get("request_actor_device_id")?)?;
+    let candidate_identity_id = identity_id(row.try_get("candidate_identity_id")?)?;
+    let candidate_device_id = device_id(row.try_get("candidate_device_id")?)?;
+    let invite_id = invite_capability_id(row.try_get("invite_id")?)?;
+    let fence = MembershipFence::new(
+        revision(row.try_get("request_policy_revision")?)?,
         digest(
-            row.try_get("request_idempotency_key_hash")?,
-            "workflow request idempotency key",
+            row.try_get("request_sequencer_head")?,
+            "workflow request Sequencer head",
         )?,
-        scope,
-        request_actor_identity_id,
-        device_id(row.try_get("request_actor_device_id")?)?,
-        join_request_id,
-        identity_id(row.try_get("candidate_identity_id")?)?,
-        device_id(row.try_get("candidate_device_id")?)?,
-        invite_capability_id(row.try_get("invite_id")?)?,
-        MembershipFence::new(
-            revision(row.try_get("request_policy_revision")?)?,
-            digest(
-                row.try_get("request_sequencer_head")?,
-                "workflow request Sequencer head",
-            )?,
-        ),
     );
+    let request_context = match row.try_get::<Option<Vec<u8>>, _>("candidate_key_package_digest")? {
+        Some(value) => MembershipCommandContext::new_v2(
+            request_command.command_id,
+            request_idempotency_key_hash,
+            scope,
+            request_actor_identity_id,
+            request_actor_device_id,
+            join_request_id,
+            candidate_identity_id,
+            candidate_device_id,
+            invite_id,
+            fence,
+            digest(value, "workflow candidate KeyPackage digest")?,
+        ),
+        None => MembershipCommandContext::new(
+            request_command.command_id,
+            request_idempotency_key_hash,
+            scope,
+            request_actor_identity_id,
+            request_actor_device_id,
+            join_request_id,
+            candidate_identity_id,
+            candidate_device_id,
+            invite_id,
+            fence,
+        ),
+    };
     if request_command.idempotency.actor_identity_id != request_actor_identity_id
         || request_command.idempotency.idempotency_key_hash
             != request_context.idempotency_key_hash()
@@ -1969,7 +2004,7 @@ fn workflow_from_row(
         ));
     }
 
-    let phase = workflow_phase_from_row(&row, scope, request_context)?;
+    let phase = workflow_phase_from_row(&row, scope, &request_context)?;
     Ok(MembershipWorkflowPersistence {
         join_request_id,
         context: request_context,
@@ -1980,7 +2015,7 @@ fn workflow_from_row(
 fn workflow_phase_from_row(
     row: &sqlx::postgres::PgRow,
     scope: GroupScope,
-    request_context: MembershipCommandContext,
+    request_context: &MembershipCommandContext,
 ) -> Result<MembershipWorkflowPersistencePhase, GroupPersistenceError> {
     match row.try_get::<String, _>("state")?.as_str() {
         PENDING_APPROVAL_STATE => Ok(MembershipWorkflowPersistencePhase::PendingApproval),
@@ -2043,47 +2078,70 @@ fn workflow_phase_from_row(
 fn approval_context_from_row(
     row: &sqlx::postgres::PgRow,
     scope: GroupScope,
-    request_context: MembershipCommandContext,
+    request_context: &MembershipCommandContext,
 ) -> Result<MembershipCommandContext, GroupPersistenceError> {
-    Ok(MembershipCommandContext::new(
-        membership_command_id(required_uuid(
-            row.try_get("approval_command_id")?,
-            "workflow approval command",
+    let command_id = membership_command_id(required_uuid(
+        row.try_get("approval_command_id")?,
+        "workflow approval command",
+    )?)?;
+    let idempotency_key_hash = digest(
+        required_bytes(
+            row.try_get("approval_idempotency_key_hash")?,
+            "workflow approval idempotency key",
+        )?,
+        "workflow approval idempotency key",
+    )?;
+    let actor_identity_id = identity_id(required_string(
+        row.try_get("approval_actor_identity_id")?,
+        "workflow approval actor",
+    )?)?;
+    let actor_device_id = device_id(required_uuid(
+        row.try_get("approval_actor_device_id")?,
+        "workflow approval device",
+    )?)?;
+    let fence = MembershipFence::new(
+        revision(required_i64(
+            row.try_get("approval_policy_revision")?,
+            "workflow approval policy revision",
         )?)?,
         digest(
             required_bytes(
-                row.try_get("approval_idempotency_key_hash")?,
-                "workflow approval idempotency key",
-            )?,
-            "workflow approval idempotency key",
-        )?,
-        scope,
-        identity_id(required_string(
-            row.try_get("approval_actor_identity_id")?,
-            "workflow approval actor",
-        )?)?,
-        device_id(required_uuid(
-            row.try_get("approval_actor_device_id")?,
-            "workflow approval device",
-        )?)?,
-        request_context.join_request_id(),
-        request_context.candidate_identity_id(),
-        request_context.candidate_device_id(),
-        request_context.invite_id(),
-        MembershipFence::new(
-            revision(required_i64(
-                row.try_get("approval_policy_revision")?,
-                "workflow approval policy revision",
-            )?)?,
-            digest(
-                required_bytes(
-                    row.try_get("approval_sequencer_head")?,
-                    "workflow approval Sequencer head",
-                )?,
+                row.try_get("approval_sequencer_head")?,
                 "workflow approval Sequencer head",
             )?,
-        ),
-    ))
+            "workflow approval Sequencer head",
+        )?,
+    );
+    Ok(
+        if let Some(candidate_key_package_digest) = request_context.candidate_key_package_digest() {
+            MembershipCommandContext::new_v2(
+                command_id,
+                idempotency_key_hash,
+                scope,
+                actor_identity_id,
+                actor_device_id,
+                request_context.join_request_id(),
+                request_context.candidate_identity_id(),
+                request_context.candidate_device_id(),
+                request_context.invite_id(),
+                fence,
+                candidate_key_package_digest,
+            )
+        } else {
+            MembershipCommandContext::new(
+                command_id,
+                idempotency_key_hash,
+                scope,
+                actor_identity_id,
+                actor_device_id,
+                request_context.join_request_id(),
+                request_context.candidate_identity_id(),
+                request_context.candidate_device_id(),
+                request_context.invite_id(),
+                fence,
+            )
+        },
+    )
 }
 
 #[allow(clippy::too_many_lines)] // Policy state writes share one transaction and one normalized image.
@@ -2416,7 +2474,8 @@ async fn persist_workflow(
              (tenant_id, scope_kind, scope_id, request_id, request_actor_identity_id,
               request_actor_device_id, request_idempotency_key_hash,
               request_policy_revision, request_sequencer_head,
-              candidate_identity_id, candidate_device_id, invite_id, state,
+              candidate_identity_id, candidate_device_id, candidate_key_package_digest,
+              invite_id, state,
               approval_command_id, approval_actor_identity_id, approval_actor_device_id,
               approval_idempotency_key_hash, approval_policy_revision,
               approval_sequencer_head, authorization_digest, admission,
@@ -2424,7 +2483,7 @@ async fn persist_workflow(
               commit_request_digest, committed_digest, rejection)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                  $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
-                 $25, $26, $27)
+                 $25, $26, $27, $28)
          ON CONFLICT (tenant_id, scope_kind, scope_id, request_id) DO UPDATE
              SET request_actor_identity_id=EXCLUDED.request_actor_identity_id,
                  request_actor_device_id=EXCLUDED.request_actor_device_id,
@@ -2433,6 +2492,7 @@ async fn persist_workflow(
                  request_sequencer_head=EXCLUDED.request_sequencer_head,
                  candidate_identity_id=EXCLUDED.candidate_identity_id,
                  candidate_device_id=EXCLUDED.candidate_device_id,
+                 candidate_key_package_digest=EXCLUDED.candidate_key_package_digest,
                  invite_id=EXCLUDED.invite_id,
                  state=EXCLUDED.state,
                  approval_command_id=EXCLUDED.approval_command_id,
@@ -2461,6 +2521,11 @@ async fn persist_workflow(
     .bind(context.fence().sequencer_head().as_bytes().as_slice())
     .bind(context.candidate_identity_id().to_string())
     .bind(uuid_from(context.candidate_device_id()))
+    .bind(
+        context
+            .candidate_key_package_digest()
+            .map(|digest| digest.as_bytes().to_vec()),
+    )
     .bind(uuid_from(context.invite_id()))
     .bind(columns.state)
     .bind(columns.approval_command_id)

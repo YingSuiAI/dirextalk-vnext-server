@@ -29,7 +29,8 @@ const INDEXER_DESCRIPTOR_HEADS_MIGRATION_VERSION: i64 = 202_607_160_022;
 const CONTACT_DELIVERY_MIGRATION_VERSION: i64 = 202_607_160_023;
 const OPAQUE_ATTACHMENTS_MIGRATION_VERSION: i64 = 202_607_160_024;
 const GROUP_MEMBERSHIP_DISCOVERY_MIGRATION_VERSION: i64 = 202_607_160_025;
-const EXPECTED_MIGRATION_COUNT: i64 = 25;
+const PEER_ADMISSION_V30_MIGRATION_VERSION: i64 = 202_607_160_026;
+const EXPECTED_MIGRATION_COUNT: i64 = 26;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -78,6 +79,8 @@ const OPAQUE_ATTACHMENTS_DOWN: &str =
     include_str!("../../../migrations/202607160024_opaque_attachments.down.sql");
 const GROUP_MEMBERSHIP_DISCOVERY_DOWN: &str =
     include_str!("../../../migrations/202607160025_group_membership_discovery.down.sql");
+const PEER_ADMISSION_V30_DOWN: &str =
+    include_str!("../../../migrations/202607160026_peer_admission_v30.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -108,7 +111,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -135,8 +138,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(CONTACT_DELIVERY_MIGRATION_VERSION)
     .bind(OPAQUE_ATTACHMENTS_MIGRATION_VERSION)
     .bind(GROUP_MEMBERSHIP_DISCOVERY_MIGRATION_VERSION)
+    .bind(PEER_ADMISSION_V30_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(PEER_ADMISSION_V30_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(GROUP_MEMBERSHIP_DISCOVERY_DOWN)
         .execute(harness.admin_pool())
         .await?;

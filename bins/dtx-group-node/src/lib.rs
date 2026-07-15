@@ -117,29 +117,49 @@ pub const GROUP_REVOKE_INVITE_CONTENT_TYPE: &str =
 /// Exact candidate join request media type.
 pub const GROUP_JOIN_REQUEST_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.group-join-request.v1+cbor";
+/// V30 candidate join request media type with exact `KeyPackage` binding.
+pub const GROUP_JOIN_REQUEST_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.group-join-request.v2+cbor";
 /// Exact owner/admin approval request media type.
 pub const GROUP_APPROVE_JOIN_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.group-approve-join.v1+cbor";
+/// V30 Owner/Admin approval media type with exact `KeyPackage` binding.
+pub const GROUP_APPROVE_JOIN_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.group-approve-join.v2+cbor";
 /// Exact local policy receipt media type.
 pub const GROUP_ACTION_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.group-action-receipt.v1+cbor";
 /// Exact membership receipt media type.
 pub const MEMBERSHIP_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.membership-receipt.v1+cbor";
+/// V30 membership receipt media type.
+pub const MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.membership-receipt.v2+cbor";
 /// Exact V29 Owner/Admin pending-request page media type.
 pub const GROUP_JOIN_REQUEST_PAGE_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.group-join-request-page.v1+cbor";
+/// V30 pending page carrying each candidate `KeyPackage` digest.
+pub const GROUP_JOIN_REQUEST_PAGE_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.group-join-request-page.v2+cbor";
 /// Exact V29 public Group Service descriptor media type.
 pub const GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.group-service.v1+cbor";
 /// Exact V2 MLS commit request media type.
 pub const MLS_COMMIT_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v2+cbor";
+/// V30 approved-identity commit request media type.
+pub const MLS_COMMIT_V3_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v3+cbor";
 /// Exact V2 signed receipt media type.
 pub const MLS_COMMIT_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mls-commit-receipt.v2+cbor";
+/// V30 receipt media type binding candidate package, join, and approval digests.
+pub const MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.mls-commit-receipt.v3+cbor";
 /// Exact V2 candidate confirmation media type.
 pub const MLS_CONFIRMATION_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mls-device-join-confirmation.v2+cbor";
+/// V30 stable confirmation body media type.
+pub const MLS_CONFIRMATION_V3_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.mls-device-join-confirmation.v3+cbor";
 /// Exact authorization scheme for active device sessions.
 pub const DEVICE_SESSION_AUTHORIZATION_SCHEME: &str = "DTX-Device-Session";
 /// Canonical HTTPS origin serving the actor's self-authenticated identity log.
@@ -148,6 +168,8 @@ pub const IDENTITY_ORIGIN_HEADER: &str = "dtx-identity-origin";
 pub const RECEIPT_QUERY_PROOF_HEADER: &str = "dtx-receipt-query-proof";
 /// Base64url canonical-CBOR proof authorizing a pending-request query.
 pub const GROUP_QUERY_PROOF_HEADER: &str = "dtx-group-query-proof";
+/// Fresh route/body-bound proof for a federated V30 MLS confirmation.
+pub const MLS_CONFIRMATION_PROOF_HEADER: &str = "dtx-mls-confirmation-proof";
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -172,6 +194,10 @@ const RECEIPT_QUERY_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.membership-receipt-
 const RECEIPT_QUERY_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.membership-receipt-query-signature.v2\0";
 const GROUP_QUERY_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.group-query-binding.v1\0";
 const GROUP_QUERY_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.group-query-signature.v1\0";
+const MLS_CONFIRMATION_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.mls-confirmation-binding.v3\0";
+const MLS_CONFIRMATION_PROOF_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.mls-confirmation-proof-signature.v3\0";
+const MLS_CONFIRMATION_BODY_HASH_DOMAIN: &[u8] = b"dirextalk.mls-confirmation-body.v3\0";
 const CONTROL_COMMAND_HASH_DOMAIN: &[u8] = b"dirextalk.group-control-command.v1\0";
 
 /// Shared state for a node that serves one trusted configured tenant.
@@ -417,7 +443,8 @@ impl GroupNodeState {
         let signable = join_request_signable(&parsed);
         let business_digest = canonical_hash(BUSINESS_FIELDS_HASH_DOMAIN, &signable)?;
         let proof = parsed.proof;
-        let context = MembershipCommandContext::new(
+        let context = membership_context(
+            parsed.protocol_version,
             MembershipCommandId::new(parsed.command_id),
             idempotency_key_hash,
             scope,
@@ -428,7 +455,8 @@ impl GroupNodeState {
             proof.actor_device_id,
             parsed.invite_id,
             MembershipFence::new(parsed.expected_revision, parsed.sequencer_head),
-        );
+            parsed.candidate_key_package_digest,
+        )?;
         let federated_actor = self.federated_actor(headers, &proof).await?;
         let candidate_identity_origin = if federated_actor.is_some() {
             proof
@@ -505,7 +533,8 @@ impl GroupNodeState {
         let business_digest = canonical_hash(BUSINESS_FIELDS_HASH_DOMAIN, &signable)?;
         let proof = parsed.proof;
         let authorization_digest = proof.binding_digest()?;
-        let context = MembershipCommandContext::new(
+        let context = membership_context(
+            parsed.protocol_version,
             MembershipCommandId::new(parsed.command_id),
             idempotency_key_hash,
             scope,
@@ -516,7 +545,8 @@ impl GroupNodeState {
             parsed.candidate_device_id,
             parsed.invite_id,
             MembershipFence::new(parsed.expected_revision, parsed.sequencer_head),
-        );
+            parsed.candidate_key_package_digest,
+        )?;
         let federated_actor = self.federated_actor(headers, &proof).await?;
         let result = if let Some(actor) = federated_actor {
             self.membership_repository
@@ -907,11 +937,12 @@ async fn request_join(
         );
         require_exact_route(&parts.uri, &expected_path)?;
         let parsed = parse_join_request_body(&parts.headers, body, join_request_id).await?;
+        let protocol_version = parsed.protocol_version;
         let now = state.now()?;
         let execution = state
             .request_join(&parts.headers, scope, expected_path, parsed, now)
             .await?;
-        membership_response(execution)
+        membership_response(execution, protocol_version)
     }
     .await;
     finish(result, request_id)
@@ -928,6 +959,11 @@ async fn list_join_requests(
         let scope = parse_scope(&scope_kind, &scope_id)?;
         let collection_path = format!("{}/join-requests", canonical_scope_path(scope));
         let query = parse_join_request_query(&parts.uri, &collection_path)?;
+        let protocol_version = requested_membership_version(
+            &parts.headers,
+            GROUP_JOIN_REQUEST_PAGE_CONTENT_TYPE,
+            GROUP_JOIN_REQUEST_PAGE_V2_CONTENT_TYPE,
+        )?;
         require_empty_get(&parts.headers, body).await?;
         let proof = parse_group_query_proof_header(&parts.headers)?;
         let now = state.now()?;
@@ -997,8 +1033,12 @@ async fn list_join_requests(
         .map_err(|error| map_persistence_error(&error))?;
         Ok(cbor_response(
             StatusCode::OK,
-            encode_pending_join_request_page(scope, &page)?,
-            GROUP_JOIN_REQUEST_PAGE_CONTENT_TYPE,
+            encode_pending_join_request_page(scope, &page, protocol_version)?,
+            if protocol_version == 2 {
+                GROUP_JOIN_REQUEST_PAGE_V2_CONTENT_TYPE
+            } else {
+                GROUP_JOIN_REQUEST_PAGE_CONTENT_TYPE
+            },
         ))
     }
     .await;
@@ -1021,11 +1061,12 @@ async fn approve_join(
         );
         require_exact_route(&parts.uri, &expected_path)?;
         let parsed = parse_approve_join_body(&parts.headers, body, join_request_id).await?;
+        let protocol_version = parsed.protocol_version;
         let now = state.now()?;
         let execution = state
             .approve_join(&parts.headers, scope, expected_path, parsed, now)
             .await?;
-        membership_response(execution)
+        membership_response(execution, protocol_version)
     }
     .await;
     finish(result, request_id)
@@ -1046,6 +1087,11 @@ async fn get_membership_receipt(
             canonical_scope_path(scope)
         );
         require_exact_route(&parts.uri, &expected_path)?;
+        let protocol_version = requested_membership_version(
+            &parts.headers,
+            MEMBERSHIP_RECEIPT_CONTENT_TYPE,
+            MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE,
+        )?;
         require_empty_get(&parts.headers, body).await?;
         let now = state.now()?;
         let query_proof = parse_receipt_query_proof_header(&parts.headers)?;
@@ -1085,8 +1131,12 @@ async fn get_membership_receipt(
         .map_err(|error| map_persistence_error(&error))?;
         Ok(cbor_response(
             StatusCode::OK,
-            encode_membership_receipt(receipt)?,
-            MEMBERSHIP_RECEIPT_CONTENT_TYPE,
+            encode_membership_receipt(receipt, protocol_version)?,
+            if protocol_version == 2 {
+                MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE
+            } else {
+                MEMBERSHIP_RECEIPT_CONTENT_TYPE
+            },
         ))
     }
     .await;
@@ -1125,22 +1175,40 @@ async fn submit_mls_commit(
             .ok_or(GroupFailure::TemporarilyUnavailable)?;
         let signing_public_key = SigningPublicKey::try_from(signing_key.verifying_key().to_bytes())
             .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
-        let signer = Arc::clone(signing_key);
-        let execution = state
-            .mls_repository
-            .submit_authenticated(
-                &state.store,
-                state.tenant_id,
-                &credential,
-                &parsed.command,
-                parsed.candidate_signature,
-                parsed.controller_signature,
-                now.get(),
-                signing_public_key,
-                move |input| Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes())),
-            )
-            .await
-            .map_err(|error| map_persistence_error(&error))?;
+        let execution = if parsed.command.protocol_version() == 3 {
+            let signer = Arc::clone(signing_key);
+            state
+                .mls_repository
+                .submit_authenticated_v3(
+                    &state.store,
+                    state.tenant_id,
+                    &credential,
+                    &parsed.command,
+                    now.get(),
+                    signing_public_key,
+                    move |input| Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes())),
+                )
+                .await
+        } else {
+            let signer = Arc::clone(signing_key);
+            state
+                .mls_repository
+                .submit_authenticated(
+                    &state.store,
+                    state.tenant_id,
+                    &credential,
+                    &parsed.command,
+                    parsed
+                        .candidate_signature
+                        .ok_or(GroupFailure::InvalidRequest)?,
+                    parsed.controller_signature,
+                    now.get(),
+                    signing_public_key,
+                    move |input| Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes())),
+                )
+                .await
+        }
+        .map_err(|error| map_persistence_error(&error))?;
         mls_commit_response(&execution)
     }
     .await;
@@ -1187,7 +1255,11 @@ async fn get_mls_commit_receipt(
         Ok(cbor_response(
             StatusCode::OK,
             encode_mls_commit_receipt(&receipt)?,
-            MLS_COMMIT_RECEIPT_CONTENT_TYPE,
+            if receipt.protocol_version() == 3 {
+                MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE
+            } else {
+                MLS_COMMIT_RECEIPT_CONTENT_TYPE
+            },
         ))
     }
     .await;
@@ -1210,21 +1282,80 @@ async fn confirm_mls_device_join(
             canonical_scope_path(scope)
         );
         require_exact_route(&parts.uri, &expected_path)?;
-        let confirmation =
+        let protocol_version =
+            if has_exact_content_type(&parts.headers, MLS_CONFIRMATION_V3_CONTENT_TYPE) {
+                3
+            } else if has_exact_content_type(&parts.headers, MLS_CONFIRMATION_CONTENT_TYPE) {
+                2
+            } else {
+                return Err(GroupFailure::InvalidRequest);
+            };
+        let (confirmation, body_digest) =
             parse_mls_confirmation_body(&parts.headers, body, submission_id, device_id).await?;
-        let credential = parse_device_session_authorization(&parts.headers)?;
         let now = state.now()?;
-        state
-            .mls_repository
-            .confirm_authenticated(
-                &state.store,
-                state.tenant_id,
-                &credential,
-                confirmation,
-                now.get(),
-            )
-            .await
-            .map_err(|error| map_persistence_error(&error))?;
+        if protocol_version == 3
+            && let Some(identity_origin) =
+                single_optional_header(&parts.headers, IDENTITY_ORIGIN_HEADER)?
+        {
+            if parts.headers.contains_key(header::AUTHORIZATION) {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            let proof = parse_mls_confirmation_proof_header(&parts.headers)?;
+            if proof.identity_origin != identity_origin
+                || proof.identity_id != confirmation.identity_id
+                || proof.device_id != confirmation.device_id
+            {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            let signing_key = state
+                .federated_identity
+                .active_device_signing_key(
+                    identity_origin,
+                    confirmation.identity_id,
+                    confirmation.device_id,
+                )
+                .await
+                .map_err(map_federated_identity_error)?;
+            proof
+                .verify(
+                    &expected_path,
+                    scope,
+                    submission_id,
+                    body_digest,
+                    now,
+                    signing_key,
+                )
+                .map_err(|_| GroupFailure::ActionProofInvalid)?;
+            state
+                .mls_repository
+                .confirm_verified(
+                    &state.store,
+                    state.tenant_id,
+                    confirmation,
+                    now.get(),
+                    signing_key,
+                )
+                .await
+                .map_err(|error| map_persistence_error(&error))?;
+        } else {
+            if parts.headers.contains_key(IDENTITY_ORIGIN_HEADER)
+                || parts.headers.contains_key(MLS_CONFIRMATION_PROOF_HEADER)
+            {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            let credential = parse_device_session_authorization(&parts.headers)?;
+            state
+                .mls_repository
+                .confirm_authenticated(
+                    &state.store,
+                    state.tenant_id,
+                    &credential,
+                    confirmation,
+                    now.get(),
+                )
+                .await
+                .map_err(|error| map_persistence_error(&error))?;
+        }
         Ok(StatusCode::NO_CONTENT.into_response())
     }
     .await;
@@ -1239,7 +1370,11 @@ fn mls_commit_response(execution: &MlsCommitExecution) -> Result<Response, Group
             StatusCode::CREATED
         },
         encode_mls_commit_receipt(execution.receipt())?,
-        MLS_COMMIT_RECEIPT_CONTENT_TYPE,
+        if execution.receipt().protocol_version() == 3 {
+            MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE
+        } else {
+            MLS_COMMIT_RECEIPT_CONTENT_TYPE
+        },
     ))
 }
 
@@ -1290,7 +1425,10 @@ fn control_response(
     }
 }
 
-fn membership_response(execution: MembershipCommandExecution) -> Result<Response, GroupFailure> {
+fn membership_response(
+    execution: MembershipCommandExecution,
+    protocol_version: u8,
+) -> Result<Response, GroupFailure> {
     let status = if execution.replayed() {
         StatusCode::OK
     } else {
@@ -1298,8 +1436,12 @@ fn membership_response(execution: MembershipCommandExecution) -> Result<Response
     };
     Ok(cbor_response(
         status,
-        encode_membership_receipt(execution.receipt())?,
-        MEMBERSHIP_RECEIPT_CONTENT_TYPE,
+        encode_membership_receipt(execution.receipt(), protocol_version)?,
+        if protocol_version == 2 {
+            MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE
+        } else {
+            MEMBERSHIP_RECEIPT_CONTENT_TYPE
+        },
     ))
 }
 
@@ -1391,10 +1533,11 @@ fn require_exact_route(uri: &Uri, expected_path: &str) -> Result<(), GroupFailur
 
 struct MlsCommitBody {
     command: MlsCommitCommand,
-    candidate_signature: Ed25519Signature,
+    candidate_signature: Option<Ed25519Signature>,
     controller_signature: Option<Ed25519Signature>,
 }
 
+#[allow(clippy::too_many_lines)] // V2/V3 exact-field validation stays contiguous so no version can bypass a bound field.
 async fn parse_mls_commit_body(
     headers: &HeaderMap,
     body: Body,
@@ -1402,17 +1545,26 @@ async fn parse_mls_commit_body(
     expected_submission_id: RequestId,
     idempotency_key_hash: Sha256Digest,
 ) -> Result<MlsCommitBody, GroupFailure> {
+    let protocol_version: u8 = if has_exact_content_type(headers, MLS_COMMIT_V3_CONTENT_TYPE) {
+        3
+    } else if has_exact_content_type(headers, MLS_COMMIT_CONTENT_TYPE) {
+        2
+    } else {
+        return Err(GroupFailure::InvalidRequest);
+    };
     let value = decode_body(
         headers,
         body,
-        MLS_COMMIT_CONTENT_TYPE,
+        if protocol_version == 2 {
+            MLS_COMMIT_CONTENT_TYPE
+        } else {
+            MLS_COMMIT_V3_CONTENT_TYPE
+        },
         MAX_MLS_COMMIT_BODY_BYTES,
     )
     .await?;
     let fields = exact_fields(&value, 15)?;
-    if field(fields, 1)? != &CanonicalValue::Unsigned(2) {
-        return Err(GroupFailure::InvalidRequest);
-    }
+    require_numeric_version(field(fields, 1)?, u64::from(protocol_version))?;
     let submission_id = parse_request_id_value(field(fields, 2)?)?;
     let scope = parse_scope_value(field(fields, 3)?)?;
     if submission_id != expected_submission_id || scope != expected_scope {
@@ -1423,7 +1575,14 @@ async fn parse_mls_commit_body(
     let candidate_identity_id = parse_identity_id_value(field(fields, 6)?)?;
     let candidate_device_id = parse_device_id_value(field(fields, 7)?)?;
     let candidate_key_package_digest = parse_digest(field(fields, 8)?)?;
-    let (candidate_proof_digest, candidate_signature) = parse_mls_device_proof(field(fields, 9)?)?;
+    let candidate_proof = if protocol_version == 2 {
+        let (digest, signature) = parse_mls_device_proof(field(fields, 9)?)?;
+        Some((digest, signature))
+    } else if field(fields, 9)? == &CanonicalValue::Null {
+        None
+    } else {
+        return Err(GroupFailure::InvalidRequest);
+    };
     let expected_epoch = parse_safe_uint(field(fields, 10)?)?;
     let expected_head = parse_digest(field(fields, 11)?)?;
     let commit_bytes = match field(fields, 12)? {
@@ -1444,16 +1603,30 @@ async fn parse_mls_commit_body(
         CanonicalValue::Unsigned(1) if authorization_fields.len() == 1 => {
             (MlsCommitAuthorization::OwnerBootstrap, None)
         }
-        CanonicalValue::Unsigned(2) if authorization_fields.len() == 3 => (
-            MlsCommitAuthorization::ApprovedIdentityJoin {
-                membership_command_id: MembershipCommandId::new(parse_request_id_value(field(
-                    authorization_fields,
-                    2,
-                )?)?),
-                authorization_digest: parse_digest(field(authorization_fields, 3)?)?,
-            },
-            None,
-        ),
+        CanonicalValue::Unsigned(2) if protocol_version == 2 && authorization_fields.len() == 3 => {
+            (
+                MlsCommitAuthorization::ApprovedIdentityJoin {
+                    membership_command_id: MembershipCommandId::new(parse_request_id_value(
+                        field(authorization_fields, 2)?,
+                    )?),
+                    authorization_digest: parse_digest(field(authorization_fields, 3)?)?,
+                },
+                None,
+            )
+        }
+        CanonicalValue::Unsigned(2) if protocol_version == 3 && authorization_fields.len() == 5 => {
+            (
+                MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                    membership_command_id: MembershipCommandId::new(parse_request_id_value(
+                        field(authorization_fields, 2)?,
+                    )?),
+                    authorization_digest: parse_digest(field(authorization_fields, 3)?)?,
+                    join_request_digest: parse_digest(field(authorization_fields, 4)?)?,
+                    approval_request_digest: parse_digest(field(authorization_fields, 5)?)?,
+                },
+                None,
+            )
+        }
         CanonicalValue::Unsigned(3) if authorization_fields.len() == 4 => {
             let controller_device_id = parse_device_id_value(field(authorization_fields, 2)?)?;
             let controller_consent_digest = parse_digest(field(authorization_fields, 3)?)?;
@@ -1472,27 +1645,60 @@ async fn parse_mls_commit_body(
         }
         _ => return Err(GroupFailure::InvalidRequest),
     };
-    let command = MlsCommitCommand::new(
-        submission_id,
-        scope,
-        actor_identity_id,
-        actor_device_id,
-        candidate_identity_id,
-        candidate_device_id,
-        candidate_key_package_digest,
-        candidate_proof_digest,
-        idempotency_key_hash,
-        expected_epoch,
-        expected_head,
-        commit_bytes,
-        commit_digest,
-        welcome_digest,
-        authorization,
-    )
+    let command = match (protocol_version, authorization) {
+        (2, authorization) => MlsCommitCommand::new(
+            submission_id,
+            scope,
+            actor_identity_id,
+            actor_device_id,
+            candidate_identity_id,
+            candidate_device_id,
+            candidate_key_package_digest,
+            candidate_proof
+                .as_ref()
+                .ok_or(GroupFailure::InvalidRequest)?
+                .0,
+            idempotency_key_hash,
+            expected_epoch,
+            expected_head,
+            commit_bytes,
+            commit_digest,
+            welcome_digest,
+            authorization,
+        ),
+        (
+            3,
+            MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                membership_command_id,
+                authorization_digest,
+                join_request_digest,
+                approval_request_digest,
+            },
+        ) => MlsCommitCommand::new_v3_approved_identity_join(
+            submission_id,
+            scope,
+            actor_identity_id,
+            actor_device_id,
+            candidate_identity_id,
+            candidate_device_id,
+            candidate_key_package_digest,
+            idempotency_key_hash,
+            expected_epoch,
+            expected_head,
+            commit_bytes,
+            commit_digest,
+            welcome_digest,
+            membership_command_id,
+            authorization_digest,
+            join_request_digest,
+            approval_request_digest,
+        ),
+        _ => return Err(GroupFailure::InvalidRequest),
+    }
     .map_err(|_| GroupFailure::InvalidRequest)?;
     Ok(MlsCommitBody {
         command,
-        candidate_signature,
+        candidate_signature: candidate_proof.map(|(_, signature)| signature),
         controller_signature,
     })
 }
@@ -1515,14 +1721,13 @@ async fn parse_mls_confirmation_body(
     body: Body,
     expected_submission_id: RequestId,
     expected_device_id: DeviceId,
-) -> Result<MlsDeviceJoinConfirmation, GroupFailure> {
-    let value = decode_body(
-        headers,
-        body,
-        MLS_CONFIRMATION_CONTENT_TYPE,
-        MAX_MEMBERSHIP_BODY_BYTES,
-    )
-    .await?;
+) -> Result<(MlsDeviceJoinConfirmation, Sha256Digest), GroupFailure> {
+    let content_type = if has_exact_content_type(headers, MLS_CONFIRMATION_V3_CONTENT_TYPE) {
+        MLS_CONFIRMATION_V3_CONTENT_TYPE
+    } else {
+        MLS_CONFIRMATION_CONTENT_TYPE
+    };
+    let value = decode_body(headers, body, content_type, MAX_MEMBERSHIP_BODY_BYTES).await?;
     let fields = exact_fields(&value, 7)?;
     if field(fields, 1)? != &CanonicalValue::Unsigned(1) {
         return Err(GroupFailure::InvalidRequest);
@@ -1540,7 +1745,11 @@ async fn parse_mls_confirmation_body(
     {
         return Err(GroupFailure::InvalidRequest);
     }
-    Ok(confirmation)
+    let exact = encode_deterministic_cbor(&value).map_err(|_| GroupFailure::InvalidRequest)?;
+    Ok((
+        confirmation,
+        Sha256Digest::hash_domain(MLS_CONFIRMATION_BODY_HASH_DOMAIN, &exact),
+    ))
 }
 
 async fn parse_create_body(
@@ -1608,11 +1817,13 @@ async fn parse_issue_invite_body(
 
 #[derive(Clone)]
 struct JoinRequestBody {
+    protocol_version: u8,
     command_id: RequestId,
     join_request_id: JoinRequestId,
     invite_id: InviteCapabilityId,
     expected_revision: Revision,
     sequencer_head: Sha256Digest,
+    candidate_key_package_digest: Option<Sha256Digest>,
     proof: ActionProof,
 }
 
@@ -1621,27 +1832,41 @@ async fn parse_join_request_body(
     body: Body,
     join_request_id: JoinRequestId,
 ) -> Result<JoinRequestBody, GroupFailure> {
+    let protocol_version = membership_mutation_version(
+        headers,
+        GROUP_JOIN_REQUEST_CONTENT_TYPE,
+        GROUP_JOIN_REQUEST_V2_CONTENT_TYPE,
+    )?;
     let value = decode_body(
         headers,
         body,
-        GROUP_JOIN_REQUEST_CONTENT_TYPE,
+        if protocol_version == 2 {
+            GROUP_JOIN_REQUEST_V2_CONTENT_TYPE
+        } else {
+            GROUP_JOIN_REQUEST_CONTENT_TYPE
+        },
         MAX_MEMBERSHIP_BODY_BYTES,
     )
     .await?;
-    let fields = exact_fields(&value, 6)?;
-    require_version(field(fields, 1)?)?;
+    let fields = exact_fields(&value, if protocol_version == 2 { 7 } else { 6 })?;
+    require_numeric_version(field(fields, 1)?, u64::from(protocol_version))?;
     Ok(JoinRequestBody {
+        protocol_version,
         command_id: parse_request_id_value(field(fields, 2)?)?,
         join_request_id,
         invite_id: parse_invite_id_value(field(fields, 3)?)?,
         expected_revision: parse_revision(field(fields, 4)?)?,
         sequencer_head: parse_digest(field(fields, 5)?)?,
-        proof: parse_action_proof(field(fields, 6)?)?,
+        candidate_key_package_digest: (protocol_version == 2)
+            .then(|| parse_digest(field(fields, 6)?))
+            .transpose()?,
+        proof: parse_action_proof(field(fields, if protocol_version == 2 { 7 } else { 6 })?)?,
     })
 }
 
 #[derive(Clone)]
 struct ApproveJoinBody {
+    protocol_version: u8,
     command_id: RequestId,
     join_request_id: JoinRequestId,
     candidate_identity_id: IdentityId,
@@ -1649,6 +1874,7 @@ struct ApproveJoinBody {
     invite_id: InviteCapabilityId,
     expected_revision: Revision,
     sequencer_head: Sha256Digest,
+    candidate_key_package_digest: Option<Sha256Digest>,
     proof: ActionProof,
 }
 
@@ -1657,16 +1883,26 @@ async fn parse_approve_join_body(
     body: Body,
     join_request_id: JoinRequestId,
 ) -> Result<ApproveJoinBody, GroupFailure> {
+    let protocol_version = membership_mutation_version(
+        headers,
+        GROUP_APPROVE_JOIN_CONTENT_TYPE,
+        GROUP_APPROVE_JOIN_V2_CONTENT_TYPE,
+    )?;
     let value = decode_body(
         headers,
         body,
-        GROUP_APPROVE_JOIN_CONTENT_TYPE,
+        if protocol_version == 2 {
+            GROUP_APPROVE_JOIN_V2_CONTENT_TYPE
+        } else {
+            GROUP_APPROVE_JOIN_CONTENT_TYPE
+        },
         MAX_MEMBERSHIP_BODY_BYTES,
     )
     .await?;
-    let fields = exact_fields(&value, 8)?;
-    require_version(field(fields, 1)?)?;
+    let fields = exact_fields(&value, if protocol_version == 2 { 9 } else { 8 })?;
+    require_numeric_version(field(fields, 1)?, u64::from(protocol_version))?;
     Ok(ApproveJoinBody {
+        protocol_version,
         command_id: parse_request_id_value(field(fields, 2)?)?,
         join_request_id,
         candidate_identity_id: parse_identity_id_value(field(fields, 3)?)?,
@@ -1674,7 +1910,10 @@ async fn parse_approve_join_body(
         invite_id: parse_invite_id_value(field(fields, 5)?)?,
         expected_revision: parse_revision(field(fields, 6)?)?,
         sequencer_head: parse_digest(field(fields, 7)?)?,
-        proof: parse_action_proof(field(fields, 8)?)?,
+        candidate_key_package_digest: (protocol_version == 2)
+            .then(|| parse_digest(field(fields, 8)?))
+            .transpose()?,
+        proof: parse_action_proof(field(fields, if protocol_version == 2 { 9 } else { 8 })?)?,
     })
 }
 
@@ -1736,25 +1975,33 @@ fn issue_invite_signable(body: &IssueInviteBody) -> CanonicalValue {
 }
 
 fn join_request_signable(body: &JoinRequestBody) -> CanonicalValue {
-    numbered_map(vec![
-        CanonicalValue::Unsigned(1),
+    let mut fields = vec![
+        CanonicalValue::Unsigned(u64::from(body.protocol_version)),
         CanonicalValue::Text(body.command_id.to_string()),
         CanonicalValue::Text(body.invite_id.to_string()),
         CanonicalValue::Unsigned(body.expected_revision.get()),
         CanonicalValue::Bytes(body.sequencer_head.as_bytes().to_vec()),
-    ])
+    ];
+    if let Some(digest) = body.candidate_key_package_digest {
+        fields.push(digest.to_canonical_value());
+    }
+    numbered_map(fields)
 }
 
 fn approve_join_signable(body: &ApproveJoinBody) -> CanonicalValue {
-    numbered_map(vec![
-        CanonicalValue::Unsigned(1),
+    let mut fields = vec![
+        CanonicalValue::Unsigned(u64::from(body.protocol_version)),
         CanonicalValue::Text(body.command_id.to_string()),
         CanonicalValue::Text(body.candidate_identity_id.to_string()),
         CanonicalValue::Text(body.candidate_device_id.to_string()),
         CanonicalValue::Text(body.invite_id.to_string()),
         CanonicalValue::Unsigned(body.expected_revision.get()),
         CanonicalValue::Bytes(body.sequencer_head.as_bytes().to_vec()),
-    ])
+    ];
+    if let Some(digest) = body.candidate_key_package_digest {
+        fields.push(digest.to_canonical_value());
+    }
+    numbered_map(fields)
 }
 
 struct JoinRequestQuery {
@@ -1836,6 +2083,114 @@ fn encode_pending_join_cursor(cursor: PendingJoinRequestCursor) -> Result<String
     ]))
     .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
     Ok(Base64UrlUnpadded::encode_string(&bytes))
+}
+
+#[derive(Clone)]
+struct MlsConfirmationProof {
+    path: String,
+    scope: GroupScope,
+    submission_id: RequestId,
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    body_digest: Sha256Digest,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    identity_origin: String,
+    signature: [u8; 64],
+}
+
+impl MlsConfirmationProof {
+    fn binding_value(&self) -> CanonicalValue {
+        numbered_map(vec![
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Unsigned(1),
+            CanonicalValue::Text(self.path.clone()),
+            scope_value(self.scope),
+            CanonicalValue::Text(self.submission_id.to_string()),
+            CanonicalValue::Text(self.identity_id.to_string()),
+            CanonicalValue::Text(self.device_id.to_string()),
+            self.body_digest.to_canonical_value(),
+            utc_value(self.issued_at),
+            utc_value(self.expires_at),
+            CanonicalValue::Text(self.identity_origin.clone()),
+        ])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify(
+        &self,
+        expected_path: &str,
+        expected_scope: GroupScope,
+        expected_submission_id: RequestId,
+        expected_body_digest: Sha256Digest,
+        now: UtcMillis,
+        signing_key: SigningPublicKey,
+    ) -> Result<(), GroupPersistenceError> {
+        let lifetime = self
+            .expires_at
+            .get()
+            .checked_sub(self.issued_at.get())
+            .ok_or(GroupPersistenceError::ActionProofRejected)?;
+        if self.path != expected_path
+            || self.scope != expected_scope
+            || self.submission_id != expected_submission_id
+            || self.body_digest != expected_body_digest
+            || self.issued_at > now
+            || now >= self.expires_at
+            || !(1..=MAX_ACTION_PROOF_LIFETIME_MS).contains(&lifetime)
+        {
+            return Err(GroupPersistenceError::ActionProofRejected);
+        }
+        let binding = encode_deterministic_cbor(&self.binding_value())
+            .map_err(|_| GroupPersistenceError::ActionProofRejected)?;
+        let digest = Sha256Digest::hash_domain(MLS_CONFIRMATION_BINDING_HASH_DOMAIN, &binding);
+        let mut signature_input = Vec::with_capacity(
+            MLS_CONFIRMATION_PROOF_SIGNATURE_DOMAIN.len() + digest.as_bytes().len(),
+        );
+        signature_input.extend_from_slice(MLS_CONFIRMATION_PROOF_SIGNATURE_DOMAIN);
+        signature_input.extend_from_slice(digest.as_bytes());
+        let verifying_key = VerifyingKey::from_bytes(signing_key.as_bytes())
+            .map_err(|_| GroupPersistenceError::ActionProofRejected)?;
+        verifying_key
+            .verify_strict(&signature_input, &Signature::from_bytes(&self.signature))
+            .map_err(|_| GroupPersistenceError::ActionProofRejected)
+    }
+}
+
+fn parse_mls_confirmation_proof_header(
+    headers: &HeaderMap,
+) -> Result<MlsConfirmationProof, GroupFailure> {
+    let encoded = single_optional_header(headers, MLS_CONFIRMATION_PROOF_HEADER)?
+        .ok_or(GroupFailure::ActionProofInvalid)?;
+    if encoded.len() > MAX_GROUP_QUERY_PROOF_BYTES || !encoded.bytes().all(is_base64url_byte) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let mut decoded = vec![0_u8; encoded.len()];
+    let exact = Base64UrlUnpadded::decode(encoded, &mut decoded)
+        .map_err(|_| GroupFailure::InvalidRequest)?;
+    if Base64UrlUnpadded::encode_string(exact) != encoded {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let value = decode_deterministic_cbor(exact).map_err(|_| GroupFailure::InvalidRequest)?;
+    let fields = exact_fields(&value, 3)?;
+    require_numeric_version(field(fields, 1)?, 3)?;
+    let binding = exact_fields(field(fields, 2)?, 11)?;
+    require_numeric_version(field(binding, 1)?, 3)?;
+    if field(binding, 2)? != &CanonicalValue::Unsigned(1) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    Ok(MlsConfirmationProof {
+        path: parse_text(field(binding, 3)?, 1, 512)?,
+        scope: parse_scope_value(field(binding, 4)?)?,
+        submission_id: parse_request_id_value(field(binding, 5)?)?,
+        identity_id: parse_identity_id_value(field(binding, 6)?)?,
+        device_id: parse_device_id_value(field(binding, 7)?)?,
+        body_digest: parse_digest(field(binding, 8)?)?,
+        issued_at: parse_utc_millis(field(binding, 9)?)?,
+        expires_at: parse_utc_millis(field(binding, 10)?)?,
+        identity_origin: parse_text(field(binding, 11)?, 10, 512)?,
+        signature: parse_exact_bytes(field(fields, 3)?)?,
+    })
 }
 
 #[derive(Clone)]
@@ -2237,10 +2592,59 @@ fn field(
 }
 
 fn require_version(value: &CanonicalValue) -> Result<(), GroupFailure> {
-    if value == &CanonicalValue::Unsigned(1) {
+    require_numeric_version(value, 1)
+}
+
+fn require_numeric_version(value: &CanonicalValue, expected: u64) -> Result<(), GroupFailure> {
+    if value == &CanonicalValue::Unsigned(expected) {
         Ok(())
     } else {
         Err(GroupFailure::InvalidRequest)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn membership_context(
+    protocol_version: u8,
+    command_id: MembershipCommandId,
+    idempotency_key_hash: Sha256Digest,
+    scope: GroupScope,
+    actor_identity_id: IdentityId,
+    actor_device_id: DeviceId,
+    join_request_id: JoinRequestId,
+    candidate_identity_id: IdentityId,
+    candidate_device_id: DeviceId,
+    invite_id: InviteCapabilityId,
+    fence: MembershipFence,
+    candidate_key_package_digest: Option<Sha256Digest>,
+) -> Result<MembershipCommandContext, GroupFailure> {
+    match (protocol_version, candidate_key_package_digest) {
+        (1, None) => Ok(MembershipCommandContext::new(
+            command_id,
+            idempotency_key_hash,
+            scope,
+            actor_identity_id,
+            actor_device_id,
+            join_request_id,
+            candidate_identity_id,
+            candidate_device_id,
+            invite_id,
+            fence,
+        )),
+        (2, Some(candidate_key_package_digest)) => Ok(MembershipCommandContext::new_v2(
+            command_id,
+            idempotency_key_hash,
+            scope,
+            actor_identity_id,
+            actor_device_id,
+            join_request_id,
+            candidate_identity_id,
+            candidate_device_id,
+            invite_id,
+            fence,
+            candidate_key_package_digest,
+        )),
+        _ => Err(GroupFailure::InvalidRequest),
     }
 }
 
@@ -2434,6 +2838,7 @@ fn encode_control_receipt(
 fn encode_pending_join_request_page(
     scope: GroupScope,
     page: &PendingJoinRequestPage,
+    protocol_version: u8,
 ) -> Result<Vec<u8>, GroupFailure> {
     let (epoch, head) = page.mls_head().map_or(
         (CanonicalValue::Null, CanonicalValue::Null),
@@ -2448,7 +2853,7 @@ fn encode_pending_join_request_page(
         .items()
         .iter()
         .map(|item| {
-            numbered_map(vec![
+            let mut fields = vec![
                 CanonicalValue::Text(item.join_request_id().to_string()),
                 CanonicalValue::Text(item.candidate_identity_id().to_string()),
                 CanonicalValue::Text(item.candidate_device_id().to_string()),
@@ -2457,16 +2862,24 @@ fn encode_pending_join_request_page(
                 utc_value(item.requested_at()),
                 CanonicalValue::Text(item.request_command_id().request_id().to_string()),
                 CanonicalValue::Bytes(item.request_digest().as_bytes().to_vec()),
-            ])
+            ];
+            if protocol_version == 2 {
+                fields.push(
+                    item.candidate_key_package_digest()
+                        .ok_or(GroupFailure::TemporarilyUnavailable)?
+                        .to_canonical_value(),
+                );
+            }
+            Ok(numbered_map(fields))
         })
-        .collect();
+        .collect::<Result<Vec<_>, GroupFailure>>()?;
     let next_after = page
         .next_cursor()
         .map_or(Ok(CanonicalValue::Null), |cursor| {
             encode_pending_join_cursor(cursor).map(CanonicalValue::Text)
         })?;
     encode_deterministic_cbor(&numbered_map(vec![
-        CanonicalValue::Unsigned(1),
+        CanonicalValue::Unsigned(u64::from(protocol_version)),
         scope_value(scope),
         CanonicalValue::Unsigned(page.policy_revision().get()),
         epoch,
@@ -2477,9 +2890,12 @@ fn encode_pending_join_request_page(
     .map_err(|_| GroupFailure::TemporarilyUnavailable)
 }
 
-fn encode_membership_receipt(receipt: MembershipReceipt) -> Result<Vec<u8>, GroupFailure> {
+fn encode_membership_receipt(
+    receipt: MembershipReceipt,
+    protocol_version: u8,
+) -> Result<Vec<u8>, GroupFailure> {
     let mut fields = vec![
-        CanonicalValue::Unsigned(1),
+        CanonicalValue::Unsigned(u64::from(protocol_version)),
         CanonicalValue::Text(receipt.command_id().request_id().to_string()),
         CanonicalValue::Bytes(receipt.request_digest().as_bytes().to_vec()),
     ];
@@ -2529,6 +2945,39 @@ fn has_exact_content_type(headers: &HeaderMap, expected: &'static str) -> bool {
     let mut values = headers.get_all(header::CONTENT_TYPE).iter();
     matches!(values.next(), Some(value) if value.as_bytes() == expected.as_bytes())
         && values.next().is_none()
+}
+
+fn membership_mutation_version(
+    headers: &HeaderMap,
+    v1: &'static str,
+    v2: &'static str,
+) -> Result<u8, GroupFailure> {
+    if has_exact_content_type(headers, v2) {
+        Ok(2)
+    } else if has_exact_content_type(headers, v1) {
+        Ok(1)
+    } else {
+        Err(GroupFailure::InvalidRequest)
+    }
+}
+
+fn requested_membership_version(
+    headers: &HeaderMap,
+    v1: &'static str,
+    v2: &'static str,
+) -> Result<u8, GroupFailure> {
+    let mut values = headers.get_all(header::ACCEPT).iter();
+    let Some(value) = values.next() else {
+        return Ok(1);
+    };
+    if values.next().is_some() {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    match value.as_bytes() {
+        value if value == v1.as_bytes() => Ok(1),
+        value if value == v2.as_bytes() => Ok(2),
+        _ => Err(GroupFailure::InvalidRequest),
+    }
 }
 
 fn single_optional_header<'a>(

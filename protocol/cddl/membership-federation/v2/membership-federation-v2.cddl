@@ -1,0 +1,40 @@
+; Cross-node authorization for membership V2 (baseline V30).
+; The proof shapes and domains remain V18-compatible. A V2 mutation's exact
+; business-fields digest covers candidate_key_package_digest.
+
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+channel-id = tstr .size 57
+sha256 = bstr .size 32
+signature = bstr .size 64
+utc-millis = -62135596800000..253402300799999
+scope = { 1: 1, 2: uuid-v7 } / { 1: 2, 2: channel-id }
+origin = tstr .size (8..512)
+
+federated-device-action-binding-v2 = {
+  1: 2, 2: 1..7, 3: tstr .size (1..512), 4: scope,
+  5: identity-id, 6: uuid-v7, 7: sha256, 8: sha256,
+  9: utc-millis, 10: utc-millis, 11: origin
+}
+federated-device-action-proof-v2 = {
+  1: 2, 2: federated-device-action-binding-v2, 3: signature
+}
+
+federated-receipt-query-binding-v2 = {
+  1: 2, 2: 8, 3: tstr .size (1..512), 4: scope,
+  5: uuid-v7, 6: identity-id, 7: uuid-v7,
+  8: utc-millis, 9: utc-millis, 10: origin
+}
+federated-receipt-query-proof-v2 = {
+  1: 2, 2: federated-receipt-query-binding-v2, 3: signature
+}
+
+; V29 group-query proof remains byte-compatible and selects the V2 page with
+; an exact Accept header.
+federated-pending-query-binding-v1 = {
+  1: 1, 2: 1, 3: tstr .size (1..768), 4: scope,
+  5: identity-id, 6: uuid-v7, 7: utc-millis, 8: utc-millis, 9: origin
+}
+federated-pending-query-proof-v1 = {
+  1: 1, 2: federated-pending-query-binding-v1, 3: signature
+}

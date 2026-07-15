@@ -19,6 +19,9 @@ use dtx_wire::{CanonicalValue, Sha256Digest, encode_deterministic_cbor};
 /// Domain separator for an internal, canonical membership command request digest.
 pub const MEMBERSHIP_COMMAND_REQUEST_HASH_DOMAIN: &[u8] =
     b"dirextalk.membership-command-request.v1\0";
+/// Domain separator for the V2 transcript that binds the candidate `KeyPackage`.
+pub const MEMBERSHIP_COMMAND_REQUEST_V2_HASH_DOMAIN: &[u8] =
+    b"dirextalk.membership-command-request.v2\0";
 
 /// Typed command identity for one membership action.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -81,6 +84,7 @@ pub struct MembershipCommandContext {
     candidate_device_id: DeviceId,
     invite_id: InviteCapabilityId,
     fence: MembershipFence,
+    candidate_key_package_digest: Option<Sha256Digest>,
 }
 
 impl MembershipCommandContext {
@@ -110,12 +114,45 @@ impl MembershipCommandContext {
             candidate_device_id,
             invite_id,
             fence,
+            candidate_key_package_digest: None,
+        }
+    }
+
+    /// Constructs the V2 membership context and binds one exact candidate
+    /// `KeyPackage` digest through join, approval, and Sequencer admission.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new_v2(
+        command_id: MembershipCommandId,
+        idempotency_key_hash: Sha256Digest,
+        scope: GroupScope,
+        actor_identity_id: IdentityId,
+        actor_device_id: DeviceId,
+        join_request_id: JoinRequestId,
+        candidate_identity_id: IdentityId,
+        candidate_device_id: DeviceId,
+        invite_id: InviteCapabilityId,
+        fence: MembershipFence,
+        candidate_key_package_digest: Sha256Digest,
+    ) -> Self {
+        Self {
+            command_id,
+            idempotency_key_hash,
+            scope,
+            actor_identity_id,
+            actor_device_id,
+            join_request_id,
+            candidate_identity_id,
+            candidate_device_id,
+            invite_id,
+            fence,
+            candidate_key_package_digest: Some(candidate_key_package_digest),
         }
     }
 
     /// Computes the canonical digest for the candidate-authored join command.
     #[must_use]
-    pub fn join_request_digest(self) -> Sha256Digest {
+    pub fn join_request_digest(&self) -> Sha256Digest {
         command_digest(CommandKind::RequestJoin, self, None)
     }
 
@@ -178,6 +215,13 @@ impl MembershipCommandContext {
     pub const fn fence(self) -> MembershipFence {
         self.fence
     }
+
+    /// Returns the V2 candidate `KeyPackage` binding. `None` identifies a
+    /// frozen V17/V18 workflow that cannot authorize the V30 production path.
+    #[must_use]
+    pub const fn candidate_key_package_digest(self) -> Option<Sha256Digest> {
+        self.candidate_key_package_digest
+    }
 }
 
 /// Candidate-authored command that creates a pending approval workflow.
@@ -225,7 +269,7 @@ impl ApproveJoinCommand {
         Self {
             request_digest: command_digest(
                 CommandKind::ApproveJoin,
-                context,
+                &context,
                 Some(authorization_digest),
             ),
             context,
@@ -783,7 +827,7 @@ impl MembershipCommandBook {
         if let Some(receipt) = self.existing_or_conflict(
             context.command_id,
             command.request_digest,
-            IdempotencyLookup::new(context),
+            IdempotencyLookup::new(&context),
         )? {
             return Ok(receipt);
         }
@@ -801,7 +845,7 @@ impl MembershipCommandBook {
                 StoredCommand::terminal(CommandKind::RequestJoin, command.request_digest, phase),
             );
             self.idempotency
-                .insert(IdempotencyLookup::new(context), context.command_id);
+                .insert(IdempotencyLookup::new(&context), context.command_id);
             return self.receipt_for(context.command_id);
         }
         if self.workflows.contains_key(&context.join_request_id) {
@@ -817,9 +861,9 @@ impl MembershipCommandBook {
             ),
         );
         self.idempotency
-            .insert(IdempotencyLookup::new(context), context.command_id);
+            .insert(IdempotencyLookup::new(&context), context.command_id);
         self.workflows
-            .insert(context.join_request_id, JoinWorkflow::pending(context));
+            .insert(context.join_request_id, JoinWorkflow::pending(&context));
         self.receipt_for(context.command_id)
     }
 
@@ -844,7 +888,7 @@ impl MembershipCommandBook {
         if let Some(receipt) = self.existing_or_conflict(
             context.command_id,
             command.request_digest,
-            IdempotencyLookup::new(context),
+            IdempotencyLookup::new(&context),
         )? {
             return Ok(receipt);
         }
@@ -853,7 +897,7 @@ impl MembershipCommandBook {
             .get(&context.join_request_id)
             .copied()
             .ok_or(MembershipCommandError::JoinRequestNotFound)?;
-        if !workflow.matches(context) {
+        if !workflow.matches(&context) {
             return Err(MembershipCommandError::JoinRequestMismatch);
         }
 
@@ -868,7 +912,7 @@ impl MembershipCommandBook {
                 StoredCommand::terminal(CommandKind::ApproveJoin, command.request_digest, phase),
             );
             self.idempotency
-                .insert(IdempotencyLookup::new(context), context.command_id);
+                .insert(IdempotencyLookup::new(&context), context.command_id);
             if matches!(
                 workflow.phase,
                 WorkflowPhase::PendingApproval
@@ -899,7 +943,7 @@ impl MembershipCommandBook {
                     ),
                 );
                 self.idempotency
-                    .insert(IdempotencyLookup::new(context), context.command_id);
+                    .insert(IdempotencyLookup::new(&context), context.command_id);
                 self.workflows.insert(
                     context.join_request_id,
                     JoinWorkflow {
@@ -1199,7 +1243,7 @@ impl MembershipCommandBook {
                     && command.request_digest == workflow.context.join_request_digest()
                     && self.idempotency.iter().any(|(lookup, mapped)| {
                         *mapped == *command_id
-                            && *lookup == IdempotencyLookup::new(workflow.context)
+                            && *lookup == IdempotencyLookup::new(&workflow.context)
                     })
             });
             if !has_request {
@@ -1207,7 +1251,7 @@ impl MembershipCommandBook {
             }
             workflow
                 .phase
-                .validate(*workflow_id, workflow.context, self)?;
+                .validate(*workflow_id, &workflow.context, self)?;
         }
         Ok(())
     }
@@ -1270,7 +1314,7 @@ struct IdempotencyLookup {
 }
 
 impl IdempotencyLookup {
-    const fn new(context: MembershipCommandContext) -> Self {
+    const fn new(context: &MembershipCommandContext) -> Self {
         Self {
             scope: context.scope,
             actor_identity_id: context.actor_identity_id,
@@ -1338,15 +1382,15 @@ struct JoinWorkflow {
 }
 
 impl JoinWorkflow {
-    const fn pending(context: MembershipCommandContext) -> Self {
+    const fn pending(context: &MembershipCommandContext) -> Self {
         Self {
-            context,
+            context: *context,
             phase: WorkflowPhase::PendingApproval,
         }
     }
 
-    fn matches(self, context: MembershipCommandContext) -> bool {
-        workflow_context_matches(self.context, context)
+    fn matches(self, context: &MembershipCommandContext) -> bool {
+        workflow_context_matches(&self.context, context)
     }
 }
 
@@ -1433,7 +1477,7 @@ impl WorkflowPhase {
     fn validate(
         self,
         workflow_id: JoinRequestId,
-        context: MembershipCommandContext,
+        context: &MembershipCommandContext,
         book: &MembershipCommandBook,
     ) -> Result<(), MembershipCommandError> {
         match self {
@@ -1448,7 +1492,7 @@ impl WorkflowPhase {
                 approval_context,
                 authorization_digest,
             } => {
-                if !workflow_context_matches(context, approval_context) {
+                if !workflow_context_matches(context, &approval_context) {
                     return Err(MembershipCommandError::InvariantViolation);
                 }
                 let command = book
@@ -1666,7 +1710,7 @@ fn validate_workflow_command(
                 approval_context,
                 authorization_digest,
             } if approval_command_id == command_id
-                && workflow_context_matches(workflow.context, approval_context)
+                && workflow_context_matches(&workflow.context, &approval_context)
                 && command.request_digest
                     == ApproveJoinCommand::new(approval_context, authorization_digest)
                         .request_digest() =>
@@ -1696,14 +1740,15 @@ fn single_workflow_approval(
 }
 
 fn workflow_context_matches(
-    request: MembershipCommandContext,
-    candidate: MembershipCommandContext,
+    request: &MembershipCommandContext,
+    candidate: &MembershipCommandContext,
 ) -> bool {
     request.scope == candidate.scope
         && request.join_request_id == candidate.join_request_id
         && request.candidate_identity_id == candidate.candidate_identity_id
         && request.candidate_device_id == candidate.candidate_device_id
         && request.invite_id == candidate.invite_id
+        && request.candidate_key_package_digest == candidate.candidate_key_package_digest
 }
 
 fn validate_commit_reference(
@@ -1724,10 +1769,10 @@ fn validate_commit_reference(
 
 fn command_digest(
     kind: CommandKind,
-    context: MembershipCommandContext,
+    context: &MembershipCommandContext,
     authorization_digest: Option<Sha256Digest>,
 ) -> Sha256Digest {
-    let value = CanonicalValue::Map(vec![
+    let mut fields = vec![
         (
             CanonicalValue::Unsigned(1),
             CanonicalValue::Unsigned(kind.code()),
@@ -1775,13 +1820,23 @@ fn command_digest(
                 CanonicalValue::Bytes(digest.as_bytes().to_vec())
             }),
         ),
-    ]);
+    ];
+    let domain = if let Some(candidate_key_package_digest) = context.candidate_key_package_digest {
+        fields.push((
+            CanonicalValue::Unsigned(13),
+            CanonicalValue::Bytes(candidate_key_package_digest.as_bytes().to_vec()),
+        ));
+        MEMBERSHIP_COMMAND_REQUEST_V2_HASH_DOMAIN
+    } else {
+        MEMBERSHIP_COMMAND_REQUEST_HASH_DOMAIN
+    };
+    let value = CanonicalValue::Map(fields);
     // Every field above has a fixed bounded representation: UUIDv7 strings,
-    // self-certifying IDs, 32-byte hashes, and a twelve-entry map. Encoding can
+    // self-certifying IDs, 32-byte hashes, and a bounded versioned map. Encoding can
     // therefore never reach the profile limits for a valid typed context.
     let bytes = encode_deterministic_cbor(&value)
         .expect("bounded membership command transcript must be canonical CBOR");
-    Sha256Digest::hash_domain(MEMBERSHIP_COMMAND_REQUEST_HASH_DOMAIN, &bytes)
+    Sha256Digest::hash_domain(domain, &bytes)
 }
 
 fn scope_value(scope: GroupScope) -> CanonicalValue {

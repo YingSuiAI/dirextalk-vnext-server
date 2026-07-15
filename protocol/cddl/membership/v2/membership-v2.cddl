@@ -1,0 +1,66 @@
+; Dirextalk group membership V2 delta (baseline V30).
+; V17/V18 V1 remains readable. New join and approval commands bind one exact
+; candidate KeyPackage digest end to end. Historical NULL rows fail closed
+; when requested through the V2 pending-discovery or V3 Sequencer path.
+
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+channel-id = tstr .size 57
+sha256 = bstr .size 32
+signature = bstr .size 64
+safe-uint = 0..9007199254740991
+positive-safe-uint = 1..9007199254740991
+utc-millis = -62135596800000..253402300799999
+scope = { 1: 1, 2: uuid-v7 } / { 1: 2, 2: channel-id }
+
+; Local and federated action proofs retain their frozen V17/V18 shapes. The
+; business-fields digest now covers the V2 signable map including field 6/8.
+device-action-binding = {
+  1: 1 / 2, 2: 1..7, 3: tstr .size (1..512), 4: scope,
+  5: identity-id, 6: uuid-v7, 7: sha256, 8: sha256,
+  9: utc-millis, 10: utc-millis, ? 11: tstr .size (8..512)
+}
+device-action-proof = { 1: 1 / 2, 2: device-action-binding, 3: signature }
+
+join-request-signable-v2 = {
+  1: 2, 2: uuid-v7, 3: uuid-v7, 4: positive-safe-uint,
+  5: sha256, 6: sha256
+}
+join-request-command-v2 = {
+  1: 2, 2: uuid-v7, 3: uuid-v7, 4: positive-safe-uint,
+  5: sha256, 6: sha256, 7: device-action-proof
+}
+approve-join-signable-v2 = {
+  1: 2, 2: uuid-v7, 3: identity-id, 4: uuid-v7, 5: uuid-v7,
+  6: positive-safe-uint, 7: sha256, 8: sha256
+}
+approve-join-command-v2 = {
+  1: 2, 2: uuid-v7, 3: identity-id, 4: uuid-v7, 5: uuid-v7,
+  6: positive-safe-uint, 7: sha256, 8: sha256, 9: device-action-proof
+}
+
+; SHA-256(`dirextalk.membership-command-request.v2\0` || exact transcript).
+membership-command-digest-transcript-v2 = {
+  1: 1 / 2, 2: uuid-v7, 3: scope, 4: identity-id, 5: uuid-v7,
+  6: uuid-v7, 7: identity-id, 8: uuid-v7, 9: uuid-v7,
+  10: positive-safe-uint, 11: sha256, 12: sha256 / null,
+  13: sha256
+}
+
+membership-commit-reference-v2 = {
+  1: 1, 2: scope, 3: uuid-v7, 4: sha256, 5: sha256
+}
+membership-receipt-v2 =
+  { 1: 2, 2: uuid-v7, 3: sha256, 4: 1 / 2 / 3 } /
+  { 1: 2, 2: uuid-v7, 3: sha256, 4: 4, 5: 1 / 2, 6: membership-commit-reference-v2 } /
+  { 1: 2, 2: uuid-v7, 3: sha256, 4: 5, 5: 1 / 2 / 3 }
+
+pending-join-item-v2 = {
+  1: uuid-v7, 2: identity-id, 3: uuid-v7, 4: tstr .size (8..512),
+  5: uuid-v7, 6: utc-millis, 7: uuid-v7, 8: sha256, 9: sha256
+}
+pending-join-page-v2 = {
+  1: 2, 2: scope, 3: positive-safe-uint,
+  4: safe-uint / null, 5: sha256 / null,
+  6: [* pending-join-item-v2], 7: tstr / null
+}

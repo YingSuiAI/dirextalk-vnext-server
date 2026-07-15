@@ -15,7 +15,12 @@ use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use sha2::{Digest as _, Sha256};
 use std::{error::Error, fmt};
 
+mod peer_admission;
 mod repository;
+pub use peer_admission::{
+    PEER_ADMISSION_HPKE_INFO_V1, PeerAdmissionEnvelopeV1, PeerAdmissionOfferUnsignedV1,
+    PeerAdmissionOfferV1, PeerAdmissionWelcomeUnsignedV1, PeerAdmissionWelcomeV1,
+};
 pub use repository::{
     ContactRepository, ContactRequestRecord, ContactStoreError, StoredContactReceipt,
 };

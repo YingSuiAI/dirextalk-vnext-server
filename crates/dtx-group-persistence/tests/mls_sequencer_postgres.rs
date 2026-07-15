@@ -629,7 +629,8 @@ async fn confirmed_approved_device_waits_for_gm1_identity_finalize() -> Result<(
         .await?;
 
     let join_id = JoinRequestId::from_str("0190f2a5-7b1c-7abc-8def-0123456789a6")?;
-    let request_context = MembershipCommandContext::new(
+    let candidate_key_package_digest = digest(0x61);
+    let request_context = MembershipCommandContext::new_v2(
         MembershipCommandId::new(request("0190f2a5-7b1c-7abc-8def-0123456789a7")),
         digest(0x31),
         scope(),
@@ -640,7 +641,9 @@ async fn confirmed_approved_device_waits_for_gm1_identity_finalize() -> Result<(
         candidate_device,
         invite,
         MembershipFence::new(request_revision, bootstrap_receipt.receipt().head_digest()),
+        candidate_key_package_digest,
     );
+    let join_request_digest = JoinRequestCommand::new(request_context).request_digest();
     GroupMembershipRepository
         .request_join(
             &store,
@@ -657,7 +660,7 @@ async fn confirmed_approved_device_waits_for_gm1_identity_finalize() -> Result<(
         .revision();
     let approval_id = MembershipCommandId::new(request("0190f2a5-7b1c-7abc-8def-0123456789a8"));
     let authorization_digest = digest(0x44);
-    let approval_context = MembershipCommandContext::new(
+    let approval_context = MembershipCommandContext::new_v2(
         approval_id,
         digest(0x32),
         scope(),
@@ -668,7 +671,10 @@ async fn confirmed_approved_device_waits_for_gm1_identity_finalize() -> Result<(
         candidate_device,
         invite,
         MembershipFence::new(approval_revision, bootstrap_receipt.receipt().head_digest()),
+        candidate_key_package_digest,
     );
+    let approval_request_digest =
+        ApproveJoinCommand::new(approval_context, authorization_digest).request_digest();
     GroupMembershipRepository
         .approve_join(
             &store,
@@ -679,25 +685,24 @@ async fn confirmed_approved_device_waits_for_gm1_identity_finalize() -> Result<(
         )
         .await?;
     let commit = vec![0x55; 48];
-    let approved = MlsCommitCommand::new(
+    let approved = MlsCommitCommand::new_v3_approved_identity_join(
         request("0190f2a5-7b1c-7abc-8def-0123456789a9"),
         scope(),
         owner(),
         owner_device,
         candidate,
         candidate_device,
-        digest(0x61),
-        digest(0x62),
+        candidate_key_package_digest,
         digest(0x63),
         1,
         bootstrap_receipt.receipt().head_digest(),
         commit.clone(),
         mls_opaque_commit_digest(&commit),
         digest(0x64),
-        MlsCommitAuthorization::ApprovedIdentityJoin {
-            membership_command_id: approval_id,
-            authorization_digest,
-        },
+        approval_id,
+        authorization_digest,
+        join_request_digest,
+        approval_request_digest,
     )?;
     let accepted = MlsCommitSequencerRepository
         .submit(
@@ -711,26 +716,38 @@ async fn confirmed_approved_device_waits_for_gm1_identity_finalize() -> Result<(
             |input| Ok(sign(&signer, input)),
         )
         .await?;
+    assert_eq!(accepted.receipt().protocol_version(), 3);
+    assert_eq!(
+        accepted.receipt().candidate_key_package_digest(),
+        candidate_key_package_digest
+    );
+    assert_eq!(
+        accepted.receipt().join_request_digest(),
+        Some(join_request_digest)
+    );
+    assert_eq!(
+        accepted.receipt().approval_request_digest(),
+        Some(approval_request_digest)
+    );
     let second_commit = vec![0x56; 48];
-    let duplicate_approval = MlsCommitCommand::new(
+    let duplicate_approval = MlsCommitCommand::new_v3_approved_identity_join(
         request("0190f2a5-7b1c-7abc-8def-0123456789b4"),
         scope(),
         owner(),
         owner_device,
         candidate,
         candidate_device,
-        digest(0x71),
-        digest(0x72),
+        candidate_key_package_digest,
         digest(0x73),
         2,
         accepted.receipt().head_digest(),
         second_commit.clone(),
         mls_opaque_commit_digest(&second_commit),
         digest(0x74),
-        MlsCommitAuthorization::ApprovedIdentityJoin {
-            membership_command_id: approval_id,
-            authorization_digest,
-        },
+        approval_id,
+        authorization_digest,
+        join_request_digest,
+        approval_request_digest,
     )?;
     assert!(matches!(
         MlsCommitSequencerRepository

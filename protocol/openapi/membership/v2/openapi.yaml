@@ -1,0 +1,80 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Membership KeyPackage Binding
+  version: 2.0.0
+  description: >-
+    V30 delta over the frozen V17/V18 routes. New join and approval bodies bind
+    one candidate KeyPackage digest. V1 stays readable; a V2 read of an old
+    workflow whose digest is NULL fails closed with 503.
+paths:
+  /v1/groups/{scope_kind}/{scope_id}/join-requests/{join_request_id}:
+    put:
+      operationId: requestJoinV2
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.group-join-request.v2+cbor:
+            schema: {$ref: '#/components/schemas/ExactCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/MembershipReceipt'}
+        '202': {$ref: '#/components/responses/MembershipReceipt'}
+        '422': {description: Body, proof, package digest, or durable fence rejected.}
+  /v1/groups/{scope_kind}/{scope_id}/join-requests/{join_request_id}/approvals:
+    post:
+      operationId: approveJoinV2
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.group-approve-join.v2+cbor:
+            schema: {$ref: '#/components/schemas/ExactCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/MembershipReceipt'}
+        '202': {$ref: '#/components/responses/MembershipReceipt'}
+        '422': {description: Approval does not match the durable V2 join facts.}
+  /v1/groups/{scope_kind}/{scope_id}/join-requests:
+    get:
+      operationId: listJoinRequestsV2
+      parameters:
+        - name: Accept
+          in: header
+          required: true
+          schema: {type: string, const: application/vnd.dirextalk.group-join-request-page.v2+cbor}
+      responses:
+        '200':
+          description: Every item includes candidate_key_package_digest.
+          content:
+            application/vnd.dirextalk.group-join-request-page.v2+cbor:
+              schema: {$ref: '#/components/schemas/ExactCbor'}
+        '503': {description: A historical NULL workflow cannot be represented as V2.}
+  /v1/groups/{scope_kind}/{scope_id}/membership-receipts/{membership_command_id}:
+    get:
+      operationId: getMembershipReceiptV2
+      parameters:
+        - name: Accept
+          in: header
+          required: true
+          schema: {type: string, const: application/vnd.dirextalk.membership-receipt.v2+cbor}
+      responses:
+        '200': {$ref: '#/components/responses/MembershipReceipt'}
+components:
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 16, maxLength: 128}
+  schemas:
+    ExactCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+  responses:
+    MembershipReceipt:
+      description: Stable V2 membership receipt; exact replay returns identical bytes.
+      content:
+        application/vnd.dirextalk.membership-receipt.v2+cbor:
+          schema: {$ref: '#/components/schemas/ExactCbor'}

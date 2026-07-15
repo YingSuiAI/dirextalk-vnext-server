@@ -135,6 +135,19 @@ const V29_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/group-membership-discovery/v1",
     "protocol/test-vectors/group-membership-discovery/v1",
 ];
+const V30_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/conversation-admission/v1",
+    "protocol/test-vectors/conversation-admission/v1",
+    "protocol/cddl/membership/v2",
+    "protocol/openapi/membership/v2",
+    "protocol/test-vectors/membership/v2",
+    "protocol/cddl/membership-federation/v2",
+    "protocol/openapi/membership-federation/v2",
+    "protocol/test-vectors/membership-federation/v2",
+    "protocol/cddl/mls-sequencer/v3",
+    "protocol/openapi/mls-sequencer/v3",
+    "protocol/test-vectors/mls-sequencer/v3",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -324,6 +337,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v29/manifest.json",
         includes_registries: false,
         artifact_paths: V29_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 30,
+        path: "protocol/baseline/v30/manifest.json",
+        includes_registries: false,
+        artifact_paths: V30_ARTIFACT_PATHS,
     },
 ];
 

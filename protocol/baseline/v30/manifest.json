@@ -1,0 +1,18 @@
+{
+  "version": 30,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/conversation-admission/v1/conversation-admission-v1.cddl": "sha256:ce0d596b80308190bf4acf197ac3dfd7c08e961e89b2954751a7677fcacf697a",
+    "protocol/cddl/membership-federation/v2/membership-federation-v2.cddl": "sha256:275efde604fff7f375fe80f5c352fa1302f852809d33827bbf2b3058f08925c7",
+    "protocol/cddl/membership/v2/membership-v2.cddl": "sha256:bcef0994c00daf4f8a964ea082aeffc53fdeb9ff1bb9d93e0877a3bdfcad0b9b",
+    "protocol/cddl/mls-sequencer/v3/mls-sequencer-v3.cddl": "sha256:89e213c19220d5877b829dea903a4ef1e040bc06157da9fb5698fac0cc298480",
+    "protocol/openapi/membership-federation/v2/openapi.yaml": "sha256:4a35e47f8b20bdd91a46c692012bb240177e1e6462eef31912b0d25a9088f5e0",
+    "protocol/openapi/membership/v2/openapi.yaml": "sha256:99cfd3cb31cb9bb6ab4e4b5d31e40dae6ea9dd8ea9de3e17939d8dfe9464993b",
+    "protocol/openapi/mls-sequencer/v3/openapi.yaml": "sha256:bb3a5db532df63164d493c0e5d75d52326992627cb15e4cc9bb1c71b82726a41",
+    "protocol/test-vectors/conversation-admission/v1/conversation-admission-v1.json": "sha256:eb850380d55dd2f20bc4543987681f22e7dca50b8ff19d42305e5a26102d72ee",
+    "protocol/test-vectors/membership-federation/v2/membership-federation-v2.json": "sha256:b7a7a5487b791ca597a0e6b86c4d8f6c4e69464bd57e2ab5524eb40db7b31e92",
+    "protocol/test-vectors/membership/v2/membership-v2.json": "sha256:ce04ff2ed83c2b7be2b1189e1fa129e5c058c424df0bcc1e26e4aed01a38804e",
+    "protocol/test-vectors/mls-sequencer/v3/mls-sequencer-v3.json": "sha256:051d5387c016c06879473e40b538f89b1257f9541ec1b33b7503cc80d8a3f8d7"
+  }
+}
