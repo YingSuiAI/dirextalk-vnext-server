@@ -1,0 +1,10 @@
+{
+  "version": 31,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/conversation-agent-grant/v1/conversation-agent-grant-v1.cddl": "sha256:8e3a623a5c9a1799cfbab7966a9b825bd90fe70f56a39a28728ea48110f997ea",
+    "protocol/openapi/conversation-agent-grant/v1/openapi.yaml": "sha256:173ad6cad6c30f8dd4d65916c5247c6fcf252b8308a69ab0848ef64a11d455ae",
+    "protocol/test-vectors/conversation-agent-grant/v1/conversation-agent-grant-v1.json": "sha256:54aab9bfd3e4dc7cf5be1cc72c5d4ab4b2e5abffd712d5d212f4261a19c3abf8"
+  }
+}

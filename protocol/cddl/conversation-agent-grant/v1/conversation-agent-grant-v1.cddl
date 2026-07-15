@@ -1,0 +1,88 @@
+; Dirextalk private-conversation Owner Agent Grant V1 (baseline V31).
+;
+; This is a deliberately closed first-grant surface. A successful PUT can
+; grant only MentionOnly chat authority: `read_future_messages` and
+; `send_messages`. It cannot grant history, attachments, comments, tools,
+; jobs, cloud connections, data-egress, or an all-messages trigger.
+
+sha256 = bstr .size 32
+ed25519-signature = bstr .size 64
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+safe-uint = 0..9007199254740991
+positive-safe-uint = 1..9007199254740991
+utc-millis = -62135596800000..253402300799999
+
+agent-grant-action-v1 = 1 / 2 ; grant / revoke
+mention-only-chat-profile-v1 = 1
+
+; The signed binding carries the exact HTTP path IDs, idempotency operation,
+; and optimistic grant fence. `operation_id` MUST equal `Idempotency-Key` and
+; `expected_grant_version` MUST equal the numeric value in `If-Match`.
+;
+; The server accepts proof_expires_at_ms only when it is strictly after server
+; time and no more than 600000 ms ahead. On a grant request it accepts
+; grant_expires_at_ms only when it is strictly after server time and no more
+; than 7776000000 ms (90 days) ahead. A revoke carries null for fields 11/12.
+conversation-agent-grant-put-binding-v1 = {
+  1: 1,
+  2: 1,                      ; grant
+  3: uuid-v7,                ; tenant_id
+  4: uuid-v7,                ; private conversation_id
+  5: uuid-v7,                ; installation_id
+  6: uuid-v7,                ; operation_id
+  7: safe-uint,              ; expected grant version; zero means no head
+  8: identity-id,            ; authenticated Owner identity
+  9: uuid-v7,                ; authenticated active Owner device
+  10: utc-millis,            ; proof_expires_at_ms
+  11: utc-millis,            ; grant_expires_at_ms
+  12: sha256                 ; acknowledged privacy policy hash
+}
+
+conversation-agent-grant-delete-binding-v1 = {
+  1: 1,
+  2: 2,                      ; revoke
+  3: uuid-v7,                ; tenant_id
+  4: uuid-v7,                ; private conversation_id
+  5: uuid-v7,                ; installation_id
+  6: uuid-v7,                ; operation_id
+  7: positive-safe-uint,     ; expected current grant version
+  8: identity-id,            ; authenticated Owner identity
+  9: uuid-v7,                ; authenticated active Owner device
+  10: utc-millis,            ; proof_expires_at_ms
+  11: null,                  ; grant_expires_at_ms is absent for revoke
+  12: null                   ; privacy policy hash is absent for revoke
+}
+
+conversation-agent-grant-binding-v1 =
+  conversation-agent-grant-put-binding-v1 /
+  conversation-agent-grant-delete-binding-v1
+
+; Field 2 is SHA-256("dirextalk.conversation-agent-grant-binding.v1\0" ||
+; canonical-CBOR(field 1)). Field 3 signs
+; "dirextalk.conversation-agent-grant-signature.v1\0" || field 2 using the
+; exact current signing key of the authenticated Owner device.
+conversation-agent-grant-request-v1 = {
+  1: conversation-agent-grant-binding-v1,
+  2: sha256,                 ; binding_digest
+  3: ed25519-signature       ; owner_signature
+}
+
+; The server allocates grant_id only after authorizing the signed request. The
+; receipt is exact-replayed as its original canonical bytes. It deliberately
+; omits device-session material, signatures, binding bytes, operation IDs, and
+; any message, Connector, capability, or secret value.
+conversation-agent-grant-receipt-v1 = {
+  1: 1,
+  2: agent-grant-action-v1,
+  3: uuid-v7,                ; tenant_id
+  4: uuid-v7,                ; conversation_id
+  5: uuid-v7,                ; installation_id
+  6: uuid-v7,                ; server-generated grant_id
+  7: positive-safe-uint,     ; resulting grant_version
+  8: mention-only-chat-profile-v1,
+  9: sha256,                 ; resulting/revoked privacy policy hash
+  10: uuid-v7,               ; acting Owner device
+  11: utc-millis,            ; committed_at_ms
+  12: utc-millis / null      ; grant expiry / null after revoke
+}

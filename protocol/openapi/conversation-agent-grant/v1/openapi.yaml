@@ -1,0 +1,136 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Private Conversation Agent Grant
+  version: 1.0.0
+  description: >-
+    Owner-device mutation of a private-conversation Agent grant. This V1
+    surface is intentionally closed: it can only grant MentionOnly chat
+    authority (`read_future_messages` plus `send_messages`) until the signed
+    expiry. It cannot authorize tools, jobs, cloud, data egress, history,
+    attachments, comments, or an all-messages trigger.
+paths:
+  /v1/conversations/{conversation_id}/agent-grants/{installation_id}:
+    parameters:
+      - $ref: '#/components/parameters/ConversationId'
+      - $ref: '#/components/parameters/InstallationId'
+      - $ref: '#/components/parameters/DeviceSessionAuthorization'
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/GrantFence'
+    put:
+      operationId: grantPrivateConversationAgent
+      description: >-
+        Issue a first grant when `If-Match` is `"g0"`, or regrant after a
+        revoked head when it equals the exact current `"gN"` fence. The
+        canonical binding duplicates both the path IDs and those two headers;
+        any mismatch is rejected. The server generates the new grant ID.
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.conversation-agent-grant.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/GrantReceiptCreated'}
+        '200': {$ref: '#/components/responses/GrantReceiptReplay'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {description: The active device is not the current Owner, or the target is not a private conversation.}
+        '409': {description: Changed idempotency replay, stale grant fence, or an active/revoked grant state incompatible with this action.}
+        '422': {description: The exact canonical proof, signed binding, action, header/path duplicate, proof lifetime, or requested grant lifetime is invalid.}
+        '503': {description: Required durable authorization data is temporarily unavailable.}
+    delete:
+      operationId: revokePrivateConversationAgent
+      description: >-
+        Revoke exactly the current active grant. DELETE has the same mandatory
+        canonical CBOR device proof as PUT; it is never an unsigned empty-body
+        operation. Its signed binding uses action `revoke`, a nonzero current
+        grant fence, and null grant-expiry/privacy-hash fields.
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.conversation-agent-grant.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/GrantReceiptReplay'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {description: The active device is not the current Owner, or the target is not a private conversation.}
+        '409': {description: Changed idempotency replay, stale grant fence, or no matching active grant.}
+        '422': {description: The exact canonical proof, signed binding, action, header/path duplicate, or proof lifetime is invalid.}
+        '503': {description: Required durable authorization data is temporarily unavailable.}
+components:
+  parameters:
+    ConversationId:
+      name: conversation_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    InstallationId:
+      name: installation_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        A canonical lowercase UUIDv7 operation ID. It MUST equal signed
+        binding field 6. The same operation and exact request digest replay the
+        original receipt; any changed replay conflicts.
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    GrantFence:
+      name: If-Match
+      in: header
+      required: true
+      description: >-
+        Exact quoted grant fence: `"g0"` means no current grant head;
+        `"gN"` means exact positive current version N. It MUST equal signed
+        binding field 7. Whitespace, weak validators, duplicate headers, and
+        alternate numeric representations are invalid.
+      schema:
+        type: string
+        pattern: '^"g(?:0|[1-9][0-9]{0,15})"$'
+    DeviceSessionAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      description: >-
+        Exact active Owner device session. The authenticated tenant, identity,
+        device, and current signing key must match the signed canonical body.
+      schema:
+        type: string
+        pattern: '^DTX-Device-Session [0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$'
+  schemas:
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    ExactCanonicalCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+  responses:
+    GrantReceiptCreated:
+      description: >-
+        Fresh server-generated grant receipt. `Cache-Control: no-store` is
+        mandatory; the body is the exact canonical CDDL receipt and contains
+        no session material, signature, operation ID, binding bytes, message,
+        Connector, capability, or secret.
+      headers:
+        Cache-Control:
+          required: true
+          schema: {type: string, const: no-store}
+      content:
+        application/vnd.dirextalk.conversation-agent-grant-receipt.v1+cbor:
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    GrantReceiptReplay:
+      description: >-
+        Current revoke receipt or exact replay of a previous successful
+        operation. A replay returns the original canonical receipt bytes, not
+        a reconstructed current projection.
+      headers:
+        Cache-Control:
+          required: true
+          schema: {type: string, const: no-store}
+      content:
+        application/vnd.dirextalk.conversation-agent-grant-receipt.v1+cbor:
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    Unauthorized:
+      description: Device session is missing, expired, revoked, malformed, or for another identity.
