@@ -7,6 +7,7 @@
 
 use dtx_domain::{DeviceId, IdentityId, RequestId, TenantId};
 use dtx_group_policy::GroupScope;
+use dtx_identity_persistence::{DeviceSessionCredential, DeviceSessionRepository};
 use dtx_membership_command::MembershipCommandId;
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, Sha256Digest, SigningPublicKey,
@@ -16,7 +17,10 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
-use crate::{GroupPersistenceError, GroupPgStore, repository::settle};
+use crate::{
+    GroupPersistenceError, GroupPgStore,
+    repository::{begin_authenticated_with_signing_key, resolve_mls_commit_in_transaction, settle},
+};
 
 const COMMIT_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-opaque-commit.v1\0";
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-request.v1\0";
@@ -24,6 +28,19 @@ const HEAD_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-sequencer-head.v1\0";
 const RECEIPT_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt.v1\0";
 const RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt-signature.v1\0";
 const DEVICE_CONFIRMATION_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-device-join-confirmation.v1\0";
+/// V2 candidate possession transcript digest domain.
+pub const MLS_CANDIDATE_PROOF_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-candidate-proof-digest.v2\0";
+/// V2 candidate possession signature domain.
+pub const MLS_CANDIDATE_PROOF_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.mls-candidate-proof-signature.v2\0";
+/// V2 existing-device consent transcript digest domain.
+pub const MLS_CONTROLLER_CONSENT_DIGEST_DOMAIN: &[u8] =
+    b"dirextalk.mls-controller-consent-digest.v2\0";
+/// V2 existing-device consent signature domain.
+pub const MLS_CONTROLLER_CONSENT_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.mls-controller-consent-signature.v2\0";
+/// V2 raw HTTP idempotency-key hash domain.
+pub const MLS_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] = b"dirextalk.mls-idempotency-key.v2\0";
 const MAX_COMMIT_BYTES: usize = 1_048_576;
 
 /// Computes the protocol-frozen digest of opaque MLS Commit wire bytes.
@@ -271,6 +288,16 @@ impl MlsCommitCommand {
     pub const fn scope(&self) -> GroupScope {
         self.scope
     }
+    /// Exact authenticated actor identity.
+    #[must_use]
+    pub const fn actor_identity_id(&self) -> IdentityId {
+        self.actor_identity_id
+    }
+    /// Exact authenticated actor device.
+    #[must_use]
+    pub const fn actor_device_id(&self) -> DeviceId {
+        self.actor_device_id
+    }
     /// Exact candidate identity.
     #[must_use]
     pub const fn candidate_identity_id(&self) -> IdentityId {
@@ -291,11 +318,205 @@ impl MlsCommitCommand {
     pub const fn candidate_proof_digest(&self) -> Sha256Digest {
         self.candidate_proof_digest
     }
+    /// Idempotency key hash bound into both device-proof transcripts.
+    #[must_use]
+    pub const fn idempotency_key_hash(&self) -> Sha256Digest {
+        self.idempotency_key_hash
+    }
+    /// Expected parent epoch.
+    #[must_use]
+    pub const fn expected_epoch(&self) -> u64 {
+        self.expected_epoch
+    }
+    /// Expected parent head.
+    #[must_use]
+    pub const fn expected_head(&self) -> Sha256Digest {
+        self.expected_head
+    }
+    /// Domain-separated opaque commit digest.
+    #[must_use]
+    pub const fn commit_digest(&self) -> Sha256Digest {
+        self.commit_digest
+    }
+    /// Opaque Welcome digest.
+    #[must_use]
+    pub const fn welcome_digest(&self) -> Sha256Digest {
+        self.welcome_digest
+    }
     /// Admission authority, including exact controller-consent binding when required.
     #[must_use]
     pub const fn authorization(&self) -> MlsCommitAuthorization {
         self.authorization
     }
+}
+
+fn mls_device_proof_transcript(command: &MlsCommitCommand) -> CanonicalValue {
+    let (operation, membership_command, approval_digest, controller_device) =
+        match command.authorization {
+            MlsCommitAuthorization::OwnerBootstrap => (
+                1,
+                CanonicalValue::Null,
+                CanonicalValue::Null,
+                CanonicalValue::Null,
+            ),
+            MlsCommitAuthorization::ApprovedIdentityJoin {
+                membership_command_id,
+                authorization_digest,
+            } => (
+                2,
+                CanonicalValue::Text(membership_command_id.request_id().to_string()),
+                authorization_digest.to_canonical_value(),
+                CanonicalValue::Null,
+            ),
+            MlsCommitAuthorization::ExistingMemberDeviceAdd {
+                controller_device_id,
+                ..
+            } => (
+                3,
+                CanonicalValue::Null,
+                CanonicalValue::Null,
+                CanonicalValue::Text(controller_device_id.to_string()),
+            ),
+        };
+    CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Unsigned(operation),
+        ),
+        (CanonicalValue::Unsigned(3), scope_value(command.scope)),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(command.submission_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            command.idempotency_key_hash.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Text(command.actor_identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Text(command.actor_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Text(command.candidate_identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Text(command.candidate_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(10),
+            command.candidate_key_package_digest.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(11),
+            CanonicalValue::Unsigned(command.expected_epoch),
+        ),
+        (
+            CanonicalValue::Unsigned(12),
+            command.expected_head.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(13),
+            CanonicalValue::Unsigned(command.expected_epoch + 1),
+        ),
+        (
+            CanonicalValue::Unsigned(14),
+            command.commit_digest.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(15),
+            command.welcome_digest.to_canonical_value(),
+        ),
+        (CanonicalValue::Unsigned(16), membership_command),
+        (CanonicalValue::Unsigned(17), approval_digest),
+        (CanonicalValue::Unsigned(18), controller_device),
+    ])
+}
+
+/// Canonical V2 proof transcript bytes shared by candidate and controller.
+///
+/// # Errors
+///
+/// Returns a corruption error if the bounded transcript cannot be encoded.
+pub fn mls_device_proof_transcript_canonical_bytes(
+    command: &MlsCommitCommand,
+) -> Result<Vec<u8>, GroupPersistenceError> {
+    encode_deterministic_cbor(&mls_device_proof_transcript(command))
+        .map_err(|_| GroupPersistenceError::CorruptData("MLS device proof encoding"))
+}
+
+/// Recomputes the V2 candidate proof digest from server-decoded request facts.
+///
+/// # Errors
+///
+/// Returns a corruption error if the bounded transcript cannot be encoded.
+pub fn mls_candidate_proof_digest(
+    command: &MlsCommitCommand,
+) -> Result<Sha256Digest, GroupPersistenceError> {
+    let bytes = mls_device_proof_transcript_canonical_bytes(command)?;
+    Ok(Sha256Digest::hash_domain(
+        MLS_CANDIDATE_PROOF_DIGEST_DOMAIN,
+        &bytes,
+    ))
+}
+
+/// Exact candidate signature input for the V2 recomputed transcript digest.
+///
+/// # Errors
+///
+/// Returns a corruption error if the bounded transcript cannot be encoded.
+pub fn mls_candidate_proof_signature_input(
+    command: &MlsCommitCommand,
+) -> Result<Vec<u8>, GroupPersistenceError> {
+    let digest = mls_candidate_proof_digest(command)?;
+    let mut input =
+        Vec::with_capacity(MLS_CANDIDATE_PROOF_SIGNATURE_DOMAIN.len() + digest.as_bytes().len());
+    input.extend_from_slice(MLS_CANDIDATE_PROOF_SIGNATURE_DOMAIN);
+    input.extend_from_slice(digest.as_bytes());
+    Ok(input)
+}
+
+/// Recomputes the V2 active-controller consent digest.
+///
+/// # Errors
+///
+/// Rejects non-device-add commands and transcript encoding failures.
+pub fn mls_controller_consent_digest(
+    command: &MlsCommitCommand,
+) -> Result<Sha256Digest, GroupPersistenceError> {
+    if !matches!(
+        command.authorization,
+        MlsCommitAuthorization::ExistingMemberDeviceAdd { .. }
+    ) {
+        return Err(GroupPersistenceError::MlsAuthorizationRejected);
+    }
+    let bytes = mls_device_proof_transcript_canonical_bytes(command)?;
+    Ok(Sha256Digest::hash_domain(
+        MLS_CONTROLLER_CONSENT_DIGEST_DOMAIN,
+        &bytes,
+    ))
+}
+
+/// Exact controller signature input for the V2 recomputed transcript digest.
+///
+/// # Errors
+///
+/// Rejects non-device-add commands and transcript encoding failures.
+pub fn mls_controller_consent_signature_input(
+    command: &MlsCommitCommand,
+) -> Result<Vec<u8>, GroupPersistenceError> {
+    let digest = mls_controller_consent_digest(command)?;
+    let mut input =
+        Vec::with_capacity(MLS_CONTROLLER_CONSENT_SIGNATURE_DOMAIN.len() + digest.as_bytes().len());
+    input.extend_from_slice(MLS_CONTROLLER_CONSENT_SIGNATURE_DOMAIN);
+    input.extend_from_slice(digest.as_bytes());
+    Ok(input)
 }
 
 /// Immutable signed receipt returned after one CAS-accepted opaque commit.
@@ -411,6 +632,205 @@ pub struct MlsCommitSequencerRepository;
 
 #[allow(clippy::missing_errors_doc, clippy::too_many_arguments)]
 impl MlsCommitSequencerRepository {
+    /// Authenticates the exact actor, recomputes both V2 proof transcripts,
+    /// persists the sequencer receipt, and (for an approved identity join)
+    /// finalizes the canonical GM1 workflow in the same transaction.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn submit_authenticated<FS>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        command: &MlsCommitCommand,
+        candidate_signature: Ed25519Signature,
+        controller_signature: Option<Ed25519Signature>,
+        now_ms: i64,
+        sequencer_signing_key: SigningPublicKey,
+        sign_receipt: FS,
+    ) -> Result<MlsCommitExecution, GroupPersistenceError>
+    where
+        FS: FnOnce(&[u8]) -> Result<Ed25519Signature, GroupPersistenceError>,
+    {
+        let (mut session, authenticated) =
+            begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
+        let authenticated_session = authenticated.session();
+        if authenticated_session.identity_id() != command.actor_identity_id
+            || authenticated_session.device_id() != command.actor_device_id
+        {
+            return settle(
+                session,
+                Err(GroupPersistenceError::DeviceAuthenticationRejected),
+            )
+            .await;
+        }
+        let candidate_key = DeviceSessionRepository::active_device_signing_key_in_transaction(
+            session.connection(),
+            command.candidate_identity_id,
+            command.candidate_device_id,
+        )
+        .await
+        .map_err(|_| GroupPersistenceError::MlsAuthorizationRejected)?;
+        let expected_candidate_digest = mls_candidate_proof_digest(command)?;
+        if expected_candidate_digest != command.candidate_proof_digest {
+            return settle(
+                session,
+                Err(GroupPersistenceError::MlsAuthorizationRejected),
+            )
+            .await;
+        }
+        verify_signature(
+            candidate_key,
+            &mls_candidate_proof_signature_input(command)?,
+            candidate_signature,
+        )
+        .map_err(|_| GroupPersistenceError::MlsAuthorizationRejected)?;
+
+        let authorization_result = match command.authorization {
+            MlsCommitAuthorization::ExistingMemberDeviceAdd {
+                controller_device_id,
+                controller_consent_digest,
+            } => {
+                let controller_signature =
+                    controller_signature.ok_or(GroupPersistenceError::MlsAuthorizationRejected)?;
+                let expected = mls_controller_consent_digest(command)?;
+                if expected == controller_consent_digest {
+                    let controller_key =
+                        DeviceSessionRepository::active_device_signing_key_in_transaction(
+                            session.connection(),
+                            command.candidate_identity_id,
+                            controller_device_id,
+                        )
+                        .await
+                        .map_err(|_| GroupPersistenceError::MlsAuthorizationRejected)?;
+                    verify_signature(
+                        controller_key,
+                        &mls_controller_consent_signature_input(command)?,
+                        controller_signature,
+                    )
+                    .map_err(|_| GroupPersistenceError::MlsAuthorizationRejected)
+                } else {
+                    Err(GroupPersistenceError::MlsAuthorizationRejected)
+                }
+            }
+            _ if controller_signature.is_some() => {
+                Err(GroupPersistenceError::MlsAuthorizationRejected)
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = authorization_result {
+            return settle(session, Err(error)).await;
+        }
+        let result = async {
+            let execution = submit_in_transaction(
+                session.connection(),
+                tenant_id,
+                command,
+                now_ms,
+                sequencer_signing_key,
+                |_| Ok(()),
+                |_| Ok(()),
+                sign_receipt,
+            )
+            .await?;
+            if let MlsCommitAuthorization::ApprovedIdentityJoin {
+                membership_command_id,
+                ..
+            } = command.authorization
+            {
+                resolve_mls_commit_in_transaction(
+                    session.connection(),
+                    tenant_id,
+                    command.scope,
+                    membership_command_id,
+                    execution.receipt.receipt_digest,
+                    now_ms,
+                )
+                .await?;
+            }
+            Ok(execution)
+        }
+        .await;
+        settle(session, result).await
+    }
+
+    /// Authenticates an actor or candidate before returning an immutable receipt.
+    pub async fn receipt_authenticated(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        scope: GroupScope,
+        submission_id: RequestId,
+        now_ms: i64,
+        expected_signing_key: SigningPublicKey,
+    ) -> Result<MlsCommitReceipt, GroupPersistenceError> {
+        let (mut session, authenticated) =
+            begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
+        let result = async {
+            let receipt = load_receipt(
+                session.connection(),
+                tenant_id,
+                scope,
+                submission_id,
+                expected_signing_key,
+            )
+            .await?
+            .ok_or(GroupPersistenceError::GroupNotFound)?;
+            let allowed: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM groups.mls_commit_intents
+                  WHERE tenant_id=$1 AND submission_id=$2 AND scope_kind=$3 AND scope_id=$4
+                    AND ((actor_identity_id=$5 AND actor_device_id=$6)
+                      OR (candidate_identity_id=$5 AND candidate_device_id=$6)))",
+            )
+            .bind(Uuid::from(tenant_id))
+            .bind(Uuid::from(submission_id))
+            .bind(scope_columns(scope).0)
+            .bind(scope_columns(scope).1)
+            .bind(authenticated.session().identity_id().to_string())
+            .bind(Uuid::from(authenticated.session().device_id()))
+            .fetch_one(session.connection())
+            .await?;
+            if !allowed {
+                return Err(GroupPersistenceError::DeviceAuthenticationRejected);
+            }
+            Ok(receipt)
+        }
+        .await;
+        settle(session, result).await
+    }
+
+    /// Authenticates the exact candidate device before activating its leaf.
+    pub async fn confirm_authenticated(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        confirmation: MlsDeviceJoinConfirmation,
+        now_ms: i64,
+    ) -> Result<bool, GroupPersistenceError> {
+        let (mut session, authenticated) =
+            begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
+        let authenticated_session = authenticated.session();
+        if authenticated_session.identity_id() != confirmation.identity_id
+            || authenticated_session.device_id() != confirmation.device_id
+        {
+            return settle(
+                session,
+                Err(GroupPersistenceError::DeviceAuthenticationRejected),
+            )
+            .await;
+        }
+        let result = confirm_in_transaction(
+            session.connection(),
+            tenant_id,
+            confirmation,
+            now_ms,
+            authenticated.signing_key(),
+        )
+        .await;
+        settle(session, result).await
+    }
+
     /// CAS-submits an opaque commit, writes intent/outbox first, then signs and stores its receipt.
     ///
     /// For [`MlsCommitAuthorization::ApprovedIdentityJoin`], the worker that
@@ -1357,7 +1777,7 @@ fn scope_value(scope: GroupScope) -> CanonicalValue {
     CanonicalValue::Map(vec![
         (
             CanonicalValue::Unsigned(1),
-            CanonicalValue::Text(kind.replace('_', "-")),
+            CanonicalValue::Unsigned(if kind == "private_conversation" { 1 } else { 2 }),
         ),
         (CanonicalValue::Unsigned(2), CanonicalValue::Text(id)),
     ])

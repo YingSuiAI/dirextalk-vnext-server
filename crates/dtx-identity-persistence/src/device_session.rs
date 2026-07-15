@@ -552,6 +552,24 @@ impl AuthenticatedDeviceSigningSession {
 pub struct DeviceSessionRepository;
 
 impl DeviceSessionRepository {
+    /// Resolves the current active signing key for an exact identity/device on
+    /// a caller-owned transaction.
+    ///
+    /// This narrow read is used by another durable authorization boundary to
+    /// verify a second device's proof without accepting a caller-supplied key.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing or revoked device and malformed identity projections.
+    pub async fn active_device_signing_key_in_transaction(
+        connection: &mut PgConnection,
+        identity_id: IdentityId,
+        device_id: DeviceId,
+    ) -> Result<SigningPublicKey, IdentityPersistenceError> {
+        let snapshot = lock_and_load_active_snapshot(connection, identity_id).await?;
+        active_device_signing_key(snapshot.projection(), device_id)
+    }
+
     /// Creates a one-time challenge for an active device without retaining its
     /// raw nonce. A response loss can safely begin a new challenge.
     ///

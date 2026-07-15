@@ -1,0 +1,55 @@
+; Dirextalk single-node MLS Commit Sequencer V2. All MLS fields are opaque.
+sha256 = bytes .size 32
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+; The server recomputes proof_digest from the complete canonical transcript;
+; a client-supplied digest is never accepted as an authorization fact.
+device-proof-v2 = { 1: 2, 2: sha256, 3: bytes .size 64 }
+group-scope = { 1: 1 / 2, 2: tstr .size (36..57) }
+mls-sequencer-descriptor-v2 = { 1: 2, 2: bytes .size 32 }
+
+owner-bootstrap = { 1: 1 }
+approved-identity-join = { 1: 2, 2: uuid-v7, 3: sha256 }
+existing-member-device-add = { 1: 3, 2: uuid-v7, 3: sha256, 4: device-proof-v2 }
+mls-admission-authorization = owner-bootstrap / approved-identity-join / existing-member-device-add
+
+mls-commit-request-v2 = {
+  1: 2,
+  2: uuid-v7,              ; submission_id
+  3: group-scope,
+  4: identity-id,          ; actor
+  5: uuid-v7,              ; actor device
+  6: identity-id,          ; candidate
+  7: uuid-v7,              ; candidate device
+  8: sha256,               ; candidate KeyPackage digest
+  9: device-proof-v2,      ; server-recomputed candidate possession proof
+  10: uint .le 9007199254740990,
+  11: sha256,              ; expected head (all-zero only for owner bootstrap)
+  12: bytes .size (1..1048576), ; opaque MLS Commit wire bytes
+  13: sha256,              ; domain-separated Commit digest
+  14: sha256,              ; opaque Welcome digest
+  15: mls-admission-authorization
+}
+
+; Both transcripts bind operation kind, scope, submission, idempotency hash,
+; actor, candidate, KeyPackage, parent/proposed epoch and head, Commit/Welcome,
+; and the applicable GM1 approval or active-controller device. Candidate and
+; controller use distinct digest and signature domains frozen by the vector.
+mls-device-proof-transcript-v2 = {
+  1: 2, 2: 1 / 2 / 3, 3: group-scope, 4: uuid-v7, 5: sha256,
+  6: identity-id, 7: uuid-v7, 8: identity-id, 9: uuid-v7,
+  10: sha256, 11: uint, 12: sha256, 13: uint, 14: sha256, 15: sha256,
+  16: uuid-v7 / null, 17: sha256 / null, 18: uuid-v7 / null
+}
+
+mls-commit-receipt-v2 = {
+  1: 1, 2: uuid-v7, 3: group-scope, 4: sha256, 5: uint,
+  6: sha256, 7: sha256, 8: sha256, 9: identity-id, 10: uuid-v7
+}
+signed-mls-commit-receipt-v2 = {
+  1: mls-commit-receipt-v2, 2: sha256, 3: bytes .size 32, 4: bytes .size 64
+}
+mls-device-join-confirmation-v2 = {
+  1: 1, 2: uuid-v7, 3: identity-id, 4: uuid-v7,
+  5: sha256, 6: sha256, 7: bytes .size 64
+}

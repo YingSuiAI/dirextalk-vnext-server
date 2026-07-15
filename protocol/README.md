@@ -78,6 +78,12 @@ Layout:
   opaque commit CAS, signed response-loss-safe receipts, one-time Owner
   bootstrap, GM1-approved identity admission, same-identity active-controller
   consent for additional devices, and candidate confirmation before routing.
+  `baseline/v22/manifest.json` is the production HTTP revision. It replaces
+  the under-specified V1 device proof with a server-recomputed canonical
+  transcript and distinct candidate/controller signature domains, fixes
+  `group-scope` to the CDDL integer enum, and publishes the stable receipt
+  verification-key descriptor. V21 remains immutable and has no production
+  route.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

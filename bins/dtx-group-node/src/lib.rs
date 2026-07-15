@@ -26,7 +26,10 @@ use dtx_domain::{
 use dtx_group_persistence::{
     GroupControlCommand, GroupControlDisposition, GroupControlExecution, GroupControlOperation,
     GroupControlReceipt, GroupControlRejection, GroupControlRepository, GroupMembershipRepository,
-    GroupPersistenceError, GroupPgStore, MembershipCommandExecution, VerifiedDeviceActor,
+    GroupPersistenceError, GroupPgStore, MLS_IDEMPOTENCY_KEY_HASH_DOMAIN,
+    MembershipCommandExecution, MlsCommitAuthorization, MlsCommitCommand, MlsCommitExecution,
+    MlsCommitReceipt, MlsCommitSequencerRepository, MlsDeviceJoinConfirmation, VerifiedDeviceActor,
+    mls_opaque_commit_digest,
 };
 use dtx_group_policy::GroupScope;
 use dtx_identity_persistence::DeviceSessionCredential;
@@ -36,10 +39,10 @@ use dtx_membership_command::{
     MembershipReceipt, MembershipRejection,
 };
 use dtx_wire::{
-    CanonicalValue, Sha256Digest, SigningPublicKey, UtcMillis, decode_deterministic_cbor,
-    encode_deterministic_cbor,
+    CanonicalEncode, CanonicalValue, Ed25519Signature, Sha256Digest, SigningPublicKey, UtcMillis,
+    decode_deterministic_cbor, encode_deterministic_cbor,
 };
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
 
 use crate::federated_identity::{FederatedIdentityError, FederatedIdentityVerifier};
@@ -79,6 +82,14 @@ pub const GROUP_JOIN_APPROVAL_PATH_TEMPLATE: &str =
 /// Durable membership-receipt path template.
 pub const GROUP_MEMBERSHIP_RECEIPT_PATH_TEMPLATE: &str =
     "/v1/groups/{scope_kind}/{scope_id}/membership-receipts/{membership_command_id}";
+/// V2 MLS commit submit/query path. V1 is intentionally not routed.
+pub const MLS_COMMIT_PATH_TEMPLATE: &str =
+    "/v1/groups/{scope_kind}/{scope_id}/mls-commits/{submission_id}";
+/// V2 exact-device confirmation path.
+pub const MLS_CONFIRMATION_PATH_TEMPLATE: &str =
+    "/v1/groups/{scope_kind}/{scope_id}/mls-commits/{submission_id}/confirmations/{device_id}";
+/// Origin-bound public verification key descriptor.
+pub const MLS_SEQUENCER_DESCRIPTOR_PATH: &str = "/v1/mls-sequencer";
 
 /// Exact create request media type.
 pub const GROUP_CREATE_CONTENT_TYPE: &str = "application/vnd.dirextalk.group-create.v1+cbor";
@@ -106,6 +117,14 @@ pub const GROUP_ACTION_RECEIPT_CONTENT_TYPE: &str =
 /// Exact membership receipt media type.
 pub const MEMBERSHIP_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.membership-receipt.v1+cbor";
+/// Exact V2 MLS commit request media type.
+pub const MLS_COMMIT_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v2+cbor";
+/// Exact V2 signed receipt media type.
+pub const MLS_COMMIT_RECEIPT_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.mls-commit-receipt.v2+cbor";
+/// Exact V2 candidate confirmation media type.
+pub const MLS_CONFIRMATION_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.mls-device-join-confirmation.v2+cbor";
 /// Exact authorization scheme for active device sessions.
 pub const DEVICE_SESSION_AUTHORIZATION_SCHEME: &str = "DTX-Device-Session";
 /// Canonical HTTPS origin serving the actor's self-authenticated identity log.
@@ -119,6 +138,7 @@ const MIN_IDEMPOTENCY_KEY_BYTES: usize = 16;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 const MAX_CONTROL_BODY_BYTES: usize = 16_384;
 const MAX_MEMBERSHIP_BODY_BYTES: usize = 32_768;
+const MAX_MLS_COMMIT_BODY_BYTES: usize = 1_100_000;
 const MAX_GET_BODY_BYTES: usize = 1_024;
 const MAX_ACTION_PROOF_LIFETIME_MS: i64 = 300_000;
 
@@ -139,6 +159,8 @@ pub struct GroupNodeState {
     tenant_id: TenantId,
     control_repository: GroupControlRepository,
     membership_repository: GroupMembershipRepository,
+    mls_repository: MlsCommitSequencerRepository,
+    mls_signing_key: Option<Arc<SigningKey>>,
     federated_identity: FederatedIdentityVerifier,
     clock: Arc<dyn Clock>,
 }
@@ -164,9 +186,18 @@ impl GroupNodeState {
             tenant_id,
             control_repository: GroupControlRepository,
             membership_repository: GroupMembershipRepository,
+            mls_repository: MlsCommitSequencerRepository,
+            mls_signing_key: None,
             federated_identity,
             clock,
         }
+    }
+
+    /// Installs the stable, externally provisioned sequencer signing key.
+    #[must_use]
+    pub fn with_mls_sequencer_signing_key(mut self, signing_key: SigningKey) -> Self {
+        self.mls_signing_key = Some(Arc::new(signing_key));
+        self
     }
 
     /// Allows exact HTTP identity origins only for an explicitly configured
@@ -509,7 +540,50 @@ pub fn group_router_with_state(state: GroupNodeState) -> Router {
             GROUP_MEMBERSHIP_RECEIPT_PATH_TEMPLATE,
             get(get_membership_receipt),
         )
+        .route(
+            MLS_COMMIT_PATH_TEMPLATE,
+            post(submit_mls_commit).get(get_mls_commit_receipt),
+        )
+        .route(
+            MLS_CONFIRMATION_PATH_TEMPLATE,
+            post(confirm_mls_device_join),
+        )
+        .route(
+            MLS_SEQUENCER_DESCRIPTOR_PATH,
+            get(get_mls_sequencer_descriptor),
+        )
         .with_state(state)
+}
+
+async fn get_mls_sequencer_descriptor(
+    State(state): State<GroupNodeState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    let result = async {
+        require_exact_route(&parts.uri, MLS_SEQUENCER_DESCRIPTOR_PATH)?;
+        require_empty_get(&parts.headers, body).await?;
+        let signing_key = state
+            .mls_signing_key
+            .as_ref()
+            .ok_or(GroupFailure::TemporarilyUnavailable)?;
+        let body = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Bytes(signing_key.verifying_key().to_bytes().to_vec()),
+            ),
+        ]))
+        .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
+        Ok(cbor_response(
+            StatusCode::OK,
+            body,
+            "application/vnd.dirextalk.mls-sequencer-descriptor.v2+cbor",
+        ))
+    }
+    .await;
+    finish(result, request_id)
 }
 
 async fn create_group(
@@ -827,6 +901,179 @@ async fn get_membership_receipt(
     finish(result, request_id)
 }
 
+async fn submit_mls_commit(
+    State(state): State<GroupNodeState>,
+    Path((scope_kind, scope_id, submission_id)): Path<(String, String, String)>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    let result = async {
+        let scope = parse_scope(&scope_kind, &scope_id)?;
+        let submission_id = parse_request_id(&submission_id)?;
+        let expected_path = format!(
+            "{}/mls-commits/{submission_id}",
+            canonical_scope_path(scope)
+        );
+        require_exact_route(&parts.uri, &expected_path)?;
+        let idempotency_key_hash = mls_idempotency_key_hash(&parts.headers)?;
+        let parsed = parse_mls_commit_body(
+            &parts.headers,
+            body,
+            scope,
+            submission_id,
+            idempotency_key_hash,
+        )
+        .await?;
+        let credential = parse_device_session_authorization(&parts.headers)?;
+        let now = state.now()?;
+        let signing_key = state
+            .mls_signing_key
+            .as_ref()
+            .ok_or(GroupFailure::TemporarilyUnavailable)?;
+        let signing_public_key = SigningPublicKey::try_from(signing_key.verifying_key().to_bytes())
+            .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
+        let signer = Arc::clone(signing_key);
+        let execution = state
+            .mls_repository
+            .submit_authenticated(
+                &state.store,
+                state.tenant_id,
+                &credential,
+                &parsed.command,
+                parsed.candidate_signature,
+                parsed.controller_signature,
+                now.get(),
+                signing_public_key,
+                move |input| Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes())),
+            )
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        mls_commit_response(&execution)
+    }
+    .await;
+    finish(result, request_id)
+}
+
+async fn get_mls_commit_receipt(
+    State(state): State<GroupNodeState>,
+    Path((scope_kind, scope_id, submission_id)): Path<(String, String, String)>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    let result = async {
+        let scope = parse_scope(&scope_kind, &scope_id)?;
+        let submission_id = parse_request_id(&submission_id)?;
+        let expected_path = format!(
+            "{}/mls-commits/{submission_id}",
+            canonical_scope_path(scope)
+        );
+        require_exact_route(&parts.uri, &expected_path)?;
+        require_empty_get(&parts.headers, body).await?;
+        let credential = parse_device_session_authorization(&parts.headers)?;
+        let now = state.now()?;
+        let signing_key = state
+            .mls_signing_key
+            .as_ref()
+            .ok_or(GroupFailure::TemporarilyUnavailable)?;
+        let signing_public_key = SigningPublicKey::try_from(signing_key.verifying_key().to_bytes())
+            .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
+        let receipt = state
+            .mls_repository
+            .receipt_authenticated(
+                &state.store,
+                state.tenant_id,
+                &credential,
+                scope,
+                submission_id,
+                now.get(),
+                signing_public_key,
+            )
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        Ok(cbor_response(
+            StatusCode::OK,
+            encode_mls_commit_receipt(&receipt)?,
+            MLS_COMMIT_RECEIPT_CONTENT_TYPE,
+        ))
+    }
+    .await;
+    finish(result, request_id)
+}
+
+async fn confirm_mls_device_join(
+    State(state): State<GroupNodeState>,
+    Path((scope_kind, scope_id, submission_id, device_id)): Path<(String, String, String, String)>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    let result = async {
+        let scope = parse_scope(&scope_kind, &scope_id)?;
+        let submission_id = parse_request_id(&submission_id)?;
+        let device_id = parse_device_id(&device_id)?;
+        let expected_path = format!(
+            "{}/mls-commits/{submission_id}/confirmations/{device_id}",
+            canonical_scope_path(scope)
+        );
+        require_exact_route(&parts.uri, &expected_path)?;
+        let confirmation =
+            parse_mls_confirmation_body(&parts.headers, body, submission_id, device_id).await?;
+        let credential = parse_device_session_authorization(&parts.headers)?;
+        let now = state.now()?;
+        state
+            .mls_repository
+            .confirm_authenticated(
+                &state.store,
+                state.tenant_id,
+                &credential,
+                confirmation,
+                now.get(),
+            )
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    }
+    .await;
+    finish(result, request_id)
+}
+
+fn mls_commit_response(execution: &MlsCommitExecution) -> Result<Response, GroupFailure> {
+    Ok(cbor_response(
+        if execution.replayed() {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        encode_mls_commit_receipt(execution.receipt())?,
+        MLS_COMMIT_RECEIPT_CONTENT_TYPE,
+    ))
+}
+
+fn encode_mls_commit_receipt(receipt: &MlsCommitReceipt) -> Result<Vec<u8>, GroupFailure> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (
+            CanonicalValue::Unsigned(1),
+            decode_deterministic_cbor(receipt.canonical_cbor())
+                .map_err(|_| GroupFailure::TemporarilyUnavailable)?,
+        ),
+        (
+            CanonicalValue::Unsigned(2),
+            receipt.receipt_digest().to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Bytes(receipt.signing_public_key().as_bytes().to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Bytes(receipt.signature().as_bytes().to_vec()),
+        ),
+    ]))
+    .map_err(|_| GroupFailure::TemporarilyUnavailable)
+}
+
 fn control_response(
     action: GroupAction,
     scope: GroupScope,
@@ -902,6 +1149,160 @@ fn require_exact_route(uri: &Uri, expected_path: &str) -> Result<(), GroupFailur
     } else {
         Err(GroupFailure::InvalidRequest)
     }
+}
+
+struct MlsCommitBody {
+    command: MlsCommitCommand,
+    candidate_signature: Ed25519Signature,
+    controller_signature: Option<Ed25519Signature>,
+}
+
+async fn parse_mls_commit_body(
+    headers: &HeaderMap,
+    body: Body,
+    expected_scope: GroupScope,
+    expected_submission_id: RequestId,
+    idempotency_key_hash: Sha256Digest,
+) -> Result<MlsCommitBody, GroupFailure> {
+    let value = decode_body(
+        headers,
+        body,
+        MLS_COMMIT_CONTENT_TYPE,
+        MAX_MLS_COMMIT_BODY_BYTES,
+    )
+    .await?;
+    let fields = exact_fields(&value, 15)?;
+    if field(fields, 1)? != &CanonicalValue::Unsigned(2) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let submission_id = parse_request_id_value(field(fields, 2)?)?;
+    let scope = parse_scope_value(field(fields, 3)?)?;
+    if submission_id != expected_submission_id || scope != expected_scope {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let actor_identity_id = parse_identity_id_value(field(fields, 4)?)?;
+    let actor_device_id = parse_device_id_value(field(fields, 5)?)?;
+    let candidate_identity_id = parse_identity_id_value(field(fields, 6)?)?;
+    let candidate_device_id = parse_device_id_value(field(fields, 7)?)?;
+    let candidate_key_package_digest = parse_digest(field(fields, 8)?)?;
+    let (candidate_proof_digest, candidate_signature) = parse_mls_device_proof(field(fields, 9)?)?;
+    let expected_epoch = parse_safe_uint(field(fields, 10)?)?;
+    let expected_head = parse_digest(field(fields, 11)?)?;
+    let commit_bytes = match field(fields, 12)? {
+        CanonicalValue::Bytes(bytes) if (1..=1_048_576).contains(&bytes.len()) => bytes.clone(),
+        _ => return Err(GroupFailure::InvalidRequest),
+    };
+    let commit_digest = parse_digest(field(fields, 13)?)?;
+    if commit_digest != mls_opaque_commit_digest(&commit_bytes) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let welcome_digest = parse_digest(field(fields, 14)?)?;
+    let authorization_len = match field(fields, 15)? {
+        CanonicalValue::Map(values) => values.len(),
+        _ => return Err(GroupFailure::InvalidRequest),
+    };
+    let authorization_fields = exact_fields(field(fields, 15)?, authorization_len)?;
+    let (authorization, controller_signature) = match field(authorization_fields, 1)? {
+        CanonicalValue::Unsigned(1) if authorization_fields.len() == 1 => {
+            (MlsCommitAuthorization::OwnerBootstrap, None)
+        }
+        CanonicalValue::Unsigned(2) if authorization_fields.len() == 3 => (
+            MlsCommitAuthorization::ApprovedIdentityJoin {
+                membership_command_id: MembershipCommandId::new(parse_request_id_value(field(
+                    authorization_fields,
+                    2,
+                )?)?),
+                authorization_digest: parse_digest(field(authorization_fields, 3)?)?,
+            },
+            None,
+        ),
+        CanonicalValue::Unsigned(3) if authorization_fields.len() == 4 => {
+            let controller_device_id = parse_device_id_value(field(authorization_fields, 2)?)?;
+            let controller_consent_digest = parse_digest(field(authorization_fields, 3)?)?;
+            let (proof_digest, signature) =
+                parse_mls_device_proof(field(authorization_fields, 4)?)?;
+            if proof_digest != controller_consent_digest {
+                return Err(GroupFailure::InvalidRequest);
+            }
+            (
+                MlsCommitAuthorization::ExistingMemberDeviceAdd {
+                    controller_device_id,
+                    controller_consent_digest,
+                },
+                Some(signature),
+            )
+        }
+        _ => return Err(GroupFailure::InvalidRequest),
+    };
+    let command = MlsCommitCommand::new(
+        submission_id,
+        scope,
+        actor_identity_id,
+        actor_device_id,
+        candidate_identity_id,
+        candidate_device_id,
+        candidate_key_package_digest,
+        candidate_proof_digest,
+        idempotency_key_hash,
+        expected_epoch,
+        expected_head,
+        commit_bytes,
+        commit_digest,
+        welcome_digest,
+        authorization,
+    )
+    .map_err(|_| GroupFailure::InvalidRequest)?;
+    Ok(MlsCommitBody {
+        command,
+        candidate_signature,
+        controller_signature,
+    })
+}
+
+fn parse_mls_device_proof(
+    value: &CanonicalValue,
+) -> Result<(Sha256Digest, Ed25519Signature), GroupFailure> {
+    let fields = exact_fields(value, 3)?;
+    if field(fields, 1)? != &CanonicalValue::Unsigned(2) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    Ok((
+        parse_digest(field(fields, 2)?)?,
+        Ed25519Signature::from_bytes(parse_exact_bytes(field(fields, 3)?)?),
+    ))
+}
+
+async fn parse_mls_confirmation_body(
+    headers: &HeaderMap,
+    body: Body,
+    expected_submission_id: RequestId,
+    expected_device_id: DeviceId,
+) -> Result<MlsDeviceJoinConfirmation, GroupFailure> {
+    let value = decode_body(
+        headers,
+        body,
+        MLS_CONFIRMATION_CONTENT_TYPE,
+        MAX_MEMBERSHIP_BODY_BYTES,
+    )
+    .await?;
+    let fields = exact_fields(&value, 7)?;
+    if field(fields, 1)? != &CanonicalValue::Unsigned(1) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let confirmation = MlsDeviceJoinConfirmation {
+        submission_id: parse_request_id_value(field(fields, 2)?)?,
+        identity_id: parse_identity_id_value(field(fields, 3)?)?,
+        device_id: parse_device_id_value(field(fields, 4)?)?,
+        receipt_digest: parse_digest(field(fields, 5)?)?,
+        head_digest: parse_digest(field(fields, 6)?)?,
+        signature: Ed25519Signature::from_bytes(parse_exact_bytes(field(fields, 7)?)?),
+    };
+    if confirmation.submission_id != expected_submission_id
+        || confirmation.device_id != expected_device_id
+    {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    Ok(confirmation)
 }
 
 async fn parse_create_body(
@@ -1468,9 +1869,11 @@ fn parse_optional_identity_id(value: &CanonicalValue) -> Result<Option<IdentityI
 }
 
 fn parse_device_id_value(value: &CanonicalValue) -> Result<DeviceId, GroupFailure> {
-    parse_text(value, 36, 36)?
-        .parse()
-        .map_err(|_| GroupFailure::InvalidRequest)
+    parse_device_id(&parse_text(value, 36, 36)?)
+}
+
+fn parse_device_id(value: &str) -> Result<DeviceId, GroupFailure> {
+    value.parse().map_err(|_| GroupFailure::InvalidRequest)
 }
 
 fn parse_request_id(value: &str) -> Result<RequestId, GroupFailure> {
@@ -1686,6 +2089,17 @@ fn single_optional_header<'a>(
 }
 
 fn idempotency_key_hash(headers: &HeaderMap) -> Result<Sha256Digest, GroupFailure> {
+    idempotency_key_hash_with_domain(headers, IDEMPOTENCY_HASH_DOMAIN)
+}
+
+fn mls_idempotency_key_hash(headers: &HeaderMap) -> Result<Sha256Digest, GroupFailure> {
+    idempotency_key_hash_with_domain(headers, MLS_IDEMPOTENCY_KEY_HASH_DOMAIN)
+}
+
+fn idempotency_key_hash_with_domain(
+    headers: &HeaderMap,
+    domain: &[u8],
+) -> Result<Sha256Digest, GroupFailure> {
     let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
     let Some(value) = values.next() else {
         return Err(GroupFailure::InvalidRequest);
@@ -1699,7 +2113,7 @@ fn idempotency_key_hash(headers: &HeaderMap) -> Result<Sha256Digest, GroupFailur
     {
         return Err(GroupFailure::InvalidRequest);
     }
-    Ok(Sha256Digest::hash_domain(IDEMPOTENCY_HASH_DOMAIN, bytes))
+    Ok(Sha256Digest::hash_domain(domain, bytes))
 }
 
 fn parse_device_session_authorization(
@@ -1809,8 +2223,10 @@ fn map_persistence_error(error: &GroupPersistenceError) -> GroupFailure {
         | GroupPersistenceError::MembershipCommand(
             MembershipCommandError::CommandNotFound | MembershipCommandError::JoinRequestNotFound,
         ) => GroupFailure::Unavailable,
-        GroupPersistenceError::ActionProofRejected => GroupFailure::ActionProofInvalid,
-        GroupPersistenceError::ControlCommandConflict => GroupFailure::IdempotencyConflict,
+        GroupPersistenceError::ActionProofRejected
+        | GroupPersistenceError::MlsAuthorizationRejected => GroupFailure::ActionProofInvalid,
+        GroupPersistenceError::ControlCommandConflict
+        | GroupPersistenceError::MlsCommitConflict => GroupFailure::IdempotencyConflict,
         GroupPersistenceError::MembershipCommand(MembershipCommandError::IdempotencyConflict) => {
             GroupFailure::IdempotencyConflict
         }
@@ -1819,7 +2235,9 @@ fn map_persistence_error(error: &GroupPersistenceError) -> GroupFailure {
             | MembershipCommandError::JoinRequestMismatch,
         ) => GroupFailure::InvalidRequest,
         GroupPersistenceError::MembershipCommand(_)
-        | GroupPersistenceError::GroupBootstrapConflict => GroupFailure::ActionConflict,
+        | GroupPersistenceError::GroupBootstrapConflict
+        | GroupPersistenceError::StaleMlsHead
+        | GroupPersistenceError::MlsDeviceConfirmationRejected => GroupFailure::ActionConflict,
         GroupPersistenceError::GroupPolicy(_)
         | GroupPersistenceError::Database(_)
         | GroupPersistenceError::UnsafeRuntimeRole

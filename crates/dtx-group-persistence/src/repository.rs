@@ -766,6 +766,70 @@ impl GroupMembershipRepository {
     }
 }
 
+/// Finalizes the exact GM1 approval represented by an accepted MLS commit.
+///
+/// This is crate-visible only so the MLS sequencer can call it on the same
+/// `PostgreSQL` transaction that persists the commit receipt and new group head.
+/// It is deliberately not a second public membership fact source.
+pub(crate) async fn resolve_mls_commit_in_transaction(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    scope: GroupScope,
+    command_id: MembershipCommandId,
+    committed_digest: Sha256Digest,
+    now_ms: i64,
+) -> Result<MembershipReceipt, GroupPersistenceError> {
+    let key = ScopeKey::from_scope(tenant_id, scope);
+    let mut aggregate = load_aggregate(connection, key, true)
+        .await?
+        .ok_or(GroupPersistenceError::GroupNotFound)?;
+    if let Ok(receipt) = aggregate.book.receipt(command_id)
+        && let MembershipCommandPhase::Committed(admission) = receipt.phase()
+    {
+        let reference = admission.commit_reference();
+        if reference.scope() == scope
+            && reference.command_id() == command_id
+            && reference.committed_digest() == committed_digest
+        {
+            return Ok(receipt);
+        }
+        return Err(GroupPersistenceError::MlsCommitConflict);
+    }
+    let action = aggregate
+        .book
+        .next_sequencer_action(command_id)?
+        .ok_or(GroupPersistenceError::MlsAuthorizationRejected)?;
+    let (action_scope, action_command_id, request_digest, join_request_id) = match action {
+        SequencerAction::Submit(submit) => {
+            let (action_command_id, request_digest) = submit.idempotency();
+            (
+                submit.scope(),
+                action_command_id,
+                request_digest,
+                submit.join_request_id(),
+            )
+        }
+        SequencerAction::Query(_) => return Err(GroupPersistenceError::MlsAuthorizationRejected),
+    };
+    if action_scope != scope || action_command_id != command_id {
+        return Err(GroupPersistenceError::MlsAuthorizationRejected);
+    }
+    let reference =
+        MembershipCommitReference::new(scope, command_id, request_digest, committed_digest);
+    let receipt = aggregate
+        .book
+        .observe_sequencer_resolution(command_id, SequencerResolution::Committed(reference))?;
+    aggregate.policy.finalize_reserved_join(
+        aggregate.policy.revision(),
+        join_request_id,
+        now_ms,
+    )?;
+    persist_policy(connection, tenant_id, &aggregate.policy, now_ms, false).await?;
+    persist_book(connection, &aggregate.book, tenant_id, scope, now_ms).await?;
+    complete_unleased_outbox(connection, key, command_id, now_ms).await?;
+    Ok(receipt)
+}
+
 async fn load_receipt_for_identity_in_transaction(
     connection: &mut PgConnection,
     tenant_id: TenantId,

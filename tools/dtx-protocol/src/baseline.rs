@@ -95,6 +95,11 @@ const V21_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/mls-sequencer/v1",
     "protocol/test-vectors/mls-sequencer/v1",
 ];
+const V22_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/mls-sequencer/v2",
+    "protocol/openapi/mls-sequencer/v2",
+    "protocol/test-vectors/mls-sequencer/v2",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -236,6 +241,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v21/manifest.json",
         includes_registries: false,
         artifact_paths: V21_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 22,
+        path: "protocol/baseline/v22/manifest.json",
+        includes_registries: false,
+        artifact_paths: V22_ARTIFACT_PATHS,
     },
 ];
 

@@ -945,6 +945,7 @@ dependencies = [
  "dtx-storage",
  "dtx-wire",
  "ed25519-dalek",
+ "serde_json",
  "sha2 0.11.0",
  "sqlx",
  "testcontainers-modules",

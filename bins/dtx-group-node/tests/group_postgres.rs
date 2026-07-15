@@ -22,11 +22,14 @@ use dtx_group_node::{
     GROUP_APPROVE_JOIN_CONTENT_TYPE, GROUP_CREATE_CONTENT_TYPE, GROUP_ISSUE_INVITE_CONTENT_TYPE,
     GROUP_JOIN_REQUEST_CONTENT_TYPE, GROUP_MEMBERSHIP_RECEIPT_PATH_TEMPLATE,
     GROUP_SCOPE_PATH_TEMPLATE, GroupNodeState, IDENTITY_ORIGIN_HEADER,
-    MEMBERSHIP_RECEIPT_CONTENT_TYPE, RECEIPT_QUERY_PROOF_HEADER, group_router_with_state,
+    MEMBERSHIP_RECEIPT_CONTENT_TYPE, MLS_COMMIT_CONTENT_TYPE, MLS_COMMIT_RECEIPT_CONTENT_TYPE,
+    RECEIPT_QUERY_PROOF_HEADER, group_router_with_state,
 };
 use dtx_group_persistence::{
     GroupControlCommand, GroupControlDisposition, GroupControlOperation, GroupControlRejection,
     GroupControlRepository, GroupMembershipRepository, GroupPgStore,
+    MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, MlsCommitAuthorization, MlsCommitCommand,
+    mls_candidate_proof_digest, mls_candidate_proof_signature_input, mls_opaque_commit_digest,
 };
 use dtx_group_policy::GroupScope;
 use dtx_identity_log::{
@@ -463,11 +466,10 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
     let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
     let group_store = GroupPgStore::connect(harness.group_runtime_options(), 4).await?;
     let tenant_id = TenantId::new();
-    let app = group_router_with_state(GroupNodeState::with_clock(
-        group_store,
-        tenant_id,
-        Arc::new(FixedClock(NOW)),
-    ));
+    let app = group_router_with_state(
+        GroupNodeState::with_clock(group_store, tenant_id, Arc::new(FixedClock(NOW)))
+            .with_mls_sequencer_signing_key(SigningKey::from_bytes(&[99; 32])),
+    );
     let owner = enroll_active_device(&identity_store, 11, 12, 13, [14; 32]).await?;
     let candidate = enroll_active_device(&identity_store, 21, 22, 23, [24; 32]).await?;
     let scope = GroupScope::PrivateConversation(ConversationId::new());
@@ -507,6 +509,47 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
         response_bytes(refreshed_create).await?,
         first_create_receipt
     );
+
+    let bootstrap_submission = RequestId::new();
+    let bootstrap_path = format!("{scope_path}/mls-commits/{bootstrap_submission}");
+    let bootstrap_key = "mls-owner-bootstrap-0001";
+    let bootstrap_body = mls_commit_body(
+        &owner,
+        &owner,
+        scope,
+        bootstrap_submission,
+        bootstrap_key,
+        0,
+        Sha256Digest::from_bytes([0; 32]),
+        vec![0x41; 48],
+        MlsCommitAuthorization::OwnerBootstrap,
+    )?;
+    let bootstrap = send_mutation(
+        app.clone(),
+        "POST",
+        &bootstrap_path,
+        MLS_COMMIT_CONTENT_TYPE,
+        bootstrap_key,
+        &owner,
+        bootstrap_body.clone(),
+    )
+    .await?;
+    assert_eq!(bootstrap.status(), StatusCode::CREATED);
+    assert_content_type(&bootstrap, MLS_COMMIT_RECEIPT_CONTENT_TYPE);
+    let bootstrap_receipt = response_bytes(bootstrap).await?;
+    let bootstrap_head = mls_receipt_head(&bootstrap_receipt)?;
+    let bootstrap_replay = send_mutation(
+        app.clone(),
+        "POST",
+        &bootstrap_path,
+        MLS_COMMIT_CONTENT_TYPE,
+        bootstrap_key,
+        &owner,
+        bootstrap_body,
+    )
+    .await?;
+    assert_eq!(bootstrap_replay.status(), StatusCode::OK);
+    assert_eq!(response_bytes(bootstrap_replay).await?, bootstrap_receipt);
 
     let invite_id = InviteCapabilityId::new();
     let invite_path = format!("{scope_path}/invites/{invite_id}");
@@ -589,8 +632,9 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
         candidate.device_id,
         invite_id,
         Revision::new(3)?,
-        Sha256Digest::hash_domain(b"test-group-head\0", b"approval"),
+        bootstrap_head,
     )?;
+    let authorization_digest = action_proof_binding_digest(&approval_body)?;
     let approval = send_mutation(
         app.clone(),
         "POST",
@@ -618,8 +662,52 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
     assert_eq!(approval_replay.status(), StatusCode::OK);
     assert_eq!(response_bytes(approval_replay).await?, approval_receipt);
 
+    let membership_command_id =
+        dtx_membership_command::MembershipCommandId::new(approval_command_id);
+    let join_submission = RequestId::new();
+    let join_commit_path = format!("{scope_path}/mls-commits/{join_submission}");
+    let join_commit_key = "mls-approved-join-0001";
+    let join_commit_body = mls_commit_body(
+        &owner,
+        &candidate,
+        scope,
+        join_submission,
+        join_commit_key,
+        1,
+        bootstrap_head,
+        vec![0x52; 48],
+        MlsCommitAuthorization::ApprovedIdentityJoin {
+            membership_command_id,
+            authorization_digest,
+        },
+    )?;
+    let committed = send_mutation(
+        app.clone(),
+        "POST",
+        &join_commit_path,
+        MLS_COMMIT_CONTENT_TYPE,
+        join_commit_key,
+        &owner,
+        join_commit_body.clone(),
+    )
+    .await?;
+    assert_eq!(committed.status(), StatusCode::CREATED);
+    let committed_receipt = response_bytes(committed).await?;
+    let committed_replay = send_mutation(
+        app.clone(),
+        "POST",
+        &join_commit_path,
+        MLS_COMMIT_CONTENT_TYPE,
+        join_commit_key,
+        &owner,
+        join_commit_body,
+    )
+    .await?;
+    assert_eq!(committed_replay.status(), StatusCode::OK);
+    assert_eq!(response_bytes(committed_replay).await?, committed_receipt);
+
     // The candidate may recover the admin-created approval receipt. It remains
-    // pending_commit until a real MLS Sequencer adapter supplies evidence.
+    // The sequencer receipt and GM1 member/outbox resolution committed together.
     let receipt_path = GROUP_MEMBERSHIP_RECEIPT_PATH_TEMPLATE
         .replace("{scope_kind}", "private-conversation")
         .replace(
@@ -629,7 +717,7 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
         .replace("{membership_command_id}", &approval_command_id.to_string());
     let receipt = send_get(app, &receipt_path, &candidate).await?;
     assert_eq!(receipt.status(), StatusCode::OK);
-    assert_membership_phase(&response_bytes(receipt).await?, 2)?;
+    assert_membership_phase(&response_bytes(receipt).await?, 4)?;
     Ok(())
 }
 
@@ -1557,6 +1645,131 @@ fn scope_value(scope: GroupScope) -> CanonicalValue {
             CanonicalValue::Text(channel_id.to_string()),
         ]),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mls_commit_body(
+    actor: &ActiveDevice,
+    candidate: &ActiveDevice,
+    scope: GroupScope,
+    submission_id: RequestId,
+    idempotency_key: &str,
+    expected_epoch: u64,
+    expected_head: Sha256Digest,
+    commit_bytes: Vec<u8>,
+    authorization: MlsCommitAuthorization,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let idempotency_key_hash =
+        Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, idempotency_key.as_bytes());
+    let key_package_digest = Sha256Digest::hash_domain(
+        b"test-mls-key-package\0",
+        candidate.device.verifying_key().as_bytes(),
+    );
+    let commit_digest = mls_opaque_commit_digest(&commit_bytes);
+    let welcome_digest = Sha256Digest::hash_domain(b"test-mls-welcome\0", &commit_bytes);
+    let placeholder = Sha256Digest::from_bytes([0; 32]);
+    let provisional = MlsCommitCommand::new(
+        submission_id,
+        scope,
+        actor.identity_id,
+        actor.device_id,
+        candidate.identity_id,
+        candidate.device_id,
+        key_package_digest,
+        placeholder,
+        idempotency_key_hash,
+        expected_epoch,
+        expected_head,
+        commit_bytes.clone(),
+        commit_digest,
+        welcome_digest,
+        authorization,
+    )?;
+    let candidate_digest = mls_candidate_proof_digest(&provisional)?;
+    let command = MlsCommitCommand::new(
+        submission_id,
+        scope,
+        actor.identity_id,
+        actor.device_id,
+        candidate.identity_id,
+        candidate.device_id,
+        key_package_digest,
+        candidate_digest,
+        idempotency_key_hash,
+        expected_epoch,
+        expected_head,
+        commit_bytes.clone(),
+        commit_digest,
+        welcome_digest,
+        authorization,
+    )?;
+    let candidate_signature = candidate
+        .device
+        .sign(&mls_candidate_proof_signature_input(&command)?)
+        .to_bytes();
+    let candidate_proof = numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        CanonicalValue::Bytes(candidate_digest.as_bytes().to_vec()),
+        CanonicalValue::Bytes(candidate_signature.to_vec()),
+    ]);
+    let authorization = match authorization {
+        MlsCommitAuthorization::OwnerBootstrap => numbered_map(vec![CanonicalValue::Unsigned(1)]),
+        MlsCommitAuthorization::ApprovedIdentityJoin {
+            membership_command_id,
+            authorization_digest,
+        } => numbered_map(vec![
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(membership_command_id.request_id().to_string()),
+            CanonicalValue::Bytes(authorization_digest.as_bytes().to_vec()),
+        ]),
+        MlsCommitAuthorization::ExistingMemberDeviceAdd { .. } => {
+            return Err("device-add helper not needed by this acceptance".into());
+        }
+    };
+    encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        CanonicalValue::Text(submission_id.to_string()),
+        scope_value(scope),
+        CanonicalValue::Text(actor.identity_id.to_string()),
+        CanonicalValue::Text(actor.device_id.to_string()),
+        CanonicalValue::Text(candidate.identity_id.to_string()),
+        CanonicalValue::Text(candidate.device_id.to_string()),
+        CanonicalValue::Bytes(key_package_digest.as_bytes().to_vec()),
+        candidate_proof,
+        CanonicalValue::Unsigned(expected_epoch),
+        CanonicalValue::Bytes(expected_head.as_bytes().to_vec()),
+        CanonicalValue::Bytes(commit_bytes),
+        CanonicalValue::Bytes(commit_digest.as_bytes().to_vec()),
+        CanonicalValue::Bytes(welcome_digest.as_bytes().to_vec()),
+        authorization,
+    ]))
+}
+
+fn mls_receipt_head(bytes: &[u8]) -> Result<Sha256Digest, Box<dyn Error>> {
+    let CanonicalValue::Map(outer) = decode_deterministic_cbor(bytes)? else {
+        return Err("MLS receipt wrapper must be a map".into());
+    };
+    let CanonicalValue::Map(inner) = &outer[0].1 else {
+        return Err("MLS receipt payload must be a map".into());
+    };
+    let CanonicalValue::Bytes(head) = &inner[5].1 else {
+        return Err("MLS receipt head must be bytes".into());
+    };
+    let exact: [u8; 32] = head.as_slice().try_into()?;
+    Ok(Sha256Digest::from_bytes(exact))
+}
+
+fn action_proof_binding_digest(body: &[u8]) -> Result<Sha256Digest, Box<dyn Error>> {
+    let CanonicalValue::Map(body_fields) = decode_deterministic_cbor(body)? else {
+        return Err("approval body must be a map".into());
+    };
+    let CanonicalValue::Map(proof_fields) = &body_fields[7].1 else {
+        return Err("approval proof must be a map".into());
+    };
+    Ok(Sha256Digest::hash_domain(
+        ACTION_BINDING_HASH_DOMAIN,
+        &encode_deterministic_cbor(&proof_fields[1].1)?,
+    ))
 }
 
 fn numbered_map(values: Vec<CanonicalValue>) -> CanonicalValue {

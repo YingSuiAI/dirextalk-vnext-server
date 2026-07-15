@@ -151,7 +151,56 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
 
 fn validate_private_messaging_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_private_event_v1(root)?;
-    validate_mls_sequencer_v1(root)
+    validate_mls_sequencer_v1(root)?;
+    validate_mls_sequencer_v2(root)
+}
+
+fn validate_mls_sequencer_v2(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl_path = root.join("protocol/cddl/mls-sequencer/v2/mls-sequencer-v2.cddl");
+    let cddl = read(&cddl_path)?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse MLS Sequencer v2 CDDL {}: {error}",
+            cddl_path.display()
+        ))
+    })?;
+    let openapi_path = root.join("protocol/openapi/mls-sequencer/v2/openapi.yaml");
+    let source = read(&openapi_path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse MLS Sequencer v2 OpenAPI {}: {error}",
+            openapi_path.display()
+        ))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer v2 OpenAPI must declare 3.1.0",
+        ));
+    }
+    let vector =
+        read_json(&root.join("protocol/test-vectors/mls-sequencer/v2/mls-sequencer-v2.json"))?;
+    if vector.get("version").and_then(Value::as_u64) != Some(2)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(22)
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer v2 vector version/baseline must be 2/22",
+        ));
+    }
+    for domain in [
+        "candidate_proof_digest_domain_utf8_hex",
+        "candidate_proof_signature_domain_utf8_hex",
+        "controller_consent_digest_domain_utf8_hex",
+        "controller_consent_signature_domain_utf8_hex",
+        "idempotency_key_hash_domain_utf8_hex",
+        "inherited_confirmation_signature_domain_utf8_hex",
+    ] {
+        if json_string(&vector, domain)?.is_empty() {
+            return Err(ProtocolToolError::new(format!(
+                "MLS Sequencer v2 missing {domain}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_mls_sequencer_v1(root: &Path) -> Result<(), ProtocolToolError> {
