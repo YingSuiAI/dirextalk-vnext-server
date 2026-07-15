@@ -148,6 +148,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_group_membership_discovery_v1(root)?;
     validate_private_messaging_artifacts(root)?;
     validate_v30_peer_admission(root)?;
+    validate_conversation_agent_grant_v1(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
@@ -393,6 +394,273 @@ fn validate_v30_peer_admission(root: &Path) -> Result<(), ProtocolToolError> {
         "MLS V3 confirmation proof",
     )?;
     Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one frozen V31 audit keeps CDDL, OpenAPI, signed requests, and receipts coupled"
+)]
+fn validate_conversation_agent_grant_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    const REQUEST_MEDIA_TYPE: &str = "application/vnd.dirextalk.conversation-agent-grant.v1+cbor";
+    const RECEIPT_MEDIA_TYPE: &str =
+        "application/vnd.dirextalk.conversation-agent-grant-receipt.v1+cbor";
+    const BINDING_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-binding.v1\0";
+    const SIGNATURE_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-signature.v1\0";
+    const REQUEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-request.v1\0";
+    const RECEIPT_DIGEST_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-receipt.v1\0";
+
+    let cddl = read(
+        &root.join("protocol/cddl/conversation-agent-grant/v1/conversation-agent-grant-v1.cddl"),
+    )?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse conversation agent grant V1 CDDL: {error}"))
+    })?;
+
+    let openapi_path = root.join("protocol/openapi/conversation-agent-grant/v1/openapi.yaml");
+    let openapi = read(&openapi_path)?;
+    let spec = oas3::from_yaml(&openapi).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse conversation agent grant V1 OpenAPI {}: {error}",
+            openapi_path.display()
+        ))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "conversation agent grant V1 OpenAPI must declare 3.1.0",
+        ));
+    }
+    let openapi_value: Value = yaml_serde::from_str(&openapi).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse conversation agent grant V1 OpenAPI value: {error}"
+        ))
+    })?;
+    for (pointer, expected) in [
+        (
+            "/paths/~1v1~1conversations~1{conversation_id}~1agent-grants~1{installation_id}/put/operationId",
+            json!("grantPrivateConversationAgent"),
+        ),
+        (
+            "/paths/~1v1~1conversations~1{conversation_id}~1agent-grants~1{installation_id}/delete/operationId",
+            json!("revokePrivateConversationAgent"),
+        ),
+        (
+            "/components/parameters/GrantFence/schema/pattern",
+            json!("^\"g(?:0|[1-9][0-9]{0,15})\"$"),
+        ),
+        (
+            "/components/responses/GrantReceiptCreated/headers/Cache-Control/schema/const",
+            json!("no-store"),
+        ),
+        (
+            "/components/responses/GrantReceiptReplay/headers/Cache-Control/schema/const",
+            json!("no-store"),
+        ),
+    ] {
+        expect_value(&openapi_value, pointer, &expected)?;
+    }
+    for pointer in [
+        "/paths/~1v1~1conversations~1{conversation_id}~1agent-grants~1{installation_id}/put/requestBody/content/application~1vnd.dirextalk.conversation-agent-grant.v1+cbor/schema/$ref",
+        "/paths/~1v1~1conversations~1{conversation_id}~1agent-grants~1{installation_id}/delete/requestBody/content/application~1vnd.dirextalk.conversation-agent-grant.v1+cbor/schema/$ref",
+    ] {
+        expect_value(
+            &openapi_value,
+            pointer,
+            &json!("#/components/schemas/ExactCanonicalCbor"),
+        )?;
+    }
+
+    let vector = read_json(&root.join(
+        "protocol/test-vectors/conversation-agent-grant/v1/conversation-agent-grant-v1.json",
+    ))?;
+    validate_vector_version(&vector, "conversation-agent-grant-v1")?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(31) {
+        return Err(ProtocolToolError::new(
+            "conversation agent grant V1 vector baseline must be 31",
+        ));
+    }
+    for (pointer, expected) in [
+        ("/media_types/request", json!(REQUEST_MEDIA_TYPE)),
+        ("/media_types/receipt", json!(RECEIPT_MEDIA_TYPE)),
+        (
+            "/binding_hash_domain",
+            json!("dirextalk.conversation-agent-grant-binding.v1\0"),
+        ),
+        (
+            "/signature_domain",
+            json!("dirextalk.conversation-agent-grant-signature.v1\0"),
+        ),
+        (
+            "/request_digest_domain",
+            json!("dirextalk.conversation-agent-grant-request.v1\0"),
+        ),
+        (
+            "/receipt_digest_domain",
+            json!("dirextalk.conversation-agent-grant-receipt.v1\0"),
+        ),
+        ("/limits/maximum_proof_lifetime_ms", json!(600_000)),
+        (
+            "/limits/maximum_grant_lifetime_ms",
+            json!(7_776_000_000_u64),
+        ),
+        ("/fixed_profile/code", json!(1)),
+        ("/fixed_profile/trigger_policy", json!("mention_only")),
+        (
+            "/fixed_profile/permissions",
+            json!(["read_future_messages", "send_messages"]),
+        ),
+        ("/grant/if_match", json!("\"g0\"")),
+        ("/revoke/if_match", json!("\"g1\"")),
+    ] {
+        expect_value(&vector, pointer, &expected)?;
+    }
+    validate_uuid_fields(
+        &vector,
+        &[
+            "/tenant_id",
+            "/conversation_id",
+            "/installation_id",
+            "/server_generated_grant_id",
+            "/owner_device_id",
+            "/grant/operation_id",
+            "/revoke/operation_id",
+        ],
+    )?;
+    validate_identity_id(
+        json_string(&vector, "owner_identity_id")?,
+        "conversation agent grant owner identity",
+    )?;
+    let signing_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "device_signing_public_key_hex")?)?;
+
+    for (name, binding_rule, action) in [
+        ("grant", "conversation-agent-grant-put-binding-v1", 1_u64),
+        (
+            "revoke",
+            "conversation-agent-grant-delete-binding-v1",
+            2_u64,
+        ),
+    ] {
+        let operation = vector.get(name).ok_or_else(|| {
+            ProtocolToolError::new(format!(
+                "conversation agent grant vector has no {name} operation"
+            ))
+        })?;
+        validate_conversation_agent_grant_operation(
+            &cddl,
+            operation,
+            name,
+            binding_rule,
+            action,
+            signing_key,
+            BINDING_DOMAIN,
+            SIGNATURE_DOMAIN,
+            REQUEST_DIGEST_DOMAIN,
+            RECEIPT_DIGEST_DOMAIN,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // One frozen vector operation keeps all four transcripts coupled.
+fn validate_conversation_agent_grant_operation(
+    cddl: &str,
+    operation: &Value,
+    name: &str,
+    binding_rule: &str,
+    action: u64,
+    signing_key: [u8; 32],
+    binding_domain: &[u8],
+    signature_domain: &[u8],
+    request_digest_domain: &[u8],
+    receipt_digest_domain: &[u8],
+) -> Result<(), ProtocolToolError> {
+    let binding_hex = json_string(operation, "binding_canonical_cbor_hex")?;
+    validate_cddl_hex(binding_rule, cddl, binding_hex)?;
+    ensure_domain_digest(
+        binding_domain,
+        binding_hex,
+        json_string(operation, "binding_digest_hex")?,
+        &format!("conversation agent grant {name} binding"),
+    )?;
+    let binding = decode_hex(binding_hex)?;
+    let binding_value = decode_deterministic_cbor(&binding).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "decode conversation agent grant {name} binding: {error}"
+        ))
+    })?;
+    let CanonicalValue::Map(binding_fields) = &binding_value else {
+        return Err(ProtocolToolError::new(format!(
+            "conversation agent grant {name} binding must be a map"
+        )));
+    };
+    let Some((CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(actual_action))) =
+        binding_fields.get(1)
+    else {
+        return Err(ProtocolToolError::new(format!(
+            "conversation agent grant {name} binding action is missing"
+        )));
+    };
+    if *actual_action != action {
+        return Err(ProtocolToolError::new(format!(
+            "conversation agent grant {name} binding action drift"
+        )));
+    }
+
+    let binding_digest =
+        decode_lower_hex_fixed::<32>(json_string(operation, "binding_digest_hex")?)?;
+    let owner_signature =
+        decode_lower_hex_fixed::<64>(json_string(operation, "owner_signature_hex")?)?;
+    verify_domain_digest_signature(
+        signing_key,
+        signature_domain,
+        binding_digest,
+        owner_signature,
+        &format!("conversation agent grant {name}"),
+    )?;
+
+    let request_hex = json_string(operation, "request_canonical_cbor_hex")?;
+    validate_cddl_hex("conversation-agent-grant-request-v1", cddl, request_hex)?;
+    ensure_domain_digest(
+        request_digest_domain,
+        request_hex,
+        json_string(operation, "request_digest_hex")?,
+        &format!("conversation agent grant {name} request"),
+    )?;
+    let request = decode_deterministic_cbor(&decode_hex(request_hex)?).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "decode conversation agent grant {name} request: {error}"
+        ))
+    })?;
+    let CanonicalValue::Map(request_fields) = request else {
+        return Err(ProtocolToolError::new(format!(
+            "conversation agent grant {name} request must be a map"
+        )));
+    };
+    let expected_request_fields = [
+        (CanonicalValue::Unsigned(1), binding_value),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Bytes(binding_digest.to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Bytes(owner_signature.to_vec()),
+        ),
+    ];
+    if request_fields != expected_request_fields {
+        return Err(ProtocolToolError::new(format!(
+            "conversation agent grant {name} request/binding linkage drift"
+        )));
+    }
+
+    let receipt_hex = json_string(operation, "receipt_canonical_cbor_hex")?;
+    validate_cddl_hex("conversation-agent-grant-receipt-v1", cddl, receipt_hex)?;
+    ensure_domain_digest(
+        receipt_digest_domain,
+        receipt_hex,
+        json_string(operation, "receipt_digest_hex")?,
+        &format!("conversation agent grant {name} receipt"),
+    )
 }
 
 fn require_v30_vector(vector: &Value, version: u64, name: &str) -> Result<(), ProtocolToolError> {
