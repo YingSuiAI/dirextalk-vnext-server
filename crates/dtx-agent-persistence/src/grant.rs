@@ -51,7 +51,11 @@ impl ConversationGrantRepository {
         }
     }
 
-    async fn save_in_transaction(
+    /// Appends one grant version inside a caller-owned tenant transaction.
+    ///
+    /// The caller is responsible for atomically persisting any owner receipt or
+    /// other authorization record before committing the surrounding session.
+    pub async fn save_in_transaction(
         self,
         connection: &mut PgConnection,
         grant: &ConversationGrant,
@@ -302,6 +306,40 @@ impl ConversationGrantRepository {
                FROM agent.conversation_grant_heads
               WHERE tenant_id=$1 AND conversation_id=$2 AND installation_id=$3
               FOR SHARE",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(conversation_id))
+        .bind(Uuid::from(installation_id))
+        .fetch_optional(&mut *connection)
+        .await?;
+        if current.is_none() {
+            return Ok(None);
+        }
+        self.load(connection, tenant_id, conversation_id, installation_id)
+            .await
+    }
+
+    /// Loads the current Grant while holding its head row for an owner mutation.
+    ///
+    /// The caller must keep the surrounding transaction open until it has
+    /// persisted the successor. This avoids a stale approval proof crossing a
+    /// competing grant transition while the Owner API waits on the write lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns database/corrupt-data errors or rejects a malformed grant snapshot.
+    pub async fn load_for_update(
+        self,
+        connection: &mut PgConnection,
+        tenant_id: TenantId,
+        conversation_id: ConversationId,
+        installation_id: InstallationId,
+    ) -> Result<Option<ConversationGrant>, AgentPersistenceError> {
+        let current: Option<i64> = sqlx::query_scalar(
+            "SELECT current_grant_version
+               FROM agent.conversation_grant_heads
+              WHERE tenant_id=$1 AND conversation_id=$2 AND installation_id=$3
+              FOR UPDATE",
         )
         .bind(Uuid::from(tenant_id))
         .bind(Uuid::from(conversation_id))

@@ -13,23 +13,33 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_agent_control::ServerCommandPayload;
-use dtx_agent_registry::DeviceCredentialFingerprint;
-use dtx_domain::{
-    AgentDeviceId, ApprovalId, BindingId, ConnectorId, DeviceId, DeviceSessionId, IdentityId,
-    InstallationId, ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision,
-    TenantId,
+use dtx_agent_persistence::{
+    AgentInstallationRepository, AgentPersistenceError, ConversationGrantRepository,
 };
-use dtx_identity_persistence::DeviceSessionCredential;
+use dtx_agent_registry::{
+    AgentConversationPermission, AgentConversationPermissions, ConversationGrant,
+    ConversationGrantCommand, ConversationGrantUpdate, DeviceCredentialFingerprint,
+    PrivacyPolicyDigest, TriggerPolicy,
+};
+use dtx_domain::{
+    AgentDeviceId, ApprovalId, BindingId, ConnectorId, ConversationId, DeviceId, DeviceSessionId,
+    GrantId, IdentityId, InstallationId, ProvisioningDeliveryId, ProvisioningRecipientKeyId,
+    RequestId, Revision, TenantId,
+};
+use dtx_identity_persistence::{DeviceSessionCredential, DeviceSessionRepository};
 use dtx_storage::PgStore;
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, UtcMillis,
     decode_deterministic_cbor, encode_deterministic_cbor,
 };
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Serialize;
+use sqlx::Row;
+use uuid::Uuid;
 
 use crate::connector_projection::{
     CONNECTOR_PROJECTION_MEDIA_TYPE_V1, ConnectorProjectionError, ConnectorProjectionQueryV1,
@@ -52,8 +62,20 @@ const IDEMPOTENCY_DOMAIN: &[u8] = b"dirextalk.agent-provisioning-idempotency-key
 const DELIVERY_BINDING_DOMAIN: &[u8] = b"dirextalk.agent-provisioning-delivery-binding.v1\0";
 const CAPSULE_DIGEST_DOMAIN: &[u8] = b"dirextalk.agent-provisioning-capsule.v1\0";
 const REVOCATION_BINDING_DOMAIN: &[u8] = b"dirextalk.agent-provisioning-revocation-binding.v1\0";
+const CONVERSATION_GRANT_BINDING_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-binding.v1\0";
+const CONVERSATION_GRANT_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.conversation-agent-grant-signature.v1\0";
+const CONVERSATION_GRANT_REQUEST_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-request.v1\0";
+const CONVERSATION_GRANT_RECEIPT_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-receipt.v1\0";
 const MAX_SMALL_BODY: usize = 16 * 1024;
 const MAX_DELIVERY_BODY: usize = 212_992;
+const MAX_GRANT_PROOF_LIFETIME_MS: i64 = 10 * 60 * 1000;
+const MAX_GRANT_LIFETIME_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+
+const CONVERSATION_GRANT_MEDIA_TYPE_V1: &str =
+    "application/vnd.dirextalk.conversation-agent-grant.v1+cbor";
+const CONVERSATION_GRANT_RECEIPT_MEDIA_TYPE_V1: &str =
+    "application/vnd.dirextalk.conversation-agent-grant-receipt.v1+cbor";
 
 pub type OwnerBackendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CborOwnerReply, AgentProvisioningOwnerError>> + Send + 'a>>;
@@ -115,6 +137,33 @@ pub struct ConnectorLifecycleOwnerCommand {
     pub action: ConnectorLifecycleAction,
 }
 
+/// Closed mutation permitted on a private-conversation Agent grant head.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversationGrantOwnerAction {
+    /// Creates a first grant or replaces a revoked grant lifecycle.
+    Grant,
+    /// Revokes exactly one active grant lifecycle.
+    Revoke,
+}
+
+/// Fresh device-signed Owner command for one private-conversation grant head.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationGrantOwnerCommand {
+    pub action: ConversationGrantOwnerAction,
+    pub operation_id: RequestId,
+    pub tenant_id: TenantId,
+    pub conversation_id: ConversationId,
+    pub installation_id: InstallationId,
+    pub expected_grant_version: Option<Revision>,
+    pub owner_identity_id: IdentityId,
+    pub owner_device_id: DeviceId,
+    pub proof_expires_at: UtcMillis,
+    pub grant_expires_at: Option<UtcMillis>,
+    pub privacy_policy_hash: Option<PrivacyPolicyDigest>,
+    pub binding_digest: Sha256Digest,
+    pub owner_signature: Ed25519Signature,
+}
+
 /// Durable application interface. Parsing and stable HTTP errors stay independent of `PostgreSQL`.
 pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
     fn list_connectors(
@@ -127,6 +176,13 @@ pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
         &self,
         credential: DeviceSessionCredential,
         command: ConnectorLifecycleOwnerCommand,
+    ) -> OwnerBackendFuture<'_>;
+    fn mutate_conversation_grant(
+        &self,
+        credential: DeviceSessionCredential,
+        command: ConversationGrantOwnerCommand,
+        exact_body: Vec<u8>,
+        now: UtcMillis,
     ) -> OwnerBackendFuture<'_>;
     fn approve(
         &self,
@@ -264,6 +320,39 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                     command.connector_id,
                     &write,
                 )?,
+            })
+        })
+    }
+
+    fn mutate_conversation_grant(
+        &self,
+        credential: DeviceSessionCredential,
+        command: ConversationGrantOwnerCommand,
+        exact_body: Vec<u8>,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            if command.tenant_id != self.tenant_id {
+                return Err(AgentProvisioningOwnerError::AccessDenied);
+            }
+            let receipt = mutate_private_conversation_grant(
+                &self.store,
+                &credential,
+                command,
+                exact_body,
+                now,
+            )
+            .await?;
+            Ok(CborOwnerReply {
+                status: if receipt.replayed {
+                    StatusCode::OK
+                } else if receipt.action == ConversationGrantOwnerAction::Grant {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                content_type: CONVERSATION_GRANT_RECEIPT_MEDIA_TYPE_V1,
+                exact_cbor: receipt.exact_cbor,
             })
         })
     }
@@ -638,6 +727,515 @@ const fn map_connector_control_error(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConversationGrantOwnerReceipt {
+    replayed: bool,
+    action: ConversationGrantOwnerAction,
+    exact_cbor: Vec<u8>,
+}
+
+async fn mutate_private_conversation_grant(
+    store: &PgStore,
+    credential: &DeviceSessionCredential,
+    command: ConversationGrantOwnerCommand,
+    exact_body: Vec<u8>,
+    authenticated_at: UtcMillis,
+) -> Result<ConversationGrantOwnerReceipt, AgentProvisioningOwnerError> {
+    let request_digest = Sha256Digest::hash_domain(CONVERSATION_GRANT_REQUEST_DOMAIN, &exact_body);
+    let mut session = store
+        .begin_tenant(command.tenant_id)
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let result = mutate_private_conversation_grant_in_transaction(
+        session.connection(),
+        credential,
+        &command,
+        request_digest,
+        authenticated_at,
+    )
+    .await;
+    match result {
+        Ok(receipt) => {
+            session
+                .commit()
+                .await
+                .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+            Ok(receipt)
+        }
+        Err(error) => {
+            let _ = session.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn mutate_private_conversation_grant_in_transaction(
+    connection: &mut sqlx::PgConnection,
+    credential: &DeviceSessionCredential,
+    command: &ConversationGrantOwnerCommand,
+    request_digest: Sha256Digest,
+    authenticated_at: UtcMillis,
+) -> Result<ConversationGrantOwnerReceipt, AgentProvisioningOwnerError> {
+    let owner = DeviceSessionRepository::authenticate_with_signing_key_in_transaction(
+        connection,
+        credential,
+        authenticated_at,
+    )
+    .await
+    .map_err(map_conversation_grant_identity_error)?;
+    let owner_session = owner.session();
+    if owner_session.identity_id() != command.owner_identity_id
+        || owner_session.device_id() != command.owner_device_id
+    {
+        return Err(AgentProvisioningOwnerError::AccessDenied);
+    }
+    let signature = Signature::from_bytes(command.owner_signature.as_bytes());
+    let verifying_key = VerifyingKey::from_bytes(owner.signing_key().as_bytes())
+        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+    verifying_key
+        .verify_strict(
+            &conversation_grant_signature_input(command.binding_digest),
+            &signature,
+        )
+        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(conversation_grant_operation_lock_key(command.operation_id))
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if let Some(receipt) = load_conversation_grant_operation(
+        connection,
+        command.tenant_id,
+        command.operation_id,
+        command.action,
+        request_digest,
+    )
+    .await?
+    {
+        return Ok(receipt);
+    }
+
+    let is_owner: bool =
+        sqlx::query_scalar("SELECT groups.private_conversation_owner_authorized($1, $2, $3)")
+            .bind(Uuid::from(command.tenant_id))
+            .bind(Uuid::from(command.conversation_id))
+            .bind(owner_session.identity_id().to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if !is_owner {
+        return Err(AgentProvisioningOwnerError::AccessDenied);
+    }
+
+    let installation = AgentInstallationRepository::new()
+        .load(connection, command.tenant_id, command.installation_id)
+        .await
+        .map_err(map_conversation_grant_persistence_error)?
+        .ok_or(AgentProvisioningOwnerError::NotFound)?;
+    if installation.owner_id() != owner_session.identity_id() {
+        return Err(AgentProvisioningOwnerError::AccessDenied);
+    }
+
+    let repository = ConversationGrantRepository::new();
+    let mut grant = repository
+        .load_for_update(
+            connection,
+            command.tenant_id,
+            command.conversation_id,
+            command.installation_id,
+        )
+        .await
+        .map_err(map_conversation_grant_persistence_error)?;
+    // Exact retries have already returned above. Sample after the per-grant
+    // write lock so a new operation cannot commit based on a proof that expired
+    // while it waited for an earlier transition.
+    let committed_at = now()?;
+    validate_conversation_grant_command(command, committed_at)?;
+    let expected = command.expected_grant_version;
+    match (&mut grant, command.action, expected) {
+        (None, ConversationGrantOwnerAction::Grant, None) => {
+            grant = Some(new_private_conversation_grant(
+                &installation,
+                command,
+                owner_session.device_id(),
+                committed_at,
+            )?);
+        }
+        (None, ConversationGrantOwnerAction::Grant, Some(_))
+        | (None, ConversationGrantOwnerAction::Revoke, _) => {
+            return Err(AgentProvisioningOwnerError::Conflict);
+        }
+        (Some(_), _, None) => return Err(AgentProvisioningOwnerError::Conflict),
+        (Some(current), ConversationGrantOwnerAction::Grant, Some(expected)) => {
+            if current.grant_version() != expected || current.snapshot().revoked_at_ms.is_none() {
+                return Err(AgentProvisioningOwnerError::Conflict);
+            }
+            let update = new_private_conversation_grant_update(
+                command,
+                owner_session.device_id(),
+                committed_at,
+            )?;
+            current
+                .apply(
+                    &installation,
+                    expected,
+                    ConversationGrantCommand::Regrant {
+                        grant_id: GrantId::new(),
+                        update,
+                        permission_expansion:
+                            dtx_agent_registry::PermissionExpansionConfirmation::confirmed(),
+                        all_messages: None,
+                    },
+                )
+                .map_err(|_| AgentProvisioningOwnerError::Conflict)?;
+        }
+        (Some(current), ConversationGrantOwnerAction::Revoke, Some(expected)) => {
+            if current.grant_version() != expected || current.snapshot().revoked_at_ms.is_some() {
+                return Err(AgentProvisioningOwnerError::Conflict);
+            }
+            current
+                .apply(
+                    &installation,
+                    expected,
+                    ConversationGrantCommand::Revoke {
+                        revoked_at_ms: committed_at.get(),
+                    },
+                )
+                .map_err(|_| AgentProvisioningOwnerError::Conflict)?;
+        }
+    }
+    let grant = grant.ok_or(AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    repository
+        .save_in_transaction(connection, &grant, committed_at.get())
+        .await
+        .map_err(map_conversation_grant_persistence_error)?;
+    let snapshot = grant.snapshot();
+    let revoked = snapshot.revoked_at_ms.is_some();
+    let receipt_bytes = conversation_grant_receipt_cbor(
+        command.action,
+        command.tenant_id,
+        command.conversation_id,
+        command.installation_id,
+        snapshot.grant_id,
+        snapshot.grant_version,
+        snapshot.privacy_policy_hash,
+        owner_session.device_id(),
+        committed_at,
+        (command.action == ConversationGrantOwnerAction::Grant)
+            .then_some(snapshot.expires_at_ms)
+            .flatten(),
+    )?;
+    let receipt_digest =
+        Sha256Digest::hash_domain(CONVERSATION_GRANT_RECEIPT_DOMAIN, &receipt_bytes);
+    sqlx::query(
+        "INSERT INTO agent.conversation_grant_owner_operations (
+             tenant_id, operation_id, conversation_id, installation_id, action,
+             request_digest, grant_id, grant_version, revoked, owner_identity_id,
+             owner_device_id, owner_session_id, receipt_bytes, receipt_digest, committed_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.operation_id))
+    .bind(Uuid::from(command.conversation_id))
+    .bind(Uuid::from(command.installation_id))
+    .bind(conversation_grant_action_code(command.action))
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(Uuid::from(snapshot.grant_id))
+    .bind(
+        i64::try_from(snapshot.grant_version.get())
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+    )
+    .bind(revoked)
+    .bind(owner_session.identity_id().to_string())
+    .bind(Uuid::from(owner_session.device_id()))
+    .bind(Uuid::from(owner_session.session_id()))
+    .bind(&receipt_bytes)
+    .bind(receipt_digest.as_bytes().as_slice())
+    .bind(committed_at.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_conversation_grant_operation_insert_error)?;
+    Ok(ConversationGrantOwnerReceipt {
+        replayed: false,
+        action: command.action,
+        exact_cbor: receipt_bytes,
+    })
+}
+
+fn validate_conversation_grant_command(
+    command: &ConversationGrantOwnerCommand,
+    now: UtcMillis,
+) -> Result<(), AgentProvisioningOwnerError> {
+    let proof_expires_at = command.proof_expires_at.get();
+    if proof_expires_at <= now.get()
+        || proof_expires_at > now.get().saturating_add(MAX_GRANT_PROOF_LIFETIME_MS)
+    {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    match command.action {
+        ConversationGrantOwnerAction::Grant => {
+            let grant_expires_at = command
+                .grant_expires_at
+                .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+            if command.privacy_policy_hash.is_none()
+                || grant_expires_at.get() <= now.get()
+                || grant_expires_at.get() > now.get().saturating_add(MAX_GRANT_LIFETIME_MS)
+            {
+                return Err(AgentProvisioningOwnerError::InvalidRequest);
+            }
+        }
+        ConversationGrantOwnerAction::Revoke
+            if command.grant_expires_at.is_some() || command.privacy_policy_hash.is_some() =>
+        {
+            return Err(AgentProvisioningOwnerError::InvalidRequest);
+        }
+        ConversationGrantOwnerAction::Revoke => {}
+    }
+    Ok(())
+}
+
+fn new_private_conversation_grant(
+    installation: &dtx_agent_registry::AgentInstallation,
+    command: &ConversationGrantOwnerCommand,
+    device_id: DeviceId,
+    now: UtcMillis,
+) -> Result<ConversationGrant, AgentProvisioningOwnerError> {
+    ConversationGrant::issue(
+        installation,
+        GrantId::new(),
+        command.conversation_id,
+        private_conversation_permissions(),
+        TriggerPolicy::MentionOnly,
+        command
+            .privacy_policy_hash
+            .ok_or(AgentProvisioningOwnerError::InvalidRequest)?,
+        device_id,
+        now.get(),
+        Some(
+            command
+                .grant_expires_at
+                .ok_or(AgentProvisioningOwnerError::InvalidRequest)?
+                .get(),
+        ),
+        None,
+    )
+    .map_err(|_| AgentProvisioningOwnerError::Conflict)
+}
+
+fn new_private_conversation_grant_update(
+    command: &ConversationGrantOwnerCommand,
+    device_id: DeviceId,
+    now: UtcMillis,
+) -> Result<ConversationGrantUpdate, AgentProvisioningOwnerError> {
+    Ok(ConversationGrantUpdate::new(
+        private_conversation_permissions(),
+        TriggerPolicy::MentionOnly,
+        command
+            .privacy_policy_hash
+            .ok_or(AgentProvisioningOwnerError::InvalidRequest)?,
+        device_id,
+        now.get(),
+        Some(
+            command
+                .grant_expires_at
+                .ok_or(AgentProvisioningOwnerError::InvalidRequest)?
+                .get(),
+        ),
+    ))
+}
+
+fn private_conversation_permissions() -> AgentConversationPermissions {
+    AgentConversationPermissions::none()
+        .with(AgentConversationPermission::ReadFutureMessages)
+        .with(AgentConversationPermission::SendMessages)
+}
+
+async fn load_conversation_grant_operation(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    operation_id: RequestId,
+    action: ConversationGrantOwnerAction,
+    request_digest: Sha256Digest,
+) -> Result<Option<ConversationGrantOwnerReceipt>, AgentProvisioningOwnerError> {
+    let row = sqlx::query(
+        "SELECT action, request_digest, receipt_bytes, receipt_digest
+           FROM agent.conversation_grant_owner_operations
+          WHERE tenant_id=$1 AND operation_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(operation_id))
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row
+        .try_get::<Vec<u8>, _>("request_digest")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?
+        .as_slice()
+        != request_digest.as_bytes()
+        || row
+            .try_get::<String, _>("action")
+            .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?
+            != conversation_grant_action_code(action)
+    {
+        return Err(AgentProvisioningOwnerError::Conflict);
+    }
+    let exact_cbor = row
+        .try_get::<Vec<u8>, _>("receipt_bytes")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let stored_digest = row
+        .try_get::<Vec<u8>, _>("receipt_digest")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let stored_digest: [u8; 32] = stored_digest
+        .try_into()
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if *Sha256Digest::hash_domain(CONVERSATION_GRANT_RECEIPT_DOMAIN, &exact_cbor).as_bytes()
+        != stored_digest
+        || decode_deterministic_cbor(&exact_cbor).is_err()
+    {
+        return Err(AgentProvisioningOwnerError::TemporarilyUnavailable);
+    }
+    Ok(Some(ConversationGrantOwnerReceipt {
+        replayed: true,
+        action,
+        exact_cbor,
+    }))
+}
+
+fn conversation_grant_receipt_cbor(
+    action: ConversationGrantOwnerAction,
+    tenant_id: TenantId,
+    conversation_id: ConversationId,
+    installation_id: InstallationId,
+    grant_id: GrantId,
+    grant_version: Revision,
+    privacy_policy_hash: PrivacyPolicyDigest,
+    owner_device_id: DeviceId,
+    committed_at: UtcMillis,
+    grant_expires_at_ms: Option<i64>,
+) -> Result<Vec<u8>, AgentProvisioningOwnerError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Unsigned(match action {
+                ConversationGrantOwnerAction::Grant => 1,
+                ConversationGrantOwnerAction::Revoke => 2,
+            }),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(tenant_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(conversation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(installation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Text(grant_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Unsigned(grant_version.get()),
+        ),
+        (CanonicalValue::Unsigned(8), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Bytes(privacy_policy_hash.as_bytes().to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(10),
+            CanonicalValue::Text(owner_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(11),
+            committed_at.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(12),
+            grant_expires_at_ms.map_or(CanonicalValue::Null, |value| {
+                UtcMillis::new(value)
+                    .expect("persisted Conversation Grant expiry is valid")
+                    .to_canonical_value()
+            }),
+        ),
+    ]))
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
+}
+
+fn conversation_grant_signature_input(binding_digest: Sha256Digest) -> Vec<u8> {
+    let mut input = CONVERSATION_GRANT_SIGNATURE_DOMAIN.to_vec();
+    input.extend_from_slice(binding_digest.as_bytes());
+    input
+}
+
+const fn conversation_grant_action_code(action: ConversationGrantOwnerAction) -> &'static str {
+    match action {
+        ConversationGrantOwnerAction::Grant => "grant",
+        ConversationGrantOwnerAction::Revoke => "revoke",
+    }
+}
+
+fn conversation_grant_operation_lock_key(operation_id: RequestId) -> i64 {
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&operation_id.as_uuid().as_bytes()[..8]);
+    i64::from_be_bytes(prefix)
+}
+
+fn map_conversation_grant_identity_error(
+    error: dtx_identity_persistence::IdentityPersistenceError,
+) -> AgentProvisioningOwnerError {
+    match error {
+        dtx_identity_persistence::IdentityPersistenceError::DeviceAuthenticationRejected => {
+            AgentProvisioningOwnerError::AuthenticationRejected
+        }
+        _ => AgentProvisioningOwnerError::TemporarilyUnavailable,
+    }
+}
+
+fn map_conversation_grant_persistence_error(
+    error: AgentPersistenceError,
+) -> AgentProvisioningOwnerError {
+    match error {
+        AgentPersistenceError::ImmutableConflict(_)
+        | AgentPersistenceError::RevisionConflict { .. } => AgentProvisioningOwnerError::Conflict,
+        AgentPersistenceError::Database(_)
+        | AgentPersistenceError::CorruptData(_)
+        | AgentPersistenceError::FenceConflict
+        | AgentPersistenceError::ClaimRejected(_)
+        | AgentPersistenceError::AuthorizationRejected(_)
+        | AgentPersistenceError::CursorConflict { .. }
+        | AgentPersistenceError::CommandDecodeRejected
+        | AgentPersistenceError::MaterializationLimitExceeded(_)
+        | AgentPersistenceError::SnapshotRejected(_) => {
+            AgentProvisioningOwnerError::TemporarilyUnavailable
+        }
+    }
+}
+
+fn map_conversation_grant_operation_insert_error(
+    error: sqlx::Error,
+) -> AgentProvisioningOwnerError {
+    if error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .is_some_and(|code| code == "23505")
+    {
+        AgentProvisioningOwnerError::Conflict
+    } else {
+        AgentProvisioningOwnerError::TemporarilyUnavailable
+    }
+}
+
 #[derive(Serialize)]
 struct ConnectorLifecycleReceiptV1 {
     schema_version: u8,
@@ -710,6 +1308,10 @@ pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBa
         .route(
             "/v1/connectors/{connector_id}/rotate-credential",
             post(post_connector_credential_rotation),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/agent-grants/{installation_id}",
+            put(put_conversation_grant).delete(delete_conversation_grant),
         )
         .route(
             "/v1/agent-installations/{installation_id}/identity-approvals",
@@ -828,6 +1430,76 @@ async fn post_connector_lifecycle(
                     action,
                 },
             )
+            .await
+    }
+    .await;
+    owner_response(result)
+}
+
+async fn put_conversation_grant(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path((conversation_id, installation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    mutate_conversation_grant(
+        backend,
+        conversation_id,
+        installation_id,
+        headers,
+        body,
+        ConversationGrantOwnerAction::Grant,
+    )
+    .await
+}
+
+async fn delete_conversation_grant(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path((conversation_id, installation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    mutate_conversation_grant(
+        backend,
+        conversation_id,
+        installation_id,
+        headers,
+        body,
+        ConversationGrantOwnerAction::Revoke,
+    )
+    .await
+}
+
+async fn mutate_conversation_grant(
+    backend: Arc<dyn AgentProvisioningOwnerBackend>,
+    conversation_id: String,
+    installation_id: String,
+    headers: HeaderMap,
+    body: Bytes,
+    action: ConversationGrantOwnerAction,
+) -> Response {
+    let result = async {
+        require_content_type(&headers, CONVERSATION_GRANT_MEDIA_TYPE_V1)?;
+        bounded(&body, MAX_SMALL_BODY)?;
+        let credential = parse_device_session(&headers)?;
+        let operation_id = parse_conversation_grant_operation(&headers)?;
+        let expected_grant_version = parse_conversation_grant_fence(&headers)?;
+        let conversation_id = conversation_id
+            .parse::<ConversationId>()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        let installation_id = installation_id
+            .parse::<InstallationId>()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        let command = parse_conversation_grant(&body, action)?;
+        if command.operation_id != operation_id
+            || command.expected_grant_version != expected_grant_version
+            || command.conversation_id != conversation_id
+            || command.installation_id != installation_id
+        {
+            return Err(AgentProvisioningOwnerError::InvalidRequest);
+        }
+        backend
+            .mutate_conversation_grant(credential, command, body.to_vec(), now()?)
             .await
     }
     .await;
@@ -1170,6 +1842,61 @@ fn parse_revocation(body: &[u8]) -> Result<RevocationOwnerCommand, AgentProvisio
     })
 }
 
+fn parse_conversation_grant(
+    body: &[u8],
+    expected_action: ConversationGrantOwnerAction,
+) -> Result<ConversationGrantOwnerCommand, AgentProvisioningOwnerError> {
+    let request = exact_map(
+        decode_deterministic_cbor(body).map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+        3,
+    )?;
+    let binding = map_value(&request, 1)?.clone();
+    let fields = exact_map(binding.clone(), 12)?;
+    expect_version(&fields)?;
+    let action = match unsigned_int(&fields, 2)? {
+        1 => ConversationGrantOwnerAction::Grant,
+        2 => ConversationGrantOwnerAction::Revoke,
+        _ => return Err(AgentProvisioningOwnerError::InvalidRequest),
+    };
+    if action != expected_action {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let supplied = digest(map_value(&request, 2)?)?;
+    if supplied != binding_hash(CONVERSATION_GRANT_BINDING_DOMAIN, &binding)? {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let grant_expires_at = nullable_utc(&fields, 11)?;
+    let privacy_policy_hash = nullable_digest(&fields, 12)?;
+    match action {
+        ConversationGrantOwnerAction::Grant
+            if grant_expires_at.is_none() || privacy_policy_hash.is_none() =>
+        {
+            return Err(AgentProvisioningOwnerError::InvalidRequest);
+        }
+        ConversationGrantOwnerAction::Revoke
+            if grant_expires_at.is_some() || privacy_policy_hash.is_some() =>
+        {
+            return Err(AgentProvisioningOwnerError::InvalidRequest);
+        }
+        _ => {}
+    }
+    Ok(ConversationGrantOwnerCommand {
+        action,
+        operation_id: text_id(&fields, 6)?,
+        tenant_id: text_id(&fields, 3)?,
+        conversation_id: text_id(&fields, 4)?,
+        installation_id: text_id(&fields, 5)?,
+        expected_grant_version: expected_grant_version(&fields, 7)?,
+        owner_identity_id: text_id(&fields, 8)?,
+        owner_device_id: text_id(&fields, 9)?,
+        proof_expires_at: utc(&fields, 10)?,
+        grant_expires_at,
+        privacy_policy_hash,
+        binding_digest: supplied,
+        owner_signature: Ed25519Signature::from_bytes(bytes_array(map_value(&request, 3)?)?),
+    })
+}
+
 type Fields = Vec<(CanonicalValue, CanonicalValue)>;
 fn exact_map(value: CanonicalValue, count: usize) -> Result<Fields, AgentProvisioningOwnerError> {
     let CanonicalValue::Map(fields) = value else {
@@ -1256,6 +1983,39 @@ fn utc(fields: &Fields, key: u64) -> Result<UtcMillis, AgentProvisioningOwnerErr
     .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
     UtcMillis::new(value).map_err(|_| AgentProvisioningOwnerError::InvalidRequest)
 }
+fn nullable_utc(
+    fields: &Fields,
+    key: u64,
+) -> Result<Option<UtcMillis>, AgentProvisioningOwnerError> {
+    if matches!(map_value(fields, key)?, CanonicalValue::Null) {
+        Ok(None)
+    } else {
+        utc(fields, key).map(Some)
+    }
+}
+fn nullable_digest(
+    fields: &Fields,
+    key: u64,
+) -> Result<Option<PrivacyPolicyDigest>, AgentProvisioningOwnerError> {
+    if matches!(map_value(fields, key)?, CanonicalValue::Null) {
+        Ok(None)
+    } else {
+        digest(map_value(fields, key)?)
+            .map(|digest| PrivacyPolicyDigest::from_bytes(*digest.as_bytes()))
+            .map(Some)
+    }
+}
+fn expected_grant_version(
+    fields: &Fields,
+    key: u64,
+) -> Result<Option<Revision>, AgentProvisioningOwnerError> {
+    match unsigned_int(fields, key)? {
+        0 => Ok(None),
+        value => Revision::new(value)
+            .map(Some)
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest),
+    }
+}
 fn binding_hash(
     domain: &[u8],
     value: &CanonicalValue,
@@ -1329,6 +2089,54 @@ fn parse_connector_lifecycle_operation(
         .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?
         .parse()
         .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)
+}
+
+fn parse_conversation_grant_operation(
+    headers: &HeaderMap,
+) -> Result<RequestId, AgentProvisioningOwnerError> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let value = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    if values.next().is_some() {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    value
+        .parse()
+        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)
+}
+
+fn parse_conversation_grant_fence(
+    headers: &HeaderMap,
+) -> Result<Option<Revision>, AgentProvisioningOwnerError> {
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let value = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    if values.next().is_some() {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let value = value
+        .strip_prefix("\"g")
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    if value.is_empty() || !value.bytes().all(|value| value.is_ascii_digit()) {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    if value == "0" {
+        return Ok(None);
+    }
+    if value.starts_with('0') {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| Revision::new(value).ok())
+        .map(Some)
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)
 }
 
 fn parse_connector_lifecycle_fence(
@@ -1472,21 +2280,131 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
     use base64ct::{Base64UrlUnpadded, Encoding};
     use dtx_agent_control::Sha256Digest as ControlSha256Digest;
-    use dtx_domain::{RequestId, Revision};
+    use dtx_agent_registry::PrivacyPolicyDigest;
+    use dtx_domain::{
+        ConversationId, DeviceId, GrantId, InstallationId, RequestId, Revision, TenantId,
+    };
     use dtx_wire::{CanonicalValue, decode_deterministic_cbor, encode_deterministic_cbor};
     use dtx_wire::{Sha256Digest, UtcMillis};
     use serde_json::Value;
 
     use super::{
-        AgentProvisioningDeliveryReceipt, AgentProvisioningOwnerError, REVOCATION_BINDING_DOMAIN,
-        approval_status, delivery_receipt_cbor, delivery_status, parse_approval,
-        parse_connector_projection_query, parse_delivery, parse_device_session, parse_idempotency,
-        parse_revocation,
+        AgentProvisioningDeliveryReceipt, AgentProvisioningOwnerError,
+        ConversationGrantOwnerAction, REVOCATION_BINDING_DOMAIN, approval_status,
+        conversation_grant_receipt_cbor, delivery_receipt_cbor, delivery_status, parse_approval,
+        parse_connector_projection_query, parse_conversation_grant, parse_conversation_grant_fence,
+        parse_conversation_grant_operation, parse_delivery, parse_device_session,
+        parse_idempotency, parse_revocation,
     };
 
     const VECTORS: &str = include_str!(
         "../../../protocol/test-vectors/agent-provisioning/v1/agent-provisioning-v1.json"
     );
+    const CONVERSATION_GRANT_VECTORS: &str = include_str!(
+        "../../../protocol/test-vectors/conversation-agent-grant/v1/conversation-agent-grant-v1.json"
+    );
+
+    #[test]
+    fn frozen_private_conversation_grant_vectors_bind_headers_and_receipts() {
+        let vectors: Value = serde_json::from_str(CONVERSATION_GRANT_VECTORS).unwrap();
+        let tenant_id: TenantId = vectors["tenant_id"].as_str().unwrap().parse().unwrap();
+        let conversation_id: ConversationId = vectors["conversation_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let installation_id: InstallationId = vectors["installation_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let owner_device_id: DeviceId = vectors["owner_device_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let grant_id: GrantId = vectors["server_generated_grant_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let grant = &vectors["grant"];
+        let grant_body = hex(grant["request_canonical_cbor_hex"].as_str().unwrap());
+        let command =
+            parse_conversation_grant(&grant_body, ConversationGrantOwnerAction::Grant).unwrap();
+        assert_eq!(command.tenant_id, tenant_id);
+        assert_eq!(command.conversation_id, conversation_id);
+        assert_eq!(command.installation_id, installation_id);
+        assert_eq!(
+            command.operation_id.to_string(),
+            grant["operation_id"].as_str().unwrap()
+        );
+        assert_eq!(command.expected_grant_version, None);
+        assert_eq!(command.grant_expires_at.unwrap().get(), 8_640_000);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_str(grant["operation_id"].as_str().unwrap()).unwrap(),
+        );
+        headers.insert(
+            header::IF_MATCH,
+            HeaderValue::from_str(grant["if_match"].as_str().unwrap()).unwrap(),
+        );
+        assert_eq!(
+            parse_conversation_grant_operation(&headers).unwrap(),
+            command.operation_id
+        );
+        assert_eq!(parse_conversation_grant_fence(&headers).unwrap(), None);
+
+        let privacy_hash: [u8; 32] = hex(grant["privacy_policy_hash_hex"].as_str().unwrap())
+            .try_into()
+            .unwrap();
+        let receipt = conversation_grant_receipt_cbor(
+            ConversationGrantOwnerAction::Grant,
+            tenant_id,
+            conversation_id,
+            installation_id,
+            grant_id,
+            Revision::INITIAL,
+            PrivacyPolicyDigest::from_bytes(privacy_hash),
+            owner_device_id,
+            // The frozen receipt records the durable commit instant, which is
+            // deliberately later than the request's sampled server time.
+            UtcMillis::new(1_000_050).unwrap(),
+            Some(grant["grant_expires_at_ms"].as_i64().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            receipt,
+            hex(grant["receipt_canonical_cbor_hex"].as_str().unwrap())
+        );
+
+        let revoke = &vectors["revoke"];
+        let revoke_body = hex(revoke["request_canonical_cbor_hex"].as_str().unwrap());
+        let command =
+            parse_conversation_grant(&revoke_body, ConversationGrantOwnerAction::Revoke).unwrap();
+        assert_eq!(command.expected_grant_version, Some(Revision::INITIAL));
+        assert!(command.grant_expires_at.is_none());
+        assert!(command.privacy_policy_hash.is_none());
+        let mut changed = decode_deterministic_cbor(&revoke_body).unwrap();
+        let CanonicalValue::Map(fields) = &mut changed else {
+            panic!("frozen revoke request must be a CBOR map");
+        };
+        let (_, CanonicalValue::Bytes(binding_digest)) = fields
+            .iter_mut()
+            .find(|(key, _)| *key == CanonicalValue::Unsigned(2))
+            .unwrap()
+        else {
+            panic!("frozen revoke request must carry its binding digest");
+        };
+        binding_digest[0] ^= 1;
+        let changed = encode_deterministic_cbor(&changed).unwrap();
+        assert_eq!(
+            parse_conversation_grant(&changed, ConversationGrantOwnerAction::Revoke),
+            Err(AgentProvisioningOwnerError::InvalidRequest)
+        );
+    }
 
     #[test]
     fn connector_projection_query_is_keyset_bounded_and_closed() {

@@ -29,8 +29,8 @@ use dtx_agent_control_server::{
 use dtx_agent_host::AgentHost;
 use dtx_agent_persistence::{
     AgentDefinitionRepository, AgentDeviceRepository, AgentHostRepository,
-    AgentInstallationRepository, BindingSetRepository, ConnectorRepository, CurrentWrite,
-    ConversationGrantRepository, DefinitionInsert,
+    AgentInstallationRepository, BindingSetRepository, ConnectorRepository,
+    ConversationGrantRepository, CurrentWrite, DefinitionInsert,
 };
 use dtx_agent_registry::{
     AgentDevice, AgentDeviceCommand, AgentDeviceState, AgentInstallation, DescriptorDigest,
@@ -597,14 +597,9 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         82,
     )
     .await?;
-    let (owner_credential, owner_authorization) = provision_owner_session(
-        &harness,
-        owner_id,
-        owner_device_id,
-        owner_head,
-        [0x83; 32],
-    )
-    .await?;
+    let (owner_credential, owner_authorization) =
+        provision_owner_session(&harness, owner_id, owner_device_id, owner_head, [0x83; 32])
+            .await?;
 
     let non_owner_root = key(84);
     let non_owner_device_key = key(85);
@@ -663,6 +658,12 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
     ));
     let uri = format!("/v1/conversations/{conversation_id}/agent-grants/{installation_id}");
     let grant_operation = RequestId::new();
+    let expiring_proof_at = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )? + 3_000;
     let first_grant_body = conversation_grant_body(
         1,
         grant_operation,
@@ -675,6 +676,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         &owner_device_key,
         Some(now() + 600_000),
         Some([0x91; 32]),
+        expiring_proof_at,
     )?;
     let first = owner_conversation_grant_mutation(
         router.clone(),
@@ -688,6 +690,10 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
     .await?;
     assert_eq!(first.0, StatusCode::CREATED);
 
+    // The original signed proof is now stale, but a response-loss replay must
+    // still return the committed receipt rather than treating the operation as
+    // a new, expired approval.
+    tokio::time::sleep(Duration::from_millis(3_100)).await;
     let replay = owner_conversation_grant_mutation(
         router.clone(),
         Method::PUT,
@@ -713,6 +719,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         &owner_device_key,
         Some(now() + 600_000),
         Some([0x92; 32]),
+        now() + 300_000,
     )?;
     let conflicting_retry = owner_conversation_grant_mutation(
         router.clone(),
@@ -746,6 +753,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
             &non_owner_device_key,
             Some(now() + 600_000),
             Some([0x93; 32]),
+            now() + 300_000,
         )?,
     )
     .await?;
@@ -771,6 +779,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
             &owner_device_key,
             None,
             None,
+            now() + 300_000,
         )?,
     )
     .await?;
@@ -1211,6 +1220,7 @@ fn conversation_grant_body(
     owner_key: &SigningKey,
     grant_expires_at: Option<i64>,
     privacy_policy_hash: Option<[u8; 32]>,
+    proof_expires_at: i64,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     let grant_expires_at = match grant_expires_at {
         Some(expires_at) => UtcMillis::new(expires_at)?.to_canonical_value(),
@@ -1233,7 +1243,10 @@ fn conversation_grant_body(
         ),
         (u(8), text(owner_id)),
         (u(9), text(owner_device_id)),
-        (u(10), UtcMillis::new(now() + 300_000)?.to_canonical_value()),
+        (
+            u(10),
+            UtcMillis::new(proof_expires_at)?.to_canonical_value(),
+        ),
         (u(11), grant_expires_at),
         (u(12), privacy_policy_hash),
     ]);

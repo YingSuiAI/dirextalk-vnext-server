@@ -71,6 +71,10 @@ const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[
     ),
     ("agent.router_stable_names(text[])", "EXECUTE"),
     ("identity.identity_agent_reader_authorized()", "EXECUTE"),
+    (
+        "groups.private_conversation_owner_authorized(uuid,uuid,text)",
+        "EXECUTE",
+    ),
 ];
 const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.hosts", "SELECT"),
@@ -99,6 +103,13 @@ const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.conversation_grant_heads", "SELECT"),
     ("agent.conversation_grant_permissions", "SELECT"),
     ("agent.conversation_grant_cloud_connections", "SELECT"),
+    ("agent.conversation_grant_ids", "INSERT"),
+    ("agent.conversation_grant_versions", "INSERT"),
+    ("agent.conversation_grant_heads", "INSERT"),
+    ("agent.conversation_grant_heads", "UPDATE"),
+    ("agent.conversation_grant_permissions", "INSERT"),
+    ("agent.conversation_grant_owner_operations", "SELECT"),
+    ("agent.conversation_grant_owner_operations", "INSERT"),
     ("agent.connector_instances", "SELECT"),
     ("agent.connector_instances", "INSERT"),
     ("agent.connector_instances", "UPDATE"),
