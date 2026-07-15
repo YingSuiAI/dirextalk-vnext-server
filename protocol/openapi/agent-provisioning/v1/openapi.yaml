@@ -1,0 +1,144 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Owner-approved Agent Provisioning
+  version: 1.0.0
+  description: >-
+    Binds one independently self-certifying Agent identity/device to an
+    installation, then relays an end-to-end sealed, one-time provisioning
+    capsule to the exact Connector binding. Root and recovery authority never
+    enter this API, Agent Control, or the sidecar bundle.
+paths:
+  /v1/agent-installations/{installation_id}/identity-approvals:
+    post:
+      operationId: approveAgentIdentity
+      parameters:
+        - $ref: '#/components/parameters/InstallationId'
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.agent-identity-approval.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/ApprovalReceipt'}
+        '200': {$ref: '#/components/responses/ApprovalReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {description: The active device is not the exact installation Owner.}
+        '409': {description: Revision, idempotency, identity, device, or binding conflict.}
+        '422': {description: Canonical body, Owner signature, identity head, or credential binding is invalid.}
+  /v1/agent-installations/{installation_id}/identity-approvals/{approval_id}:
+    get:
+      operationId: getAgentIdentityApproval
+      parameters:
+        - $ref: '#/components/parameters/InstallationId'
+        - $ref: '#/components/parameters/ApprovalId'
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+      responses:
+        '200': {$ref: '#/components/responses/ApprovalReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {description: No approval visible to the authenticated Owner.}
+  /v1/agent-installations/{installation_id}/provisioning-target:
+    get:
+      operationId: getAgentProvisioningTarget
+      parameters:
+        - $ref: '#/components/parameters/InstallationId'
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - {name: approval_id, in: query, required: true, schema: {$ref: '#/components/schemas/UuidV7'}}
+        - {name: binding_id, in: query, required: true, schema: {$ref: '#/components/schemas/UuidV7'}}
+      responses:
+        '200':
+          description: Fresh Connector-signed one-time recipient descriptor.
+          content:
+            application/vnd.dirextalk.agent-provisioning-recipient.v1+cbor:
+              schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {description: No fresh recipient exists for the exact active binding.}
+        '409': {description: The installation is not approved or is revoked.}
+  /v1/agent-installations/{installation_id}/provisioning-deliveries:
+    post:
+      operationId: deliverAgentProvisioning
+      parameters:
+        - $ref: '#/components/parameters/InstallationId'
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.agent-provisioning-delivery.v1+cbor:
+            x-dirextalk-max-body-bytes: 212992
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '202': {$ref: '#/components/responses/DeliveryReceipt'}
+        '200': {$ref: '#/components/responses/DeliveryReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {description: The active device is not the exact installation Owner.}
+        '409': {description: Changed replay, stale revision, consumed recipient, or revoked installation.}
+        '422': {description: Capsule digest, Owner signature, descriptor, or canonical binding is invalid.}
+  /v1/agent-installations/{installation_id}/provisioning-deliveries/{delivery_id}:
+    get:
+      operationId: getAgentProvisioningDelivery
+      parameters:
+        - $ref: '#/components/parameters/InstallationId'
+        - $ref: '#/components/parameters/DeliveryId'
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+      responses:
+        '200': {$ref: '#/components/responses/DeliveryReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {description: No delivery visible to the authenticated Owner.}
+  /v1/agent-installations/{installation_id}/revocations:
+    post:
+      operationId: revokeAgentProvisioning
+      parameters:
+        - $ref: '#/components/parameters/InstallationId'
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.agent-provisioning-revocation.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/RevocationReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {description: The active device is not the exact installation Owner.}
+        '409': {description: Changed replay or stale revision.}
+components:
+  parameters:
+    InstallationId: {name: installation_id, in: path, required: true, schema: {$ref: '#/components/schemas/UuidV7'}}
+    ApprovalId: {name: approval_id, in: path, required: true, schema: {$ref: '#/components/schemas/UuidV7'}}
+    DeliveryId: {name: delivery_id, in: path, required: true, schema: {$ref: '#/components/schemas/UuidV7'}}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 16, maxLength: 128, pattern: '^[A-Za-z0-9_-]{16,128}$'}
+    DeviceSessionAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      description: Exact active Owner device session; identity and device must match the signed canonical body.
+      schema:
+        type: string
+        pattern: '^DTX-Device-Session [0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$'
+  schemas:
+    UuidV7: {type: string, pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'}
+    ExactCanonicalCbor: {type: string, contentEncoding: binary, x-dirextalk-exact-cbor: true}
+  responses:
+    ApprovalReceipt:
+      description: Immutable bind-once approval receipt; exact retry returns the original bytes.
+      content:
+        application/vnd.dirextalk.agent-identity-approval-receipt.v1+cbor:
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    DeliveryReceipt:
+      description: Current non-secret delivery state; an installed receipt never contains capsule bytes.
+      content:
+        application/vnd.dirextalk.agent-provisioning-delivery-receipt.v1+cbor:
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    RevocationReceipt:
+      description: Immutable fail-closed revocation receipt; local cleanup may complete asynchronously.
+      content:
+        application/vnd.dirextalk.agent-provisioning-revocation-receipt.v1+cbor:
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    Unauthorized:
+      description: Device session is missing, expired, revoked, malformed, or for another identity.

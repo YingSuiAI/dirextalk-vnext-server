@@ -84,6 +84,11 @@ Layout:
   `group-scope` to the CDDL integer enum, and publishes the stable receipt
   verification-key descriptor. V21 remains immutable and has no production
   route.
+  `baseline/v23/manifest.json` freezes Owner approval of one independently
+  self-certifying Agent identity/device and an opaque, one-time provisioning
+  handoff. Agent Control 1.3 adds only a Connector-signed sidecar recipient,
+  the durable sealed-capsule delivery command, and installed/rejected results;
+  it does not add secrets or plaintext to Run grants.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

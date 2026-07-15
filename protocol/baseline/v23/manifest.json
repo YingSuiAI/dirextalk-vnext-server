@@ -1,0 +1,11 @@
+{
+  "version": 23,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/agent-provisioning/v1/agent-provisioning-v1.cddl": "sha256:be049cabecbde43d63ea33c24c0302c94ccdb68d464a747d5d261759dbc15ee8",
+    "protocol/openapi/agent-provisioning/v1/openapi.yaml": "sha256:accb7035bc4e01b167ad675d30a2d4be645b60423bfec0c897101ae2515ed1ab",
+    "protocol/proto/dirextalk/agent_control/v1_3/agent_control.proto": "sha256:ecb64bb585dee6822c59db3da04b5dedd12ac99bbb4122d17dca6569d9af1f2a",
+    "protocol/test-vectors/agent-provisioning/v1/agent-provisioning-v1.json": "sha256:9affc5b183c64c15c489334f47108aa9fdd4e5f64623fd7d6ffab33df5aac7f4"
+  }
+}
