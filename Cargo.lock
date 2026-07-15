@@ -808,6 +808,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tonic",
+ "tower",
  "uuid",
  "x509-parser",
  "zeroize",

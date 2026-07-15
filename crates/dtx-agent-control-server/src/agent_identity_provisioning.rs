@@ -941,6 +941,18 @@ pub async fn create_agent_provisioning_delivery<D: DurableCommandDecoder + ?Size
         .to_string()
         .parse::<RequestId>()
         .map_err(|_| AgentIdentityProvisioningError::InvalidRequest)?;
+    sqlx::query(
+        "INSERT INTO agent.connector_control_operations (
+             tenant_id, operation_id, connector_id, operation_kind, created_at_ms
+         ) VALUES ($1,$2,$3,'deliver_agent_provisioning',$4)",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(operation_id))
+    .bind(Uuid::from(connector_id))
+    .bind(now.get())
+    .execute(session.connection())
+    .await
+    .map_err(map_unique_conflict)?;
     let control_payload = ServerCommandPayload::DeliverAgentProvisioning(
         DeliverAgentProvisioningCommand::new(
             command.delivery_id,
@@ -1279,6 +1291,18 @@ pub async fn revoke_agent_provisioning<D: DurableCommandDecoder + ?Sized>(
         .checked_add(1)
         .filter(|value| *value <= Revision::MAX)
         .ok_or(AgentIdentityProvisioningError::Conflict)?;
+    sqlx::query(
+        "INSERT INTO agent.connector_control_operations (
+             tenant_id, operation_id, connector_id, operation_kind, created_at_ms
+         ) VALUES ($1,$2,$3,'revoke_agent_provisioning',$4)",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.revocation_id))
+    .bind(Uuid::from(connector_id))
+    .bind(now.get())
+    .execute(session.connection())
+    .await
+    .map_err(map_unique_conflict)?;
     let payload = ServerCommandPayload::RevokeAgentProvisioning(
         RevokeAgentProvisioningCommand::new(
             command.revocation_id,

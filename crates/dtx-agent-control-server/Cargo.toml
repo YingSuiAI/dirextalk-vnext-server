@@ -44,6 +44,7 @@ zeroize.workspace = true
 dtx-testkit = { path = "../dtx-testkit" }
 ed25519-dalek.workspace = true
 testcontainers-modules.workspace = true
+tower.workspace = true
 x509-parser.workspace = true
 
 [lints]

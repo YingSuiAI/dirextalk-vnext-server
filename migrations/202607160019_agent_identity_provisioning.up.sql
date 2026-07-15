@@ -1,5 +1,20 @@
 -- V23: bind-once Agent identity approval and opaque Connector provisioning delivery.
 
+ALTER TABLE agent.connector_control_operations
+    DROP CONSTRAINT connector_control_operations_kind_valid,
+    ADD CONSTRAINT connector_control_operations_kind_valid
+        CHECK (operation_kind IN (
+            'enrollment', 'apply_config', 'rotate_credential', 'close_stream',
+            'deliver_agent_provisioning', 'revoke_agent_provisioning'
+        ));
+ALTER TABLE agent.connector_control_commands
+    DROP CONSTRAINT connector_control_commands_kind_valid,
+    ADD CONSTRAINT connector_control_commands_kind_valid
+        CHECK (command_kind IN (
+            'apply_config', 'rotate_credential', 'close_stream',
+            'deliver_agent_provisioning', 'revoke_agent_provisioning'
+        ));
+
 CREATE FUNCTION identity.identity_agent_reader_authorized()
 RETURNS boolean LANGUAGE sql STABLE PARALLEL SAFE AS $$
     SELECT COALESCE(pg_has_role(current_user, to_regrole('dtx_agent_runtime'), 'MEMBER'), false)
