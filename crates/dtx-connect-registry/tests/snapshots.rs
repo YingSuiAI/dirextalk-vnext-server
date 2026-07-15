@@ -32,6 +32,7 @@ fn active_entities(tenant_id: TenantId) -> (AgentInstallation, AgentDevice) {
     let mut device = AgentDevice::enroll(
         &installation,
         AgentDeviceId::new(),
+        dtx_domain::DeviceId::new(),
         DeviceCredentialFingerprint::from_bytes([2; 32]),
     )
     .unwrap();

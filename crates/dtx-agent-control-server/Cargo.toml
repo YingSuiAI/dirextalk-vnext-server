@@ -14,8 +14,12 @@ dtx-agent-registry = { path = "../dtx-agent-registry" }
 dtx-agent-router = { path = "../dtx-agent-router" }
 dtx-connect-registry = { path = "../dtx-connect-registry" }
 dtx-domain = { path = "../dtx-domain" }
+dtx-identity-log = { path = "../dtx-identity-log" }
+dtx-identity-persistence = { path = "../dtx-identity-persistence" }
 dtx-security = { path = "../dtx-security" }
 dtx-storage = { path = "../dtx-storage" }
+dtx-wire = { path = "../dtx-wire" }
+ed25519-dalek.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true

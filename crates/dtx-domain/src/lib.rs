@@ -12,8 +12,8 @@ pub use ids::{
     DirectoryRegistrationId, EnrollmentIntentId, EnvelopeId, EventId, GrantId, HostCredentialId,
     HostId, IdParseError, IndexerId, InstallationId, InviteCapabilityId, JobEvidenceId, JobId,
     JobResourceId, JobStepId, JoinRequestId, KeyPackageId, LeaseId, MailboxId, ManagedServiceId,
-    OutboxId, RequestId, RunId, RunLeaseId, RunOfferId, SecretId, ServiceOperationId, TenantId,
-    WorkerId,
+    OutboxId, ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, RunId, RunLeaseId,
+    RunOfferId, SecretId, ServiceOperationId, TenantId, WorkerId,
 };
 pub use ports::{Clock, ClockError, IdGenerationError, IdGenerator, SystemClock, UuidV7Generator};
 pub use public_id::{

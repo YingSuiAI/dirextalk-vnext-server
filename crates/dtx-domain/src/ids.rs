@@ -193,6 +193,11 @@ define_uuid_v7_id!(GrantId, "conversation agent grant ID");
 define_uuid_v7_id!(HostCredentialId, "agent host credential ID");
 define_uuid_v7_id!(ConsentId, "consent ID");
 define_uuid_v7_id!(ApprovalId, "approval ID");
+define_uuid_v7_id!(ProvisioningDeliveryId, "agent provisioning delivery ID");
+define_uuid_v7_id!(
+    ProvisioningRecipientKeyId,
+    "agent provisioning recipient key ID"
+);
 define_uuid_v7_id!(RunId, "agent run ID");
 define_uuid_v7_id!(RunOfferId, "agent run offer ID");
 define_uuid_v7_id!(RunLeaseId, "agent run lease ID");

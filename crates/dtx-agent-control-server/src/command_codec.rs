@@ -1,14 +1,17 @@
 use dtx_agent_control::{
     ApplyConfigCommand, CloseStreamCommand, CloseStreamReason, CommandError, ConfigEntry,
-    ExactCommandBytes, MAX_COMMAND_BYTES, RotateCredentialCommand, ServerCommandPayload,
-    Sha256Digest, command_payload_digest,
+    DeliverAgentProvisioningCommand, ExactCommandBytes, MAX_COMMAND_BYTES, RotateCredentialCommand,
+    ServerCommandPayload, Sha256Digest, command_payload_digest,
 };
 use dtx_agent_control_proto::v1;
 use dtx_agent_persistence::{
     DecodedDurableCommand, DurableCommandDecodeError, DurableCommandDecoder,
 };
 use dtx_connect_registry::ConnectorDesiredState;
-use dtx_domain::{RequestId, Revision};
+use dtx_domain::{
+    AgentDeviceId, ApprovalId, BindingId, InstallationId, ProvisioningDeliveryId,
+    ProvisioningRecipientKeyId, RequestId, Revision,
+};
 use prost::Message as _;
 
 type DecodeResult<T> = Result<T, DurableCommandDecodeError>;
@@ -22,6 +25,7 @@ const DURABLE_COMMAND_RULES: &[FieldRule] = &[
     FieldRule::singular(10, WireType::LengthDelimited),
     FieldRule::singular(11, WireType::LengthDelimited),
     FieldRule::singular(12, WireType::LengthDelimited),
+    FieldRule::singular(13, WireType::LengthDelimited),
 ];
 const APPLY_CONFIG_RULES: &[FieldRule] = &[
     FieldRule::singular(1, WireType::Varint),
@@ -42,6 +46,19 @@ const CLOSE_STREAM_RULES: &[FieldRule] = &[
     FieldRule::singular(1, WireType::Varint),
     FieldRule::singular(2, WireType::LengthDelimited),
     FieldRule::singular(3, WireType::LengthDelimited),
+];
+const DELIVER_AGENT_PROVISIONING_RULES: &[FieldRule] = &[
+    FieldRule::singular(1, WireType::LengthDelimited),
+    FieldRule::singular(2, WireType::LengthDelimited),
+    FieldRule::singular(3, WireType::LengthDelimited),
+    FieldRule::singular(4, WireType::LengthDelimited),
+    FieldRule::singular(5, WireType::LengthDelimited),
+    FieldRule::singular(6, WireType::Varint),
+    FieldRule::singular(7, WireType::LengthDelimited),
+    FieldRule::singular(8, WireType::LengthDelimited),
+    FieldRule::singular(9, WireType::LengthDelimited),
+    FieldRule::singular(10, WireType::LengthDelimited),
+    FieldRule::singular(11, WireType::Varint),
 ];
 
 /// Canonical protobuf encoding needed by [`dtx_agent_control::CommandLog::append`].
@@ -144,6 +161,31 @@ fn encode_payload(
             };
             let exact = encoded.encode_to_vec();
             Ok((v1::durable_command::Command::CloseStream(encoded), exact))
+        }
+        ServerCommandPayload::DeliverAgentProvisioning(command) => {
+            let expires_at_millis = u64::try_from(command.expires_at_millis())
+                .map_err(|_| CommandError::InvalidCommandPayload)?;
+            let encoded = v1::DeliverAgentProvisioning {
+                delivery_id: command.delivery_id().to_string(),
+                approval_id: command.approval_id().to_string(),
+                binding_id: command.binding_id().to_string(),
+                installation_id: command.installation_id().to_string(),
+                agent_device_id: command.agent_device_id().to_string(),
+                provisioning_revision: command.provisioning_revision().get(),
+                recipient_key_id: command.recipient_key_id().to_string(),
+                recipient_descriptor_digest: command
+                    .recipient_descriptor_digest()
+                    .as_bytes()
+                    .to_vec(),
+                capsule_digest: command.capsule_digest().as_bytes().to_vec(),
+                sealed_capsule: command.sealed_capsule().to_vec(),
+                expires_at_millis,
+            };
+            let exact = encoded.encode_to_vec();
+            Ok((
+                v1::durable_command::Command::DeliverAgentProvisioning(encoded),
+                exact,
+            ))
         }
     }
 }
@@ -274,6 +316,47 @@ fn decode_payload(
             .map(ServerCommandPayload::CloseStream)
             .map_err(|_| DurableCommandDecodeError)
         }
+        (13, Some(v1::durable_command::Command::DeliverAgentProvisioning(command))) => {
+            validate_wire_schema(exact_payload, DELIVER_AGENT_PROVISIONING_RULES)?;
+            let recipient_descriptor_digest = digest(command.recipient_descriptor_digest)?;
+            let capsule_digest = digest(command.capsule_digest)?;
+            let expires_at_millis =
+                i64::try_from(command.expires_at_millis).map_err(|_| DurableCommandDecodeError)?;
+            DeliverAgentProvisioningCommand::new(
+                command
+                    .delivery_id
+                    .parse::<ProvisioningDeliveryId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                command
+                    .approval_id
+                    .parse::<ApprovalId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                command
+                    .binding_id
+                    .parse::<BindingId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                command
+                    .installation_id
+                    .parse::<InstallationId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                command
+                    .agent_device_id
+                    .parse::<AgentDeviceId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                Revision::new(command.provisioning_revision)
+                    .map_err(|_| DurableCommandDecodeError)?,
+                command
+                    .recipient_key_id
+                    .parse::<ProvisioningRecipientKeyId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                recipient_descriptor_digest,
+                capsule_digest,
+                command.sealed_capsule,
+                expires_at_millis,
+            )
+            .map(ServerCommandPayload::DeliverAgentProvisioning)
+            .map_err(|_| DurableCommandDecodeError)
+        }
         _ => Err(DurableCommandDecodeError),
     }
 }
@@ -291,7 +374,7 @@ fn validate_apply_config_wire(bytes: &[u8]) -> DecodeResult<()> {
 fn selected_payload<'a>(fields: &[WireField<'a>]) -> DecodeResult<(u32, &'a [u8])> {
     let mut selected = None;
     for field in fields {
-        if matches!(field.number, 10..=12)
+        if matches!(field.number, 10..=13)
             && selected.replace((field.number, field.value)).is_some()
         {
             return Err(DurableCommandDecodeError);

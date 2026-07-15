@@ -117,6 +117,7 @@ proptest! {
         let mut state = AgentDevice::enroll(
             &owner,
             AgentDeviceId::from_str(UUID_A).unwrap(),
+            dtx_domain::DeviceId::new(),
             DeviceCredentialFingerprint::from_bytes([7; 32]),
         ).unwrap();
         for activate in commands {

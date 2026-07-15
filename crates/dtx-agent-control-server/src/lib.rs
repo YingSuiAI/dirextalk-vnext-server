@@ -7,6 +7,7 @@
 //! rustls configuration with mandatory per-Connector cryptographic authentication.
 //! Live credential authorization remains inside the `PostgreSQL`-backed application boundary.
 
+mod agent_identity_provisioning;
 mod application;
 mod authentication;
 mod authorization_index;
@@ -25,6 +26,7 @@ mod service;
 mod transport_admission;
 mod wire;
 
+pub use agent_identity_provisioning::*;
 pub use application::{
     ApplicationFuture, ConnectorControlApplication, ConnectorControlApplicationError,
     CredentialRotationCompletion, EnrollmentCompletion, HeartbeatCompletion, OpenControlCompletion,

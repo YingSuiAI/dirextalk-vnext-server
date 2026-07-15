@@ -329,6 +329,11 @@ impl PostgresHarness {
              GRANT SELECT, INSERT ON agent.agent_definitions TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.installations TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.agent_devices TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.agent_identity_approvals TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.agent_provisioning_recipients TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.agent_provisioning_deliveries TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.agent_provisioning_outbox TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.agent_installation_revocations TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.hosts TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.host_credentials TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.host_provisioning_operations TO dtx_runtime_test;

@@ -31,30 +31,37 @@ use dtx_connect_registry::{
     ConnectorFence, ConnectorLease, ConnectorObservedState,
 };
 use dtx_domain::{
-    Clock, ConnectorCredentialId, ConnectorId, ConversationId, Ed25519PublicKey,
-    EnrollmentIntentId, EventId, HostId, IdGenerator, InstallationId, LeaseId, RequestId, Revision,
-    RunId, RunLeaseId, RunOfferId, SystemClock, TenantId, UuidV7Generator,
+    AgentDeviceId, BindingId, Clock, ConnectorCredentialId, ConnectorId, ConversationId,
+    Ed25519PublicKey, EnrollmentIntentId, EventId, HostId, IdGenerator, InstallationId, LeaseId,
+    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, RunId, RunLeaseId,
+    RunOfferId, SystemClock, TenantId, UuidV7Generator,
 };
 use dtx_security::{AuthenticatedConnectorPeer, ConnectorWorkloadIdentity};
 use dtx_storage::PgStore;
+use dtx_wire::{CanonicalValue, Sha256Digest as WireSha256Digest, encode_deterministic_cbor};
+use ed25519_dalek::{Signature, VerifyingKey};
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
+use sqlx::Row as _;
+use uuid::Uuid;
 
 use crate::{
     ApplicationFuture, CommandNotificationSubscription, ConnectorCertificateAuthority,
     ConnectorControlApplication, ConnectorControlApplicationError,
     ConnectorCredentialAuthorizationIndex, CredentialRotationCompletion, EnrollmentCompletion,
-    HeartbeatCompletion, OpenControlCompletion, ParsedCapacity, ParsedCommandAcknowledgement,
+    HeartbeatCompletion, OpenControlCompletion, ParsedAgentProvisioningInstalled,
+    ParsedAgentProvisioningRejected, ParsedCapacity, ParsedCommandAcknowledgement,
     ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat, ParsedHello,
-    ParsedLeaseFence, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted,
-    ParsedRunExecutionFence, ParsedRunFailed, ParsedRunOutput, ParsedRunRelease,
-    ProtobufDurableCommandEncoder, RunAvailableWire, RunCancelRequestedWire, RunLeaseGrantedWire,
-    RunOfferNotificationSubscription, command_notifications::ConnectorCommandNotifications,
+    ParsedLeaseFence, ParsedProvisioningRecipientAnnouncement, ParsedReady, ParsedRunCheckpoint,
+    ParsedRunClaim, ParsedRunCompleted, ParsedRunExecutionFence, ParsedRunFailed, ParsedRunOutput,
+    ParsedRunRelease, ProtobufDurableCommandEncoder, RunAvailableWire, RunCancelRequestedWire,
+    RunLeaseGrantedWire, RunOfferNotificationSubscription,
+    command_notifications::ConnectorCommandNotifications,
     run_notifications::ConnectorRunOfferNotifications,
 };
 
 const PROTOCOL_MAJOR: u32 = 1;
-const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 2;
+const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 3;
 const DEFAULT_HEARTBEAT_INTERVAL_MILLIS: u32 = 10_000;
 const DEFAULT_HEARTBEAT_TTL_MILLIS: u32 = 30_000;
 const CERTIFICATE_NOT_BEFORE_SKEW_MILLIS: i64 = 30_000;
@@ -128,6 +135,7 @@ impl Default for ConnectorControlPolicy {
                 "credential-rotation".to_owned(),
                 "durable-command-replay".to_owned(),
                 "run-routing".to_owned(),
+                "opaque-agent-provisioning".to_owned(),
                 "runtime-claims".to_owned(),
             ],
         )
@@ -2183,9 +2191,9 @@ impl PostgresConnectorControlApplication {
         let command = self.decode_persisted_command(acknowledgement_write.command())?;
         let configuration = match command.payload() {
             ServerCommandPayload::ApplyConfig(configuration) => Some(configuration.clone()),
-            ServerCommandPayload::RotateCredential(_) | ServerCommandPayload::CloseStream(_) => {
-                None
-            }
+            ServerCommandPayload::RotateCredential(_)
+            | ServerCommandPayload::CloseStream(_)
+            | ServerCommandPayload::DeliverAgentProvisioning(_) => None,
         };
         if !acknowledgement_write.advanced() {
             session
@@ -2988,6 +2996,645 @@ fn permissions_authorize_run(
     })
 }
 
+impl PostgresConnectorControlApplication {
+    #[allow(clippy::too_many_lines)]
+    async fn announce_provisioning_recipient_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        announcement: ParsedProvisioningRecipientAnnouncement,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        ensure_peer_fence(peer, announcement.connector_fence)?;
+        let now = self.now()?;
+        if announcement.created_at_millis > now.saturating_add(30_000)
+            || announcement.expires_at_millis <= now
+            || announcement.expires_at_millis - announcement.created_at_millis > 600_000
+        {
+            return Err(ConnectorControlApplicationError::InvalidRequest);
+        }
+        let tenant_id = announcement.connector_fence.tenant_id;
+        let connector_id = announcement.connector_fence.connector_id;
+        let mut session = self
+            .store
+            .begin_tenant(tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let connector = ConnectorRepository::new()
+            .load_heartbeat_head_for_update(session.connection(), tenant_id, connector_id)
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::StaleFence)?;
+        ensure_resolved_fence(connector.fence(), announcement.connector_fence)?;
+        require_live_current_credential(
+            session.connection(),
+            peer,
+            tenant_id,
+            connector_id,
+            announcement.connector_fence.connector_generation,
+            now,
+        )
+        .await?;
+        let binding_matches: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                   FROM agent.connector_bindings b
+                   JOIN agent.installations i
+                     ON i.tenant_id=b.tenant_id AND i.installation_id=b.installation_id
+                   JOIN agent.agent_devices d
+                     ON d.tenant_id=b.tenant_id AND d.installation_id=b.installation_id
+                    AND d.agent_device_id=b.agent_device_id
+                  WHERE b.tenant_id=$1 AND b.connector_id=$2 AND b.binding_id=$3
+                    AND b.installation_id=$4 AND b.agent_device_id=$5
+                    AND b.state='enabled' AND i.desired_state <> 'revoked'
+                    AND d.state <> 'revoked' AND i.aggregate_revision=$6
+             )",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(connector_id))
+        .bind(Uuid::from(announcement.binding_id))
+        .bind(Uuid::from(announcement.installation_id))
+        .bind(Uuid::from(announcement.agent_device_id))
+        .bind(
+            i64::try_from(announcement.provisioning_revision)
+                .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?,
+        )
+        .fetch_one(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if !binding_matches {
+            return Err(ConnectorControlApplicationError::PermissionDenied);
+        }
+        let credential = sqlx::query(
+            "SELECT r.current_credential_id, r.connector_generation,
+                    c.online_public_key, c.certificate_fingerprint
+               FROM agent.connector_control_credential_heads h
+               JOIN agent.connector_control_credential_revisions r
+                 ON r.tenant_id=h.tenant_id AND r.connector_id=h.connector_id
+                AND r.authorization_revision=h.current_revision
+               JOIN agent.connector_control_credentials c
+                 ON c.tenant_id=r.tenant_id AND c.connector_id=r.connector_id
+                AND c.credential_id=r.current_credential_id
+              WHERE h.tenant_id=$1 AND h.connector_id=$2 AND r.lifecycle='active'",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(connector_id))
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?
+        .ok_or(ConnectorControlApplicationError::AuthenticationFailed)?;
+        let credential_id: Uuid = credential
+            .try_get("current_credential_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let generation: i64 = credential
+            .try_get("connector_generation")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let public_key: Vec<u8> = credential
+            .try_get("online_public_key")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let fingerprint: Vec<u8> = credential
+            .try_get("certificate_fingerprint")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        if credential_id != Uuid::from(announcement.credential_id)
+            || generation
+                != i64::try_from(announcement.connector_fence.connector_generation)
+                    .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?
+            || fingerprint.as_slice() != peer.certificate_fingerprint().as_bytes()
+        {
+            return Err(ConnectorControlApplicationError::AuthenticationFailed);
+        }
+        let descriptor_digest = provisioning_recipient_descriptor_digest(&announcement);
+        if descriptor_digest != announcement.descriptor_digest {
+            return Err(ConnectorControlApplicationError::InvalidRequest);
+        }
+        let verifying_key = VerifyingKey::from_bytes(
+            &public_key
+                .try_into()
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let signature = Signature::from_bytes(&announcement.recipient_signature);
+        verifying_key
+            .verify_strict(
+                &provisioning_recipient_signature_input(descriptor_digest),
+                &signature,
+            )
+            .map_err(|_| ConnectorControlApplicationError::AuthenticationFailed)?;
+        let recipient_uuid = Uuid::from(announcement.recipient_key_id);
+        if let Some(existing) = sqlx::query(
+            "SELECT binding_id, installation_id, agent_device_id, provisioning_revision,
+                    recipient_public_key, credential_id, credential_generation,
+                    connector_credential_fingerprint, descriptor_digest, announce_signature,
+                    expires_at_ms, announced_at_ms
+               FROM agent.agent_provisioning_recipients
+              WHERE tenant_id=$1 AND recipient_id=$2",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(recipient_uuid)
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?
+        {
+            let exact = existing.try_get::<Uuid, _>("binding_id").ok()
+                == Some(Uuid::from(announcement.binding_id))
+                && existing.try_get::<Uuid, _>("installation_id").ok()
+                    == Some(Uuid::from(announcement.installation_id))
+                && existing.try_get::<Uuid, _>("agent_device_id").ok()
+                    == Some(Uuid::from(announcement.agent_device_id))
+                && existing.try_get::<i64, _>("provisioning_revision").ok()
+                    == i64::try_from(announcement.provisioning_revision).ok()
+                && existing
+                    .try_get::<Vec<u8>, _>("recipient_public_key")
+                    .ok()
+                    .as_deref()
+                    == Some(announcement.recipient_public_key.as_slice())
+                && existing.try_get::<Uuid, _>("credential_id").ok() == Some(credential_id)
+                && existing.try_get::<i64, _>("credential_generation").ok() == Some(generation)
+                && existing
+                    .try_get::<Vec<u8>, _>("connector_credential_fingerprint")
+                    .ok()
+                    .as_deref()
+                    == Some(fingerprint.as_slice())
+                && existing
+                    .try_get::<Vec<u8>, _>("descriptor_digest")
+                    .ok()
+                    .as_deref()
+                    == Some(descriptor_digest.as_bytes().as_slice())
+                && existing
+                    .try_get::<Vec<u8>, _>("announce_signature")
+                    .ok()
+                    .as_deref()
+                    == Some(announcement.recipient_signature.as_slice())
+                && existing.try_get::<i64, _>("expires_at_ms").ok()
+                    == Some(announcement.expires_at_millis)
+                && existing.try_get::<i64, _>("announced_at_ms").ok()
+                    == Some(announcement.created_at_millis);
+            if !exact {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+            session
+                .commit()
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO agent.agent_provisioning_recipients (
+                 tenant_id, recipient_id, connector_id, binding_id, installation_id,
+                 agent_device_id, provisioning_revision, recipient_key_id,
+                 recipient_public_key, credential_id, credential_generation,
+                 connector_credential_fingerprint, descriptor_digest, announce_signature,
+                 expires_at_ms, announced_at_ms, state
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$2,$8,$9,$10,$11,$12,$13,$14,$15,'open')",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(recipient_uuid)
+        .bind(Uuid::from(connector_id))
+        .bind(Uuid::from(announcement.binding_id))
+        .bind(Uuid::from(announcement.installation_id))
+        .bind(Uuid::from(announcement.agent_device_id))
+        .bind(
+            i64::try_from(announcement.provisioning_revision)
+                .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?,
+        )
+        .bind(announcement.recipient_public_key.as_slice())
+        .bind(credential_id)
+        .bind(generation)
+        .bind(&fingerprint)
+        .bind(descriptor_digest.as_bytes().as_slice())
+        .bind(announcement.recipient_signature.as_slice())
+        .bind(announcement.expires_at_millis)
+        .bind(announcement.created_at_millis)
+        .execute(session.connection())
+        .await
+        .map_err(|error| {
+            if error
+                .as_database_error()
+                .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+            {
+                ConnectorControlApplicationError::Conflict
+            } else {
+                ConnectorControlApplicationError::Unavailable
+            }
+        })?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        Ok(())
+    }
+
+    async fn complete_agent_provisioning_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        installed: ParsedAgentProvisioningInstalled,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        self.resolve_agent_provisioning_operation(
+            peer,
+            ProvisioningResolution::Installed(installed),
+        )
+        .await
+    }
+
+    async fn reject_agent_provisioning_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        rejected: ParsedAgentProvisioningRejected,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        self.resolve_agent_provisioning_operation(peer, ProvisioningResolution::Rejected(rejected))
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn resolve_agent_provisioning_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        resolution: ProvisioningResolution,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        let fence = resolution.fence();
+        ensure_peer_fence(peer, fence)?;
+        let now = self.now()?;
+        let mut session = self
+            .store
+            .begin_tenant(fence.tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let connector = self
+            .load_authorized_connector(session.connection(), peer, fence, now)
+            .await?;
+        let resolved_fence = resolve_fence(&connector, fence)?;
+        connector
+            .validate_fence(&resolved_fence, now)
+            .map_err(|_| ConnectorControlApplicationError::StaleFence)?;
+        let row = sqlx::query(
+            "SELECT delivery_id, installation_id, recipient_id, binding_id, agent_device_id,
+                    recipient_key_id, provisioning_revision, command_sequence,
+                    command_payload_digest, encoded_command_digest, capsule_digest,
+                    state, result_digest, rejection_code, resolved_at_ms
+               FROM agent.agent_provisioning_deliveries
+              WHERE tenant_id=$1 AND delivery_id=$2 AND connector_id=$3
+              FOR UPDATE",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(resolution.delivery_id()))
+        .bind(Uuid::from(fence.connector_id))
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?
+        .ok_or(ConnectorControlApplicationError::NotFound)?;
+        let installation_id = InstallationId::try_from(
+            row.try_get::<Uuid, _>("installation_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let binding_id = BindingId::try_from(
+            row.try_get::<Uuid, _>("binding_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let agent_device_id = AgentDeviceId::try_from(
+            row.try_get::<Uuid, _>("agent_device_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let delivery_id = ProvisioningDeliveryId::try_from(
+            row.try_get::<Uuid, _>("delivery_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let recipient_key_id = ProvisioningRecipientKeyId::try_from(
+            row.try_get::<Uuid, _>("recipient_key_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let provisioning_revision = positive_revision(
+            row.try_get("provisioning_revision")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )?;
+        let command_sequence = u64::try_from(
+            row.try_get::<i64, _>("command_sequence")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_payload = digest_vec(&row, "command_payload_digest")?;
+        let stored_encoded = digest_vec(&row, "encoded_command_digest")?;
+        let stored_capsule = digest_vec(&row, "capsule_digest")?;
+        if command_sequence != resolution.command_sequence()
+            || stored_payload != resolution.command_payload_digest()
+            || stored_encoded != resolution.encoded_command_digest()
+            || stored_capsule != resolution.capsule_digest()
+            || recipient_key_id.to_string() != resolution.recipient_key_id().to_string()
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let target = CommandLogRepository::new()
+            .command_by_sequence(
+                session.connection(),
+                fence.tenant_id,
+                fence.connector_id,
+                command_sequence,
+            )
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::StaleFence)?;
+        let decoded = self.decode_persisted_command(&target)?;
+        let ServerCommandPayload::DeliverAgentProvisioning(delivery_command) = decoded.payload()
+        else {
+            return Err(ConnectorControlApplicationError::Conflict);
+        };
+        if delivery_command.delivery_id() != delivery_id
+            || delivery_command.installation_id() != installation_id
+            || delivery_command.binding_id() != binding_id
+            || delivery_command.agent_device_id() != agent_device_id
+            || delivery_command.recipient_key_id() != recipient_key_id
+            || delivery_command.provisioning_revision() != provisioning_revision
+            || delivery_command.capsule_digest() != stored_capsule
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        resolution.validate_digests(ProvisioningDurableFacts {
+            tenant_id: fence.tenant_id,
+            installation_id,
+            binding_id,
+            agent_device_id,
+            delivery_id,
+            recipient_key_id,
+            provisioning_revision,
+            capsule_digest: stored_capsule,
+        })?;
+        let state: String = row
+            .try_get("state")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        if matches!(state.as_str(), "installed" | "rejected") {
+            if state != resolution.state()
+                || row
+                    .try_get::<Option<Vec<u8>>, _>("result_digest")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    != Some(resolution.result_digest().as_bytes().as_slice())
+                || row
+                    .try_get::<Option<String>, _>("rejection_code")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    != resolution.rejection_code()
+                || row
+                    .try_get::<Option<i64>, _>("resolved_at_ms")
+                    .ok()
+                    .flatten()
+                    != Some(resolution.resolved_at_millis())
+            {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+            session
+                .commit()
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            return Ok(());
+        }
+        if !matches!(state.as_str(), "pending" | "dispatched") {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        CommandLogRepository::new()
+            .acknowledge_command(
+                session.connection(),
+                fence.tenant_id,
+                fence.connector_id,
+                fence.connector_generation,
+                command_sequence,
+                stored_payload,
+                stored_encoded,
+                now,
+            )
+            .await
+            .map_err(persistence_error)?;
+        sqlx::query(
+            "UPDATE agent.agent_provisioning_deliveries
+                SET state=$3, result_digest=$4, rejection_code=$5, resolved_at_ms=$6
+              WHERE tenant_id=$1 AND delivery_id=$2",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(delivery_id))
+        .bind(resolution.state())
+        .bind(resolution.result_digest().as_bytes().as_slice())
+        .bind(resolution.rejection_code())
+        .bind(resolution.resolved_at_millis())
+        .execute(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        sqlx::query(
+            "UPDATE agent.agent_provisioning_recipients SET state='claimed'
+              WHERE tenant_id=$1 AND recipient_id=$2 AND claimed_delivery_id=$3",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(recipient_key_id))
+        .bind(Uuid::from(delivery_id))
+        .execute(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ProvisioningResolution {
+    Installed(ParsedAgentProvisioningInstalled),
+    Rejected(ParsedAgentProvisioningRejected),
+}
+
+#[derive(Clone, Copy)]
+struct ProvisioningDurableFacts {
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_device_id: AgentDeviceId,
+    delivery_id: ProvisioningDeliveryId,
+    recipient_key_id: ProvisioningRecipientKeyId,
+    provisioning_revision: Revision,
+    capsule_digest: Sha256Digest,
+}
+
+impl ProvisioningResolution {
+    fn fence(&self) -> ParsedLeaseFence {
+        match self {
+            Self::Installed(v) => v.connector_fence,
+            Self::Rejected(v) => v.connector_fence,
+        }
+    }
+    fn delivery_id(&self) -> RequestId {
+        match self {
+            Self::Installed(v) => v.delivery_id,
+            Self::Rejected(v) => v.delivery_id,
+        }
+    }
+    fn command_sequence(&self) -> u64 {
+        match self {
+            Self::Installed(v) => v.command_sequence,
+            Self::Rejected(v) => v.command_sequence,
+        }
+    }
+    fn command_payload_digest(&self) -> Sha256Digest {
+        match self {
+            Self::Installed(v) => v.command_payload_digest,
+            Self::Rejected(v) => v.command_payload_digest,
+        }
+    }
+    fn encoded_command_digest(&self) -> Sha256Digest {
+        match self {
+            Self::Installed(v) => v.encoded_command_digest,
+            Self::Rejected(v) => v.encoded_command_digest,
+        }
+    }
+    fn recipient_key_id(&self) -> RequestId {
+        match self {
+            Self::Installed(v) => v.recipient_key_id,
+            Self::Rejected(v) => v.recipient_key_id,
+        }
+    }
+    fn capsule_digest(&self) -> Sha256Digest {
+        match self {
+            Self::Installed(v) => v.capsule_digest,
+            Self::Rejected(v) => v.capsule_digest,
+        }
+    }
+    fn result_digest(&self) -> Sha256Digest {
+        match self {
+            Self::Installed(v) => v.result_digest,
+            Self::Rejected(v) => v.result_digest,
+        }
+    }
+    fn resolved_at_millis(&self) -> i64 {
+        match self {
+            Self::Installed(v) => v.installed_at_millis,
+            Self::Rejected(v) => v.rejected_at_millis,
+        }
+    }
+    fn state(&self) -> &'static str {
+        match self {
+            Self::Installed(_) => "installed",
+            Self::Rejected(_) => "rejected",
+        }
+    }
+    fn rejection_code(&self) -> Option<&str> {
+        match self {
+            Self::Installed(_) => None,
+            Self::Rejected(v) => Some(&v.stable_error_code),
+        }
+    }
+
+    fn validate_digests(
+        &self,
+        facts: ProvisioningDurableFacts,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        let timestamp = u64::try_from(self.resolved_at_millis())
+            .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?
+            .to_be_bytes();
+        let expected_result = match self {
+            Self::Installed(value) => {
+                let receipt = installed_receipt_digest(facts)?;
+                if receipt.as_bytes() != value.installation_receipt_digest.as_bytes() {
+                    return Err(ConnectorControlApplicationError::Conflict);
+                }
+                provisioning_commit(
+                    b"dirextalk.agent-provisioning-installed.v1",
+                    &[
+                        Uuid::from(facts.delivery_id).as_bytes(),
+                        Uuid::from(facts.recipient_key_id).as_bytes(),
+                        &facts.capsule_digest.as_bytes(),
+                        &value.installation_receipt_digest.as_bytes(),
+                        &timestamp,
+                    ],
+                )
+            }
+            Self::Rejected(value) => provisioning_commit(
+                b"dirextalk.agent-provisioning-rejected.v1",
+                &[
+                    Uuid::from(facts.delivery_id).as_bytes(),
+                    Uuid::from(facts.recipient_key_id).as_bytes(),
+                    &facts.capsule_digest.as_bytes(),
+                    value.stable_error_code.as_bytes(),
+                    &timestamp,
+                ],
+            ),
+        };
+        if expected_result != self.result_digest() {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        Ok(())
+    }
+}
+
+fn installed_receipt_digest(
+    facts: ProvisioningDurableFacts,
+) -> Result<Sha256Digest, ConnectorControlApplicationError> {
+    let value = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(facts.tenant_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(facts.installation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(facts.binding_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(facts.agent_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Text(facts.delivery_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Text(facts.recipient_key_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Unsigned(facts.provisioning_revision.get()),
+        ),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Bytes(facts.capsule_digest.as_bytes().to_vec()),
+        ),
+    ]);
+    let bytes = encode_deterministic_cbor(&value)
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+    Ok(Sha256Digest::from_bytes(
+        *WireSha256Digest::hash_domain(
+            b"dirextalk.agent-provisioning-installed-receipt.v1\0",
+            &bytes,
+        )
+        .as_bytes(),
+    ))
+}
+
+fn digest_vec(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<Sha256Digest, ConnectorControlApplicationError> {
+    let bytes: [u8; 32] = row
+        .try_get::<Vec<u8>, _>(field)
+        .map_err(|_| ConnectorControlApplicationError::Internal)?
+        .try_into()
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+    Ok(Sha256Digest::from_bytes(bytes))
+}
+
+fn positive_revision(value: i64) -> Result<Revision, ConnectorControlApplicationError> {
+    u64::try_from(value)
+        .ok()
+        .and_then(|value| Revision::new(value).ok())
+        .ok_or(ConnectorControlApplicationError::Internal)
+}
+
 impl fmt::Debug for PostgresConnectorControlApplication {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -3192,6 +3839,92 @@ impl ConnectorControlApplication for PostgresConnectorControlApplication {
             },
         ))
     }
+
+    fn announce_provisioning_recipient(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        announcement: ParsedProvisioningRecipientAnnouncement,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.announce_provisioning_recipient_operation(peer, announcement))
+    }
+
+    fn complete_agent_provisioning(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        installed: ParsedAgentProvisioningInstalled,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.complete_agent_provisioning_operation(peer, installed))
+    }
+
+    fn reject_agent_provisioning(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        rejected: ParsedAgentProvisioningRejected,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.reject_agent_provisioning_operation(peer, rejected))
+    }
+}
+
+fn provisioning_recipient_descriptor_digest(
+    announcement: &ParsedProvisioningRecipientAnnouncement,
+) -> Sha256Digest {
+    let revision = announcement.provisioning_revision.to_be_bytes();
+    let created = u64::try_from(announcement.created_at_millis)
+        .unwrap_or_default()
+        .to_be_bytes();
+    let expires = u64::try_from(announcement.expires_at_millis)
+        .unwrap_or_default()
+        .to_be_bytes();
+    let generation = announcement
+        .connector_fence
+        .connector_generation
+        .to_be_bytes();
+    provisioning_commit(
+        b"dirextalk.agent-provisioning-recipient.v1",
+        &[
+            Uuid::from(announcement.connector_fence.tenant_id).as_bytes(),
+            Uuid::from(announcement.connector_fence.connector_id).as_bytes(),
+            Uuid::from(announcement.binding_id).as_bytes(),
+            Uuid::from(announcement.installation_id).as_bytes(),
+            Uuid::from(announcement.agent_device_id).as_bytes(),
+            &revision,
+            Uuid::from(announcement.recipient_key_id).as_bytes(),
+            &announcement.recipient_public_key,
+            &created,
+            &expires,
+            Uuid::from(announcement.credential_id).as_bytes(),
+            &generation,
+        ],
+    )
+}
+
+fn provisioning_recipient_signature_input(digest: Sha256Digest) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + 55 + 8 + 32);
+    push_lp(
+        &mut bytes,
+        b"dirextalk.agent-provisioning-recipient-signature.v1",
+    );
+    push_lp(&mut bytes, &digest.as_bytes());
+    bytes
+}
+
+fn provisioning_commit(domain: &[u8], parts: &[&[u8]]) -> Sha256Digest {
+    let mut hasher = Sha256::new();
+    push_lp_hasher(&mut hasher, domain);
+    for part in parts {
+        push_lp_hasher(&mut hasher, part);
+    }
+    Sha256Digest::from_bytes(hasher.finalize().into())
+}
+
+fn push_lp_hasher(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn push_lp(output: &mut Vec<u8>, value: &[u8]) {
+    output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    output.extend_from_slice(value);
 }
 
 fn parsed_connector_fence(fence: ConnectorFence) -> ParsedLeaseFence {

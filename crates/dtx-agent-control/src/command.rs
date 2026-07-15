@@ -1,7 +1,10 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use dtx_connect_registry::ConnectorDesiredState;
-use dtx_domain::{ConnectorId, RequestId, Revision, TenantId};
+use dtx_domain::{
+    AgentDeviceId, ApprovalId, BindingId, ConnectorId, InstallationId, ProvisioningDeliveryId,
+    ProvisioningRecipientKeyId, RequestId, Revision, TenantId,
+};
 
 use crate::{Sha256Digest, digest::domain_digest};
 
@@ -17,6 +20,7 @@ pub const MAX_CONFIG_KEY_BYTES: usize = 64;
 pub const MAX_CONFIG_VALUE_BYTES: usize = 1_024;
 pub const MAX_CLOSE_STREAM_CODE_BYTES: usize = 64;
 pub const MAX_CLOSE_STREAM_DETAIL_BYTES: usize = 512;
+pub const MAX_PROVISIONING_CAPSULE_BYTES: usize = 196_608;
 
 /// Exact immutable wire bytes used for byte-for-byte replay.
 #[derive(Clone, Eq, PartialEq)]
@@ -311,12 +315,138 @@ impl CloseStreamCommand {
     }
 }
 
+/// Opaque, owner-authorized Agent provisioning capsule delivered to one exact Connector.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DeliverAgentProvisioningCommand {
+    delivery_id: ProvisioningDeliveryId,
+    approval_id: ApprovalId,
+    binding_id: BindingId,
+    installation_id: InstallationId,
+    agent_device_id: AgentDeviceId,
+    provisioning_revision: Revision,
+    recipient_key_id: ProvisioningRecipientKeyId,
+    recipient_descriptor_digest: Sha256Digest,
+    capsule_digest: Sha256Digest,
+    sealed_capsule: Vec<u8>,
+    expires_at_millis: i64,
+}
+
+impl fmt::Debug for DeliverAgentProvisioningCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeliverAgentProvisioningCommand")
+            .field("delivery_id", &self.delivery_id)
+            .field("approval_id", &self.approval_id)
+            .field("binding_id", &self.binding_id)
+            .field("installation_id", &self.installation_id)
+            .field("agent_device_id", &self.agent_device_id)
+            .field("provisioning_revision", &self.provisioning_revision)
+            .field("recipient_key_id", &self.recipient_key_id)
+            .field(
+                "recipient_descriptor_digest",
+                &self.recipient_descriptor_digest,
+            )
+            .field("capsule_digest", &self.capsule_digest)
+            .field("sealed_capsule", &"[REDACTED]")
+            .field("expires_at_millis", &self.expires_at_millis)
+            .finish()
+    }
+}
+
+impl DeliverAgentProvisioningCommand {
+    /// Creates one bounded opaque provisioning delivery.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/oversized capsules and non-positive expiry timestamps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        delivery_id: ProvisioningDeliveryId,
+        approval_id: ApprovalId,
+        binding_id: BindingId,
+        installation_id: InstallationId,
+        agent_device_id: AgentDeviceId,
+        provisioning_revision: Revision,
+        recipient_key_id: ProvisioningRecipientKeyId,
+        recipient_descriptor_digest: Sha256Digest,
+        capsule_digest: Sha256Digest,
+        sealed_capsule: Vec<u8>,
+        expires_at_millis: i64,
+    ) -> Result<Self, CommandError> {
+        if sealed_capsule.is_empty()
+            || sealed_capsule.len() > MAX_PROVISIONING_CAPSULE_BYTES
+            || expires_at_millis <= 0
+        {
+            return Err(CommandError::InvalidCommandPayload);
+        }
+        Ok(Self {
+            delivery_id,
+            approval_id,
+            binding_id,
+            installation_id,
+            agent_device_id,
+            provisioning_revision,
+            recipient_key_id,
+            recipient_descriptor_digest,
+            capsule_digest,
+            sealed_capsule,
+            expires_at_millis,
+        })
+    }
+
+    #[must_use]
+    pub const fn delivery_id(&self) -> ProvisioningDeliveryId {
+        self.delivery_id
+    }
+    #[must_use]
+    pub const fn approval_id(&self) -> ApprovalId {
+        self.approval_id
+    }
+    #[must_use]
+    pub const fn binding_id(&self) -> BindingId {
+        self.binding_id
+    }
+    #[must_use]
+    pub const fn installation_id(&self) -> InstallationId {
+        self.installation_id
+    }
+    #[must_use]
+    pub const fn agent_device_id(&self) -> AgentDeviceId {
+        self.agent_device_id
+    }
+    #[must_use]
+    pub const fn provisioning_revision(&self) -> Revision {
+        self.provisioning_revision
+    }
+    #[must_use]
+    pub const fn recipient_key_id(&self) -> ProvisioningRecipientKeyId {
+        self.recipient_key_id
+    }
+    #[must_use]
+    pub const fn recipient_descriptor_digest(&self) -> Sha256Digest {
+        self.recipient_descriptor_digest
+    }
+    #[must_use]
+    pub const fn capsule_digest(&self) -> Sha256Digest {
+        self.capsule_digest
+    }
+    #[must_use]
+    pub fn sealed_capsule(&self) -> &[u8] {
+        &self.sealed_capsule
+    }
+    #[must_use]
+    pub const fn expires_at_millis(&self) -> i64 {
+        self.expires_at_millis
+    }
+}
+
 /// Closed set of durable `MC2b` server commands.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServerCommandPayload {
     ApplyConfig(ApplyConfigCommand),
     RotateCredential(RotateCredentialCommand),
     CloseStream(CloseStreamCommand),
+    DeliverAgentProvisioning(DeliverAgentProvisioningCommand),
 }
 
 /// One append-only, exactly replayable server command.
@@ -1089,6 +1219,14 @@ fn validate_payload(
             if !valid_upper_snake_code(&command.stable_code, MAX_CLOSE_STREAM_CODE_BYTES)
                 || command.redacted_detail.len() > MAX_CLOSE_STREAM_DETAIL_BYTES
                 || contains_c0_c1_control(&command.redacted_detail)
+            {
+                return Err(CommandError::InvalidCommandPayload);
+            }
+        }
+        ServerCommandPayload::DeliverAgentProvisioning(command) => {
+            if command.sealed_capsule.is_empty()
+                || command.sealed_capsule.len() > MAX_PROVISIONING_CAPSULE_BYTES
+                || command.expires_at_millis <= 0
             {
                 return Err(CommandError::InvalidCommandPayload);
             }

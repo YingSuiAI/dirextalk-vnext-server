@@ -375,6 +375,7 @@ async fn drive_control(
     let protocol_minor = opened.protocol_minor;
     let router_enabled = protocol_minor >= 1;
     let execution_reporting_enabled = protocol_minor >= 2;
+    let agent_provisioning_enabled = protocol_minor >= 3;
     // Subscribe before the final durable suffix query. This ordering closes the
     // commit-between-replay-and-wait race while allowing lossy/coalesced hints.
     let mut command_notifications =
@@ -644,6 +645,33 @@ async fn drive_control(
                                 }
                                 Err(error) => Err(error),
                             }
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::ProvisioningRecipientAnnouncement(announcement) => {
+                        if agent_provisioning_enabled {
+                            application
+                                .announce_provisioning_recipient(peer, announcement)
+                                .await
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::AgentProvisioningInstalled(installed) => {
+                        if agent_provisioning_enabled {
+                            application
+                                .complete_agent_provisioning(peer, installed)
+                                .await
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::AgentProvisioningRejected(rejected) => {
+                        if agent_provisioning_enabled {
+                            application
+                                .reject_agent_provisioning(peer, rejected)
+                                .await
                         } else {
                             Err(ConnectorControlApplicationError::PermissionDenied)
                         }

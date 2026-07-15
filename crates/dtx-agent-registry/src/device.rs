@@ -1,6 +1,6 @@
 use std::{error::Error, fmt};
 
-use dtx_domain::{AgentDeviceId, InstallationId, Revision, TenantId};
+use dtx_domain::{AgentDeviceId, DeviceId, InstallationId, Revision, TenantId};
 
 use crate::{AgentInstallation, InstallationDesiredState};
 
@@ -54,6 +54,7 @@ pub struct AgentDevice {
     tenant_id: TenantId,
     installation_id: InstallationId,
     device_id: AgentDeviceId,
+    identity_device_id: DeviceId,
     credential_fingerprint: DeviceCredentialFingerprint,
     state: AgentDeviceState,
     revision: Revision,
@@ -65,6 +66,7 @@ pub struct AgentDeviceSnapshot {
     pub tenant_id: TenantId,
     pub installation_id: InstallationId,
     pub agent_device_id: AgentDeviceId,
+    pub identity_device_id: DeviceId,
     pub credential_fingerprint: DeviceCredentialFingerprint,
     pub state: AgentDeviceState,
     pub revision: Revision,
@@ -79,6 +81,7 @@ impl AgentDevice {
     pub fn enroll(
         installation: &AgentInstallation,
         agent_device_id: AgentDeviceId,
+        identity_device_id: DeviceId,
         credential_fingerprint: DeviceCredentialFingerprint,
     ) -> Result<Self, AgentDeviceError> {
         if installation.desired_state() != InstallationDesiredState::Enabled {
@@ -88,6 +91,7 @@ impl AgentDevice {
             tenant_id: installation.tenant_id(),
             installation_id: installation.installation_id(),
             device_id: agent_device_id,
+            identity_device_id,
             credential_fingerprint,
             state: AgentDeviceState::Provisioning,
             revision: Revision::INITIAL,
@@ -101,6 +105,7 @@ impl AgentDevice {
             tenant_id: self.tenant_id,
             installation_id: self.installation_id,
             agent_device_id: self.device_id,
+            identity_device_id: self.identity_device_id,
             credential_fingerprint: self.credential_fingerprint,
             state: self.state,
             revision: self.revision,
@@ -127,6 +132,7 @@ impl AgentDevice {
             tenant_id: snapshot.tenant_id,
             installation_id: snapshot.installation_id,
             device_id: snapshot.agent_device_id,
+            identity_device_id: snapshot.identity_device_id,
             credential_fingerprint: snapshot.credential_fingerprint,
             state: snapshot.state,
             revision: snapshot.revision,
@@ -149,6 +155,12 @@ impl AgentDevice {
     #[must_use]
     pub const fn agent_device_id(&self) -> AgentDeviceId {
         self.device_id
+    }
+
+    /// Returns the immutable identity-log device represented by this Agent Device.
+    #[must_use]
+    pub const fn identity_device_id(&self) -> DeviceId {
+        self.identity_device_id
     }
 
     /// Returns the current credential lifecycle state.

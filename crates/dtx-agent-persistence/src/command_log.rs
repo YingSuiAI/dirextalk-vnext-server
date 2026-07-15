@@ -1524,6 +1524,7 @@ fn command_kind(payload: &ServerCommandPayload) -> &'static str {
         ServerCommandPayload::ApplyConfig(_) => "apply_config",
         ServerCommandPayload::RotateCredential(_) => "rotate_credential",
         ServerCommandPayload::CloseStream(_) => "close_stream",
+        ServerCommandPayload::DeliverAgentProvisioning(_) => "deliver_agent_provisioning",
     }
 }
 

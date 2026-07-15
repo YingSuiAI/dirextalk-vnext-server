@@ -878,7 +878,12 @@ pub(crate) async fn lock_identity(
 /// identity-only transaction. Authentication callers use this exact helper so
 /// a device's active status cannot be read in one transaction and consumed in
 /// a second transaction after a concurrent revoke or recovery restore.
-pub(crate) async fn lock_and_load_active_snapshot(
+/// Locks and reconstructs one active identity log at its exact committed head.
+///
+/// # Errors
+///
+/// Returns a persistence error for a missing, inactive, or corrupt identity log.
+pub async fn lock_and_load_active_snapshot(
     connection: &mut PgConnection,
     identity_id: IdentityId,
 ) -> Result<IdentityLogSnapshot, IdentityPersistenceError> {

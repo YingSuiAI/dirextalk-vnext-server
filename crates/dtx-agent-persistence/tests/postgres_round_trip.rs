@@ -1007,6 +1007,12 @@ async fn persist_definition_and_installation(
         installations.save(connection, &installation, 1_011).await?,
         CurrentWrite::Existing
     );
+    installation.apply(
+        installation.revision(),
+        InstallationCommand::BindAgentIdentity {
+            identity_id: installation.owner_id(),
+        },
+    )?;
     installation.apply(installation.revision(), InstallationCommand::MarkReady)?;
     assert_eq!(
         installations.save(connection, &installation, 1_012).await?,
@@ -1027,6 +1033,7 @@ async fn persist_device(
     let mut device = AgentDevice::enroll(
         installation,
         AgentDeviceId::new(),
+        dtx_domain::DeviceId::new(),
         DeviceCredentialFingerprint::from_bytes([21; 32]),
     )?;
     let devices = AgentDeviceRepository::new();
@@ -1638,6 +1645,7 @@ async fn persist_binding_race_entity(
     let mut device = AgentDevice::enroll(
         &installation,
         AgentDeviceId::new(),
+        dtx_domain::DeviceId::new(),
         DeviceCredentialFingerprint::from_bytes([fingerprint_byte; 32]),
     )?;
     assert_eq!(

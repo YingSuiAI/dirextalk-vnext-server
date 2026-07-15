@@ -234,6 +234,50 @@ pub struct ParsedRunFailed {
     pub evidence: Option<(ArtifactId, Sha256Digest)>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedProvisioningRecipientAnnouncement {
+    pub connector_fence: ParsedLeaseFence,
+    pub binding_id: BindingId,
+    pub installation_id: InstallationId,
+    pub agent_device_id: dtx_domain::AgentDeviceId,
+    pub provisioning_revision: u64,
+    pub recipient_key_id: RequestId,
+    pub recipient_public_key: [u8; 32],
+    pub credential_id: ConnectorCredentialId,
+    pub created_at_millis: i64,
+    pub expires_at_millis: i64,
+    pub descriptor_digest: Sha256Digest,
+    pub recipient_signature: [u8; 64],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedAgentProvisioningInstalled {
+    pub connector_fence: ParsedLeaseFence,
+    pub delivery_id: RequestId,
+    pub command_sequence: u64,
+    pub command_payload_digest: Sha256Digest,
+    pub encoded_command_digest: Sha256Digest,
+    pub recipient_key_id: RequestId,
+    pub capsule_digest: Sha256Digest,
+    pub installation_receipt_digest: Sha256Digest,
+    pub installed_at_millis: i64,
+    pub result_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedAgentProvisioningRejected {
+    pub connector_fence: ParsedLeaseFence,
+    pub delivery_id: RequestId,
+    pub command_sequence: u64,
+    pub command_payload_digest: Sha256Digest,
+    pub encoded_command_digest: Sha256Digest,
+    pub recipient_key_id: RequestId,
+    pub capsule_digest: Sha256Digest,
+    pub stable_error_code: String,
+    pub rejected_at_millis: i64,
+    pub result_digest: Sha256Digest,
+}
+
 /// Validated first control-stream frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedHello {
@@ -364,6 +408,9 @@ pub enum ParsedClientFrame {
     RunOutput(ParsedRunOutput),
     RunCompleted(ParsedRunCompleted),
     RunFailed(ParsedRunFailed),
+    ProvisioningRecipientAnnouncement(ParsedProvisioningRecipientAnnouncement),
+    AgentProvisioningInstalled(ParsedAgentProvisioningInstalled),
+    AgentProvisioningRejected(ParsedAgentProvisioningRejected),
 }
 
 /// Converts an enrollment protobuf message into proof-bound domain input.
@@ -904,7 +951,96 @@ pub fn parse_client_frame(value: v1::ClientFrame) -> Result<ParsedClientFrame, W
             parse_run_completed(frame).map(ParsedClientFrame::RunCompleted)
         }
         Kind::RunFailed(frame) => parse_run_failed(frame).map(ParsedClientFrame::RunFailed),
+        Kind::ProvisioningRecipientAnnouncement(frame) => parse_provisioning_recipient(frame)
+            .map(ParsedClientFrame::ProvisioningRecipientAnnouncement),
+        Kind::AgentProvisioningInstalled(frame) => {
+            parse_provisioning_installed(frame).map(ParsedClientFrame::AgentProvisioningInstalled)
+        }
+        Kind::AgentProvisioningRejected(frame) => {
+            parse_provisioning_rejected(frame).map(ParsedClientFrame::AgentProvisioningRejected)
+        }
     }
+}
+
+fn parse_provisioning_recipient(
+    value: v1::ProvisioningRecipientAnnouncement,
+) -> Result<ParsedProvisioningRecipientAnnouncement, WireError> {
+    let created_at_millis = parse_wire_timestamp(value.created_at_millis, "created_at_millis")?;
+    let expires_at_millis = parse_wire_timestamp(value.expires_at_millis, "expires_at_millis")?;
+    if expires_at_millis <= created_at_millis
+        || expires_at_millis.saturating_sub(created_at_millis) > 600_000
+    {
+        return Err(invalid_value("expires_at_millis"));
+    }
+    Ok(ParsedProvisioningRecipientAnnouncement {
+        connector_fence: parse_required_lease_fence(value.connector_fence)?,
+        binding_id: parse_id(&value.binding_id, "binding_id")?,
+        installation_id: parse_id(&value.installation_id, "installation_id")?,
+        agent_device_id: parse_id(&value.agent_device_id, "agent_device_id")?,
+        provisioning_revision: positive_safe(value.provisioning_revision, "provisioning_revision")?,
+        recipient_key_id: parse_id(&value.recipient_key_id, "recipient_key_id")?,
+        recipient_public_key: exact_array(value.recipient_public_key, "recipient_public_key")?,
+        credential_id: parse_id(&value.credential_id, "credential_id")?,
+        created_at_millis,
+        expires_at_millis,
+        descriptor_digest: parse_digest(value.descriptor_digest, "descriptor_digest")?,
+        recipient_signature: exact_array(value.recipient_signature, "recipient_signature")?,
+    })
+}
+
+fn parse_provisioning_installed(
+    value: v1::AgentProvisioningInstalled,
+) -> Result<ParsedAgentProvisioningInstalled, WireError> {
+    Ok(ParsedAgentProvisioningInstalled {
+        connector_fence: parse_required_lease_fence(value.connector_fence)?,
+        delivery_id: parse_id(&value.delivery_id, "delivery_id")?,
+        command_sequence: positive_safe(value.command_sequence, "command_sequence")?,
+        command_payload_digest: parse_digest(
+            value.command_payload_digest,
+            "command_payload_digest",
+        )?,
+        encoded_command_digest: parse_digest(
+            value.encoded_command_digest,
+            "encoded_command_digest",
+        )?,
+        recipient_key_id: parse_id(&value.recipient_key_id, "recipient_key_id")?,
+        capsule_digest: parse_digest(value.capsule_digest, "capsule_digest")?,
+        installation_receipt_digest: parse_digest(
+            value.installation_receipt_digest,
+            "installation_receipt_digest",
+        )?,
+        installed_at_millis: parse_wire_timestamp(
+            value.installed_at_millis,
+            "installed_at_millis",
+        )?,
+        result_digest: parse_digest(value.result_digest, "result_digest")?,
+    })
+}
+
+fn parse_provisioning_rejected(
+    value: v1::AgentProvisioningRejected,
+) -> Result<ParsedAgentProvisioningRejected, WireError> {
+    if !valid_upper_stable_code(&value.stable_error_code) {
+        return Err(invalid_value("stable_error_code"));
+    }
+    Ok(ParsedAgentProvisioningRejected {
+        connector_fence: parse_required_lease_fence(value.connector_fence)?,
+        delivery_id: parse_id(&value.delivery_id, "delivery_id")?,
+        command_sequence: positive_safe(value.command_sequence, "command_sequence")?,
+        command_payload_digest: parse_digest(
+            value.command_payload_digest,
+            "command_payload_digest",
+        )?,
+        encoded_command_digest: parse_digest(
+            value.encoded_command_digest,
+            "encoded_command_digest",
+        )?,
+        recipient_key_id: parse_id(&value.recipient_key_id, "recipient_key_id")?,
+        capsule_digest: parse_digest(value.capsule_digest, "capsule_digest")?,
+        stable_error_code: value.stable_error_code,
+        rejected_at_millis: parse_wire_timestamp(value.rejected_at_millis, "rejected_at_millis")?,
+        result_digest: parse_digest(value.result_digest, "result_digest")?,
+    })
 }
 
 /// Projects public domain credential facts onto their protobuf representation.
@@ -1106,6 +1242,13 @@ fn parse_lease_fence(value: &v1::LeaseFence) -> Result<ParsedLeaseFence, WireErr
         lease_id: parse_id(&value.lease_id, "fence.lease_id")?,
         lease_epoch: positive_safe(value.lease_epoch, "fence.lease_epoch")?,
     })
+}
+
+fn parse_required_lease_fence(
+    value: Option<v1::LeaseFence>,
+) -> Result<ParsedLeaseFence, WireError> {
+    let value = required(value, "connector_fence")?;
+    parse_lease_fence(&value)
 }
 
 fn build_parsed_lease_fence(value: ParsedLeaseFence) -> Result<v1::LeaseFence, WireError> {

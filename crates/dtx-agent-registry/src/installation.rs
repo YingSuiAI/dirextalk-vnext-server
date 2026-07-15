@@ -40,6 +40,11 @@ pub enum InstallationObservedState {
 /// One authorized installation state transition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallationCommand {
+    /// Permanently binds the isolated Agent identity approved by the owner.
+    BindAgentIdentity {
+        /// Verified identity-log subject for this installation.
+        identity_id: IdentityId,
+    },
     /// Reconciler observed a conforming ready route.
     MarkReady,
     /// Reconciler observed impaired health.
@@ -73,6 +78,7 @@ pub struct AgentInstallation {
     installation_id: InstallationId,
     agent_id: AgentId,
     owner_id: IdentityId,
+    agent_identity_id: Option<IdentityId>,
     execution_mode: ExecutionMode,
     descriptor_version: Revision,
     descriptor_hash: DescriptorDigest,
@@ -89,6 +95,7 @@ pub struct AgentInstallationSnapshot {
     pub installation_id: InstallationId,
     pub agent_id: AgentId,
     pub owner_id: IdentityId,
+    pub agent_identity_id: Option<IdentityId>,
     pub execution_mode: ExecutionMode,
     pub descriptor_version: Revision,
     pub descriptor_hash: DescriptorDigest,
@@ -115,6 +122,7 @@ impl AgentInstallation {
             installation_id,
             agent_id,
             owner_id,
+            agent_identity_id: None,
             execution_mode,
             descriptor_version,
             descriptor_hash,
@@ -133,6 +141,7 @@ impl AgentInstallation {
             installation_id: self.installation_id,
             agent_id: self.agent_id,
             owner_id: self.owner_id,
+            agent_identity_id: self.agent_identity_id,
             execution_mode: self.execution_mode,
             descriptor_version: self.descriptor_version,
             descriptor_hash: self.descriptor_hash,
@@ -152,7 +161,8 @@ impl AgentInstallation {
         snapshot: AgentInstallationSnapshot,
     ) -> Result<Self, AgentInstallationSnapshotError> {
         if snapshot.revision.get() == Revision::INITIAL.get()
-            && (snapshot.policy_revision.get() != Revision::INITIAL.get()
+            && (snapshot.agent_identity_id.is_some()
+                || snapshot.policy_revision.get() != Revision::INITIAL.get()
                 || !matches!(snapshot.desired_state, InstallationDesiredState::Enabled)
                 || !matches!(
                     snapshot.observed_state,
@@ -166,6 +176,7 @@ impl AgentInstallation {
             installation_id: snapshot.installation_id,
             agent_id: snapshot.agent_id,
             owner_id: snapshot.owner_id,
+            agent_identity_id: snapshot.agent_identity_id,
             execution_mode: snapshot.execution_mode,
             descriptor_version: snapshot.descriptor_version,
             descriptor_hash: snapshot.descriptor_hash,
@@ -198,6 +209,12 @@ impl AgentInstallation {
     #[must_use]
     pub const fn owner_id(&self) -> IdentityId {
         self.owner_id
+    }
+
+    /// Returns the permanently approved isolated Agent identity, if bound.
+    #[must_use]
+    pub const fn agent_identity_id(&self) -> Option<IdentityId> {
+        self.agent_identity_id
     }
 
     /// Returns the immutable execution trust domain.
@@ -248,6 +265,7 @@ impl AgentInstallation {
     ///
     /// Rejects stale revisions, invalid state transitions, descriptor downgrade
     /// or equivocation, and every transition out of revoked state.
+    #[allow(clippy::too_many_lines)]
     pub fn apply(
         &mut self,
         expected_revision: Revision,
@@ -268,10 +286,20 @@ impl AgentInstallation {
         let mut descriptor_version = self.descriptor_version;
         let mut descriptor_hash = self.descriptor_hash;
         let mut policy_revision = self.policy_revision;
+        let mut agent_identity_id = self.agent_identity_id;
 
         match command {
+            InstallationCommand::BindAgentIdentity { identity_id }
+                if agent_identity_id.is_none() =>
+            {
+                agent_identity_id = Some(identity_id);
+            }
+            InstallationCommand::BindAgentIdentity { .. } => {
+                return Err(InstallationError::AgentIdentityAlreadyBound);
+            }
             InstallationCommand::MarkReady
                 if desired == InstallationDesiredState::Enabled
+                    && agent_identity_id.is_some()
                     && matches!(
                         observed,
                         InstallationObservedState::Installing | InstallationObservedState::Degraded
@@ -327,6 +355,9 @@ impl AgentInstallation {
             InstallationCommand::Revoke => {
                 desired = InstallationDesiredState::Revoked;
             }
+            InstallationCommand::MarkReady if agent_identity_id.is_none() => {
+                return Err(InstallationError::AgentIdentityRequired);
+            }
             InstallationCommand::MarkReady
             | InstallationCommand::MarkDegraded
             | InstallationCommand::RequireUpgrade
@@ -345,6 +376,7 @@ impl AgentInstallation {
         self.descriptor_version = descriptor_version;
         self.descriptor_hash = descriptor_hash;
         self.policy_revision = policy_revision;
+        self.agent_identity_id = agent_identity_id;
         self.revision = next_revision;
         Ok(next_revision)
     }
@@ -353,6 +385,10 @@ impl AgentInstallation {
 /// Stable installation transition rejection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstallationError {
+    /// Readiness is impossible before owner approval binds the Agent identity.
+    AgentIdentityRequired,
+    /// An installation identity is immutable after its first approval.
+    AgentIdentityAlreadyBound,
     /// The command was based on a stale aggregate revision.
     RevisionConflict {
         /// Current aggregate revision.
@@ -379,6 +415,8 @@ pub enum InstallationError {
 impl fmt::Display for InstallationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::AgentIdentityRequired => "Agent identity approval is required",
+            Self::AgentIdentityAlreadyBound => "Agent identity is already bound",
             Self::RevisionConflict { .. } => "installation revision conflict",
             Self::InvalidTransition => "invalid installation state transition",
             Self::Revoked => "installation is revoked",

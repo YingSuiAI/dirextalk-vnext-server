@@ -25,6 +25,14 @@ fn installation() -> AgentInstallation {
 #[test]
 fn desired_and_observed_transitions_are_separate_and_revocation_is_terminal() {
     let mut installation = installation();
+    installation
+        .apply(
+            Revision::INITIAL,
+            InstallationCommand::BindAgentIdentity {
+                identity_id: IdentityId::from_str(OWNER_ID).unwrap(),
+            },
+        )
+        .unwrap();
     assert_eq!(
         installation.desired_state(),
         InstallationDesiredState::Enabled
@@ -33,25 +41,25 @@ fn desired_and_observed_transitions_are_separate_and_revocation_is_terminal() {
         installation.observed_state(),
         InstallationObservedState::Installing
     );
-    assert_eq!(installation.revision(), Revision::new(1).unwrap());
+    assert_eq!(installation.revision(), Revision::new(2).unwrap());
 
     installation
-        .apply(Revision::new(1).unwrap(), InstallationCommand::MarkReady)
+        .apply(Revision::new(2).unwrap(), InstallationCommand::MarkReady)
         .unwrap();
     installation
-        .apply(Revision::new(2).unwrap(), InstallationCommand::Disable)
+        .apply(Revision::new(3).unwrap(), InstallationCommand::Disable)
         .unwrap();
     assert_eq!(
         installation.desired_state(),
         InstallationDesiredState::Disabled
     );
     assert_eq!(
-        installation.apply(Revision::new(3).unwrap(), InstallationCommand::MarkReady),
+        installation.apply(Revision::new(4).unwrap(), InstallationCommand::MarkReady),
         Err(InstallationError::InvalidTransition)
     );
 
     installation
-        .apply(Revision::new(3).unwrap(), InstallationCommand::Enable)
+        .apply(Revision::new(4).unwrap(), InstallationCommand::Enable)
         .unwrap();
     assert_eq!(
         installation.observed_state(),
@@ -59,13 +67,13 @@ fn desired_and_observed_transitions_are_separate_and_revocation_is_terminal() {
     );
     installation
         .apply(
-            Revision::new(4).unwrap(),
+            Revision::new(5).unwrap(),
             InstallationCommand::RequireUpgrade,
         )
         .unwrap();
     installation
         .apply(
-            Revision::new(5).unwrap(),
+            Revision::new(6).unwrap(),
             InstallationCommand::UpgradeDescriptor {
                 version: Revision::new(2).unwrap(),
                 hash: DescriptorDigest::from_bytes([2; 32]),
@@ -79,15 +87,15 @@ fn desired_and_observed_transitions_are_separate_and_revocation_is_terminal() {
         InstallationObservedState::Installing
     );
     assert_eq!(
-        installation.apply(Revision::new(5).unwrap(), InstallationCommand::MarkReady),
+        installation.apply(Revision::new(6).unwrap(), InstallationCommand::MarkReady),
         Err(InstallationError::RevisionConflict {
-            actual: Revision::new(6).unwrap(),
-            expected: Revision::new(5).unwrap(),
+            actual: Revision::new(7).unwrap(),
+            expected: Revision::new(6).unwrap(),
         })
     );
 
     installation
-        .apply(Revision::new(6).unwrap(), InstallationCommand::Revoke)
+        .apply(Revision::new(7).unwrap(), InstallationCommand::Revoke)
         .unwrap();
     let terminal = installation.clone();
     assert_eq!(
@@ -95,7 +103,7 @@ fn desired_and_observed_transitions_are_separate_and_revocation_is_terminal() {
         InstallationDesiredState::Revoked
     );
     assert_eq!(
-        installation.apply(Revision::new(7).unwrap(), InstallationCommand::Enable),
+        installation.apply(Revision::new(8).unwrap(), InstallationCommand::Enable),
         Err(InstallationError::Revoked)
     );
     assert_eq!(installation, terminal);
@@ -153,4 +161,36 @@ fn policy_revision_advances_monotonically_and_is_independent_of_descriptor_versi
         Err(InstallationError::PolicyRevisionRegressed)
     );
     assert_eq!(installation, unchanged);
+}
+
+#[test]
+fn agent_identity_is_bind_once_and_required_before_ready() {
+    let mut installation = installation();
+    let agent_identity = IdentityId::from_str(OWNER_ID).unwrap();
+
+    assert_eq!(
+        installation.apply(Revision::INITIAL, InstallationCommand::MarkReady),
+        Err(InstallationError::AgentIdentityRequired)
+    );
+    installation
+        .apply(
+            Revision::INITIAL,
+            InstallationCommand::BindAgentIdentity {
+                identity_id: agent_identity,
+            },
+        )
+        .unwrap();
+    assert_eq!(installation.agent_identity_id(), Some(agent_identity));
+    assert_eq!(
+        installation.apply(
+            Revision::new(2).unwrap(),
+            InstallationCommand::BindAgentIdentity {
+                identity_id: agent_identity,
+            },
+        ),
+        Err(InstallationError::AgentIdentityAlreadyBound)
+    );
+    installation
+        .apply(Revision::new(2).unwrap(), InstallationCommand::MarkReady)
+        .unwrap();
 }

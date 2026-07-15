@@ -4,7 +4,9 @@ use dtx_agent_registry::{
     AgentDevice, AgentDeviceCommand, AgentDeviceError, AgentDeviceState, AgentInstallation,
     DescriptorDigest, DeviceCredentialFingerprint, ExecutionMode,
 };
-use dtx_domain::{AgentDeviceId, AgentId, IdentityId, InstallationId, Revision, TenantId};
+use dtx_domain::{
+    AgentDeviceId, AgentId, DeviceId, IdentityId, InstallationId, Revision, TenantId,
+};
 
 const UUID_A: &str = "0190f2a5-7b1c-7abc-8def-0123456789ab";
 const UUID_B: &str = "0190f2a5-7b1c-7abc-8def-0123456789ac";
@@ -32,6 +34,7 @@ fn device_lifecycle_is_bound_to_its_exact_tenant_and_installation() {
     let mut device = AgentDevice::enroll(
         &owner,
         AgentDeviceId::from_str(UUID_A).unwrap(),
+        DeviceId::from_str(UUID_B).unwrap(),
         fingerprint,
     )
     .unwrap();
@@ -88,11 +91,16 @@ fn device_state_retains_only_a_redacted_credential_fingerprint() {
     let device = AgentDevice::enroll(
         &owner,
         AgentDeviceId::from_str(UUID_A).unwrap(),
+        DeviceId::from_str(UUID_B).unwrap(),
         fingerprint,
     )
     .unwrap();
 
     assert!(device.credential_matches(fingerprint));
+    assert_eq!(
+        device.identity_device_id(),
+        DeviceId::from_str(UUID_B).unwrap()
+    );
     let debug = format!("{device:?}");
     assert!(debug.contains("<redacted>"));
     assert!(!debug.contains("165"));

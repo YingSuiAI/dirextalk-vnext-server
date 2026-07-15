@@ -1,12 +1,16 @@
 use dtx_agent_control::{
     ApplyConfigCommand, CloseStreamCommand, CloseStreamReason, ConfigEntry,
-    RotateCredentialCommand, ServerCommandPayload, command_payload_digest,
+    DeliverAgentProvisioningCommand, RotateCredentialCommand, ServerCommandPayload, Sha256Digest,
+    command_payload_digest,
 };
 use dtx_agent_control_proto::v1;
 use dtx_agent_control_server::{ProtobufDurableCommandDecoder, ProtobufDurableCommandEncoder};
 use dtx_agent_persistence::DurableCommandDecoder as _;
 use dtx_connect_registry::ConnectorDesiredState;
-use dtx_domain::{RequestId, Revision};
+use dtx_domain::{
+    AgentDeviceId, ApprovalId, BindingId, InstallationId, ProvisioningDeliveryId,
+    ProvisioningRecipientKeyId, RequestId, Revision,
+};
 use prost::Message as _;
 
 const OPERATION_ID: &str = "01890f47-3a5b-7c1d-8e2f-123456789abc";
@@ -177,6 +181,34 @@ fn production_encoder_round_trips_every_closed_command_without_reconstruction() 
             RotateCredentialCommand::new([7; 32], revision.checked_next().unwrap(), 2_000).unwrap(),
         ),
         ServerCommandPayload::CloseStream(CloseStreamCommand::protocol_upgrade()),
+        ServerCommandPayload::DeliverAgentProvisioning(
+            DeliverAgentProvisioningCommand::new(
+                "01890f47-3a5b-7c1d-8e2f-123456789ab1"
+                    .parse::<ProvisioningDeliveryId>()
+                    .unwrap(),
+                "01890f47-3a5b-7c1d-8e2f-123456789ab2"
+                    .parse::<ApprovalId>()
+                    .unwrap(),
+                "01890f47-3a5b-7c1d-8e2f-123456789ab3"
+                    .parse::<BindingId>()
+                    .unwrap(),
+                "01890f47-3a5b-7c1d-8e2f-123456789ab4"
+                    .parse::<InstallationId>()
+                    .unwrap(),
+                "01890f47-3a5b-7c1d-8e2f-123456789ab5"
+                    .parse::<AgentDeviceId>()
+                    .unwrap(),
+                Revision::new(8).unwrap(),
+                "01890f47-3a5b-7c1d-8e2f-123456789ab6"
+                    .parse::<ProvisioningRecipientKeyId>()
+                    .unwrap(),
+                Sha256Digest::from_bytes([0x11; 32]),
+                Sha256Digest::from_bytes([0x22; 32]),
+                vec![0xa5; 64],
+                2_000,
+            )
+            .unwrap(),
+        ),
     ];
     let operation_id = OPERATION_ID.parse::<RequestId>().unwrap();
 

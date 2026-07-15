@@ -85,6 +85,7 @@ fn device_snapshot_rejects_every_unreachable_revision_state_pair() {
     let mut device = AgentDevice::enroll(
         &installation,
         AgentDeviceId::new(),
+        dtx_domain::DeviceId::new(),
         DeviceCredentialFingerprint::from_bytes([3; 32]),
     )
     .unwrap();

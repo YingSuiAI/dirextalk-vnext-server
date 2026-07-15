@@ -5,7 +5,9 @@ use dtx_agent_registry::{
     AgentInstallationSnapshot, DescriptorDigest, DeviceCredentialFingerprint, ExecutionMode,
     InstallationDesiredState, InstallationObservedState,
 };
-use dtx_domain::{AgentDeviceId, AgentId, IdentityId, InstallationId, Revision, TenantId};
+use dtx_domain::{
+    AgentDeviceId, AgentId, DeviceId, IdentityId, InstallationId, Revision, TenantId,
+};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
@@ -45,10 +47,10 @@ impl AgentInstallationRepository {
         let insert = sqlx::query(
             "INSERT INTO agent.installations (
                  tenant_id, installation_id, agent_id, owner_id, execution_mode,
-                 descriptor_version, descriptor_hash, policy_revision,
+                 agent_identity_id, descriptor_version, descriptor_hash, policy_revision,
                  desired_state, observed_state, aggregate_revision,
                  created_at_ms, updated_at_ms
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)
              ON CONFLICT (tenant_id, installation_id) DO NOTHING",
         )
         .bind(Uuid::from(snapshot.tenant_id))
@@ -56,6 +58,7 @@ impl AgentInstallationRepository {
         .bind(snapshot.agent_id.to_string())
         .bind(snapshot.owner_id.to_string())
         .bind(execution_mode_code(snapshot.execution_mode))
+        .bind(snapshot.agent_identity_id.map(|value| value.to_string()))
         .bind(revision_to_i64(snapshot.descriptor_version)?)
         .bind(snapshot.descriptor_hash.as_bytes().to_vec())
         .bind(revision_to_i64(snapshot.policy_revision)?)
@@ -85,14 +88,15 @@ impl AgentInstallationRepository {
             }
             let updated = sqlx::query(
                 "UPDATE agent.installations
-                    SET descriptor_version=$4, descriptor_hash=$5, policy_revision=$6,
-                        desired_state=$7, observed_state=$8, aggregate_revision=$9,
-                        updated_at_ms=$10
+                    SET agent_identity_id=$4, descriptor_version=$5, descriptor_hash=$6,
+                        policy_revision=$7, desired_state=$8, observed_state=$9,
+                        aggregate_revision=$10, updated_at_ms=$11
                   WHERE tenant_id=$1 AND installation_id=$2 AND aggregate_revision=$3",
             )
             .bind(Uuid::from(snapshot.tenant_id))
             .bind(Uuid::from(snapshot.installation_id))
             .bind(revision_to_i64(existing_snapshot.revision)?)
+            .bind(snapshot.agent_identity_id.map(|value| value.to_string()))
             .bind(revision_to_i64(snapshot.descriptor_version)?)
             .bind(snapshot.descriptor_hash.as_bytes().to_vec())
             .bind(revision_to_i64(snapshot.policy_revision)?)
@@ -123,7 +127,7 @@ impl AgentInstallationRepository {
         installation_id: InstallationId,
     ) -> Result<Option<AgentInstallation>, AgentPersistenceError> {
         let row = sqlx::query(
-            "SELECT agent_id, owner_id, execution_mode, descriptor_version,
+            "SELECT agent_id, owner_id, execution_mode, agent_identity_id, descriptor_version,
                     descriptor_hash, policy_revision, desired_state,
                     observed_state, aggregate_revision
                FROM agent.installations
@@ -140,6 +144,10 @@ impl AgentInstallationRepository {
                 installation_id,
                 agent_id: parse_agent_id(row.try_get("agent_id")?)?,
                 owner_id: parse_identity_id(row.try_get("owner_id")?)?,
+                agent_identity_id: row
+                    .try_get::<Option<&str>, _>("agent_identity_id")?
+                    .map(parse_identity_id)
+                    .transpose()?,
                 execution_mode: parse_execution_mode(row.try_get("execution_mode")?)?,
                 descriptor_version: revision_from_i64(row.try_get("descriptor_version")?)?,
                 descriptor_hash: DescriptorDigest::from_bytes(bytes_32(
@@ -203,14 +211,15 @@ impl AgentDeviceRepository {
         let inserted = sqlx::query(
             "INSERT INTO agent.agent_devices (
                  tenant_id, agent_device_id, installation_id,
-                 credential_fingerprint, state, aggregate_revision,
+                 identity_device_id, credential_fingerprint, state, aggregate_revision,
                  created_at_ms, updated_at_ms
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
              ON CONFLICT (tenant_id, agent_device_id) DO NOTHING",
         )
         .bind(Uuid::from(snapshot.tenant_id))
         .bind(Uuid::from(snapshot.agent_device_id))
         .bind(Uuid::from(snapshot.installation_id))
+        .bind(Uuid::from(snapshot.identity_device_id))
         .bind(snapshot.credential_fingerprint.as_bytes().to_vec())
         .bind(device_state_code(snapshot.state))
         .bind(revision_to_i64(snapshot.revision)?)
@@ -229,6 +238,7 @@ impl AgentDeviceRepository {
             return Ok(CurrentWrite::Existing);
         }
         if previous.installation_id != snapshot.installation_id
+            || previous.identity_device_id != snapshot.identity_device_id
             || previous.credential_fingerprint != snapshot.credential_fingerprint
         {
             return Err(AgentPersistenceError::ImmutableConflict("Agent Device"));
@@ -280,7 +290,7 @@ impl AgentDeviceRepository {
         agent_device_id: AgentDeviceId,
     ) -> Result<Option<AgentDevice>, AgentPersistenceError> {
         let row = sqlx::query(
-            "SELECT installation_id, credential_fingerprint, state, aggregate_revision
+            "SELECT installation_id, identity_device_id, credential_fingerprint, state, aggregate_revision
                FROM agent.agent_devices
               WHERE tenant_id=$1 AND agent_device_id=$2",
         )
@@ -290,12 +300,15 @@ impl AgentDeviceRepository {
         .await?;
         row.map(|row| {
             let installation_id: Uuid = row.try_get("installation_id")?;
+            let identity_device_id: Uuid = row.try_get("identity_device_id")?;
             let fingerprint: Vec<u8> = row.try_get("credential_fingerprint")?;
             let snapshot = AgentDeviceSnapshot {
                 tenant_id,
                 installation_id: InstallationId::try_from(installation_id)
                     .map_err(|_| AgentPersistenceError::CorruptData("installation ID"))?,
                 agent_device_id,
+                identity_device_id: DeviceId::try_from(identity_device_id)
+                    .map_err(|_| AgentPersistenceError::CorruptData("identity device ID"))?,
                 credential_fingerprint: DeviceCredentialFingerprint::from_bytes(bytes_32(
                     fingerprint,
                     "device credential fingerprint",
@@ -317,6 +330,8 @@ fn ensure_same_installation_identity(
     if previous.agent_id == proposed.agent_id
         && previous.owner_id == proposed.owner_id
         && previous.execution_mode == proposed.execution_mode
+        && (previous.agent_identity_id.is_none()
+            || previous.agent_identity_id == proposed.agent_identity_id)
     {
         Ok(())
     } else {

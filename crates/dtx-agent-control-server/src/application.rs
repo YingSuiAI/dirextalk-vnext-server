@@ -8,10 +8,11 @@ use dtx_domain::{ConnectorId, TenantId};
 use dtx_security::AuthenticatedConnectorPeer;
 
 use crate::wire::{
+    ParsedAgentProvisioningInstalled, ParsedAgentProvisioningRejected,
     ParsedCommandAcknowledgement, ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat,
-    ParsedHello, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted,
-    ParsedRunFailed, ParsedRunOutput, ParsedRunRelease, RunAvailableWire, RunCancelRequestedWire,
-    RunLeaseGrantedWire,
+    ParsedHello, ParsedProvisioningRecipientAnnouncement, ParsedReady, ParsedRunCheckpoint,
+    ParsedRunClaim, ParsedRunCompleted, ParsedRunFailed, ParsedRunOutput, ParsedRunRelease,
+    RunAvailableWire, RunCancelRequestedWire, RunLeaseGrantedWire,
 };
 use crate::{CommandNotificationSubscription, RunOfferNotificationSubscription};
 
@@ -210,6 +211,30 @@ pub trait ConnectorControlApplication: Send + Sync + 'static {
         &self,
         _peer: AuthenticatedConnectorPeer,
         _failed: ParsedRunFailed,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    fn announce_provisioning_recipient(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _announcement: ParsedProvisioningRecipientAnnouncement,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    fn complete_agent_provisioning(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _installed: ParsedAgentProvisioningInstalled,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    fn reject_agent_provisioning(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _rejected: ParsedAgentProvisioningRejected,
     ) -> ApplicationFuture<'_, ()> {
         Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
     }

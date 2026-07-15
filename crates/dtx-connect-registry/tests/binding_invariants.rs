@@ -81,6 +81,7 @@ fn active_entities(
     let mut device = AgentDevice::enroll(
         &installation,
         agent_device_id,
+        dtx_domain::DeviceId::new(),
         DeviceCredentialFingerprint::from_bytes([2; 32]),
     )
     .unwrap();
@@ -185,6 +186,7 @@ fn entity_relationship_adapter_and_binding_capacity_are_verified() {
     let mut device = AgentDevice::enroll(
         &installation,
         AgentDeviceId::new(),
+        dtx_domain::DeviceId::new(),
         DeviceCredentialFingerprint::from_bytes([3; 32]),
     )
     .unwrap();
