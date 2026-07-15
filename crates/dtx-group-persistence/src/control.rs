@@ -13,7 +13,7 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use crate::{
-    GroupPersistenceError, GroupPgStore,
+    GroupPersistenceError, GroupPgStore, VerifiedDeviceActor,
     repository::{
         ScopeKey, begin_authenticated, begin_authenticated_with_signing_key, load_policy,
         persist_policy, settle,
@@ -398,6 +398,34 @@ impl GroupControlRepository {
                 return Err(GroupPersistenceError::DeviceAuthenticationRejected);
             }
             verify_proof(authenticated.signing_key())?;
+            execute_in_transaction(session.connection(), tenant_id, &command, now_ms).await
+        }
+        .await;
+        settle(session, result).await
+    }
+
+    /// Executes a remote-device mutation after the caller has resolved a
+    /// current self-authenticated identity-log device key.
+    pub async fn execute_verified_with_proof_outcome<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        actor: VerifiedDeviceActor,
+        command: GroupControlCommand,
+        now_ms: i64,
+        verify_proof: F,
+    ) -> Result<GroupControlExecution, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        let mut session = store.begin(tenant_id).await?;
+        let result = async {
+            if actor.identity_id() != command.actor_identity_id()
+                || actor.device_id() != command.actor_device_id()
+            {
+                return Err(GroupPersistenceError::DeviceAuthenticationRejected);
+            }
+            verify_proof(actor.signing_key())?;
             execute_in_transaction(session.connection(), tenant_id, &command, now_ms).await
         }
         .await;

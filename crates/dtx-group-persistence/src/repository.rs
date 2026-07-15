@@ -64,6 +64,52 @@ pub struct MembershipCommandExecution {
     replayed: bool,
 }
 
+/// A device authorization that a Group Node verified outside the local
+/// identity-session database, for example from a self-authenticated remote
+/// identity log. The repository still binds these coordinates to the command
+/// and verifies the domain-specific action proof before reading a receipt or
+/// mutating group state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedDeviceActor {
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    signing_key: SigningPublicKey,
+}
+
+impl VerifiedDeviceActor {
+    /// Creates one already-verified active device actor.
+    #[must_use]
+    pub const fn new(
+        identity_id: IdentityId,
+        device_id: DeviceId,
+        signing_key: SigningPublicKey,
+    ) -> Self {
+        Self {
+            identity_id,
+            device_id,
+            signing_key,
+        }
+    }
+
+    /// Returns the self-certifying actor identity.
+    #[must_use]
+    pub const fn identity_id(self) -> IdentityId {
+        self.identity_id
+    }
+
+    /// Returns the active actor device.
+    #[must_use]
+    pub const fn device_id(self) -> DeviceId {
+        self.device_id
+    }
+
+    /// Returns the current device signing key resolved by the caller.
+    #[must_use]
+    pub const fn signing_key(self) -> SigningPublicKey {
+        self.signing_key
+    }
+}
+
 impl MembershipCommandExecution {
     /// Returns the durable membership receipt.
     #[must_use]
@@ -250,6 +296,38 @@ impl GroupMembershipRepository {
         settle(session, result).await
     }
 
+    /// Records or replays a remote-device join after the caller has validated
+    /// a current self-authenticated identity-log projection.
+    pub async fn request_join_verified_with_proof_outcome<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        actor: VerifiedDeviceActor,
+        command: JoinRequestCommand,
+        candidate_membership: CandidateMembership,
+        now_ms: i64,
+        verify_proof: F,
+    ) -> Result<MembershipCommandExecution, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        let mut session = store.begin(tenant_id).await?;
+        let result = async {
+            ensure_verified_actor(actor, command.context())?;
+            verify_proof(actor.signing_key())?;
+            request_join_in_transaction(
+                session.connection(),
+                tenant_id,
+                command,
+                candidate_membership,
+                now_ms,
+            )
+            .await
+        }
+        .await;
+        settle(session, result).await
+    }
+
     /// Records or exactly replays an Owner/Admin approval and its durable submit outbox.
     ///
     /// The policy reservation and `PendingCommit` command state commit together
@@ -367,6 +445,38 @@ impl GroupMembershipRepository {
         settle(session, result).await
     }
 
+    /// Records or replays a remote Owner/Admin approval after verification of
+    /// the actor's current self-authenticated identity-log projection.
+    pub async fn approve_join_verified_with_proof_outcome<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        actor: VerifiedDeviceActor,
+        command: ApproveJoinCommand,
+        candidate_membership: CandidateMembership,
+        now_ms: i64,
+        verify_proof: F,
+    ) -> Result<MembershipCommandExecution, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        let mut session = store.begin(tenant_id).await?;
+        let result = async {
+            ensure_verified_actor(actor, command.context())?;
+            verify_proof(actor.signing_key())?;
+            approve_join_in_transaction(
+                session.connection(),
+                tenant_id,
+                command,
+                candidate_membership,
+                now_ms,
+            )
+            .await
+        }
+        .await;
+        settle(session, result).await
+    }
+
     /// Loads one membership receipt after revalidating the reading device in
     /// the same tenant transaction.
     ///
@@ -384,46 +494,35 @@ impl GroupMembershipRepository {
     ) -> Result<MembershipReceipt, GroupPersistenceError> {
         let (mut session, authenticated) =
             begin_authenticated(store, tenant_id, credential, now_ms).await?;
-        let result = async {
-            let key = ScopeKey::from_scope(tenant_id, scope);
-            let Some(aggregate) = load_aggregate(session.connection(), key, false).await? else {
-                return Err(GroupPersistenceError::GroupNotFound);
-            };
-            let access = sqlx::query(
-                "SELECT command.actor_identity_id,
-                        workflow.candidate_identity_id
-                   FROM groups.membership_commands AS command
-                   LEFT JOIN groups.membership_workflows AS workflow
-                     ON workflow.tenant_id=command.tenant_id
-                    AND workflow.scope_kind=command.scope_kind
-                    AND workflow.scope_id=command.scope_id
-                    AND workflow.request_id=command.workflow_id
-                  WHERE command.tenant_id=$1 AND command.command_id=$2
-                    AND command.scope_kind=$3 AND command.scope_id=$4",
-            )
-            .bind(Uuid::from(tenant_id))
-            .bind(Uuid::from(command_id.request_id()))
-            .bind(key.kind)
-            .bind(key.id())
-            .fetch_optional(session.connection())
-            .await?
-            .ok_or(GroupPersistenceError::GroupNotFound)?;
-            let caller = authenticated.identity_id().to_string();
-            let is_actor = access.try_get::<String, _>("actor_identity_id")? == caller;
-            let is_candidate = access
-                .try_get::<Option<String>, _>("candidate_identity_id")?
-                .as_deref()
-                == Some(caller.as_str());
-            if !is_actor
-                && !is_candidate
-                && !aggregate
-                    .policy
-                    .can_approve_join(authenticated.identity_id())
-            {
-                return Err(GroupPersistenceError::MembershipReceiptAccessDenied);
-            }
-            aggregate.book.receipt(command_id).map_err(Into::into)
-        }
+        let result = load_receipt_for_identity_in_transaction(
+            session.connection(),
+            tenant_id,
+            authenticated.identity_id(),
+            scope,
+            command_id,
+        )
+        .await;
+        settle(session, result).await
+    }
+
+    /// Loads a receipt for an actor whose current device key and signed query
+    /// proof were verified by the Group Node from a remote identity log.
+    pub async fn load_receipt_verified(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        actor: VerifiedDeviceActor,
+        scope: GroupScope,
+        command_id: MembershipCommandId,
+    ) -> Result<MembershipReceipt, GroupPersistenceError> {
+        let mut session = store.begin(tenant_id).await?;
+        let result = load_receipt_for_identity_in_transaction(
+            session.connection(),
+            tenant_id,
+            actor.identity_id(),
+            scope,
+            command_id,
+        )
         .await;
         settle(session, result).await
     }
@@ -667,6 +766,48 @@ impl GroupMembershipRepository {
     }
 }
 
+async fn load_receipt_for_identity_in_transaction(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    caller_identity_id: IdentityId,
+    scope: GroupScope,
+    command_id: MembershipCommandId,
+) -> Result<MembershipReceipt, GroupPersistenceError> {
+    let key = ScopeKey::from_scope(tenant_id, scope);
+    let Some(aggregate) = load_aggregate(connection, key, false).await? else {
+        return Err(GroupPersistenceError::GroupNotFound);
+    };
+    let access = sqlx::query(
+        "SELECT command.actor_identity_id,
+                workflow.candidate_identity_id
+           FROM groups.membership_commands AS command
+           LEFT JOIN groups.membership_workflows AS workflow
+             ON workflow.tenant_id=command.tenant_id
+            AND workflow.scope_kind=command.scope_kind
+            AND workflow.scope_id=command.scope_id
+            AND workflow.request_id=command.workflow_id
+          WHERE command.tenant_id=$1 AND command.command_id=$2
+            AND command.scope_kind=$3 AND command.scope_id=$4",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(command_id.request_id()))
+    .bind(key.kind)
+    .bind(key.id())
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or(GroupPersistenceError::GroupNotFound)?;
+    let caller = caller_identity_id.to_string();
+    let is_actor = access.try_get::<String, _>("actor_identity_id")? == caller;
+    let is_candidate = access
+        .try_get::<Option<String>, _>("candidate_identity_id")?
+        .as_deref()
+        == Some(caller.as_str());
+    if !is_actor && !is_candidate && !aggregate.policy.can_approve_join(caller_identity_id) {
+        return Err(GroupPersistenceError::MembershipReceiptAccessDenied);
+    }
+    aggregate.book.receipt(command_id).map_err(Into::into)
+}
+
 /// Begins a tenant-bound group transaction and revalidates a device session on
 /// that exact connection. The group runtime receives only the narrow identity
 /// reads needed by [`DeviceSessionRepository::authenticate_in_transaction`].
@@ -728,6 +869,19 @@ fn ensure_authenticated_actor(
 ) -> Result<(), GroupPersistenceError> {
     if authenticated.identity_id() == context.actor_identity_id()
         && authenticated.device_id() == context.actor_device_id()
+    {
+        Ok(())
+    } else {
+        Err(GroupPersistenceError::DeviceAuthenticationRejected)
+    }
+}
+
+fn ensure_verified_actor(
+    actor: VerifiedDeviceActor,
+    context: MembershipCommandContext,
+) -> Result<(), GroupPersistenceError> {
+    if actor.identity_id() == context.actor_identity_id()
+        && actor.device_id() == context.actor_device_id()
     {
         Ok(())
     } else {

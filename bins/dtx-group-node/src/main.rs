@@ -15,7 +15,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<SocketAddr>()?;
     let options = PgConnectOptions::from_str(&database_url)?;
     let store = GroupPgStore::connect(options, 8).await?;
+    let allowed_http_identity_origins = env::var("DTX_GROUP_DEV_HTTP_IDENTITY_ORIGINS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let state = dtx_group_node::GroupNodeState::new(store, tenant_id)
+        .with_allowed_http_identity_origins(allowed_http_identity_origins)?;
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
-    axum::serve(listener, dtx_group_node::group_router(store, tenant_id)).await?;
+    axum::serve(listener, dtx_group_node::group_router_with_state(state)).await?;
     Ok(())
 }

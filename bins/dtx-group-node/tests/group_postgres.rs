@@ -1,7 +1,12 @@
 #[path = "../../../crates/dtx-storage/tests/support/mod.rs"]
 mod support;
 
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    str::FromStr,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -16,8 +21,8 @@ use dtx_group_node::{
     DEVICE_SESSION_AUTHORIZATION_SCHEME, GROUP_ACTION_RECEIPT_CONTENT_TYPE,
     GROUP_APPROVE_JOIN_CONTENT_TYPE, GROUP_CREATE_CONTENT_TYPE, GROUP_ISSUE_INVITE_CONTENT_TYPE,
     GROUP_JOIN_REQUEST_CONTENT_TYPE, GROUP_MEMBERSHIP_RECEIPT_PATH_TEMPLATE,
-    GROUP_SCOPE_PATH_TEMPLATE, GroupNodeState, MEMBERSHIP_RECEIPT_CONTENT_TYPE,
-    group_router_with_state,
+    GROUP_SCOPE_PATH_TEMPLATE, GroupNodeState, IDENTITY_ORIGIN_HEADER,
+    MEMBERSHIP_RECEIPT_CONTENT_TYPE, RECEIPT_QUERY_PROOF_HEADER, group_router_with_state,
 };
 use dtx_group_persistence::{
     GroupControlCommand, GroupControlDisposition, GroupControlOperation, GroupControlRejection,
@@ -29,6 +34,7 @@ use dtx_identity_log::{
     UnsignedDeviceCertificateV1, UnsignedIdentityLogEventV1, device_certificate_signature_input,
     genesis_recovery_acceptance_input, identity_log_signature_input,
 };
+use dtx_identity_node::identity_bootstrap_router;
 use dtx_identity_persistence::{
     DEVICE_SESSION_SECRET_HASH_DOMAIN, DeviceSessionCompletionCommand, DeviceSessionOutcome,
     DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogRepository,
@@ -39,15 +45,415 @@ use dtx_wire::{
     decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use ed25519_dalek::{Signer, SigningKey};
+use sqlx::postgres::PgConnectOptions;
 use tower::ServiceExt;
 
 const AUDIENCE: &str = "https://group.test";
 const NOW: i64 = 2_000;
-const PROOF_EXPIRES: i64 = 20_000;
 const IDEMPOTENCY_HASH_DOMAIN: &[u8] = b"dirextalk.membership-idempotency-key.v1\0";
 const BUSINESS_FIELDS_HASH_DOMAIN: &[u8] = b"dirextalk.membership-action-business-fields.v1\0";
 const ACTION_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.membership-action-binding.v1\0";
 const ACTION_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.membership-action-signature.v1\0";
+const FEDERATED_ACTION_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.membership-action-binding.v2\0";
+const FEDERATED_ACTION_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.membership-action-signature.v2\0";
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn remote_owner_admin_and_candidate_use_fresh_identity_logs_without_session_forwarding()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 8).await?;
+    let group_store = GroupPgStore::connect(harness.group_runtime_options(), 4).await?;
+    let owner = enroll_active_device(&identity_store, 51, 52, 53, [54; 32]).await?;
+    let admin = enroll_active_device(&identity_store, 61, 62, 63, [64; 32]).await?;
+    let candidate = enroll_active_device(&identity_store, 71, 72, 73, [74; 32]).await?;
+    let (admin_origin, admin_server) = start_identity_log_server(identity_store.clone()).await?;
+    let (candidate_origin, candidate_server) =
+        start_identity_log_server(identity_store.clone()).await?;
+    let tenant_id = TenantId::new();
+    let state =
+        GroupNodeState::with_clock(group_store.clone(), tenant_id, Arc::new(FixedClock(NOW)))
+            .with_allowed_http_identity_origins([admin_origin.clone(), candidate_origin.clone()])?;
+    let app = group_router_with_state(state);
+    let scope = GroupScope::PrivateConversation(ConversationId::new());
+    let scope_path = scope_path(scope);
+
+    let create_key = "federated-group-create-0001";
+    let create = send_mutation(
+        app.clone(),
+        "PUT",
+        &scope_path,
+        GROUP_CREATE_CONTENT_TYPE,
+        create_key,
+        &owner,
+        create_body(&owner, scope, &scope_path, create_key, 1_000)?,
+    )
+    .await?;
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let grant_path = format!("{scope_path}/admins/{}", admin.identity_id);
+    let grant_key = "federated-grant-admin-0001";
+    let grant = send_mutation(
+        app.clone(),
+        "PUT",
+        &grant_path,
+        "application/vnd.dirextalk.group-grant-admin.v1+cbor",
+        grant_key,
+        &owner,
+        grant_admin_body(
+            &owner,
+            scope,
+            &grant_path,
+            grant_key,
+            1_000,
+            Revision::INITIAL,
+            admin.identity_id,
+        )?,
+    )
+    .await?;
+    assert_eq!(grant.status(), StatusCode::CREATED);
+
+    let invite_id = InviteCapabilityId::new();
+    let invite_path = format!("{scope_path}/invites/{invite_id}");
+    let invite_key = "federated-admin-invite-0001";
+    let invite_body = federated_issue_invite_body(
+        &admin,
+        &admin_origin,
+        scope,
+        &invite_path,
+        invite_key,
+        1_000,
+        Revision::new(2)?,
+        Some(candidate.identity_id),
+        1,
+        10_000,
+    )?;
+    let invite = send_federated_mutation(
+        app.clone(),
+        "PUT",
+        &invite_path,
+        GROUP_ISSUE_INVITE_CONTENT_TYPE,
+        invite_key,
+        &admin_origin,
+        invite_body,
+    )
+    .await?;
+    assert_eq!(invite.status(), StatusCode::CREATED);
+
+    let join_request_id = JoinRequestId::new();
+    let join_command_id = RequestId::new();
+    let join_path = format!("{scope_path}/join-requests/{join_request_id}");
+    let join_key = "federated-candidate-join-0001";
+    let join_body = federated_join_request_body(
+        &candidate,
+        &candidate_origin,
+        scope,
+        &join_path,
+        join_key,
+        1_000,
+        join_command_id,
+        invite_id,
+        Revision::new(3)?,
+        Sha256Digest::hash_domain(b"test-group-head\0", b"federated-join"),
+    )?;
+    let join = send_federated_mutation(
+        app.clone(),
+        "PUT",
+        &join_path,
+        GROUP_JOIN_REQUEST_CONTENT_TYPE,
+        join_key,
+        &candidate_origin,
+        join_body.clone(),
+    )
+    .await?;
+    assert_eq!(join.status(), StatusCode::ACCEPTED);
+    assert_membership_phase(&response_bytes(join).await?, 1)?;
+    let join_receipt_path = format!("{scope_path}/membership-receipts/{join_command_id}");
+    let recovered_join = send_federated_get(
+        app.clone(),
+        &join_receipt_path,
+        &candidate_origin,
+        receipt_query_proof(
+            &candidate,
+            &candidate_origin,
+            scope,
+            &join_receipt_path,
+            join_command_id,
+            1_500,
+        )?,
+    )
+    .await?;
+    assert_eq!(recovered_join.status(), StatusCode::OK);
+    assert_membership_phase(&response_bytes(recovered_join).await?, 1)?;
+
+    let approval_path = format!("{join_path}/approvals");
+    let approval_key = "federated-admin-approval-0001";
+    let approval = send_federated_mutation(
+        app.clone(),
+        "POST",
+        &approval_path,
+        GROUP_APPROVE_JOIN_CONTENT_TYPE,
+        approval_key,
+        &admin_origin,
+        federated_approve_join_body(
+            &admin,
+            &admin_origin,
+            scope,
+            &approval_path,
+            approval_key,
+            1_000,
+            RequestId::new(),
+            candidate.identity_id,
+            candidate.device_id,
+            invite_id,
+            Revision::new(4)?,
+            Sha256Digest::hash_domain(b"test-group-head\0", b"federated-approval"),
+        )?,
+    )
+    .await?;
+    assert_eq!(approval.status(), StatusCode::ACCEPTED);
+    assert_membership_phase(&response_bytes(approval).await?, 2)?;
+
+    revoke_device(&identity_store, &candidate, 30_000).await?;
+    let revoked_replay = send_federated_mutation(
+        app,
+        "PUT",
+        &join_path,
+        GROUP_JOIN_REQUEST_CONTENT_TYPE,
+        join_key,
+        &candidate_origin,
+        join_body,
+    )
+    .await?;
+    assert_eq!(revoked_replay.status(), StatusCode::UNAUTHORIZED);
+
+    admin_server.abort();
+    candidate_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable three-node Docker Compose cluster"]
+#[allow(clippy::too_many_lines)]
+async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recovery()
+-> Result<(), Box<dyn Error>> {
+    if std::env::var("DTX_THREE_NODE_COMPOSE_ACCEPTANCE").as_deref() != Ok("1") {
+        return Err(
+            "set DTX_THREE_NODE_COMPOSE_ACCEPTANCE=1 for the disposable local cluster".into(),
+        );
+    }
+
+    let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let identity_a = IdentityPgStore::connect(
+        PgConnectOptions::from_str(
+            "postgres://dtx_identity_node@127.0.0.1:15432/dtx_node_a?sslmode=disable",
+        )?,
+        2,
+    )
+    .await?;
+    let identity_b = IdentityPgStore::connect(
+        PgConnectOptions::from_str(
+            "postgres://dtx_identity_node@127.0.0.1:15432/dtx_node_b?sslmode=disable",
+        )?,
+        2,
+    )
+    .await?;
+    let identity_c = IdentityPgStore::connect(
+        PgConnectOptions::from_str(
+            "postgres://dtx_identity_node@127.0.0.1:15432/dtx_node_c?sslmode=disable",
+        )?,
+        2,
+    )
+    .await?;
+    let owner = enroll_active_device_at(&identity_a, 151, 152, 153, [154; 32], now).await?;
+    let admin = enroll_active_device_at(&identity_b, 161, 162, 163, [164; 32], now).await?;
+    let candidate = enroll_active_device_at(&identity_c, 171, 172, 173, [174; 32], now).await?;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let group_origin = "http://127.0.0.1:14814";
+    let admin_identity_origin = "http://identity-b:8080";
+    let candidate_identity_origin = "http://identity-c:8080";
+    let scope = GroupScope::PrivateConversation(ConversationId::new());
+    let scope_path = scope_path(scope);
+
+    let create_key = "compose-federated-create-0001";
+    let create = send_network_mutation(
+        &client,
+        group_origin,
+        reqwest::Method::PUT,
+        &scope_path,
+        GROUP_CREATE_CONTENT_TYPE,
+        create_key,
+        Some(device_session_authorization(
+            owner.session_id,
+            owner.session_secret,
+        )),
+        None,
+        create_body(&owner, scope, &scope_path, create_key, now)?,
+    )
+    .await?;
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let grant_path = format!("{scope_path}/admins/{}", admin.identity_id);
+    let grant_key = "compose-federated-grant-0001";
+    let grant = send_network_mutation(
+        &client,
+        group_origin,
+        reqwest::Method::PUT,
+        &grant_path,
+        "application/vnd.dirextalk.group-grant-admin.v1+cbor",
+        grant_key,
+        Some(device_session_authorization(
+            owner.session_id,
+            owner.session_secret,
+        )),
+        None,
+        grant_admin_body(
+            &owner,
+            scope,
+            &grant_path,
+            grant_key,
+            now,
+            Revision::INITIAL,
+            admin.identity_id,
+        )?,
+    )
+    .await?;
+    assert_eq!(grant.status(), StatusCode::CREATED);
+
+    let invite_id = InviteCapabilityId::new();
+    let invite_path = format!("{scope_path}/invites/{invite_id}");
+    let invite_key = "compose-federated-invite-0001";
+    let invite = send_network_mutation(
+        &client,
+        group_origin,
+        reqwest::Method::PUT,
+        &invite_path,
+        GROUP_ISSUE_INVITE_CONTENT_TYPE,
+        invite_key,
+        None,
+        Some(admin_identity_origin),
+        federated_issue_invite_body(
+            &admin,
+            admin_identity_origin,
+            scope,
+            &invite_path,
+            invite_key,
+            now,
+            Revision::new(2)?,
+            Some(candidate.identity_id),
+            1,
+            now + 600_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(invite.status(), StatusCode::CREATED);
+
+    let join_request_id = JoinRequestId::new();
+    let join_command_id = RequestId::new();
+    let join_path = format!("{scope_path}/join-requests/{join_request_id}");
+    let join_key = "compose-federated-join-0001";
+    let join = send_network_mutation(
+        &client,
+        group_origin,
+        reqwest::Method::PUT,
+        &join_path,
+        GROUP_JOIN_REQUEST_CONTENT_TYPE,
+        join_key,
+        None,
+        Some(candidate_identity_origin),
+        federated_join_request_body(
+            &candidate,
+            candidate_identity_origin,
+            scope,
+            &join_path,
+            join_key,
+            now,
+            join_command_id,
+            invite_id,
+            Revision::new(3)?,
+            Sha256Digest::hash_domain(b"compose-group-head\0", b"join"),
+        )?,
+    )
+    .await?;
+    assert_eq!(join.status(), StatusCode::ACCEPTED);
+    assert_membership_phase(&join.bytes().await?, 1)?;
+
+    let join_receipt_path = format!("{scope_path}/membership-receipts/{join_command_id}");
+    let recovered_join = send_network_receipt_query(
+        &client,
+        group_origin,
+        &join_receipt_path,
+        candidate_identity_origin,
+        receipt_query_proof(
+            &candidate,
+            candidate_identity_origin,
+            scope,
+            &join_receipt_path,
+            join_command_id,
+            now + 1,
+        )?,
+    )
+    .await?;
+    assert_eq!(recovered_join.status(), StatusCode::OK);
+    assert_membership_phase(&recovered_join.bytes().await?, 1)?;
+
+    let approval_command_id = RequestId::new();
+    let approval_path = format!("{join_path}/approvals");
+    let approval_key = "compose-federated-approval-0001";
+    let approval = send_network_mutation(
+        &client,
+        group_origin,
+        reqwest::Method::POST,
+        &approval_path,
+        GROUP_APPROVE_JOIN_CONTENT_TYPE,
+        approval_key,
+        None,
+        Some(admin_identity_origin),
+        federated_approve_join_body(
+            &admin,
+            admin_identity_origin,
+            scope,
+            &approval_path,
+            approval_key,
+            now,
+            approval_command_id,
+            candidate.identity_id,
+            candidate.device_id,
+            invite_id,
+            Revision::new(4)?,
+            Sha256Digest::hash_domain(b"compose-group-head\0", b"approval"),
+        )?,
+    )
+    .await?;
+    assert_eq!(approval.status(), StatusCode::ACCEPTED);
+    assert_membership_phase(&approval.bytes().await?, 2)?;
+
+    let approval_receipt_path = format!("{scope_path}/membership-receipts/{approval_command_id}");
+    let recovered_approval = send_network_receipt_query(
+        &client,
+        group_origin,
+        &approval_receipt_path,
+        candidate_identity_origin,
+        receipt_query_proof(
+            &candidate,
+            candidate_identity_origin,
+            scope,
+            &approval_receipt_path,
+            approval_command_id,
+            now + 2,
+        )?,
+    )
+    .await?;
+    assert_eq!(recovered_approval.status(), StatusCode::OK);
+    assert_membership_phase(&recovered_approval.bytes().await?, 2)?;
+    Ok(())
+}
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // The end-to-end recovery scenario intentionally keeps its user-visible sequence together.
@@ -110,6 +516,7 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
         scope,
         &invite_path,
         invite_key,
+        1_000,
         Revision::INITIAL,
         Some(candidate.identity_id),
         1,
@@ -136,6 +543,7 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
         scope,
         &join_path,
         join_key,
+        1_000,
         join_command_id,
         invite_id,
         Revision::new(2)?,
@@ -175,6 +583,7 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
         scope,
         &approval_path,
         approval_key,
+        1_000,
         approval_command_id,
         candidate.identity_id,
         candidate.device_id,
@@ -373,6 +782,7 @@ async fn group_control_persists_a_hard_five_admin_limit_under_serialized_writes(
 struct ActiveDevice {
     identity_id: IdentityId,
     device_id: DeviceId,
+    root: SigningKey,
     device: SigningKey,
     session_id: DeviceSessionId,
     session_secret: [u8; 32],
@@ -385,10 +795,29 @@ async fn enroll_active_device(
     device_seed: u8,
     session_secret: [u8; 32],
 ) -> Result<ActiveDevice, Box<dyn Error>> {
+    enroll_active_device_at(
+        store,
+        root_seed,
+        recovery_seed,
+        device_seed,
+        session_secret,
+        NOW,
+    )
+    .await
+}
+
+async fn enroll_active_device_at(
+    store: &IdentityPgStore,
+    root_seed: u8,
+    recovery_seed: u8,
+    device_seed: u8,
+    session_secret: [u8; 32],
+    now: i64,
+) -> Result<ActiveDevice, Box<dyn Error>> {
     let root = SigningKey::from_bytes(&[root_seed; 32]);
     let recovery = SigningKey::from_bytes(&[recovery_seed; 32]);
     let device = SigningKey::from_bytes(&[device_seed; 32]);
-    let genesis = genesis(&root, &recovery, 1_000)?;
+    let genesis = genesis(&root, &recovery, now - 1_000)?;
     let identity_id = genesis.identity_id();
     let repository = IdentityLogRepository::new();
     let bootstrap = IdentityAppendCommand::new(
@@ -398,7 +827,7 @@ async fn enroll_active_device(
     )?;
     assert!(matches!(
         repository
-            .append_bootstrap(store, &bootstrap, UtcMillis::new(1_200)?)
+            .append_bootstrap(store, &bootstrap, UtcMillis::new(now - 800)?)
             .await?,
         IdentityAppendOutcome::Committed(_)
     ));
@@ -410,7 +839,7 @@ async fn enroll_active_device(
         device_id,
         genesis.entry_hash()?,
         2,
-        1_100,
+        now - 700,
     )?;
     assert!(matches!(
         repository
@@ -419,7 +848,7 @@ async fn enroll_active_device(
                 Sha256Digest::hash_domain(b"test-group-initial\0", &[root_seed]),
                 genesis.entry_hash()?,
                 initial.to_deterministic_cbor()?,
-                UtcMillis::new(1_300)?,
+                UtcMillis::new(now - 500)?,
             )
             .await?,
         IdentityAppendOutcome::Committed(_)
@@ -431,7 +860,7 @@ async fn enroll_active_device(
             device_id,
             [device_seed; 32],
             AUDIENCE,
-            UtcMillis::new(NOW)?,
+            UtcMillis::new(now)?,
         )
         .await?;
     let session_id = DeviceSessionId::new();
@@ -462,17 +891,67 @@ async fn enroll_active_device(
     )?;
     assert!(matches!(
         DeviceSessionRepository
-            .complete(store, &completion, UtcMillis::new(NOW)?)
+            .complete(store, &completion, UtcMillis::new(now)?)
             .await?,
         DeviceSessionOutcome::Issued(_)
     ));
     Ok(ActiveDevice {
         identity_id,
         device_id,
+        root,
         device,
         session_id,
         session_secret,
     })
+}
+
+async fn start_identity_log_server(
+    store: IdentityPgStore,
+) -> Result<(String, tokio::task::JoinHandle<()>), Box<dyn Error>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, identity_bootstrap_router(store)).await;
+    });
+    Ok((origin, server))
+}
+
+async fn revoke_device(
+    store: &IdentityPgStore,
+    active: &ActiveDevice,
+    occurred_at_ms: i64,
+) -> Result<(), Box<dyn Error>> {
+    let repository = IdentityLogRepository::new();
+    let head = repository
+        .load(store, active.identity_id)
+        .await?
+        .ok_or("identity missing before federated revoke")?
+        .head();
+    let revoke = signed_event(
+        &active.root,
+        active.identity_id,
+        head.sequence().get() + 1,
+        Some(head.hash()),
+        occurred_at_ms,
+        IdentityLogEventPayloadV1::DeviceRevoke {
+            device_id: active.device_id,
+        },
+    )?;
+    let command = IdentityAppendCommand::new(
+        Sha256Digest::hash_domain(
+            b"test-federated-device-revoke\0",
+            active.identity_id.to_string().as_bytes(),
+        ),
+        Some(head),
+        revoke.to_deterministic_cbor()?,
+    )?;
+    assert!(matches!(
+        repository
+            .append(store, &command, UtcMillis::new(occurred_at_ms)?)
+            .await?,
+        IdentityAppendOutcome::Committed(_)
+    ));
+    Ok(())
 }
 
 fn create_body(
@@ -495,12 +974,42 @@ fn create_body(
     encode(&numbered_map(vec![CanonicalValue::Unsigned(1), proof]))
 }
 
+fn grant_admin_body(
+    active: &ActiveDevice,
+    scope: GroupScope,
+    path: &str,
+    idempotency_key: &str,
+    issued_at: i64,
+    expected_revision: Revision,
+    _administrator_identity_id: IdentityId,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let signable = numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Unsigned(expected_revision.get()),
+    ]);
+    let proof = action_proof(
+        2,
+        active,
+        scope,
+        path,
+        idempotency_key,
+        &signable,
+        issued_at,
+    )?;
+    encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Unsigned(expected_revision.get()),
+        proof,
+    ]))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn issue_invite_body(
     active: &ActiveDevice,
     scope: GroupScope,
     path: &str,
     idempotency_key: &str,
+    issued_at: i64,
     expected_revision: Revision,
     target_identity_id: Option<IdentityId>,
     max_uses: u32,
@@ -516,7 +1025,58 @@ fn issue_invite_body(
         CanonicalValue::Unsigned(u64::from(max_uses)),
         utc_value(expires_at_ms),
     ]);
-    let proof = action_proof(4, active, scope, path, idempotency_key, &signable, 1_000)?;
+    let proof = action_proof(
+        4,
+        active,
+        scope,
+        path,
+        idempotency_key,
+        &signable,
+        issued_at,
+    )?;
+    encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Unsigned(expected_revision.get()),
+        target,
+        CanonicalValue::Unsigned(u64::from(max_uses)),
+        utc_value(expires_at_ms),
+        proof,
+    ]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn federated_issue_invite_body(
+    active: &ActiveDevice,
+    identity_origin: &str,
+    scope: GroupScope,
+    path: &str,
+    idempotency_key: &str,
+    issued_at: i64,
+    expected_revision: Revision,
+    target_identity_id: Option<IdentityId>,
+    max_uses: u32,
+    expires_at_ms: i64,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let target = target_identity_id.map_or(CanonicalValue::Null, |identity_id| {
+        CanonicalValue::Text(identity_id.to_string())
+    });
+    let signable = numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Unsigned(expected_revision.get()),
+        target.clone(),
+        CanonicalValue::Unsigned(u64::from(max_uses)),
+        utc_value(expires_at_ms),
+    ]);
+    let proof = federated_action_proof(
+        4,
+        active,
+        identity_origin,
+        scope,
+        path,
+        idempotency_key,
+        &signable,
+        issued_at,
+    )?;
     encode(&numbered_map(vec![
         CanonicalValue::Unsigned(1),
         CanonicalValue::Unsigned(expected_revision.get()),
@@ -533,6 +1093,7 @@ fn join_request_body(
     scope: GroupScope,
     path: &str,
     idempotency_key: &str,
+    issued_at: i64,
     command_id: RequestId,
     invite_id: InviteCapabilityId,
     expected_revision: Revision,
@@ -545,7 +1106,55 @@ fn join_request_body(
         CanonicalValue::Unsigned(expected_revision.get()),
         CanonicalValue::Bytes(sequencer_head.as_bytes().to_vec()),
     ]);
-    let proof = action_proof(6, active, scope, path, idempotency_key, &signable, 1_000)?;
+    let proof = action_proof(
+        6,
+        active,
+        scope,
+        path,
+        idempotency_key,
+        &signable,
+        issued_at,
+    )?;
+    encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Text(command_id.to_string()),
+        CanonicalValue::Text(invite_id.to_string()),
+        CanonicalValue::Unsigned(expected_revision.get()),
+        CanonicalValue::Bytes(sequencer_head.as_bytes().to_vec()),
+        proof,
+    ]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn federated_join_request_body(
+    active: &ActiveDevice,
+    identity_origin: &str,
+    scope: GroupScope,
+    path: &str,
+    idempotency_key: &str,
+    issued_at: i64,
+    command_id: RequestId,
+    invite_id: InviteCapabilityId,
+    expected_revision: Revision,
+    sequencer_head: Sha256Digest,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let signable = numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Text(command_id.to_string()),
+        CanonicalValue::Text(invite_id.to_string()),
+        CanonicalValue::Unsigned(expected_revision.get()),
+        CanonicalValue::Bytes(sequencer_head.as_bytes().to_vec()),
+    ]);
+    let proof = federated_action_proof(
+        6,
+        active,
+        identity_origin,
+        scope,
+        path,
+        idempotency_key,
+        &signable,
+        issued_at,
+    )?;
     encode(&numbered_map(vec![
         CanonicalValue::Unsigned(1),
         CanonicalValue::Text(command_id.to_string()),
@@ -562,6 +1171,7 @@ fn approve_join_body(
     scope: GroupScope,
     path: &str,
     idempotency_key: &str,
+    issued_at: i64,
     command_id: RequestId,
     candidate_identity_id: IdentityId,
     candidate_device_id: DeviceId,
@@ -578,7 +1188,61 @@ fn approve_join_body(
         CanonicalValue::Unsigned(expected_revision.get()),
         CanonicalValue::Bytes(sequencer_head.as_bytes().to_vec()),
     ]);
-    let proof = action_proof(7, active, scope, path, idempotency_key, &signable, 1_000)?;
+    let proof = action_proof(
+        7,
+        active,
+        scope,
+        path,
+        idempotency_key,
+        &signable,
+        issued_at,
+    )?;
+    encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Text(command_id.to_string()),
+        CanonicalValue::Text(candidate_identity_id.to_string()),
+        CanonicalValue::Text(candidate_device_id.to_string()),
+        CanonicalValue::Text(invite_id.to_string()),
+        CanonicalValue::Unsigned(expected_revision.get()),
+        CanonicalValue::Bytes(sequencer_head.as_bytes().to_vec()),
+        proof,
+    ]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn federated_approve_join_body(
+    active: &ActiveDevice,
+    identity_origin: &str,
+    scope: GroupScope,
+    path: &str,
+    idempotency_key: &str,
+    issued_at: i64,
+    command_id: RequestId,
+    candidate_identity_id: IdentityId,
+    candidate_device_id: DeviceId,
+    invite_id: InviteCapabilityId,
+    expected_revision: Revision,
+    sequencer_head: Sha256Digest,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let signable = numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Text(command_id.to_string()),
+        CanonicalValue::Text(candidate_identity_id.to_string()),
+        CanonicalValue::Text(candidate_device_id.to_string()),
+        CanonicalValue::Text(invite_id.to_string()),
+        CanonicalValue::Unsigned(expected_revision.get()),
+        CanonicalValue::Bytes(sequencer_head.as_bytes().to_vec()),
+    ]);
+    let proof = federated_action_proof(
+        7,
+        active,
+        identity_origin,
+        scope,
+        path,
+        idempotency_key,
+        &signable,
+        issued_at,
+    )?;
     encode(&numbered_map(vec![
         CanonicalValue::Unsigned(1),
         CanonicalValue::Text(command_id.to_string()),
@@ -600,6 +1264,9 @@ fn action_proof(
     signable: &CanonicalValue,
     issued_at: i64,
 ) -> Result<CanonicalValue, Box<dyn Error>> {
+    let expires_at = issued_at
+        .checked_add(120_000)
+        .ok_or("action proof expiry overflow")?;
     let idempotency_key_hash =
         Sha256Digest::hash_domain(IDEMPOTENCY_HASH_DOMAIN, idempotency_key.as_bytes());
     let business_fields_digest = Sha256Digest::hash_domain(
@@ -616,7 +1283,7 @@ fn action_proof(
         CanonicalValue::Bytes(idempotency_key_hash.as_bytes().to_vec()),
         CanonicalValue::Bytes(business_fields_digest.as_bytes().to_vec()),
         utc_value(issued_at),
-        utc_value(PROOF_EXPIRES),
+        utc_value(expires_at),
     ]);
     let binding_digest = Sha256Digest::hash_domain(
         ACTION_BINDING_HASH_DOMAIN,
@@ -630,6 +1297,92 @@ fn action_proof(
         binding,
         CanonicalValue::Bytes(signature.to_vec()),
     ]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn federated_action_proof(
+    action: u64,
+    active: &ActiveDevice,
+    identity_origin: &str,
+    scope: GroupScope,
+    path: &str,
+    idempotency_key: &str,
+    signable: &CanonicalValue,
+    issued_at: i64,
+) -> Result<CanonicalValue, Box<dyn Error>> {
+    let expires_at = issued_at
+        .checked_add(120_000)
+        .ok_or("federated action proof expiry overflow")?;
+    let idempotency_key_hash =
+        Sha256Digest::hash_domain(IDEMPOTENCY_HASH_DOMAIN, idempotency_key.as_bytes());
+    let business_fields_digest = Sha256Digest::hash_domain(
+        BUSINESS_FIELDS_HASH_DOMAIN,
+        &encode_deterministic_cbor(signable)?,
+    );
+    let binding = numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        CanonicalValue::Unsigned(action),
+        CanonicalValue::Text(path.to_owned()),
+        scope_value(scope),
+        CanonicalValue::Text(active.identity_id.to_string()),
+        CanonicalValue::Text(active.device_id.to_string()),
+        CanonicalValue::Bytes(idempotency_key_hash.as_bytes().to_vec()),
+        CanonicalValue::Bytes(business_fields_digest.as_bytes().to_vec()),
+        utc_value(issued_at),
+        utc_value(expires_at),
+        CanonicalValue::Text(identity_origin.to_owned()),
+    ]);
+    let binding_digest = Sha256Digest::hash_domain(
+        FEDERATED_ACTION_BINDING_HASH_DOMAIN,
+        &encode_deterministic_cbor(&binding)?,
+    );
+    let mut signature_input = FEDERATED_ACTION_SIGNATURE_DOMAIN.to_vec();
+    signature_input.extend_from_slice(binding_digest.as_bytes());
+    let signature = active.device.sign(&signature_input).to_bytes();
+    Ok(numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        binding,
+        CanonicalValue::Bytes(signature.to_vec()),
+    ]))
+}
+
+fn receipt_query_proof(
+    active: &ActiveDevice,
+    identity_origin: &str,
+    scope: GroupScope,
+    path: &str,
+    command_id: RequestId,
+    issued_at: i64,
+) -> Result<String, Box<dyn Error>> {
+    let expires_at = issued_at
+        .checked_add(120_000)
+        .ok_or("receipt query proof expiry overflow")?;
+    let binding = numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        CanonicalValue::Unsigned(8),
+        CanonicalValue::Text(path.to_owned()),
+        scope_value(scope),
+        CanonicalValue::Text(command_id.to_string()),
+        CanonicalValue::Text(active.identity_id.to_string()),
+        CanonicalValue::Text(active.device_id.to_string()),
+        utc_value(issued_at),
+        utc_value(expires_at),
+        CanonicalValue::Text(identity_origin.to_owned()),
+    ]);
+    let binding_digest = Sha256Digest::hash_domain(
+        b"dirextalk.membership-receipt-query-binding.v2\0",
+        &encode_deterministic_cbor(&binding)?,
+    );
+    let mut signature_input = b"dirextalk.membership-receipt-query-signature.v2\0".to_vec();
+    signature_input.extend_from_slice(binding_digest.as_bytes());
+    let proof = numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        binding,
+        CanonicalValue::Bytes(active.device.sign(&signature_input).to_bytes().to_vec()),
+    ]);
+    Ok(Base64UrlUnpadded::encode_string(
+        &encode_deterministic_cbor(&proof)?,
+    ))
 }
 
 async fn send_mutation(
@@ -655,6 +1408,92 @@ async fn send_mutation(
     )
     .await
     .map_err(Into::into)
+}
+
+async fn send_federated_mutation(
+    app: axum::Router,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    idempotency_key: &str,
+    identity_origin: &str,
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, content_type)
+            .header("idempotency-key", idempotency_key)
+            .header(IDENTITY_ORIGIN_HEADER, identity_origin)
+            .body(Body::from(body))?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn send_federated_get(
+    app: axum::Router,
+    path: &str,
+    identity_origin: &str,
+    proof: String,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(IDENTITY_ORIGIN_HEADER, identity_origin)
+            .header(RECEIPT_QUERY_PROOF_HEADER, proof)
+            .body(Body::empty())?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_network_mutation(
+    client: &reqwest::Client,
+    group_origin: &str,
+    method: reqwest::Method,
+    path: &str,
+    content_type: &str,
+    idempotency_key: &str,
+    authorization: Option<String>,
+    identity_origin: Option<&str>,
+    body: Vec<u8>,
+) -> Result<reqwest::Response, Box<dyn Error>> {
+    if authorization.is_some() && identity_origin.is_some() {
+        return Err(
+            "network acceptance request cannot mix local and federated authentication".into(),
+        );
+    }
+    let mut request = client
+        .request(method, format!("{group_origin}{path}"))
+        .header(header::CONTENT_TYPE.as_str(), content_type)
+        .header("idempotency-key", idempotency_key)
+        .body(body);
+    if let Some(authorization) = authorization {
+        request = request.header(header::AUTHORIZATION.as_str(), authorization);
+    }
+    if let Some(identity_origin) = identity_origin {
+        request = request.header(IDENTITY_ORIGIN_HEADER, identity_origin);
+    }
+    Ok(request.send().await?)
+}
+
+async fn send_network_receipt_query(
+    client: &reqwest::Client,
+    group_origin: &str,
+    path: &str,
+    identity_origin: &str,
+    proof: String,
+) -> Result<reqwest::Response, Box<dyn Error>> {
+    Ok(client
+        .get(format!("{group_origin}{path}"))
+        .header(IDENTITY_ORIGIN_HEADER, identity_origin)
+        .header(RECEIPT_QUERY_PROOF_HEADER, proof)
+        .send()
+        .await?)
 }
 
 async fn send_get(

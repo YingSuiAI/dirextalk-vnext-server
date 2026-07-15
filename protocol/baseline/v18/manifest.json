@@ -1,0 +1,10 @@
+{
+  "version": 18,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/membership-federation/v1/membership-federation-v1.cddl": "sha256:68b19ba29b5a24a3b5e8244dcb3311f436fcb95503b7af90a560a847fc5a8527",
+    "protocol/openapi/membership-federation/v1/openapi.yaml": "sha256:f940ba938eb387e0919e152cda715738a487f3a313ec48d3cf4a53724878c84b",
+    "protocol/test-vectors/membership-federation/v1/membership-federation-v1.json": "sha256:fac190ef8338098d2e05258ccfdb08d8018f83785f3d6436269e056fc0ee32b0"
+  }
+}

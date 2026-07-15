@@ -130,11 +130,152 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_public_descriptor_v1(root)?;
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
+    validate_membership_federation_v1(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_membership_federation_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl_path =
+        root.join("protocol/cddl/membership-federation/v1/membership-federation-v1.cddl");
+    let cddl = read(&cddl_path)?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse membership-federation v1 CDDL {}: {error}",
+            cddl_path.display()
+        ))
+    })?;
+
+    let vector = read_json(
+        &root.join("protocol/test-vectors/membership-federation/v1/membership-federation-v1.json"),
+    )?;
+    validate_vector_version(&vector, "membership-federation-v1")?;
+    for (field, expected) in [
+        (
+            "action_binding_hash_domain",
+            "dirextalk.membership-action-binding.v2\0",
+        ),
+        (
+            "action_signature_domain",
+            "dirextalk.membership-action-signature.v2\0",
+        ),
+        (
+            "receipt_query_binding_hash_domain",
+            "dirextalk.membership-receipt-query-binding.v2\0",
+        ),
+        (
+            "receipt_query_signature_domain",
+            "dirextalk.membership-receipt-query-signature.v2\0",
+        ),
+    ] {
+        if json_string(&vector, field)? != expected {
+            return Err(ProtocolToolError::new(format!(
+                "membership-federation-v1 {field} drift"
+            )));
+        }
+    }
+    let origin = json_string(&vector, "identity_origin")?;
+    if !origin.starts_with("https://") || origin.ends_with('/') || origin.contains(['?', '#']) {
+        return Err(ProtocolToolError::new(
+            "membership-federation-v1 identity_origin must be a canonical HTTPS origin without a trailing slash",
+        ));
+    }
+
+    validate_membership_federation_proof_vector(&vector, &cddl)?;
+
+    let openapi_path = root.join("protocol/openapi/membership-federation/v1/openapi.yaml");
+    let openapi_source = read(&openapi_path)?;
+    let openapi = oas3::from_yaml(&openapi_source).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse membership-federation OpenAPI {}: {error}",
+            openapi_path.display()
+        ))
+    })?;
+    if openapi.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "membership-federation OpenAPI must declare 3.1.0",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_membership_federation_proof_vector(
+    vector: &Value,
+    cddl: &str,
+) -> Result<(), ProtocolToolError> {
+    const BINDING_DOMAIN: &[u8] = b"dirextalk.membership-receipt-query-binding.v2\0";
+    const SIGNATURE_DOMAIN: &[u8] = b"dirextalk.membership-receipt-query-signature.v2\0";
+
+    validate_cddl_hex(
+        "federated-receipt-query-binding-v2",
+        cddl,
+        json_string(vector, "receipt_query_binding_canonical_cbor_hex")?,
+    )?;
+    validate_cddl_hex(
+        "federated-receipt-query-proof-v2",
+        cddl,
+        json_string(vector, "receipt_query_proof_canonical_cbor_hex")?,
+    )?;
+
+    let binding = decode_hex(json_string(
+        vector,
+        "receipt_query_binding_canonical_cbor_hex",
+    )?)?;
+    let mut hasher = Sha256::new();
+    hasher.update(BINDING_DOMAIN);
+    hasher.update(&binding);
+    let digest: [u8; 32] = hasher.finalize().into();
+    if lowercase_hex(&digest) != json_string(vector, "receipt_query_binding_digest_hex")? {
+        return Err(ProtocolToolError::new(
+            "membership-federation-v1 receipt query binding digest drift",
+        ));
+    }
+    let mut signature_input = Vec::with_capacity(SIGNATURE_DOMAIN.len() + digest.len());
+    signature_input.extend_from_slice(SIGNATURE_DOMAIN);
+    signature_input.extend_from_slice(&digest);
+    if lowercase_hex(&signature_input) != json_string(vector, "receipt_query_signature_input_hex")?
+    {
+        return Err(ProtocolToolError::new(
+            "membership-federation-v1 receipt query signature input drift",
+        ));
+    }
+
+    let exact_proof = decode_hex(json_string(
+        vector,
+        "receipt_query_proof_canonical_cbor_hex",
+    )?)?;
+    let encoded_proof =
+        Base64UrlUnpadded::decode_vec(json_string(vector, "receipt_query_proof_base64url")?)
+            .map_err(|_| {
+                ProtocolToolError::new(
+                    "membership-federation-v1 receipt query proof must be unpadded base64url",
+                )
+            })?;
+    if encoded_proof != exact_proof {
+        return Err(ProtocolToolError::new(
+            "membership-federation-v1 base64url and canonical CBOR proof differ",
+        ));
+    }
+
+    let public_key =
+        decode_lower_hex_fixed::<32>(json_string(vector, "device_signing_public_key_hex")?)?;
+    let signature =
+        decode_lower_hex_fixed::<64>(json_string(vector, "receipt_query_signature_hex")?)?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key).map_err(|_| {
+        ProtocolToolError::new("membership-federation-v1 device signing public key is not Ed25519")
+    })?;
+    verifying_key
+        .verify_strict(&signature_input, &Signature::from_bytes(&signature))
+        .map_err(|_| {
+            ProtocolToolError::new(
+                "membership-federation-v1 receipt query signature does not verify",
+            )
+        })?;
+
     Ok(())
 }
 
@@ -2537,7 +2678,9 @@ fn valid_contact_card_port(port: &str) -> bool {
 }
 
 fn looks_like_whatwg_ipv4_host(host: &str) -> bool {
-    host.split('.').next_back().is_some_and(is_whatwg_ipv4_number)
+    host.split('.')
+        .next_back()
+        .is_some_and(is_whatwg_ipv4_number)
 }
 
 fn is_whatwg_ipv4_number(part: &str) -> bool {
@@ -3072,16 +3215,20 @@ mod tests {
 
     #[test]
     fn identity_id_rejects_noncanonical_base32_tail_bits() {
-        assert!(validate_identity_id(
-            "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobiq",
-            "test identity"
-        )
-        .is_ok());
-        assert!(validate_identity_id(
-            "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobir",
-            "test identity"
-        )
-        .is_err());
+        assert!(
+            validate_identity_id(
+                "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobiq",
+                "test identity"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_identity_id(
+                "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobir",
+                "test identity"
+            )
+            .is_err()
+        );
     }
 
     #[test]

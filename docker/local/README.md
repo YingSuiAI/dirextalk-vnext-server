@@ -44,13 +44,19 @@ to validate network isolation or production credential boundaries.
 
 It exercises identity, opaque mailbox, and group-command services on three
 separate node databases. Each Group Node has a fixed, non-secret local tenant
-identifier and reads the identity session projection from its own logical
-database; it does not need to proxy through the Identity HTTP endpoint.
-current services do not yet federate identity or group state between A/B/C, so
-this topology is the target environment for the upcoming cross-node
-Owner/Admin/invitee workflow; service health alone does not prove that workflow.
-Each runtime principal has only the explicit group-write and identity-session-read
-permissions needed for that path.
+identifier. Local actors use that node's session projection; federated actors
+send an origin-bound device proof and the Group Node fetches the actor's
+self-authenticated identity log from the matching A/B/C Identity Node. Exact
+HTTP origins are allowed only by this development configuration. Each runtime
+principal has only the explicit permissions needed for its path.
+
+The explicit ignored integration test
+`three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recovery`
+requires a freshly reset disposable volume and
+`DTX_THREE_NODE_COMPOSE_ACCEPTANCE=1`. It proves A Owner → B Admin → B invite →
+C join → B approval plus fresh C receipt-query recovery across the three
+logical node databases. Normal Compose health checks do not substitute for
+this workflow acceptance.
 
 The Group Node provides the durable policy/membership command boundary only.
 MLS commit reconciliation, public-channel discovery, contact acceptance, and

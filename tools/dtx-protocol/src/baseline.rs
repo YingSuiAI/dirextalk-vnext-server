@@ -80,6 +80,11 @@ const V17_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/membership/v1",
     "protocol/test-vectors/membership/v1",
 ];
+const V18_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/membership-federation/v1",
+    "protocol/openapi/membership-federation/v1",
+    "protocol/test-vectors/membership-federation/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -197,6 +202,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v17/manifest.json",
         includes_registries: false,
         artifact_paths: V17_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 18,
+        path: "protocol/baseline/v18/manifest.json",
+        includes_registries: false,
+        artifact_paths: V18_ARTIFACT_PATHS,
     },
 ];
 

@@ -6,6 +6,8 @@
 //! not invent an MLS result: a later Sequencer adapter is the only component
 //! allowed to turn that intent into a committed membership fact.
 
+mod federated_identity;
+
 use std::sync::Arc;
 
 use axum::{
@@ -24,7 +26,7 @@ use dtx_domain::{
 use dtx_group_persistence::{
     GroupControlCommand, GroupControlDisposition, GroupControlExecution, GroupControlOperation,
     GroupControlReceipt, GroupControlRejection, GroupControlRepository, GroupMembershipRepository,
-    GroupPersistenceError, GroupPgStore, MembershipCommandExecution,
+    GroupPersistenceError, GroupPgStore, MembershipCommandExecution, VerifiedDeviceActor,
 };
 use dtx_group_policy::GroupScope;
 use dtx_identity_persistence::DeviceSessionCredential;
@@ -39,6 +41,20 @@ use dtx_wire::{
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Serialize;
+
+use crate::federated_identity::{FederatedIdentityError, FederatedIdentityVerifier};
+
+/// Invalid local-development federation configuration.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupNodeConfigurationError(FederatedIdentityError);
+
+impl std::fmt::Display for GroupNodeConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for GroupNodeConfigurationError {}
 
 /// Group creation path template.
 pub const GROUP_SCOPE_PATH_TEMPLATE: &str = "/v1/groups/{scope_kind}/{scope_id}";
@@ -92,6 +108,10 @@ pub const MEMBERSHIP_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.membership-receipt.v1+cbor";
 /// Exact authorization scheme for active device sessions.
 pub const DEVICE_SESSION_AUTHORIZATION_SCHEME: &str = "DTX-Device-Session";
+/// Canonical HTTPS origin serving the actor's self-authenticated identity log.
+pub const IDENTITY_ORIGIN_HEADER: &str = "dtx-identity-origin";
+/// Base64url canonical-CBOR proof authorizing a federated receipt lookup.
+pub const RECEIPT_QUERY_PROOF_HEADER: &str = "dtx-receipt-query-proof";
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -106,6 +126,10 @@ const IDEMPOTENCY_HASH_DOMAIN: &[u8] = b"dirextalk.membership-idempotency-key.v1
 const BUSINESS_FIELDS_HASH_DOMAIN: &[u8] = b"dirextalk.membership-action-business-fields.v1\0";
 const ACTION_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.membership-action-binding.v1\0";
 const ACTION_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.membership-action-signature.v1\0";
+const FEDERATED_ACTION_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.membership-action-binding.v2\0";
+const FEDERATED_ACTION_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.membership-action-signature.v2\0";
+const RECEIPT_QUERY_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.membership-receipt-query-binding.v2\0";
+const RECEIPT_QUERY_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.membership-receipt-query-signature.v2\0";
 const CONTROL_COMMAND_HASH_DOMAIN: &[u8] = b"dirextalk.group-control-command.v1\0";
 
 /// Shared state for a node that serves one trusted configured tenant.
@@ -115,6 +139,7 @@ pub struct GroupNodeState {
     tenant_id: TenantId,
     control_repository: GroupControlRepository,
     membership_repository: GroupMembershipRepository,
+    federated_identity: FederatedIdentityVerifier,
     clock: Arc<dyn Clock>,
 }
 
@@ -126,15 +151,38 @@ impl GroupNodeState {
     }
 
     /// Creates state with a deterministic clock for boundary tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed HTTPS-only Rustls client cannot be constructed.
     #[must_use]
     pub fn with_clock(store: GroupPgStore, tenant_id: TenantId, clock: Arc<dyn Clock>) -> Self {
+        let federated_identity = FederatedIdentityVerifier::new(std::iter::empty())
+            .expect("the fixed HTTPS-only federated identity client is valid");
         Self {
             store,
             tenant_id,
             control_repository: GroupControlRepository,
             membership_repository: GroupMembershipRepository,
+            federated_identity,
             clock,
         }
+    }
+
+    /// Allows exact HTTP identity origins only for an explicitly configured
+    /// trusted local-development topology. Production origins remain HTTPS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupNodeConfigurationError`] when an origin is not an exact
+    /// canonical HTTP origin or the bounded verifier client cannot be built.
+    pub fn with_allowed_http_identity_origins(
+        mut self,
+        origins: impl IntoIterator<Item = String>,
+    ) -> Result<Self, GroupNodeConfigurationError> {
+        self.federated_identity =
+            FederatedIdentityVerifier::new(origins).map_err(GroupNodeConfigurationError)?;
+        Ok(self)
     }
 
     fn now(&self) -> Result<UtcMillis, GroupFailure> {
@@ -144,6 +192,71 @@ impl GroupNodeState {
             .and_then(|value| {
                 UtcMillis::new(value).map_err(|_| GroupFailure::TemporarilyUnavailable)
             })
+    }
+
+    async fn federated_actor(
+        &self,
+        headers: &HeaderMap,
+        proof: &ActionProof,
+    ) -> Result<Option<VerifiedDeviceActor>, GroupFailure> {
+        let Some(origin) = single_optional_header(headers, IDENTITY_ORIGIN_HEADER)? else {
+            if proof.identity_origin.is_some() {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            return Ok(None);
+        };
+        if headers.contains_key(header::AUTHORIZATION)
+            || proof.identity_origin.as_deref() != Some(origin)
+        {
+            return Err(GroupFailure::ActionProofInvalid);
+        }
+        let signing_key = self
+            .federated_identity
+            .active_device_signing_key(origin, proof.actor_identity_id, proof.actor_device_id)
+            .await
+            .map_err(map_federated_identity_error)?;
+        Ok(Some(VerifiedDeviceActor::new(
+            proof.actor_identity_id,
+            proof.actor_device_id,
+            signing_key,
+        )))
+    }
+
+    async fn federated_receipt_actor(
+        &self,
+        headers: &HeaderMap,
+        proof: &ReceiptQueryProof,
+        expected_path: &str,
+        expected_scope: GroupScope,
+        expected_command_id: MembershipCommandId,
+        now: UtcMillis,
+    ) -> Result<Option<VerifiedDeviceActor>, GroupFailure> {
+        let Some(origin) = single_optional_header(headers, IDENTITY_ORIGIN_HEADER)? else {
+            if headers.contains_key(RECEIPT_QUERY_PROOF_HEADER) {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            return Ok(None);
+        };
+        if headers.contains_key(header::AUTHORIZATION) || proof.identity_origin != origin {
+            return Err(GroupFailure::ActionProofInvalid);
+        }
+        let signing_key = self
+            .federated_identity
+            .active_device_signing_key(origin, proof.actor_identity_id, proof.actor_device_id)
+            .await
+            .map_err(map_federated_identity_error)?;
+        proof.verify(
+            expected_path,
+            expected_scope,
+            expected_command_id,
+            now,
+            signing_key,
+        )?;
+        Ok(Some(VerifiedDeviceActor::new(
+            proof.actor_identity_id,
+            proof.actor_device_id,
+            signing_key,
+        )))
     }
 
     #[allow(clippy::too_many_arguments)] // The explicit proof-bound values are the security contract; a one-use parameter bag would obscure them at each route.
@@ -158,7 +271,6 @@ impl GroupNodeState {
         operation: GroupControlOperation,
         now: UtcMillis,
     ) -> Result<GroupControlExecution, GroupFailure> {
-        let credential = parse_device_session_authorization(headers)?;
         let idempotency_key_hash = idempotency_key_hash(headers)?;
         let business_digest = canonical_hash(BUSINESS_FIELDS_HASH_DOMAIN, &signable)?;
         let binding_digest = proof.binding_digest()?;
@@ -179,28 +291,52 @@ impl GroupNodeState {
             request_digest,
             binding_digest,
         );
-        let execution = self
-            .control_repository
-            .execute_authenticated_with_proof_outcome(
-                &self.store,
-                self.tenant_id,
-                &credential,
-                command,
-                now.get(),
-                move |signing_key| {
-                    proof.verify(
-                        action,
-                        &expected_path,
-                        scope,
-                        idempotency_key_hash,
-                        business_digest,
-                        now,
-                        signing_key,
-                    )
-                },
-            )
-            .await
-            .map_err(|error| map_persistence_error(&error))?;
+        let federated_actor = self.federated_actor(headers, &proof).await?;
+        let execution = if let Some(actor) = federated_actor {
+            self.control_repository
+                .execute_verified_with_proof_outcome(
+                    &self.store,
+                    self.tenant_id,
+                    actor,
+                    command,
+                    now.get(),
+                    move |signing_key| {
+                        proof.verify(
+                            action,
+                            &expected_path,
+                            scope,
+                            idempotency_key_hash,
+                            business_digest,
+                            now,
+                            signing_key,
+                        )
+                    },
+                )
+                .await
+        } else {
+            let credential = parse_device_session_authorization(headers)?;
+            self.control_repository
+                .execute_authenticated_with_proof_outcome(
+                    &self.store,
+                    self.tenant_id,
+                    &credential,
+                    command,
+                    now.get(),
+                    move |signing_key| {
+                        proof.verify(
+                            action,
+                            &expected_path,
+                            scope,
+                            idempotency_key_hash,
+                            business_digest,
+                            now,
+                            signing_key,
+                        )
+                    },
+                )
+                .await
+        }
+        .map_err(|error| map_persistence_error(&error))?;
         Ok(execution)
     }
 
@@ -212,7 +348,6 @@ impl GroupNodeState {
         parsed: JoinRequestBody,
         now: UtcMillis,
     ) -> Result<MembershipCommandExecution, GroupFailure> {
-        let credential = parse_device_session_authorization(headers)?;
         let idempotency_key_hash = idempotency_key_hash(headers)?;
         let signable = join_request_signable(&parsed);
         let business_digest = canonical_hash(BUSINESS_FIELDS_HASH_DOMAIN, &signable)?;
@@ -229,28 +364,54 @@ impl GroupNodeState {
             parsed.invite_id,
             MembershipFence::new(parsed.expected_revision, parsed.sequencer_head),
         );
-        self.membership_repository
-            .request_join_authenticated_with_proof_outcome(
-                &self.store,
-                self.tenant_id,
-                &credential,
-                JoinRequestCommand::new(context),
-                CandidateMembership::NotMember,
-                now.get(),
-                move |signing_key| {
-                    proof.verify(
-                        GroupAction::RequestJoin,
-                        &expected_path,
-                        scope,
-                        idempotency_key_hash,
-                        business_digest,
-                        now,
-                        signing_key,
-                    )
-                },
-            )
-            .await
-            .map_err(|error| map_persistence_error(&error))
+        let federated_actor = self.federated_actor(headers, &proof).await?;
+        let result = if let Some(actor) = federated_actor {
+            self.membership_repository
+                .request_join_verified_with_proof_outcome(
+                    &self.store,
+                    self.tenant_id,
+                    actor,
+                    JoinRequestCommand::new(context),
+                    CandidateMembership::NotMember,
+                    now.get(),
+                    move |signing_key| {
+                        proof.verify(
+                            GroupAction::RequestJoin,
+                            &expected_path,
+                            scope,
+                            idempotency_key_hash,
+                            business_digest,
+                            now,
+                            signing_key,
+                        )
+                    },
+                )
+                .await
+        } else {
+            let credential = parse_device_session_authorization(headers)?;
+            self.membership_repository
+                .request_join_authenticated_with_proof_outcome(
+                    &self.store,
+                    self.tenant_id,
+                    &credential,
+                    JoinRequestCommand::new(context),
+                    CandidateMembership::NotMember,
+                    now.get(),
+                    move |signing_key| {
+                        proof.verify(
+                            GroupAction::RequestJoin,
+                            &expected_path,
+                            scope,
+                            idempotency_key_hash,
+                            business_digest,
+                            now,
+                            signing_key,
+                        )
+                    },
+                )
+                .await
+        };
+        result.map_err(|error| map_persistence_error(&error))
     }
 
     async fn approve_join(
@@ -261,7 +422,6 @@ impl GroupNodeState {
         parsed: ApproveJoinBody,
         now: UtcMillis,
     ) -> Result<MembershipCommandExecution, GroupFailure> {
-        let credential = parse_device_session_authorization(headers)?;
         let idempotency_key_hash = idempotency_key_hash(headers)?;
         let signable = approve_join_signable(&parsed);
         let business_digest = canonical_hash(BUSINESS_FIELDS_HASH_DOMAIN, &signable)?;
@@ -279,28 +439,54 @@ impl GroupNodeState {
             parsed.invite_id,
             MembershipFence::new(parsed.expected_revision, parsed.sequencer_head),
         );
-        self.membership_repository
-            .approve_join_authenticated_with_proof_outcome(
-                &self.store,
-                self.tenant_id,
-                &credential,
-                ApproveJoinCommand::new(context, authorization_digest),
-                CandidateMembership::NotMember,
-                now.get(),
-                move |signing_key| {
-                    proof.verify(
-                        GroupAction::ApproveJoin,
-                        &expected_path,
-                        scope,
-                        idempotency_key_hash,
-                        business_digest,
-                        now,
-                        signing_key,
-                    )
-                },
-            )
-            .await
-            .map_err(|error| map_persistence_error(&error))
+        let federated_actor = self.federated_actor(headers, &proof).await?;
+        let result = if let Some(actor) = federated_actor {
+            self.membership_repository
+                .approve_join_verified_with_proof_outcome(
+                    &self.store,
+                    self.tenant_id,
+                    actor,
+                    ApproveJoinCommand::new(context, authorization_digest),
+                    CandidateMembership::NotMember,
+                    now.get(),
+                    move |signing_key| {
+                        proof.verify(
+                            GroupAction::ApproveJoin,
+                            &expected_path,
+                            scope,
+                            idempotency_key_hash,
+                            business_digest,
+                            now,
+                            signing_key,
+                        )
+                    },
+                )
+                .await
+        } else {
+            let credential = parse_device_session_authorization(headers)?;
+            self.membership_repository
+                .approve_join_authenticated_with_proof_outcome(
+                    &self.store,
+                    self.tenant_id,
+                    &credential,
+                    ApproveJoinCommand::new(context, authorization_digest),
+                    CandidateMembership::NotMember,
+                    now.get(),
+                    move |signing_key| {
+                        proof.verify(
+                            GroupAction::ApproveJoin,
+                            &expected_path,
+                            scope,
+                            idempotency_key_hash,
+                            business_digest,
+                            now,
+                            signing_key,
+                        )
+                    },
+                )
+                .await
+        };
+        result.map_err(|error| map_persistence_error(&error))
     }
 }
 
@@ -595,20 +781,42 @@ async fn get_membership_receipt(
         );
         require_exact_route(&parts.uri, &expected_path)?;
         require_empty_get(&parts.headers, body).await?;
-        let credential = parse_device_session_authorization(&parts.headers)?;
         let now = state.now()?;
-        let receipt = state
-            .membership_repository
-            .load_receipt_authenticated(
-                &state.store,
-                state.tenant_id,
-                &credential,
-                scope,
-                command_id,
-                now.get(),
-            )
-            .await
-            .map_err(|error| map_persistence_error(&error))?;
+        let query_proof = parse_receipt_query_proof_header(&parts.headers)?;
+        let receipt = if let Some(query_proof) = query_proof {
+            let actor = state
+                .federated_receipt_actor(
+                    &parts.headers,
+                    &query_proof,
+                    &expected_path,
+                    scope,
+                    command_id,
+                    now,
+                )
+                .await?
+                .ok_or(GroupFailure::ActionProofInvalid)?;
+            state
+                .membership_repository
+                .load_receipt_verified(&state.store, state.tenant_id, actor, scope, command_id)
+                .await
+        } else {
+            if parts.headers.contains_key(IDENTITY_ORIGIN_HEADER) {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            let credential = parse_device_session_authorization(&parts.headers)?;
+            state
+                .membership_repository
+                .load_receipt_authenticated(
+                    &state.store,
+                    state.tenant_id,
+                    &credential,
+                    scope,
+                    command_id,
+                    now.get(),
+                )
+                .await
+        }
+        .map_err(|error| map_persistence_error(&error))?;
         Ok(cbor_response(
             StatusCode::OK,
             encode_membership_receipt(receipt)?,
@@ -921,13 +1129,14 @@ struct ActionProof {
     business_fields_digest: Sha256Digest,
     issued_at: UtcMillis,
     expires_at: UtcMillis,
+    identity_origin: Option<String>,
     signature: [u8; 64],
 }
 
 impl ActionProof {
     fn binding_value(&self) -> CanonicalValue {
-        numbered_map(vec![
-            CanonicalValue::Unsigned(1),
+        let mut fields = vec![
+            CanonicalValue::Unsigned(if self.identity_origin.is_some() { 2 } else { 1 }),
             CanonicalValue::Unsigned(self.action.code()),
             CanonicalValue::Text(self.path.clone()),
             scope_value(self.scope),
@@ -937,11 +1146,31 @@ impl ActionProof {
             CanonicalValue::Bytes(self.business_fields_digest.as_bytes().to_vec()),
             utc_value(self.issued_at),
             utc_value(self.expires_at),
-        ])
+        ];
+        if let Some(origin) = &self.identity_origin {
+            fields.push(CanonicalValue::Text(origin.clone()));
+        }
+        numbered_map(fields)
     }
 
     fn binding_digest(&self) -> Result<Sha256Digest, GroupFailure> {
-        canonical_hash(ACTION_BINDING_HASH_DOMAIN, &self.binding_value())
+        canonical_hash(self.binding_hash_domain(), &self.binding_value())
+    }
+
+    const fn binding_hash_domain(&self) -> &'static [u8] {
+        if self.identity_origin.is_some() {
+            FEDERATED_ACTION_BINDING_HASH_DOMAIN
+        } else {
+            ACTION_BINDING_HASH_DOMAIN
+        }
+    }
+
+    const fn signature_domain(&self) -> &'static [u8] {
+        if self.identity_origin.is_some() {
+            FEDERATED_ACTION_SIGNATURE_DOMAIN
+        } else {
+            ACTION_SIGNATURE_DOMAIN
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // All independently bound proof coordinates are intentionally visible at the verification call site.
@@ -973,10 +1202,10 @@ impl ActionProof {
         }
         let binding = encode_deterministic_cbor(&self.binding_value())
             .map_err(|_| GroupPersistenceError::ActionProofRejected)?;
-        let binding_digest = Sha256Digest::hash_domain(ACTION_BINDING_HASH_DOMAIN, &binding);
+        let binding_digest = Sha256Digest::hash_domain(self.binding_hash_domain(), &binding);
         let mut signature_input =
-            Vec::with_capacity(ACTION_SIGNATURE_DOMAIN.len() + binding_digest.as_bytes().len());
-        signature_input.extend_from_slice(ACTION_SIGNATURE_DOMAIN);
+            Vec::with_capacity(self.signature_domain().len() + binding_digest.as_bytes().len());
+        signature_input.extend_from_slice(self.signature_domain());
         signature_input.extend_from_slice(binding_digest.as_bytes());
         let verifying_key = VerifyingKey::from_bytes(signing_key.as_bytes())
             .map_err(|_| GroupPersistenceError::ActionProofRejected)?;
@@ -986,11 +1215,118 @@ impl ActionProof {
     }
 }
 
+struct ReceiptQueryProof {
+    path: String,
+    scope: GroupScope,
+    command_id: MembershipCommandId,
+    actor_identity_id: IdentityId,
+    actor_device_id: DeviceId,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    identity_origin: String,
+    signature: [u8; 64],
+}
+
+impl ReceiptQueryProof {
+    fn binding_value(&self) -> CanonicalValue {
+        numbered_map(vec![
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Text(self.path.clone()),
+            scope_value(self.scope),
+            CanonicalValue::Text(self.command_id.request_id().to_string()),
+            CanonicalValue::Text(self.actor_identity_id.to_string()),
+            CanonicalValue::Text(self.actor_device_id.to_string()),
+            utc_value(self.issued_at),
+            utc_value(self.expires_at),
+            CanonicalValue::Text(self.identity_origin.clone()),
+        ])
+    }
+
+    fn verify(
+        &self,
+        expected_path: &str,
+        expected_scope: GroupScope,
+        expected_command_id: MembershipCommandId,
+        now: UtcMillis,
+        signing_key: SigningPublicKey,
+    ) -> Result<(), GroupFailure> {
+        let lifetime = self
+            .expires_at
+            .get()
+            .checked_sub(self.issued_at.get())
+            .ok_or(GroupFailure::ActionProofInvalid)?;
+        if self.path != expected_path
+            || self.scope != expected_scope
+            || self.command_id != expected_command_id
+            || self.issued_at > now
+            || now >= self.expires_at
+            || !(1..=MAX_ACTION_PROOF_LIFETIME_MS).contains(&lifetime)
+        {
+            return Err(GroupFailure::ActionProofInvalid);
+        }
+        let binding = encode_deterministic_cbor(&self.binding_value())
+            .map_err(|_| GroupFailure::ActionProofInvalid)?;
+        let digest = Sha256Digest::hash_domain(RECEIPT_QUERY_BINDING_HASH_DOMAIN, &binding);
+        let mut signature_input =
+            Vec::with_capacity(RECEIPT_QUERY_SIGNATURE_DOMAIN.len() + digest.as_bytes().len());
+        signature_input.extend_from_slice(RECEIPT_QUERY_SIGNATURE_DOMAIN);
+        signature_input.extend_from_slice(digest.as_bytes());
+        let verifying_key = VerifyingKey::from_bytes(signing_key.as_bytes())
+            .map_err(|_| GroupFailure::ActionProofInvalid)?;
+        verifying_key
+            .verify_strict(&signature_input, &Signature::from_bytes(&self.signature))
+            .map_err(|_| GroupFailure::ActionProofInvalid)
+    }
+}
+
+fn parse_receipt_query_proof_header(
+    headers: &HeaderMap,
+) -> Result<Option<ReceiptQueryProof>, GroupFailure> {
+    let Some(encoded) = single_optional_header(headers, RECEIPT_QUERY_PROOF_HEADER)? else {
+        return Ok(None);
+    };
+    if encoded.len() > 1_024 || !encoded.bytes().all(is_base64url_byte) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let mut decoded = vec![0_u8; encoded.len()];
+    let exact = Base64UrlUnpadded::decode(encoded, &mut decoded)
+        .map_err(|_| GroupFailure::InvalidRequest)?;
+    let value = decode_deterministic_cbor(exact).map_err(|_| GroupFailure::InvalidRequest)?;
+    let fields = exact_fields(&value, 3)?;
+    if parse_proof_version(field(fields, 1)?)? != 2 {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let binding = exact_fields(field(fields, 2)?, 10)?;
+    if parse_proof_version(field(binding, 1)?)? != 2
+        || field(binding, 2)? != &CanonicalValue::Unsigned(8)
+    {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    Ok(Some(ReceiptQueryProof {
+        path: parse_text(field(binding, 3)?, 1, 512)?,
+        scope: parse_scope_value(field(binding, 4)?)?,
+        command_id: MembershipCommandId::new(parse_request_id(&parse_text(
+            field(binding, 5)?,
+            36,
+            36,
+        )?)?),
+        actor_identity_id: parse_identity_id_value(field(binding, 6)?)?,
+        actor_device_id: parse_device_id_value(field(binding, 7)?)?,
+        issued_at: parse_utc_millis(field(binding, 8)?)?,
+        expires_at: parse_utc_millis(field(binding, 9)?)?,
+        identity_origin: parse_text(field(binding, 10)?, 10, 512)?,
+        signature: parse_exact_bytes(field(fields, 3)?)?,
+    }))
+}
+
 fn parse_action_proof(value: &CanonicalValue) -> Result<ActionProof, GroupFailure> {
     let fields = exact_fields(value, 3)?;
-    require_version(field(fields, 1)?)?;
-    let binding = exact_fields(field(fields, 2)?, 10)?;
-    require_version(field(binding, 1)?)?;
+    let proof_version = parse_proof_version(field(fields, 1)?)?;
+    let binding = exact_fields(field(fields, 2)?, if proof_version == 2 { 11 } else { 10 })?;
+    if parse_proof_version(field(binding, 1)?)? != proof_version {
+        return Err(GroupFailure::InvalidRequest);
+    }
     Ok(ActionProof {
         action: GroupAction::parse(field(binding, 2)?)?,
         path: parse_text(field(binding, 3)?, 1, 512)?,
@@ -1001,8 +1337,20 @@ fn parse_action_proof(value: &CanonicalValue) -> Result<ActionProof, GroupFailur
         business_fields_digest: parse_digest(field(binding, 8)?)?,
         issued_at: parse_utc_millis(field(binding, 9)?)?,
         expires_at: parse_utc_millis(field(binding, 10)?)?,
+        identity_origin: if proof_version == 2 {
+            Some(parse_text(field(binding, 11)?, 10, 512)?)
+        } else {
+            None
+        },
         signature: parse_exact_bytes(field(fields, 3)?)?,
     })
+}
+
+fn parse_proof_version(value: &CanonicalValue) -> Result<u64, GroupFailure> {
+    match value {
+        CanonicalValue::Unsigned(version @ (1 | 2)) => Ok(*version),
+        _ => Err(GroupFailure::InvalidRequest),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1318,6 +1666,25 @@ fn has_exact_content_type(headers: &HeaderMap, expected: &'static str) -> bool {
         && values.next().is_none()
 }
 
+fn single_optional_header<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<Option<&'a str>, GroupFailure> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    value
+        .to_str()
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(Some)
+        .ok_or(GroupFailure::InvalidRequest)
+}
+
 fn idempotency_key_hash(headers: &HeaderMap) -> Result<Sha256Digest, GroupFailure> {
     let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
     let Some(value) = values.next() else {
@@ -1411,6 +1778,15 @@ enum GroupFailure {
     ActionConflict,
     IdempotencyConflict,
     TemporarilyUnavailable,
+}
+
+fn map_federated_identity_error(error: FederatedIdentityError) -> GroupFailure {
+    match error {
+        FederatedIdentityError::TemporarilyUnavailable => GroupFailure::TemporarilyUnavailable,
+        FederatedIdentityError::InvalidOrigin
+        | FederatedIdentityError::InvalidIdentityLog
+        | FederatedIdentityError::DeviceUnavailable => GroupFailure::AuthenticationRejected,
+    }
 }
 
 fn map_control_rejection(rejection: GroupControlRejection) -> GroupFailure {

@@ -19,6 +19,6 @@ pub use control::{
     GroupControlReceipt, GroupControlRejection, GroupControlRepository,
 };
 pub use error::GroupPersistenceError;
-pub use repository::{GroupMembershipRepository, MembershipCommandExecution};
+pub use repository::{GroupMembershipRepository, MembershipCommandExecution, VerifiedDeviceActor};
 pub use store::{GroupPgStore, GroupSession};
 pub use types::{PreparedSequencerAction, SequencerActionLease};
