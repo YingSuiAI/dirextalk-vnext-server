@@ -11,6 +11,7 @@
     "delivery_binding": "dirextalk.agent-provisioning-delivery-binding.v1\\0",
     "delivery_signature": "dirextalk.agent-provisioning-delivery-signature.v1\\0",
     "installed_result_commit": "dirextalk.agent-provisioning-installed.v1",
+    "installed_receipt": "dirextalk.agent-provisioning-installed-receipt.v1\\0",
     "rejected_result_commit": "dirextalk.agent-provisioning-rejected.v1"
   },
   "limits": {
@@ -35,6 +36,11 @@
     "capsule_digest_hex": "975ff4bbe1df2f1811fb80eca9437d06a616322d54be2e0b518d28eddd1fbd5a",
     "binding_digest_hex": "dea308d55293b9ddb94b2a41bae538fcfb15235f30d9c7fee2609d6a82a3c396",
     "owner_signature_hex": "7096cfa9e47bbf4f63bfadc08e25ef20b7885ae790169c49c8522a0ce1d86d673ab31d0195500b040abdf53bfb3657b877f5f8f51bbb38a04b339fc56c93ef0f"
+  },
+  "installed_receipt_golden": {
+    "bundle_revision": 1,
+    "canonical_cbor_hex": "a9010102782430313930663261352d376231632d376162632d386465662d30313233343536373839303103782430313930663261352d376231632d376162632d386465662d30313233343536373839303204782430313930663261352d376231632d376162632d386465662d30313233343536373839303305782430313930663261352d376231632d376162632d386465662d30313233343536373839303406782430313930663261352d376231632d376162632d386465662d30313233343536373839306107782430313930663261352d376231632d376162632d386465662d3031323334353637383930370801095820975ff4bbe1df2f1811fb80eca9437d06a616322d54be2e0b518d28eddd1fbd5a",
+    "digest_hex": "d67a52f79a4aa2489c0db403baac49244e7fae254a6a60e3ffba00e07189e9ce"
   },
   "invariants": {
     "independent_identity": "agent identity differs from installation owner and is bind-once",

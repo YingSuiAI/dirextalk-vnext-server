@@ -107,6 +107,22 @@ agent-provisioning-delivery-receipt-v1 = {
   8: utc-millis
 }
 
+; The sidecar success receipt is not an arbitrary digest. Agent Control
+; recomputes SHA-256("dirextalk.agent-provisioning-installed-receipt.v1\0" ||
+; deterministic-cbor(this map)) from durable delivery facts before accepting
+; AgentProvisioningInstalled.
+agent-provisioning-installed-receipt-v1 = {
+  1: 1,
+  2: uuid-v7,       ; tenant_id
+  3: uuid-v7,       ; installation_id
+  4: uuid-v7,       ; binding_id
+  5: uuid-v7,       ; agent_device_id
+  6: uuid-v7,       ; delivery_id
+  7: uuid-v7,       ; recipient_key_id
+  8: safe-uint,     ; bundle_revision
+  9: sha256         ; capsule_digest
+}
+
 agent-provisioning-revocation-request-v1 = {
   1: 1,
   2: uuid-v7,

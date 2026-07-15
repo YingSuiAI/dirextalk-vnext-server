@@ -320,7 +320,11 @@ message AgentProvisioningInstalled {
   bytes encoded_command_digest = 5; // Exact 32-byte raw command digest.
   string recipient_key_id = 6; // Exact one-time recipient UUIDv7.
   bytes capsule_digest = 7; // Exact V23 opaque capsule digest.
-  bytes installation_receipt_digest = 8; // Exact 32-byte sidecar receipt digest.
+  // SHA-256("dirextalk.agent-provisioning-installed-receipt.v1\0" || canonical
+  // CBOR numeric map binding tenant, installation, binding, Agent Device,
+  // delivery, recipient, bundle revision and capsule digest). The server
+  // recomputes it exclusively from durable delivery facts.
+  bytes installation_receipt_digest = 8;
   uint64 installed_at_millis = 9; // Connector-observed UTC Unix milliseconds.
   bytes result_digest = 10; // Exact installed-result COMMIT defined above.
 }
