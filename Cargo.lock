@@ -924,6 +924,7 @@ dependencies = [
  "dtx-wire",
  "ed25519-dalek",
  "reqwest",
+ "rustix 1.1.4",
  "rustls",
  "serde",
  "serde_json",
@@ -932,6 +933,7 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
