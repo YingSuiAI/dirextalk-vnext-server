@@ -1,0 +1,13 @@
+indexer-version-v1 = {1: 1, 2: 0}
+indexer-wire-v1 = {1: indexer-version-v1, 2: indexer-version-v1}
+uuid-v7-v1 = bstr .size 16
+digest-v1 = bstr .size 32
+subject-id-v1 = tstr .size 57
+index-registration-request-v1 = {1: indexer-wire-v1, 2: uuid-v7-v1, 3: uuid-v7-v1, 4: bstr .size (1..65536)}
+index-registration-receipt-v1 = {
+  1: indexer-wire-v1, 2: uuid-v7-v1, 3: uuid-v7-v1, 4: subject-id-v1,
+  5: 1..5, 6: 1..9007199254740991, 7: digest-v1,
+  8: 1..9007199254740991 / null, 9: digest-v1 / null, 10: tstr / null
+}
+public-search-result-v1 = {1: uuid-v7-v1, 2: subject-id-v1, 3: bstr, 4: 1 / 2}
+public-search-page-v1 = {1: indexer-wire-v1, 2: [* public-search-result-v1]}

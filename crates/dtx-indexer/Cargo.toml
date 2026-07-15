@@ -1,0 +1,20 @@
+[package]
+name = "dtx-indexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dtx-domain = { path = "../dtx-domain" }
+dtx-public-descriptor = { path = "../dtx-public-descriptor" }
+dtx-public-feed = { path = "../dtx-public-feed" }
+dtx-wire = { path = "../dtx-wire" }
+uuid.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

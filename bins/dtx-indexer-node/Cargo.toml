@@ -1,0 +1,37 @@
+[package]
+name = "dtx-indexer-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "dtx-indexer-node"
+path = "src/main.rs"
+
+[lib]
+name = "dtx_indexer_node"
+path = "src/lib.rs"
+
+[dependencies]
+axum.workspace = true
+dtx-domain = { path = "../../crates/dtx-domain" }
+dtx-indexer = { path = "../../crates/dtx-indexer" }
+dtx-public-descriptor = { path = "../../crates/dtx-public-descriptor" }
+dtx-public-feed = { path = "../../crates/dtx-public-feed" }
+dtx-wire = { path = "../../crates/dtx-wire" }
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+dtx-storage = { path = "../../crates/dtx-storage" }
+ed25519-dalek.workspace = true
+testcontainers-modules.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

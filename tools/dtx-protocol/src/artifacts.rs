@@ -141,6 +141,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
     validate_public_feed_v1(root)?;
+    validate_indexer_v1(root)?;
     validate_membership_federation_v1(root)?;
     validate_private_messaging_artifacts(root)?;
 
@@ -148,6 +149,34 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_indexer_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/indexer/v1/indexer-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse Indexer V1 CDDL: {error}")))?;
+    let source = read(&root.join("protocol/openapi/indexer/v1/openapi.yaml"))?;
+    let spec = oas3::from_yaml(&source)
+        .map_err(|error| ProtocolToolError::new(format!("parse Indexer V1 OpenAPI: {error}")))?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "Indexer V1 OpenAPI must declare 3.1.0",
+        ));
+    }
+    let vector = read_json(&root.join("protocol/test-vectors/indexer/v1/indexer-v1.json"))?;
+    validate_vector_version(&vector, "indexer-v1")?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(25) {
+        return Err(ProtocolToolError::new(
+            "Indexer V1 vector baseline must be 25",
+        ));
+    }
+    validate_uuid_fields(&vector, &["/registration_id", "/indexer_id"])?;
+    validate_cddl_hex(
+        "index-registration-request-v1",
+        &cddl,
+        json_string(&vector, "registration_request_cbor_hex")?,
+    )?;
     Ok(())
 }
 

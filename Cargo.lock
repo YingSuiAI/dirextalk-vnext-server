@@ -1027,6 +1027,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-indexer"
+version = "0.1.0"
+dependencies = [
+ "dtx-domain",
+ "dtx-public-descriptor",
+ "dtx-public-feed",
+ "dtx-wire",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "dtx-indexer-node"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dtx-domain",
+ "dtx-indexer",
+ "dtx-public-descriptor",
+ "dtx-public-feed",
+ "dtx-storage",
+ "dtx-wire",
+ "ed25519-dalek",
+ "reqwest",
+ "rustls",
+ "serde",
+ "sqlx",
+ "testcontainers-modules",
+ "tokio",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "dtx-mailbox"
 version = "0.1.0"
 dependencies = [

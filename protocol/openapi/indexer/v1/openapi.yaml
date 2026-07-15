@@ -1,0 +1,35 @@
+openapi: 3.1.0
+info: { title: Dirextalk Indexer V1, version: 1.0.0 }
+paths:
+  /v1/index-registrations:
+    post:
+      summary: Register one exact signed public descriptor at one logical Indexer
+      parameters:
+        - { name: x-dtx-deadline-ms, in: header, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.index-registration.v1+cbor:
+            schema: { type: string, contentEncoding: base64, maxLength: 65536 }
+      responses:
+        '200': { description: Exact replay or completed refresh }
+        '201': { description: Registration created }
+        '429': { description: Per-tenant logical-Indexer rate limit }
+  /v1/index-registrations/{registration_id}:
+    get:
+      parameters:
+        - { name: registration_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses: { '200': { description: Per-Indexer registration state }, '404': { description: Unknown registration } }
+  /v1/public-search:
+    get:
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 256 } }
+        - { name: kind, in: query, schema: { type: string, enum: [channel, agent] } }
+        - { name: indexer_id, in: query, required: true, schema: { type: string, format: uuid } }
+      responses: { '200': { description: Exact ID first, then PostgreSQL FTS and trigram results } }
+  /v1/public-subjects/{stable_id}:
+    get:
+      parameters:
+        - { name: stable_id, in: path, required: true, schema: { type: string, minLength: 57, maxLength: 57 } }
+        - { name: indexer_id, in: query, required: true, schema: { type: string, format: uuid } }
+      responses: { '200': { description: Exact signed descriptor }, '404': { description: Not published } }
