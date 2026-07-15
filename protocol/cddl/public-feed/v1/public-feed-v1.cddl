@@ -1,0 +1,46 @@
+; PD2 signed public feed. This schema cannot encode private MLS ciphertext,
+; mailbox tokens, attachment URLs/bytes, or moderation labels.
+public-feed-version-v1 = { 1: 1, 2: 0 }
+public-feed-wire-v1 = { 1: public-feed-version-v1, 2: public-feed-version-v1 }
+public-feed-subject-id-v1 = tstr .size 57
+public-feed-identity-id-v1 = tstr .size 57
+public-feed-digest-v1 = bstr .size 32
+public-feed-key-v1 = bstr .size 32
+public-feed-signature-v1 = bstr .size 64
+public-feed-safe-uint-v1 = 0..9007199254740991
+public-feed-positive-safe-uint-v1 = 1..9007199254740991
+public-feed-time-v1 = -62135596800000..253402300799999
+
+public-attachment-ref-v1 = {
+  1: public-feed-digest-v1,
+  2: tstr .size (1..127),
+  3: public-feed-positive-safe-uint-v1
+}
+public-post-payload-v1 = { 1: tstr .size (1..32768), 2: [* public-attachment-ref-v1] }
+public-feed-tombstone-v1 = {}
+public-feed-event-v1 = {
+  1: public-feed-wire-v1,
+  2: public-feed-subject-id-v1,
+  3: public-feed-identity-id-v1,
+  4: public-feed-key-v1,
+  5: public-feed-positive-safe-uint-v1,
+  6: public-feed-digest-v1 / null,
+  7: public-feed-time-v1,
+  8: 1 / 2,
+  9: public-post-payload-v1 / public-feed-tombstone-v1,
+  10: public-feed-signature-v1
+}
+public-feed-cursor-v1 = {
+  1: public-feed-subject-id-v1,
+  2: public-feed-safe-uint-v1,
+  3: public-feed-positive-safe-uint-v1,
+  4: public-feed-digest-v1
+}
+public-feed-page-v1 = {
+  1: public-feed-wire-v1,
+  2: public-feed-subject-id-v1,
+  3: [* bstr],
+  4: tstr / null,
+  5: public-feed-positive-safe-uint-v1,
+  6: public-feed-digest-v1
+}

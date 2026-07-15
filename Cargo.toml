@@ -6,6 +6,7 @@ members = [
     "bins/dtx-group-node",
     "bins/dtx-identity-node",
     "bins/dtx-mailbox-node",
+    "bins/dtx-public-feed-node",
     "bins/dtx-node",
     "crates/dtx-agent-control",
     "crates/dtx-agent-control-proto",
@@ -24,6 +25,7 @@ members = [
     "crates/dtx-membership-command",
     "crates/dtx-mailbox",
     "crates/dtx-public-descriptor",
+    "crates/dtx-public-feed",
     "crates/dtx-security",
     "crates/dtx-storage",
     "crates/dtx-testkit",
@@ -38,7 +40,7 @@ edition = "2024"
 rust-version = "1.97.0"
 
 [workspace.dependencies]
-axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "query", "tokio"] }
 base64ct = { version = "1.8.3", features = ["alloc"] }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
 futures-core = "0.3.32"

@@ -1,0 +1,69 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Public Feed V1
+  version: 1.0.0
+paths:
+  /.well-known/dirextalk/public/v1/{subject_id}:
+    get:
+      summary: Read the current exact signed descriptor
+      parameters:
+        - $ref: '#/components/parameters/SubjectId'
+      responses:
+        '200':
+          description: Exact canonical signed descriptor
+          headers:
+            Cache-Control: { schema: { type: string, const: 'public, max-age=60, must-revalidate' } }
+          content:
+            application/vnd.dirextalk.public-descriptor.v1.2+cbor:
+              schema: { type: string, contentEncoding: base64 }
+        '404': { description: Unknown subject }
+    put:
+      summary: Register or advance one exact publisher-signed descriptor
+      parameters:
+        - $ref: '#/components/parameters/SubjectId'
+        - { name: x-dtx-deadline-ms, in: header, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.public-descriptor.v1.2+cbor:
+            schema: { type: string, contentEncoding: base64, maxLength: 65536 }
+      responses:
+        '201': { description: Registered }
+        '200': { description: Exact replay converged }
+        '409': { description: Descriptor CAS conflict or permanent tombstone }
+  /.well-known/dirextalk/public/v1/{subject_id}/feed:
+    get:
+      summary: Read a stable snapshot page of exact signed public events
+      parameters:
+        - $ref: '#/components/parameters/SubjectId'
+        - { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+      responses:
+        '200':
+          description: Canonical feed page
+          headers:
+            Cache-Control: { schema: { type: string, const: 'public, max-age=15, must-revalidate' } }
+          content:
+            application/vnd.dirextalk.public-feed-page.v1+cbor:
+              schema: { type: string, contentEncoding: base64 }
+    post:
+      summary: Append one exact publisher-signed public event
+      parameters:
+        - $ref: '#/components/parameters/SubjectId'
+        - { name: x-dtx-deadline-ms, in: header, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.public-feed-event.v1+cbor:
+            schema: { type: string, contentEncoding: base64, maxLength: 65536 }
+      responses:
+        '201': { description: Appended }
+        '200': { description: Exact replay converged }
+        '409': { description: CAS conflict, equivocation, gap, or tombstoned feed }
+components:
+  parameters:
+    SubjectId:
+      name: subject_id
+      in: path
+      required: true
+      schema: { type: string, minLength: 57, maxLength: 57, pattern: '^dtx[ca]1[a-z2-7]{52}$' }

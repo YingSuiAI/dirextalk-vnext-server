@@ -23,7 +23,8 @@ const AGENT_RUN_EXECUTION_MIGRATION_VERSION: i64 = 202_607_160_016;
 const AGENT_RUN_CANCELLATION_MIGRATION_VERSION: i64 = 202_607_160_017;
 const MLS_COMMIT_SEQUENCER_MIGRATION_VERSION: i64 = 202_607_160_018;
 const AGENT_IDENTITY_PROVISIONING_MIGRATION_VERSION: i64 = 202_607_160_019;
-const EXPECTED_MIGRATION_COUNT: i64 = 19;
+const PUBLIC_FEED_MIGRATION_VERSION: i64 = 202_607_160_020;
+const EXPECTED_MIGRATION_COUNT: i64 = 20;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -61,6 +62,8 @@ const MLS_COMMIT_SEQUENCER_DOWN: &str =
     include_str!("../../../migrations/202607160018_mls_commit_sequencer.down.sql");
 const AGENT_IDENTITY_PROVISIONING_DOWN: &str =
     include_str!("../../../migrations/202607160019_agent_identity_provisioning.down.sql");
+const PUBLIC_FEED_DOWN: &str =
+    include_str!("../../../migrations/202607160020_public_feed.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -91,7 +94,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -112,8 +115,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(AGENT_RUN_CANCELLATION_MIGRATION_VERSION)
     .bind(MLS_COMMIT_SEQUENCER_MIGRATION_VERSION)
     .bind(AGENT_IDENTITY_PROVISIONING_MIGRATION_VERSION)
+    .bind(PUBLIC_FEED_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(PUBLIC_FEED_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(AGENT_IDENTITY_PROVISIONING_DOWN)
         .execute(harness.admin_pool())
         .await?;
@@ -197,6 +204,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .fetch_one(harness.admin_pool())
     .await?;
     assert!(!messaging_schema_exists);
+    let directory_schema_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'directory')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!directory_schema_exists);
 
     MigrationRunner::new().run(harness.admin_pool()).await?;
 

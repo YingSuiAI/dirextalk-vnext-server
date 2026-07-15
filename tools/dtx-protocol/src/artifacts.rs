@@ -38,6 +38,7 @@ const CONTACT_CARD_MAX_QR_PAYLOAD_CHARS: usize =
 ///
 /// Returns [`ProtocolToolError`] for missing, malformed, or inconsistent
 /// CDDL, `OpenAPI`, Protobuf, Buf, registry, or vector artifacts.
+#[allow(clippy::too_many_lines)] // Central artifact routing remains explicit at the protocol gate.
 pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     let cddl_root = root.join("protocol/cddl/v1");
     let common = read(&cddl_root.join("common.cddl"))?;
@@ -139,6 +140,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_public_descriptor_v1(root)?;
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
+    validate_public_feed_v1(root)?;
     validate_membership_federation_v1(root)?;
     validate_private_messaging_artifacts(root)?;
 
@@ -146,6 +148,33 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_public_feed_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl_path = root.join("protocol/cddl/public-feed/v1/public-feed-v1.cddl");
+    let cddl = read(&cddl_path)?;
+    cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse public feed V1 CDDL: {error}")))?;
+    let source = read(&root.join("protocol/openapi/public-feed/v1/openapi.yaml"))?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse public feed V1 OpenAPI: {error}"))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "public feed V1 OpenAPI must declare 3.1.0",
+        ));
+    }
+    let vector = read_json(&root.join("protocol/test-vectors/public-feed/v1/public-feed-v1.json"))?;
+    validate_vector_version(&vector, "public-feed-v1")?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(24) {
+        return Err(ProtocolToolError::new(
+            "public feed V1 vector baseline must be 24",
+        ));
+    }
+    for field in ["channel_post_cbor_hex", "agent_post_cbor_hex"] {
+        validate_cddl_hex("public-feed-event-v1", &cddl, json_string(&vector, field)?)?;
+    }
     Ok(())
 }
 

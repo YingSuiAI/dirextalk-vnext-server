@@ -106,6 +106,11 @@ const V23_ARTIFACT_PATHS: &[&str] = &[
     "protocol/proto/dirextalk/agent_control/v1_3",
     "protocol/test-vectors/agent-provisioning/v1",
 ];
+const V24_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/public-feed/v1",
+    "protocol/openapi/public-feed/v1",
+    "protocol/test-vectors/public-feed/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -259,6 +264,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v23/manifest.json",
         includes_registries: false,
         artifact_paths: V23_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 24,
+        path: "protocol/baseline/v24/manifest.json",
+        includes_registries: false,
+        artifact_paths: V24_ARTIFACT_PATHS,
     },
 ];
 
