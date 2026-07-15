@@ -132,6 +132,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_identity_log_v1_1(root)?;
     validate_identity_log_page_v1(root)?;
     validate_contact_card_v1(root)?;
+    validate_contact_delivery_v1(root)?;
     validate_identity_bootstrap_v1(root)?;
     validate_identity_session_v1(root)?;
     validate_identity_enrollment_v1(root)?;
@@ -150,6 +151,50 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_contact_delivery_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/contact-delivery/v1/contact-delivery-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse contact delivery V1 CDDL: {error}"))
+    })?;
+
+    let openapi = read(&root.join("protocol/openapi/contact-delivery/v1/openapi.yaml"))?;
+    oas3::from_yaml(&openapi).map_err(|error| {
+        ProtocolToolError::new(format!("parse contact delivery V1 OpenAPI: {error}"))
+    })?;
+
+    let vector = read_json(
+        &root.join("protocol/test-vectors/contact-delivery/v1/contact-request-aad-v1.json"),
+    )?;
+    validate_vector_version(&vector, "contact-delivery-v1")?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(27) {
+        return Err(ProtocolToolError::new(
+            "contact delivery V1 vector baseline must be 27",
+        ));
+    }
+    validate_uuid_fields(&vector, &["/request_id", "/invite_id", "/target_device_id"])?;
+
+    let aad = decode_hex(json_string(&vector, "request_aad_cbor_hex")?)?;
+    decode_deterministic_cbor(&aad).map_err(|error| {
+        ProtocolToolError::new(format!("decode contact request AAD vector: {error}"))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"dirextalk.contact-request-sealed-aad.v1\0");
+    hasher.update(&aad);
+    let actual = hasher.finalize();
+    let expected = decode_hex(json_string(&vector, "request_aad_digest_hex")?)?;
+    if actual.as_slice() != expected.as_slice() {
+        return Err(ProtocolToolError::new(
+            "contact request AAD vector digest does not match its canonical CBOR",
+        ));
+    }
+    if decode_hex(json_string(&vector, "receipt_capability_hash_hex")?)?.len() != 32 {
+        return Err(ProtocolToolError::new(
+            "contact receipt capability hash vector must be 32 bytes",
+        ));
+    }
     Ok(())
 }
 

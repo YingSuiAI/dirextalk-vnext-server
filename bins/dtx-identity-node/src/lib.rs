@@ -16,12 +16,16 @@ use axum::{
     extract::{Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
+use dtx_contact::{
+    ContactInviteV1, ContactRepository, ContactRequestRecord, ContactRequestV1, ContactReviewV1,
+    ContactStoreError,
+};
 use dtx_domain::{
     Clock, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionChallengeId, DeviceSessionId,
-    IdentityId, KeyPackageId, RequestId, SystemClock,
+    IdentityId, InviteCapabilityId, KeyPackageId, RequestId, SystemClock,
 };
 use dtx_identity_log::{
     DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1,
@@ -66,6 +70,11 @@ pub const KEY_PACKAGE_PUBLISH_PATH_TEMPLATE: &str = "/v1/key-packages/{package_i
 pub const KEY_PACKAGE_CLAIM_PATH: &str = "/v1/key-packages/claim";
 /// Public read-only route template for exact signed identity-log pages.
 pub const IDENTITY_LOG_PAGE_PATH_TEMPLATE: &str = "/v1/identities/{identity_id}/log";
+pub const CONTACT_INVITES_PATH: &str = "/v1/contact-invites";
+pub const CONTACT_INVITE_PATH: &str = "/v1/contact-invites/{invite_id}";
+pub const CONTACT_REQUESTS_PATH: &str = "/v1/contact-requests";
+pub const CONTACT_REVIEW_PATH: &str = "/v1/contact-requests/{request_id}/review";
+pub const CONTACT_RECEIPT_PATH: &str = "/v1/contact-requests/{request_id}/receipt";
 /// Required media type for exact signed V1.1 identity-log events.
 pub const IDENTITY_LOG_EVENT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.identity-log.v1.1+cbor";
@@ -99,6 +108,16 @@ pub const KEY_PACKAGE_CLAIM_CONTENT_TYPE: &str =
 /// Exact original publish envelope returned by a one-time claim.
 pub const KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.key-package-claim-receipt.v1+cbor";
+pub const CONTACT_INVITE_CONTENT_TYPE: &str = "application/vnd.dirextalk.contact-invite.v1+cbor";
+pub const CONTACT_INVITE_RECEIPT_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.contact-invite-receipt.v1+cbor";
+pub const CONTACT_REQUEST_CONTENT_TYPE: &str = "application/vnd.dirextalk.contact-request.v1+cbor";
+pub const CONTACT_REVIEW_CONTENT_TYPE: &str = "application/vnd.dirextalk.contact-review.v1+cbor";
+pub const CONTACT_RECEIPT_CONTENT_TYPE: &str = "application/vnd.dirextalk.contact-receipt.v1+cbor";
+pub const CONTACT_PENDING_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.contact-pending-page.v1+cbor";
+pub const CONTACT_INVITE_SECRET_HEADER: &str = "DTX-Contact-Invite-Secret";
+pub const CONTACT_RECEIPT_SECRET_HEADER: &str = "DTX-Contact-Receipt-Secret";
 /// Header that carries a candidate-owned status/cancellation capability.
 pub const DEVICE_ENROLLMENT_CAPABILITY_HEADER: &str = "DTX-Enrollment-Capability";
 /// Exact authorization scheme for short-lived device sessions.
@@ -144,6 +163,7 @@ pub struct IdentityBootstrapState {
     device_sessions: DeviceSessionRepository,
     device_enrollments: DeviceEnrollmentRepository,
     key_packages: KeyPackageRepository,
+    contacts: ContactRepository,
     clock: Arc<dyn Clock>,
     device_session_audience: Arc<str>,
 }
@@ -177,6 +197,7 @@ impl IdentityBootstrapState {
             device_sessions: DeviceSessionRepository,
             device_enrollments: DeviceEnrollmentRepository,
             key_packages: KeyPackageRepository::new(),
+            contacts: ContactRepository,
             clock,
             device_session_audience: audience.into(),
         }
@@ -214,7 +235,292 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
         .route(DEVICE_ENROLLMENT_PATH, post(approve_device_enrollment))
         .route(KEY_PACKAGE_PUBLISH_PATH_TEMPLATE, put(publish_key_package))
         .route(KEY_PACKAGE_CLAIM_PATH, post(claim_key_package))
+        .route(CONTACT_INVITES_PATH, post(create_contact_invite))
+        .route(CONTACT_INVITE_PATH, delete(revoke_contact_invite))
+        .route(
+            CONTACT_REQUESTS_PATH,
+            get(pending_contact_requests).post(submit_contact_request),
+        )
+        .route(CONTACT_REVIEW_PATH, post(review_contact_request))
+        .route(CONTACT_RECEIPT_PATH, get(get_contact_receipt))
         .with_state(state)
+}
+
+#[allow(
+    clippy::manual_let_else,
+    reason = "explicit failure mapping keeps each HTTP boundary branch visible"
+)]
+async fn create_contact_invite(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    if !has_exact_content_type(&parts.headers, CONTACT_INVITE_CONTENT_TYPE)
+        || parts.headers.contains_key(header::CONTENT_ENCODING)
+    {
+        return contact_failure(ContactStoreError::Invalid, request_id);
+    }
+    let credential = match parse_device_session_authorization(&parts.headers) {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Authentication, request_id),
+    };
+    let idempotency =
+        match idempotency_key_hash(&parts.headers, b"dirextalk.contact-invite-http.v1\0") {
+            Ok(v) => v,
+            Err(_) => return contact_failure(ContactStoreError::Invalid, request_id),
+        };
+    let secret = match contact_secret(&parts.headers, CONTACT_INVITE_SECRET_HEADER) {
+        Ok(v) => v,
+        Err(e) => return contact_failure(e, request_id),
+    };
+    let bytes = match to_bytes(body, 65_536).await {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Invalid, request_id),
+    };
+    let invite = match ContactInviteV1::decode(&bytes) {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Invalid, request_id),
+    };
+    let now = match state.committed_at() {
+        Ok(v) => v,
+        Err(()) => return contact_failure(ContactStoreError::Unavailable, request_id),
+    };
+    match state
+        .contacts
+        .create_invite(
+            &state.store,
+            &credential,
+            *idempotency.as_bytes(),
+            &invite,
+            &bytes,
+            secret,
+            now,
+        )
+        .await
+    {
+        Ok(receipt) => exact_cbor_response(
+            StatusCode::CREATED,
+            receipt,
+            CONTACT_INVITE_RECEIPT_CONTENT_TYPE,
+            request_id,
+        ),
+        Err(e) => contact_failure(e, request_id),
+    }
+}
+#[allow(
+    clippy::manual_let_else,
+    reason = "explicit failure mapping keeps each HTTP boundary branch visible"
+)]
+async fn revoke_contact_invite(
+    State(state): State<IdentityBootstrapState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = RequestId::new();
+    let Ok(invite_id) = id.parse::<InviteCapabilityId>() else {
+        return contact_failure(ContactStoreError::Invalid, request_id);
+    };
+    let credential = match parse_device_session_authorization(&headers) {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Authentication, request_id),
+    };
+    let idempotency = match idempotency_key_hash(&headers, b"dirextalk.contact-revoke-http.v1\0") {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Invalid, request_id),
+    };
+    let now = match state.committed_at() {
+        Ok(v) => v,
+        Err(()) => return contact_failure(ContactStoreError::Unavailable, request_id),
+    };
+    match state
+        .contacts
+        .revoke_invite(
+            &state.store,
+            &credential,
+            *idempotency.as_bytes(),
+            invite_id,
+            now,
+        )
+        .await
+    {
+        Ok(receipt) => exact_cbor_response(
+            StatusCode::OK,
+            receipt,
+            CONTACT_INVITE_RECEIPT_CONTENT_TYPE,
+            request_id,
+        ),
+        Err(e) => contact_failure(e, request_id),
+    }
+}
+#[allow(
+    clippy::manual_let_else,
+    reason = "explicit failure mapping keeps each HTTP boundary branch visible"
+)]
+async fn submit_contact_request(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    if !has_exact_content_type(&parts.headers, CONTACT_REQUEST_CONTENT_TYPE)
+        || parts.headers.contains_key(header::AUTHORIZATION)
+        || parts.headers.contains_key(header::CONTENT_ENCODING)
+    {
+        return contact_failure(ContactStoreError::Invalid, request_id);
+    }
+    let secret = match contact_secret(&parts.headers, CONTACT_INVITE_SECRET_HEADER) {
+        Ok(v) => v,
+        Err(e) => return contact_failure(e, request_id),
+    };
+    let bytes = match to_bytes(body, 150_000).await {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Invalid, request_id),
+    };
+    let command = match ContactRequestV1::decode(&bytes) {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Invalid, request_id),
+    };
+    let now = match state.committed_at() {
+        Ok(v) => v,
+        Err(()) => return contact_failure(ContactStoreError::Unavailable, request_id),
+    };
+    match state
+        .contacts
+        .submit_request(&state.store, &command, &bytes, secret, now)
+        .await
+    {
+        Ok(receipt) => exact_cbor_response(
+            StatusCode::CREATED,
+            receipt.exact_bytes,
+            CONTACT_RECEIPT_CONTENT_TYPE,
+            request_id,
+        ),
+        Err(e) => contact_failure(e, request_id),
+    }
+}
+#[allow(
+    clippy::manual_let_else,
+    reason = "explicit failure mapping keeps each HTTP boundary branch visible"
+)]
+async fn pending_contact_requests(
+    State(state): State<IdentityBootstrapState>,
+    headers: HeaderMap,
+) -> Response {
+    let request_id = RequestId::new();
+    let credential = match parse_device_session_authorization(&headers) {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Authentication, request_id),
+    };
+    let now = match state.committed_at() {
+        Ok(v) => v,
+        Err(()) => return contact_failure(ContactStoreError::Unavailable, request_id),
+    };
+    match state
+        .contacts
+        .pending(&state.store, &credential, now)
+        .await
+        .and_then(|v| encode_pending(&v))
+    {
+        Ok(bytes) => exact_cbor_response(
+            StatusCode::OK,
+            bytes,
+            CONTACT_PENDING_CONTENT_TYPE,
+            request_id,
+        ),
+        Err(e) => contact_failure(e, request_id),
+    }
+}
+#[allow(
+    clippy::manual_let_else,
+    reason = "explicit failure mapping keeps each HTTP boundary branch visible"
+)]
+async fn review_contact_request(
+    State(state): State<IdentityBootstrapState>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response {
+    let http_request_id = RequestId::new();
+    let Ok(route_id) = id.parse::<RequestId>() else {
+        return contact_failure(ContactStoreError::Invalid, http_request_id);
+    };
+    let (parts, body) = request.into_parts();
+    if !has_exact_content_type(&parts.headers, CONTACT_REVIEW_CONTENT_TYPE)
+        || parts.headers.contains_key(header::CONTENT_ENCODING)
+    {
+        return contact_failure(ContactStoreError::Invalid, http_request_id);
+    }
+    let credential = match parse_device_session_authorization(&parts.headers) {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Authentication, http_request_id),
+    };
+    let idem = match idempotency_key_hash(&parts.headers, b"dirextalk.contact-review-http.v1\0") {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Invalid, http_request_id),
+    };
+    let bytes = match to_bytes(body, 300_000).await {
+        Ok(v) => v,
+        Err(_) => return contact_failure(ContactStoreError::Invalid, http_request_id),
+    };
+    let review = match ContactReviewV1::decode(&bytes) {
+        Ok(v) if v.request_id() == route_id => v,
+        _ => return contact_failure(ContactStoreError::Invalid, http_request_id),
+    };
+    let now = match state.committed_at() {
+        Ok(v) => v,
+        Err(()) => return contact_failure(ContactStoreError::Unavailable, http_request_id),
+    };
+    match state
+        .contacts
+        .review(
+            &state.store,
+            &credential,
+            *idem.as_bytes(),
+            &review,
+            &bytes,
+            now,
+        )
+        .await
+    {
+        Ok(v) => exact_cbor_response(
+            StatusCode::OK,
+            v.exact_bytes,
+            CONTACT_RECEIPT_CONTENT_TYPE,
+            http_request_id,
+        ),
+        Err(e) => contact_failure(e, http_request_id),
+    }
+}
+#[allow(
+    clippy::manual_let_else,
+    reason = "explicit failure mapping keeps each HTTP boundary branch visible"
+)]
+async fn get_contact_receipt(
+    State(state): State<IdentityBootstrapState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let http_request_id = RequestId::new();
+    let Ok(id) = id.parse::<RequestId>() else {
+        return contact_failure(ContactStoreError::Invalid, http_request_id);
+    };
+    let secret = match contact_secret(&headers, CONTACT_RECEIPT_SECRET_HEADER) {
+        Ok(v) => v,
+        Err(e) => return contact_failure(e, http_request_id),
+    };
+    let now = match state.committed_at() {
+        Ok(v) => v,
+        Err(()) => return contact_failure(ContactStoreError::Unavailable, http_request_id),
+    };
+    match state.contacts.receipt(&state.store, id, secret, now).await {
+        Ok(v) => exact_cbor_response(
+            StatusCode::OK,
+            v.exact_bytes,
+            CONTACT_RECEIPT_CONTENT_TYPE,
+            http_request_id,
+        ),
+        Err(e) => contact_failure(e, http_request_id),
+    }
 }
 
 async fn bootstrap_identity(
@@ -2233,6 +2539,83 @@ fn encode_device_enrollment_status_fields(
     ]);
     encode_deterministic_cbor(&value)
         .expect("trusted device enrollment status always has a bounded canonical representation")
+}
+
+fn contact_secret(headers: &HeaderMap, name: &'static str) -> Result<[u8; 32], ContactStoreError> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next().ok_or(ContactStoreError::NotFound)?;
+    if values.next().is_some() || value.as_bytes().len() != 43 {
+        return Err(ContactStoreError::NotFound);
+    }
+    let mut output = [0_u8; 32];
+    let decoded = Base64UrlUnpadded::decode(value.as_bytes(), &mut output)
+        .map_err(|_| ContactStoreError::NotFound)?;
+    if decoded.len() != output.len()
+        || Base64UrlUnpadded::encode_string(&output).as_bytes() != value.as_bytes()
+    {
+        return Err(ContactStoreError::NotFound);
+    }
+    Ok(output)
+}
+
+fn encode_pending(values: &[ContactRequestRecord]) -> Result<Vec<u8>, ContactStoreError> {
+    let entries = values
+        .iter()
+        .map(|value| {
+            CanonicalValue::Map(vec![
+                (
+                    CanonicalValue::Unsigned(1),
+                    CanonicalValue::Text(value.request_id.to_string()),
+                ),
+                (
+                    CanonicalValue::Unsigned(2),
+                    CanonicalValue::Text(value.invite_id.to_string()),
+                ),
+                (
+                    CanonicalValue::Unsigned(3),
+                    CanonicalValue::Bytes(value.sealed_request.clone()),
+                ),
+                (
+                    CanonicalValue::Unsigned(4),
+                    value.created_at.to_canonical_value(),
+                ),
+                (
+                    CanonicalValue::Unsigned(5),
+                    value.expires_at.to_canonical_value(),
+                ),
+                (
+                    CanonicalValue::Unsigned(6),
+                    value.receipt_capability_hash.to_canonical_value(),
+                ),
+            ])
+        })
+        .collect();
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (CanonicalValue::Unsigned(2), CanonicalValue::Array(entries)),
+    ]))
+    .map_err(|_| ContactStoreError::Invalid)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the owned error is consumed at the HTTP boundary"
+)]
+fn contact_failure(error: ContactStoreError, request_id: RequestId) -> Response {
+    let status = match error {
+        ContactStoreError::Invalid => StatusCode::UNPROCESSABLE_ENTITY,
+        ContactStoreError::Authentication => StatusCode::UNAUTHORIZED,
+        ContactStoreError::NotFound => StatusCode::NOT_FOUND,
+        ContactStoreError::RateLimited | ContactStoreError::Quota => StatusCode::TOO_MANY_REQUESTS,
+        ContactStoreError::Conflict
+        | ContactStoreError::Expired
+        | ContactStoreError::Revoked
+        | ContactStoreError::Exhausted => StatusCode::CONFLICT,
+        ContactStoreError::Persistence(_)
+        | ContactStoreError::Database(_)
+        | ContactStoreError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    with_common_headers(status.into_response(), request_id)
 }
 
 fn exact_cbor_response(

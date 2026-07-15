@@ -1,0 +1,79 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Opaque Contact Delivery V1
+  version: 1.0.0
+  description: >-
+    Every response is Cache-Control no-store. Invite and receipt capabilities
+    are raw 32-byte secrets encoded as exactly 43 unpadded base64url characters
+    in the named headers; they are forbidden in URLs, bodies, logs, and durable
+    storage. Sealed request and delivery fields are RFC 9180 base-mode
+    X25519/HKDF-SHA256/ChaCha20Poly1305 envelopes defined by the V1 CDDL and are
+    opaque to the Identity Node.
+paths:
+  /v1/contact-invites:
+    post:
+      summary: Register a short-lived signed invite from an active owner device
+      parameters:
+        - { name: Authorization, in: header, required: true, schema: { type: string } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string } }
+        - { name: DTX-Contact-Invite-Secret, in: header, required: true, schema: { type: string, minLength: 43, maxLength: 43 } }
+      requestBody: { required: true, content: { application/vnd.dirextalk.contact-invite.v1+cbor: { schema: { type: string, contentEncoding: base64, maxLength: 65536 } } } }
+      responses:
+        '201':
+          description: Durable exact invite receipt; an exact response-loss replay returns identical bytes
+          content: { application/vnd.dirextalk.contact-invite-receipt.v1+cbor: { schema: { type: string, contentEncoding: base64 } } }
+        '409': { description: Idempotency or capability conflict }
+        '429': { description: Rate limit }
+  /v1/contact-invites/{invite_id}:
+    delete:
+      summary: Permanently revoke an invite and every still-pending request
+      parameters:
+        - { name: invite_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Authorization, in: header, required: true, schema: { type: string } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Stable revoke receipt; pending polls permanently become state 5
+          content: { application/vnd.dirextalk.contact-invite-receipt.v1+cbor: { schema: { type: string, contentEncoding: base64 } } }
+  /v1/contact-requests:
+    post:
+      summary: Spend one invite use to relay an opaque request sealed to the target device
+      parameters:
+        - { name: DTX-Contact-Invite-Secret, in: header, required: true, schema: { type: string, minLength: 43, maxLength: 43 } }
+      requestBody: { required: true, content: { application/vnd.dirextalk.contact-request.v1+cbor: { schema: { type: string, contentEncoding: base64, maxLength: 150000 } } } }
+      responses:
+        '201':
+          description: Stable request receipt; exact replay never spends another use
+          content: { application/vnd.dirextalk.contact-receipt.v1+cbor: { schema: { type: string, contentEncoding: base64 } } }
+        '404': { description: Uniform unknown or invalid capability }
+        '409': { description: Expired revoked exhausted device-revoked or conflicting request }
+    get:
+      summary: Pull up to 100 non-consuming opaque requests for the authenticated device
+      parameters: [ { name: Authorization, in: header, required: true, schema: { type: string } } ]
+      responses:
+        '200':
+          description: Non-consuming pending page of at most 100 opaque requests; each entry includes only the receipt capability hash needed to reconstruct request HPKE AAD, never the raw receipt secret
+          content: { application/vnd.dirextalk.contact-pending-page.v1+cbor: { schema: { type: string, contentEncoding: base64 } } }
+  /v1/contact-requests/{request_id}/review:
+    post:
+      summary: Accept with an opaque sealed delivery or permanently reject
+      parameters:
+        - { name: request_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Authorization, in: header, required: true, schema: { type: string } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string } }
+      requestBody: { required: true, content: { application/vnd.dirextalk.contact-review.v1+cbor: { schema: { type: string, contentEncoding: base64, maxLength: 300000 } } } }
+      responses:
+        '200':
+          description: Stable exact terminal receipt; accept is state 2 and reject is state 3
+          content: { application/vnd.dirextalk.contact-receipt.v1+cbor: { schema: { type: string, contentEncoding: base64 } } }
+  /v1/contact-requests/{request_id}/receipt:
+    get:
+      summary: Stable non-consuming request receipt and optional opaque delivery
+      parameters:
+        - { name: request_id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: DTX-Contact-Receipt-Secret, in: header, required: true, schema: { type: string, minLength: 43, maxLength: 43 } }
+      responses:
+        '200':
+          description: Non-consuming exact receipt with state 1 pending, 2 accepted, 3 rejected, 4 expired, 5 invite-revoked, or 6 device-revoked
+          content: { application/vnd.dirextalk.contact-receipt.v1+cbor: { schema: { type: string, contentEncoding: base64 } } }
+        '404': { description: Uniform unknown or invalid receipt capability }

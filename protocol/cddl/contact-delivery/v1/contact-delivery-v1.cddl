@@ -1,0 +1,82 @@
+; IM8c/IM3f opaque contact admission and delivery. Sealed fields are never parsed by a node.
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+digest = bstr .size 32
+utc-millis = -62135596800000..253402300799999
+signature = bstr .size 64
+positive-safe-uint = 1..9007199254740991
+canonical-https-origin = tstr .size (9..2048)
+
+; Both sealed payloads use RFC 9180 base mode with
+; DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, and ChaCha20Poly1305
+; (kem_id=0x0020, kdf_id=0x0001, aead_id=0x0003). `enc` is exactly 32 bytes.
+; `sealed-request` uses info "dirextalk.contact-request-hpke.v1\0" and the
+; canonical request AAD map as HPKE AAD. `sealed-delivery` uses info
+; "dirextalk.contact-delivery-hpke.v1\0" and the canonical delivery AAD map.
+; The relay receives this exact envelope as an opaque bstr and never parses it.
+hpke-sealed-v1 = { 1: 1, 2: bstr .size 32, 3: bstr .size (17..262080) }
+
+; Decrypted only by the invited target device. The signature transcript is
+; "dirextalk.contact-request-plaintext-signature.v1\0" followed by the
+; canonical map of fields 1..9. The target resolves `requester-identity-origin`,
+; verifies that the advertised log head belongs to `requester-identity-id`,
+; then requires `requester-device-id` to still be active at the current head.
+contact-request-plaintext-v1 = {
+  1: 1, 2: identity-id, 3: uuid-v7, 4: canonical-https-origin,
+  5: positive-safe-uint, 6: digest, 7: digest, 8: utc-millis,
+  9: bstr .size 32, 10: signature
+}
+
+; Decrypted only by the accepted requester device. Field 11 is the exact
+; publisher-signed key-package-publish-v1 CBOR from baseline V15; clients must
+; validate its active-device binding and MLS KeyPackage before creating the
+; one-to-one conversation. The signature transcript is
+; "dirextalk.contact-delivery-plaintext-signature.v1\0" followed by the
+; canonical map of fields 1..13. Field 9 is the raw mailbox write capability;
+; it exists only inside HPKE ciphertext and must never be sent in a URL.
+contact-delivery-plaintext-v1 = {
+  1: 1, 2: identity-id, 3: uuid-v7, 4: canonical-https-origin,
+  5: positive-safe-uint, 6: digest,
+  7: canonical-https-origin, 8: uuid-v7, 9: bstr .size 32,
+  10: utc-millis, 11: bstr .size (1..65536), 12: digest,
+  13: utc-millis, 14: signature
+}
+
+contact-invite-v1 = {
+  1: 1, 2: uuid-v7, 3: identity-id, 4: uuid-v7, 5: digest,
+  6: 1..8, 7: utc-millis, 8: utc-millis, 9: signature
+}
+
+; Invite receipt state is 1 active or 2 permanently revoked. Field 4 is the
+; committed operation time and field 5 remains the original expiry time.
+contact-invite-receipt-v1 = {
+  1: 1, 2: uuid-v7, 3: 1 / 2, 4: utc-millis, 5: utc-millis
+}
+
+; Field 7 is exact `hpke-sealed-v1` CBOR, kept opaque by the node. Its plaintext
+; is `contact-request-plaintext-v1`; the node sees no requester identity or
+; friendship edge. Field 8 is SHA-256 over the request-AAD domain and canonical
+; map {1:1,2:request-id,3:invite-id,4:target-identity,5:target-device,
+; 6:receipt-capability-hash}.
+contact-request-v1 = {
+  1: 1, 2: uuid-v7, 3: uuid-v7, 4: identity-id, 5: uuid-v7,
+  6: digest, 7: bstr .size (1..131072), 8: digest
+}
+
+; decision 1 accepts and requires exact `hpke-sealed-v1` CBOR in field 4; its
+; plaintext is `contact-delivery-plaintext-v1`. Field 5 hashes the canonical
+; delivery AAD map {1:1,2:request-id,3:invite-id,4:target-identity,
+; 5:target-device,6:decision}. Decision 2 rejects and requires null fields.
+contact-review-v1 = {
+  1: 1, 2: uuid-v7, 3: 1 / 2,
+  4: bstr .size (1..262144) / null, 5: digest / null
+}
+
+; Receipt state is 1 pending, 2 accepted, 3 rejected, 4 expired,
+; 5 invite-revoked, or 6 target-device-revoked. Only state 2 carries field 4.
+contact-request-receipt-v1 = { 1: 1, 2: uuid-v7, 3: 1..6, 4: bstr .size (1..262144) / null }
+; Field 6 is the receipt capability *hash*, not the raw polling secret. Together
+; with the authenticated target identity/device it lets the target reconstruct
+; the exact request HPKE AAD without exposing a receipt authority.
+contact-pending-entry-v1 = { 1: uuid-v7, 2: uuid-v7, 3: bstr .size (1..131072), 4: utc-millis, 5: utc-millis, 6: digest }
+contact-pending-page-v1 = { 1: 1, 2: [*100 contact-pending-entry-v1] }

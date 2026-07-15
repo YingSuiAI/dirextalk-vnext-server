@@ -899,6 +899,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-contact"
+version = "0.1.0"
+dependencies = [
+ "dtx-domain",
+ "dtx-identity-persistence",
+ "dtx-wire",
+ "ed25519-dalek",
+ "sha2 0.11.0",
+ "sqlx",
+ "uuid",
+]
+
+[[package]]
 name = "dtx-dev-migrate"
 version = "0.1.0"
 dependencies = [
@@ -998,6 +1011,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64ct",
+ "dtx-contact",
  "dtx-domain",
  "dtx-identity-log",
  "dtx-identity-persistence",

@@ -105,6 +105,11 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
              AND has_table_privilege(current_user, 'identity.key_package_claims', 'INSERT') \
              AND has_table_privilege(current_user, 'identity.key_package_claim_receipts', 'SELECT') \
              AND has_table_privilege(current_user, 'identity.key_package_claim_receipts', 'INSERT') \
+             AND has_table_privilege(current_user, 'identity.contact_invites', 'SELECT,INSERT,UPDATE') \
+             AND has_table_privilege(current_user, 'identity.contact_requests', 'SELECT,INSERT,UPDATE') \
+             AND has_table_privilege(current_user, 'identity.contact_delivery_outbox', 'SELECT,INSERT') \
+             AND has_table_privilege(current_user, 'identity.contact_owner_commands', 'SELECT,INSERT') \
+             AND has_table_privilege(current_user, 'identity.contact_rate_limits', 'SELECT,INSERT,UPDATE') \
              AND has_function_privilege( \
                  current_user, \
                  'identity.prune_expired_device_sessions(bigint, integer)', \
@@ -315,7 +320,10 @@ async fn role_has_excess_identity_privileges(
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
                         )) \
-                        OR (relation.relname = 'key_packages' AND (\
+                        OR (relation.relname IN (\
+                            'key_packages', 'contact_invites', 'contact_requests', \
+                            'contact_rate_limits'\
+                        ) AND (\
                             has_table_privilege(current_user, relation.oid, 'DELETE') \
                             OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
                             OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
@@ -325,7 +333,8 @@ async fn role_has_excess_identity_privileges(
                         OR (relation.relname IN (\
                             'device_sessions', 'device_session_idempotency_claims', \
                             'device_session_receipts', 'key_package_publish_claims', \
-                            'key_package_claims', 'key_package_claim_receipts'\
+                            'key_package_claims', 'key_package_claim_receipts', \
+                            'contact_delivery_outbox', 'contact_owner_commands'\
                         ) AND (\
                             has_table_privilege(current_user, relation.oid, 'UPDATE') \
                             OR has_table_privilege(current_user, relation.oid, 'DELETE') \
@@ -357,6 +366,9 @@ async fn role_has_excess_identity_privileges(
                             'device_session_receipts', 'device_enrollment_challenges', \
                             'key_packages', 'key_package_publish_claims', \
                             'key_package_claims', 'key_package_claim_receipts', \
+                            'contact_invites', 'contact_requests', \
+                            'contact_delivery_outbox', 'contact_owner_commands', \
+                            'contact_rate_limits', \
                             'fork_evidence', 'log_outbox'\
                         ) AND (\
                             has_table_privilege(current_user, relation.oid, 'SELECT') \

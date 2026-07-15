@@ -120,6 +120,11 @@ const V26_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/conditional-cache/v1",
     "protocol/test-vectors/conditional-cache/v1",
 ];
+const V27_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/contact-delivery/v1",
+    "protocol/openapi/contact-delivery/v1",
+    "protocol/test-vectors/contact-delivery/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -291,6 +296,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v26/manifest.json",
         includes_registries: false,
         artifact_paths: V26_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 27,
+        path: "protocol/baseline/v27/manifest.json",
+        includes_registries: false,
+        artifact_paths: V27_ARTIFACT_PATHS,
     },
 ];
 

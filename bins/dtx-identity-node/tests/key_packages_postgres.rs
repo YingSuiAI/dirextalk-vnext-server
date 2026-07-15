@@ -8,17 +8,25 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
-use dtx_domain::{Clock, ClockError, DeviceId, DeviceSessionId, IdentityId, KeyPackageId};
+use dtx_contact::{contact_receipt_capability_hash, invite_capability_hash};
+use dtx_domain::{
+    Clock, ClockError, DeviceId, DeviceSessionId, IdentityId, InviteCapabilityId, KeyPackageId,
+    RequestId,
+};
 use dtx_identity_log::{
     DeviceCertificateV1, DeviceEncryptionPublicKey, IdentityLogEventPayloadV1, IdentityLogEventV1,
     UnsignedDeviceCertificateV1, UnsignedIdentityLogEventV1, device_certificate_signature_input,
     genesis_recovery_acceptance_input, identity_log_signature_input,
 };
 use dtx_identity_node::{
-    DEVICE_SESSION_AUTHORIZATION_SCHEME, IdentityBootstrapState, KEY_PACKAGE_CLAIM_CONTENT_TYPE,
-    KEY_PACKAGE_CLAIM_PATH, KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE,
-    KEY_PACKAGE_PUBLISH_CONTENT_TYPE, KEY_PACKAGE_PUBLISH_PATH_TEMPLATE,
-    KEY_PACKAGE_PUBLISH_RECEIPT_CONTENT_TYPE, identity_bootstrap_router_with_state,
+    CONTACT_INVITE_CONTENT_TYPE, CONTACT_INVITE_SECRET_HEADER, CONTACT_INVITES_PATH,
+    CONTACT_PENDING_CONTENT_TYPE, CONTACT_RECEIPT_CONTENT_TYPE, CONTACT_RECEIPT_PATH,
+    CONTACT_RECEIPT_SECRET_HEADER, CONTACT_REQUEST_CONTENT_TYPE, CONTACT_REQUESTS_PATH,
+    CONTACT_REVIEW_CONTENT_TYPE, CONTACT_REVIEW_PATH, DEVICE_SESSION_AUTHORIZATION_SCHEME,
+    IdentityBootstrapState, KEY_PACKAGE_CLAIM_CONTENT_TYPE, KEY_PACKAGE_CLAIM_PATH,
+    KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE, KEY_PACKAGE_PUBLISH_CONTENT_TYPE,
+    KEY_PACKAGE_PUBLISH_PATH_TEMPLATE, KEY_PACKAGE_PUBLISH_RECEIPT_CONTENT_TYPE,
+    identity_bootstrap_router_with_state,
 };
 use dtx_identity_persistence::{
     DEVICE_SESSION_SECRET_HASH_DOMAIN, DeviceSessionCompletionCommand, DeviceSessionOutcome,
@@ -311,6 +319,231 @@ async fn opaque_key_packages_are_device_bound_idempotent_and_claimed_once()
     Ok(())
 }
 
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one HTTP/PostgreSQL boundary test protects opaque delivery, exact replay, revocation, and device-revocation admission together"
+)]
+async fn opaque_contact_delivery_is_replay_safe_and_revocable() -> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let app = identity_bootstrap_router_with_state(
+        IdentityBootstrapState::with_clock_and_device_session_audience(
+            store.clone(),
+            Arc::new(FixedClock(2_000)),
+            AUDIENCE,
+        ),
+    );
+    let owner = enroll_active_device(&store, 81, 82, 83, [84; 32]).await?;
+
+    let invite_secret = [85_u8; 32];
+    let invite_id = InviteCapabilityId::new();
+    let invite = contact_invite_body(&owner, invite_id, invite_secret, 2)?;
+    let first_invite = send_contact_invite(
+        app.clone(),
+        "contact-invite-0001",
+        &owner,
+        invite_secret,
+        invite.clone(),
+    )
+    .await?;
+    assert_eq!(first_invite.status(), StatusCode::CREATED);
+    assert_eq!(first_invite.headers()[header::CACHE_CONTROL], "no-store");
+    let first_invite_receipt = to_bytes(first_invite.into_body(), 16_384).await?;
+    let replay_invite = send_contact_invite(
+        app.clone(),
+        "contact-invite-0001",
+        &owner,
+        invite_secret,
+        invite,
+    )
+    .await?;
+    assert_eq!(replay_invite.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay_invite.into_body(), 16_384).await?,
+        first_invite_receipt
+    );
+
+    let receipt_secret = [86_u8; 32];
+    let request_id = RequestId::new();
+    let sealed_request = b"opaque:a-device-proof-and-contact-request";
+    let request = contact_request_body(
+        request_id,
+        invite_id,
+        owner.identity_id,
+        owner.device_id,
+        receipt_secret,
+        sealed_request,
+    )?;
+    let first_submit = send_contact_request(app.clone(), invite_secret, request.clone()).await?;
+    assert_eq!(first_submit.status(), StatusCode::CREATED);
+    let first_submit_receipt = to_bytes(first_submit.into_body(), 16_384).await?;
+    let replay_submit = send_contact_request(app.clone(), invite_secret, request).await?;
+    assert_eq!(replay_submit.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(replay_submit.into_body(), 16_384).await?,
+        first_submit_receipt
+    );
+    let use_count: i16 =
+        sqlx::query_scalar("SELECT use_count FROM identity.contact_invites WHERE invite_id=$1")
+            .bind(invite_id.as_uuid())
+            .fetch_one(harness.identity_runtime_pool())
+            .await?;
+    assert_eq!(
+        use_count, 1,
+        "an exact replay must not spend the invite twice"
+    );
+
+    let pending = send_contact_pending(app.clone(), &owner).await?;
+    assert_eq!(pending.status(), StatusCode::OK);
+    assert_eq!(
+        pending.headers()[header::CONTENT_TYPE],
+        CONTACT_PENDING_CONTENT_TYPE
+    );
+    let pending = to_bytes(pending.into_body(), 200_000).await?;
+    assert!(
+        pending
+            .windows(sealed_request.len())
+            .any(|window| window == sealed_request),
+        "the node must relay the opaque request without interpreting it"
+    );
+    let receipt_hash = contact_receipt_capability_hash(&receipt_secret);
+    assert!(
+        pending
+            .windows(receipt_hash.as_bytes().len())
+            .any(|window| window == receipt_hash.as_bytes()),
+        "the target needs the non-authorizing receipt hash to reconstruct HPKE AAD"
+    );
+
+    let sealed_delivery = b"opaque:peer-mailbox-descriptor+origin-pin+claimable-key-package";
+    let review = contact_review_body(
+        request_id,
+        invite_id,
+        owner.identity_id,
+        owner.device_id,
+        sealed_delivery,
+    )?;
+    let accepted = send_contact_review(
+        app.clone(),
+        "contact-review-0001",
+        &owner,
+        request_id,
+        review.clone(),
+    )
+    .await?;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let accepted_receipt = to_bytes(accepted.into_body(), 300_000).await?;
+    let accepted_replay = send_contact_review(
+        app.clone(),
+        "contact-review-0001",
+        &owner,
+        request_id,
+        review,
+    )
+    .await?;
+    assert_eq!(accepted_replay.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(accepted_replay.into_body(), 300_000).await?,
+        accepted_receipt
+    );
+    let poll = send_contact_receipt(app.clone(), request_id, receipt_secret).await?;
+    assert_eq!(poll.status(), StatusCode::OK);
+    assert_eq!(
+        poll.headers()[header::CONTENT_TYPE],
+        CONTACT_RECEIPT_CONTENT_TYPE
+    );
+    let poll_body = to_bytes(poll.into_body(), 300_000).await?;
+    assert_eq!(poll_body, accepted_receipt);
+    assert!(
+        poll_body
+            .windows(sealed_delivery.len())
+            .any(|window| window == sealed_delivery)
+    );
+    let poll_replay = send_contact_receipt(app.clone(), request_id, receipt_secret).await?;
+    assert_eq!(to_bytes(poll_replay.into_body(), 300_000).await?, poll_body);
+    let outbox_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM identity.contact_delivery_outbox WHERE request_id=$1",
+    )
+    .bind(request_id.as_uuid())
+    .fetch_one(harness.identity_runtime_pool())
+    .await?;
+    assert_eq!(outbox_count, 1);
+
+    let device_revoked_invite_id = InviteCapabilityId::new();
+    let device_revoked_secret = [87_u8; 32];
+    let device_revoked_invite =
+        contact_invite_body(&owner, device_revoked_invite_id, device_revoked_secret, 2)?;
+    assert_eq!(
+        send_contact_invite(
+            app.clone(),
+            "contact-invite-device-revoke",
+            &owner,
+            device_revoked_secret,
+            device_revoked_invite,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED
+    );
+    let pending_before_revoke_id = RequestId::new();
+    let pending_before_revoke_secret = [88_u8; 32];
+    assert_eq!(
+        send_contact_request(
+            app.clone(),
+            device_revoked_secret,
+            contact_request_body(
+                pending_before_revoke_id,
+                device_revoked_invite_id,
+                owner.identity_id,
+                owner.device_id,
+                pending_before_revoke_secret,
+                b"pending-before-device-revoke",
+            )?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED
+    );
+    revoke_active_device(&store, &owner).await?;
+    let revoked_receipt = send_contact_receipt(
+        app.clone(),
+        pending_before_revoke_id,
+        pending_before_revoke_secret,
+    )
+    .await?;
+    assert_eq!(revoked_receipt.status(), StatusCode::OK);
+    let revoked_state: i16 =
+        sqlx::query_scalar("SELECT state FROM identity.contact_requests WHERE request_id=$1")
+            .bind(pending_before_revoke_id.as_uuid())
+            .fetch_one(harness.identity_runtime_pool())
+            .await?;
+    assert_eq!(
+        revoked_state, 6,
+        "poll must durably expose device revocation"
+    );
+    let blocked = send_contact_request(
+        app,
+        device_revoked_secret,
+        contact_request_body(
+            RequestId::new(),
+            device_revoked_invite_id,
+            owner.identity_id,
+            owner.device_id,
+            [89; 32],
+            b"must-not-be-admitted-after-device-revoke",
+        )?,
+    )
+    .await?;
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    let blocked_uses: i16 =
+        sqlx::query_scalar("SELECT use_count FROM identity.contact_invites WHERE invite_id=$1")
+            .bind(device_revoked_invite_id.as_uuid())
+            .fetch_one(harness.identity_runtime_pool())
+            .await?;
+    assert_eq!(blocked_uses, 1);
+    Ok(())
+}
+
 struct ActiveDevice {
     root: SigningKey,
     device: SigningKey,
@@ -459,6 +692,274 @@ async fn revoke_active_device(
         IdentityAppendOutcome::Committed(_)
     ));
     Ok(())
+}
+
+fn contact_invite_body(
+    owner: &ActiveDevice,
+    invite_id: InviteCapabilityId,
+    secret: [u8; 32],
+    max_uses: u8,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut fields = vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(invite_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(owner.identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(owner.device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            invite_capability_hash(&secret).to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Unsigned(u64::from(max_uses)),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            UtcMillis::new(1_900)?.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            UtcMillis::new(600_000)?.to_canonical_value(),
+        ),
+    ];
+    let unsigned = encode_deterministic_cbor(&CanonicalValue::Map(fields.clone()))?;
+    let mut input = b"dirextalk.contact-invite-signature.v1\0".to_vec();
+    input.extend_from_slice(&unsigned);
+    fields.push((
+        CanonicalValue::Unsigned(9),
+        signature(&owner.device, &input).to_canonical_value(),
+    ));
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
+}
+
+fn contact_request_body(
+    request_id: RequestId,
+    invite_id: InviteCapabilityId,
+    target_identity_id: IdentityId,
+    target_device_id: DeviceId,
+    receipt_secret: [u8; 32],
+    sealed_request: &[u8],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let receipt_hash = contact_receipt_capability_hash(&receipt_secret);
+    let aad = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(request_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(invite_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(target_identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(target_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            receipt_hash.to_canonical_value(),
+        ),
+    ]);
+    let digest = contact_test_digest(
+        b"dirextalk.contact-request-sealed-aad.v1\0",
+        &encode_deterministic_cbor(&aad)?,
+    );
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(request_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(invite_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(target_identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(target_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            receipt_hash.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Bytes(sealed_request.to_vec()),
+        ),
+        (CanonicalValue::Unsigned(8), digest.to_canonical_value()),
+    ]))?)
+}
+
+fn contact_review_body(
+    request_id: RequestId,
+    invite_id: InviteCapabilityId,
+    target_identity_id: IdentityId,
+    target_device_id: DeviceId,
+    sealed_delivery: &[u8],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let aad = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(request_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(invite_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(target_identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(target_device_id.to_string()),
+        ),
+        (CanonicalValue::Unsigned(6), CanonicalValue::Unsigned(1)),
+    ]);
+    let digest = contact_test_digest(
+        b"dirextalk.contact-delivery-sealed-aad.v1\0",
+        &encode_deterministic_cbor(&aad)?,
+    );
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(request_id.to_string()),
+        ),
+        (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Bytes(sealed_delivery.to_vec()),
+        ),
+        (CanonicalValue::Unsigned(5), digest.to_canonical_value()),
+    ]))?)
+}
+
+fn contact_test_digest(domain: &[u8], exact: &[u8]) -> Sha256Digest {
+    Sha256Digest::hash_domain(domain, exact)
+}
+
+async fn send_contact_invite(
+    app: axum::Router,
+    idempotency_key: &str,
+    owner: &ActiveDevice,
+    secret: [u8; 32],
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(CONTACT_INVITES_PATH)
+            .header(header::CONTENT_TYPE, CONTACT_INVITE_CONTENT_TYPE)
+            .header("idempotency-key", idempotency_key)
+            .header(
+                header::AUTHORIZATION,
+                device_session_authorization(owner.session_id, owner.session_secret),
+            )
+            .header(
+                CONTACT_INVITE_SECRET_HEADER,
+                Base64UrlUnpadded::encode_string(&secret),
+            )
+            .body(Body::from(body))?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn send_contact_request(
+    app: axum::Router,
+    secret: [u8; 32],
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(CONTACT_REQUESTS_PATH)
+            .header(header::CONTENT_TYPE, CONTACT_REQUEST_CONTENT_TYPE)
+            .header(
+                CONTACT_INVITE_SECRET_HEADER,
+                Base64UrlUnpadded::encode_string(&secret),
+            )
+            .body(Body::from(body))?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn send_contact_pending(
+    app: axum::Router,
+    owner: &ActiveDevice,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .uri(CONTACT_REQUESTS_PATH)
+            .header(
+                header::AUTHORIZATION,
+                device_session_authorization(owner.session_id, owner.session_secret),
+            )
+            .body(Body::empty())?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn send_contact_review(
+    app: axum::Router,
+    idempotency_key: &str,
+    owner: &ActiveDevice,
+    request_id: RequestId,
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(CONTACT_REVIEW_PATH.replace("{request_id}", &request_id.to_string()))
+            .header(header::CONTENT_TYPE, CONTACT_REVIEW_CONTENT_TYPE)
+            .header("idempotency-key", idempotency_key)
+            .header(
+                header::AUTHORIZATION,
+                device_session_authorization(owner.session_id, owner.session_secret),
+            )
+            .body(Body::from(body))?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn send_contact_receipt(
+    app: axum::Router,
+    request_id: RequestId,
+    secret: [u8; 32],
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .uri(CONTACT_RECEIPT_PATH.replace("{request_id}", &request_id.to_string()))
+            .header(
+                CONTACT_RECEIPT_SECRET_HEADER,
+                Base64UrlUnpadded::encode_string(&secret),
+            )
+            .body(Body::empty())?,
+    )
+    .await
+    .map_err(Into::into)
 }
 
 #[allow(clippy::too_many_arguments)]
