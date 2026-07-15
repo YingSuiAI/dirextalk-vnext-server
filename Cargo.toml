@@ -21,6 +21,7 @@ members = [
     "crates/dtx-domain",
     "crates/dtx-group-policy",
     "crates/dtx-group-persistence",
+    "crates/dtx-http-cache",
     "crates/dtx-identity-log",
     "crates/dtx-identity-persistence",
     "crates/dtx-indexer",

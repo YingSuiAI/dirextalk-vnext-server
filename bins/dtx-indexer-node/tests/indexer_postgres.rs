@@ -23,6 +23,7 @@ use dtx_wire::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use std::{
+    collections::HashSet,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -47,7 +48,24 @@ fn public() -> SigningPublicKey {
     SigningPublicKey::try_from(key().verifying_key().to_bytes()).expect("key")
 }
 fn descriptor(now: i64) -> SignedPublicDescriptorV1 {
+    descriptor_version(now, 1, None, false)
+}
+fn descriptor_version(
+    now: i64,
+    sequence: u64,
+    previous: Option<Sha256Digest>,
+    tombstone: bool,
+) -> SignedPublicDescriptorV1 {
     let public = public();
+    let issued = UtcMillis::new(now - 1000).expect("time");
+    let payload = if tombstone {
+        PublicDescriptorPayloadV1::Tombstone
+    } else {
+        PublicDescriptorPayloadV1::Channel {
+            feed_origin: "https://feed.example".to_owned(),
+            capability_digest: Sha256Digest::from_bytes([9; 32]),
+        }
+    };
     let unsigned = UnsignedPublicDescriptorV1::new(
         PUBLIC_DESCRIPTOR_WIRE_VERSION,
         PublicDescriptorKindV1::Channel,
@@ -55,14 +73,15 @@ fn descriptor(now: i64) -> SignedPublicDescriptorV1 {
         public,
         IdentityId::derive(public.as_domain_key()),
         public,
-        SafeUint::new(1).expect("seq"),
-        None,
-        UtcMillis::new(now - 1000).expect("time"),
-        UtcMillis::new(now + 60_000).expect("time"),
-        PublicDescriptorPayloadV1::Channel {
-            feed_origin: "https://feed.example".to_owned(),
-            capability_digest: Sha256Digest::from_bytes([9; 32]),
+        SafeUint::new(sequence).expect("seq"),
+        previous,
+        issued,
+        if tombstone {
+            issued
+        } else {
+            UtcMillis::new(now + 60_000).expect("time")
         },
+        payload,
     )
     .expect("descriptor");
     let input = unsigned.signature_input().expect("input");
@@ -71,6 +90,27 @@ fn descriptor(now: i64) -> SignedPublicDescriptorV1 {
         Ed25519Signature::from_bytes(key().sign(&input).to_bytes()),
     )
     .expect("signed")
+}
+
+#[derive(Clone)]
+struct DynamicFetcher {
+    failed: Arc<tokio::sync::Mutex<HashSet<IndexerId>>>,
+    bundle: Arc<tokio::sync::Mutex<FetchedPublicBundle>>,
+}
+impl PublicBundleFetcher for DynamicFetcher {
+    fn fetch<'a>(
+        &'a self,
+        indexer: IndexerId,
+        _: &'a SignedPublicDescriptorV1,
+    ) -> Pin<Box<dyn Future<Output = Result<FetchedPublicBundle, NodeError>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.failed.lock().await.contains(&indexer) {
+                Err(NodeError::FetchFailed)
+            } else {
+                Ok(self.bundle.lock().await.clone())
+            }
+        })
+    }
 }
 fn event(
     subject: PublicSubjectId,
@@ -166,6 +206,28 @@ fn field(map: &[(CanonicalValue, CanonicalValue)], key: u64) -> &CanonicalValue 
     map.iter()
         .find_map(|(k, v)| (*k == CanonicalValue::Unsigned(key)).then_some(v))
         .expect("field")
+}
+async fn search_count(
+    app: axum::Router,
+    indexer: IndexerId,
+    query: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/public-search?indexer_id={indexer}&q={query}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = decode_deterministic_cbor(&to_bytes(response.into_body(), 100_000).await?)?;
+    let CanonicalValue::Map(fields) = page else {
+        return Err("search page must be a map".into());
+    };
+    let CanonicalValue::Array(results) = field(&fields, 2) else {
+        return Err("search results must be an array".into());
+    };
+    Ok(results.len())
 }
 
 #[tokio::test]
@@ -307,5 +369,219 @@ async fn two_logical_indexers_keep_independent_registration_and_search_state()
         panic!("results")
     };
     assert_eq!(results.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one update, partial failure, replay, and permanent revoke workflow"
+)]
+async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    let tenant = TenantId::new();
+    let now = now();
+    let v1 = descriptor(now);
+    let subject = v1.subject_id();
+    let first = event(subject, 1, None, "public alpha", now);
+    let first_page = page(subject, std::slice::from_ref(&first));
+    let fetcher = DynamicFetcher {
+        failed: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        bundle: Arc::new(tokio::sync::Mutex::new(FetchedPublicBundle {
+            descriptor: v1.to_deterministic_cbor()?,
+            pages: vec![first_page],
+        })),
+    };
+    let first_indexer = IndexerId::new();
+    let second_indexer = IndexerId::new();
+    let first_registration = DirectoryRegistrationId::new();
+    let second_registration = DirectoryRegistrationId::new();
+    let store = IndexerPgStore::from_prevalidated_pool(harness.admin_pool().clone());
+    let shared: Arc<dyn PublicBundleFetcher> = Arc::new(fetcher.clone());
+    let first_app = indexer_router(store.clone(), tenant, first_indexer, Arc::clone(&shared));
+    let second_app = indexer_router(store, tenant, second_indexer, shared);
+    for (app, indexer, registration) in [
+        (first_app.clone(), first_indexer, first_registration),
+        (second_app.clone(), second_indexer, second_registration),
+    ] {
+        let request =
+            IndexRegistrationRequestV1::new(registration, indexer, v1.to_deterministic_cbor()?)?;
+        assert_eq!(
+            app.oneshot(post("/v1/index-registrations", request.encode()?, now))
+                .await?
+                .status(),
+            StatusCode::CREATED
+        );
+    }
+
+    let v2 = descriptor_version(now, 2, Some(v1.entry_hash()?), false);
+    let second = event(subject, 2, Some(first.entry_hash()?), "updated beta", now);
+    *fetcher.bundle.lock().await = FetchedPublicBundle {
+        descriptor: v2.to_deterministic_cbor()?,
+        pages: vec![page(subject, &[first.clone(), second])],
+    };
+    fetcher.failed.lock().await.insert(second_indexer);
+    let first_update = IndexRegistrationRequestV1::new(
+        first_registration,
+        first_indexer,
+        v2.to_deterministic_cbor()?,
+    )?;
+    let second_update = IndexRegistrationRequestV1::new(
+        second_registration,
+        second_indexer,
+        v2.to_deterministic_cbor()?,
+    )?;
+    assert_eq!(
+        first_app
+            .clone()
+            .oneshot(post("/v1/index-registrations", first_update.encode()?, now))
+            .await?
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        second_app
+            .clone()
+            .oneshot(post(
+                "/v1/index-registrations",
+                second_update.encode()?,
+                now
+            ))
+            .await?
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        search_count(first_app.clone(), first_indexer, "beta").await?,
+        1
+    );
+    assert_eq!(
+        search_count(second_app.clone(), second_indexer, "beta").await?,
+        0
+    );
+    assert_eq!(
+        search_count(second_app.clone(), second_indexer, "alpha").await?,
+        1
+    );
+    let cached = first_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/public-search?indexer_id={first_indexer}&q=beta"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let etag = cached
+        .headers()
+        .get(header::ETAG)
+        .ok_or("missing ETag")?
+        .clone();
+    assert_eq!(
+        first_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/public-search?indexer_id={first_indexer}&q=beta"
+                    ))
+                    .header(header::IF_NONE_MATCH, etag.clone())
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::NOT_MODIFIED
+    );
+
+    assert_eq!(
+        first_app
+            .clone()
+            .oneshot(post("/v1/index-registrations", first_update.encode()?, now))
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let fork = descriptor_version(now + 1, 2, Some(v1.entry_hash()?), false);
+    let fork_request = IndexRegistrationRequestV1::new(
+        first_registration,
+        first_indexer,
+        fork.to_deterministic_cbor()?,
+    )?;
+    assert_eq!(
+        first_app
+            .clone()
+            .oneshot(post("/v1/index-registrations", fork_request.encode()?, now))
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let gap = descriptor_version(now, 4, Some(v2.entry_hash()?), false);
+    let gap_request = IndexRegistrationRequestV1::new(
+        first_registration,
+        first_indexer,
+        gap.to_deterministic_cbor()?,
+    )?;
+    assert_eq!(
+        first_app
+            .clone()
+            .oneshot(post("/v1/index-registrations", gap_request.encode()?, now))
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    let tombstone = descriptor_version(now, 3, Some(v2.entry_hash()?), true);
+    *fetcher.bundle.lock().await = FetchedPublicBundle {
+        descriptor: tombstone.to_deterministic_cbor()?,
+        pages: vec![],
+    };
+    let revoke = IndexRegistrationRequestV1::new(
+        first_registration,
+        first_indexer,
+        tombstone.to_deterministic_cbor()?,
+    )?;
+    let response = first_app
+        .clone()
+        .oneshot(post("/v1/index-registrations", revoke.encode()?, now))
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let receipt = decode_deterministic_cbor(&to_bytes(response.into_body(), 100_000).await?)?;
+    let CanonicalValue::Map(fields) = receipt else {
+        return Err("receipt must be a map".into());
+    };
+    assert_eq!(field(&fields, 5), &CanonicalValue::Unsigned(5));
+    assert_eq!(
+        search_count(first_app.clone(), first_indexer, "alpha").await?,
+        0
+    );
+    assert_eq!(
+        first_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/public-search?indexer_id={first_indexer}&q=beta"
+                    ))
+                    .header(header::IF_NONE_MATCH, etag)
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+    let old = IndexRegistrationRequestV1::new(
+        first_registration,
+        first_indexer,
+        v1.to_deterministic_cbor()?,
+    )?;
+    assert_eq!(
+        first_app
+            .oneshot(post("/v1/index-registrations", old.encode()?, now))
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
     Ok(())
 }

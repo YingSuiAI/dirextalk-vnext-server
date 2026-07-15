@@ -247,6 +247,56 @@ pub struct VerifiedPublicBundleV1 {
     search_text: String,
     revoked: bool,
 }
+
+fn verify_descriptor_transition(
+    candidate: &SignedPublicDescriptorV1,
+    accepted_exact: Option<&[u8]>,
+    now: UtcMillis,
+) -> Result<(), IndexerError> {
+    let Some(accepted_exact) = accepted_exact else {
+        return DescriptorHeadV1::bootstrap_at(candidate, now)
+            .map(|_| ())
+            .map_err(|_| IndexerError::DescriptorExpired);
+    };
+    let accepted = SignedPublicDescriptorV1::decode_and_verify(accepted_exact)
+        .map_err(|_| IndexerError::InvalidDescriptor)?;
+    if accepted.is_tombstone() {
+        return Err(IndexerError::Downgrade);
+    }
+    if candidate.kind() != accepted.kind()
+        || candidate.subject_id() != accepted.subject_id()
+        || candidate.subject_genesis_signing_key() != accepted.subject_genesis_signing_key()
+        || candidate.publisher_identity_id() != accepted.publisher_identity_id()
+        || candidate.publisher_identity_genesis_signing_key()
+            != accepted.publisher_identity_genesis_signing_key()
+    {
+        return Err(IndexerError::InvalidDescriptor);
+    }
+    let expected = accepted
+        .sequence()
+        .get()
+        .checked_add(1)
+        .ok_or(IndexerError::InvalidDescriptor)?;
+    if candidate.sequence().get() < expected {
+        return Err(IndexerError::Downgrade);
+    }
+    if candidate.sequence().get() != expected
+        || candidate.previous_descriptor_hash()
+            != Some(
+                accepted
+                    .entry_hash()
+                    .map_err(|_| IndexerError::InvalidDescriptor)?,
+            )
+    {
+        return Err(IndexerError::InvalidDescriptor);
+    }
+    if candidate.issued_at() > now || (!candidate.is_tombstone() && candidate.expires_at() <= now) {
+        Err(IndexerError::DescriptorExpired)
+    } else {
+        Ok(())
+    }
+}
+
 impl VerifiedPublicBundleV1 {
     /// Verifies an exact registration proof and all stable-snapshot feed pages.
     ///
@@ -258,7 +308,7 @@ impl VerifiedPublicBundleV1 {
         fetched_descriptor: &[u8],
         pages: &[Vec<u8>],
         now: UtcMillis,
-        accepted_sequence: Option<SafeUint>,
+        accepted_descriptor: Option<&[u8]>,
     ) -> Result<Self, IndexerError> {
         let registered = SignedPublicDescriptorV1::decode_and_verify(registered_descriptor)
             .map_err(|_| IndexerError::InvalidDescriptor)?;
@@ -274,9 +324,7 @@ impl VerifiedPublicBundleV1 {
         {
             return Err(IndexerError::DescriptorMismatch);
         }
-        if accepted_sequence.is_some_and(|sequence| fetched.sequence() < sequence) {
-            return Err(IndexerError::Downgrade);
-        }
+        verify_descriptor_transition(&fetched, accepted_descriptor, now)?;
         if fetched.is_tombstone() {
             return Ok(Self {
                 descriptor: fetched,
@@ -288,8 +336,6 @@ impl VerifiedPublicBundleV1 {
                 revoked: true,
             });
         }
-        DescriptorHeadV1::bootstrap_at(&fetched, now)
-            .map_err(|_| IndexerError::DescriptorExpired)?;
         if pages.len() > MAX_FEED_PAGES {
             return Err(IndexerError::FeedTooLarge);
         }

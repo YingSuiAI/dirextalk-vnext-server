@@ -11,6 +11,7 @@ use axum::{
     routing::{get, post},
 };
 use dtx_domain::{DirectoryRegistrationId, IndexerId, PublicSubjectId, TenantId};
+use dtx_http_cache::{CachedBody, ResponseCache};
 use dtx_indexer::{
     IndexRegistrationRequestV1, IndexerError, PinnedOriginV1, RegistrationStatusV1,
     VerifiedPublicBundleV1,
@@ -269,6 +270,11 @@ fn page_next_cursor(bytes: &[u8]) -> Result<Option<String>, NodeError> {
 pub struct IndexerPgStore {
     pool: PgPool,
 }
+struct Admission {
+    receipt: RegistrationReceipt,
+    should_fetch: bool,
+    accepted_descriptor: Option<Vec<u8>>,
+}
 impl IndexerPgStore {
     #[must_use]
     pub const fn from_prevalidated_pool(pool: PgPool) -> Self {
@@ -311,7 +317,7 @@ impl IndexerPgStore {
         tenant: TenantId,
         request: &IndexRegistrationRequestV1,
         now: i64,
-    ) -> Result<(RegistrationReceipt, bool), NodeError> {
+    ) -> Result<Admission, NodeError> {
         let descriptor = SignedPublicDescriptorV1::decode_and_verify(request.descriptor_bytes())
             .map_err(|_| NodeError::InvalidRequest)?;
         let hash = descriptor
@@ -323,40 +329,58 @@ impl IndexerPgStore {
         if rate.is_none() {
             return Err(NodeError::RateLimited);
         }
-        if let Some(row)=sqlx::query("SELECT indexer_id,subject_id,descriptor_hash,status,descriptor_sequence,feed_sequence,feed_hash,failure_code FROM directory.index_registrations WHERE tenant_id=$1 AND registration_id=$2 FOR UPDATE").bind(tenant.as_uuid()).bind(request.registration_id().as_uuid()).fetch_optional(&mut*tx).await? {
-            if row.try_get::<uuid::Uuid,_>("indexer_id")? != *request.indexer_id().as_uuid()
-                || row.try_get::<String,_>("subject_id")? != descriptor.subject_id().to_string()
+        if let Some(row)=sqlx::query("SELECT registration_id,status,descriptor_sequence,descriptor_hash,descriptor_exact_cbor,feed_sequence,feed_hash,failure_code FROM directory.index_registrations WHERE tenant_id=$1 AND indexer_id=$2 AND subject_id=$3 FOR UPDATE").bind(tenant.as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).fetch_optional(&mut*tx).await? {
+            if row.try_get::<uuid::Uuid,_>("registration_id")? != *request.registration_id().as_uuid() {
+                return Err(NodeError::Conflict);
+            }
+            let head_sequence:i64 = row.try_get("descriptor_sequence")?;
+            let head_hash:Vec<u8> = row.try_get("descriptor_hash")?;
+            let head_exact:Vec<u8> = row.try_get("descriptor_exact_cbor")?;
+            let head_status = status_from_code(row.try_get("status")?)?;
+            if head_status == RegistrationStatusV1::Revoked && head_hash != hash.as_bytes() {
+                return Err(NodeError::Conflict);
+            }
+            if let Some(attempt)=sqlx::query("SELECT status,descriptor_hash,descriptor_exact_cbor,failure_code FROM directory.index_registration_attempts WHERE tenant_id=$1 AND indexer_id=$2 AND subject_id=$3 AND descriptor_sequence=$4").bind(tenant.as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).bind(i64::try_from(descriptor.sequence().get()).map_err(|_|NodeError::InvalidRequest)?).fetch_optional(&mut*tx).await? {
+                if attempt.try_get::<Vec<u8>,_>("descriptor_hash")? != hash.as_bytes()
+                    || attempt.try_get::<Vec<u8>,_>("descriptor_exact_cbor")? != request.descriptor_bytes()
+                { return Err(NodeError::Conflict); }
+                let status=status_from_code(attempt.try_get("status")?)?;
+                let receipt=RegistrationReceipt{registration_id:request.registration_id(),indexer_id:request.indexer_id(),subject_id:descriptor.subject_id(),status,descriptor_sequence:descriptor.sequence(),descriptor_hash:hash,feed_sequence:(descriptor.sequence().get()==u64::try_from(head_sequence).map_err(|_|NodeError::Conflict)?).then(||row.try_get::<Option<i64>,_>("feed_sequence")).transpose()?.flatten().map(|v|SafeUint::new(u64::try_from(v).map_err(|_|NodeError::Conflict)?).map_err(|_|NodeError::Conflict)).transpose()?,feed_hash:(descriptor.sequence().get()==u64::try_from(head_sequence).map_err(|_|NodeError::Conflict)?).then(||row.try_get::<Option<Vec<u8>>,_>("feed_hash")).transpose()?.flatten().map(|v|v.try_into().map(Sha256Digest::from_bytes).map_err(|_|NodeError::Conflict)).transpose()?,failure:attempt.try_get("failure_code")?};
+                let should_fetch=status==RegistrationStatusV1::Pending;
+                tx.commit().await?;
+                return Ok(Admission{receipt,should_fetch,accepted_descriptor:should_fetch.then_some(head_exact).filter(|_| head_hash != hash.as_bytes())});
+            }
+            if descriptor.sequence().get() <= u64::try_from(head_sequence).map_err(|_|NodeError::Conflict)?
+                || descriptor.sequence().get() != u64::try_from(head_sequence).map_err(|_|NodeError::Conflict)?.checked_add(1).ok_or(NodeError::Conflict)?
+                || descriptor.previous_descriptor_hash().map(|v|v.as_bytes().to_vec()) != Some(head_hash.clone())
             { return Err(NodeError::Conflict); }
-            let old_hash:Vec<u8> = row.try_get("descriptor_hash")?;
-            let old_sequence:i64 = row.try_get("descriptor_sequence")?;
-            if descriptor.sequence().get() < u64::try_from(old_sequence).map_err(|_|NodeError::Conflict)? {
-                sqlx::query("UPDATE directory.index_registrations SET status=4,failure_code='DOWNGRADE',updated_at_ms=$3 WHERE tenant_id=$1 AND registration_id=$2").bind(tenant.as_uuid()).bind(request.registration_id().as_uuid()).bind(now).execute(&mut*tx).await?;
-                let mut receipt=receipt_from_row(request.registration_id(),request.indexer_id(),descriptor.subject_id(),&row)?;
-                receipt.status=RegistrationStatusV1::Stale;receipt.failure=Some("DOWNGRADE".to_owned());tx.commit().await?;return Ok((receipt,false));
-            }
-            if old_hash == hash.as_bytes() {
-                let receipt=receipt_from_row(request.registration_id(),request.indexer_id(),descriptor.subject_id(),&row)?;
-                let resume=receipt.status==RegistrationStatusV1::Pending;tx.commit().await?;return Ok((receipt,resume));
-            }
-            return Err(NodeError::Conflict);
+            sqlx::query("INSERT INTO directory.index_registration_attempts(tenant_id,registration_id,indexer_id,subject_id,descriptor_sequence,descriptor_hash,descriptor_exact_cbor,status,created_at_ms,updated_at_ms)VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$8)").bind(tenant.as_uuid()).bind(request.registration_id().as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).bind(i64::try_from(descriptor.sequence().get()).map_err(|_|NodeError::InvalidRequest)?).bind(hash.as_bytes().as_slice()).bind(request.descriptor_bytes()).bind(now).execute(&mut*tx).await?;
+            tx.commit().await?;
+            return Ok(Admission{receipt:RegistrationReceipt::pending(request.registration_id(),request.indexer_id(),descriptor.subject_id(),descriptor.sequence(),hash),should_fetch:true,accepted_descriptor:Some(head_exact)});
         }
         let kind = match descriptor.kind() {
             PublicDescriptorKindV1::Channel => 1_i16,
             PublicDescriptorKindV1::Agent => 2_i16,
         };
         sqlx::query("INSERT INTO directory.index_registrations(tenant_id,registration_id,indexer_id,subject_id,subject_kind,status,descriptor_sequence,descriptor_hash,descriptor_exact_cbor,feed_origin,created_at_ms,updated_at_ms)VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,$9,$10,$10)").bind(tenant.as_uuid()).bind(request.registration_id().as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).bind(kind).bind(i64::try_from(descriptor.sequence().get()).map_err(|_|NodeError::InvalidRequest)?).bind(hash.as_bytes().as_slice()).bind(request.descriptor_bytes()).bind(descriptor.feed_origin()).bind(now).execute(&mut*tx).await?;
+        sqlx::query("INSERT INTO directory.index_registration_attempts(tenant_id,registration_id,indexer_id,subject_id,descriptor_sequence,descriptor_hash,descriptor_exact_cbor,status,created_at_ms,updated_at_ms)VALUES($1,$2,$3,$4,$5,$6,$7,1,$8,$8)").bind(tenant.as_uuid()).bind(request.registration_id().as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).bind(i64::try_from(descriptor.sequence().get()).map_err(|_|NodeError::InvalidRequest)?).bind(hash.as_bytes().as_slice()).bind(request.descriptor_bytes()).bind(now).execute(&mut*tx).await?;
         tx.commit().await?;
-        Ok((
-            RegistrationReceipt::pending(
+        Ok(Admission {
+            receipt: RegistrationReceipt::pending(
                 request.registration_id(),
                 request.indexer_id(),
                 descriptor.subject_id(),
                 descriptor.sequence(),
                 hash,
             ),
-            true,
-        ))
+            should_fetch: true,
+            accepted_descriptor: None,
+        })
     }
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transactional descriptor CAS and projection replacement"
+    )]
     async fn finish(
         &self,
         tenant: TenantId,
@@ -370,6 +394,16 @@ impl IndexerPgStore {
         let hash = descriptor
             .entry_hash()
             .map_err(|_| NodeError::InvalidRequest)?;
+        let head=sqlx::query("SELECT status,descriptor_sequence,descriptor_hash FROM directory.index_registrations WHERE tenant_id=$1 AND registration_id=$2 AND indexer_id=$3 AND subject_id=$4 FOR UPDATE").bind(tenant.as_uuid()).bind(request.registration_id().as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).fetch_optional(&mut*tx).await?.ok_or(NodeError::Conflict)?;
+        let attempt=sqlx::query("SELECT status,descriptor_hash,descriptor_exact_cbor,failure_code FROM directory.index_registration_attempts WHERE tenant_id=$1 AND indexer_id=$2 AND subject_id=$3 AND descriptor_sequence=$4 FOR UPDATE").bind(tenant.as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).bind(i64::try_from(descriptor.sequence().get()).map_err(|_|NodeError::Conflict)?).fetch_optional(&mut*tx).await?.ok_or(NodeError::Conflict)?;
+        if attempt.try_get::<Vec<u8>, _>("descriptor_hash")? != hash.as_bytes()
+            || attempt.try_get::<Vec<u8>, _>("descriptor_exact_cbor")? != request.descriptor_bytes()
+        {
+            return Err(NodeError::Conflict);
+        }
+        if status_from_code(attempt.try_get("status")?)? != RegistrationStatusV1::Pending {
+            return Err(NodeError::Conflict);
+        }
         let (status, failure, verified) = match bundle {
             Ok(value) if value.is_revoked() => (RegistrationStatusV1::Revoked, None, Some(value)),
             Ok(value) => (RegistrationStatusV1::Published, None, Some(value)),
@@ -382,6 +416,38 @@ impl IndexerPgStore {
                 None,
             ),
         };
+        if verified.is_none() {
+            sqlx::query("UPDATE directory.index_registration_attempts SET status=$5,failure_code=$6,updated_at_ms=$7 WHERE tenant_id=$1 AND indexer_id=$2 AND subject_id=$3 AND descriptor_sequence=$4 AND status=1").bind(tenant.as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).bind(i64::try_from(descriptor.sequence().get()).map_err(|_|NodeError::Conflict)?).bind(status.code()).bind(failure).bind(now).execute(&mut*tx).await?;
+            if head.try_get::<Vec<u8>, _>("descriptor_hash")? == hash.as_bytes() {
+                sqlx::query("UPDATE directory.index_registrations SET status=$4,failure_code=$5,updated_at_ms=$6 WHERE tenant_id=$1 AND registration_id=$2 AND descriptor_hash=$3").bind(tenant.as_uuid()).bind(request.registration_id().as_uuid()).bind(hash.as_bytes().as_slice()).bind(status.code()).bind(failure).bind(now).execute(&mut*tx).await?;
+            }
+            tx.commit().await?;
+            return Ok(RegistrationReceipt {
+                registration_id: request.registration_id(),
+                indexer_id: request.indexer_id(),
+                subject_id: descriptor.subject_id(),
+                status,
+                descriptor_sequence: descriptor.sequence(),
+                descriptor_hash: hash,
+                feed_sequence: None,
+                feed_hash: None,
+                failure: failure.map(str::to_owned),
+            });
+        }
+        let head_sequence: u64 = u64::try_from(head.try_get::<i64, _>("descriptor_sequence")?)
+            .map_err(|_| NodeError::Conflict)?;
+        let head_hash: Vec<u8> = head.try_get("descriptor_hash")?;
+        let is_initial =
+            head_hash == hash.as_bytes() && head_sequence == descriptor.sequence().get();
+        let is_successor = descriptor.sequence().get()
+            == head_sequence.checked_add(1).ok_or(NodeError::Conflict)?
+            && descriptor
+                .previous_descriptor_hash()
+                .map(|v| v.as_bytes().to_vec())
+                == Some(head_hash);
+        if !is_initial && !is_successor {
+            return Err(NodeError::Conflict);
+        }
         if let Some(value) = verified.as_ref() {
             for exact in value.entries() {
                 let event = SignedPublicFeedEventV1::decode_and_verify(exact)
@@ -412,10 +478,11 @@ impl IndexerPgStore {
         let search = verified
             .as_ref()
             .map_or("", VerifiedPublicBundleV1::search_text);
-        let changed=sqlx::query("UPDATE directory.index_registrations SET status=$4,feed_sequence=$5,feed_hash=$6,search_document=$7,failure_code=$8,updated_at_ms=$9 WHERE tenant_id=$1 AND registration_id=$2 AND descriptor_hash=$3").bind(tenant.as_uuid()).bind(request.registration_id().as_uuid()).bind(hash.as_bytes().as_slice()).bind(status.code()).bind(feed_sequence).bind(feed_hash.as_deref()).bind(search).bind(failure).bind(now).execute(&mut*tx).await?;
+        let changed=sqlx::query("UPDATE directory.index_registrations SET status=$4,descriptor_sequence=$5,descriptor_hash=$6,descriptor_exact_cbor=$7,feed_origin=$8,feed_sequence=$9,feed_hash=$10,search_document=$11,failure_code=$12,updated_at_ms=$13 WHERE tenant_id=$1 AND registration_id=$2 AND descriptor_hash=$3").bind(tenant.as_uuid()).bind(request.registration_id().as_uuid()).bind(head.try_get::<Vec<u8>,_>("descriptor_hash")?).bind(status.code()).bind(i64::try_from(descriptor.sequence().get()).map_err(|_|NodeError::Conflict)?).bind(hash.as_bytes().as_slice()).bind(request.descriptor_bytes()).bind(descriptor.feed_origin()).bind(feed_sequence).bind(feed_hash.as_deref()).bind(search).bind(failure).bind(now).execute(&mut*tx).await?;
         if changed.rows_affected() != 1 {
             return Err(NodeError::Conflict);
         }
+        sqlx::query("UPDATE directory.index_registration_attempts SET status=$5,failure_code=$6,updated_at_ms=$7 WHERE tenant_id=$1 AND indexer_id=$2 AND subject_id=$3 AND descriptor_sequence=$4 AND descriptor_hash=$8").bind(tenant.as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).bind(i64::try_from(descriptor.sequence().get()).map_err(|_|NodeError::Conflict)?).bind(status.code()).bind(failure).bind(now).bind(hash.as_bytes().as_slice()).execute(&mut*tx).await?;
         tx.commit().await?;
         Ok(RegistrationReceipt {
             registration_id: request.registration_id(),
@@ -631,6 +698,7 @@ struct AppState {
     tenant: TenantId,
     indexer_id: IndexerId,
     fetcher: Arc<dyn PublicBundleFetcher>,
+    cache: ResponseCache,
 }
 pub fn indexer_router(
     store: IndexerPgStore,
@@ -648,6 +716,7 @@ pub fn indexer_router(
             tenant,
             indexer_id,
             fetcher,
+            cache: ResponseCache::new(256, 16 * 1024 * 1024),
         })
 }
 async fn register(State(state): State<AppState>, request: Request) -> Response {
@@ -671,20 +740,29 @@ async fn register(State(state): State<AppState>, request: Request) -> Response {
     let Ok(now) = now else {
         return failure(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let (receipt, created) = match state.store.admit(state.tenant, &command, now).await {
+    let admission = match state.store.admit(state.tenant, &command, now).await {
         Ok(value) => value,
         Err(error) => return map_error(&error),
     };
-    if !created {
-        return receipt_response(StatusCode::OK, &receipt);
+    if !admission.should_fetch {
+        return receipt_response(StatusCode::OK, &admission.receipt);
     }
     let Ok(descriptor) = SignedPublicDescriptorV1::decode_and_verify(command.descriptor_bytes())
     else {
         return failure(StatusCode::INTERNAL_SERVER_ERROR);
     };
+    let fetch_descriptor = if descriptor.is_tombstone() {
+        admission
+            .accepted_descriptor
+            .as_deref()
+            .and_then(|exact| SignedPublicDescriptorV1::decode_and_verify(exact).ok())
+            .unwrap_or_else(|| descriptor.clone())
+    } else {
+        descriptor.clone()
+    };
     let result = state
         .fetcher
-        .fetch(state.indexer_id, &descriptor)
+        .fetch(state.indexer_id, &fetch_descriptor)
         .await
         .and_then(|fetched| {
             VerifiedPublicBundleV1::verify(
@@ -692,7 +770,7 @@ async fn register(State(state): State<AppState>, request: Request) -> Response {
                 &fetched.descriptor,
                 &fetched.pages,
                 UtcMillis::new(now).map_err(|_| NodeError::InvalidRequest)?,
-                None,
+                admission.accepted_descriptor.as_deref(),
             )
             .map_err(NodeError::from)
         });
@@ -701,7 +779,10 @@ async fn register(State(state): State<AppState>, request: Request) -> Response {
         .finish(state.tenant, &command, result, now)
         .await
     {
-        Ok(value) => receipt_response(StatusCode::CREATED, &value),
+        Ok(value) => {
+            state.cache.invalidate_prefix(&cache_prefix(&state)).await;
+            receipt_response(StatusCode::CREATED, &value)
+        }
         Err(error) => map_error(&error),
     }
 }
@@ -720,7 +801,11 @@ struct SearchQuery {
     indexer_id: String,
     kind: Option<String>,
 }
-async fn search(State(state): State<AppState>, Query(query): Query<SearchQuery>) -> Response {
+async fn search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Response {
     let Ok(indexer) = query.indexer_id.parse() else {
         return failure(StatusCode::BAD_REQUEST);
     };
@@ -733,16 +818,25 @@ async fn search(State(state): State<AppState>, Query(query): Query<SearchQuery>)
         Some("agent") => Some(2),
         _ => return failure(StatusCode::BAD_REQUEST),
     };
+    let normalized = normalize_query(&query.q);
+    let key = format!("{}search:{normalized}:{kind:?}", cache_prefix(&state));
     match state
-        .store
-        .search(state.tenant, indexer, &query.q, kind)
+        .cache
+        .load(key, Duration::from_secs(15), || async {
+            state
+                .store
+                .search(state.tenant, indexer, &normalized, kind)
+                .await
+                .and_then(|v| {
+                    encode_deterministic_cbor(&SearchPage(v)).map_err(|_| NodeError::Conflict)
+                })
+        })
         .await
-        .and_then(|v| encode_deterministic_cbor(&SearchPage(v)).map_err(|_| NodeError::Conflict))
     {
-        Ok(bytes) => success(
-            StatusCode::OK,
+        Ok(body) => conditional_success(
+            &headers,
             SEARCH_CONTENT_TYPE,
-            bytes,
+            &body,
             "public, max-age=15, must-revalidate",
         ),
         Err(error) => map_error(&error),
@@ -754,6 +848,7 @@ struct SubjectQuery {
 }
 async fn get_subject(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(query): Query<SubjectQuery>,
 ) -> Response {
@@ -766,15 +861,85 @@ async fn get_subject(
     let Ok(subject) = id.parse() else {
         return failure(StatusCode::BAD_REQUEST);
     };
-    match state.store.subject(state.tenant, indexer, subject).await {
-        Ok(bytes) => success(
-            StatusCode::OK,
+    let key = format!("{}subject:{subject}", cache_prefix(&state));
+    match state
+        .cache
+        .load(key, Duration::from_mins(1), || async {
+            state.store.subject(state.tenant, indexer, subject).await
+        })
+        .await
+    {
+        Ok(body) => conditional_success(
+            &headers,
             DESCRIPTOR_CONTENT_TYPE,
-            bytes,
+            &body,
             "public, max-age=60, must-revalidate",
         ),
         Err(error) => map_error(&error),
     }
+}
+fn cache_prefix(state: &AppState) -> String {
+    format!("{}:{}:", state.tenant, state.indexer_id)
+}
+fn normalize_query(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+fn conditional_success(
+    headers: &HeaderMap,
+    content_type: &'static str,
+    body: &CachedBody,
+    cache: &'static str,
+) -> Response {
+    let Ok(matched) = if_none_match(headers, body.etag()) else {
+        return failure(StatusCode::BAD_REQUEST);
+    };
+    let mut response = if matched {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        success(StatusCode::OK, content_type, body.bytes().to_vec(), cache)
+    };
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(body.etag()).expect("generated ETag is valid"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+fn if_none_match(headers: &HeaderMap, etag: &str) -> Result<bool, ()> {
+    let mut values = headers.get_all(header::IF_NONE_MATCH).iter();
+    let Some(value) = values.next() else {
+        return Ok(false);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?;
+    validate_strong_etag(value)?;
+    Ok(value == etag)
+}
+fn validate_strong_etag(value: &str) -> Result<(), ()> {
+    let digest = value
+        .strip_prefix("\"dtx-")
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or(())?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+    {
+        return Err(());
+    }
+    Ok(())
 }
 fn receipt_response(status: StatusCode, value: &RegistrationReceipt) -> Response {
     match value.encode() {
@@ -836,24 +1001,6 @@ fn now_ms() -> Result<i64, NodeError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| NodeError::Conflict)
         .and_then(|v| i64::try_from(v.as_millis()).map_err(|_| NodeError::Conflict))
-}
-fn receipt_from_row(
-    registration_id: DirectoryRegistrationId,
-    indexer_id: IndexerId,
-    subject_id: PublicSubjectId,
-    row: &sqlx::postgres::PgRow,
-) -> Result<RegistrationReceipt, NodeError> {
-    receipt_from_values(
-        registration_id,
-        indexer_id,
-        subject_id,
-        row.try_get("status")?,
-        row.try_get("descriptor_sequence")?,
-        row.try_get("descriptor_hash")?,
-        row.try_get("feed_sequence")?,
-        row.try_get("feed_hash")?,
-        row.try_get("failure_code")?,
-    )
 }
 fn receipt_from_full_row(row: &sqlx::postgres::PgRow) -> Result<RegistrationReceipt, NodeError> {
     let registration: uuid::Uuid = row.try_get("registration_id")?;

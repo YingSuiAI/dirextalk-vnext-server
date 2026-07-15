@@ -192,6 +192,11 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         )
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
+    let root_etag = response
+        .headers()
+        .get(header::ETAG)
+        .ok_or("missing feed ETag")?
+        .clone();
     let page = decode_deterministic_cbor(&to_bytes(response.into_body(), 100_000).await?)?;
     let CanonicalValue::Map(fields) = page else {
         panic!("page map")
@@ -199,6 +204,17 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
     let CanonicalValue::Text(cursor) = map_field(&fields, 4) else {
         panic!("cursor")
     };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{feed}?limit=1"))
+                .header(header::IF_NONE_MATCH, root_etag.clone())
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(response.headers().get(header::ETAG), Some(&root_etag));
     let response = app
         .clone()
         .oneshot(
@@ -242,6 +258,16 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         ))
         .await?;
     assert_eq!(response.status(), StatusCode::CREATED);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("{feed}?limit=1"))
+                .header(header::IF_NONE_MATCH, root_etag)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
     let resurrection = event(
         subject,
         4,
@@ -263,6 +289,6 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         .await?;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let forced:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='directory' AND c.relrowsecurity AND c.relforcerowsecurity").fetch_one(harness.admin_pool()).await?;
-    assert_eq!(forced, 4);
+    assert_eq!(forced, 8);
     Ok(())
 }

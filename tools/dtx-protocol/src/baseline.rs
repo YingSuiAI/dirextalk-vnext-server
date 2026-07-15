@@ -116,6 +116,10 @@ const V25_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/indexer/v1",
     "protocol/test-vectors/indexer/v1",
 ];
+const V26_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/openapi/conditional-cache/v1",
+    "protocol/test-vectors/conditional-cache/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -281,6 +285,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v25/manifest.json",
         includes_registries: false,
         artifact_paths: V25_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 26,
+        path: "protocol/baseline/v26/manifest.json",
+        includes_registries: false,
+        artifact_paths: V26_ARTIFACT_PATHS,
     },
 ];
 

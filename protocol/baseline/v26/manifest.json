@@ -1,0 +1,9 @@
+{
+  "version": 26,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/openapi/conditional-cache/v1/openapi.yaml": "sha256:c3743cd281f4a838ea361e06c19836dd3c665579fe3b84ac0d43877a1538d9ac",
+    "protocol/test-vectors/conditional-cache/v1/etag-v1.json": "sha256:32c3471818b00b2abe005736af1d2c574b7d77fafa473963bb42113c132438bb"
+  }
+}

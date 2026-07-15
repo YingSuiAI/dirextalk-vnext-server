@@ -1,0 +1,55 @@
+openapi: 3.1.0
+info: { title: Dirextalk Public Conditional Cache Extension, version: 1.0.0 }
+paths:
+  /.well-known/dirextalk/public/v1/{subject_id}:
+    get:
+      summary: Exact public descriptor cached for 60 seconds with mandatory revalidation
+      parameters:
+        - { name: subject_id, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses: { '200': { $ref: '#/components/responses/CacheableBody' }, '304': { $ref: '#/components/responses/NotModified' } }
+  /.well-known/dirextalk/public/v1/{subject_id}/feed:
+    get:
+      summary: Root pages use 10 seconds; immutable snapshot-cursor pages use 300 seconds
+      parameters:
+        - { name: subject_id, in: path, required: true, schema: { type: string } }
+        - { name: cursor, in: query, schema: { type: string } }
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses: { '200': { $ref: '#/components/responses/CacheableBody' }, '304': { $ref: '#/components/responses/NotModified' } }
+  /v1/public-search:
+    get:
+      summary: Complete canonical Indexer query cached for 15 seconds
+      parameters: [ { $ref: '#/components/parameters/IfNoneMatch' } ]
+      responses: { '200': { $ref: '#/components/responses/CacheableBody' }, '304': { $ref: '#/components/responses/NotModified' } }
+  /v1/public-subjects/{stable_id}:
+    get:
+      summary: Exact Indexer descriptor cached for 60 seconds
+      parameters:
+        - { name: stable_id, in: path, required: true, schema: { type: string } }
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses: { '200': { $ref: '#/components/responses/CacheableBody' }, '304': { $ref: '#/components/responses/NotModified' } }
+components:
+  parameters:
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: One strong quoted ETag; weak, wildcard, list, and duplicate forms are rejected
+      schema: { type: string, pattern: '^"dtx-[0-9a-f]{64}"$' }
+  headers:
+    ETag: { required: true, schema: { type: string, pattern: '^"dtx-[0-9a-f]{64}"$' } }
+    CacheControl: { required: true, description: Policy always includes must-revalidate, schema: { type: string } }
+    Nosniff: { required: true, schema: { type: string, const: nosniff } }
+  responses:
+    CacheableBody:
+      description: Exact canonical response body
+      headers:
+        ETag: { $ref: '#/components/headers/ETag' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+        X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }
+    NotModified:
+      description: Empty body with retained validators and policy
+      headers:
+        ETag: { $ref: '#/components/headers/ETag' }
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+        X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }

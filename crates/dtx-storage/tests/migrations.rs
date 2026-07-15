@@ -25,7 +25,8 @@ const MLS_COMMIT_SEQUENCER_MIGRATION_VERSION: i64 = 202_607_160_018;
 const AGENT_IDENTITY_PROVISIONING_MIGRATION_VERSION: i64 = 202_607_160_019;
 const PUBLIC_FEED_MIGRATION_VERSION: i64 = 202_607_160_020;
 const INDEXER_MIGRATION_VERSION: i64 = 202_607_160_021;
-const EXPECTED_MIGRATION_COUNT: i64 = 21;
+const INDEXER_DESCRIPTOR_HEADS_MIGRATION_VERSION: i64 = 202_607_160_022;
+const EXPECTED_MIGRATION_COUNT: i64 = 22;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -66,6 +67,8 @@ const AGENT_IDENTITY_PROVISIONING_DOWN: &str =
 const PUBLIC_FEED_DOWN: &str =
     include_str!("../../../migrations/202607160020_public_feed.down.sql");
 const INDEXER_DOWN: &str = include_str!("../../../migrations/202607160021_indexer.down.sql");
+const INDEXER_DESCRIPTOR_HEADS_DOWN: &str =
+    include_str!("../../../migrations/202607160022_indexer_descriptor_heads.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -96,7 +99,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -119,8 +122,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(AGENT_IDENTITY_PROVISIONING_MIGRATION_VERSION)
     .bind(PUBLIC_FEED_MIGRATION_VERSION)
     .bind(INDEXER_MIGRATION_VERSION)
+    .bind(INDEXER_DESCRIPTOR_HEADS_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(INDEXER_DESCRIPTOR_HEADS_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(INDEXER_DOWN)
         .execute(harness.admin_pool())
         .await?;

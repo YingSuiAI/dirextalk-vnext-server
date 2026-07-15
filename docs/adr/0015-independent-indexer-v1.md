@@ -22,6 +22,15 @@ pending intent before any remote request, then records one of `published`,
 durable outcome; a lower descriptor sequence is persisted as stale, while
 conflicting bytes at an accepted sequence are rejected.
 
+The registration ID is the immutable handle for one `(Indexer, stable
+subject)` head. A successor reuses it and must be exactly the next signed
+sequence with `previous_descriptor_hash` equal to the accepted head. Attempts
+are retained independently from the searchable head: a failed refresh records
+its durable outcome without replacing the last published projection. A
+successful refresh replaces descriptor and search state in one transaction.
+An accepted descriptor tombstone permanently revokes the head, clears search
+content, and prevents every older descriptor from becoming active again.
+
 Remote fetching is HTTPS-only. The node resolves the descriptor's canonical
 origin once, rejects the complete answer if any address is non-public, and
 pins the validated socket addresses into the HTTP connector. Redirects,

@@ -5,7 +5,7 @@
 use std::{
     fmt,
     str::FromStr,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -17,6 +17,7 @@ use axum::{
     routing::get,
 };
 use dtx_domain::{PublicSubjectId, TenantId};
+use dtx_http_cache::{CachedBody, ResponseCache};
 use dtx_public_descriptor::{DescriptorHeadV1, PublicDescriptorKindV1, SignedPublicDescriptorV1};
 use dtx_public_feed::{PublicFeedCursorV1, PublicFeedError, SignedPublicFeedEventV1};
 use dtx_wire::{
@@ -476,6 +477,7 @@ impl CanonicalEncode for FeedPage {
 struct AppState {
     store: PublicFeedPgStore,
     tenant: TenantId,
+    cache: ResponseCache,
 }
 #[derive(Deserialize)]
 struct PageQuery {
@@ -486,17 +488,32 @@ pub fn public_feed_router(store: PublicFeedPgStore, tenant: TenantId) -> Router 
     Router::new()
         .route(SUBJECT_PATH, get(get_descriptor).put(put_descriptor))
         .route(FEED_PATH, get(get_page).post(append_event))
-        .with_state(AppState { store, tenant })
+        .with_state(AppState {
+            store,
+            tenant,
+            cache: ResponseCache::new(256, 16 * 1024 * 1024),
+        })
 }
-async fn get_descriptor(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+async fn get_descriptor(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     let Ok(subject) = parse_subject(&id) else {
         return failure(StatusCode::BAD_REQUEST);
     };
-    match s.store.descriptor(s.tenant, &subject).await {
-        Ok(bytes) => success(
-            StatusCode::OK,
+    let key = format!("{}:{subject}:descriptor", s.tenant);
+    match s
+        .cache
+        .load(key, Duration::from_mins(1), || async {
+            s.store.descriptor(s.tenant, &subject).await
+        })
+        .await
+    {
+        Ok(body) => conditional_success(
+            &headers,
             DESCRIPTOR_CONTENT_TYPE,
-            bytes,
+            &body,
             "public, max-age=60, must-revalidate",
         ),
         Err(e) => map_error(&e),
@@ -529,7 +546,7 @@ async fn put_descriptor(
     let Ok(now) = unix_millis() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE);
     };
-    match s.store.register_descriptor(s.tenant, &bytes, now).await {
+    let response = match s.store.register_descriptor(s.tenant, &bytes, now).await {
         Ok(AppendOutcome::Created) => success(
             StatusCode::CREATED,
             DESCRIPTOR_CONTENT_TYPE,
@@ -543,10 +560,17 @@ async fn put_descriptor(
             "no-store",
         ),
         Err(e) => map_error(&e),
+    };
+    if response.status().is_success() {
+        s.cache
+            .invalidate_prefix(&format!("{}:{subject}:", s.tenant))
+            .await;
     }
+    response
 }
 async fn get_page(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     Query(q): Query<PageQuery>,
 ) -> Response {
@@ -557,18 +581,25 @@ async fn get_page(
     if !(1..=100).contains(&limit) {
         return failure(StatusCode::BAD_REQUEST);
     }
+    let cursor = q.cursor.clone().unwrap_or_default();
+    let ttl = if q.cursor.is_some() { 300 } else { 10 };
+    let cache_control = if q.cursor.is_some() {
+        "public, max-age=300, must-revalidate"
+    } else {
+        "public, max-age=10, must-revalidate"
+    };
+    let key = format!("{}:{subject}:feed:{cursor}:{limit}", s.tenant);
     match s
-        .store
-        .page(s.tenant, &subject, q.cursor.as_deref(), limit)
+        .cache
+        .load(key, Duration::from_secs(ttl), || async {
+            s.store
+                .page(s.tenant, &subject, q.cursor.as_deref(), limit)
+                .await
+                .and_then(|v| v.encode())
+        })
         .await
-        .and_then(|v| v.encode())
     {
-        Ok(bytes) => success(
-            StatusCode::OK,
-            PAGE_CONTENT_TYPE,
-            bytes,
-            "public, max-age=15, must-revalidate",
-        ),
+        Ok(body) => conditional_success(&headers, PAGE_CONTENT_TYPE, &body, cache_control),
         Err(e) => map_error(&e),
     }
 }
@@ -593,7 +624,7 @@ async fn append_event(
     let Ok(now) = unix_millis() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE);
     };
-    match s.store.append(s.tenant, &subject, &bytes, now).await {
+    let response = match s.store.append(s.tenant, &subject, &bytes, now).await {
         Ok(AppendOutcome::Created) => success(
             StatusCode::CREATED,
             EVENT_CONTENT_TYPE,
@@ -607,7 +638,13 @@ async fn append_event(
             "no-store",
         ),
         Err(e) => map_error(&e),
+    };
+    if response.status().is_success() {
+        s.cache
+            .invalidate_prefix(&format!("{}:{subject}:", s.tenant))
+            .await;
     }
+    response
 }
 fn parse_subject(value: &str) -> Result<PublicSubjectId, StoreError> {
     let id = PublicSubjectId::from_str(value).map_err(|_| StoreError::NotFound)?;
@@ -660,6 +697,59 @@ fn success(
         HeaderValue::from_static("nosniff"),
     );
     response
+}
+fn conditional_success(
+    headers: &HeaderMap,
+    content_type: &'static str,
+    body: &CachedBody,
+    cache: &'static str,
+) -> Response {
+    let Ok(matched) = if_none_match(headers, body.etag()) else {
+        return failure(StatusCode::BAD_REQUEST);
+    };
+    let mut response = if matched {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        success(StatusCode::OK, content_type, body.bytes().to_vec(), cache)
+    };
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(body.etag()).expect("generated ETag is valid"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+fn if_none_match(headers: &HeaderMap, etag: &str) -> Result<bool, ()> {
+    let mut values = headers.get_all(header::IF_NONE_MATCH).iter();
+    let Some(value) = values.next() else {
+        return Ok(false);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?;
+    validate_strong_etag(value)?;
+    Ok(value == etag)
+}
+fn validate_strong_etag(value: &str) -> Result<(), ()> {
+    let digest = value
+        .strip_prefix("\"dtx-")
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or(())?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+    {
+        return Err(());
+    }
+    Ok(())
 }
 fn failure(status: StatusCode) -> Response {
     let mut response = status.into_response();

@@ -142,6 +142,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_public_descriptor_v1_2(root)?;
     validate_public_feed_v1(root)?;
     validate_indexer_v1(root)?;
+    validate_conditional_cache_v1(root)?;
     validate_membership_federation_v1(root)?;
     validate_private_messaging_artifacts(root)?;
 
@@ -149,6 +150,44 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_conditional_cache_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let source = read(&root.join("protocol/openapi/conditional-cache/v1/openapi.yaml"))?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse conditional cache V1 OpenAPI: {error}"))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "conditional cache V1 OpenAPI must declare 3.1.0",
+        ));
+    }
+    for required in ["If-None-Match", "'304'", "ETag", "must-revalidate"] {
+        if !source.contains(required) {
+            return Err(ProtocolToolError::new(format!(
+                "conditional cache V1 OpenAPI is missing {required}"
+            )));
+        }
+    }
+    let vector = read_json(&root.join("protocol/test-vectors/conditional-cache/v1/etag-v1.json"))?;
+    validate_vector_version(&vector, "conditional-cache-v1")?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(26) {
+        return Err(ProtocolToolError::new(
+            "conditional cache V1 vector baseline must be 26",
+        ));
+    }
+    let body = decode_hex(json_string(&vector, "body_hex")?)?;
+    let digest: [u8; 32] = Sha256::digest(body).into();
+    let advertised = json_string(&vector, "strong_etag")?
+        .strip_prefix("\"dtx-")
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or_else(|| ProtocolToolError::new("conditional cache V1 ETag shape is invalid"))?;
+    if decode_lower_hex_fixed::<32>(advertised)? != digest {
+        return Err(ProtocolToolError::new(
+            "conditional cache V1 strong ETag digest mismatch",
+        ));
+    }
     Ok(())
 }
 
