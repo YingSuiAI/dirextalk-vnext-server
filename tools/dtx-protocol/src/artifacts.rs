@@ -6,6 +6,10 @@ use std::{
 };
 
 use base64ct::{Base64UrlUnpadded, Encoding};
+use dtx_wire::{
+    CanonicalEncode, CanonicalValue, UtcMillis, decode_deterministic_cbor,
+    encode_deterministic_cbor,
+};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -16,6 +20,11 @@ use crate::{
 };
 
 const SAFE_UINT_MAX: u64 = 9_007_199_254_740_991;
+const PRIVATE_EVENT_MAX_ENCODED_BYTES: usize = 66_383;
+const PRIVATE_EVENT_MLS_GROUP_ID_DOMAIN: &[u8] = b"dirextalk.mls-group-id.conversation.v1\0";
+const PRIVATE_EVENT_MLS_CIPHERTEXT_DIGEST_DOMAIN: &[u8] =
+    b"dirextalk.private-event-mls-ciphertext.v1\0";
+const PRIVATE_EVENT_MAX_MLS_CIPHERTEXT_BYTES: usize = 262_144;
 const CONTACT_CARD_QR_PREFIX: &str = "dtxc1:";
 const CONTACT_CARD_MAX_DECODED_CBOR_BYTES: usize = 4_096;
 const CONTACT_CARD_MAX_UNPADDED_BASE64URL_CHARS: usize =
@@ -131,12 +140,516 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
     validate_membership_federation_v1(root)?;
+    validate_private_event_v1(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
     Ok(())
+}
+
+fn validate_private_event_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl_path = root.join("protocol/cddl/private-event/v1/private-event-v1.cddl");
+    let cddl = read(&cddl_path)?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse private application event v1 CDDL {}: {error}",
+            cddl_path.display()
+        ))
+    })?;
+
+    let vector =
+        read_json(&root.join("protocol/test-vectors/private-event/v1/private-event-v1.json"))?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "baseline",
+            "max_canonical_cbor_bytes",
+            "mls_group_id_derivation",
+            "mls_authenticated_event_digest",
+            "events",
+        ],
+        "private-event-v1 vector",
+    )?;
+    validate_vector_version(&vector, "private-event-v1")?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(20) {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 vector baseline must be 20",
+        ));
+    }
+    if vector
+        .get("max_canonical_cbor_bytes")
+        .and_then(Value::as_u64)
+        != Some(PRIVATE_EVENT_MAX_ENCODED_BYTES as u64)
+    {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 max canonical CBOR bytes must be 66383",
+        ));
+    }
+    validate_private_event_mls_group_id_derivation(&vector)?;
+    validate_private_event_mls_ciphertext_digest(&vector)?;
+    let events = vector
+        .get("events")
+        .and_then(Value::as_array)
+        .filter(|events| events.len() == 3)
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "private-event-v1 vector must contain exactly text, agent_request, and agent_response",
+            )
+        })?;
+    let mut kinds = BTreeSet::new();
+    for event in events {
+        let kind = validate_private_event_vector_entry(event, &cddl)?;
+        if !kinds.insert(kind) {
+            return Err(ProtocolToolError::new(
+                "private-event-v1 vector event kinds must be unique",
+            ));
+        }
+    }
+    if kinds != BTreeSet::from([1, 2, 3]) {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 vector must cover kinds 1, 2, and 3",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_private_event_mls_ciphertext_digest(vector: &Value) -> Result<(), ProtocolToolError> {
+    let digest = vector
+        .get("mls_authenticated_event_digest")
+        .ok_or_else(|| {
+            ProtocolToolError::new("private-event-v1 MLS-authenticated event digest is missing")
+        })?;
+    require_exact_object_keys(
+        digest,
+        &[
+            "domain_utf8_hex",
+            "event_id",
+            "event_uuid_raw16_hex",
+            "max_ciphertext_bytes",
+            "mls_wire_ciphertext_hex",
+            "ciphertext_len",
+            "digest_hex",
+        ],
+        "private-event-v1 MLS-authenticated event digest",
+    )?;
+    let domain = decode_hex(json_string(digest, "domain_utf8_hex")?)?;
+    if domain != PRIVATE_EVENT_MLS_CIPHERTEXT_DIGEST_DOMAIN {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 MLS ciphertext digest domain drifted",
+        ));
+    }
+    if digest.get("max_ciphertext_bytes").and_then(Value::as_u64)
+        != Some(PRIVATE_EVENT_MAX_MLS_CIPHERTEXT_BYTES as u64)
+    {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 MLS ciphertext maximum must match mailbox ciphertext maximum",
+        ));
+    }
+    let event_id = json_string(digest, "event_id")?;
+    let raw = decode_uuid_v7_raw16(event_id)?;
+    if decode_lower_hex_fixed::<16>(json_string(digest, "event_uuid_raw16_hex")?)? != raw {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 digest event UUID raw16 vector drifted",
+        ));
+    }
+    let ciphertext = decode_hex(json_string(digest, "mls_wire_ciphertext_hex")?)?;
+    if digest.get("ciphertext_len").and_then(Value::as_u64) != u64::try_from(ciphertext.len()).ok()
+    {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 MLS ciphertext length vector drifted",
+        ));
+    }
+    let expected = mls_authenticated_private_event_digest(event_id, &ciphertext)?;
+    if decode_lower_hex_fixed::<32>(json_string(digest, "digest_hex")?)? != expected {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 MLS-authenticated event digest vector drifted",
+        ));
+    }
+    let event_is_frozen = vector
+        .get("events")
+        .and_then(Value::as_array)
+        .is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event.get("event_id").and_then(Value::as_str) == Some(event_id))
+        });
+    if !event_is_frozen {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 digest event_id must reference a frozen event vector",
+        ));
+    }
+    Ok(())
+}
+
+fn mls_authenticated_private_event_digest(
+    event_id: &str,
+    ciphertext: &[u8],
+) -> Result<[u8; 32], ProtocolToolError> {
+    let event_id = decode_uuid_v7_raw16(event_id)?;
+    if ciphertext.is_empty() || ciphertext.len() > PRIVATE_EVENT_MAX_MLS_CIPHERTEXT_BYTES {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 MLS ciphertext must contain 1..262144 bytes",
+        ));
+    }
+    let ciphertext_len = u64::try_from(ciphertext.len())
+        .expect("private event MLS ciphertext length is bounded by 262144");
+    Ok(Sha256::new()
+        .chain_update(PRIVATE_EVENT_MLS_CIPHERTEXT_DIGEST_DOMAIN)
+        .chain_update(event_id)
+        .chain_update(ciphertext_len.to_be_bytes())
+        .chain_update(ciphertext)
+        .finalize()
+        .into())
+}
+
+fn validate_private_event_mls_group_id_derivation(vector: &Value) -> Result<(), ProtocolToolError> {
+    let derivation = vector.get("mls_group_id_derivation").ok_or_else(|| {
+        ProtocolToolError::new("private-event-v1 MLS group derivation is missing")
+    })?;
+    require_exact_object_keys(
+        derivation,
+        &[
+            "domain_utf8_hex",
+            "conversation_id",
+            "conversation_uuid_raw16_hex",
+            "mls_group_id_hex",
+        ],
+        "private-event-v1 MLS group derivation",
+    )?;
+    let domain = decode_hex(json_string(derivation, "domain_utf8_hex")?)?;
+    if domain != PRIVATE_EVENT_MLS_GROUP_ID_DOMAIN {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 MLS group derivation domain drifted",
+        ));
+    }
+    let conversation_id = json_string(derivation, "conversation_id")?;
+    let raw = decode_uuid_v7_raw16(conversation_id)?;
+    if decode_lower_hex_fixed::<16>(json_string(derivation, "conversation_uuid_raw16_hex")?)? != raw
+    {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 conversation UUID raw16 vector drifted",
+        ));
+    }
+    let expected: [u8; 32] = Sha256::new()
+        .chain_update(PRIVATE_EVENT_MLS_GROUP_ID_DOMAIN)
+        .chain_update(raw)
+        .finalize()
+        .into();
+    if decode_lower_hex_fixed::<32>(json_string(derivation, "mls_group_id_hex")?)? != expected {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 MLS group ID vector drifted",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // One entry audit keeps JSON semantics and exact CBOR inseparable.
+fn validate_private_event_vector_entry(
+    event: &Value,
+    cddl: &str,
+) -> Result<u64, ProtocolToolError> {
+    require_exact_object_keys(
+        event,
+        &[
+            "label",
+            "event_id",
+            "conversation_id",
+            "author_identity_id",
+            "author_device_id",
+            "created_at_ms",
+            "kind",
+            "parent_event_ids",
+            "body_utf8_hex",
+            "run_id",
+            "canonical_cbor_hex",
+        ],
+        "private-event-v1 entry",
+    )?;
+    let label = json_string(event, "label")?;
+    let event_id = json_string(event, "event_id")?;
+    let conversation_id = json_string(event, "conversation_id")?;
+    let author_identity_id = json_string(event, "author_identity_id")?;
+    let author_device_id = json_string(event, "author_device_id")?;
+    for (value, name) in [
+        (event_id, "event_id"),
+        (conversation_id, "conversation_id"),
+        (author_device_id, "author_device_id"),
+    ] {
+        validate_uuid_v7(value).map_err(|error| {
+            ProtocolToolError::new(format!(
+                "private-event-v1 {label} {name} is invalid: {error}"
+            ))
+        })?;
+    }
+    validate_identity_id(author_identity_id, "private-event-v1 author_identity_id")?;
+    let created_at_ms = event
+        .get("created_at_ms")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            ProtocolToolError::new("private-event-v1 created_at_ms must be an integer")
+        })?;
+    let created_at = UtcMillis::new(created_at_ms).map_err(|_| {
+        ProtocolToolError::new("private-event-v1 created_at_ms must be a valid UtcMillis")
+    })?;
+    let kind = event
+        .get("kind")
+        .and_then(Value::as_u64)
+        .filter(|kind| (1..=3).contains(kind))
+        .ok_or_else(|| ProtocolToolError::new("private-event-v1 kind must be 1, 2, or 3"))?;
+    let parent_values = event
+        .get("parent_event_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProtocolToolError::new("private-event-v1 parent_event_ids must be an array")
+        })?;
+    if parent_values.len() > 16 {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 parent_event_ids cannot exceed 16 entries",
+        ));
+    }
+    let mut parent_ids = Vec::with_capacity(parent_values.len());
+    let mut unique_parents = BTreeSet::new();
+    for parent in parent_values {
+        let parent = parent.as_str().ok_or_else(|| {
+            ProtocolToolError::new("private-event-v1 parent_event_id must be text")
+        })?;
+        validate_uuid_v7(parent)?;
+        if parent == event_id {
+            return Err(ProtocolToolError::new(
+                "private-event-v1 parent_event_ids cannot contain event_id",
+            ));
+        }
+        if !unique_parents.insert(parent) {
+            return Err(ProtocolToolError::new(
+                "private-event-v1 parent_event_ids must be unique",
+            ));
+        }
+        parent_ids.push(CanonicalValue::Text(parent.to_owned()));
+    }
+    let body_bytes = decode_hex(json_string(event, "body_utf8_hex")?)?;
+    if body_bytes.len() > 65_536 {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 body exceeds 65536 UTF-8 bytes",
+        ));
+    }
+    let body = String::from_utf8(body_bytes)
+        .map_err(|_| ProtocolToolError::new("private-event-v1 body_utf8_hex is not valid UTF-8"))?;
+    let run_id = match event.get("run_id") {
+        Some(Value::Null) => None,
+        Some(Value::String(value)) => {
+            validate_uuid_v7(value)?;
+            Some(value.as_str())
+        }
+        _ => {
+            return Err(ProtocolToolError::new(
+                "private-event-v1 run_id must be UUIDv7 text or null",
+            ));
+        }
+    };
+    if (kind == 1 && run_id.is_some()) || (kind == 3 && run_id.is_none()) {
+        return Err(ProtocolToolError::new(
+            "private-event-v1 kind/run_id combination is invalid",
+        ));
+    }
+
+    let canonical = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(event_id.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(conversation_id.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(author_identity_id.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(author_device_id.to_owned()),
+        ),
+        (CanonicalValue::Unsigned(6), created_at.to_canonical_value()),
+        (CanonicalValue::Unsigned(7), CanonicalValue::Unsigned(kind)),
+        (
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Array(parent_ids),
+        ),
+        (CanonicalValue::Unsigned(9), CanonicalValue::Text(body)),
+        (
+            CanonicalValue::Unsigned(10),
+            run_id.map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::Text(value.to_owned())
+            }),
+        ),
+    ]);
+    let actual = encode_deterministic_cbor(&canonical).map_err(|error| {
+        ProtocolToolError::new(format!("encode private-event-v1 {label}: {error}"))
+    })?;
+    let expected_hex = json_string(event, "canonical_cbor_hex")?;
+    if lowercase_hex(&actual) != expected_hex {
+        return Err(ProtocolToolError::new(format!(
+            "private-event-v1 {label} canonical CBOR drift: actual {}",
+            lowercase_hex(&actual)
+        )));
+    }
+    validate_private_event_bytes(cddl, &actual).map_err(|error| {
+        ProtocolToolError::new(format!("private-event-v1 {label} is invalid: {error}"))
+    })?;
+    Ok(kind)
+}
+
+#[allow(clippy::too_many_lines)] // All ten strict decoder fields are audited in one ordered pass.
+fn validate_private_event_bytes(cddl: &str, bytes: &[u8]) -> Result<(), ProtocolToolError> {
+    if bytes.len() > PRIVATE_EVENT_MAX_ENCODED_BYTES {
+        return Err(ProtocolToolError::new(
+            "private application event exceeds 66383 canonical CBOR bytes",
+        ));
+    }
+    let value = decode_deterministic_cbor(bytes).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "private application event is not canonical: {error}"
+        ))
+    })?;
+    let CanonicalValue::Map(entries) = value else {
+        return Err(ProtocolToolError::new(
+            "private application event must be a map",
+        ));
+    };
+    if entries.len() != 10 {
+        return Err(ProtocolToolError::new(
+            "private application event must contain exactly fields 1 through 10",
+        ));
+    }
+    let values = entries
+        .iter()
+        .enumerate()
+        .map(|(index, (key, value))| {
+            let expected = u64::try_from(index + 1).expect("field index is bounded");
+            if key == &CanonicalValue::Unsigned(expected) {
+                Ok(value)
+            } else {
+                Err(ProtocolToolError::new(
+                    "private application event contains an unknown or missing field",
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values[0] != &CanonicalValue::Unsigned(1) {
+        return Err(ProtocolToolError::new(
+            "private application event version must be 1",
+        ));
+    }
+    for (value, label) in [
+        (values[1], "event_id"),
+        (values[2], "conversation_id"),
+        (values[4], "author_device_id"),
+    ] {
+        let CanonicalValue::Text(value) = value else {
+            return Err(ProtocolToolError::new(format!(
+                "private application event {label} must be text"
+            )));
+        };
+        validate_uuid_v7(value)?;
+    }
+    let CanonicalValue::Text(author_identity_id) = values[3] else {
+        return Err(ProtocolToolError::new(
+            "private application event author_identity_id must be text",
+        ));
+    };
+    validate_identity_id(
+        author_identity_id,
+        "private application event author_identity_id",
+    )?;
+    decode_private_event_utc_millis(values[5])?;
+    let CanonicalValue::Unsigned(kind @ 1..=3) = values[6] else {
+        return Err(ProtocolToolError::new(
+            "private application event kind must be 1, 2, or 3",
+        ));
+    };
+    let CanonicalValue::Array(parents) = values[7] else {
+        return Err(ProtocolToolError::new(
+            "private application event parents must be an array",
+        ));
+    };
+    if parents.len() > 16 {
+        return Err(ProtocolToolError::new(
+            "private application event parents cannot exceed 16 entries",
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for parent in parents {
+        let CanonicalValue::Text(parent) = parent else {
+            return Err(ProtocolToolError::new(
+                "private application event parent must be text",
+            ));
+        };
+        validate_uuid_v7(parent)?;
+        let CanonicalValue::Text(event_id) = values[1] else {
+            unreachable!("event_id was validated as text")
+        };
+        if parent == event_id {
+            return Err(ProtocolToolError::new(
+                "private application event parents cannot contain event_id",
+            ));
+        }
+        if !unique.insert(parent) {
+            return Err(ProtocolToolError::new(
+                "private application event parents must be unique",
+            ));
+        }
+    }
+    let CanonicalValue::Text(body) = values[8] else {
+        return Err(ProtocolToolError::new(
+            "private application event body must be UTF-8 text",
+        ));
+    };
+    if body.len() > 65_536 {
+        return Err(ProtocolToolError::new(
+            "private application event body exceeds 65536 UTF-8 bytes",
+        ));
+    }
+    let run_id = match values[9] {
+        CanonicalValue::Null => None,
+        CanonicalValue::Text(value) => {
+            validate_uuid_v7(value)?;
+            Some(value)
+        }
+        _ => {
+            return Err(ProtocolToolError::new(
+                "private application event run_id must be UUIDv7 text or null",
+            ));
+        }
+    };
+    if (*kind == 1 && run_id.is_some()) || (*kind == 3 && run_id.is_none()) {
+        return Err(ProtocolToolError::new(
+            "private application event kind/run_id combination is invalid",
+        ));
+    }
+    cddl_cat::validate_cbor_bytes("private-application-event-v1", cddl, bytes).map_err(|error| {
+        ProtocolToolError::new(format!("private application event CDDL rejected: {error}"))
+    })
+}
+
+fn decode_private_event_utc_millis(value: &CanonicalValue) -> Result<UtcMillis, ProtocolToolError> {
+    let raw = match value {
+        CanonicalValue::Unsigned(value) => i64::try_from(*value).map_err(|_| {
+            ProtocolToolError::new("private application event created_at_ms exceeds i64")
+        })?,
+        CanonicalValue::Negative(value) => *value,
+        _ => {
+            return Err(ProtocolToolError::new(
+                "private application event created_at_ms must be an integer",
+            ));
+        }
+    };
+    UtcMillis::new(raw).map_err(|_| {
+        ProtocolToolError::new("private application event created_at_ms must be a valid UtcMillis")
+    })
 }
 
 fn validate_membership_federation_v1(root: &Path) -> Result<(), ProtocolToolError> {
@@ -2461,6 +2974,16 @@ fn validate_uuid_v7(value: &str) -> Result<(), ProtocolToolError> {
     Ok(())
 }
 
+fn decode_uuid_v7_raw16(value: &str) -> Result<[u8; 16], ProtocolToolError> {
+    validate_uuid_v7(value)?;
+    let compact = value
+        .bytes()
+        .filter(|byte| *byte != b'-')
+        .map(char::from)
+        .collect::<String>();
+    decode_lower_hex_fixed(&compact)
+}
+
 fn is_lower_hex(byte: u8) -> bool {
     byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
 }
@@ -3180,6 +3703,191 @@ mod tests {
             encoded.extend([0x61, b'a' + index, 0xf4]);
         }
         encoded
+    }
+
+    fn private_event_fixture(label: &str) -> (String, Vec<u8>) {
+        let cddl =
+            read(&root().join("protocol/cddl/private-event/v1/private-event-v1.cddl")).unwrap();
+        let vector: Value = serde_json::from_str(include_str!(
+            "../../../protocol/test-vectors/private-event/v1/private-event-v1.json"
+        ))
+        .unwrap();
+        let event = vector["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["label"] == label)
+            .unwrap();
+        (
+            cddl,
+            decode_hex(event["canonical_cbor_hex"].as_str().unwrap()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn private_event_decoder_rejects_unknown_noncanonical_and_invalid_semantics() {
+        let (cddl, text) = private_event_fixture("text");
+        validate_private_event_bytes(&cddl, &text).unwrap();
+
+        let mut noncanonical = text.clone();
+        noncanonical.splice(2..3, [0x18, 0x01]);
+        assert!(validate_private_event_bytes(&cddl, &noncanonical).is_err());
+
+        let mut unknown = text.clone();
+        unknown[0] = 0xab;
+        unknown.extend([0x0b, 0x00]);
+        assert!(validate_private_event_bytes(&cddl, &unknown).is_err());
+
+        let mut invalid_text_run = text;
+        assert_eq!(invalid_text_run.pop(), Some(0xf6));
+        invalid_text_run.extend([0x78, 0x24]);
+        invalid_text_run.extend_from_slice(b"0190f2a5-7b1c-7abc-8def-0123456789b6");
+        assert!(validate_private_event_bytes(&cddl, &invalid_text_run).is_err());
+
+        let (_, mut duplicate_parent) = private_event_fixture("agent_response");
+        let parent_marker = duplicate_parent
+            .windows(4)
+            .position(|window| window == [0x08, 0x81, 0x78, 0x24])
+            .unwrap();
+        duplicate_parent[parent_marker + 1] = 0x82;
+        let parent_start = parent_marker + 2;
+        let parent_end = parent_start + 38;
+        let encoded_parent = duplicate_parent[parent_start..parent_end].to_vec();
+        duplicate_parent.splice(parent_end..parent_end, encoded_parent);
+        assert!(validate_private_event_bytes(&cddl, &duplicate_parent).is_err());
+
+        let (_, mut self_parent) = private_event_fixture("agent_response");
+        let parent_marker = self_parent
+            .windows(4)
+            .position(|window| window == [0x08, 0x81, 0x78, 0x24])
+            .unwrap();
+        let parent_payload_start = parent_marker + 4;
+        self_parent[parent_payload_start..parent_payload_start + 36]
+            .copy_from_slice(b"0190f2a5-7b1c-7abc-8def-0123456789b4");
+        assert!(validate_private_event_bytes(&cddl, &self_parent).is_err());
+    }
+
+    #[test]
+    fn private_event_decoder_enforces_identity_timestamp_and_exact_size_bounds() {
+        let (cddl, text) = private_event_fixture("text");
+        let timestamp_marker = text
+            .windows(2)
+            .position(|window| window == [0x06, 0x1b])
+            .unwrap();
+
+        let mut minimum_timestamp = text.clone();
+        minimum_timestamp[timestamp_marker + 1] = 0x3b;
+        minimum_timestamp[timestamp_marker + 2..timestamp_marker + 10]
+            .copy_from_slice(&62_135_596_799_999_u64.to_be_bytes());
+        validate_private_event_bytes(&cddl, &minimum_timestamp).unwrap();
+
+        let mut below_minimum_timestamp = text.clone();
+        below_minimum_timestamp[timestamp_marker + 1] = 0x3b;
+        below_minimum_timestamp[timestamp_marker + 2..timestamp_marker + 10]
+            .copy_from_slice(&62_135_596_800_000_u64.to_be_bytes());
+        assert!(validate_private_event_bytes(&cddl, &below_minimum_timestamp).is_err());
+
+        let mut maximum_timestamp = text.clone();
+        maximum_timestamp[timestamp_marker + 2..timestamp_marker + 10]
+            .copy_from_slice(&253_402_300_799_999_u64.to_be_bytes());
+        validate_private_event_bytes(&cddl, &maximum_timestamp).unwrap();
+
+        let mut above_maximum_timestamp = text.clone();
+        above_maximum_timestamp[timestamp_marker + 2..timestamp_marker + 10]
+            .copy_from_slice(&253_402_300_800_000_u64.to_be_bytes());
+        assert!(validate_private_event_bytes(&cddl, &above_maximum_timestamp).is_err());
+
+        let identity_marker = text
+            .windows(3)
+            .position(|window| window == [0x04, 0x78, 0x39])
+            .unwrap();
+        let identity_start = identity_marker + 1;
+
+        let mut noncanonical_identity = text;
+        noncanonical_identity[identity_start + 2] = b'x';
+        assert!(validate_private_event_bytes(&cddl, &noncanonical_identity).is_err());
+
+        let parents = (0..16)
+            .map(|index| {
+                CanonicalValue::Text(format!("0190f2a5-7b1c-7abc-8def-0123456789{index:02x}"))
+            })
+            .collect();
+        let maximal = CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text("0190f2a5-7b1c-7abc-8def-0123456789b1".to_owned()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Text("0190f2a5-7b1c-7abc-8def-0123456789b0".to_owned()),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                CanonicalValue::Text(
+                    "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la".to_owned(),
+                ),
+            ),
+            (
+                CanonicalValue::Unsigned(5),
+                CanonicalValue::Text("0190f2a5-7b1c-7abc-8def-0123456789b2".to_owned()),
+            ),
+            (
+                CanonicalValue::Unsigned(6),
+                CanonicalValue::Unsigned(253_402_300_799_999),
+            ),
+            (CanonicalValue::Unsigned(7), CanonicalValue::Unsigned(3)),
+            (CanonicalValue::Unsigned(8), CanonicalValue::Array(parents)),
+            (
+                CanonicalValue::Unsigned(9),
+                CanonicalValue::Text("a".repeat(65_536)),
+            ),
+            (
+                CanonicalValue::Unsigned(10),
+                CanonicalValue::Text("0190f2a5-7b1c-7abc-8def-0123456789b6".to_owned()),
+            ),
+        ]);
+        let maximal = encode_deterministic_cbor(&maximal).unwrap();
+        assert_eq!(maximal.len(), PRIVATE_EVENT_MAX_ENCODED_BYTES);
+        validate_private_event_bytes(&cddl, &maximal).unwrap();
+        let mut maximum_plus_one = maximal;
+        maximum_plus_one.push(0);
+        assert_eq!(maximum_plus_one.len(), PRIVATE_EVENT_MAX_ENCODED_BYTES + 1);
+        assert!(validate_private_event_bytes(&cddl, &maximum_plus_one).is_err());
+    }
+
+    #[test]
+    fn private_event_mls_digest_binds_event_length_and_exact_ciphertext() {
+        let event_id = "0190f2a5-7b1c-7abc-8def-0123456789b1";
+        let ciphertext =
+            decode_hex("d91000010203a0ff1020304050607080").expect("fixture ciphertext");
+        assert_eq!(
+            mls_authenticated_private_event_digest(event_id, &ciphertext).unwrap(),
+            decode_lower_hex_fixed(
+                "b4d82332aaf82d39decd8aa42f02e300df5ebe6265e66fce877195d069254da6"
+            )
+            .unwrap()
+        );
+
+        let other_event = "0190f2a5-7b1c-7abc-8def-0123456789b2";
+        assert_ne!(
+            mls_authenticated_private_event_digest(event_id, &ciphertext).unwrap(),
+            mls_authenticated_private_event_digest(other_event, &ciphertext).unwrap()
+        );
+        let mut changed_ciphertext = ciphertext.clone();
+        changed_ciphertext.push(0);
+        assert_ne!(
+            mls_authenticated_private_event_digest(event_id, &ciphertext).unwrap(),
+            mls_authenticated_private_event_digest(event_id, &changed_ciphertext).unwrap()
+        );
+        assert!(mls_authenticated_private_event_digest(event_id, &[]).is_err());
+        assert!(
+            mls_authenticated_private_event_digest(
+                event_id,
+                &vec![0; PRIVATE_EVENT_MAX_MLS_CIPHERTEXT_BYTES + 1],
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -85,6 +85,11 @@ const V18_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/membership-federation/v1",
     "protocol/test-vectors/membership-federation/v1",
 ];
+const V19_ARTIFACT_PATHS: &[&str] = &["protocol/proto/dirextalk/agent_control/v1_2"];
+const V20_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/private-event/v1",
+    "protocol/test-vectors/private-event/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -208,6 +213,18 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v18/manifest.json",
         includes_registries: false,
         artifact_paths: V18_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 19,
+        path: "protocol/baseline/v19/manifest.json",
+        includes_registries: false,
+        artifact_paths: V19_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 20,
+        path: "protocol/baseline/v20/manifest.json",
+        includes_registries: false,
+        artifact_paths: V20_ARTIFACT_PATHS,
     },
 ];
 

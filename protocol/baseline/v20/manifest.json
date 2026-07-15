@@ -1,0 +1,9 @@
+{
+  "version": 20,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/private-event/v1/private-event-v1.cddl": "sha256:f0149b148b607f1c449c807a9cf109d8e0054b5ca4d5de1036943add16858489",
+    "protocol/test-vectors/private-event/v1/private-event-v1.json": "sha256:3fddf176482c2c5e47bc7325d6e0265ddc3e92a7414bb1db9d58e666c85dc3a2"
+  }
+}

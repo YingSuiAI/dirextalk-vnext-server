@@ -23,6 +23,20 @@ fn cddl_openapi_protobuf_and_golden_vectors_validate_together() {
 }
 
 #[test]
+fn private_application_event_v1_is_part_of_the_validated_frozen_contract() {
+    let root = repository_root();
+    assert!(
+        root.join("protocol/cddl/private-event/v1/private-event-v1.cddl")
+            .is_file()
+    );
+    assert!(
+        root.join("protocol/test-vectors/private-event/v1/private-event-v1.json")
+            .is_file()
+    );
+    validate_artifacts(&root).expect("private application event vectors must be byte exact");
+}
+
+#[test]
 fn freezing_a_new_version_preserves_the_published_v1_manifest() {
     let root = isolated_protocol_tree();
     let v1 = root.join("protocol/baseline/v1/manifest.json");

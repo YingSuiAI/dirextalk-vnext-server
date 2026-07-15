@@ -9,6 +9,7 @@ publish = false
 base64ct.workspace = true
 cddl-cat.workspace = true
 ed25519-dalek.workspace = true
+dtx-wire = { path = "../../crates/dtx-wire" }
 oas3.workspace = true
 prost-types.workspace = true
 protox.workspace = true

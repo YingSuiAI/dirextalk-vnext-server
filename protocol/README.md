@@ -61,6 +61,19 @@ Layout:
   writer, decoder, reducer, registration, or Indexer path. No version
   introduces an Indexer, public feed transport, delegation, or a control-plane
   UUID alias for a public subject.
+  `baseline/v19/manifest.json` assigns the previously published Agent Control
+  1.2 execution-report and cancellation source to its disjoint frozen set.
+  `baseline/v20/manifest.json` freezes the private application event carried
+  only inside MLS ciphertext. Its vector stores body bytes as hex solely for
+  byte-exact cross-implementation conformance; no server storage, reducer, or
+  logging path may decode or retain that field. Consumers must reject an event
+  larger than the exact V1 maximum of 66,383 canonical CBOR bytes. The same
+  vector freezes the 32-byte MLS group identifier as
+  `SHA-256("dirextalk.mls-group-id.conversation.v1\0" || conversation UUID raw16)`.
+  It also freezes the Agent Control MLS-authenticated private event digest as
+  `SHA-256("dirextalk.private-event-mls-ciphertext.v1\0" || event UUID raw16 || u64-be(ciphertext length) || exact MLS wire ciphertext)`.
+  Implementations must never hash the plaintext body or canonical private event
+  for that field; only the non-empty, mailbox-bounded MLS ciphertext is safe.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

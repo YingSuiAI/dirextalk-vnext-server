@@ -1078,6 +1078,7 @@ version = "0.1.0"
 dependencies = [
  "base64ct",
  "cddl-cat",
+ "dtx-wire",
  "ed25519-dalek",
  "oas3",
  "prost-types",

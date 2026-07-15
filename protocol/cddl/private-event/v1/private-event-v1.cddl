@@ -1,0 +1,67 @@
+; Dirextalk encrypted private application event V1 (baseline V20).
+;
+; These bytes exist only inside MLS application ciphertext. Relays and control
+; planes MUST treat them as opaque and MUST NOT persist or log field 9.
+
+uuid-v7-v1 = tstr .size 36
+private-event-author-identity-v1 = tstr .size 57
+private-event-created-at-ms-v1 = -62135596800000..253402300799999
+private-event-body-v1 = tstr .size (0..65536)
+private-event-parents-v1 = [*16 uuid-v7-v1]
+; author_identity_id is additionally required to be the canonical dtxi1 form.
+; Parents are unique and MUST NOT equal event_id. The largest deterministic
+; encoding is 66383 bytes: the fixed 57-byte IdentityId, 16 parents, a 9-byte
+; UTC millisecond integer, the maximum body, and a UUID run_id.
+;
+; An MLS group ID for a conversation is exactly:
+; SHA-256("dirextalk.mls-group-id.conversation.v1\0" || conversation UUID raw16).
+; The MLS-authenticated private event digest used by Agent Control is exactly:
+; SHA-256("dirextalk.private-event-mls-ciphertext.v1\0" || event UUID raw16 ||
+;        u64-be(ciphertext length) || exact MLS wire ciphertext).
+; The ciphertext is non-empty and at most 262144 bytes, matching the mailbox
+; opaque-ciphertext bound. Plaintext and canonical private-event bytes MUST NOT
+; be substituted into this digest because doing so exposes short bodies to
+; offline dictionary attacks.
+
+private-text-event-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: uuid-v7-v1,
+  4: private-event-author-identity-v1,
+  5: uuid-v7-v1,
+  6: private-event-created-at-ms-v1,
+  7: 1,
+  8: private-event-parents-v1,
+  9: private-event-body-v1,
+  10: null
+}
+
+private-agent-request-event-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: uuid-v7-v1,
+  4: private-event-author-identity-v1,
+  5: uuid-v7-v1,
+  6: private-event-created-at-ms-v1,
+  7: 2,
+  8: private-event-parents-v1,
+  9: private-event-body-v1,
+  10: uuid-v7-v1 / null
+}
+
+private-agent-response-event-v1 = {
+  1: 1,
+  2: uuid-v7-v1,
+  3: uuid-v7-v1,
+  4: private-event-author-identity-v1,
+  5: uuid-v7-v1,
+  6: private-event-created-at-ms-v1,
+  7: 3,
+  8: private-event-parents-v1,
+  9: private-event-body-v1,
+  10: uuid-v7-v1
+}
+
+private-application-event-v1 = private-text-event-v1 /
+  private-agent-request-event-v1 /
+  private-agent-response-event-v1
