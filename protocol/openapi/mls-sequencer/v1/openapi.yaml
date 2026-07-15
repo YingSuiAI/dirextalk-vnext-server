@@ -1,0 +1,62 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Single-node MLS Commit Sequencer
+  version: 1.0.0
+  description: Opaque MLS commit serialization and exact-device admission. The server never decodes MLS application plaintext.
+paths:
+  /v1/groups/{scope_kind}/{scope_id}/mls-commits/{submission_id}:
+    parameters:
+      - {name: scope_kind, in: path, required: true, schema: {type: string, enum: [private-conversation, controlled-public-channel]}}
+      - {name: scope_id, in: path, required: true, schema: {type: string, minLength: 36, maxLength: 57}}
+      - {name: submission_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: submitMlsCommit
+      summary: CAS-submit one opaque MLS Commit and return its server-signed receipt.
+      parameters:
+        - {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 16, maxLength: 128}}
+        - {name: Authorization, in: header, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.mls-commit.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/CommitReceipt'}
+        '200': {$ref: '#/components/responses/CommitReceipt'}
+        '409': {description: Idempotency conflict or stale epoch/head.}
+        '422': {description: Approval, controller consent, candidate proof, or bootstrap rule rejected.}
+    get:
+      operationId: getMlsCommitReceipt
+      summary: Query the original immutable receipt after response loss.
+      responses:
+        '200': {$ref: '#/components/responses/CommitReceipt'}
+        '404': {description: No such scoped receipt.}
+  /v1/groups/{scope_kind}/{scope_id}/mls-commits/{submission_id}/confirmations/{device_id}:
+    parameters:
+      - {name: scope_kind, in: path, required: true, schema: {type: string}}
+      - {name: scope_id, in: path, required: true, schema: {type: string}}
+      - {name: submission_id, in: path, required: true, schema: {type: string, format: uuid}}
+      - {name: device_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: confirmMlsDeviceJoin
+      summary: Activate the exact leaf only after its device signs receipt and head.
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.mls-device-join-confirmation.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '204': {description: Confirmed or exact replay.}
+        '409': {description: Confirmation conflicts with durable facts.}
+components:
+  schemas:
+    ExactCanonicalCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+  responses:
+    CommitReceipt:
+      description: Immutable server-signed canonical receipt.
+      content:
+        application/vnd.dirextalk.mls-commit-receipt.v1+cbor:
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}

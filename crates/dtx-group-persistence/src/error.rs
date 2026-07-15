@@ -40,6 +40,14 @@ pub enum GroupPersistenceError {
     MembershipReceiptAccessDenied,
     /// The caller's route-bound device action proof was malformed, expired, or invalid.
     ActionProofRejected,
+    /// An MLS submission ID or idempotency key was reused with different canonical facts.
+    MlsCommitConflict,
+    /// The submitted MLS parent epoch/head is no longer current.
+    StaleMlsHead,
+    /// The membership approval or existing-identity controller consent is not valid.
+    MlsAuthorizationRejected,
+    /// The exact candidate device could not confirm the committed receipt/head.
+    MlsDeviceConfirmationRejected,
 }
 
 impl fmt::Display for GroupPersistenceError {
@@ -70,6 +78,10 @@ impl fmt::Display for GroupPersistenceError {
             Self::DeviceAuthenticationRejected => "device session authentication was rejected",
             Self::MembershipReceiptAccessDenied => "membership receipt access was denied",
             Self::ActionProofRejected => "group device action proof was rejected",
+            Self::MlsCommitConflict => "MLS commit submission conflicts with a durable receipt",
+            Self::StaleMlsHead => "MLS commit parent epoch or head is stale",
+            Self::MlsAuthorizationRejected => "MLS device admission authorization was rejected",
+            Self::MlsDeviceConfirmationRejected => "MLS device join confirmation was rejected",
         })
     }
 }
@@ -93,7 +105,11 @@ impl Error for GroupPersistenceError {
             | Self::ControlCommandConflict
             | Self::DeviceAuthenticationRejected
             | Self::MembershipReceiptAccessDenied
-            | Self::ActionProofRejected => None,
+            | Self::ActionProofRejected
+            | Self::MlsCommitConflict
+            | Self::StaleMlsHead
+            | Self::MlsAuthorizationRejected
+            | Self::MlsDeviceConfirmationRejected => None,
         }
     }
 }

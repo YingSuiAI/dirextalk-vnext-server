@@ -1,0 +1,10 @@
+{
+  "version": 21,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/mls-sequencer/v1/mls-sequencer-v1.cddl": "sha256:c76169ec93761c27cd2a2245283d8a95f1ebd2b36f90006d64cfd82a80bbd87f",
+    "protocol/openapi/mls-sequencer/v1/openapi.yaml": "sha256:bff3e3df553974d54d7ae89f6c50032b8d2f2557dc38c75f1f1ff11ad4899ad2",
+    "protocol/test-vectors/mls-sequencer/v1/mls-sequencer-v1.json": "sha256:df3b98c8c400c80efbea79af131dc4255eb65faa508ca5f5e313c452cf37a4ae"
+  }
+}

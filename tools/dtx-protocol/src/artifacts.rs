@@ -140,12 +140,64 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_public_descriptor_v1_1(root)?;
     validate_public_descriptor_v1_2(root)?;
     validate_membership_federation_v1(root)?;
-    validate_private_event_v1(root)?;
+    validate_private_messaging_artifacts(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_private_messaging_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
+    validate_private_event_v1(root)?;
+    validate_mls_sequencer_v1(root)
+}
+
+fn validate_mls_sequencer_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl_path = root.join("protocol/cddl/mls-sequencer/v1/mls-sequencer-v1.cddl");
+    let cddl = read(&cddl_path)?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse MLS Sequencer v1 CDDL {}: {error}",
+            cddl_path.display()
+        ))
+    })?;
+    let openapi_path = root.join("protocol/openapi/mls-sequencer/v1/openapi.yaml");
+    let source = read(&openapi_path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse MLS Sequencer v1 OpenAPI {}: {error}",
+            openapi_path.display()
+        ))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer OpenAPI must declare 3.1.0",
+        ));
+    }
+    let vector =
+        read_json(&root.join("protocol/test-vectors/mls-sequencer/v1/mls-sequencer-v1.json"))?;
+    validate_vector_version(&vector, "mls-sequencer-v1")?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(21) {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer vector baseline must be 21",
+        ));
+    }
+    if json_string(&vector, "genesis_head_hex")? != "0".repeat(64) {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer genesis head must be 32 zero bytes",
+        ));
+    }
+    if vector
+        .get("max_opaque_commit_bytes")
+        .and_then(Value::as_u64)
+        != Some(1_048_576)
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer maximum opaque Commit must be 1048576",
+        ));
+    }
     Ok(())
 }
 

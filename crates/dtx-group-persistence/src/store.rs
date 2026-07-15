@@ -113,6 +113,7 @@ impl GroupSession<'_> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn validate_group_runtime_role(pool: &PgPool) -> Result<(), GroupPersistenceError> {
     let schema_usage: bool =
         sqlx::query_scalar("SELECT has_schema_privilege(current_user, 'groups', 'USAGE')")
@@ -193,7 +194,13 @@ async fn validate_group_runtime_role(pool: &PgPool) -> Result<(), GroupPersisten
              AND has_table_privilege(current_user, 'groups.sequencer_outbox', 'INSERT')
              AND has_table_privilege(current_user, 'groups.sequencer_outbox', 'UPDATE')
              AND has_table_privilege(current_user, 'groups.control_commands', 'SELECT')
-             AND has_table_privilege(current_user, 'groups.control_commands', 'INSERT')",
+             AND has_table_privilege(current_user, 'groups.control_commands', 'INSERT')
+             AND has_table_privilege(current_user, 'groups.mls_heads', 'SELECT, INSERT, UPDATE')
+             AND has_table_privilege(current_user, 'groups.mls_commit_intents', 'SELECT, INSERT')
+             AND has_table_privilege(current_user, 'groups.mls_commit_receipts', 'SELECT, INSERT')
+             AND has_table_privilege(current_user, 'groups.mls_sequencer_outbox', 'SELECT, INSERT')
+             AND has_table_privilege(current_user, 'groups.mls_device_members', 'SELECT, INSERT, UPDATE')
+             AND has_table_privilege(current_user, 'groups.mls_join_confirmations', 'SELECT, INSERT')",
     )
     .fetch_one(pool)
     .await?;
@@ -358,19 +365,27 @@ async fn role_has_excess_group_privileges(pool: &PgPool) -> Result<bool, GroupPe
                     AND ((relation.relname IN ('policy_heads', 'admin_terms', 'members', 'invites',
                                                 'join_records', 'membership_commands',
                                                 'membership_workflows', 'sequencer_outbox',
-                                                'control_commands')
+                                                'control_commands', 'mls_heads',
+                                                'mls_commit_intents', 'mls_commit_receipts',
+                                                'mls_sequencer_outbox', 'mls_device_members',
+                                                'mls_join_confirmations')
                           AND (has_table_privilege(current_user, relation.oid, 'DELETE')
                             OR has_table_privilege(current_user, relation.oid, 'TRUNCATE')
                             OR has_table_privilege(current_user, relation.oid, 'REFERENCES')
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER')
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')
                             OR (relation.relname IN ('members', 'membership_commands',
-                                                     'control_commands')
+                                                     'control_commands', 'mls_commit_intents',
+                                                     'mls_commit_receipts', 'mls_sequencer_outbox',
+                                                     'mls_join_confirmations')
                                 AND has_table_privilege(current_user, relation.oid, 'UPDATE'))))
                          OR (relation.relname NOT IN ('policy_heads', 'admin_terms', 'members', 'invites',
                                                      'join_records', 'membership_commands',
                                                      'membership_workflows', 'sequencer_outbox',
-                                                     'control_commands')
+                                                     'control_commands', 'mls_heads',
+                                                     'mls_commit_intents', 'mls_commit_receipts',
+                                                     'mls_sequencer_outbox', 'mls_device_members',
+                                                     'mls_join_confirmations')
                              AND (has_table_privilege(current_user, relation.oid, 'SELECT')
                                OR has_table_privilege(current_user, relation.oid, 'INSERT')
                                OR has_table_privilege(current_user, relation.oid, 'UPDATE')

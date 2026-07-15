@@ -1,0 +1,41 @@
+; Dirextalk single-node MLS Commit Sequencer V1. All MLS fields are opaque.
+sha256 = bytes .size 32
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+device-proof = { 1: 1, 2: sha256, 3: bytes .size 64 }
+group-scope = { 1: 1 / 2, 2: tstr .size (36..57) }
+
+owner-bootstrap = { 1: 1 }
+approved-identity-join = { 1: 2, 2: uuid-v7, 3: sha256 }
+existing-member-device-add = { 1: 3, 2: uuid-v7, 3: sha256, 4: device-proof }
+mls-admission-authorization = owner-bootstrap / approved-identity-join / existing-member-device-add
+
+mls-commit-request-v1 = {
+  1: 1,
+  2: uuid-v7,              ; submission_id
+  3: group-scope,
+  4: identity-id,          ; actor
+  5: uuid-v7,              ; actor device
+  6: identity-id,          ; candidate
+  7: uuid-v7,              ; candidate device
+  8: sha256,               ; candidate KeyPackage digest
+  9: device-proof,         ; candidate possession proof
+  10: uint .le 9007199254740990,
+  11: sha256,              ; expected head (all-zero only for owner bootstrap)
+  12: bytes .size (1..1048576), ; opaque MLS Commit wire bytes
+  13: sha256,              ; domain-separated Commit digest
+  14: sha256,              ; opaque Welcome digest
+  15: mls-admission-authorization
+}
+
+mls-commit-receipt-v1 = {
+  1: 1, 2: uuid-v7, 3: group-scope, 4: sha256, 5: uint,
+  6: sha256, 7: sha256, 8: sha256, 9: identity-id, 10: uuid-v7
+}
+signed-mls-commit-receipt-v1 = {
+  1: mls-commit-receipt-v1, 2: sha256, 3: bytes .size 32, 4: bytes .size 64
+}
+mls-device-join-confirmation-v1 = {
+  1: 1, 2: uuid-v7, 3: identity-id, 4: uuid-v7,
+  5: sha256, 6: sha256, 7: bytes .size 64
+}

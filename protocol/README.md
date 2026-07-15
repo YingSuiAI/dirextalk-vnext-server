@@ -74,6 +74,10 @@ Layout:
   `SHA-256("dirextalk.private-event-mls-ciphertext.v1\0" || event UUID raw16 || u64-be(ciphertext length) || exact MLS wire ciphertext)`.
   Implementations must never hash the plaintext body or canonical private event
   for that field; only the non-empty, mailbox-bounded MLS ciphertext is safe.
+  `baseline/v21/manifest.json` freezes the single-node MLS Commit Sequencer:
+  opaque commit CAS, signed response-loss-safe receipts, one-time Owner
+  bootstrap, GM1-approved identity admission, same-identity active-controller
+  consent for additional devices, and candidate confirmation before routing.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

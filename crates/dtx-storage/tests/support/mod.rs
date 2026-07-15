@@ -399,6 +399,12 @@ impl PostgresHarness {
              GRANT SELECT, INSERT, UPDATE ON groups.membership_workflows TO dtx_group_runtime;
              GRANT SELECT, INSERT, UPDATE ON groups.sequencer_outbox TO dtx_group_runtime;
              GRANT SELECT, INSERT ON groups.control_commands TO dtx_group_runtime;
+             GRANT SELECT, INSERT, UPDATE ON groups.mls_heads TO dtx_group_runtime;
+             GRANT SELECT, INSERT ON groups.mls_commit_intents TO dtx_group_runtime;
+             GRANT SELECT, INSERT ON groups.mls_commit_receipts TO dtx_group_runtime;
+             GRANT SELECT, INSERT ON groups.mls_sequencer_outbox TO dtx_group_runtime;
+             GRANT SELECT, INSERT, UPDATE ON groups.mls_device_members TO dtx_group_runtime;
+             GRANT SELECT, INSERT ON groups.mls_join_confirmations TO dtx_group_runtime;
              GRANT USAGE ON SCHEMA identity TO dtx_group_runtime;
              GRANT EXECUTE ON FUNCTION identity.identity_group_reader_authorized()
                 TO dtx_group_runtime;

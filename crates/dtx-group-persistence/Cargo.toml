@@ -11,6 +11,8 @@ dtx-group-policy = { path = "../dtx-group-policy" }
 dtx-identity-persistence = { path = "../dtx-identity-persistence" }
 dtx-membership-command = { path = "../dtx-membership-command" }
 dtx-wire = { path = "../dtx-wire" }
+ed25519-dalek.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 uuid.workspace = true
 

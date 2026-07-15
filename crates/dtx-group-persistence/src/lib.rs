@@ -10,6 +10,7 @@
 
 mod control;
 mod error;
+mod mls_sequencer;
 mod repository;
 mod store;
 mod types;
@@ -19,6 +20,11 @@ pub use control::{
     GroupControlReceipt, GroupControlRejection, GroupControlRepository,
 };
 pub use error::GroupPersistenceError;
+pub use mls_sequencer::{
+    MlsCommitAuthorization, MlsCommitCommand, MlsCommitExecution, MlsCommitReceipt,
+    MlsCommitSequencerRepository, MlsDeviceJoinConfirmation, MlsDeviceMemberState,
+    mls_device_confirmation_signature_input, mls_opaque_commit_digest,
+};
 pub use repository::{GroupMembershipRepository, MembershipCommandExecution, VerifiedDeviceActor};
 pub use store::{GroupPgStore, GroupSession};
 pub use types::{PreparedSequencerAction, SequencerActionLease};

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "baseline": 21,
+  "paths": {
+    "submit_or_query": "/v1/groups/{scope_kind}/{scope_id}/mls-commits/{submission_id}",
+    "confirm": "/v1/groups/{scope_kind}/{scope_id}/mls-commits/{submission_id}/confirmations/{device_id}"
+  },
+  "authorization_modes": ["owner_bootstrap", "approved_identity_join", "existing_member_device_add"],
+  "genesis_head_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+  "commit_digest_domain_utf8_hex": "646972657874616c6b2e6d6c732d6f70617175652d636f6d6d69742e763100",
+  "request_digest_domain_utf8_hex": "646972657874616c6b2e6d6c732d636f6d6d69742d726571756573742e763100",
+  "head_digest_domain_utf8_hex": "646972657874616c6b2e6d6c732d73657175656e6365722d686561642e763100",
+  "receipt_digest_domain_utf8_hex": "646972657874616c6b2e6d6c732d636f6d6d69742d726563656970742e763100",
+  "receipt_signature_domain_utf8_hex": "646972657874616c6b2e6d6c732d636f6d6d69742d726563656970742d7369676e61747572652e763100",
+  "max_opaque_commit_bytes": 1048576,
+  "invariants": {
+    "same_submission_or_idempotency_and_body": "return byte-exact original receipt",
+    "same_submission_or_idempotency_and_different_body": "conflict",
+    "same_parent_concurrency": "exactly one CAS succeeds",
+    "owner_bootstrap": "epoch 0, zero head, exact policy owner and live owner device, once only",
+    "approved_identity_join": "pending_commit approval candidate, device, fence and authorization digest must match",
+    "existing_member_device_add": "identity member plus same-identity active controller consent and candidate proof; no invite mutation",
+    "activation": "pending_confirmation until candidate signs exact receipt and result head"
+  }
+}

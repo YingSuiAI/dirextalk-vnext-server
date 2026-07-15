@@ -90,6 +90,11 @@ const V20_ARTIFACT_PATHS: &[&str] = &[
     "protocol/cddl/private-event/v1",
     "protocol/test-vectors/private-event/v1",
 ];
+const V21_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/mls-sequencer/v1",
+    "protocol/openapi/mls-sequencer/v1",
+    "protocol/test-vectors/mls-sequencer/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -225,6 +230,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v20/manifest.json",
         includes_registries: false,
         artifact_paths: V20_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 21,
+        path: "protocol/baseline/v21/manifest.json",
+        includes_registries: false,
+        artifact_paths: V21_ARTIFACT_PATHS,
     },
 ];
 
