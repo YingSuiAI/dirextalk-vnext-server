@@ -1,0 +1,45 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Opaque Attachment API
+  version: 1.0.0
+paths:
+  /v1/attachments:
+    post:
+      summary: Allocate an owner-device attachment using client-generated capabilities
+      parameters:
+        - { name: Authorization, in: header, required: true, schema: { type: string } }
+        - { name: DTX-Attachment-Upload-Capability, in: header, required: true, schema: { type: string } }
+        - { name: DTX-Attachment-Read-Capability, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.attachment-create.v1+cbor:
+            schema: { type: string, format: binary }
+      responses:
+        '201': { description: Created; headers: { DTX-Attachment-Upload-Capability: { schema: { type: string } }, DTX-Attachment-Read-Capability: { schema: { type: string } } } }
+        '200': { description: Exact replay; capability headers are intentionally omitted }
+  /v1/attachments/{object_id}:
+    delete:
+      summary: Cancel an attachment using the current owner device session
+      parameters: [{ name: object_id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses: { '204': { description: Cancelled } }
+  /v1/attachments/{object_id}/manifest:
+    put:
+      summary: Finalize only after every content-addressed ciphertext chunk is complete
+      parameters: [{ name: object_id, in: path, required: true, schema: { type: string, format: uuid } }, { name: Authorization, in: header, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/vnd.dirextalk.attachment-manifest.v1+octets: { schema: { type: string, format: binary } } } }
+      responses: { '201': { description: Ready }, '200': { description: Exact replay } }
+    get:
+      summary: Read the opaque canonical manifest with a short-lived read capability
+      parameters: [{ name: object_id, in: path, required: true, schema: { type: string, format: uuid } }, { name: Authorization, in: header, required: true, schema: { type: string } }]
+      responses: { '200': { description: Opaque manifest } }
+  /v1/attachments/{object_id}/chunks/{index}:
+    put:
+      summary: Store one exact-idempotent ciphertext chunk
+      parameters: [{ name: object_id, in: path, required: true, schema: { type: string, format: uuid } }, { name: index, in: path, required: true, schema: { type: integer, minimum: 0, maximum: 4095 } }, { name: Authorization, in: header, required: true, schema: { type: string } }, { name: Idempotency-Key, in: header, required: true, schema: { type: string } }, { name: DTX-Ciphertext-SHA256, in: header, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/vnd.dirextalk.attachment-chunk.v1+octets: { schema: { type: string, format: binary } } } }
+      responses: { '201': { description: Stored }, '200': { description: Exact replay } }
+    get:
+      summary: Read one ciphertext chunk with a short-lived read capability
+      parameters: [{ name: object_id, in: path, required: true, schema: { type: string, format: uuid } }, { name: index, in: path, required: true, schema: { type: integer, minimum: 0, maximum: 4095 } }, { name: Authorization, in: header, required: true, schema: { type: string } }]
+      responses: { '200': { description: Ciphertext chunk } }

@@ -8,11 +8,16 @@
 //! transaction as owner mutations, so a revoked session cannot replay an old
 //! receipt.
 
+mod attachment;
 mod error;
 mod repository;
 mod store;
 mod types;
 
+pub use attachment::{
+    AttachmentCapability, AttachmentChunk, AttachmentChunkReference, AttachmentCreate,
+    AttachmentError, AttachmentManifest, AttachmentRepository, AttachmentStatus,
+};
 pub use error::MailboxPersistenceError;
 pub use repository::MailboxRepository;
 pub use store::{MailboxPgStore, MailboxSession};

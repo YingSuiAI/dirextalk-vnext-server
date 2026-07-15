@@ -1,0 +1,10 @@
+{
+  "version": 28,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/attachment/v1/attachment-v1.cddl": "sha256:9968f4d133a8e3c11423a0cddb9b0daa05bed7c67e4028b6dc852cdffa18b850",
+    "protocol/openapi/attachment/v1/openapi.yaml": "sha256:b41743c0185b3be62cf0550f93c27181cda6ff2e5eb6820a5a323d21c9f02263",
+    "protocol/test-vectors/attachment/v1/attachment-v1.json": "sha256:3df7ff10a0d5a5625e26954cdc76d765e217f4374fbb51ce027ebd879eb93bc9"
+  }
+}

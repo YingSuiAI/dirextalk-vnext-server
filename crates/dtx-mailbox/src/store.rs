@@ -108,6 +108,12 @@ async fn validate_mailbox_runtime_role(pool: &PgPool) -> Result<(), MailboxPersi
              AND has_table_privilege(current_user, 'messaging.mailbox_enqueue_claims', 'INSERT')
              AND has_table_privilege(current_user, 'messaging.mailbox_ack_claims', 'SELECT')
              AND has_table_privilege(current_user, 'messaging.mailbox_ack_claims', 'INSERT')
+             AND has_table_privilege(current_user, 'messaging.attachment_objects', 'SELECT')
+             AND has_table_privilege(current_user, 'messaging.attachment_objects', 'INSERT')
+             AND has_table_privilege(current_user, 'messaging.attachment_objects', 'UPDATE')
+             AND has_table_privilege(current_user, 'messaging.attachment_chunks', 'SELECT')
+             AND has_table_privilege(current_user, 'messaging.attachment_chunks', 'INSERT')
+             AND has_function_privilege(current_user, 'messaging.expire_attachment_objects(integer)'::regprocedure, 'EXECUTE')
              AND has_table_privilege(current_user, 'identity.device_sessions', 'SELECT')
              AND has_table_privilege(current_user, 'identity.log_heads', 'SELECT')
              AND has_table_privilege(current_user, 'identity.log_entries', 'SELECT')
@@ -245,7 +251,8 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, MailboxPersi
                     AND procedure.oid NOT IN (
                         'messaging.mailbox_runtime_authorized()'::regprocedure,
                         'messaging.mailbox_owner_authorized()'::regprocedure,
-                        'messaging.is_uuid_v7(uuid)'::regprocedure
+                        'messaging.is_uuid_v7(uuid)'::regprocedure,
+                        'messaging.expire_attachment_objects(integer)'::regprocedure
                     )
              )",
     )

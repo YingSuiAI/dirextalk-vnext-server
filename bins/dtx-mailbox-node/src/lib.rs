@@ -31,6 +31,8 @@ use dtx_mailbox::{
 use dtx_wire::{CanonicalValue, SafeUint, Sha256Digest, UtcMillis, decode_deterministic_cbor};
 use serde::Serialize;
 
+mod attachment;
+
 /// Mailbox registration route template.
 pub const MAILBOX_REGISTER_PATH_TEMPLATE: &str = "/v1/mailboxes/{mailbox_id}";
 /// Opaque envelope append route template.
@@ -273,6 +275,7 @@ pub fn mailbox_router_with_state(state: MailboxNodeState) -> Router {
         .route(MAILBOX_ENQUEUE_PATH_TEMPLATE, put(enqueue_mailbox_envelope))
         .route(MAILBOX_PULL_PATH_TEMPLATE, post(pull_mailbox))
         .route(MAILBOX_ACK_PATH_TEMPLATE, post(acknowledge_mailbox))
+        .merge(attachment::attachment_router())
         .with_state(state)
 }
 

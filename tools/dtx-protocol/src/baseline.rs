@@ -125,6 +125,11 @@ const V27_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/contact-delivery/v1",
     "protocol/test-vectors/contact-delivery/v1",
 ];
+const V28_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/attachment/v1/attachment-v1.cddl",
+    "protocol/openapi/attachment/v1/openapi.yaml",
+    "protocol/test-vectors/attachment/v1/attachment-v1.json",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -302,6 +307,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v27/manifest.json",
         includes_registries: false,
         artifact_paths: V27_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 28,
+        path: "protocol/baseline/v28/manifest.json",
+        includes_registries: false,
+        artifact_paths: V28_ARTIFACT_PATHS,
     },
 ];
 

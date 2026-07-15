@@ -1,0 +1,16 @@
+attachment-create = {
+  1: 1,
+  2: tstr .size 36,
+  3: tstr .size (8..128),
+  4: tstr .size 36,
+  5: bstr .size 32,
+  6: uint .ge 1 .le 4096,
+  7: uint .ge 1 .le 1073741824,
+  8: int
+}
+
+; Canonical manifest octets are: "DTXA1" || chunk-count:u16be ||
+; repeated(index:u16be || ciphertext-size:u32be || sha256:bstr32) ||
+; encrypted-manifest-size:u32be || encrypted-manifest-ciphertext.
+attachment-capability = bstr .size 32
+attachment-chunk = bstr .size (17..1048576)

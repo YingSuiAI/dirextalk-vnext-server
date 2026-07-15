@@ -1091,6 +1091,7 @@ dependencies = [
  "dtx-domain",
  "dtx-identity-persistence",
  "dtx-wire",
+ "sha2 0.11.0",
  "sqlx",
  "subtle",
  "uuid",
