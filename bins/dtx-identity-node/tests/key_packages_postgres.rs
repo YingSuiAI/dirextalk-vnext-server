@@ -487,18 +487,19 @@ async fn opaque_contact_delivery_is_replay_safe_and_revocable() -> Result<(), Bo
     );
     let pending_before_revoke_id = RequestId::new();
     let pending_before_revoke_secret = [88_u8; 32];
+    let pending_before_revoke_request = contact_request_body(
+        pending_before_revoke_id,
+        device_revoked_invite_id,
+        owner.identity_id,
+        owner.device_id,
+        pending_before_revoke_secret,
+        b"pending-before-device-revoke",
+    )?;
     assert_eq!(
         send_contact_request(
             app.clone(),
             device_revoked_secret,
-            contact_request_body(
-                pending_before_revoke_id,
-                device_revoked_invite_id,
-                owner.identity_id,
-                owner.device_id,
-                pending_before_revoke_secret,
-                b"pending-before-device-revoke",
-            )?,
+            pending_before_revoke_request.clone(),
         )
         .await?
         .status(),
@@ -512,6 +513,19 @@ async fn opaque_contact_delivery_is_replay_safe_and_revocable() -> Result<(), Bo
     )
     .await?;
     assert_eq!(revoked_receipt.status(), StatusCode::OK);
+    let revoked_receipt_body = to_bytes(revoked_receipt.into_body(), 300_000).await?;
+    let submit_replay_after_revoke = send_contact_request(
+        app.clone(),
+        device_revoked_secret,
+        pending_before_revoke_request,
+    )
+    .await?;
+    assert_eq!(submit_replay_after_revoke.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(submit_replay_after_revoke.into_body(), 300_000).await?,
+        revoked_receipt_body,
+        "an admitted request must replay its terminal receipt after target-device revocation"
+    );
     let revoked_state: i16 =
         sqlx::query_scalar("SELECT state FROM identity.contact_requests WHERE request_id=$1")
             .bind(pending_before_revoke_id.as_uuid())

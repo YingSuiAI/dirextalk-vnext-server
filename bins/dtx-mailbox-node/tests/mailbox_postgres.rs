@@ -452,6 +452,58 @@ async fn opaque_attachment_is_exact_idempotent_and_cancel_revokes_read()
             .await,
         Err(AttachmentError::Conflict)
     ));
+    let second_object_id = Uuid::now_v7();
+    let second_request = AttachmentCreate {
+        object_id: second_object_id,
+        owner_identity_id: owner.identity_id,
+        owner_device_id: owner.device_id,
+        manifest_digest: request.manifest_digest,
+        chunk_count: 2,
+        ciphertext_bytes: (ciphertext.len() * 2) as u64,
+        expires_at: UtcMillis::new(EXPIRY)?,
+    };
+    assert_eq!(
+        AttachmentRepository
+            .create(
+                &mailbox_store,
+                &credential,
+                &second_request,
+                &upload,
+                &read,
+                UtcMillis::new(NOW + 3)?,
+            )
+            .await
+            .unwrap(),
+        AttachmentStatus::Created
+    );
+    AttachmentRepository
+        .put_chunk(
+            &mailbox_store,
+            second_object_id,
+            0,
+            &upload,
+            idempotency,
+            chunk_digest,
+            &ciphertext,
+            UtcMillis::new(NOW + 3)?,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        AttachmentRepository
+            .put_chunk(
+                &mailbox_store,
+                second_object_id,
+                1,
+                &upload,
+                idempotency,
+                chunk_digest,
+                &ciphertext,
+                UtcMillis::new(NOW + 3)?,
+            )
+            .await,
+        Err(AttachmentError::Conflict)
+    ));
     assert_eq!(
         AttachmentRepository
             .finalize(
@@ -480,18 +532,33 @@ async fn opaque_attachment_is_exact_idempotent_and_cancel_revokes_read()
         ciphertext
     );
     let cancel_credential = DeviceSessionCredential::new(owner.session_id, owner.session_secret)?;
-    AttachmentRepository
-        .cancel(
-            &mailbox_store,
-            &cancel_credential,
-            object_id,
-            UtcMillis::new(NOW + 6)?,
-        )
-        .await
-        .unwrap();
+    assert_eq!(
+        AttachmentRepository
+            .cancel(
+                &mailbox_store,
+                &cancel_credential,
+                object_id,
+                UtcMillis::new(NOW + 6)?,
+            )
+            .await
+            .unwrap(),
+        AttachmentStatus::Cancelled
+    );
+    assert_eq!(
+        AttachmentRepository
+            .cancel(
+                &mailbox_store,
+                &cancel_credential,
+                object_id,
+                UtcMillis::new(NOW + 7)?,
+            )
+            .await
+            .unwrap(),
+        AttachmentStatus::Replay
+    );
     assert!(matches!(
         AttachmentRepository
-            .read_manifest(&mailbox_store, object_id, &read, UtcMillis::new(NOW + 7)?)
+            .read_manifest(&mailbox_store, object_id, &read, UtcMillis::new(NOW + 8)?)
             .await,
         Err(AttachmentError::Unavailable)
     ));

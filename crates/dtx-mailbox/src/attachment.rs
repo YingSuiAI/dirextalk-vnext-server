@@ -281,6 +281,15 @@ impl AttachmentRepository {
             session.commit().await.map_err(|_| AttachmentError::Unavailable)?;
             return Ok(AttachmentStatus::Replay);
         }
+        if sqlx::query_scalar::<_, i32>("SELECT chunk_index FROM messaging.attachment_chunks WHERE object_id=$1 AND idempotency_key_hash=$2")
+            .bind(object_id)
+            .bind(idempotency_hash.as_bytes().as_slice())
+            .fetch_optional(session.connection())
+            .await?
+            .is_some()
+        {
+            return Err(AttachmentError::Conflict);
+        }
         let new_bytes = row.get::<i64, _>("uploaded_ciphertext_bytes")
             + i64::try_from(ciphertext.len()).map_err(|_| AttachmentError::Invalid)?;
         if new_bytes > row.get::<i64, _>("expected_ciphertext_bytes") {
@@ -455,16 +464,33 @@ impl AttachmentRepository {
         )
         .await
         .map_err(|_| AttachmentError::Authentication)?;
-        let changed = sqlx::query("UPDATE messaging.attachment_objects SET state='cancelled',updated_at_ms=$2 WHERE object_id=$1 AND owner_identity_id=$3 AND owner_device_id=$4 AND state IN ('uploading','ready')")
-            .bind(object_id).bind(now.get()).bind(authenticated.identity_id().to_string()).bind(*authenticated.device_id().as_uuid()).execute(session.connection()).await?;
-        if changed.rows_affected() == 0 {
+        let row = sqlx::query("SELECT owner_identity_id,owner_device_id,state FROM messaging.attachment_objects WHERE object_id=$1 FOR UPDATE")
+            .bind(object_id)
+            .fetch_optional(session.connection())
+            .await?
+            .ok_or(AttachmentError::Unavailable)?;
+        if row.get::<String, _>("owner_identity_id") != authenticated.identity_id().to_string()
+            || row.get::<Uuid, _>("owner_device_id") != *authenticated.device_id().as_uuid()
+        {
             return Err(AttachmentError::Unavailable);
         }
+        let status = match row.get::<String, _>("state").as_str() {
+            "cancelled" => AttachmentStatus::Replay,
+            "uploading" | "ready" => {
+                sqlx::query("UPDATE messaging.attachment_objects SET state='cancelled',updated_at_ms=$2 WHERE object_id=$1")
+                    .bind(object_id)
+                    .bind(now.get())
+                    .execute(session.connection())
+                    .await?;
+                AttachmentStatus::Cancelled
+            }
+            _ => return Err(AttachmentError::Unavailable),
+        };
         session
             .commit()
             .await
             .map_err(|_| AttachmentError::Unavailable)?;
-        Ok(AttachmentStatus::Cancelled)
+        Ok(status)
     }
 }
 

@@ -163,6 +163,22 @@ impl ContactRepository {
         let result=async{
             let row=sqlx::query("SELECT owner_identity_id,owner_device_id,capability_hash,max_uses,use_count,expires_at_ms,revoked_at_ms FROM identity.contact_invites WHERE invite_id=$1").bind(request.invite_id().as_uuid()).fetch_optional(tx.connection()).await?.ok_or(ContactStoreError::NotFound)?;
             let capability_hash=invite_capability_hash(&invite_secret);if !constant_eq(row.try_get::<Vec<u8>,_>("capability_hash")?.as_slice(),capability_hash.as_bytes()){return Err(ContactStoreError::NotFound)}
+            let request_digest=domain_hash(REQUEST_DIGEST_DOMAIN,exact);
+            if let Some(existing)=sqlx::query("SELECT request_digest FROM identity.contact_requests WHERE request_id=$1").bind(request.request_id().as_uuid()).fetch_optional(tx.connection()).await? {
+                if existing.try_get::<Vec<u8>,_>("request_digest")?!=request_digest.as_bytes(){return Err(ContactStoreError::Conflict)}
+                let device_revoked = match DeviceSessionRepository::active_device_signing_key_in_transaction(
+                    tx.connection(),
+                    request.target_identity_id(),
+                    request.target_device_id(),
+                )
+                .await
+                {
+                    Ok(_) => false,
+                    Err(IdentityPersistenceError::DeviceAuthenticationRejected | IdentityPersistenceError::IdentityInactive) => true,
+                    Err(error) => return Err(ContactStoreError::Persistence(error)),
+                };
+                return receipt_in_tx(tx.connection(),request.request_id(),now,device_revoked).await;
+            }
             let owner_identity = row
                 .try_get::<String, _>("owner_identity_id")?
                 .parse::<IdentityId>()
@@ -181,8 +197,6 @@ impl ContactRepository {
             // revoke and submit cannot deadlock or admit stale invite state.
             let row=sqlx::query("SELECT owner_identity_id,owner_device_id,capability_hash,max_uses,use_count,expires_at_ms,revoked_at_ms FROM identity.contact_invites WHERE invite_id=$1 FOR UPDATE").bind(request.invite_id().as_uuid()).fetch_optional(tx.connection()).await?.ok_or(ContactStoreError::NotFound)?;
             if !constant_eq(row.try_get::<Vec<u8>,_>("capability_hash")?.as_slice(),capability_hash.as_bytes()){return Err(ContactStoreError::NotFound)}
-            let request_digest=domain_hash(REQUEST_DIGEST_DOMAIN,exact);
-            if let Some(existing)=sqlx::query("SELECT request_digest FROM identity.contact_requests WHERE request_id=$1").bind(request.request_id().as_uuid()).fetch_optional(tx.connection()).await?{if existing.try_get::<Vec<u8>,_>("request_digest")?!=request_digest.as_bytes(){return Err(ContactStoreError::Conflict)}return receipt_in_tx(tx.connection(),request.request_id(),now,false).await}
             if row.try_get::<Option<i64>,_>("revoked_at_ms")?.is_some(){return Err(ContactStoreError::Revoked)} if now.get()>=row.try_get::<i64,_>("expires_at_ms")?{return Err(ContactStoreError::Expired)} if row.try_get::<i16,_>("use_count")?>=row.try_get::<i16,_>("max_uses")?{return Err(ContactStoreError::Exhausted)}
             if row.try_get::<String,_>("owner_identity_id")?!=request.target_identity_id().to_string()||row.try_get::<uuid::Uuid,_>("owner_device_id")?!=*request.target_device_id().as_uuid(){return Err(ContactStoreError::NotFound)}
             let pending:i64=sqlx::query_scalar("SELECT count(*) FROM identity.contact_requests WHERE target_identity_id=$1 AND target_device_id=$2 AND state=1 AND expires_at_ms>$3").bind(request.target_identity_id().to_string()).bind(request.target_device_id().as_uuid()).bind(now.get()).fetch_one(tx.connection()).await?;if pending>=MAX_PENDING_PER_DEVICE{return Err(ContactStoreError::Quota)}

@@ -389,6 +389,15 @@ impl PostgresHarness {
                 TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.fork_evidence TO dtx_identity_runtime;
               GRANT SELECT, INSERT ON identity.log_outbox TO dtx_identity_runtime;
+             GRANT SELECT, INSERT, UPDATE ON
+                identity.contact_invites,
+                identity.contact_requests,
+                identity.contact_rate_limits
+                TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON
+                identity.contact_delivery_outbox,
+                identity.contact_owner_commands
+                TO dtx_identity_runtime;
 
              GRANT USAGE ON SCHEMA system TO dtx_group_runtime;
              GRANT EXECUTE ON FUNCTION system.current_tenant_id() TO dtx_group_runtime;
@@ -431,6 +440,10 @@ impl PostgresHarness {
              GRANT SELECT, INSERT, UPDATE ON messaging.mailbox_envelopes TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON messaging.mailbox_enqueue_claims TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON messaging.mailbox_ack_claims TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT, UPDATE ON messaging.attachment_objects TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT ON messaging.attachment_chunks TO dtx_mailbox_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.expire_attachment_objects(integer)
+                TO dtx_mailbox_runtime;
              GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
                 TO dtx_mailbox_runtime;",
         )
