@@ -974,6 +974,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-http-cache"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
+ "tokio",
+]
+
+[[package]]
 name = "dtx-identity-log"
 version = "0.1.0"
 dependencies = [
@@ -1045,6 +1053,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "dtx-domain",
+ "dtx-http-cache",
  "dtx-indexer",
  "dtx-public-descriptor",
  "dtx-public-feed",
@@ -1116,8 +1125,10 @@ dependencies = [
  "dtx-group-persistence",
  "dtx-identity-node",
  "dtx-identity-persistence",
+ "dtx-indexer-node",
  "dtx-mailbox",
  "dtx-mailbox-node",
+ "dtx-public-feed-node",
  "sqlx",
  "tokio",
  "zeroize",
@@ -1170,6 +1181,7 @@ dependencies = [
  "axum",
  "base64ct",
  "dtx-domain",
+ "dtx-http-cache",
  "dtx-public-descriptor",
  "dtx-public-feed",
  "dtx-storage",

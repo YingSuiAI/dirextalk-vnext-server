@@ -12,8 +12,10 @@ dtx-group-node = { path = "../dtx-group-node" }
 dtx-group-persistence = { path = "../../crates/dtx-group-persistence" }
 dtx-identity-node = { path = "../dtx-identity-node" }
 dtx-identity-persistence = { path = "../../crates/dtx-identity-persistence" }
+dtx-indexer-node = { path = "../dtx-indexer-node" }
 dtx-mailbox = { path = "../../crates/dtx-mailbox" }
 dtx-mailbox-node = { path = "../dtx-mailbox-node" }
+dtx-public-feed-node = { path = "../dtx-public-feed-node" }
 sqlx.workspace = true
 tokio.workspace = true
 zeroize.workspace = true

@@ -3,13 +3,15 @@
 use std::{env, fs, net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
 use axum::{http::StatusCode, routing::get};
-use dtx_domain::{SystemClock, TenantId};
+use dtx_domain::{IndexerId, SystemClock, TenantId};
 use dtx_group_node::{GroupNodeState, group_router_with_state};
 use dtx_group_persistence::GroupPgStore;
 use dtx_identity_node::{IdentityBootstrapState, identity_bootstrap_router_with_state};
 use dtx_identity_persistence::IdentityPgStore;
+use dtx_indexer_node::{IndexerPgStore, PinnedHttpsBundleFetcher, indexer_router};
 use dtx_mailbox::MailboxPgStore;
 use dtx_mailbox_node::{MailboxNodeState, mailbox_router_with_state};
+use dtx_public_feed_node::{PublicFeedPgStore, public_feed_router};
 use sqlx::postgres::PgConnectOptions;
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
@@ -21,6 +23,9 @@ const TENANT_ID_ENV: &str = "DTX_NODE_TENANT_ID";
 const IDENTITY_DATABASE_URL_FILE_ENV: &str = "DTX_IDENTITY_DATABASE_URL_FILE";
 const GROUP_DATABASE_URL_FILE_ENV: &str = "DTX_GROUP_DATABASE_URL_FILE";
 const MAILBOX_DATABASE_URL_FILE_ENV: &str = "DTX_MAILBOX_DATABASE_URL_FILE";
+const PUBLIC_FEED_DATABASE_URL_FILE_ENV: &str = "DTX_PUBLIC_FEED_DATABASE_URL_FILE";
+const INDEXER_DATABASE_URL_FILE_ENV: &str = "DTX_INDEXER_DATABASE_URL_FILE";
+const INDEXER_ID_ENV: &str = "DTX_NODE_INDEXER_ID";
 const DEV_HTTP_IDENTITY_ORIGINS_ENV: &str = "DTX_GROUP_DEV_HTTP_IDENTITY_ORIGINS";
 const MAX_DATABASE_URL_BYTES: usize = 8_192;
 
@@ -46,6 +51,12 @@ async fn run() -> Result<(), NodeError> {
     let mailbox_store = MailboxPgStore::connect(config.mailbox_database, 8)
         .await
         .map_err(|_| NodeError::Database("mailbox"))?;
+    let public_feed_store = PublicFeedPgStore::connect(config.public_feed_database, 8)
+        .await
+        .map_err(|_| NodeError::Database("public feed"))?;
+    let indexer_store = IndexerPgStore::connect(config.indexer_database, 8)
+        .await
+        .map_err(|_| NodeError::Database("indexer"))?;
 
     let clock = Arc::new(SystemClock);
     let identity_state = IdentityBootstrapState::with_clock_and_device_session_audience(
@@ -61,6 +72,13 @@ async fn run() -> Result<(), NodeError> {
     let router = identity_bootstrap_router_with_state(identity_state)
         .merge(group_router_with_state(group_state))
         .merge(mailbox_router_with_state(mailbox_state))
+        .merge(public_feed_router(public_feed_store, config.tenant_id))
+        .merge(indexer_router(
+            indexer_store,
+            config.tenant_id,
+            config.indexer_id,
+            Arc::new(PinnedHttpsBundleFetcher::default()),
+        ))
         .route("/local-health", get(local_health));
     let listener = TcpListener::bind(config.listen)
         .await
@@ -82,6 +100,9 @@ struct NodeConfig {
     identity_database: PgConnectOptions,
     group_database: PgConnectOptions,
     mailbox_database: PgConnectOptions,
+    public_feed_database: PgConnectOptions,
+    indexer_database: PgConnectOptions,
+    indexer_id: IndexerId,
     allowed_http_identity_origins: Vec<String>,
 }
 
@@ -99,6 +120,10 @@ impl NodeConfig {
         let tenant_id = env::var(TENANT_ID_ENV)
             .map_err(|_| NodeError::Configuration)?
             .parse::<TenantId>()
+            .map_err(|_| NodeError::Configuration)?;
+        let indexer_id = env::var(INDEXER_ID_ENV)
+            .map_err(|_| NodeError::Configuration)?
+            .parse::<IndexerId>()
             .map_err(|_| NodeError::Configuration)?;
         let allowed_http_identity_origins = env::var(DEV_HTTP_IDENTITY_ORIGINS_ENV)
             .ok()
@@ -119,6 +144,9 @@ impl NodeConfig {
             identity_database: load_database_options(IDENTITY_DATABASE_URL_FILE_ENV)?,
             group_database: load_database_options(GROUP_DATABASE_URL_FILE_ENV)?,
             mailbox_database: load_database_options(MAILBOX_DATABASE_URL_FILE_ENV)?,
+            public_feed_database: load_database_options(PUBLIC_FEED_DATABASE_URL_FILE_ENV)?,
+            indexer_database: load_database_options(INDEXER_DATABASE_URL_FILE_ENV)?,
+            indexer_id,
             allowed_http_identity_origins,
         })
     }

@@ -3,19 +3,6 @@
 -- their schemas. Keep it explicit: if a new runtime requirement is added, the
 -- local cluster must fail closed until this matrix is updated deliberately.
 
--- The init script runs only for a new Compose volume. Provisioning also creates
--- this passwordless local principal so an existing disposable volume can pick
--- up the Group Node without a manual reset. The role remains confined to the
--- Compose network and loopback-only database publication.
-DO $roles$
-BEGIN
-    IF to_regrole('dtx_group_node') IS NULL THEN
-        CREATE ROLE dtx_group_node LOGIN IN ROLE dtx_group_runtime
-            NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
-    END IF;
-END
-$roles$;
-
 GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA identity TO dtx_identity_runtime;
 GRANT SELECT, INSERT, UPDATE ON identity.log_heads TO dtx_identity_runtime;
@@ -76,3 +63,21 @@ GRANT SELECT, INSERT ON messaging.mailbox_enqueue_claims TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT ON messaging.mailbox_ack_claims TO dtx_mailbox_runtime;
 GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
     TO dtx_mailbox_runtime;
+
+-- These login roles deliberately use direct grants with NOINHERIT. Membership
+-- in dtx_public_feed_runtime is only the RLS authorization marker and does not
+-- let either service reach the other one's mutable tables.
+GRANT USAGE ON SCHEMA directory TO dtx_public_feed_node, dtx_indexer_node;
+GRANT EXECUTE ON FUNCTION directory.public_feed_runtime_authorized()
+    TO dtx_public_feed_node, dtx_indexer_node;
+GRANT EXECUTE ON FUNCTION directory.public_feed_owner_authorized()
+    TO dtx_public_feed_node, dtx_indexer_node;
+GRANT EXECUTE ON FUNCTION directory.current_tenant_id()
+    TO dtx_public_feed_node, dtx_indexer_node;
+GRANT SELECT, INSERT, UPDATE ON directory.public_subjects TO dtx_public_feed_node;
+GRANT SELECT, INSERT ON directory.descriptor_versions, directory.feed_entries,
+    directory.moderation_labels TO dtx_public_feed_node;
+GRANT SELECT, INSERT, UPDATE ON directory.index_registrations,
+    directory.index_rate_limits, directory.index_registration_attempts
+    TO dtx_indexer_node;
+GRANT SELECT, INSERT ON directory.indexed_feed_entries TO dtx_indexer_node;
