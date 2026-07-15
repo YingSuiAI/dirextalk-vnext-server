@@ -18,8 +18,9 @@ use axum::{
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_agent_registry::DeviceCredentialFingerprint;
 use dtx_domain::{
-    AgentDeviceId, ApprovalId, BindingId, DeviceId, DeviceSessionId, IdentityId, InstallationId,
-    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, TenantId,
+    AgentDeviceId, ApprovalId, BindingId, ConnectorId, DeviceId, DeviceSessionId, IdentityId,
+    InstallationId, ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision,
+    TenantId,
 };
 use dtx_identity_persistence::DeviceSessionCredential;
 use dtx_storage::PgStore;
@@ -29,6 +30,11 @@ use dtx_wire::{
 };
 use serde::Serialize;
 
+use crate::connector_projection::{
+    CONNECTOR_PROJECTION_MEDIA_TYPE_V1, ConnectorProjectionError, ConnectorProjectionQueryV1,
+    DEFAULT_CONNECTOR_PROJECTION_LIMIT, MAX_CONNECTOR_PROJECTION_LIMIT,
+    list_connector_projection_v1,
+};
 use crate::{AGENT_IDENTITY_APPROVAL_BINDING_DOMAIN, AgentIdentityApprovalCommand};
 use crate::{
     AgentIdentityProvisioningError, AgentProvisioningDeliveryCommand,
@@ -98,6 +104,12 @@ pub struct RevocationOwnerCommand {
 
 /// Durable application interface. Parsing and stable HTTP errors stay independent of `PostgreSQL`.
 pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
+    fn list_connectors(
+        &self,
+        credential: DeviceSessionCredential,
+        query: ConnectorProjectionQueryV1,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_>;
     fn approve(
         &self,
         credential: DeviceSessionCredential,
@@ -172,6 +184,26 @@ impl PostgresAgentProvisioningOwnerBackend {
 }
 
 impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
+    fn list_connectors(
+        &self,
+        credential: DeviceSessionCredential,
+        query: ConnectorProjectionQueryV1,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            let page =
+                list_connector_projection_v1(&self.store, self.tenant_id, &credential, query, now)
+                    .await
+                    .map_err(map_connector_projection_error)?;
+            Ok(CborOwnerReply {
+                status: StatusCode::OK,
+                content_type: CONNECTOR_PROJECTION_MEDIA_TYPE_V1,
+                exact_cbor: serde_json::to_vec(&page)
+                    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?,
+            })
+        })
+    }
+
     fn approve(
         &self,
         credential: DeviceSessionCredential,
@@ -504,9 +536,23 @@ fn map_application_error(error: &AgentIdentityProvisioningError) -> AgentProvisi
     }
 }
 
+const fn map_connector_projection_error(
+    error: ConnectorProjectionError,
+) -> AgentProvisioningOwnerError {
+    match error {
+        ConnectorProjectionError::AuthenticationRejected => {
+            AgentProvisioningOwnerError::AuthenticationRejected
+        }
+        ConnectorProjectionError::Unavailable => {
+            AgentProvisioningOwnerError::TemporarilyUnavailable
+        }
+    }
+}
+
 /// Builds the complete V23 Owner API router.
 pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBackend>) -> Router {
     Router::new()
+        .route("/v1/connectors", get(get_connectors))
         .route(
             "/v1/agent-installations/{installation_id}/identity-approvals",
             post(post_approval),
@@ -532,6 +578,58 @@ pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBa
             post(post_revocation),
         )
         .with_state(backend)
+}
+
+async fn get_connectors(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let result = async {
+        let query = parse_connector_projection_query(uri.query())?;
+        let credential = parse_device_session(&headers)?;
+        backend.list_connectors(credential, query, now()?).await
+    }
+    .await;
+    owner_response(result)
+}
+
+fn parse_connector_projection_query(
+    query: Option<&str>,
+) -> Result<ConnectorProjectionQueryV1, AgentProvisioningOwnerError> {
+    let mut after = None;
+    let mut limit = DEFAULT_CONNECTOR_PROJECTION_LIMIT;
+    let mut limit_seen = false;
+    if let Some(query) = query {
+        if query.is_empty() {
+            return Err(AgentProvisioningOwnerError::InvalidRequest);
+        }
+        for pair in query.split('&') {
+            let (name, value) = pair
+                .split_once('=')
+                .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+            match name {
+                "after" if after.is_none() => {
+                    after = Some(
+                        value
+                            .parse::<ConnectorId>()
+                            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+                    );
+                }
+                "limit" if !limit_seen => {
+                    limit_seen = true;
+                    limit = value
+                        .parse::<u16>()
+                        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+                    if limit == 0 || limit > MAX_CONNECTOR_PROJECTION_LIMIT {
+                        return Err(AgentProvisioningOwnerError::InvalidRequest);
+                    }
+                }
+                _ => return Err(AgentProvisioningOwnerError::InvalidRequest),
+            }
+        }
+    }
+    Ok(ConnectorProjectionQueryV1 { after, limit })
 }
 
 async fn post_approval(
@@ -1084,13 +1182,41 @@ mod tests {
 
     use super::{
         AgentProvisioningDeliveryReceipt, AgentProvisioningOwnerError, REVOCATION_BINDING_DOMAIN,
-        approval_status, delivery_receipt_cbor, delivery_status, parse_approval, parse_delivery,
-        parse_device_session, parse_idempotency, parse_revocation,
+        approval_status, delivery_receipt_cbor, delivery_status, parse_approval,
+        parse_connector_projection_query, parse_delivery, parse_device_session, parse_idempotency,
+        parse_revocation,
     };
 
     const VECTORS: &str = include_str!(
         "../../../protocol/test-vectors/agent-provisioning/v1/agent-provisioning-v1.json"
     );
+
+    #[test]
+    fn connector_projection_query_is_keyset_bounded_and_closed() {
+        let connector = dtx_domain::ConnectorId::new();
+        let parsed =
+            parse_connector_projection_query(Some(&format!("after={connector}&limit=64"))).unwrap();
+        assert_eq!(parsed.after, Some(connector));
+        assert_eq!(parsed.limit, 64);
+        assert_eq!(
+            parse_connector_projection_query(None).unwrap().limit,
+            super::DEFAULT_CONNECTOR_PROJECTION_LIMIT
+        );
+        for rejected in [
+            "",
+            "limit=0",
+            "limit=65",
+            "limit=1&limit=2",
+            "after=not-a-connector",
+            "cursor=anything",
+        ] {
+            assert_eq!(
+                parse_connector_projection_query(Some(rejected)),
+                Err(AgentProvisioningOwnerError::InvalidRequest),
+                "query must be rejected: {rejected}"
+            );
+        }
+    }
 
     #[test]
     fn frozen_approval_and_delivery_vectors_parse_exactly() {

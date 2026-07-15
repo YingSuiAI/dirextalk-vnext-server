@@ -14,6 +14,7 @@ mod authorization_index;
 mod certificate;
 mod command_codec;
 mod command_notifications;
+mod connector_projection;
 mod gateway_application;
 mod gateway_authentication;
 mod gateway_service;
@@ -45,6 +46,11 @@ pub use command_codec::{
     EncodedDurableCommand, ProtobufDurableCommandDecoder, ProtobufDurableCommandEncoder,
 };
 pub use command_notifications::CommandNotificationSubscription;
+pub use connector_projection::{
+    CONNECTOR_PROJECTION_MEDIA_TYPE_V1, ConnectorBindingProjectionV1, ConnectorProjectionPageV1,
+    ConnectorProjectionQueryV1, ConnectorProjectionV1, DEFAULT_CONNECTOR_PROJECTION_LIMIT,
+    MAX_CONNECTOR_PROJECTION_BINDINGS, MAX_CONNECTOR_PROJECTION_LIMIT,
+};
 pub use dtx_agent_router::DispatchMode;
 pub use gateway_application::AgentRunIngressApplication;
 pub use gateway_authentication::{

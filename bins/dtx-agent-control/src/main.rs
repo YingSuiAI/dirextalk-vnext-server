@@ -73,6 +73,7 @@ const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[
     ("identity.identity_agent_reader_authorized()", "EXECUTE"),
 ];
 const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
+    ("agent.hosts", "SELECT"),
     ("agent.installations", "SELECT"),
     ("agent.agent_devices", "SELECT"),
     ("identity.device_sessions", "SELECT"),
