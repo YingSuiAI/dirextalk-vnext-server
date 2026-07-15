@@ -10,7 +10,8 @@ use dtx_security::AuthenticatedConnectorPeer;
 use crate::wire::{
     ParsedCommandAcknowledgement, ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat,
     ParsedHello, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted,
-    ParsedRunFailed, ParsedRunOutput, ParsedRunRelease, RunAvailableWire, RunLeaseGrantedWire,
+    ParsedRunFailed, ParsedRunOutput, ParsedRunRelease, RunAvailableWire, RunCancelRequestedWire,
+    RunLeaseGrantedWire,
 };
 use crate::{CommandNotificationSubscription, RunOfferNotificationSubscription};
 
@@ -135,6 +136,17 @@ pub trait ConnectorControlApplication: Send + Sync + 'static {
         _fence: ConnectorFence,
         _after_sequence: u64,
     ) -> ApplicationFuture<'_, Vec<RunAvailableWire>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Returns all still-live durable cancellation intents for this exact v1.2 stream fence.
+    /// Intents may be replayed until the Run reaches a terminal state or the deadline passes.
+    fn poll_run_cancellations(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _fence: ConnectorFence,
+        _after_sequence: u64,
+    ) -> ApplicationFuture<'_, Vec<RunCancelRequestedWire>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 

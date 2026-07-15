@@ -16,8 +16,9 @@ use dtx_agent_persistence::{
     CommandReplayBatch, CommandStreamHead, ConnectorControlOperationKind,
     ConnectorControlOperationRepository, ConnectorCredentialAuthorizationRepository,
     ConnectorRepository, ConversationGrantRepository, DurableCommandDecoder,
-    EnrollmentIntentRepository, MAX_AGENT_RUN_EXPIRY_BATCH, MAX_AGENT_RUN_OFFER_PAGE,
-    PendingAgentRunOffer, PersistedCommandFrame, RunExecutionFence, RunExecutionReport,
+    EnrollmentIntentRepository, MAX_AGENT_RUN_CANCELLATION_PAGE, MAX_AGENT_RUN_EXPIRY_BATCH,
+    MAX_AGENT_RUN_OFFER_PAGE, PendingAgentRunOffer, PendingRunCancellation, PersistedCommandFrame,
+    RunCancellationRequest, RunCancellationWrite, RunExecutionFence, RunExecutionReport,
     RuntimeCapacity, RuntimeClaimRecord, RuntimeClaimRepository, RuntimeClaimSource,
 };
 use dtx_agent_registry::{AgentConversationPermission, AgentConversationPermissions};
@@ -47,7 +48,7 @@ use crate::{
     ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat, ParsedHello,
     ParsedLeaseFence, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted,
     ParsedRunExecutionFence, ParsedRunFailed, ParsedRunOutput, ParsedRunRelease,
-    ProtobufDurableCommandEncoder, RunAvailableWire, RunLeaseGrantedWire,
+    ProtobufDurableCommandEncoder, RunAvailableWire, RunCancelRequestedWire, RunLeaseGrantedWire,
     RunOfferNotificationSubscription, command_notifications::ConnectorCommandNotifications,
     run_notifications::ConnectorRunOfferNotifications,
 };
@@ -61,6 +62,17 @@ const DEFAULT_RUN_QUEUE_TTL_MILLIS: i64 = 300_000;
 const MAX_RUN_QUEUE_TTL_MILLIS: i64 = 3_600_000;
 const DEFAULT_RUN_OFFER_TTL_MILLIS: i64 = 15_000;
 const DEFAULT_RUN_LEASE_TTL_MILLIS: i64 = 30_000;
+
+/// Server-authenticated cancellation request for one exact active Run lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelAgentRunRequest {
+    pub tenant_id: TenantId,
+    pub run_id: RunId,
+    pub run_lease_id: RunLeaseId,
+    pub run_lease_epoch: u64,
+    pub stable_reason: String,
+    pub cancel_deadline_millis: i64,
+}
 
 /// Validated server-owned negotiation and lease policy for Connector control.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -694,6 +706,64 @@ impl PostgresConnectorControlApplication {
             run_offer_notifications: ConnectorRunOfferNotifications::new(),
             policy,
         }
+    }
+
+    /// Durably requests cancellation of one exact active execution lease.
+    /// The intent commits before any Connector notification is published.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid, stale, expired, terminal, conflicting, or unavailable requests.
+    pub async fn cancel_agent_run(
+        &self,
+        request: CancelAgentRunRequest,
+    ) -> Result<RunCancellationWrite, ConnectorControlApplicationError> {
+        let tenant_id = request.tenant_id;
+        let mut session = self
+            .store
+            .begin_tenant(tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let persistence_request = RunCancellationRequest {
+            tenant_id,
+            run_id: request.run_id,
+            run_lease_id: request.run_lease_id,
+            run_lease_epoch: request.run_lease_epoch,
+            stable_reason: request.stable_reason,
+            cancel_deadline_millis: request.cancel_deadline_millis,
+        };
+        let disposition = AgentRunRepository::new()
+            .request_cancellation(
+                session.connection(),
+                &persistence_request,
+                self.clock.as_ref(),
+            )
+            .await
+            .map_err(run_persistence_error)?;
+        let connector_id = if disposition == RunCancellationWrite::Inserted {
+            Some(
+                AgentRunRepository::new()
+                    .load(session.connection(), tenant_id, request.run_id)
+                    .await
+                    .map_err(persistence_error)?
+                    .and_then(|run| {
+                        run.current_lease()
+                            .map(|lease| lease.connector_fence().connector_id())
+                    })
+                    .ok_or(ConnectorControlApplicationError::StaleLease)?,
+            )
+        } else {
+            None
+        };
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if let Some(connector_id) = connector_id {
+            self.run_offer_notifications
+                .publish(tenant_id, connector_id);
+        }
+        Ok(disposition)
     }
 
     /// Persists an explicit Agent Run before making a bounded best-effort offer.
@@ -2296,6 +2366,61 @@ impl PostgresConnectorControlApplication {
         Ok(offers)
     }
 
+    async fn poll_run_cancellations_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        fence: ConnectorFence,
+        after_sequence: u64,
+    ) -> Result<Vec<RunCancelRequestedWire>, ConnectorControlApplicationError> {
+        ensure_peer_identity(peer, fence.tenant_id(), fence.connector_id())?;
+        let parsed_fence = parsed_connector_fence(fence);
+        let now = self.now()?;
+        let mut session = self
+            .store
+            .begin_tenant(fence.tenant_id())
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let connector_head = ConnectorRepository::new()
+            .load_heartbeat_head_for_update(
+                session.connection(),
+                fence.tenant_id(),
+                fence.connector_id(),
+            )
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::StaleLease)?;
+        ensure_resolved_fence(connector_head.fence(), parsed_fence)
+            .map_err(|_| ConnectorControlApplicationError::StaleLease)?;
+        connector_head
+            .validate_fence(&fence, now)
+            .map_err(|_| ConnectorControlApplicationError::StaleLease)?;
+        require_live_current_credential(
+            session.connection(),
+            peer,
+            fence.tenant_id(),
+            fence.connector_id(),
+            fence.generation().get(),
+            now,
+        )
+        .await?;
+        let pending = AgentRunRepository::new()
+            .poll_cancellations(
+                session.connection(),
+                ConnectorLeaseFence::from(fence),
+                after_sequence,
+                now,
+                MAX_AGENT_RUN_CANCELLATION_PAGE,
+            )
+            .await
+            .map_err(run_persistence_error)?;
+        let cancellations = pending.into_iter().map(run_cancel_requested_wire).collect();
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        Ok(cancellations)
+    }
+
     async fn claim_run_operation(
         &self,
         peer: AuthenticatedConnectorPeer,
@@ -2965,6 +3090,15 @@ impl ConnectorControlApplication for PostgresConnectorControlApplication {
         Box::pin(self.poll_run_offers_operation(peer, fence, after_sequence))
     }
 
+    fn poll_run_cancellations(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        fence: ConnectorFence,
+        after_sequence: u64,
+    ) -> ApplicationFuture<'_, Vec<RunCancelRequestedWire>> {
+        Box::pin(self.poll_run_cancellations_operation(peer, fence, after_sequence))
+    }
+
     fn reconcile_agent_run_timeouts(
         &self,
         tenant_id: TenantId,
@@ -3104,6 +3238,28 @@ fn run_available_wire(
         offer_deadline_millis: offer.expires_at_millis(),
         required_capabilities: run.request().required_capabilities().to_vec(),
     })
+}
+
+fn run_cancel_requested_wire(value: PendingRunCancellation) -> RunCancelRequestedWire {
+    let fence = value.execution_fence;
+    RunCancelRequestedWire {
+        connector_cancel_sequence: value.connector_cancel_sequence,
+        execution_fence: ParsedRunExecutionFence {
+            connector_fence: parsed_router_fence(fence.connector_fence),
+            run_id: fence.run_id,
+            request_id: fence.request_id,
+            installation_id: fence.installation_id,
+            binding_id: fence.binding_id,
+            connector_id: fence.connector_id,
+            offer_attempt: fence.offer_attempt,
+            run_lease_id: fence.run_lease_id,
+            run_lease_epoch: fence.run_lease_epoch,
+            run_lease_deadline_millis: fence.run_lease_deadline_millis,
+        },
+        stable_reason: value.stable_reason,
+        requested_at_millis: value.requested_at_millis,
+        cancel_deadline_millis: value.cancel_deadline_millis,
+    }
 }
 
 fn run_lease_granted_wire(

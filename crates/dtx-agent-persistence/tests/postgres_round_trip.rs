@@ -9,8 +9,9 @@ use dtx_agent_persistence::{
     AgentDefinitionRepository, AgentDeviceRepository, AgentHostRepository,
     AgentInstallationRepository, AgentPersistenceError, AgentRunCreate, AgentRunOfferNext,
     AgentRunRepository, BindingSetRepository, ConnectorRepository, ConversationGrantRepository,
-    CurrentWrite, DefinitionInsert, RunExecutionFence, RunExecutionReport, RunExecutionWrite,
-    RuntimeCapacity, RuntimeClaimRecord, RuntimeClaimRepository, RuntimeClaimSource,
+    CurrentWrite, DefinitionInsert, RunCancellationRequest, RunCancellationWrite,
+    RunExecutionFence, RunExecutionReport, RunExecutionWrite, RuntimeCapacity, RuntimeClaimRecord,
+    RuntimeClaimRepository, RuntimeClaimSource,
 };
 use dtx_agent_registry::{
     AgentConversationPermission, AgentConversationPermissions, AgentDevice, AgentDeviceCommand,
@@ -455,6 +456,7 @@ async fn grant_agent_router_runtime_access(
          GRANT SELECT, INSERT ON agent.agent_run_checkpoints TO dtx_runtime_test;
          GRANT SELECT, INSERT ON agent.agent_run_outputs TO dtx_runtime_test;
          GRANT SELECT, INSERT ON agent.agent_run_terminals TO dtx_runtime_test;
+         GRANT SELECT, INSERT ON agent.agent_run_cancellation_intents TO dtx_runtime_test;
          GRANT EXECUTE ON FUNCTION agent.router_stable_names(text[]) TO dtx_runtime_test;",
     )
     .execute(harness.admin_pool())
@@ -552,6 +554,86 @@ async fn assert_execution_reports_are_fenced_and_idempotent(
         connector_fence,
     };
     let clock = TestClock(1_164);
+    let cancellation = RunCancellationRequest {
+        tenant_id,
+        run_id: fence.run_id,
+        run_lease_id,
+        run_lease_epoch: fence.run_lease_epoch,
+        stable_reason: "USER_CANCELLED".to_owned(),
+        cancel_deadline_millis: 1_170,
+    };
+    let (left, right) = tokio::join!(
+        request_cancellation(store, &cancellation, &clock),
+        request_cancellation(store, &cancellation, &clock)
+    );
+    let mut dispositions = [left?, right?];
+    dispositions.sort_by_key(|value| match value {
+        RunCancellationWrite::Inserted => 0,
+        RunCancellationWrite::Existing => 1,
+    });
+    assert_eq!(
+        dispositions,
+        [
+            RunCancellationWrite::Inserted,
+            RunCancellationWrite::Existing
+        ],
+        "concurrent exact requests serialize to one durable intent"
+    );
+    let conflicting = RunCancellationRequest {
+        stable_reason: "ADMIN_CANCELLED".to_owned(),
+        ..cancellation.clone()
+    };
+    let mut session = store.begin_tenant(tenant_id).await?;
+    assert!(matches!(
+        repository
+            .request_cancellation(session.connection(), &conflicting, &clock)
+            .await,
+        Err(AgentPersistenceError::ImmutableConflict(
+            "Run cancellation intent"
+        ))
+    ));
+    session.rollback().await?;
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let pending = repository
+        .poll_cancellations(session.connection(), connector_fence, 0, 1_164, 8)
+        .await?;
+    session.commit().await?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].connector_cancel_sequence, 2);
+    assert_eq!(pending[0].execution_fence, fence);
+    assert_eq!(pending[0].stable_reason, "USER_CANCELLED");
+    let mut session = store.begin_tenant(tenant_id).await?;
+    assert!(
+        repository
+            .poll_cancellations(session.connection(), connector_fence, 2, 1_164, 8)
+            .await?
+            .is_empty(),
+        "the durable cancellation cursor prevents duplicate delivery in one stream"
+    );
+    session.commit().await?;
+    let stale_connector_fence = ConnectorLeaseFence::new(
+        tenant_id,
+        connector_id,
+        connector_fence.boot_id(),
+        connector_fence.connector_generation(),
+        LeaseId::new(),
+        connector_fence.connector_lease_epoch() + 1,
+    )?;
+    let mut session = store.begin_tenant(tenant_id).await?;
+    assert!(
+        repository
+            .poll_cancellations(session.connection(), stale_connector_fence, 0, 1_164, 8)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        repository
+            .poll_cancellations(session.connection(), connector_fence, 0, 1_170, 8)
+            .await?
+            .is_empty(),
+        "an expired cancellation is never delivered"
+    );
+    session.commit().await?;
     let checkpoint_id = ArtifactId::new();
     let checkpoint = RunExecutionReport::Checkpoint {
         sequence: 1,
@@ -645,6 +727,22 @@ async fn assert_execution_reports_are_fenced_and_idempotent(
         RunExecutionWrite::Existing,
         "an exact terminal replay remains acknowledgeable after lease expiry"
     );
+    let mut session = store.begin_tenant(tenant_id).await?;
+    assert_eq!(
+        repository
+            .request_cancellation(session.connection(), &cancellation, &recovery_clock)
+            .await?,
+        RunCancellationWrite::Existing,
+        "an exact cancellation retry recovers a lost response after terminal"
+    );
+    assert!(
+        repository
+            .poll_cancellations(session.connection(), connector_fence, 0, 1_165, 8)
+            .await?
+            .is_empty(),
+        "terminal Runs no longer project cancellation requests"
+    );
+    session.commit().await?;
     let post_terminal_checkpoint = RunExecutionReport::Checkpoint {
         sequence: 2,
         artifact_id: ArtifactId::new(),
@@ -703,6 +801,33 @@ async fn record_execution(
         .expect("test tenant session opens");
     let result = AgentRunRepository::new()
         .record_execution(session.connection(), fence, report, clock)
+        .await;
+    match result {
+        Ok(disposition) => {
+            session.commit().await.expect("test transaction commits");
+            Ok(disposition)
+        }
+        Err(error) => {
+            session
+                .rollback()
+                .await
+                .expect("test transaction rolls back");
+            Err(error)
+        }
+    }
+}
+
+async fn request_cancellation(
+    store: &PgStore,
+    request: &RunCancellationRequest,
+    clock: &dyn Clock,
+) -> Result<RunCancellationWrite, AgentPersistenceError> {
+    let mut session = store
+        .begin_tenant(request.tenant_id)
+        .await
+        .expect("test tenant session opens");
+    let result = AgentRunRepository::new()
+        .request_cancellation(session.connection(), request, clock)
         .await;
     match result {
         Ok(disposition) => {

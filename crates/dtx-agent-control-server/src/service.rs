@@ -431,6 +431,7 @@ async fn drive_control(
         return;
     }
     let mut run_offer_cursor = 0;
+    let mut run_cancel_cursor = 0;
     let (run_offer_drain_sender, mut run_offer_drain_receiver) = mpsc::channel(1);
     if router_enabled {
         if !reconcile_agent_run_timeouts_on_tick(
@@ -452,6 +453,19 @@ async fn drive_control(
             &run_offer_drain_sender,
         )
         .await
+        {
+            return;
+        }
+        if execution_reporting_enabled
+            && !poll_and_deliver_run_cancellations(
+                application.as_ref(),
+                peer,
+                stream_fence,
+                &mut run_cancel_cursor,
+                &sender,
+                &run_offer_drain_sender,
+            )
+            .await
         {
             return;
         }
@@ -662,6 +676,12 @@ async fn drive_control(
                 ).await {
                     return;
                 }
+                if execution_reporting_enabled && !poll_and_deliver_run_cancellations(
+                    application.as_ref(), peer, stream_fence, &mut run_cancel_cursor,
+                    &sender, &run_offer_drain_sender,
+                ).await {
+                    return;
+                }
             }
             drain = run_offer_drain_receiver.recv() => {
                 if drain.is_none() || !poll_and_deliver_run_offers(
@@ -671,6 +691,12 @@ async fn drive_control(
                     &mut run_offer_cursor,
                     &sender,
                     &run_offer_drain_sender,
+                ).await {
+                    return;
+                }
+                if execution_reporting_enabled && !poll_and_deliver_run_cancellations(
+                    application.as_ref(), peer, stream_fence, &mut run_cancel_cursor,
+                    &sender, &run_offer_drain_sender,
                 ).await {
                     return;
                 }
@@ -703,6 +729,12 @@ async fn drive_control(
                     &mut run_offer_cursor,
                     &sender,
                     &run_offer_drain_sender,
+                ).await {
+                    return;
+                }
+                if execution_reporting_enabled && !poll_and_deliver_run_cancellations(
+                    application.as_ref(), peer, stream_fence, &mut run_cancel_cursor,
+                    &sender, &run_offer_drain_sender,
                 ).await {
                     return;
                 }
@@ -775,6 +807,58 @@ async fn poll_and_deliver_run_offers(
                 }
             };
             if !send_frame(sender, v1::server_frame::Kind::RunAvailable(frame)).await {
+                return false;
+            }
+        }
+        if page + 1 == AGENT_RUN_OFFER_DRAIN_PAGE_BUDGET {
+            let _ = drain_wakeup.try_send(());
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    true
+}
+
+async fn poll_and_deliver_run_cancellations(
+    application: &dyn ConnectorControlApplication,
+    peer: AuthenticatedConnectorPeer,
+    stream_fence: dtx_connect_registry::ConnectorFence,
+    after_sequence: &mut u64,
+    sender: &mpsc::Sender<Result<v1::ServerFrame, Status>>,
+    drain_wakeup: &mpsc::Sender<()>,
+) -> bool {
+    for page in 0..AGENT_RUN_OFFER_DRAIN_PAGE_BUDGET {
+        let cancellations = match application
+            .poll_run_cancellations(peer, stream_fence, *after_sequence)
+            .await
+        {
+            Ok(cancellations) => cancellations,
+            Err(error) => {
+                send_status(sender, application_status(error)).await;
+                return false;
+            }
+        };
+        if cancellations.is_empty() {
+            return true;
+        }
+        for cancellation in cancellations {
+            if cancellation.connector_cancel_sequence <= *after_sequence {
+                send_status(
+                    sender,
+                    application_status(ConnectorControlApplicationError::Internal),
+                )
+                .await;
+                return false;
+            }
+            *after_sequence = cancellation.connector_cancel_sequence;
+            let frame = match crate::build_run_cancel_requested(cancellation) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    send_status(sender, wire_status(error)).await;
+                    return false;
+                }
+            };
+            if !send_frame(sender, v1::server_frame::Kind::RunCancelRequested(frame)).await {
                 return false;
             }
         }

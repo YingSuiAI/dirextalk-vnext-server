@@ -58,10 +58,11 @@ pub use incoming::{
     MAX_CONCURRENT_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT, connector_tls_incoming, tls_incoming,
 };
 pub use postgres_application::{
-    AgentRunReconcileBatch, ApplyConnectorConfigurationRequest, CloseConnectorStreamRequest,
-    ConnectorCommandFence, ConnectorControlPolicy, CreateAgentRunRequest,
-    CreateConnectorEnrollmentRequest, CreatedAgentRun, CreatedConnectorEnrollment,
-    PostgresConnectorControlApplication, RotateConnectorCredentialRequest,
+    AgentRunReconcileBatch, ApplyConnectorConfigurationRequest, CancelAgentRunRequest,
+    CloseConnectorStreamRequest, ConnectorCommandFence, ConnectorControlPolicy,
+    CreateAgentRunRequest, CreateConnectorEnrollmentRequest, CreatedAgentRun,
+    CreatedConnectorEnrollment, PostgresConnectorControlApplication,
+    RotateConnectorCredentialRequest,
 };
 pub use provisioning::*;
 pub use run_notifications::RunOfferNotificationSubscription;

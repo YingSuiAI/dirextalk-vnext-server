@@ -18,8 +18,9 @@ use dtx_agent_control_server::{
     ConnectorCredentialAuthorizationIndex, CredentialRotationCompletion, EnrollmentCompletion,
     HeartbeatCompletion, OpenControlCompletion, ParsedCommandAcknowledgement,
     ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat, ParsedHello,
-    ParsedLeaseFence, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, RunAvailableWire,
-    RunLeaseGrantedWire, connector_control_service, connector_tls_incoming,
+    ParsedLeaseFence, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, ParsedRunExecutionFence,
+    RunAvailableWire, RunCancelRequestedWire, RunLeaseGrantedWire, connector_control_service,
+    connector_tls_incoming,
 };
 use dtx_connect_registry::{
     AdapterKind, Connector, ConnectorDesiredState, ConnectorFence, ConnectorObservedState,
@@ -81,6 +82,7 @@ struct FakeApplication {
     command_page_size: usize,
     protocol_minor: u32,
     run: Option<FakeRun>,
+    cancellation: Option<FakeRun>,
 }
 
 impl FakeApplication {
@@ -157,6 +159,7 @@ impl FakeApplication {
             command_page_size: 64,
             protocol_minor: 0,
             run: None,
+            cancellation: None,
         }
     }
 
@@ -168,6 +171,11 @@ impl FakeApplication {
 
     fn with_execution_reporting(mut self) -> Self {
         self.protocol_minor = 2;
+        self
+    }
+
+    fn with_cancellation(mut self, run: FakeRun) -> Self {
+        self.cancellation = Some(run);
         self
     }
 
@@ -461,6 +469,48 @@ impl ConnectorControlApplication for FakeApplication {
                 offered_at_millis: self.now_millis,
                 offer_deadline_millis: self.now_millis + 60_000,
                 required_capabilities: run.required_capabilities.clone(),
+            }])
+        })();
+        application_result(result)
+    }
+
+    fn poll_run_cancellations(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        fence: ConnectorFence,
+        after_sequence: u64,
+    ) -> ApplicationFuture<'_, Vec<RunCancelRequestedWire>> {
+        let result = (|| {
+            self.validate_peer(peer)?;
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            let connector_fence = parsed_fence(fence);
+            matching_fence(&state.connector, connector_fence)?;
+            let Some(run) = &self.cancellation else {
+                return Ok(Vec::new());
+            };
+            if after_sequence >= 1 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![RunCancelRequestedWire {
+                connector_cancel_sequence: 1,
+                execution_fence: ParsedRunExecutionFence {
+                    connector_fence,
+                    run_id: run.run_id,
+                    request_id: run.request_id,
+                    installation_id: run.installation_id,
+                    binding_id: run.binding_id,
+                    connector_id: self.identity.connector_id(),
+                    offer_attempt: 1,
+                    run_lease_id: run.run_lease_id,
+                    run_lease_epoch: 1,
+                    run_lease_deadline_millis: self.now_millis + 60_000,
+                },
+                stable_reason: "USER_CANCELLED".to_owned(),
+                requested_at_millis: self.now_millis,
+                cancel_deadline_millis: self.now_millis + 30_000,
             }])
         })();
         application_result(result)
@@ -926,7 +976,8 @@ async fn minor_one_offer_requires_claim_before_the_same_stream_grants_a_run_leas
             command,
             payload_digest,
         )
-        .with_router_run(run.clone()),
+        .with_router_run(run.clone())
+        .with_cancellation(run.clone()),
     );
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1071,6 +1122,16 @@ async fn minor_two_acknowledges_execution_reports_only_after_application_commit(
     let server_config = server_config(&server_certificate, verifier.as_ref().clone());
     let client_tls = client_tls_config(&ca, &client_certificate);
     let (operation_id, command, payload_digest, _) = exact_command();
+    let cancellation_run = FakeRun {
+        run_id: RunId::new(),
+        request_id: RequestId::new(),
+        installation_id: InstallationId::new(),
+        binding_id: BindingId::new(),
+        run_lease_id: RunLeaseId::new(),
+        conversation_id: ConversationId::new(),
+        input_event_id: EventId::new(),
+        required_capabilities: vec!["agent.run".to_owned()],
+    };
     let application = Arc::new(
         FakeApplication::new(
             now_millis,
@@ -1081,7 +1142,8 @@ async fn minor_two_acknowledges_execution_reports_only_after_application_commit(
             command,
             payload_digest,
         )
-        .with_execution_reporting(),
+        .with_execution_reporting()
+        .with_cancellation(cancellation_run.clone()),
     );
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1110,6 +1172,30 @@ async fn minor_two_acknowledges_execution_reports_only_after_application_commit(
     let connect_lease = expect_connect_lease(&mut responses).await;
     assert_eq!(connect_lease.protocol_minor, 2);
     let _command = expect_command(&mut responses).await;
+    let cancellation = match responses
+        .message()
+        .await
+        .expect("cancel response is readable")
+        .expect("cancel response exists")
+        .kind
+        .expect("cancel response kind exists")
+    {
+        v1::server_frame::Kind::RunCancelRequested(value) => value,
+        other => panic!("expected RunCancelRequested, got {other:?}"),
+    };
+    let cancellation_fence = cancellation
+        .execution_fence
+        .expect("cancellation carries its complete execution fence");
+    assert_eq!(
+        cancellation_fence.run_id,
+        cancellation_run.run_id.to_string()
+    );
+    assert_eq!(
+        cancellation_fence.run_lease_id,
+        cancellation_run.run_lease_id.to_string()
+    );
+    assert_eq!(cancellation_fence.connector_fence, connect_lease.fence);
+    assert_eq!(cancellation.stable_reason, "USER_CANCELLED");
     let fence = v1::RunExecutionFence {
         connector_fence: connect_lease.fence,
         run_id: RunId::new().to_string(),

@@ -48,8 +48,9 @@ pub use operation::{
 pub use registry::{AgentDeviceRepository, AgentInstallationRepository, CurrentWrite};
 pub use run::{
     AGENT_RUN_OFFER_NOTIFY_CHANNEL, AgentRunCreate, AgentRunOfferNext, AgentRunRepository,
-    MAX_AGENT_RUN_EXPIRY_BATCH, MAX_AGENT_RUN_OFFER_PAGE, PendingAgentRunOffer, RunExecutionFence,
-    RunExecutionReport, RunExecutionWrite, agent_run_offer_notification_payload,
+    MAX_AGENT_RUN_CANCELLATION_PAGE, MAX_AGENT_RUN_EXPIRY_BATCH, MAX_AGENT_RUN_OFFER_PAGE,
+    PendingAgentRunOffer, PendingRunCancellation, RunCancellationRequest, RunCancellationWrite,
+    RunExecutionFence, RunExecutionReport, RunExecutionWrite, agent_run_offer_notification_payload,
     parse_agent_run_offer_notification_payload,
 };
 pub use runtime_claim::{

@@ -23,6 +23,8 @@ use crate::{
 pub const AGENT_RUN_OFFER_NOTIFY_CHANNEL: &str = "dtx_agent_run_offer_v1";
 /// Maximum offers returned by one Connector poll.
 pub const MAX_AGENT_RUN_OFFER_PAGE: usize = 128;
+/// Maximum live cancellation intents returned to one Connector poll.
+pub const MAX_AGENT_RUN_CANCELLATION_PAGE: usize = 128;
 /// Maximum due Runs fenced by one timeout sweep transaction.
 pub const MAX_AGENT_RUN_EXPIRY_BATCH: usize = 128;
 
@@ -84,6 +86,34 @@ pub enum RunExecutionReport {
 pub enum RunExecutionWrite {
     Inserted,
     Existing,
+}
+
+/// Server-side request to durably cancel one exact active execution lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunCancellationRequest {
+    pub tenant_id: TenantId,
+    pub run_id: RunId,
+    pub run_lease_id: RunLeaseId,
+    pub run_lease_epoch: u64,
+    pub stable_reason: String,
+    pub cancel_deadline_millis: i64,
+}
+
+/// Exact-create disposition for a cancellation intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunCancellationWrite {
+    Inserted,
+    Existing,
+}
+
+/// Durable cancellation delivery projected for one exact Connector fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRunCancellation {
+    pub connector_cancel_sequence: u64,
+    pub execution_fence: RunExecutionFence,
+    pub stable_reason: String,
+    pub requested_at_millis: i64,
+    pub cancel_deadline_millis: i64,
 }
 
 /// One bounded, durable offer selected for an exact Connector control fence.
@@ -1195,6 +1225,243 @@ impl AgentRunRepository {
         timing.ensure_before(release_deadline)?;
         transaction.commit().await?;
         Ok(run)
+    }
+
+    /// Persists one cancellation intent for the exact current execution lease.
+    /// Exact retries return `Existing`, including after the delivery deadline;
+    /// conflicting, stale, terminal, or already-expired new requests fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed reasons/deadlines, stale lease fences, terminal Runs,
+    /// expired authority, immutable conflicts, and database failures.
+    #[allow(clippy::too_many_lines)]
+    pub async fn request_cancellation(
+        self,
+        connection: &mut PgConnection,
+        request: &RunCancellationRequest,
+        clock: &dyn Clock,
+    ) -> Result<RunCancellationWrite, AgentPersistenceError> {
+        if !valid_stable_code(&request.stable_reason) {
+            return Err(AgentPersistenceError::SnapshotRejected(
+                "Run cancellation reason",
+            ));
+        }
+        let mut transaction = connection.begin().await?;
+        // Lock the Run before probing the idempotency row. This serializes two
+        // first writers without relying on a missing-row predicate lock.
+        let run = load_run(&mut transaction, request.tenant_id, request.run_id, true)
+            .await?
+            .ok_or(AgentPersistenceError::FenceConflict)?;
+        let existing = sqlx::query(
+            "SELECT run_lease_id,run_lease_epoch,stable_reason,cancel_deadline_ms
+               FROM agent.agent_run_cancellation_intents
+              WHERE tenant_id=$1 AND run_id=$2 FOR UPDATE",
+        )
+        .bind(Uuid::from(request.tenant_id))
+        .bind(Uuid::from(request.run_id))
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(existing) = existing {
+            let exact = existing.try_get::<Uuid, _>("run_lease_id")?
+                == Uuid::from(request.run_lease_id)
+                && positive_u64(existing.try_get("run_lease_epoch")?, "Run lease epoch")?
+                    == request.run_lease_epoch
+                && existing.try_get::<String, _>("stable_reason")? == request.stable_reason
+                && existing.try_get::<i64, _>("cancel_deadline_ms")?
+                    == request.cancel_deadline_millis;
+            transaction.commit().await?;
+            return if exact {
+                Ok(RunCancellationWrite::Existing)
+            } else {
+                Err(AgentPersistenceError::ImmutableConflict(
+                    "Run cancellation intent",
+                ))
+            };
+        }
+
+        let lease = run
+            .current_lease()
+            .ok_or(AgentPersistenceError::FenceConflict)?;
+        let candidate = run.current_candidate();
+        if run.state() != RunRoutingState::Leased
+            || lease.run_lease_id() != request.run_lease_id
+            || lease.run_lease_epoch() != request.run_lease_epoch
+        {
+            return Err(AgentPersistenceError::FenceConflict);
+        }
+        let now_millis = clock
+            .now_utc_millis()
+            .map_err(|_| AgentPersistenceError::CorruptData("cancellation clock"))?;
+        let control_expires_at =
+            lock_current_control_expiry(&mut transaction, lease.connector_fence()).await?;
+        let authority_deadline = control_expires_at.min(lease.expires_at_millis());
+        if now_millis >= authority_deadline
+            || request.cancel_deadline_millis <= now_millis
+            || request.cancel_deadline_millis > authority_deadline
+        {
+            return Err(AgentPersistenceError::FenceConflict);
+        }
+        let fence = lease.connector_fence();
+        let connector_capacity = lock_connector_capacity(
+            &mut transaction,
+            request.tenant_id,
+            candidate.connector_id(),
+        )
+        .await?;
+        let connector_cancel_sequence = connector_capacity
+            .last_offer_sequence
+            .checked_add(1)
+            .filter(|value| *value <= Revision::MAX)
+            .ok_or(AgentPersistenceError::CorruptData(
+                "Connector cancellation sequence",
+            ))?;
+        advance_connector_capacity(
+            &mut transaction,
+            request.tenant_id,
+            candidate.connector_id(),
+            connector_capacity,
+            ConnectorCapacity {
+                last_offer_sequence: connector_cancel_sequence,
+                ..connector_capacity
+            },
+            now_millis,
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent.agent_run_cancellation_intents (
+                 tenant_id,run_id,request_id,installation_id,binding_id,connector_id,
+                 offer_attempt,run_lease_id,run_lease_epoch,run_lease_deadline_ms,
+                 connector_boot_id,connector_generation,connector_lease_id,
+                 connector_lease_epoch,connector_cancel_sequence,stable_reason,
+                 requested_at_ms,cancel_deadline_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
+        )
+        .bind(Uuid::from(request.tenant_id))
+        .bind(Uuid::from(request.run_id))
+        .bind(Uuid::from(run.request().request_id()))
+        .bind(Uuid::from(run.request().installation_id()))
+        .bind(Uuid::from(candidate.binding_id()))
+        .bind(Uuid::from(candidate.connector_id()))
+        .bind(to_i64(lease.offer_attempt(), "Run offer attempt")?)
+        .bind(Uuid::from(lease.run_lease_id()))
+        .bind(to_i64(lease.run_lease_epoch(), "Run lease epoch")?)
+        .bind(lease.expires_at_millis())
+        .bind(Uuid::from(fence.boot_id()))
+        .bind(to_i64(
+            fence.connector_generation(),
+            "Connector generation",
+        )?)
+        .bind(Uuid::from(fence.connector_lease_id()))
+        .bind(to_i64(
+            fence.connector_lease_epoch(),
+            "Connector lease epoch",
+        )?)
+        .bind(to_i64(
+            connector_cancel_sequence,
+            "Connector cancellation sequence",
+        )?)
+        .bind(&request.stable_reason)
+        .bind(now_millis)
+        .bind(request.cancel_deadline_millis)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(RunCancellationWrite::Inserted)
+    }
+
+    /// Returns live cancellation intents only for the exact active Connector fence.
+    /// Intents are deliberately replayed until terminal convergence or deadline.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid bounds, corrupt persisted fences, and database failures.
+    pub async fn poll_cancellations(
+        self,
+        connection: &mut PgConnection,
+        connector_fence: ConnectorLeaseFence,
+        after_sequence: u64,
+        now_millis: i64,
+        limit: usize,
+    ) -> Result<Vec<PendingRunCancellation>, AgentPersistenceError> {
+        if limit == 0 || limit > MAX_AGENT_RUN_CANCELLATION_PAGE {
+            return Err(AgentPersistenceError::MaterializationLimitExceeded(
+                "Agent Run cancellation page",
+            ));
+        }
+        let rows =
+            sqlx::query(
+                "SELECT c.connector_cancel_sequence,c.run_id,c.request_id,c.installation_id,c.binding_id,c.connector_id,
+                    c.offer_attempt,c.run_lease_id,c.run_lease_epoch,c.run_lease_deadline_ms,
+                    c.stable_reason,c.requested_at_ms,c.cancel_deadline_ms
+               FROM agent.agent_run_cancellation_intents c
+               JOIN agent.agent_runs r ON r.tenant_id=c.tenant_id AND r.run_id=c.run_id
+               JOIN agent.connector_leases l
+                 ON l.tenant_id=c.tenant_id AND l.connector_id=c.connector_id
+                AND l.lease_id=c.connector_lease_id
+              WHERE c.tenant_id=$1 AND c.connector_id=$2 AND c.connector_boot_id=$3
+                AND c.connector_generation=$4 AND c.connector_lease_id=$5
+                AND c.connector_lease_epoch=$6 AND r.state='leased'
+                AND r.current_run_lease_id=c.run_lease_id AND l.status='active'
+                AND c.connector_cancel_sequence>$7
+                AND l.expires_at_ms>$8 AND c.run_lease_deadline_ms>$8
+                AND c.cancel_deadline_ms>$8
+              ORDER BY c.connector_cancel_sequence LIMIT $9",
+            )
+            .bind(Uuid::from(connector_fence.tenant_id()))
+            .bind(Uuid::from(connector_fence.connector_id()))
+            .bind(Uuid::from(connector_fence.boot_id()))
+            .bind(to_i64(
+                connector_fence.connector_generation(),
+                "Connector generation",
+            )?)
+            .bind(Uuid::from(connector_fence.connector_lease_id()))
+            .bind(to_i64(
+                connector_fence.connector_lease_epoch(),
+                "Connector lease epoch",
+            )?)
+            .bind(to_i64(
+                after_sequence,
+                "Connector cancellation cursor",
+            )?)
+            .bind(now_millis)
+            .bind(i64::try_from(limit).map_err(|_| {
+                AgentPersistenceError::CorruptData("Agent Run cancellation page limit")
+            })?)
+            .fetch_all(&mut *connection)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PendingRunCancellation {
+                    connector_cancel_sequence: positive_u64(
+                        row.try_get("connector_cancel_sequence")?,
+                        "Connector cancellation sequence",
+                    )?,
+                    execution_fence: RunExecutionFence {
+                        tenant_id: connector_fence.tenant_id(),
+                        run_id: run_id(row.try_get("run_id")?)?,
+                        request_id: request_id(row.try_get("request_id")?)?,
+                        installation_id: installation_id(row.try_get("installation_id")?)?,
+                        binding_id: binding_id(row.try_get("binding_id")?)?,
+                        connector_id: connector_id(row.try_get("connector_id")?)?,
+                        offer_attempt: positive_u64(
+                            row.try_get("offer_attempt")?,
+                            "Run offer attempt",
+                        )?,
+                        run_lease_id: run_lease_id(row.try_get("run_lease_id")?)?,
+                        run_lease_epoch: positive_u64(
+                            row.try_get("run_lease_epoch")?,
+                            "Run lease epoch",
+                        )?,
+                        run_lease_deadline_millis: row.try_get("run_lease_deadline_ms")?,
+                        connector_fence,
+                    },
+                    stable_reason: row.try_get("stable_reason")?,
+                    requested_at_millis: row.try_get("requested_at_ms")?,
+                    cancel_deadline_millis: row.try_get("cancel_deadline_ms")?,
+                })
+            })
+            .collect()
     }
 
     /// Persists one exactly fenced execution report. Checkpoint and output
@@ -2894,6 +3161,15 @@ fn optional_bytes_32(
     field: &'static str,
 ) -> Result<Option<[u8; 32]>, AgentPersistenceError> {
     value.map(|value| bytes_32(value, field)).transpose()
+}
+
+fn valid_stable_code(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (3..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_uppercase()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
 }
 
 fn positive_u64(value: i64, field: &'static str) -> Result<u64, AgentPersistenceError> {

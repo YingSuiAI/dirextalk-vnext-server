@@ -176,6 +176,17 @@ pub struct RunLeaseGrantedWire {
     pub grant_version: u64,
 }
 
+/// Server-owned durable cancellation projected onto one exact execution fence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunCancelRequestedWire {
+    /// Internal durable delivery cursor; never encoded as cancellation authority.
+    pub connector_cancel_sequence: u64,
+    pub execution_fence: ParsedRunExecutionFence,
+    pub stable_reason: String,
+    pub requested_at_millis: i64,
+    pub cancel_deadline_millis: i64,
+}
+
 /// Complete Connector and Run lease authority copied by every execution report.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ParsedRunExecutionFence {
@@ -814,6 +825,54 @@ pub fn build_run_lease_granted(
         conversation_id: value.conversation_id.to_string(),
         input_event_id: value.input_event_id.to_string(),
         grant_version: positive_safe(value.grant_version, "grant_version")?,
+    })
+}
+
+/// Builds one v1.2 durable cancellation request without plaintext task data.
+///
+/// # Errors
+///
+/// Rejects malformed stable reasons, incoherent fences, or invalid deadlines.
+pub fn build_run_cancel_requested(
+    value: RunCancelRequestedWire,
+) -> Result<v1::RunCancelRequested, WireError> {
+    if !valid_upper_stable_code(&value.stable_reason) {
+        return Err(invalid_value("stable_reason"));
+    }
+    validate_connector_identity(
+        &value.execution_fence.connector_fence,
+        value.execution_fence.connector_id,
+    )?;
+    let requested_at_millis =
+        validated_timestamp(value.requested_at_millis, "requested_at_millis")?;
+    let cancel_deadline_millis =
+        validated_timestamp(value.cancel_deadline_millis, "cancel_deadline_millis")?;
+    let run_lease_deadline_millis = validated_timestamp(
+        value.execution_fence.run_lease_deadline_millis,
+        "run_lease_deadline_millis",
+    )?;
+    if cancel_deadline_millis <= requested_at_millis
+        || cancel_deadline_millis > run_lease_deadline_millis
+    {
+        return Err(invalid_value("cancel_deadline_millis"));
+    }
+    let fence = value.execution_fence;
+    Ok(v1::RunCancelRequested {
+        execution_fence: Some(v1::RunExecutionFence {
+            connector_fence: Some(build_parsed_lease_fence(fence.connector_fence)?),
+            run_id: fence.run_id.to_string(),
+            request_id: fence.request_id.to_string(),
+            installation_id: fence.installation_id.to_string(),
+            binding_id: fence.binding_id.to_string(),
+            connector_id: fence.connector_id.to_string(),
+            offer_attempt: positive_safe(fence.offer_attempt, "offer_attempt")?,
+            run_lease_id: fence.run_lease_id.to_string(),
+            run_lease_epoch: positive_safe(fence.run_lease_epoch, "run_lease_epoch")?,
+            run_lease_deadline_millis,
+        }),
+        stable_reason: value.stable_reason,
+        requested_at_millis,
+        cancel_deadline_millis,
     })
 }
 
