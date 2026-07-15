@@ -1,0 +1,89 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Group Membership Discovery
+  version: 1.0.0
+  description: >-
+    V29 public Group Service discovery and Owner/Admin-only pending membership
+    paging. Servers never derive their public origin from the HTTP Host header.
+paths:
+  /v1/group-service:
+    get:
+      operationId: getGroupServiceDescriptor
+      responses:
+        '200':
+          description: Immutable configured origin and current V22 Sequencer verification key.
+          headers:
+            ETag:
+              schema: { type: string }
+            Cache-Control:
+              schema:
+                type: string
+                const: public, max-age=60, stale-while-revalidate=300
+          content:
+            application/vnd.dirextalk.group-service.v1+cbor:
+              schema: { type: string, format: binary }
+        '304':
+          description: The exact strong ETag still identifies the descriptor.
+        '503':
+          description: Trusted public origin or Sequencer key is unavailable.
+  /v1/groups/{scope_kind}/{scope_id}/join-requests:
+    parameters:
+      - $ref: '#/components/parameters/ScopeKind'
+      - $ref: '#/components/parameters/ScopeId'
+    get:
+      operationId: listPendingGroupJoinRequests
+      description: >-
+        Query parameters are mandatory and canonicalized exactly as
+        `after=<opaque-or-empty>&limit=<1..64>`. The signed target includes that
+        exact ordered query. Local callers send Authorization and no federation
+        header. Federated callers send DTX-Identity-Origin and no Authorization.
+      parameters:
+        - name: after
+          in: query
+          required: true
+          schema: { type: string, maxLength: 256 }
+        - name: limit
+          in: query
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 64 }
+        - name: DTX-Group-Query-Proof
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 2048
+            pattern: '^[A-Za-z0-9_-]+$'
+        - name: DTX-Identity-Origin
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 10
+            maxLength: 512
+            pattern: '^https?://[^/?#]+$'
+      responses:
+        '200':
+          description: Stable pending page. next_after is explicitly null at the end.
+          content:
+            application/vnd.dirextalk.group-join-request-page.v1+cbor:
+              schema: { type: string, format: binary }
+        '401': { description: Device authentication failed. }
+        '403': { description: The active identity is not the current Owner or Admin. }
+        '404': { description: The exact group is unavailable. }
+        '422': { description: Query or signed proof is non-canonical, expired, or invalid. }
+        '503': { description: Durable data, identity resolution, or a historical candidate origin is unavailable. }
+components:
+  parameters:
+    ScopeKind:
+      name: scope_kind
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [private-conversation, controlled-public-channel]
+    ScopeId:
+      name: scope_id
+      in: path
+      required: true
+      schema: { type: string, minLength: 36, maxLength: 57 }

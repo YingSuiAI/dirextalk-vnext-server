@@ -8,7 +8,7 @@
 
 mod federated_identity;
 
-use std::sync::Arc;
+use std::{fmt::Write as _, sync::Arc};
 
 use axum::{
     Router,
@@ -28,10 +28,11 @@ use dtx_group_persistence::{
     GroupControlReceipt, GroupControlRejection, GroupControlRepository, GroupMembershipRepository,
     GroupPersistenceError, GroupPgStore, MLS_IDEMPOTENCY_KEY_HASH_DOMAIN,
     MembershipCommandExecution, MlsCommitAuthorization, MlsCommitCommand, MlsCommitExecution,
-    MlsCommitReceipt, MlsCommitSequencerRepository, MlsDeviceJoinConfirmation, VerifiedDeviceActor,
+    MlsCommitReceipt, MlsCommitSequencerRepository, MlsDeviceJoinConfirmation,
+    PendingJoinRequestCursor, PendingJoinRequestPage, VerifiedDeviceActor,
     mls_opaque_commit_digest,
 };
-use dtx_group_policy::GroupScope;
+use dtx_group_policy::{GroupScope, MAX_ADMINS};
 use dtx_identity_persistence::DeviceSessionCredential;
 use dtx_membership_command::{
     ApproveJoinCommand, CandidateMembership, JoinRequestCommand, MembershipAdmission,
@@ -45,7 +46,9 @@ use dtx_wire::{
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
 
-use crate::federated_identity::{FederatedIdentityError, FederatedIdentityVerifier};
+use crate::federated_identity::{
+    FederatedIdentityError, FederatedIdentityVerifier, canonical_configured_origin,
+};
 
 /// Invalid local-development federation configuration.
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +79,9 @@ pub const GROUP_INVITE_REVOKE_PATH_TEMPLATE: &str =
 /// Candidate join-request path template.
 pub const GROUP_JOIN_REQUEST_PATH_TEMPLATE: &str =
     "/v1/groups/{scope_kind}/{scope_id}/join-requests/{join_request_id}";
+/// Owner/Admin pending join-request collection path template.
+pub const GROUP_JOIN_REQUEST_COLLECTION_PATH_TEMPLATE: &str =
+    "/v1/groups/{scope_kind}/{scope_id}/join-requests";
 /// Owner/Admin approval path template.
 pub const GROUP_JOIN_APPROVAL_PATH_TEMPLATE: &str =
     "/v1/groups/{scope_kind}/{scope_id}/join-requests/{join_request_id}/approvals";
@@ -90,6 +96,8 @@ pub const MLS_CONFIRMATION_PATH_TEMPLATE: &str =
     "/v1/groups/{scope_kind}/{scope_id}/mls-commits/{submission_id}/confirmations/{device_id}";
 /// Origin-bound public verification key descriptor.
 pub const MLS_SEQUENCER_DESCRIPTOR_PATH: &str = "/v1/mls-sequencer";
+/// Public V29 Group Service descriptor path.
+pub const GROUP_SERVICE_DESCRIPTOR_PATH: &str = "/v1/group-service";
 
 /// Exact create request media type.
 pub const GROUP_CREATE_CONTENT_TYPE: &str = "application/vnd.dirextalk.group-create.v1+cbor";
@@ -117,6 +125,12 @@ pub const GROUP_ACTION_RECEIPT_CONTENT_TYPE: &str =
 /// Exact membership receipt media type.
 pub const MEMBERSHIP_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.membership-receipt.v1+cbor";
+/// Exact V29 Owner/Admin pending-request page media type.
+pub const GROUP_JOIN_REQUEST_PAGE_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.group-join-request-page.v1+cbor";
+/// Exact V29 public Group Service descriptor media type.
+pub const GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.group-service.v1+cbor";
 /// Exact V2 MLS commit request media type.
 pub const MLS_COMMIT_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v2+cbor";
 /// Exact V2 signed receipt media type.
@@ -131,6 +145,8 @@ pub const DEVICE_SESSION_AUTHORIZATION_SCHEME: &str = "DTX-Device-Session";
 pub const IDENTITY_ORIGIN_HEADER: &str = "dtx-identity-origin";
 /// Base64url canonical-CBOR proof authorizing a federated receipt lookup.
 pub const RECEIPT_QUERY_PROOF_HEADER: &str = "dtx-receipt-query-proof";
+/// Base64url canonical-CBOR proof authorizing a pending-request query.
+pub const GROUP_QUERY_PROOF_HEADER: &str = "dtx-group-query-proof";
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -141,6 +157,9 @@ const MAX_MEMBERSHIP_BODY_BYTES: usize = 32_768;
 const MAX_MLS_COMMIT_BODY_BYTES: usize = 1_100_000;
 const MAX_GET_BODY_BYTES: usize = 1_024;
 const MAX_ACTION_PROOF_LIFETIME_MS: i64 = 300_000;
+const MAX_GROUP_QUERY_PROOF_BYTES: usize = 2_048;
+const MAX_GROUP_JOIN_REQUEST_PAGE_SIZE: usize = 64;
+const GROUP_SERVICE_CACHE_CONTROL: &str = "public, max-age=60, stale-while-revalidate=300";
 
 const IDEMPOTENCY_HASH_DOMAIN: &[u8] = b"dirextalk.membership-idempotency-key.v1\0";
 const BUSINESS_FIELDS_HASH_DOMAIN: &[u8] = b"dirextalk.membership-action-business-fields.v1\0";
@@ -150,6 +169,8 @@ const FEDERATED_ACTION_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.membership-actio
 const FEDERATED_ACTION_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.membership-action-signature.v2\0";
 const RECEIPT_QUERY_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.membership-receipt-query-binding.v2\0";
 const RECEIPT_QUERY_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.membership-receipt-query-signature.v2\0";
+const GROUP_QUERY_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.group-query-binding.v1\0";
+const GROUP_QUERY_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.group-query-signature.v1\0";
 const CONTROL_COMMAND_HASH_DOMAIN: &[u8] = b"dirextalk.group-control-command.v1\0";
 
 /// Shared state for a node that serves one trusted configured tenant.
@@ -161,6 +182,7 @@ pub struct GroupNodeState {
     membership_repository: GroupMembershipRepository,
     mls_repository: MlsCommitSequencerRepository,
     mls_signing_key: Option<Arc<SigningKey>>,
+    public_origin: Option<Arc<str>>,
     federated_identity: FederatedIdentityVerifier,
     clock: Arc<dyn Clock>,
 }
@@ -188,6 +210,7 @@ impl GroupNodeState {
             membership_repository: GroupMembershipRepository,
             mls_repository: MlsCommitSequencerRepository,
             mls_signing_key: None,
+            public_origin: None,
             federated_identity,
             clock,
         }
@@ -198,6 +221,23 @@ impl GroupNodeState {
     pub fn with_mls_sequencer_signing_key(mut self, signing_key: SigningKey) -> Self {
         self.mls_signing_key = Some(Arc::new(signing_key));
         self
+    }
+
+    /// Installs the trusted canonical public origin used by descriptors and
+    /// local candidate identity-origin persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupNodeConfigurationError`] when `origin` is not an exact
+    /// canonical HTTP(S) origin without credentials, path, query, or fragment.
+    pub fn with_public_origin(
+        mut self,
+        origin: impl AsRef<str>,
+    ) -> Result<Self, GroupNodeConfigurationError> {
+        let origin =
+            canonical_configured_origin(origin.as_ref()).map_err(GroupNodeConfigurationError)?;
+        self.public_origin = Some(Arc::from(origin));
+        Ok(self)
     }
 
     /// Allows exact HTTP identity origins only for an explicitly configured
@@ -396,14 +436,26 @@ impl GroupNodeState {
             MembershipFence::new(parsed.expected_revision, parsed.sequencer_head),
         );
         let federated_actor = self.federated_actor(headers, &proof).await?;
+        let candidate_identity_origin = if federated_actor.is_some() {
+            proof
+                .identity_origin
+                .clone()
+                .ok_or(GroupFailure::ActionProofInvalid)?
+        } else {
+            self.public_origin
+                .as_deref()
+                .map(str::to_owned)
+                .ok_or(GroupFailure::TemporarilyUnavailable)?
+        };
         let result = if let Some(actor) = federated_actor {
             self.membership_repository
-                .request_join_verified_with_proof_outcome(
+                .request_join_verified_with_origin_and_proof_outcome(
                     &self.store,
                     self.tenant_id,
                     actor,
                     JoinRequestCommand::new(context),
                     CandidateMembership::NotMember,
+                    &candidate_identity_origin,
                     now.get(),
                     move |signing_key| {
                         proof.verify(
@@ -421,12 +473,13 @@ impl GroupNodeState {
         } else {
             let credential = parse_device_session_authorization(headers)?;
             self.membership_repository
-                .request_join_authenticated_with_proof_outcome(
+                .request_join_authenticated_with_origin_and_proof_outcome(
                     &self.store,
                     self.tenant_id,
                     &credential,
                     JoinRequestCommand::new(context),
                     CandidateMembership::NotMember,
+                    &candidate_identity_origin,
                     now.get(),
                     move |signing_key| {
                         proof.verify(
@@ -535,6 +588,10 @@ pub fn group_router_with_state(state: GroupNodeState) -> Router {
         .route(GROUP_INVITE_PATH_TEMPLATE, put(issue_invite))
         .route(GROUP_INVITE_REVOKE_PATH_TEMPLATE, post(revoke_invite))
         .route(GROUP_JOIN_REQUEST_PATH_TEMPLATE, put(request_join))
+        .route(
+            GROUP_JOIN_REQUEST_COLLECTION_PATH_TEMPLATE,
+            get(list_join_requests),
+        )
         .route(GROUP_JOIN_APPROVAL_PATH_TEMPLATE, post(approve_join))
         .route(
             GROUP_MEMBERSHIP_RECEIPT_PATH_TEMPLATE,
@@ -551,6 +608,10 @@ pub fn group_router_with_state(state: GroupNodeState) -> Router {
         .route(
             MLS_SEQUENCER_DESCRIPTOR_PATH,
             get(get_mls_sequencer_descriptor),
+        )
+        .route(
+            GROUP_SERVICE_DESCRIPTOR_PATH,
+            get(get_group_service_descriptor),
         )
         .with_state(state)
 }
@@ -584,6 +645,55 @@ async fn get_mls_sequencer_descriptor(
     }
     .await;
     finish(result, request_id)
+}
+
+async fn get_group_service_descriptor(
+    State(state): State<GroupNodeState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    let result = async {
+        require_exact_route(&parts.uri, GROUP_SERVICE_DESCRIPTOR_PATH)?;
+        require_empty_get(&parts.headers, body).await?;
+        let public_origin = state
+            .public_origin
+            .as_deref()
+            .ok_or(GroupFailure::TemporarilyUnavailable)?;
+        let signing_key = state
+            .mls_signing_key
+            .as_ref()
+            .ok_or(GroupFailure::TemporarilyUnavailable)?;
+        let descriptor = encode_deterministic_cbor(&numbered_map(vec![
+            CanonicalValue::Unsigned(1),
+            CanonicalValue::Text(public_origin.to_owned()),
+            CanonicalValue::Array(vec![CanonicalValue::Text(
+                "membership-discovery-v1".to_owned(),
+            )]),
+            CanonicalValue::Unsigned(MAX_ADMINS as u64),
+            CanonicalValue::Unsigned(MAX_GROUP_JOIN_REQUEST_PAGE_SIZE as u64),
+            CanonicalValue::Bytes(signing_key.verifying_key().to_bytes().to_vec()),
+        ]))
+        .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
+        let etag = representation_etag(&descriptor);
+        let not_modified = if_none_match(&parts.headers, &etag)?;
+        let mut response = if not_modified {
+            StatusCode::NOT_MODIFIED.into_response()
+        } else {
+            cbor_response(
+                StatusCode::OK,
+                descriptor,
+                GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE,
+            )
+        };
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&etag).expect("generated Group Service ETag is valid"),
+        );
+        Ok(response)
+    }
+    .await;
+    finish_public_descriptor(result, request_id)
 }
 
 async fn create_group(
@@ -808,6 +918,94 @@ async fn request_join(
             .request_join(&parts.headers, scope, expected_path, parsed, now)
             .await?;
         membership_response(execution)
+    }
+    .await;
+    finish(result, request_id)
+}
+
+async fn list_join_requests(
+    State(state): State<GroupNodeState>,
+    Path((scope_kind, scope_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    let result = async {
+        let scope = parse_scope(&scope_kind, &scope_id)?;
+        let collection_path = format!("{}/join-requests", canonical_scope_path(scope));
+        let query = parse_join_request_query(&parts.uri, &collection_path)?;
+        require_empty_get(&parts.headers, body).await?;
+        let proof = parse_group_query_proof_header(&parts.headers)?;
+        let now = state.now()?;
+        let page = if let Some(identity_origin) =
+            single_optional_header(&parts.headers, IDENTITY_ORIGIN_HEADER)?
+        {
+            if parts.headers.contains_key(header::AUTHORIZATION)
+                || proof.identity_origin != identity_origin
+            {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            let signing_key = state
+                .federated_identity
+                .active_device_signing_key(
+                    identity_origin,
+                    proof.actor_identity_id,
+                    proof.actor_device_id,
+                )
+                .await
+                .map_err(map_federated_identity_error)?;
+            let actor = VerifiedDeviceActor::new(
+                proof.actor_identity_id,
+                proof.actor_device_id,
+                signing_key,
+            );
+            state
+                .membership_repository
+                .list_pending_join_requests_verified_with_proof(
+                    &state.store,
+                    state.tenant_id,
+                    actor,
+                    scope,
+                    query.after,
+                    query.limit,
+                    move |signing_key| {
+                        proof.verify(&query.canonical_target, scope, now, signing_key)
+                    },
+                )
+                .await
+        } else {
+            let public_origin = state
+                .public_origin
+                .as_deref()
+                .ok_or(GroupFailure::TemporarilyUnavailable)?;
+            if proof.identity_origin != public_origin {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            let credential = parse_device_session_authorization(&parts.headers)?;
+            state
+                .membership_repository
+                .list_pending_join_requests_authenticated_with_proof(
+                    &state.store,
+                    state.tenant_id,
+                    &credential,
+                    proof.actor_identity_id,
+                    proof.actor_device_id,
+                    scope,
+                    query.after,
+                    query.limit,
+                    now.get(),
+                    move |signing_key| {
+                        proof.verify(&query.canonical_target, scope, now, signing_key)
+                    },
+                )
+                .await
+        }
+        .map_err(|error| map_persistence_error(&error))?;
+        Ok(cbor_response(
+            StatusCode::OK,
+            encode_pending_join_request_page(scope, &page)?,
+            GROUP_JOIN_REQUEST_PAGE_CONTENT_TYPE,
+        ))
     }
     .await;
     finish(result, request_id)
@@ -1116,6 +1314,52 @@ fn finish(result: Result<Response, GroupFailure>, request_id: RequestId) -> Resp
         Ok(response) => with_common_headers(response, request_id),
         Err(failure) => group_failure_response(failure, request_id),
     }
+}
+
+fn finish_public_descriptor(
+    result: Result<Response, GroupFailure>,
+    request_id: RequestId,
+) -> Response {
+    let mut response = finish(result, request_id);
+    if matches!(response.status(), StatusCode::OK | StatusCode::NOT_MODIFIED) {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(GROUP_SERVICE_CACHE_CONTROL),
+        );
+    }
+    response
+}
+
+fn representation_etag(body: &[u8]) -> String {
+    let digest = Sha256Digest::hash_domain(b"dirextalk.group-service-etag.v1\0", body);
+    let mut value = String::with_capacity(66);
+    value.push('"');
+    for byte in digest.as_bytes() {
+        write!(&mut value, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    value.push('"');
+    value
+}
+
+fn if_none_match(headers: &HeaderMap, expected: &str) -> Result<bool, GroupFailure> {
+    let mut values = headers.get_all(header::IF_NONE_MATCH).iter();
+    let Some(value) = values.next() else {
+        return Ok(false);
+    };
+    if values.next().is_some() {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let value = value.to_str().map_err(|_| GroupFailure::InvalidRequest)?;
+    if value.len() != 66
+        || !value.starts_with('"')
+        || !value.ends_with('"')
+        || !value.as_bytes()[1..65]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    Ok(value == expected)
 }
 
 fn parse_scope(scope_kind: &str, scope_id: &str) -> Result<GroupScope, GroupFailure> {
@@ -1517,6 +1761,184 @@ fn approve_join_signable(body: &ApproveJoinBody) -> CanonicalValue {
         CanonicalValue::Unsigned(body.expected_revision.get()),
         CanonicalValue::Bytes(body.sequencer_head.as_bytes().to_vec()),
     ])
+}
+
+struct JoinRequestQuery {
+    after: Option<PendingJoinRequestCursor>,
+    limit: usize,
+    canonical_target: String,
+}
+
+fn parse_join_request_query(
+    uri: &Uri,
+    expected_path: &str,
+) -> Result<JoinRequestQuery, GroupFailure> {
+    if uri.path() != expected_path {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let query = uri.query().ok_or(GroupFailure::InvalidRequest)?;
+    let mut parameters = query.split('&');
+    let after_parameter = parameters.next().ok_or(GroupFailure::InvalidRequest)?;
+    let limit_parameter = parameters.next().ok_or(GroupFailure::InvalidRequest)?;
+    if parameters.next().is_some() {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let after_text = after_parameter
+        .strip_prefix("after=")
+        .ok_or(GroupFailure::InvalidRequest)?;
+    let limit_text = limit_parameter
+        .strip_prefix("limit=")
+        .ok_or(GroupFailure::InvalidRequest)?;
+    if limit_text.is_empty()
+        || (limit_text.len() > 1 && limit_text.starts_with('0'))
+        || !limit_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let limit = limit_text
+        .parse::<usize>()
+        .map_err(|_| GroupFailure::InvalidRequest)?;
+    if !(1..=MAX_GROUP_JOIN_REQUEST_PAGE_SIZE).contains(&limit) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let after = if after_text.is_empty() {
+        None
+    } else {
+        Some(parse_pending_join_cursor(after_text)?)
+    };
+    let canonical_query = format!("after={after_text}&limit={limit}");
+    if query != canonical_query {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    Ok(JoinRequestQuery {
+        after,
+        limit,
+        canonical_target: format!("{expected_path}?{canonical_query}"),
+    })
+}
+
+fn parse_pending_join_cursor(value: &str) -> Result<PendingJoinRequestCursor, GroupFailure> {
+    if value.len() > 256 || !value.bytes().all(is_base64url_byte) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let mut decoded = vec![0_u8; value.len()];
+    let exact =
+        Base64UrlUnpadded::decode(value, &mut decoded).map_err(|_| GroupFailure::InvalidRequest)?;
+    if Base64UrlUnpadded::encode_string(exact) != value {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let decoded = decode_deterministic_cbor(exact).map_err(|_| GroupFailure::InvalidRequest)?;
+    let fields = exact_fields(&decoded, 2)?;
+    Ok(PendingJoinRequestCursor::new(
+        parse_utc_millis(field(fields, 1)?)?,
+        parse_join_request_id(&parse_text(field(fields, 2)?, 36, 36)?)?,
+    ))
+}
+
+fn encode_pending_join_cursor(cursor: PendingJoinRequestCursor) -> Result<String, GroupFailure> {
+    let bytes = encode_deterministic_cbor(&numbered_map(vec![
+        utc_value(cursor.requested_at()),
+        CanonicalValue::Text(cursor.join_request_id().to_string()),
+    ]))
+    .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
+    Ok(Base64UrlUnpadded::encode_string(&bytes))
+}
+
+#[derive(Clone)]
+struct GroupQueryProof {
+    canonical_target: String,
+    scope: GroupScope,
+    actor_identity_id: IdentityId,
+    actor_device_id: DeviceId,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    identity_origin: String,
+    signature: [u8; 64],
+}
+
+impl GroupQueryProof {
+    fn binding_value(&self) -> CanonicalValue {
+        numbered_map(vec![
+            CanonicalValue::Unsigned(1),
+            CanonicalValue::Unsigned(1),
+            CanonicalValue::Text(self.canonical_target.clone()),
+            scope_value(self.scope),
+            CanonicalValue::Text(self.actor_identity_id.to_string()),
+            CanonicalValue::Text(self.actor_device_id.to_string()),
+            utc_value(self.issued_at),
+            utc_value(self.expires_at),
+            CanonicalValue::Text(self.identity_origin.clone()),
+        ])
+    }
+
+    fn verify(
+        &self,
+        expected_target: &str,
+        expected_scope: GroupScope,
+        now: UtcMillis,
+        signing_key: SigningPublicKey,
+    ) -> Result<(), GroupPersistenceError> {
+        let lifetime = self
+            .expires_at
+            .get()
+            .checked_sub(self.issued_at.get())
+            .ok_or(GroupPersistenceError::ActionProofRejected)?;
+        if self.canonical_target != expected_target
+            || self.scope != expected_scope
+            || self.issued_at > now
+            || now >= self.expires_at
+            || !(1..=MAX_ACTION_PROOF_LIFETIME_MS).contains(&lifetime)
+        {
+            return Err(GroupPersistenceError::ActionProofRejected);
+        }
+        let binding = encode_deterministic_cbor(&self.binding_value())
+            .map_err(|_| GroupPersistenceError::ActionProofRejected)?;
+        let digest = Sha256Digest::hash_domain(GROUP_QUERY_BINDING_HASH_DOMAIN, &binding);
+        let mut signature_input =
+            Vec::with_capacity(GROUP_QUERY_SIGNATURE_DOMAIN.len() + digest.as_bytes().len());
+        signature_input.extend_from_slice(GROUP_QUERY_SIGNATURE_DOMAIN);
+        signature_input.extend_from_slice(digest.as_bytes());
+        let verifying_key = VerifyingKey::from_bytes(signing_key.as_bytes())
+            .map_err(|_| GroupPersistenceError::ActionProofRejected)?;
+        verifying_key
+            .verify_strict(&signature_input, &Signature::from_bytes(&self.signature))
+            .map_err(|_| GroupPersistenceError::ActionProofRejected)
+    }
+}
+
+fn parse_group_query_proof_header(headers: &HeaderMap) -> Result<GroupQueryProof, GroupFailure> {
+    let encoded = single_optional_header(headers, GROUP_QUERY_PROOF_HEADER)?
+        .ok_or(GroupFailure::ActionProofInvalid)?;
+    if encoded.len() > MAX_GROUP_QUERY_PROOF_BYTES || !encoded.bytes().all(is_base64url_byte) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let mut decoded = vec![0_u8; encoded.len()];
+    let exact = Base64UrlUnpadded::decode(encoded, &mut decoded)
+        .map_err(|_| GroupFailure::InvalidRequest)?;
+    if Base64UrlUnpadded::encode_string(exact) != encoded {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let value = decode_deterministic_cbor(exact).map_err(|_| GroupFailure::InvalidRequest)?;
+    let fields = exact_fields(&value, 3)?;
+    if field(fields, 1)? != &CanonicalValue::Unsigned(1) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let binding = exact_fields(field(fields, 2)?, 9)?;
+    if field(binding, 1)? != &CanonicalValue::Unsigned(1)
+        || field(binding, 2)? != &CanonicalValue::Unsigned(1)
+    {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    Ok(GroupQueryProof {
+        canonical_target: parse_text(field(binding, 3)?, 1, 768)?,
+        scope: parse_scope_value(field(binding, 4)?)?,
+        actor_identity_id: parse_identity_id_value(field(binding, 5)?)?,
+        actor_device_id: parse_device_id_value(field(binding, 6)?)?,
+        issued_at: parse_utc_millis(field(binding, 7)?)?,
+        expires_at: parse_utc_millis(field(binding, 8)?)?,
+        identity_origin: parse_text(field(binding, 9)?, 10, 512)?,
+        signature: parse_exact_bytes(field(fields, 3)?)?,
+    })
 }
 
 #[derive(Clone)]
@@ -2015,6 +2437,52 @@ fn encode_control_receipt(
     .map_err(|_| GroupFailure::TemporarilyUnavailable)
 }
 
+fn encode_pending_join_request_page(
+    scope: GroupScope,
+    page: &PendingJoinRequestPage,
+) -> Result<Vec<u8>, GroupFailure> {
+    let (epoch, head) = page.mls_head().map_or(
+        (CanonicalValue::Null, CanonicalValue::Null),
+        |(epoch, head)| {
+            (
+                CanonicalValue::Unsigned(epoch),
+                CanonicalValue::Bytes(head.as_bytes().to_vec()),
+            )
+        },
+    );
+    let items = page
+        .items()
+        .iter()
+        .map(|item| {
+            numbered_map(vec![
+                CanonicalValue::Text(item.join_request_id().to_string()),
+                CanonicalValue::Text(item.candidate_identity_id().to_string()),
+                CanonicalValue::Text(item.candidate_device_id().to_string()),
+                CanonicalValue::Text(item.candidate_identity_origin().to_owned()),
+                CanonicalValue::Text(item.invite_id().to_string()),
+                utc_value(item.requested_at()),
+                CanonicalValue::Text(item.request_command_id().request_id().to_string()),
+                CanonicalValue::Bytes(item.request_digest().as_bytes().to_vec()),
+            ])
+        })
+        .collect();
+    let next_after = page
+        .next_cursor()
+        .map_or(Ok(CanonicalValue::Null), |cursor| {
+            encode_pending_join_cursor(cursor).map(CanonicalValue::Text)
+        })?;
+    encode_deterministic_cbor(&numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        scope_value(scope),
+        CanonicalValue::Unsigned(page.policy_revision().get()),
+        epoch,
+        head,
+        CanonicalValue::Array(items),
+        next_after,
+    ]))
+    .map_err(|_| GroupFailure::TemporarilyUnavailable)
+}
+
 fn encode_membership_receipt(receipt: MembershipReceipt) -> Result<Vec<u8>, GroupFailure> {
     let mut fields = vec![
         CanonicalValue::Unsigned(1),
@@ -2218,7 +2686,8 @@ fn map_persistence_error(error: &GroupPersistenceError) -> GroupFailure {
 
     match error {
         GroupPersistenceError::DeviceAuthenticationRejected => GroupFailure::AuthenticationRejected,
-        GroupPersistenceError::MembershipReceiptAccessDenied => GroupFailure::AccessDenied,
+        GroupPersistenceError::MembershipReceiptAccessDenied
+        | GroupPersistenceError::MembershipDiscoveryAccessDenied => GroupFailure::AccessDenied,
         GroupPersistenceError::GroupNotFound
         | GroupPersistenceError::MembershipCommand(
             MembershipCommandError::CommandNotFound | MembershipCommandError::JoinRequestNotFound,
@@ -2246,6 +2715,7 @@ fn map_persistence_error(error: &GroupPersistenceError) -> GroupFailure {
         | GroupPersistenceError::TenantContextLeak
         | GroupPersistenceError::GroupSnapshot(_)
         | GroupPersistenceError::CorruptData(_)
+        | GroupPersistenceError::CandidateIdentityOriginUnavailable
         | GroupPersistenceError::LeaseLost
         | GroupPersistenceError::ScopeMismatch => GroupFailure::TemporarilyUnavailable,
     }

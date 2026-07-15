@@ -62,9 +62,11 @@ async fn run() -> Result<(), NodeError> {
     let identity_state = IdentityBootstrapState::with_clock_and_device_session_audience(
         identity_store,
         clock.clone(),
-        config.public_origin,
+        config.public_origin.clone(),
     );
     let group_state = GroupNodeState::with_clock(group_store, config.tenant_id, clock.clone())
+        .with_public_origin(&config.public_origin)
+        .map_err(|_| NodeError::Configuration)?
         .with_allowed_http_identity_origins(config.allowed_http_identity_origins)
         .map_err(|_| NodeError::Configuration)?;
     let mailbox_state = MailboxNodeState::with_clock(mailbox_store, clock);

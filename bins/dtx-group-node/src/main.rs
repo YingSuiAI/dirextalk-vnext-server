@@ -29,6 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = GroupPgStore::connect(options, 8).await?;
     let sequencer_signing_key =
         load_sequencer_signing_key(Path::new(&env::var("DTX_GROUP_MLS_SEQUENCER_KEY_FILE")?))?;
+    let public_origin =
+        env::var("DTX_GROUP_PUBLIC_ORIGIN").or_else(|_| env::var("DTX_NODE_PUBLIC_ORIGIN"))?;
     let allowed_http_identity_origins = env::var("DTX_GROUP_DEV_HTTP_IDENTITY_ORIGINS")
         .ok()
         .map(|value| {
@@ -42,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
     let state = dtx_group_node::GroupNodeState::new(store, tenant_id)
         .with_mls_sequencer_signing_key(sequencer_signing_key)
+        .with_public_origin(public_origin)?
         .with_allowed_http_identity_origins(allowed_http_identity_origins)?;
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
     axum::serve(listener, dtx_group_node::group_router_with_state(state)).await?;
@@ -153,6 +156,7 @@ fn validate_secure_ancestors(path: &Path) -> Result<(), io::Error> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Keep the platform-neutral caller aligned with the fallible Unix permission check.
 fn validate_secure_ancestors(_path: &Path) -> Result<(), io::Error> {
     Ok(())
 }

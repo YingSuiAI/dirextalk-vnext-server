@@ -197,7 +197,7 @@ fn active_signing_key(
 }
 
 fn canonical_origin(value: &str, allow_http: bool) -> Result<Url, FederatedIdentityError> {
-    if value.is_empty() || value.len() > 512 || !value.is_ascii() {
+    if !(10..=512).contains(&value.len()) || !value.is_ascii() {
         return Err(FederatedIdentityError::InvalidOrigin);
     }
     let parsed = Url::parse(value).map_err(|_| FederatedIdentityError::InvalidOrigin)?;
@@ -214,6 +214,10 @@ fn canonical_origin(value: &str, allow_http: bool) -> Result<Url, FederatedIdent
         return Err(FederatedIdentityError::InvalidOrigin);
     }
     Ok(parsed)
+}
+
+pub(crate) fn canonical_configured_origin(value: &str) -> Result<String, FederatedIdentityError> {
+    canonical_origin(value, true).map(|origin| origin.origin().ascii_serialization())
 }
 
 fn identity_log_page_url(

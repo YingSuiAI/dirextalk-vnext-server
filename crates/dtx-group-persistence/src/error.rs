@@ -38,6 +38,10 @@ pub enum GroupPersistenceError {
     DeviceAuthenticationRejected,
     /// A valid session did not have permission to read this durable receipt.
     MembershipReceiptAccessDenied,
+    /// The reading identity is not the current Owner or an active Admin.
+    MembershipDiscoveryAccessDenied,
+    /// A pending historical workflow has no verified candidate identity origin.
+    CandidateIdentityOriginUnavailable,
     /// The caller's route-bound device action proof was malformed, expired, or invalid.
     ActionProofRejected,
     /// An MLS submission ID or idempotency key was reused with different canonical facts.
@@ -77,6 +81,8 @@ impl fmt::Display for GroupPersistenceError {
             }
             Self::DeviceAuthenticationRejected => "device session authentication was rejected",
             Self::MembershipReceiptAccessDenied => "membership receipt access was denied",
+            Self::MembershipDiscoveryAccessDenied => "membership discovery access was denied",
+            Self::CandidateIdentityOriginUnavailable => "candidate identity origin is unavailable",
             Self::ActionProofRejected => "group device action proof was rejected",
             Self::MlsCommitConflict => "MLS commit submission conflicts with a durable receipt",
             Self::StaleMlsHead => "MLS commit parent epoch or head is stale",
@@ -105,6 +111,8 @@ impl Error for GroupPersistenceError {
             | Self::ControlCommandConflict
             | Self::DeviceAuthenticationRejected
             | Self::MembershipReceiptAccessDenied
+            | Self::MembershipDiscoveryAccessDenied
+            | Self::CandidateIdentityOriginUnavailable
             | Self::ActionProofRejected
             | Self::MlsCommitConflict
             | Self::StaleMlsHead

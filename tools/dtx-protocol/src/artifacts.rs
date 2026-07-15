@@ -145,6 +145,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_indexer_v1(root)?;
     validate_conditional_cache_v1(root)?;
     validate_membership_federation_v1(root)?;
+    validate_group_membership_discovery_v1(root)?;
     validate_private_messaging_artifacts(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
@@ -954,6 +955,98 @@ fn validate_membership_federation_v1(root: &Path) -> Result<(), ProtocolToolErro
     if openapi.openapi != "3.1.0" {
         return Err(ProtocolToolError::new(
             "membership-federation OpenAPI must declare 3.1.0",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_group_membership_discovery_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    const BINDING_DOMAIN: &[u8] = b"dirextalk.group-query-binding.v1\0";
+    const SIGNATURE_DOMAIN: &[u8] = b"dirextalk.group-query-signature.v1\0";
+
+    let cddl_path =
+        root.join("protocol/cddl/group-membership-discovery/v1/group-membership-discovery-v1.cddl");
+    let cddl = read(&cddl_path)?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse group-membership-discovery V1 CDDL {}: {error}",
+            cddl_path.display()
+        ))
+    })?;
+    let vector = read_json(
+        &root.join("protocol/test-vectors/group-membership-discovery/v1/group-query-v1.json"),
+    )?;
+    validate_vector_version(&vector, "group-membership-discovery-v1")?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(29)
+        || json_string(&vector, "binding_hash_domain")? != "dirextalk.group-query-binding.v1\0"
+        || json_string(&vector, "signature_domain")? != "dirextalk.group-query-signature.v1\0"
+    {
+        return Err(ProtocolToolError::new(
+            "group membership discovery V1 baseline or domains drift",
+        ));
+    }
+    let target = json_string(&vector, "canonical_target")?;
+    if !target.ends_with("/join-requests?after=&limit=32") || target.contains('%') {
+        return Err(ProtocolToolError::new(
+            "group membership discovery canonical target drift",
+        ));
+    }
+    validate_uuid_fields(&vector, &["/scope_id", "/actor_device_id"])?;
+    validate_cddl_hex(
+        "group-query-binding-v1",
+        &cddl,
+        json_string(&vector, "binding_canonical_cbor_hex")?,
+    )?;
+    validate_cddl_hex(
+        "group-query-proof-v1",
+        &cddl,
+        json_string(&vector, "proof_canonical_cbor_hex")?,
+    )?;
+
+    let binding = decode_hex(json_string(&vector, "binding_canonical_cbor_hex")?)?;
+    let mut hasher = Sha256::new();
+    hasher.update(BINDING_DOMAIN);
+    hasher.update(&binding);
+    let digest: [u8; 32] = hasher.finalize().into();
+    if lowercase_hex(&digest) != json_string(&vector, "binding_digest_hex")? {
+        return Err(ProtocolToolError::new(
+            "group membership discovery binding digest drift",
+        ));
+    }
+    let mut signature_input = Vec::with_capacity(SIGNATURE_DOMAIN.len() + digest.len());
+    signature_input.extend_from_slice(SIGNATURE_DOMAIN);
+    signature_input.extend_from_slice(&digest);
+    if lowercase_hex(&signature_input) != json_string(&vector, "signature_input_hex")? {
+        return Err(ProtocolToolError::new(
+            "group membership discovery signature input drift",
+        ));
+    }
+    let proof = decode_hex(json_string(&vector, "proof_canonical_cbor_hex")?)?;
+    let encoded_proof = Base64UrlUnpadded::decode_vec(json_string(&vector, "proof_base64url")?)
+        .map_err(|_| ProtocolToolError::new("group query proof is not unpadded base64url"))?;
+    if proof != encoded_proof {
+        return Err(ProtocolToolError::new(
+            "group query proof base64url differs from canonical CBOR",
+        ));
+    }
+    let public_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "device_signing_public_key_hex")?)?;
+    let signature = decode_lower_hex_fixed::<64>(json_string(&vector, "signature_hex")?)?;
+    VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| ProtocolToolError::new("group query public key is not Ed25519"))?
+        .verify_strict(&signature_input, &Signature::from_bytes(&signature))
+        .map_err(|_| ProtocolToolError::new("group query signature does not verify"))?;
+
+    let openapi_path = root.join("protocol/openapi/group-membership-discovery/v1/openapi.yaml");
+    let openapi = oas3::from_yaml(&read(&openapi_path)?).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse group-membership-discovery OpenAPI {}: {error}",
+            openapi_path.display()
+        ))
+    })?;
+    if openapi.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "group-membership-discovery OpenAPI must declare 3.1.0",
         ));
     }
     Ok(())

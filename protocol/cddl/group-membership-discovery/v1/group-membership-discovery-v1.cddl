@@ -1,0 +1,75 @@
+; Dirextalk Group Membership Discovery V1 (baseline V29).
+
+identity-id-v1 = tstr .size 57
+uuid-v7-v1 = tstr .size 36
+channel-id-v1 = tstr .size 57
+sha256-digest-v1 = bstr .size 32
+ed25519-public-key-v1 = bstr .size 32
+ed25519-signature-v1 = bstr .size 64
+utc-millis-v1 = -62135596800000..253402300799999
+safe-uint-v1 = 0..9007199254740991
+
+private-conversation-scope-v1 = { 1: 1, 2: uuid-v7-v1 }
+controlled-public-channel-scope-v1 = { 1: 2, 2: channel-id-v1 }
+group-scope-v1 = private-conversation-scope-v1 / controlled-public-channel-scope-v1
+
+; URL origin ASCII serialization. No path or trailing slash. Production is
+; HTTPS; exact HTTP origins require an explicit local-development allowlist.
+canonical-origin-v1 = tstr .size (10..512)
+canonical-group-query-target-v1 = tstr .size (1..768)
+opaque-page-cursor-v1 = tstr .size (1..256)
+
+group-service-descriptor-v1 = {
+  1: 1,
+  2: canonical-origin-v1,
+  3: [ "membership-discovery-v1" ],
+  4: 5,
+  5: 64,
+  6: ed25519-public-key-v1
+}
+
+; Signature input is `dirextalk.group-query-signature.v1\0` followed by
+; SHA-256(`dirextalk.group-query-binding.v1\0` || canonical-CBOR(binding)).
+group-query-binding-v1 = {
+  1: 1,
+  2: 1, ; list_join_requests
+  3: canonical-group-query-target-v1,
+  4: group-scope-v1,
+  5: identity-id-v1,
+  6: uuid-v7-v1,
+  7: utc-millis-v1,
+  8: utc-millis-v1,
+  9: canonical-origin-v1
+}
+
+group-query-proof-v1 = {
+  1: 1,
+  2: group-query-binding-v1,
+  3: ed25519-signature-v1
+}
+
+pending-join-request-v1 = {
+  1: uuid-v7-v1,
+  2: identity-id-v1,
+  3: uuid-v7-v1,
+  4: canonical-origin-v1,
+  5: uuid-v7-v1,
+  6: utc-millis-v1,
+  7: uuid-v7-v1,
+  8: sha256-digest-v1
+}
+
+pending-join-request-page-v1 = {
+  1: 1,
+  2: group-scope-v1,
+  3: 1..9007199254740991,
+  4: safe-uint-v1 / null,
+  5: sha256-digest-v1 / null,
+  6: [* pending-join-request-v1],
+  7: opaque-page-cursor-v1 / null
+}
+
+pending-join-request-cursor-v1 = {
+  1: utc-millis-v1,
+  2: uuid-v7-v1
+}

@@ -130,6 +130,11 @@ const V28_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/attachment/v1/openapi.yaml",
     "protocol/test-vectors/attachment/v1/attachment-v1.json",
 ];
+const V29_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/group-membership-discovery/v1",
+    "protocol/openapi/group-membership-discovery/v1",
+    "protocol/test-vectors/group-membership-discovery/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -313,6 +318,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v28/manifest.json",
         includes_registries: false,
         artifact_paths: V28_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 29,
+        path: "protocol/baseline/v29/manifest.json",
+        includes_registries: false,
+        artifact_paths: V29_ARTIFACT_PATHS,
     },
 ];
 

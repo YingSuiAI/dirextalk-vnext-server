@@ -30,6 +30,9 @@ pub use mls_sequencer::{
     mls_device_confirmation_signature_input, mls_device_proof_transcript_canonical_bytes,
     mls_opaque_commit_digest,
 };
-pub use repository::{GroupMembershipRepository, MembershipCommandExecution, VerifiedDeviceActor};
+pub use repository::{
+    GroupMembershipRepository, MembershipCommandExecution, PendingJoinRequest,
+    PendingJoinRequestCursor, PendingJoinRequestPage, VerifiedDeviceActor,
+};
 pub use store::{GroupPgStore, GroupSession};
 pub use types::{PreparedSequencerAction, SequencerActionLease};

@@ -1,0 +1,10 @@
+{
+  "version": 29,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/group-membership-discovery/v1/group-membership-discovery-v1.cddl": "sha256:2e61f20e999bc2922039e629052a77d94b5445aa47a09aed3dd51ba6d92d6447",
+    "protocol/openapi/group-membership-discovery/v1/openapi.yaml": "sha256:6b139afd193e3a6465637fb93c6b130495b9c34ca414e6c1110fb9d558c97bf7",
+    "protocol/test-vectors/group-membership-discovery/v1/group-query-v1.json": "sha256:d2a384ead8c6d9466a0bb6ef9d1c2df6488a82af9a7ed62be8c23f4300c9b7f2"
+  }
+}
