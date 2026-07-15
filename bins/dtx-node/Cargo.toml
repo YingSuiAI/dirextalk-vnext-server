@@ -16,9 +16,16 @@ dtx-indexer-node = { path = "../dtx-indexer-node" }
 dtx-mailbox = { path = "../../crates/dtx-mailbox" }
 dtx-mailbox-node = { path = "../dtx-mailbox-node" }
 dtx-public-feed-node = { path = "../dtx-public-feed-node" }
+ed25519-dalek.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+dtx-storage = { path = "../../crates/dtx-storage" }
+testcontainers-modules.workspace = true
+tower.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

@@ -1144,8 +1144,13 @@ dependencies = [
  "dtx-mailbox",
  "dtx-mailbox-node",
  "dtx-public-feed-node",
+ "dtx-storage",
+ "ed25519-dalek",
  "sqlx",
+ "testcontainers-modules",
  "tokio",
+ "tower",
+ "uuid",
  "zeroize",
 ]
 

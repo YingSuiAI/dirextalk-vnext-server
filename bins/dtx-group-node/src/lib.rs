@@ -7,6 +7,7 @@
 //! allowed to turn that intent into a committed membership fact.
 
 mod federated_identity;
+mod sequencer_key;
 
 use std::{fmt::Write as _, sync::Arc};
 
@@ -46,9 +47,9 @@ use dtx_wire::{
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
 
-use crate::federated_identity::{
-    FederatedIdentityError, FederatedIdentityVerifier, canonical_configured_origin,
-};
+use crate::federated_identity::{FederatedIdentityError, FederatedIdentityVerifier};
+
+pub use crate::sequencer_key::load_mls_sequencer_signing_key;
 
 /// Invalid local-development federation configuration.
 #[derive(Clone, Copy, Debug)]
@@ -223,36 +224,29 @@ impl GroupNodeState {
         self
     }
 
-    /// Installs the trusted canonical public origin used by descriptors and
-    /// local candidate identity-origin persistence.
+    /// Atomically installs the trusted public origin and development-only HTTP
+    /// identity-origin allowlist used by federation and local persistence.
+    /// HTTPS is accepted by default; an HTTP public origin must exactly match
+    /// one canonical entry in `allowed_http_origins`.
     ///
     /// # Errors
     ///
-    /// Returns [`GroupNodeConfigurationError`] when `origin` is not an exact
-    /// canonical HTTP(S) origin without credentials, path, query, or fragment.
-    pub fn with_public_origin(
+    /// Returns [`GroupNodeConfigurationError`] when an origin is not canonical,
+    /// an allowlist entry is not HTTP, or an HTTP public origin is not explicitly
+    /// allowlisted.
+    pub fn with_public_origin_and_allowed_http_identity_origins(
         mut self,
-        origin: impl AsRef<str>,
+        public_origin: impl AsRef<str>,
+        allowed_http_origins: impl IntoIterator<Item = String>,
     ) -> Result<Self, GroupNodeConfigurationError> {
-        let origin =
-            canonical_configured_origin(origin.as_ref()).map_err(GroupNodeConfigurationError)?;
-        self.public_origin = Some(Arc::from(origin));
-        Ok(self)
-    }
-
-    /// Allows exact HTTP identity origins only for an explicitly configured
-    /// trusted local-development topology. Production origins remain HTTPS.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`GroupNodeConfigurationError`] when an origin is not an exact
-    /// canonical HTTP origin or the bounded verifier client cannot be built.
-    pub fn with_allowed_http_identity_origins(
-        mut self,
-        origins: impl IntoIterator<Item = String>,
-    ) -> Result<Self, GroupNodeConfigurationError> {
-        self.federated_identity =
-            FederatedIdentityVerifier::new(origins).map_err(GroupNodeConfigurationError)?;
+        let (federated_identity, public_origin) =
+            FederatedIdentityVerifier::new_with_public_origin(
+                public_origin.as_ref(),
+                allowed_http_origins,
+            )
+            .map_err(GroupNodeConfigurationError)?;
+        self.public_origin = Some(Arc::from(public_origin));
+        self.federated_identity = federated_identity;
         Ok(self)
     }
 
@@ -449,7 +443,7 @@ impl GroupNodeState {
         };
         let result = if let Some(actor) = federated_actor {
             self.membership_repository
-                .request_join_verified_with_origin_and_proof_outcome(
+                .request_join_verified_with_proof_outcome(
                     &self.store,
                     self.tenant_id,
                     actor,
@@ -473,7 +467,7 @@ impl GroupNodeState {
         } else {
             let credential = parse_device_session_authorization(headers)?;
             self.membership_repository
-                .request_join_authenticated_with_origin_and_proof_outcome(
+                .request_join_authenticated_with_proof_outcome(
                     &self.store,
                     self.tenant_id,
                     &credential,

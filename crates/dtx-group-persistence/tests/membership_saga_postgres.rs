@@ -18,6 +18,7 @@ use dtx_membership_command::{
 use dtx_wire::Sha256Digest;
 
 const OWNER: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+const CANDIDATE_IDENTITY_ORIGIN: &str = "https://candidate.example";
 
 fn identity(slot: u8) -> IdentityId {
     let value = format!("dtxi1{}{}", char::from(b'a' + slot), "a".repeat(51));
@@ -152,6 +153,7 @@ async fn response_loss_restarts_with_query_and_finalizes_the_original_reservatio
             tenant_id,
             request,
             CandidateMembership::NotMember,
+            CANDIDATE_IDENTITY_ORIGIN,
             2_000,
         )
         .await?;
@@ -396,6 +398,7 @@ async fn expired_invite_persists_a_terminal_rejection_before_exact_replay()
             tenant_id,
             request,
             CandidateMembership::NotMember,
+            CANDIDATE_IDENTITY_ORIGIN,
             2_000,
         )
         .await?;
@@ -414,6 +417,7 @@ async fn expired_invite_persists_a_terminal_rejection_before_exact_replay()
             tenant_id,
             request,
             CandidateMembership::NotMember,
+            CANDIDATE_IDENTITY_ORIGIN,
             1_200,
         )
         .await?;
@@ -467,6 +471,7 @@ async fn tenant_rows_are_isolated_for_the_same_scope_and_command_identity()
             first_tenant,
             request,
             CandidateMembership::NotMember,
+            CANDIDATE_IDENTITY_ORIGIN,
             2_000,
         )
         .await?;
@@ -488,6 +493,7 @@ async fn tenant_rows_are_isolated_for_the_same_scope_and_command_identity()
             second_tenant,
             request,
             CandidateMembership::NotMember,
+            CANDIDATE_IDENTITY_ORIGIN,
             2_000,
         )
         .await?;
@@ -532,6 +538,7 @@ async fn failed_outbox_write_rolls_back_the_reservation_and_allows_exact_retry()
             tenant_id,
             JoinRequestCommand::new(join_context),
             CandidateMembership::NotMember,
+            CANDIDATE_IDENTITY_ORIGIN,
             2_000,
         )
         .await?;

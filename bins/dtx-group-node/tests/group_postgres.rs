@@ -79,8 +79,10 @@ async fn remote_owner_admin_and_candidate_use_fresh_identity_logs_without_sessio
     let tenant_id = TenantId::new();
     let state =
         GroupNodeState::with_clock(group_store.clone(), tenant_id, Arc::new(FixedClock(NOW)))
-            .with_public_origin(AUDIENCE)?
-            .with_allowed_http_identity_origins([admin_origin.clone(), candidate_origin.clone()])?;
+            .with_public_origin_and_allowed_http_identity_origins(
+                AUDIENCE,
+                [admin_origin.clone(), candidate_origin.clone()],
+            )?;
     let app = group_router_with_state(state);
     let scope = GroupScope::PrivateConversation(ConversationId::new());
     let scope_path = scope_path(scope);
@@ -246,6 +248,40 @@ async fn owner_admin_discovery_is_bound_paged_cached_and_restart_safe() -> Resul
     let harness = support::PostgresHarness::start().await?;
     let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 8).await?;
     let group_store = GroupPgStore::connect(harness.group_runtime_options(), 4).await?;
+    let untrusted_http_public_origin = "http://group.test";
+    assert!(
+        GroupNodeState::with_clock(
+            group_store.clone(),
+            TenantId::new(),
+            Arc::new(FixedClock(NOW)),
+        )
+        .with_public_origin_and_allowed_http_identity_origins(untrusted_http_public_origin, [])
+        .is_err()
+    );
+    assert!(
+        GroupNodeState::with_clock(
+            group_store.clone(),
+            TenantId::new(),
+            Arc::new(FixedClock(NOW)),
+        )
+        .with_public_origin_and_allowed_http_identity_origins(
+            untrusted_http_public_origin,
+            ["http://other.test".to_owned()],
+        )
+        .is_err()
+    );
+    assert!(
+        GroupNodeState::with_clock(
+            group_store.clone(),
+            TenantId::new(),
+            Arc::new(FixedClock(NOW)),
+        )
+        .with_public_origin_and_allowed_http_identity_origins(
+            untrusted_http_public_origin,
+            [untrusted_http_public_origin.to_owned()],
+        )
+        .is_ok()
+    );
     let owner = enroll_active_device(&identity_store, 81, 82, 83, [84; 32]).await?;
     let remote_admin = enroll_active_device(&identity_store, 85, 86, 87, [88; 32]).await?;
     let local_candidate = enroll_active_device(&identity_store, 89, 90, 91, [92; 32]).await?;
@@ -257,8 +293,7 @@ async fn owner_admin_discovery_is_bound_paged_cached_and_restart_safe() -> Resul
     let build_state = || {
         GroupNodeState::with_clock(group_store.clone(), tenant_id, Arc::new(FixedClock(NOW)))
             .with_mls_sequencer_signing_key(sequencer_key.clone())
-            .with_public_origin(AUDIENCE)?
-            .with_allowed_http_identity_origins([remote_origin.clone()])
+            .with_public_origin_and_allowed_http_identity_origins(AUDIENCE, [remote_origin.clone()])
     };
     let app = group_router_with_state(build_state()?);
     let scope = GroupScope::PrivateConversation(ConversationId::new());
@@ -636,9 +671,41 @@ async fn three_node_compose_runs_remote_owner_admin_candidate_and_receipt_recove
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let group_origin = "http://127.0.0.1:14814";
-    let admin_identity_origin = "http://identity-b:8080";
-    let candidate_identity_origin = "http://identity-c:8080";
+    for (port, expected_origin) in [
+        (18_080, "http://node-a:8080"),
+        (18_081, "http://node-b:8080"),
+        (18_082, "http://node-c:8080"),
+    ] {
+        let response = client
+            .get(format!(
+                "http://127.0.0.1:{port}{GROUP_SERVICE_DESCRIPTOR_PATH}"
+            ))
+            .send()
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some(GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE)
+        );
+        let CanonicalValue::Map(descriptor) = decode_deterministic_cbor(&response.bytes().await?)?
+        else {
+            return Err("unified Group Service descriptor must be a map".into());
+        };
+        assert_eq!(
+            descriptor[1].1,
+            CanonicalValue::Text(expected_origin.to_owned())
+        );
+        assert!(matches!(
+            &descriptor[5].1,
+            CanonicalValue::Bytes(key) if key.len() == 32
+        ));
+    }
+    let group_origin = "http://127.0.0.1:18080";
+    let admin_identity_origin = "http://node-b:8080";
+    let candidate_identity_origin = "http://node-c:8080";
     let scope = GroupScope::PrivateConversation(ConversationId::new());
     let scope_path = scope_path(scope);
 
@@ -827,7 +894,7 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
     let app = group_router_with_state(
         GroupNodeState::with_clock(group_store, tenant_id, Arc::new(FixedClock(NOW)))
             .with_mls_sequencer_signing_key(SigningKey::from_bytes(&[99; 32]))
-            .with_public_origin(AUDIENCE)?,
+            .with_public_origin_and_allowed_http_identity_origins(AUDIENCE, [])?,
     );
     let owner = enroll_active_device(&identity_store, 11, 12, 13, [14; 32]).await?;
     let candidate = enroll_active_device(&identity_store, 21, 22, 23, [24; 32]).await?;

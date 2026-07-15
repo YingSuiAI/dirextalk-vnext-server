@@ -3,8 +3,8 @@
 use std::{env, fs, net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
 
 use axum::{http::StatusCode, routing::get};
-use dtx_domain::{IndexerId, SystemClock, TenantId};
-use dtx_group_node::{GroupNodeState, group_router_with_state};
+use dtx_domain::{Clock, IndexerId, SystemClock, TenantId};
+use dtx_group_node::{GroupNodeState, group_router_with_state, load_mls_sequencer_signing_key};
 use dtx_group_persistence::GroupPgStore;
 use dtx_identity_node::{IdentityBootstrapState, identity_bootstrap_router_with_state};
 use dtx_identity_persistence::IdentityPgStore;
@@ -12,6 +12,7 @@ use dtx_indexer_node::{IndexerPgStore, PinnedHttpsBundleFetcher, indexer_router}
 use dtx_mailbox::MailboxPgStore;
 use dtx_mailbox_node::{MailboxNodeState, mailbox_router_with_state};
 use dtx_public_feed_node::{PublicFeedPgStore, public_feed_router};
+use ed25519_dalek::SigningKey;
 use sqlx::postgres::PgConnectOptions;
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
@@ -22,6 +23,7 @@ const PUBLIC_ORIGIN_ENV: &str = "DTX_NODE_PUBLIC_ORIGIN";
 const TENANT_ID_ENV: &str = "DTX_NODE_TENANT_ID";
 const IDENTITY_DATABASE_URL_FILE_ENV: &str = "DTX_IDENTITY_DATABASE_URL_FILE";
 const GROUP_DATABASE_URL_FILE_ENV: &str = "DTX_GROUP_DATABASE_URL_FILE";
+const GROUP_MLS_SEQUENCER_KEY_FILE_ENV: &str = "DTX_GROUP_MLS_SEQUENCER_KEY_FILE";
 const MAILBOX_DATABASE_URL_FILE_ENV: &str = "DTX_MAILBOX_DATABASE_URL_FILE";
 const PUBLIC_FEED_DATABASE_URL_FILE_ENV: &str = "DTX_PUBLIC_FEED_DATABASE_URL_FILE";
 const INDEXER_DATABASE_URL_FILE_ENV: &str = "DTX_INDEXER_DATABASE_URL_FILE";
@@ -42,6 +44,9 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), NodeError> {
     let config = NodeConfig::load()?;
+    let sequencer_signing_key =
+        load_mls_sequencer_signing_key(&config.group_mls_sequencer_key_file)
+            .map_err(|_| NodeError::Configuration)?;
     let identity_store = IdentityPgStore::connect(config.identity_database, 8)
         .await
         .map_err(|_| NodeError::Database("identity"))?;
@@ -64,11 +69,14 @@ async fn run() -> Result<(), NodeError> {
         clock.clone(),
         config.public_origin.clone(),
     );
-    let group_state = GroupNodeState::with_clock(group_store, config.tenant_id, clock.clone())
-        .with_public_origin(&config.public_origin)
-        .map_err(|_| NodeError::Configuration)?
-        .with_allowed_http_identity_origins(config.allowed_http_identity_origins)
-        .map_err(|_| NodeError::Configuration)?;
+    let group_state = configured_group_state(
+        group_store,
+        config.tenant_id,
+        clock.clone(),
+        sequencer_signing_key,
+        &config.public_origin,
+        config.allowed_http_identity_origins,
+    )?;
     let mailbox_state = MailboxNodeState::with_clock(mailbox_store, clock);
 
     let router = identity_bootstrap_router_with_state(identity_state)
@@ -91,6 +99,23 @@ async fn run() -> Result<(), NodeError> {
         .map_err(|_| NodeError::Serve)
 }
 
+fn configured_group_state(
+    group_store: GroupPgStore,
+    tenant_id: TenantId,
+    clock: Arc<dyn Clock>,
+    sequencer_signing_key: SigningKey,
+    public_origin: &str,
+    allowed_http_identity_origins: Vec<String>,
+) -> Result<GroupNodeState, NodeError> {
+    GroupNodeState::with_clock(group_store, tenant_id, clock)
+        .with_mls_sequencer_signing_key(sequencer_signing_key)
+        .with_public_origin_and_allowed_http_identity_origins(
+            public_origin,
+            allowed_http_identity_origins,
+        )
+        .map_err(|_| NodeError::Configuration)
+}
+
 async fn local_health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -101,6 +126,7 @@ struct NodeConfig {
     tenant_id: TenantId,
     identity_database: PgConnectOptions,
     group_database: PgConnectOptions,
+    group_mls_sequencer_key_file: PathBuf,
     mailbox_database: PgConnectOptions,
     public_feed_database: PgConnectOptions,
     indexer_database: PgConnectOptions,
@@ -145,6 +171,9 @@ impl NodeConfig {
             tenant_id,
             identity_database: load_database_options(IDENTITY_DATABASE_URL_FILE_ENV)?,
             group_database: load_database_options(GROUP_DATABASE_URL_FILE_ENV)?,
+            group_mls_sequencer_key_file: env::var_os(GROUP_MLS_SEQUENCER_KEY_FILE_ENV)
+                .map(PathBuf::from)
+                .ok_or(NodeError::Configuration)?,
             mailbox_database: load_database_options(MAILBOX_DATABASE_URL_FILE_ENV)?,
             public_feed_database: load_database_options(PUBLIC_FEED_DATABASE_URL_FILE_ENV)?,
             indexer_database: load_database_options(INDEXER_DATABASE_URL_FILE_ENV)?,
@@ -201,6 +230,7 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+#[derive(Debug)]
 enum NodeError {
     Configuration,
     Database(&'static str),
@@ -221,9 +251,29 @@ impl std::fmt::Display for NodeError {
     }
 }
 
+impl std::error::Error for NodeError {}
+
+#[cfg(test)]
+#[path = "../../../crates/dtx-storage/tests/support/mod.rs"]
+mod test_support;
+
 #[cfg(test)]
 mod tests {
-    use super::is_graphic_value;
+    use std::{error::Error, sync::Arc};
+
+    use axum::{body::Body, http::Request};
+    use dtx_domain::SystemClock;
+    use dtx_group_node::{
+        GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE, GROUP_SERVICE_DESCRIPTOR_PATH,
+        group_router_with_state,
+    };
+    use ed25519_dalek::SigningKey;
+    use tower::ServiceExt;
+
+    use super::{
+        GroupPgStore, StatusCode, TenantId, configured_group_state, is_graphic_value,
+        test_support as support,
+    };
 
     #[test]
     fn graphic_config_values_reject_whitespace_and_bounds() {
@@ -231,5 +281,37 @@ mod tests {
         assert!(!is_graphic_value("https://node.example/ invalid", 256));
         assert!(!is_graphic_value("", 256));
         assert!(!is_graphic_value("toolong", 3));
+    }
+
+    #[tokio::test]
+    async fn configured_unified_group_route_serves_descriptor() -> Result<(), Box<dyn Error>> {
+        let harness = support::PostgresHarness::start().await?;
+        let store = GroupPgStore::connect(harness.group_runtime_options(), 1).await?;
+        let state = configured_group_state(
+            store,
+            TenantId::new(),
+            Arc::new(SystemClock),
+            SigningKey::from_bytes(&[73; 32]),
+            "https://node.example",
+            Vec::new(),
+        )?;
+        let response = group_router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(GROUP_SERVICE_DESCRIPTOR_PATH)
+                    .header("host", "attacker.invalid")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some(GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE)
+        );
+        Ok(())
     }
 }

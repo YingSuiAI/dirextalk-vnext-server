@@ -20,6 +20,7 @@ use dtx_wire::{Ed25519Signature, Sha256Digest, SigningPublicKey};
 use ed25519_dalek::{Signer, SigningKey};
 
 const OWNER: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+const CANDIDATE_IDENTITY_ORIGIN: &str = "https://candidate.example";
 
 fn request(value: &str) -> RequestId {
     RequestId::from_str(value).unwrap()
@@ -646,6 +647,7 @@ async fn confirmed_approved_device_waits_for_gm1_identity_finalize() -> Result<(
             tenant(),
             JoinRequestCommand::new(request_context),
             CandidateMembership::NotMember,
+            CANDIDATE_IDENTITY_ORIGIN,
             2_000,
         )
         .await?;

@@ -67,6 +67,23 @@ impl FederatedIdentityVerifier {
         })
     }
 
+    pub(crate) fn new_with_public_origin(
+        public_origin: &str,
+        allowed_http_origins: impl IntoIterator<Item = String>,
+    ) -> Result<(Self, String), FederatedIdentityError> {
+        let verifier = Self::new(allowed_http_origins)?;
+        let public_origin = canonical_origin(public_origin, true)?;
+        let canonical_public_origin = public_origin.origin().ascii_serialization();
+        if public_origin.scheme() == "http"
+            && !verifier
+                .allowed_http_origins
+                .contains(&canonical_public_origin)
+        {
+            return Err(FederatedIdentityError::InvalidOrigin);
+        }
+        Ok((verifier, canonical_public_origin))
+    }
+
     pub(crate) async fn active_device_signing_key(
         &self,
         origin: &str,
@@ -214,10 +231,6 @@ fn canonical_origin(value: &str, allow_http: bool) -> Result<Url, FederatedIdent
         return Err(FederatedIdentityError::InvalidOrigin);
     }
     Ok(parsed)
-}
-
-pub(crate) fn canonical_configured_origin(value: &str) -> Result<String, FederatedIdentityError> {
-    canonical_origin(value, true).map(|origin| origin.origin().ascii_serialization())
 }
 
 fn identity_log_page_url(

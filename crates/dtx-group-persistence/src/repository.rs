@@ -312,6 +312,7 @@ impl GroupMembershipRepository {
         tenant_id: TenantId,
         command: JoinRequestCommand,
         candidate_membership: CandidateMembership,
+        candidate_identity_origin: &str,
         now_ms: i64,
     ) -> Result<MembershipReceipt, GroupPersistenceError> {
         let mut session = store.begin(tenant_id).await?;
@@ -320,113 +321,18 @@ impl GroupMembershipRepository {
             tenant_id,
             command,
             candidate_membership,
+            candidate_identity_origin,
             now_ms,
         )
         .await;
         settle(session, result)
             .await
             .map(MembershipCommandExecution::receipt)
-    }
-
-    /// Records or exactly replays a candidate-authored join request after
-    /// revalidating the device session in the same group-storage transaction.
-    ///
-    /// This is the public-node path. Session validation happens before a
-    /// replay lookup so a revoked device cannot use a lost HTTP response to
-    /// read or mutate an old command receipt.
-    pub async fn request_join_authenticated(
-        self,
-        store: &GroupPgStore,
-        tenant_id: TenantId,
-        credential: &DeviceSessionCredential,
-        command: JoinRequestCommand,
-        candidate_membership: CandidateMembership,
-        now_ms: i64,
-    ) -> Result<MembershipReceipt, GroupPersistenceError> {
-        let (mut session, authenticated) =
-            begin_authenticated(store, tenant_id, credential, now_ms).await?;
-        let result = async {
-            ensure_authenticated_actor(authenticated, command.context())?;
-            request_join_in_transaction(
-                session.connection(),
-                tenant_id,
-                command,
-                candidate_membership,
-                now_ms,
-            )
-            .await
-        }
-        .await;
-        settle(session, result)
-            .await
-            .map(MembershipCommandExecution::receipt)
-    }
-
-    /// Records a join request after verifying a caller-supplied device action
-    /// proof with the signing key resolved in the same transaction as session
-    /// validation and receipt lookup.
-    pub async fn request_join_authenticated_with_proof<F>(
-        self,
-        store: &GroupPgStore,
-        tenant_id: TenantId,
-        credential: &DeviceSessionCredential,
-        command: JoinRequestCommand,
-        candidate_membership: CandidateMembership,
-        now_ms: i64,
-        verify_proof: F,
-    ) -> Result<MembershipReceipt, GroupPersistenceError>
-    where
-        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
-    {
-        self.request_join_authenticated_with_proof_outcome(
-            store,
-            tenant_id,
-            credential,
-            command,
-            candidate_membership,
-            now_ms,
-            verify_proof,
-        )
-        .await
-        .map(MembershipCommandExecution::receipt)
-    }
-
-    /// Records or exactly replays a proof-verified join request and reports
-    /// whether this invocation created the durable receipt.
-    pub async fn request_join_authenticated_with_proof_outcome<F>(
-        self,
-        store: &GroupPgStore,
-        tenant_id: TenantId,
-        credential: &DeviceSessionCredential,
-        command: JoinRequestCommand,
-        candidate_membership: CandidateMembership,
-        now_ms: i64,
-        verify_proof: F,
-    ) -> Result<MembershipCommandExecution, GroupPersistenceError>
-    where
-        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
-    {
-        let (mut session, authenticated) =
-            begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
-        let result = async {
-            ensure_authenticated_actor(authenticated.session(), command.context())?;
-            verify_proof(authenticated.signing_key())?;
-            request_join_in_transaction(
-                session.connection(),
-                tenant_id,
-                command,
-                candidate_membership,
-                now_ms,
-            )
-            .await
-        }
-        .await;
-        settle(session, result).await
     }
 
     /// Records a locally authenticated join and atomically binds the trusted
     /// public identity origin when this invocation creates the workflow.
-    pub async fn request_join_authenticated_with_origin_and_proof_outcome<F>(
+    pub async fn request_join_authenticated_with_proof_outcome<F>(
         self,
         store: &GroupPgStore,
         tenant_id: TenantId,
@@ -440,59 +346,17 @@ impl GroupMembershipRepository {
     where
         F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
     {
-        ensure_candidate_identity_origin(candidate_identity_origin)?;
         let (mut session, authenticated) =
             begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
         let result = async {
             ensure_authenticated_actor(authenticated.session(), command.context())?;
             verify_proof(authenticated.signing_key())?;
-            let context = command.context();
-            let execution = request_join_in_transaction(
-                session.connection(),
-                tenant_id,
-                command,
-                candidate_membership,
-                now_ms,
-            )
-            .await?;
-            persist_new_candidate_identity_origin(
-                session.connection(),
-                tenant_id,
-                context,
-                execution,
-                candidate_identity_origin,
-            )
-            .await?;
-            Ok(execution)
-        }
-        .await;
-        settle(session, result).await
-    }
-
-    /// Records or replays a remote-device join after the caller has validated
-    /// a current self-authenticated identity-log projection.
-    pub async fn request_join_verified_with_proof_outcome<F>(
-        self,
-        store: &GroupPgStore,
-        tenant_id: TenantId,
-        actor: VerifiedDeviceActor,
-        command: JoinRequestCommand,
-        candidate_membership: CandidateMembership,
-        now_ms: i64,
-        verify_proof: F,
-    ) -> Result<MembershipCommandExecution, GroupPersistenceError>
-    where
-        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
-    {
-        let mut session = store.begin(tenant_id).await?;
-        let result = async {
-            ensure_verified_actor(actor, command.context())?;
-            verify_proof(actor.signing_key())?;
             request_join_in_transaction(
                 session.connection(),
                 tenant_id,
                 command,
                 candidate_membership,
+                candidate_identity_origin,
                 now_ms,
             )
             .await
@@ -503,7 +367,7 @@ impl GroupMembershipRepository {
 
     /// Records a federated join and atomically binds the already verified
     /// identity-log origin when this invocation creates the workflow.
-    pub async fn request_join_verified_with_origin_and_proof_outcome<F>(
+    pub async fn request_join_verified_with_proof_outcome<F>(
         self,
         store: &GroupPgStore,
         tenant_id: TenantId,
@@ -517,29 +381,19 @@ impl GroupMembershipRepository {
     where
         F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
     {
-        ensure_candidate_identity_origin(candidate_identity_origin)?;
         let mut session = store.begin(tenant_id).await?;
         let result = async {
             ensure_verified_actor(actor, command.context())?;
             verify_proof(actor.signing_key())?;
-            let context = command.context();
-            let execution = request_join_in_transaction(
+            request_join_in_transaction(
                 session.connection(),
                 tenant_id,
                 command,
                 candidate_membership,
+                candidate_identity_origin,
                 now_ms,
             )
-            .await?;
-            persist_new_candidate_identity_origin(
-                session.connection(),
-                tenant_id,
-                context,
-                execution,
-                candidate_identity_origin,
-            )
-            .await?;
-            Ok(execution)
+            .await
         }
         .await;
         settle(session, result).await
@@ -1518,8 +1372,10 @@ async fn request_join_in_transaction(
     tenant_id: TenantId,
     command: JoinRequestCommand,
     candidate_membership: CandidateMembership,
+    candidate_identity_origin: &str,
     now_ms: i64,
 ) -> Result<MembershipCommandExecution, GroupPersistenceError> {
+    ensure_candidate_identity_origin(candidate_identity_origin)?;
     let context = command.context();
     let key = ScopeKey::from_scope(tenant_id, context.scope());
     let mut aggregate = load_aggregate(connection, key, true)
@@ -1584,10 +1440,19 @@ async fn request_join_in_transaction(
         now_ms,
     )
     .await?;
-    Ok(MembershipCommandExecution {
+    let execution = MembershipCommandExecution {
         receipt,
         replayed: false,
-    })
+    };
+    persist_new_candidate_identity_origin(
+        connection,
+        tenant_id,
+        context,
+        execution,
+        candidate_identity_origin,
+    )
+    .await?;
+    Ok(execution)
 }
 
 #[allow(clippy::large_types_passed_by_value)] // The command is consumed by the reducer; a database round trip dominates this small typed copy.
