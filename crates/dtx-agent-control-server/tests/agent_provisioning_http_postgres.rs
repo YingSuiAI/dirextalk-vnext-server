@@ -41,7 +41,7 @@ use dtx_connect_registry::{
 };
 use dtx_domain::{
     AgentDeviceId, AgentId, BindingId, BootId, Clock, ConnectorId, ConversationId, DeviceId,
-    DeviceSessionId, Ed25519PublicKey, HostCredentialId, HostId, IdGenerator, IdentityId,
+    DeviceSessionId, Ed25519PublicKey, EventId, HostCredentialId, HostId, IdGenerator, IdentityId,
     InstallationId, ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision,
     SystemClock, TenantId, UuidV7Generator,
 };
@@ -58,7 +58,7 @@ use dtx_security::{ConnectorMtlsClientVerifier, SecretBytes};
 use dtx_storage::PgStore;
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
-    UtcMillis, encode_deterministic_cbor,
+    UtcMillis, decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use rcgen::{
@@ -638,6 +638,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         .expect("current time fits i64")
     });
     let harness = PostgresHarness::start().await?;
+    grant_agent_route_run_runtime_access(&harness).await?;
     let store = harness.runtime_store(12).await?;
     let tenant_id = TenantId::new();
     provision_tenant(&store, tenant_id).await?;
@@ -762,6 +763,114 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
     .await?;
     assert_eq!(replay.0, StatusCode::OK);
     assert_eq!(replay.1, first.1);
+
+    // The AgentRoute is deliberately different from the source conversation.
+    // It is the only conversation ID copied into the durable Router Run, while
+    // the source remains in the owner/grant operation audit record.
+    let route_id = ConversationId::new();
+    let route_operation = RequestId::new();
+    let route_event_id = EventId::try_from(*route_operation.as_uuid())?;
+    let route_uri = format!("/v1/conversations/{conversation_id}/agent-routes/{route_id}/runs");
+    let route_proof_expires_at = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )? + 3_000;
+    let route_body = agent_route_run_body(
+        tenant_id,
+        conversation_id,
+        route_id,
+        installation_id,
+        route_event_id,
+        route_operation,
+        Revision::INITIAL,
+        owner_id,
+        owner_device_id,
+        &owner_device_key,
+        route_proof_expires_at,
+    )?;
+    let route_first = owner_agent_route_run(
+        router.clone(),
+        &route_uri,
+        &owner_authorization,
+        route_operation,
+        "\"g1\"",
+        route_body.clone(),
+    )
+    .await?;
+    assert_eq!(
+        route_first.0,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&route_first.1)
+    );
+    let route_receipt = decode_deterministic_cbor(&route_first.1)?;
+    let CanonicalValue::Map(route_receipt) = route_receipt else {
+        panic!("AgentRoute receipt must be a canonical map");
+    };
+    assert_eq!(route_receipt[2].1, text(conversation_id));
+    assert_eq!(route_receipt[3].1, text(route_id));
+    assert_eq!(route_receipt[6].1, text(route_operation));
+
+    // Replay still succeeds after the proof has expired, but a changed exact
+    // body with the same operation never creates another Run.
+    tokio::time::sleep(Duration::from_millis(3_100)).await;
+    let route_replay = owner_agent_route_run(
+        router.clone(),
+        &route_uri,
+        &owner_authorization,
+        route_operation,
+        "\"g1\"",
+        route_body,
+    )
+    .await?;
+    assert_eq!(route_replay.0, StatusCode::OK);
+    assert_eq!(route_replay.1, route_first.1);
+    let route_conflict = owner_agent_route_run(
+        router.clone(),
+        &route_uri,
+        &owner_authorization,
+        route_operation,
+        "\"g1\"",
+        agent_route_run_body(
+            tenant_id,
+            conversation_id,
+            route_id,
+            installation_id,
+            route_event_id,
+            route_operation,
+            Revision::INITIAL,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(route_conflict.0, StatusCode::CONFLICT);
+    let mut route_session = store.begin_tenant(tenant_id).await?;
+    let route_run_conversation: Uuid = sqlx::query_scalar(
+        "SELECT conversation_id FROM agent.agent_runs WHERE tenant_id=$1 AND request_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(route_operation))
+    .fetch_one(route_session.connection())
+    .await?;
+    assert_eq!(route_run_conversation, Uuid::from(route_id));
+    let operation_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.agent_route_run_operations
+          WHERE tenant_id=$1 AND operation_id=$2
+            AND source_conversation_id=$3 AND route_id=$4",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(route_operation))
+    .bind(Uuid::from(conversation_id))
+    .bind(Uuid::from(route_id))
+    .fetch_one(route_session.connection())
+    .await?;
+    assert_eq!(operation_count, 1);
+    route_session.rollback().await?;
 
     let changed_same_operation_body = conversation_grant_body(
         1,
@@ -943,6 +1052,34 @@ async fn owner_conversation_grant_mutation(
     ))
 }
 
+async fn owner_agent_route_run(
+    router: axum::Router,
+    uri: &str,
+    authorization: &str,
+    operation_id: RequestId,
+    if_match: &str,
+    body: Vec<u8>,
+) -> Result<(StatusCode, Vec<u8>), Box<dyn Error>> {
+    let response = router
+        .oneshot(
+            Request::post(uri)
+                .header(header::AUTHORIZATION, authorization)
+                .header("idempotency-key", operation_id.to_string())
+                .header(header::IF_MATCH, if_match)
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.dirextalk.agent-route-run.v1+cbor",
+                )
+                .body(Body::from(body))?,
+        )
+        .await?;
+    let status = response.status();
+    Ok((
+        status,
+        to_bytes(response.into_body(), 1_000_000).await?.to_vec(),
+    ))
+}
+
 async fn owner_get(
     router: axum::Router,
     uri: &str,
@@ -980,6 +1117,24 @@ async fn provision_tenant(store: &PgStore, tenant_id: TenantId) -> Result<(), Bo
         .execute(session.connection())
         .await?;
     session.commit().await?;
+    Ok(())
+}
+
+async fn grant_agent_route_run_runtime_access(
+    harness: &PostgresHarness,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::raw_sql(
+        "GRANT SELECT, INSERT, UPDATE ON agent.agent_runs TO dtx_runtime_test;
+         GRANT SELECT, INSERT ON agent.agent_run_candidates TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.connector_run_capacity_heads TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.binding_run_capacity_heads TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_run_offers TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_run_leases TO dtx_runtime_test;
+         GRANT EXECUTE ON FUNCTION agent.router_stable_names(text[]) TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_route_run_operations TO dtx_runtime_test;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
     Ok(())
 }
 
@@ -1321,6 +1476,45 @@ fn conversation_grant_body(
         binding,
         b"dirextalk.conversation-agent-grant-binding.v1\0",
         b"dirextalk.conversation-agent-grant-signature.v1\0",
+        owner_key,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_route_run_body(
+    tenant_id: TenantId,
+    source_conversation_id: ConversationId,
+    route_id: ConversationId,
+    installation_id: InstallationId,
+    request_event_id: EventId,
+    operation_id: RequestId,
+    grant_version: Revision,
+    owner_id: IdentityId,
+    owner_device_id: DeviceId,
+    owner_key: &SigningKey,
+    proof_expires_at: i64,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let binding = CanonicalValue::Map(vec![
+        (u(1), u(1)),
+        (u(2), text(tenant_id)),
+        (u(3), text(source_conversation_id)),
+        (u(4), text(route_id)),
+        (u(5), text(installation_id)),
+        (u(6), text(request_event_id)),
+        (u(7), text(operation_id)),
+        (u(8), u(grant_version.get())),
+        (u(9), text(owner_id)),
+        (u(10), text(owner_device_id)),
+        (
+            u(11),
+            UtcMillis::new(proof_expires_at)?.to_canonical_value(),
+        ),
+    ]);
+    signed_owner_body(
+        binding,
+        b"dirextalk.agent-route-run-binding.v1\0",
+        b"dirextalk.agent-route-run-signature.v1\0",
         owner_key,
         None,
     )

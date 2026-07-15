@@ -637,8 +637,10 @@ impl ValidatedNewRunAuthority {
 async fn validate_new_run_authority(
     connection: &mut sqlx::PgConnection,
     request: &CreateAgentRunRequest,
+    grant_conversation_id: ConversationId,
     bindings: &BindingSet,
     clock: &dyn Clock,
+    require_single_binding: bool,
 ) -> Result<ValidatedNewRunAuthority, ConnectorControlApplicationError> {
     let installation = AgentInstallationRepository::new()
         .load(connection, request.tenant_id, request.installation_id)
@@ -651,20 +653,33 @@ async fn validate_new_run_authority(
         .load_for_share(
             connection,
             request.tenant_id,
-            request.conversation_id,
+            grant_conversation_id,
             request.installation_id,
         )
         .await
         .map_err(persistence_error)?
         .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
     let binding_snapshot = bindings.snapshot();
-    let device_ids = binding_snapshot
+    let enabled_bindings = binding_snapshot
         .bindings
         .iter()
         .filter(|binding| {
             binding.installation_id == request.installation_id
                 && binding.state == BindingState::Enabled
         })
+        .collect::<Vec<_>>();
+    if enabled_bindings.is_empty() || enabled_bindings.len() > MAX_ROUTE_CANDIDATES {
+        return Err(ConnectorControlApplicationError::InvalidRequest);
+    }
+    // The first isolated AgentRoute ingress intentionally has no binding picker
+    // in its signed control metadata.  Requiring exactly one enabled Binding
+    // makes the data-plane Agent device unambiguous rather than silently
+    // selecting an unrelated Connector for a route MLS event.
+    if require_single_binding && enabled_bindings.len() != 1 {
+        return Err(ConnectorControlApplicationError::InvalidRequest);
+    }
+    let device_ids = enabled_bindings
+        .into_iter()
         .map(|binding| binding.agent_device_id)
         .collect::<BTreeSet<_>>();
     if device_ids.is_empty() || device_ids.len() > MAX_ROUTE_CANDIDATES {
@@ -830,16 +845,56 @@ impl PostgresConnectorControlApplication {
         &self,
         request: CreateAgentRunRequest,
     ) -> Result<CreatedAgentRun, ConnectorControlApplicationError> {
-        let repository = AgentRunRepository::new();
+        let tenant_id = request.tenant_id;
+        let grant_conversation_id = request.conversation_id;
         let mut session = self
             .store
-            .begin_tenant(request.tenant_id)
+            .begin_tenant(tenant_id)
             .await
             .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let CreatedAgentRun { inserted, run } = self
+            .create_agent_run_in_transaction(
+                session.connection(),
+                request,
+                grant_conversation_id,
+                false,
+            )
+            .await?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        // The durable Run commit is intentionally complete before best-effort
+        // routing. A transient routing/deadlock failure can make this response
+        // retry, but can never roll the caller's accepted Run back out of storage.
+        let run = if run.state() == RunRoutingState::Queued {
+            self.offer_agent_run(tenant_id, run.request().run_id())
+                .await?
+        } else {
+            run
+        };
+        Ok(CreatedAgentRun { inserted, run })
+    }
 
+    /// Creates one Run inside a caller-owned tenant transaction without
+    /// publishing an offer.  The normal legacy ingress authorizes the Grant
+    /// against the Run conversation itself; the private AgentRoute ingress
+    /// supplies a distinct source conversation while retaining the route ID in
+    /// the Run for the MLS data plane.
+    ///
+    /// The caller must persist its source-to-route authorization receipt in the
+    /// same transaction and call [`Self::offer_agent_run`] only after commit.
+    pub(crate) async fn create_agent_run_in_transaction(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        request: CreateAgentRunRequest,
+        grant_conversation_id: ConversationId,
+        require_single_binding: bool,
+    ) -> Result<CreatedAgentRun, ConnectorControlApplicationError> {
+        let repository = AgentRunRepository::new();
         let (disposition, run, authority) = if let Some(existing) = repository
             .load_by_identity(
-                session.connection(),
+                connection,
                 request.tenant_id,
                 request.request_id,
                 request.idempotency_digest,
@@ -853,14 +908,16 @@ impl PostgresConnectorControlApplication {
             (AgentRunCreate::Existing, existing, None)
         } else {
             let bindings = BindingSetRepository::new()
-                .load(session.connection(), request.tenant_id)
+                .load(connection, request.tenant_id)
                 .await
                 .map_err(persistence_error)?;
             let authority = validate_new_run_authority(
-                session.connection(),
+                connection,
                 &request,
+                grant_conversation_id,
                 &bindings,
                 self.clock.as_ref(),
+                require_single_binding,
             )
             .await?;
             let run = build_agent_run(
@@ -871,7 +928,7 @@ impl PostgresConnectorControlApplication {
                 authority.evaluated_at_millis,
             )?;
             let (disposition, persisted) = repository
-                .create(session.connection(), &run)
+                .create(connection, &run)
                 .await
                 .map_err(persistence_error)?;
             (disposition, persisted, Some(authority))
@@ -880,19 +937,6 @@ impl PostgresConnectorControlApplication {
         if let Some(authority) = authority {
             authority.ensure_commit_time(self.now()?)?;
         }
-        session
-            .commit()
-            .await
-            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
-        // The durable Run commit is intentionally complete before best-effort
-        // routing. A transient routing/deadlock failure can make this response
-        // retry, but can never roll the caller's accepted Run back out of storage.
-        let run = if run.state() == RunRoutingState::Queued {
-            self.offer_agent_run(request.tenant_id, run.request().run_id())
-                .await?
-        } else {
-            run
-        };
         Ok(CreatedAgentRun {
             inserted: disposition == AgentRunCreate::Inserted,
             run,

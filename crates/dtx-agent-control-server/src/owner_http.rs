@@ -25,10 +25,11 @@ use dtx_agent_registry::{
     ConversationGrantCommand, ConversationGrantUpdate, DeviceCredentialFingerprint,
     PrivacyPolicyDigest, TriggerPolicy,
 };
+use dtx_agent_router::DispatchMode;
 use dtx_domain::{
     AgentDeviceId, ApprovalId, BindingId, ConnectorId, ConversationId, DeviceId, DeviceSessionId,
-    GrantId, IdentityId, InstallationId, ProvisioningDeliveryId, ProvisioningRecipientKeyId,
-    RequestId, Revision, TenantId,
+    EventId, GrantId, IdentityId, InstallationId, ProvisioningDeliveryId,
+    ProvisioningRecipientKeyId, RequestId, Revision, RunId, TenantId,
 };
 use dtx_identity_persistence::{DeviceSessionCredential, DeviceSessionRepository};
 use dtx_storage::PgStore;
@@ -52,10 +53,10 @@ use crate::{
     AgentIdentityProvisioningError, AgentProvisioningDeliveryCommand,
     AgentProvisioningDeliveryReceipt, AgentProvisioningRevocationCommand,
     AgentProvisioningRevocationReceipt, ConnectorCommandFence, ConnectorControlApplicationError,
-    ConnectorLifecycleAction, ConnectorLifecycleCommandWrite, PostgresConnectorControlApplication,
-    ProtobufDurableCommandDecoder, approve_agent_identity, create_agent_provisioning_delivery,
-    get_agent_identity_approval, get_agent_provisioning_delivery, get_agent_provisioning_target,
-    revoke_agent_provisioning,
+    ConnectorLifecycleAction, ConnectorLifecycleCommandWrite, CreateAgentRunRequest,
+    PostgresConnectorControlApplication, ProtobufDurableCommandDecoder, approve_agent_identity,
+    create_agent_provisioning_delivery, get_agent_identity_approval,
+    get_agent_provisioning_delivery, get_agent_provisioning_target, revoke_agent_provisioning,
 };
 
 const DEVICE_SESSION_SCHEME: &str = "DTX-Device-Session";
@@ -68,6 +69,11 @@ const CONVERSATION_GRANT_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.conversation-agent-grant-signature.v1\0";
 const CONVERSATION_GRANT_REQUEST_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-request.v1\0";
 const CONVERSATION_GRANT_RECEIPT_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-receipt.v1\0";
+const AGENT_ROUTE_RUN_BINDING_DOMAIN: &[u8] = b"dirextalk.agent-route-run-binding.v1\0";
+const AGENT_ROUTE_RUN_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.agent-route-run-signature.v1\0";
+const AGENT_ROUTE_RUN_REQUEST_DOMAIN: &[u8] = b"dirextalk.agent-route-run-request.v1\0";
+const AGENT_ROUTE_RUN_IDEMPOTENCY_DOMAIN: &[u8] = b"dirextalk.agent-route-run-idempotency.v1\0";
+const AGENT_ROUTE_RUN_RECEIPT_DOMAIN: &[u8] = b"dirextalk.agent-route-run-receipt.v1\0";
 const MAX_SMALL_BODY: usize = 16 * 1024;
 const MAX_DELIVERY_BODY: usize = 212_992;
 const MAX_GRANT_PROOF_LIFETIME_MS: i64 = 10 * 60 * 1000;
@@ -77,6 +83,9 @@ const CONVERSATION_GRANT_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.conversation-agent-grant.v1+cbor";
 const CONVERSATION_GRANT_RECEIPT_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.conversation-agent-grant-receipt.v1+cbor";
+const AGENT_ROUTE_RUN_MEDIA_TYPE_V1: &str = "application/vnd.dirextalk.agent-route-run.v1+cbor";
+const AGENT_ROUTE_RUN_RECEIPT_MEDIA_TYPE_V1: &str =
+    "application/vnd.dirextalk.agent-route-run-receipt.v1+cbor";
 
 pub type OwnerBackendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CborOwnerReply, AgentProvisioningOwnerError>> + Send + 'a>>;
@@ -165,6 +174,28 @@ pub struct ConversationGrantOwnerCommand {
     pub owner_signature: Ed25519Signature,
 }
 
+/// Device-signed metadata-only ingress for one isolated AgentRoute Run.
+///
+/// `source_conversation_id` is used solely for Owner/grant authorization and
+/// audit.  `route_id` is intentionally distinct and becomes the Router Run's
+/// conversation identifier so the Agent data plane can resolve only the
+/// isolated MLS route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRouteRunOwnerCommand {
+    pub tenant_id: TenantId,
+    pub source_conversation_id: ConversationId,
+    pub route_id: ConversationId,
+    pub installation_id: InstallationId,
+    pub request_event_id: EventId,
+    pub operation_id: RequestId,
+    pub grant_version: Revision,
+    pub owner_identity_id: IdentityId,
+    pub owner_device_id: DeviceId,
+    pub proof_expires_at: UtcMillis,
+    pub binding_digest: Sha256Digest,
+    pub owner_signature: Ed25519Signature,
+}
+
 /// Durable application interface. Parsing and stable HTTP errors stay independent of `PostgreSQL`.
 pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
     fn list_connectors(
@@ -193,6 +224,13 @@ pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
         &self,
         credential: DeviceSessionCredential,
         command: ConversationGrantOwnerCommand,
+        exact_body: Vec<u8>,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_>;
+    fn create_agent_route_run(
+        &self,
+        credential: DeviceSessionCredential,
+        command: AgentRouteRunOwnerCommand,
         exact_body: Vec<u8>,
         now: UtcMillis,
     ) -> OwnerBackendFuture<'_>;
@@ -416,6 +454,38 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                     StatusCode::OK
                 },
                 content_type: CONVERSATION_GRANT_RECEIPT_MEDIA_TYPE_V1,
+                exact_cbor: receipt.exact_cbor,
+            })
+        })
+    }
+
+    fn create_agent_route_run(
+        &self,
+        credential: DeviceSessionCredential,
+        command: AgentRouteRunOwnerCommand,
+        exact_body: Vec<u8>,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            if command.tenant_id != self.tenant_id {
+                return Err(AgentProvisioningOwnerError::AccessDenied);
+            }
+            let receipt = create_private_agent_route_run(
+                &self.store,
+                self.connector_control.as_ref(),
+                &credential,
+                command,
+                exact_body,
+                now,
+            )
+            .await?;
+            Ok(CborOwnerReply {
+                status: if receipt.replayed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                },
+                content_type: AGENT_ROUTE_RUN_RECEIPT_MEDIA_TYPE_V1,
                 exact_cbor: receipt.exact_cbor,
             })
         })
@@ -796,6 +866,378 @@ struct ConversationGrantOwnerReceipt {
     replayed: bool,
     action: ConversationGrantOwnerAction,
     exact_cbor: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AgentRouteRunOwnerReceipt {
+    replayed: bool,
+    run_id: RunId,
+    exact_cbor: Vec<u8>,
+}
+
+async fn create_private_agent_route_run(
+    store: &PgStore,
+    connector_control: &PostgresConnectorControlApplication,
+    credential: &DeviceSessionCredential,
+    command: AgentRouteRunOwnerCommand,
+    exact_body: Vec<u8>,
+    authenticated_at: UtcMillis,
+) -> Result<AgentRouteRunOwnerReceipt, AgentProvisioningOwnerError> {
+    let request_digest = Sha256Digest::hash_domain(AGENT_ROUTE_RUN_REQUEST_DOMAIN, &exact_body);
+    let mut session = store
+        .begin_tenant(command.tenant_id)
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let result = create_private_agent_route_run_in_transaction(
+        session.connection(),
+        connector_control,
+        credential,
+        &command,
+        request_digest,
+        authenticated_at,
+    )
+    .await;
+    let receipt = match result {
+        Ok(receipt) => {
+            session
+                .commit()
+                .await
+                .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+            receipt
+        }
+        Err(error) => {
+            let _ = session.rollback().await;
+            return Err(error);
+        }
+    };
+    // The receipt/run relation committed before this best-effort offer.  A
+    // response loss or transient Router error can only retry the exact route
+    // operation; it cannot recreate the AgentRequest or alter its source
+    // authorization facts.
+    connector_control
+        .offer_agent_run(command.tenant_id, receipt.run_id)
+        .await
+        .map_err(map_connector_control_error)?;
+    Ok(receipt)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_private_agent_route_run_in_transaction(
+    connection: &mut sqlx::PgConnection,
+    connector_control: &PostgresConnectorControlApplication,
+    credential: &DeviceSessionCredential,
+    command: &AgentRouteRunOwnerCommand,
+    request_digest: Sha256Digest,
+    authenticated_at: UtcMillis,
+) -> Result<AgentRouteRunOwnerReceipt, AgentProvisioningOwnerError> {
+    let owner = DeviceSessionRepository::authenticate_with_signing_key_in_transaction(
+        connection,
+        credential,
+        authenticated_at,
+    )
+    .await
+    .map_err(map_conversation_grant_identity_error)?;
+    let owner_session = owner.session();
+    if owner_session.identity_id() != command.owner_identity_id
+        || owner_session.device_id() != command.owner_device_id
+    {
+        return Err(AgentProvisioningOwnerError::AccessDenied);
+    }
+    let signature = Signature::from_bytes(command.owner_signature.as_bytes());
+    let verifying_key = VerifyingKey::from_bytes(owner.signing_key().as_bytes())
+        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+    verifying_key
+        .verify_strict(
+            &agent_route_run_signature_input(command.binding_digest),
+            &signature,
+        )
+        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(agent_route_run_lock_key(*command.operation_id.as_uuid()))
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(agent_route_run_lock_key(*command.route_id.as_uuid()))
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if let Some(receipt) =
+        load_agent_route_run_operation(connection, command, request_digest).await?
+    {
+        return Ok(receipt);
+    }
+    ensure_agent_route_owner_binding(connection, command).await?;
+
+    let is_owner: bool =
+        sqlx::query_scalar("SELECT groups.private_conversation_owner_authorized($1, $2, $3)")
+            .bind(Uuid::from(command.tenant_id))
+            .bind(Uuid::from(command.source_conversation_id))
+            .bind(owner_session.identity_id().to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if !is_owner {
+        return Err(AgentProvisioningOwnerError::AccessDenied);
+    }
+    let installation = AgentInstallationRepository::new()
+        .load(connection, command.tenant_id, command.installation_id)
+        .await
+        .map_err(map_conversation_grant_persistence_error)?
+        .ok_or(AgentProvisioningOwnerError::NotFound)?;
+    if installation.owner_id() != owner_session.identity_id() {
+        return Err(AgentProvisioningOwnerError::AccessDenied);
+    }
+
+    // Check freshness only after the exact durable replay lookup.  A response
+    // lost after commit must recover the original receipt even when its proof
+    // has subsequently expired; a new operation never gets that exception.
+    validate_agent_route_run_command(command, now()?)?;
+    let idempotency_digest = Sha256Digest::hash_domain(
+        AGENT_ROUTE_RUN_IDEMPOTENCY_DOMAIN,
+        command.operation_id.as_uuid().as_bytes(),
+    );
+    let create = CreateAgentRunRequest::new(
+        command.tenant_id,
+        command.operation_id,
+        *idempotency_digest.as_bytes(),
+        *request_digest.as_bytes(),
+        command.installation_id,
+        command.route_id,
+        command.request_event_id,
+        None,
+        vec!["chat.streaming".to_owned()],
+        DispatchMode::Single,
+        command.grant_version.get(),
+        None,
+    )
+    .map_err(map_connector_control_error)?;
+    let created = connector_control
+        .create_agent_run_in_transaction(connection, create, command.source_conversation_id, true)
+        .await
+        .map_err(map_connector_control_error)?;
+    let committed_at = now()?;
+    validate_agent_route_run_command(command, committed_at)?;
+    let receipt_bytes = agent_route_run_receipt_cbor(
+        command,
+        created.run_id(),
+        owner_session.device_id(),
+        committed_at,
+    )?;
+    let receipt_digest = Sha256Digest::hash_domain(AGENT_ROUTE_RUN_RECEIPT_DOMAIN, &receipt_bytes);
+    sqlx::query(
+        "INSERT INTO agent.agent_route_run_operations (
+             tenant_id, operation_id, run_id, source_conversation_id, route_id, installation_id,
+             request_event_id, grant_version, owner_identity_id, owner_device_id, owner_session_id,
+             request_digest, receipt_bytes, receipt_digest, committed_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.operation_id))
+    .bind(Uuid::from(created.run_id()))
+    .bind(Uuid::from(command.source_conversation_id))
+    .bind(Uuid::from(command.route_id))
+    .bind(Uuid::from(command.installation_id))
+    .bind(Uuid::from(command.request_event_id))
+    .bind(
+        i64::try_from(command.grant_version.get())
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+    )
+    .bind(owner_session.identity_id().to_string())
+    .bind(Uuid::from(owner_session.device_id()))
+    .bind(Uuid::from(owner_session.session_id()))
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(&receipt_bytes)
+    .bind(receipt_digest.as_bytes().as_slice())
+    .bind(committed_at.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_agent_route_run_operation_insert_error)?;
+    Ok(AgentRouteRunOwnerReceipt {
+        replayed: false,
+        run_id: created.run_id(),
+        exact_cbor: receipt_bytes,
+    })
+}
+
+async fn ensure_agent_route_owner_binding(
+    connection: &mut sqlx::PgConnection,
+    command: &AgentRouteRunOwnerCommand,
+) -> Result<(), AgentProvisioningOwnerError> {
+    let row = sqlx::query(
+        "SELECT installation_id, owner_identity_id
+           FROM agent.agent_route_run_operations
+          WHERE tenant_id=$1 AND route_id=$2
+          ORDER BY committed_at_ms, operation_id
+          LIMIT 1 FOR SHARE",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.route_id))
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let installation_id: Uuid = row
+        .try_get("installation_id")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let owner_identity_id: String = row
+        .try_get("owner_identity_id")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if installation_id != Uuid::from(command.installation_id)
+        || owner_identity_id != command.owner_identity_id.to_string()
+    {
+        return Err(AgentProvisioningOwnerError::Conflict);
+    }
+    Ok(())
+}
+
+async fn load_agent_route_run_operation(
+    connection: &mut sqlx::PgConnection,
+    command: &AgentRouteRunOwnerCommand,
+    request_digest: Sha256Digest,
+) -> Result<Option<AgentRouteRunOwnerReceipt>, AgentProvisioningOwnerError> {
+    let rows = sqlx::query(
+        "SELECT operation_id, run_id, request_digest, receipt_bytes, receipt_digest
+           FROM agent.agent_route_run_operations
+          WHERE tenant_id=$1
+            AND (operation_id=$2 OR (route_id=$3 AND request_event_id=$4))
+          FOR UPDATE",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.operation_id))
+    .bind(Uuid::from(command.route_id))
+    .bind(Uuid::from(command.request_event_id))
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if rows.len() > 1 {
+        return Err(AgentProvisioningOwnerError::TemporarilyUnavailable);
+    }
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let operation_id: Uuid = row
+        .try_get("operation_id")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let stored_request_digest: Vec<u8> = row
+        .try_get("request_digest")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if operation_id != Uuid::from(command.operation_id)
+        || stored_request_digest.as_slice() != request_digest.as_bytes()
+    {
+        return Err(AgentProvisioningOwnerError::Conflict);
+    }
+    let exact_cbor: Vec<u8> = row
+        .try_get("receipt_bytes")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let stored_digest: [u8; 32] = row
+        .try_get::<Vec<u8>, _>("receipt_digest")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?
+        .try_into()
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if *Sha256Digest::hash_domain(AGENT_ROUTE_RUN_RECEIPT_DOMAIN, &exact_cbor).as_bytes()
+        != stored_digest
+        || decode_deterministic_cbor(&exact_cbor).is_err()
+    {
+        return Err(AgentProvisioningOwnerError::TemporarilyUnavailable);
+    }
+    let run_id = RunId::try_from(
+        row.try_get::<Uuid, _>("run_id")
+            .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?,
+    )
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    Ok(Some(AgentRouteRunOwnerReceipt {
+        replayed: true,
+        run_id,
+        exact_cbor,
+    }))
+}
+
+fn validate_agent_route_run_command(
+    command: &AgentRouteRunOwnerCommand,
+    now: UtcMillis,
+) -> Result<(), AgentProvisioningOwnerError> {
+    if command.source_conversation_id == command.route_id
+        || command.request_event_id.as_uuid() != command.operation_id.as_uuid()
+        || command.proof_expires_at.get() <= now.get()
+        || command.proof_expires_at.get() > now.get().saturating_add(MAX_GRANT_PROOF_LIFETIME_MS)
+    {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn agent_route_run_receipt_cbor(
+    command: &AgentRouteRunOwnerCommand,
+    run_id: RunId,
+    owner_device_id: DeviceId,
+    committed_at: UtcMillis,
+) -> Result<Vec<u8>, AgentProvisioningOwnerError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(command.tenant_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(command.source_conversation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(command.route_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(command.installation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Text(command.request_event_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Text(command.operation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Text(run_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Unsigned(command.grant_version.get()),
+        ),
+        (
+            CanonicalValue::Unsigned(10),
+            CanonicalValue::Text(owner_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(11),
+            committed_at.to_canonical_value(),
+        ),
+    ]))
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
+}
+
+fn agent_route_run_lock_key(id: Uuid) -> i64 {
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&id.as_bytes()[..8]);
+    i64::from_be_bytes(prefix) ^ i64::MIN
+}
+
+fn map_agent_route_run_operation_insert_error(error: sqlx::Error) -> AgentProvisioningOwnerError {
+    if error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .is_some_and(|code| code == "23505")
+    {
+        AgentProvisioningOwnerError::Conflict
+    } else {
+        AgentProvisioningOwnerError::TemporarilyUnavailable
+    }
 }
 
 async fn mutate_private_conversation_grant(
@@ -1242,6 +1684,12 @@ fn conversation_grant_signature_input(binding_digest: Sha256Digest) -> Vec<u8> {
     input
 }
 
+fn agent_route_run_signature_input(binding_digest: Sha256Digest) -> Vec<u8> {
+    let mut input = AGENT_ROUTE_RUN_SIGNATURE_DOMAIN.to_vec();
+    input.extend_from_slice(binding_digest.as_bytes());
+    input
+}
+
 const fn conversation_grant_action_code(action: ConversationGrantOwnerAction) -> &'static str {
     match action {
         ConversationGrantOwnerAction::Grant => "grant",
@@ -1376,6 +1824,10 @@ pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBa
         .route(
             "/v1/conversations/{conversation_id}/agent-grants/{installation_id}",
             put(put_conversation_grant).delete(delete_conversation_grant),
+        )
+        .route(
+            "/v1/conversations/{source_conversation_id}/agent-routes/{route_id}/runs",
+            post(post_agent_route_run),
         )
         .route(
             "/v1/agent-installations/{installation_id}/identity-approvals",
@@ -1572,6 +2024,41 @@ async fn mutate_conversation_grant(
         }
         backend
             .mutate_conversation_grant(credential, command, body.to_vec(), now()?)
+            .await
+    }
+    .await;
+    owner_response(result)
+}
+
+async fn post_agent_route_run(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path((source_conversation_id, route_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let result = async {
+        require_content_type(&headers, AGENT_ROUTE_RUN_MEDIA_TYPE_V1)?;
+        bounded(&body, MAX_SMALL_BODY)?;
+        let credential = parse_device_session(&headers)?;
+        let operation_id = parse_agent_route_run_operation(&headers)?;
+        let grant_version = parse_agent_route_run_fence(&headers)?;
+        let source_conversation_id = source_conversation_id
+            .parse::<ConversationId>()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        let route_id = route_id
+            .parse::<ConversationId>()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        let command = parse_agent_route_run(&body)?;
+        if source_conversation_id == route_id
+            || command.operation_id != operation_id
+            || command.grant_version != grant_version
+            || command.source_conversation_id != source_conversation_id
+            || command.route_id != route_id
+        {
+            return Err(AgentProvisioningOwnerError::InvalidRequest);
+        }
+        backend
+            .create_agent_route_run(credential, command, body.to_vec(), now()?)
             .await
     }
     .await;
@@ -1995,6 +2482,45 @@ fn parse_conversation_grant(
     })
 }
 
+fn parse_agent_route_run(
+    body: &[u8],
+) -> Result<AgentRouteRunOwnerCommand, AgentProvisioningOwnerError> {
+    let request = exact_map(
+        decode_deterministic_cbor(body).map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+        3,
+    )?;
+    let binding = map_value(&request, 1)?.clone();
+    let fields = exact_map(binding.clone(), 11)?;
+    expect_version(&fields)?;
+    let supplied = digest(map_value(&request, 2)?)?;
+    if supplied != binding_hash(AGENT_ROUTE_RUN_BINDING_DOMAIN, &binding)? {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let source_conversation_id = text_id(&fields, 3)?;
+    let route_id = text_id(&fields, 4)?;
+    if source_conversation_id == route_id {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let command = AgentRouteRunOwnerCommand {
+        tenant_id: text_id(&fields, 2)?,
+        source_conversation_id,
+        route_id,
+        installation_id: text_id(&fields, 5)?,
+        request_event_id: text_id(&fields, 6)?,
+        operation_id: text_id(&fields, 7)?,
+        grant_version: revision(&fields, 8)?,
+        owner_identity_id: text_id(&fields, 9)?,
+        owner_device_id: text_id(&fields, 10)?,
+        proof_expires_at: utc(&fields, 11)?,
+        binding_digest: supplied,
+        owner_signature: Ed25519Signature::from_bytes(bytes_array(map_value(&request, 3)?)?),
+    };
+    if command.request_event_id.as_uuid() != command.operation_id.as_uuid() {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    Ok(command)
+}
+
 type Fields = Vec<(CanonicalValue, CanonicalValue)>;
 fn exact_map(value: CanonicalValue, count: usize) -> Result<Fields, AgentProvisioningOwnerError> {
     let CanonicalValue::Map(fields) = value else {
@@ -2205,6 +2731,12 @@ fn parse_conversation_grant_operation(
         .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)
 }
 
+fn parse_agent_route_run_operation(
+    headers: &HeaderMap,
+) -> Result<RequestId, AgentProvisioningOwnerError> {
+    parse_conversation_grant_operation(headers)
+}
+
 fn parse_conversation_grant_fence(
     headers: &HeaderMap,
 ) -> Result<Option<Revision>, AgentProvisioningOwnerError> {
@@ -2235,6 +2767,12 @@ fn parse_conversation_grant_fence(
         .and_then(|value| Revision::new(value).ok())
         .map(Some)
         .ok_or(AgentProvisioningOwnerError::InvalidRequest)
+}
+
+fn parse_agent_route_run_fence(
+    headers: &HeaderMap,
+) -> Result<Revision, AgentProvisioningOwnerError> {
+    parse_conversation_grant_fence(headers)?.ok_or(AgentProvisioningOwnerError::InvalidRequest)
 }
 
 fn parse_connector_lifecycle_fence(

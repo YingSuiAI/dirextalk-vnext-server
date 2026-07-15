@@ -67,9 +67,9 @@ pub use incoming::{
     MAX_CONCURRENT_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT, connector_tls_incoming, tls_incoming,
 };
 pub use owner_http::{
-    AgentProvisioningOwnerBackend, AgentProvisioningOwnerError, CborOwnerReply,
-    ConnectorLifecycleOwnerCommand, DeliveryOwnerCommand, PostgresAgentProvisioningOwnerBackend,
-    RevocationOwnerCommand, agent_provisioning_owner_router,
+    AgentProvisioningOwnerBackend, AgentProvisioningOwnerError, AgentRouteRunOwnerCommand,
+    CborOwnerReply, ConnectorLifecycleOwnerCommand, DeliveryOwnerCommand,
+    PostgresAgentProvisioningOwnerBackend, RevocationOwnerCommand, agent_provisioning_owner_router,
 };
 pub use postgres_application::{
     AgentRunReconcileBatch, ApplyConnectorConfigurationRequest, CancelAgentRunRequest,
