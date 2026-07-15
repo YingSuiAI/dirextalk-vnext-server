@@ -1152,6 +1152,48 @@ impl GroupPolicy {
         Ok(reservation)
     }
 
+    /// Revalidates the Owner/Admin term that authorized a durable reservation
+    /// immediately before an external membership submit.
+    ///
+    /// A reservation intentionally survives ordinary invite expiry or invite
+    /// revocation once it has reserved capacity. It must not, however, let an
+    /// administrator submit after that administrator has been revoked (or
+    /// revoked and later re-granted under a different authorization generation).
+    /// Callers must reject the never-dispatched local intent rather than issue
+    /// an external submit when this returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the reservation is absent or its stored
+    /// Owner/Admin authority is no longer current.
+    pub fn validate_reserved_join_authority(
+        &self,
+        request_id: JoinRequestId,
+    ) -> Result<(), GroupPolicyError> {
+        let reservation = self
+            .reserved_joins
+            .get(&request_id)
+            .copied()
+            .ok_or(GroupPolicyError::ReservedJoinNotFound)?;
+        let still_authorized = match reservation.reserved_authority {
+            InviteIssuerAuthority::Owner => reservation.reserved_by == self.owner_id,
+            InviteIssuerAuthority::Admin {
+                authorization_generation,
+            } => {
+                self.administrators.contains(&reservation.reserved_by)
+                    && self
+                        .administrator_authorization_generations
+                        .get(&reservation.reserved_by)
+                        .is_some_and(|current| *current == authorization_generation)
+            }
+        };
+        if still_authorized {
+            Ok(())
+        } else {
+            Err(GroupPolicyError::InviteIssuerNoLongerAuthorized)
+        }
+    }
+
     /// Finalizes a verified remote membership commit without rechecking invite expiry.
     ///
     /// The caller must validate the remote commit's exact command, candidate,

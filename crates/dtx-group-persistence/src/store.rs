@@ -28,7 +28,8 @@ impl GroupPgStore {
     ///
     /// The database operator provisions the `dtx_group_runtime` membership.
     /// The supplied authenticated tenant is bound transaction-locally for every
-    /// operation; this role remains isolated from identity and other services.
+    /// operation. The role can additionally read only the identity projection
+    /// required to authenticate a device session in this same transaction.
     ///
     /// # Errors
     ///
@@ -150,6 +151,22 @@ async fn validate_group_runtime_role(pool: &PgPool) -> Result<(), GroupPersisten
     if !can_execute_tenant_boundary {
         return Err(GroupPersistenceError::RuntimeRoleUnauthorized);
     }
+    let can_read_identity_session_projection: bool = sqlx::query_scalar(
+        r"SELECT has_schema_privilege(current_user, 'identity', 'USAGE')
+             AND has_function_privilege(
+                 current_user,
+                 'identity.identity_group_reader_authorized()'::regprocedure,
+                 'EXECUTE'
+             )
+             AND has_table_privilege(current_user, 'identity.device_sessions', 'SELECT')
+             AND has_table_privilege(current_user, 'identity.log_heads', 'SELECT')
+             AND has_table_privilege(current_user, 'identity.log_entries', 'SELECT')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !can_read_identity_session_projection {
+        return Err(GroupPersistenceError::RuntimeRoleUnauthorized);
+    }
     let authorized: bool = sqlx::query_scalar(
         r"SELECT groups.group_runtime_authorized()
              AND has_schema_privilege(current_user, 'groups', 'USAGE')
@@ -174,7 +191,9 @@ async fn validate_group_runtime_role(pool: &PgPool) -> Result<(), GroupPersisten
              AND has_table_privilege(current_user, 'groups.membership_workflows', 'UPDATE')
              AND has_table_privilege(current_user, 'groups.sequencer_outbox', 'SELECT')
              AND has_table_privilege(current_user, 'groups.sequencer_outbox', 'INSERT')
-             AND has_table_privilege(current_user, 'groups.sequencer_outbox', 'UPDATE')",
+             AND has_table_privilege(current_user, 'groups.sequencer_outbox', 'UPDATE')
+             AND has_table_privilege(current_user, 'groups.control_commands', 'SELECT')
+             AND has_table_privilege(current_user, 'groups.control_commands', 'INSERT')",
     )
     .fetch_one(pool)
     .await?;
@@ -229,13 +248,12 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, GroupPersist
         r"SELECT has_schema_privilege(current_user, 'system', 'CREATE')
              OR has_schema_privilege(current_user, 'agent', 'USAGE')
              OR has_schema_privilege(current_user, 'agent', 'CREATE')
-             OR has_schema_privilege(current_user, 'identity', 'USAGE')
              OR has_schema_privilege(current_user, 'identity', 'CREATE')
              OR EXISTS (
                  SELECT 1
                    FROM pg_class AS relation
                    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-                  WHERE namespace.nspname IN ('system', 'agent', 'identity')
+                  WHERE namespace.nspname IN ('system', 'agent')
                     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
                     AND (has_table_privilege(current_user, relation.oid, 'SELECT')
                       OR has_table_privilege(current_user, relation.oid, 'INSERT')
@@ -248,6 +266,24 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, GroupPersist
              )
              OR EXISTS (
                  SELECT 1
+                   FROM pg_class AS relation
+                   JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                  WHERE namespace.nspname = 'identity'
+                    AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+                    AND (
+                        (relation.relname NOT IN ('device_sessions', 'log_heads', 'log_entries')
+                         AND has_table_privilege(current_user, relation.oid, 'SELECT'))
+                        OR has_table_privilege(current_user, relation.oid, 'INSERT')
+                        OR has_table_privilege(current_user, relation.oid, 'UPDATE')
+                        OR has_table_privilege(current_user, relation.oid, 'DELETE')
+                        OR has_table_privilege(current_user, relation.oid, 'TRUNCATE')
+                        OR has_table_privilege(current_user, relation.oid, 'REFERENCES')
+                        OR has_table_privilege(current_user, relation.oid, 'TRIGGER')
+                        OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')
+                    )
+             )
+             OR EXISTS (
+                 SELECT 1
                    FROM pg_proc AS procedure
                    JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
                   WHERE namespace.nspname = 'system'
@@ -255,6 +291,27 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, GroupPersist
                     AND procedure.oid NOT IN (
                         'system.current_tenant_id()'::regprocedure,
                         'system.is_uuid_v7(uuid)'::regprocedure
+                    )
+             )
+             OR EXISTS (
+                 SELECT 1
+                   FROM pg_proc AS procedure
+                   JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+                  WHERE namespace.nspname = 'identity'
+                    AND has_function_privilege(current_user, procedure.oid, 'EXECUTE')
+                    AND procedure.oid <> 'identity.identity_group_reader_authorized()'::regprocedure
+             )
+             OR EXISTS (
+                 SELECT 1
+                   FROM pg_roles AS candidate
+                  WHERE pg_has_role(current_user, candidate.oid, 'MEMBER')
+                    AND EXISTS (
+                        SELECT 1
+                          FROM pg_proc AS procedure
+                          JOIN pg_namespace AS namespace
+                            ON namespace.oid = procedure.pronamespace
+                         WHERE namespace.nspname IN ('system', 'identity')
+                           AND procedure.proowner = candidate.oid
                     )
              )",
     )
@@ -300,15 +357,20 @@ async fn role_has_excess_group_privileges(pool: &PgPool) -> Result<bool, GroupPe
                     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
                     AND ((relation.relname IN ('policy_heads', 'admin_terms', 'members', 'invites',
                                                 'join_records', 'membership_commands',
-                                                'membership_workflows', 'sequencer_outbox')
+                                                'membership_workflows', 'sequencer_outbox',
+                                                'control_commands')
                           AND (has_table_privilege(current_user, relation.oid, 'DELETE')
                             OR has_table_privilege(current_user, relation.oid, 'TRUNCATE')
                             OR has_table_privilege(current_user, relation.oid, 'REFERENCES')
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER')
-                            OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')))
+                            OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')
+                            OR (relation.relname IN ('members', 'membership_commands',
+                                                     'control_commands')
+                                AND has_table_privilege(current_user, relation.oid, 'UPDATE'))))
                          OR (relation.relname NOT IN ('policy_heads', 'admin_terms', 'members', 'invites',
                                                      'join_records', 'membership_commands',
-                                                     'membership_workflows', 'sequencer_outbox')
+                                                     'membership_workflows', 'sequencer_outbox',
+                                                     'control_commands')
                              AND (has_table_privilege(current_user, relation.oid, 'SELECT')
                                OR has_table_privilege(current_user, relation.oid, 'INSERT')
                                OR has_table_privilege(current_user, relation.oid, 'UPDATE')

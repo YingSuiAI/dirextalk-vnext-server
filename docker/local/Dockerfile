@@ -7,10 +7,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked \
     -p dtx-dev-migrate \
     -p dtx-identity-node \
+    -p dtx-group-node \
     -p dtx-mailbox-node \
     && mkdir -p /artifacts \
     && cp /workspace/target/release/dtx-dev-migrate /artifacts/dtx-dev-migrate \
     && cp /workspace/target/release/dtx-identity-node /artifacts/dtx-identity-node \
+    && cp /workspace/target/release/dtx-group-node /artifacts/dtx-group-node \
     && cp /workspace/target/release/dtx-mailbox-node /artifacts/dtx-mailbox-node
 
 FROM debian:bookworm-slim AS runtime
@@ -22,11 +24,13 @@ RUN apt-get update \
 
 COPY --from=build /artifacts/dtx-dev-migrate /usr/local/bin/dtx-dev-migrate
 COPY --from=build /artifacts/dtx-identity-node /usr/local/bin/dtx-identity-node
+COPY --from=build /artifacts/dtx-group-node /usr/local/bin/dtx-group-node
 COPY --from=build /artifacts/dtx-mailbox-node /usr/local/bin/dtx-mailbox-node
 COPY docker/local/identity-entrypoint.sh /usr/local/bin/dtx-identity-local
 
 RUN chmod 0555 /usr/local/bin/dtx-dev-migrate \
     /usr/local/bin/dtx-identity-node \
+    /usr/local/bin/dtx-group-node \
     /usr/local/bin/dtx-mailbox-node \
     /usr/local/bin/dtx-identity-local
 

@@ -521,6 +521,32 @@ impl AuthenticatedDeviceSession {
     }
 }
 
+/// A currently valid device session together with the active device signing
+/// key resolved from the same locked identity-log projection.
+///
+/// The public key is not secret. It is exposed only to let another durable
+/// authorization boundary verify a command proof inside the same transaction
+/// that rechecks session expiry and device revocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthenticatedDeviceSigningSession {
+    session: AuthenticatedDeviceSession,
+    signing_key: SigningPublicKey,
+}
+
+impl AuthenticatedDeviceSigningSession {
+    /// Returns the authenticated session facts.
+    #[must_use]
+    pub const fn session(self) -> AuthenticatedDeviceSession {
+        self.session
+    }
+
+    /// Returns the active device's verified public signing key.
+    #[must_use]
+    pub const fn signing_key(self) -> SigningPublicKey {
+        self.signing_key
+    }
+}
+
 /// Identity-specific durable device-session repository.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeviceSessionRepository;
@@ -768,6 +794,30 @@ impl DeviceSessionRepository {
         credential: &DeviceSessionCredential,
         now: UtcMillis,
     ) -> Result<AuthenticatedDeviceSession, IdentityPersistenceError> {
+        Ok(
+            Self::authenticate_with_signing_key_in_transaction(connection, credential, now)
+                .await?
+                .session(),
+        )
+    }
+
+    /// Validates one device session and resolves its current device signing key
+    /// from the same caller-owned transaction.
+    ///
+    /// This is intended for another durable authorization boundary that must
+    /// verify a device action proof before reading a replay receipt or writing
+    /// its own state. It has the same narrow read and revocation guarantees as
+    /// [`Self::authenticate_in_transaction`].
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing, expired, incorrect, or revoked device sessions, and
+    /// reports malformed active identity projections as persistence errors.
+    pub async fn authenticate_with_signing_key_in_transaction(
+        connection: &mut PgConnection,
+        credential: &DeviceSessionCredential,
+        now: UtcMillis,
+    ) -> Result<AuthenticatedDeviceSigningSession, IdentityPersistenceError> {
         let row = sqlx::query(
             "SELECT identity_id, device_id, session_secret_hash, expires_at_ms
                FROM identity.device_sessions
@@ -795,12 +845,15 @@ impl DeviceSessionRepository {
         let identity_id = parse_identity_id(&row.try_get::<String, _>("identity_id")?)?;
         let device_id = parse_device_id(row.try_get::<Uuid, _>("device_id")?)?;
         let snapshot = lock_and_load_active_snapshot(connection, identity_id).await?;
-        active_device_signing_key(snapshot.projection(), device_id)?;
-        Ok(AuthenticatedDeviceSession {
-            identity_id,
-            device_id,
-            session_id: credential.session_id(),
-            expires_at,
+        let signing_key = active_device_signing_key(snapshot.projection(), device_id)?;
+        Ok(AuthenticatedDeviceSigningSession {
+            session: AuthenticatedDeviceSession {
+                identity_id,
+                device_id,
+                session_id: credential.session_id(),
+                expires_at,
+            },
+            signing_key,
         })
     }
 }

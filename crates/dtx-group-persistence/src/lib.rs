@@ -8,12 +8,17 @@
 //! lost response transitions to an exact remote query instead of repeating a
 //! stale invitation approval.
 
+mod control;
 mod error;
 mod repository;
 mod store;
 mod types;
 
+pub use control::{
+    GroupControlCommand, GroupControlDisposition, GroupControlExecution, GroupControlOperation,
+    GroupControlReceipt, GroupControlRejection, GroupControlRepository,
+};
 pub use error::GroupPersistenceError;
-pub use repository::GroupMembershipRepository;
+pub use repository::{GroupMembershipRepository, MembershipCommandExecution};
 pub use store::{GroupPgStore, GroupSession};
 pub use types::{PreparedSequencerAction, SequencerActionLease};

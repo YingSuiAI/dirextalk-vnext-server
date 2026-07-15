@@ -12,10 +12,10 @@ each database, provisions the explicit least-privilege runtime grant matrix,
 then waits for an HTTP response from each service before returning. It starts
 these host-loopback-published development endpoints:
 
-| Logical node | Identity endpoint | Mailbox endpoint |
-| --- | --- | --- |
-| A | `http://127.0.0.1:18080` | `http://127.0.0.1:14812` |
-| B | `http://127.0.0.1:18081` | `http://127.0.0.1:14813` |
+| Logical node | Identity endpoint | Mailbox endpoint | Group endpoint | Fixed group tenant |
+| --- | --- | --- | --- | --- |
+| A | `http://127.0.0.1:18080` | `http://127.0.0.1:14812` | `http://127.0.0.1:14814` | `0190f2a5-7b1c-7abc-8def-0123456789a0` |
+| B | `http://127.0.0.1:18081` | `http://127.0.0.1:14813` | `http://127.0.0.1:14815` | `0190f2a5-7b1c-7abc-8def-0123456789a1` |
 
 The identity binary itself remains bound to container loopback; the local image
 uses a tiny same-container TCP proxy to make it reachable through Docker's
@@ -40,9 +40,16 @@ hostile-node containment: their containers share the development network and
 the passwordless trust setup. Use it for repeatable functional testing, never
 to validate network isolation or production credential boundaries.
 
-It currently exercises the runnable identity and opaque-mailbox services on two
-separate node databases. Group membership has durable server state but no HTTP
-node yet, and public-channel/contact-acceptance endpoints are still unfinished;
-the stack does not pretend those end-to-end product paths are available. The
-client's production discovery transport also requires HTTPS, so its QR/contact
-flow needs the later local TLS/test-CA stage rather than these HTTP endpoints.
+It exercises identity, opaque mailbox, and group-command services on two
+separate node databases. Each Group Node has a fixed, non-secret local tenant
+identifier and reads the identity session projection from its own logical
+database; it does not need to proxy through the Identity HTTP endpoint. The
+runtime principal has only the explicit group-write and identity-session-read
+permissions needed for that path.
+
+The Group Node provides the durable policy/membership command boundary only.
+MLS commit reconciliation, public-channel discovery, contact acceptance, and
+client integration are still unfinished; the stack does not claim those
+end-to-end product paths are available. The client's production discovery
+transport also requires HTTPS, so its QR/contact flow needs the later local
+TLS/test-CA stage rather than these HTTP endpoints.

@@ -32,6 +32,14 @@ pub enum GroupPersistenceError {
     LeaseLost,
     /// A caller supplied a command whose scope does not match the loaded group.
     ScopeMismatch,
+    /// A stable group-control command ID or idempotency key was reused with different facts.
+    ControlCommandConflict,
+    /// The caller's short-lived device session was missing, expired, revoked, or mismatched.
+    DeviceAuthenticationRejected,
+    /// A valid session did not have permission to read this durable receipt.
+    MembershipReceiptAccessDenied,
+    /// The caller's route-bound device action proof was malformed, expired, or invalid.
+    ActionProofRejected,
 }
 
 impl fmt::Display for GroupPersistenceError {
@@ -56,6 +64,12 @@ impl fmt::Display for GroupPersistenceError {
             Self::CorruptData(_) => "group persistence contained invalid durable data",
             Self::LeaseLost => "membership Sequencer action lease was lost",
             Self::ScopeMismatch => "membership command scope does not match the group",
+            Self::ControlCommandConflict => {
+                "group control command conflicts with a durable receipt"
+            }
+            Self::DeviceAuthenticationRejected => "device session authentication was rejected",
+            Self::MembershipReceiptAccessDenied => "membership receipt access was denied",
+            Self::ActionProofRejected => "group device action proof was rejected",
         })
     }
 }
@@ -75,7 +89,11 @@ impl Error for GroupPersistenceError {
             | Self::GroupBootstrapConflict
             | Self::CorruptData(_)
             | Self::LeaseLost
-            | Self::ScopeMismatch => None,
+            | Self::ScopeMismatch
+            | Self::ControlCommandConflict
+            | Self::DeviceAuthenticationRejected
+            | Self::MembershipReceiptAccessDenied
+            | Self::ActionProofRejected => None,
         }
     }
 }

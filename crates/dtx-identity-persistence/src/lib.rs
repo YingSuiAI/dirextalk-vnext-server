@@ -20,13 +20,14 @@ pub use device_enrollment::{
     DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository,
 };
 pub use device_session::{
-    AuthenticatedDeviceSession, DEVICE_SESSION_CHALLENGE_MIN_INTERVAL_MILLIS,
-    DEVICE_SESSION_CHALLENGE_TTL_MILLIS, DEVICE_SESSION_PROOF_HASH_DOMAIN,
-    DEVICE_SESSION_RECEIPT_HASH_DOMAIN, DEVICE_SESSION_REQUEST_HASH_DOMAIN,
-    DEVICE_SESSION_SECRET_HASH_DOMAIN, DEVICE_SESSION_SIGNATURE_DOMAIN, DEVICE_SESSION_TTL_MILLIS,
-    DeviceSessionChallenge, DeviceSessionCompletionCommand, DeviceSessionCredential,
-    DeviceSessionOutcome, DeviceSessionReceipt, DeviceSessionRepository,
-    device_session_proof_canonical_bytes, device_session_proof_input,
+    AuthenticatedDeviceSession, AuthenticatedDeviceSigningSession,
+    DEVICE_SESSION_CHALLENGE_MIN_INTERVAL_MILLIS, DEVICE_SESSION_CHALLENGE_TTL_MILLIS,
+    DEVICE_SESSION_PROOF_HASH_DOMAIN, DEVICE_SESSION_RECEIPT_HASH_DOMAIN,
+    DEVICE_SESSION_REQUEST_HASH_DOMAIN, DEVICE_SESSION_SECRET_HASH_DOMAIN,
+    DEVICE_SESSION_SIGNATURE_DOMAIN, DEVICE_SESSION_TTL_MILLIS, DeviceSessionChallenge,
+    DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
+    DeviceSessionReceipt, DeviceSessionRepository, device_session_proof_canonical_bytes,
+    device_session_proof_input,
 };
 pub use error::IdentityPersistenceError;
 pub use key_package::{

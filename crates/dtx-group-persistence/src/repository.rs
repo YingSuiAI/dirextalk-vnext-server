@@ -9,6 +9,10 @@ use dtx_group_policy::{
     GroupPendingJoinPersistence, GroupPolicy, GroupPolicyError, GroupPolicyPersistenceImage,
     GroupPolicySnapshot, GroupReservedJoinPersistence, GroupScope,
 };
+use dtx_identity_persistence::{
+    AuthenticatedDeviceSession, AuthenticatedDeviceSigningSession, DeviceSessionCredential,
+    DeviceSessionRepository, IdentityPersistenceError,
+};
 use dtx_membership_command::{
     ApproveJoinCommand, CandidateMembership, JoinRequestCommand, MembershipAdmission,
     MembershipCommandBook, MembershipCommandBookSnapshot, MembershipCommandContext,
@@ -18,7 +22,7 @@ use dtx_membership_command::{
     MembershipWorkflowPersistence, MembershipWorkflowPersistencePhase, SequencerAction,
     SequencerResolution,
 };
-use dtx_wire::Sha256Digest;
+use dtx_wire::{Sha256Digest, SigningPublicKey, UtcMillis};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
@@ -50,7 +54,31 @@ const QUERY_ACTION: &str = "query";
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GroupMembershipRepository;
 
-#[allow(clippy::missing_errors_doc)] // The shared error type documents the fail-closed boundary.
+/// Result of a membership command invocation at the public boundary.
+///
+/// The receipt is the durable fact; the replay marker only tells an HTTP
+/// caller whether this invocation created that fact or recovered it exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MembershipCommandExecution {
+    receipt: MembershipReceipt,
+    replayed: bool,
+}
+
+impl MembershipCommandExecution {
+    /// Returns the durable membership receipt.
+    #[must_use]
+    pub const fn receipt(self) -> MembershipReceipt {
+        self.receipt
+    }
+
+    /// Reports whether this invocation exactly replayed existing durable state.
+    #[must_use]
+    pub const fn replayed(self) -> bool {
+        self.replayed
+    }
+}
+
+#[allow(clippy::missing_errors_doc, clippy::too_many_arguments)] // The shared error type documents the fail-closed boundary; proof-verified public commands retain explicit security inputs rather than a one-use parameter bag.
 impl GroupMembershipRepository {
     /// Creates an initial durable group aggregate exactly once.
     ///
@@ -113,70 +141,110 @@ impl GroupMembershipRepository {
         now_ms: i64,
     ) -> Result<MembershipReceipt, GroupPersistenceError> {
         let mut session = store.begin(tenant_id).await?;
+        let result = request_join_in_transaction(
+            session.connection(),
+            tenant_id,
+            command,
+            candidate_membership,
+            now_ms,
+        )
+        .await;
+        settle(session, result)
+            .await
+            .map(MembershipCommandExecution::receipt)
+    }
+
+    /// Records or exactly replays a candidate-authored join request after
+    /// revalidating the device session in the same group-storage transaction.
+    ///
+    /// This is the public-node path. Session validation happens before a
+    /// replay lookup so a revoked device cannot use a lost HTTP response to
+    /// read or mutate an old command receipt.
+    pub async fn request_join_authenticated(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        command: JoinRequestCommand,
+        candidate_membership: CandidateMembership,
+        now_ms: i64,
+    ) -> Result<MembershipReceipt, GroupPersistenceError> {
+        let (mut session, authenticated) =
+            begin_authenticated(store, tenant_id, credential, now_ms).await?;
         let result = async {
-            let context = command.context();
-            let key = ScopeKey::from_scope(tenant_id, context.scope());
-            let mut aggregate = load_aggregate(&mut *session.connection(), key, true)
-                .await?
-                .ok_or(GroupPersistenceError::GroupNotFound)?;
-            let had_exact_command = aggregate.book.receipt(context.command_id()).is_ok();
-            let receipt = aggregate
-                .book
-                .record_join_request(command, candidate_membership)?;
-            if had_exact_command || receipt.command_id() != context.command_id() {
-                return Ok(receipt);
-            }
-            if matches!(receipt.phase(), MembershipCommandPhase::Committed(_)) {
-                persist_book(
-                    &mut *session.connection(),
-                    &aggregate.book,
-                    tenant_id,
-                    context.scope(),
-                    now_ms,
-                )
-                .await?;
-                return Ok(receipt);
-            }
-            if let Err(policy_error) = aggregate.policy.request_join(
-                context.fence().policy_revision(),
-                context.actor_identity_id(),
-                context.candidate_identity_id(),
-                context.join_request_id(),
-                context.invite_id(),
-                now_ms,
-            ) {
-                let rejection = local_policy_rejection(policy_error)
-                    .ok_or(GroupPersistenceError::GroupPolicy(policy_error))?;
-                let receipt = aggregate
-                    .book
-                    .reject_locally(context.command_id(), rejection)?;
-                persist_book(
-                    &mut *session.connection(),
-                    &aggregate.book,
-                    tenant_id,
-                    context.scope(),
-                    now_ms,
-                )
-                .await?;
-                return Ok(receipt);
-            }
-            persist_policy(
-                &mut *session.connection(),
+            ensure_authenticated_actor(authenticated, command.context())?;
+            request_join_in_transaction(
+                session.connection(),
                 tenant_id,
-                &aggregate.policy,
-                now_ms,
-                false,
-            )
-            .await?;
-            persist_book(
-                &mut *session.connection(),
-                &aggregate.book,
-                tenant_id,
-                context.scope(),
+                command,
+                candidate_membership,
                 now_ms,
             )
-            .await?;
-            Ok(receipt)
+            .await
+        }
+        .await;
+        settle(session, result)
+            .await
+            .map(MembershipCommandExecution::receipt)
+    }
+
+    /// Records a join request after verifying a caller-supplied device action
+    /// proof with the signing key resolved in the same transaction as session
+    /// validation and receipt lookup.
+    pub async fn request_join_authenticated_with_proof<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        command: JoinRequestCommand,
+        candidate_membership: CandidateMembership,
+        now_ms: i64,
+        verify_proof: F,
+    ) -> Result<MembershipReceipt, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        self.request_join_authenticated_with_proof_outcome(
+            store,
+            tenant_id,
+            credential,
+            command,
+            candidate_membership,
+            now_ms,
+            verify_proof,
+        )
+        .await
+        .map(MembershipCommandExecution::receipt)
+    }
+
+    /// Records or exactly replays a proof-verified join request and reports
+    /// whether this invocation created the durable receipt.
+    pub async fn request_join_authenticated_with_proof_outcome<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        command: JoinRequestCommand,
+        candidate_membership: CandidateMembership,
+        now_ms: i64,
+        verify_proof: F,
+    ) -> Result<MembershipCommandExecution, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        let (mut session, authenticated) =
+            begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
+        let result = async {
+            ensure_authenticated_actor(authenticated.session(), command.context())?;
+            verify_proof(authenticated.signing_key())?;
+            request_join_in_transaction(
+                session.connection(),
+                tenant_id,
+                command,
+                candidate_membership,
+                now_ms,
+            )
+            .await
         }
         .await;
         settle(session, result).await
@@ -195,87 +263,166 @@ impl GroupMembershipRepository {
         now_ms: i64,
     ) -> Result<MembershipReceipt, GroupPersistenceError> {
         let mut session = store.begin(tenant_id).await?;
+        let result = approve_join_in_transaction(
+            session.connection(),
+            tenant_id,
+            command,
+            candidate_membership,
+            now_ms,
+        )
+        .await;
+        settle(session, result)
+            .await
+            .map(MembershipCommandExecution::receipt)
+    }
+
+    /// Records or exactly replays an Owner/Admin approval after same-transaction
+    /// device-session validation.
+    pub async fn approve_join_authenticated(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        command: ApproveJoinCommand,
+        candidate_membership: CandidateMembership,
+        now_ms: i64,
+    ) -> Result<MembershipReceipt, GroupPersistenceError> {
+        let (mut session, authenticated) =
+            begin_authenticated(store, tenant_id, credential, now_ms).await?;
         let result = async {
-            let context = command.context();
-            let key = ScopeKey::from_scope(tenant_id, context.scope());
-            let mut aggregate = load_aggregate(&mut *session.connection(), key, true)
-                .await?
-                .ok_or(GroupPersistenceError::GroupNotFound)?;
-            let had_exact_command = aggregate.book.receipt(context.command_id()).is_ok();
-            let receipt = aggregate.book.approve_join(command, candidate_membership)?;
-            if had_exact_command || receipt.command_id() != context.command_id() {
-                return Ok(receipt);
-            }
-            if matches!(receipt.phase(), MembershipCommandPhase::Committed(_)) {
-                persist_book(
-                    &mut *session.connection(),
-                    &aggregate.book,
-                    tenant_id,
-                    context.scope(),
-                    now_ms,
-                )
-                .await?;
-                return Ok(receipt);
-            }
-            if let Err(policy_error) = aggregate.policy.reserve_join(
-                context.fence().policy_revision(),
-                context.actor_identity_id(),
-                context.join_request_id(),
-                now_ms,
-            ) {
-                let rejection = local_policy_rejection(policy_error)
-                    .ok_or(GroupPersistenceError::GroupPolicy(policy_error))?;
-                let receipt = aggregate
-                    .book
-                    .reject_locally(context.command_id(), rejection)?;
-                persist_book(
-                    &mut *session.connection(),
-                    &aggregate.book,
-                    tenant_id,
-                    context.scope(),
-                    now_ms,
-                )
-                .await?;
-                return Ok(receipt);
-            }
-            let action = aggregate
-                .book
-                .next_sequencer_action(context.command_id())?
-                .ok_or(GroupPersistenceError::CorruptData(
-                    "approval missing submit action",
-                ))?;
-            if !matches!(action, SequencerAction::Submit(_)) {
-                return Err(GroupPersistenceError::CorruptData(
-                    "approval action is not submit",
-                ));
-            }
-            persist_policy(
-                &mut *session.connection(),
+            ensure_authenticated_actor(authenticated, command.context())?;
+            approve_join_in_transaction(
+                session.connection(),
                 tenant_id,
-                &aggregate.policy,
-                now_ms,
-                false,
-            )
-            .await?;
-            persist_book(
-                &mut *session.connection(),
-                &aggregate.book,
-                tenant_id,
-                context.scope(),
+                command,
+                candidate_membership,
                 now_ms,
             )
-            .await?;
-            insert_outbox(
-                &mut *session.connection(),
+            .await
+        }
+        .await;
+        settle(session, result)
+            .await
+            .map(MembershipCommandExecution::receipt)
+    }
+
+    /// Records an approval after same-transaction device-session and action
+    /// proof verification.
+    pub async fn approve_join_authenticated_with_proof<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        command: ApproveJoinCommand,
+        candidate_membership: CandidateMembership,
+        now_ms: i64,
+        verify_proof: F,
+    ) -> Result<MembershipReceipt, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        self.approve_join_authenticated_with_proof_outcome(
+            store,
+            tenant_id,
+            credential,
+            command,
+            candidate_membership,
+            now_ms,
+            verify_proof,
+        )
+        .await
+        .map(MembershipCommandExecution::receipt)
+    }
+
+    /// Records or exactly replays a proof-verified approval and reports
+    /// whether this invocation created the durable receipt.
+    pub async fn approve_join_authenticated_with_proof_outcome<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        command: ApproveJoinCommand,
+        candidate_membership: CandidateMembership,
+        now_ms: i64,
+        verify_proof: F,
+    ) -> Result<MembershipCommandExecution, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        let (mut session, authenticated) =
+            begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
+        let result = async {
+            ensure_authenticated_actor(authenticated.session(), command.context())?;
+            verify_proof(authenticated.signing_key())?;
+            approve_join_in_transaction(
+                session.connection(),
                 tenant_id,
-                context.scope(),
-                context.command_id(),
-                context.join_request_id(),
-                SUBMIT_ACTION,
+                command,
+                candidate_membership,
                 now_ms,
             )
-            .await?;
-            Ok(receipt)
+            .await
+        }
+        .await;
+        settle(session, result).await
+    }
+
+    /// Loads one membership receipt after revalidating the reading device in
+    /// the same tenant transaction.
+    ///
+    /// The originating actor, the candidate carried by the workflow, and the
+    /// current Owner/Admin role may read it. Other authenticated identities
+    /// receive an access-denied result without receiving receipt facts.
+    pub async fn load_receipt_authenticated(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        scope: GroupScope,
+        command_id: MembershipCommandId,
+        now_ms: i64,
+    ) -> Result<MembershipReceipt, GroupPersistenceError> {
+        let (mut session, authenticated) =
+            begin_authenticated(store, tenant_id, credential, now_ms).await?;
+        let result = async {
+            let key = ScopeKey::from_scope(tenant_id, scope);
+            let Some(aggregate) = load_aggregate(session.connection(), key, false).await? else {
+                return Err(GroupPersistenceError::GroupNotFound);
+            };
+            let access = sqlx::query(
+                "SELECT command.actor_identity_id,
+                        workflow.candidate_identity_id
+                   FROM groups.membership_commands AS command
+                   LEFT JOIN groups.membership_workflows AS workflow
+                     ON workflow.tenant_id=command.tenant_id
+                    AND workflow.scope_kind=command.scope_kind
+                    AND workflow.scope_id=command.scope_id
+                    AND workflow.request_id=command.workflow_id
+                  WHERE command.tenant_id=$1 AND command.command_id=$2
+                    AND command.scope_kind=$3 AND command.scope_id=$4",
+            )
+            .bind(Uuid::from(tenant_id))
+            .bind(Uuid::from(command_id.request_id()))
+            .bind(key.kind)
+            .bind(key.id())
+            .fetch_optional(session.connection())
+            .await?
+            .ok_or(GroupPersistenceError::GroupNotFound)?;
+            let caller = authenticated.identity_id().to_string();
+            let is_actor = access.try_get::<String, _>("actor_identity_id")? == caller;
+            let is_candidate = access
+                .try_get::<Option<String>, _>("candidate_identity_id")?
+                .as_deref()
+                == Some(caller.as_str());
+            if !is_actor
+                && !is_candidate
+                && !aggregate
+                    .policy
+                    .can_approve_join(authenticated.identity_id())
+            {
+                return Err(GroupPersistenceError::MembershipReceiptAccessDenied);
+            }
+            aggregate.book.receipt(command_id).map_err(Into::into)
         }
         .await;
         settle(session, result).await
@@ -286,6 +433,7 @@ impl GroupMembershipRepository {
     /// Claiming a `Submit` first persists the command as `Reconciling` and
     /// changes the durable outbox to `Query`. A crash or lost response therefore
     /// permits only lookup recovery, never a blind second submit.
+    #[allow(clippy::too_many_lines)] // The one transaction deliberately keeps the lease, revocation recheck, receipt, policy, and outbox transition together.
     pub async fn prepare_next_action(
         self,
         store: &GroupPgStore,
@@ -319,6 +467,52 @@ impl GroupMembershipRepository {
             let expected = action_code(&action);
             if expected != outbox.action {
                 return Err(GroupPersistenceError::CorruptData("outbox action drift"));
+            }
+            if matches!(action, SequencerAction::Submit(_)) {
+                match aggregate
+                    .policy
+                    .validate_reserved_join_authority(outbox.request_id)
+                {
+                    Ok(()) => {}
+                    Err(GroupPolicyError::InviteIssuerNoLongerAuthorized) => {
+                        let receipt = aggregate
+                            .book
+                            .reject_locally(command_id, MembershipRejection::PolicyDenied)?;
+                        aggregate.policy.release_join_reservation(
+                            aggregate.policy.revision(),
+                            outbox.request_id,
+                        )?;
+                        persist_policy(
+                            &mut *session.connection(),
+                            tenant_id,
+                            &aggregate.policy,
+                            now_ms,
+                            false,
+                        )
+                        .await?;
+                        persist_book(
+                            &mut *session.connection(),
+                            &aggregate.book,
+                            tenant_id,
+                            key.scope,
+                            now_ms,
+                        )
+                        .await?;
+                        complete_unleased_outbox(
+                            &mut *session.connection(),
+                            key,
+                            command_id,
+                            now_ms,
+                        )
+                        .await?;
+                        debug_assert!(matches!(
+                            receipt.phase(),
+                            MembershipCommandPhase::Rejected(_)
+                        ));
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(GroupPersistenceError::GroupPolicy(error)),
+                }
             }
             let lease = SequencerActionLease {
                 token: Uuid::now_v7(),
@@ -473,20 +667,261 @@ impl GroupMembershipRepository {
     }
 }
 
+/// Begins a tenant-bound group transaction and revalidates a device session on
+/// that exact connection. The group runtime receives only the narrow identity
+/// reads needed by [`DeviceSessionRepository::authenticate_in_transaction`].
+pub(crate) async fn begin_authenticated<'store>(
+    store: &'store GroupPgStore,
+    tenant_id: TenantId,
+    credential: &DeviceSessionCredential,
+    now_ms: i64,
+) -> Result<(crate::GroupSession<'store>, AuthenticatedDeviceSession), GroupPersistenceError> {
+    let (session, authenticated) =
+        begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
+    Ok((session, authenticated.session()))
+}
+
+/// Same as [`begin_authenticated`], but retains the active device public key
+/// so the caller can verify a domain-specific action signature before the
+/// transaction reads a replay receipt or mutates group state.
+pub(crate) async fn begin_authenticated_with_signing_key<'store>(
+    store: &'store GroupPgStore,
+    tenant_id: TenantId,
+    credential: &DeviceSessionCredential,
+    now_ms: i64,
+) -> Result<
+    (
+        crate::GroupSession<'store>,
+        AuthenticatedDeviceSigningSession,
+    ),
+    GroupPersistenceError,
+> {
+    let now = UtcMillis::new(now_ms)
+        .map_err(|_| GroupPersistenceError::CorruptData("group authentication time"))?;
+    let mut session = store.begin(tenant_id).await?;
+    let authenticated = match DeviceSessionRepository::authenticate_with_signing_key_in_transaction(
+        session.connection(),
+        credential,
+        now,
+    )
+    .await
+    {
+        Ok(authenticated) => authenticated,
+        Err(error) => {
+            let _ = session.rollback().await;
+            return Err(map_identity_authentication_error(error));
+        }
+    };
+    Ok((session, authenticated))
+}
+
+fn map_identity_authentication_error(error: IdentityPersistenceError) -> GroupPersistenceError {
+    match error {
+        IdentityPersistenceError::Database(error) => GroupPersistenceError::Database(error),
+        _ => GroupPersistenceError::DeviceAuthenticationRejected,
+    }
+}
+
+fn ensure_authenticated_actor(
+    authenticated: AuthenticatedDeviceSession,
+    context: MembershipCommandContext,
+) -> Result<(), GroupPersistenceError> {
+    if authenticated.identity_id() == context.actor_identity_id()
+        && authenticated.device_id() == context.actor_device_id()
+    {
+        Ok(())
+    } else {
+        Err(GroupPersistenceError::DeviceAuthenticationRejected)
+    }
+}
+
+#[allow(clippy::large_types_passed_by_value)] // The command is consumed by the reducer; a database round trip dominates this small typed copy.
+async fn request_join_in_transaction(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    command: JoinRequestCommand,
+    candidate_membership: CandidateMembership,
+    now_ms: i64,
+) -> Result<MembershipCommandExecution, GroupPersistenceError> {
+    let context = command.context();
+    let key = ScopeKey::from_scope(tenant_id, context.scope());
+    let mut aggregate = load_aggregate(connection, key, true)
+        .await?
+        .ok_or(GroupPersistenceError::GroupNotFound)?;
+    let had_exact_command = aggregate.book.receipt(context.command_id()).is_ok();
+    let receipt = aggregate
+        .book
+        .record_join_request(command, candidate_membership)?;
+    if had_exact_command || receipt.command_id() != context.command_id() {
+        return Ok(MembershipCommandExecution {
+            receipt,
+            replayed: true,
+        });
+    }
+    if matches!(receipt.phase(), MembershipCommandPhase::Committed(_)) {
+        persist_book(
+            connection,
+            &aggregate.book,
+            tenant_id,
+            context.scope(),
+            now_ms,
+        )
+        .await?;
+        return Ok(MembershipCommandExecution {
+            receipt,
+            replayed: false,
+        });
+    }
+    if let Err(policy_error) = aggregate.policy.request_join(
+        context.fence().policy_revision(),
+        context.actor_identity_id(),
+        context.candidate_identity_id(),
+        context.join_request_id(),
+        context.invite_id(),
+        now_ms,
+    ) {
+        let rejection = local_policy_rejection(policy_error)
+            .ok_or(GroupPersistenceError::GroupPolicy(policy_error))?;
+        let receipt = aggregate
+            .book
+            .reject_locally(context.command_id(), rejection)?;
+        persist_book(
+            connection,
+            &aggregate.book,
+            tenant_id,
+            context.scope(),
+            now_ms,
+        )
+        .await?;
+        return Ok(MembershipCommandExecution {
+            receipt,
+            replayed: false,
+        });
+    }
+    persist_policy(connection, tenant_id, &aggregate.policy, now_ms, false).await?;
+    persist_book(
+        connection,
+        &aggregate.book,
+        tenant_id,
+        context.scope(),
+        now_ms,
+    )
+    .await?;
+    Ok(MembershipCommandExecution {
+        receipt,
+        replayed: false,
+    })
+}
+
+#[allow(clippy::large_types_passed_by_value)] // The command is consumed by the reducer; a database round trip dominates this small typed copy.
+async fn approve_join_in_transaction(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    command: ApproveJoinCommand,
+    candidate_membership: CandidateMembership,
+    now_ms: i64,
+) -> Result<MembershipCommandExecution, GroupPersistenceError> {
+    let context = command.context();
+    let key = ScopeKey::from_scope(tenant_id, context.scope());
+    let mut aggregate = load_aggregate(connection, key, true)
+        .await?
+        .ok_or(GroupPersistenceError::GroupNotFound)?;
+    let had_exact_command = aggregate.book.receipt(context.command_id()).is_ok();
+    let receipt = aggregate.book.approve_join(command, candidate_membership)?;
+    if had_exact_command || receipt.command_id() != context.command_id() {
+        return Ok(MembershipCommandExecution {
+            receipt,
+            replayed: true,
+        });
+    }
+    if matches!(receipt.phase(), MembershipCommandPhase::Committed(_)) {
+        persist_book(
+            connection,
+            &aggregate.book,
+            tenant_id,
+            context.scope(),
+            now_ms,
+        )
+        .await?;
+        return Ok(MembershipCommandExecution {
+            receipt,
+            replayed: false,
+        });
+    }
+    if let Err(policy_error) = aggregate.policy.reserve_join(
+        context.fence().policy_revision(),
+        context.actor_identity_id(),
+        context.join_request_id(),
+        now_ms,
+    ) {
+        let rejection = local_policy_rejection(policy_error)
+            .ok_or(GroupPersistenceError::GroupPolicy(policy_error))?;
+        let receipt = aggregate
+            .book
+            .reject_locally(context.command_id(), rejection)?;
+        persist_book(
+            connection,
+            &aggregate.book,
+            tenant_id,
+            context.scope(),
+            now_ms,
+        )
+        .await?;
+        return Ok(MembershipCommandExecution {
+            receipt,
+            replayed: false,
+        });
+    }
+    let action = aggregate
+        .book
+        .next_sequencer_action(context.command_id())?
+        .ok_or(GroupPersistenceError::CorruptData(
+            "approval missing submit action",
+        ))?;
+    if !matches!(action, SequencerAction::Submit(_)) {
+        return Err(GroupPersistenceError::CorruptData(
+            "approval action is not submit",
+        ));
+    }
+    persist_policy(connection, tenant_id, &aggregate.policy, now_ms, false).await?;
+    persist_book(
+        connection,
+        &aggregate.book,
+        tenant_id,
+        context.scope(),
+        now_ms,
+    )
+    .await?;
+    insert_outbox(
+        connection,
+        tenant_id,
+        context.scope(),
+        context.command_id(),
+        context.join_request_id(),
+        SUBMIT_ACTION,
+        now_ms,
+    )
+    .await?;
+    Ok(MembershipCommandExecution {
+        receipt,
+        replayed: false,
+    })
+}
+
 struct LoadedAggregate {
     policy: GroupPolicy,
     book: MembershipCommandBook,
 }
 
 #[derive(Clone, Copy)]
-struct ScopeKey {
+pub(crate) struct ScopeKey {
     tenant_id: TenantId,
     scope: GroupScope,
     kind: &'static str,
 }
 
 impl ScopeKey {
-    fn from_scope(tenant_id: TenantId, scope: GroupScope) -> Self {
+    pub(crate) fn from_scope(tenant_id: TenantId, scope: GroupScope) -> Self {
         let (kind, _) = scope_columns(scope);
         Self {
             tenant_id,
@@ -495,7 +930,7 @@ impl ScopeKey {
         }
     }
 
-    fn from_storage(
+    pub(crate) fn from_storage(
         tenant_id: TenantId,
         kind: &str,
         scope_id: &str,
@@ -504,11 +939,11 @@ impl ScopeKey {
         Ok(Self::from_scope(tenant_id, scope))
     }
 
-    fn tenant_id(self) -> Uuid {
+    pub(crate) fn tenant_id(self) -> Uuid {
         Uuid::from(self.tenant_id)
     }
 
-    fn id(self) -> String {
+    pub(crate) fn id(self) -> String {
         scope_columns(self.scope).1
     }
 }
@@ -532,7 +967,7 @@ struct OutboxRow {
     lease_expires_at_ms: i64,
 }
 
-async fn settle<T>(
+pub(crate) async fn settle<T>(
     session: crate::GroupSession<'_>,
     result: Result<T, GroupPersistenceError>,
 ) -> Result<T, GroupPersistenceError> {
@@ -561,7 +996,7 @@ async fn load_aggregate(
 }
 
 #[allow(clippy::too_many_lines)] // One projection validates every normalized policy row together.
-async fn load_policy(
+pub(crate) async fn load_policy(
     connection: &mut PgConnection,
     key: ScopeKey,
     lock: bool,
@@ -1010,7 +1445,7 @@ fn approval_context_from_row(
 }
 
 #[allow(clippy::too_many_lines)] // Policy state writes share one transaction and one normalized image.
-async fn persist_policy(
+pub(crate) async fn persist_policy(
     connection: &mut PgConnection,
     tenant_id: TenantId,
     policy: &GroupPolicy,
@@ -1543,6 +1978,33 @@ async fn complete_outbox(
     .await?
     .rows_affected();
     if changed != 1 {
+        return Err(GroupPersistenceError::LeaseLost);
+    }
+    Ok(())
+}
+
+async fn complete_unleased_outbox(
+    connection: &mut PgConnection,
+    key: ScopeKey,
+    command_id: MembershipCommandId,
+    now_ms: i64,
+) -> Result<(), GroupPersistenceError> {
+    let completed = sqlx::query(
+        "UPDATE groups.sequencer_outbox
+            SET state='completed', completed_at_ms=$5, leased_action=NULL,
+                lease_token=NULL, lease_expires_at_ms=NULL
+          WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND command_id=$4
+            AND state='active'",
+    )
+    .bind(key.tenant_id())
+    .bind(key.kind)
+    .bind(key.id())
+    .bind(uuid_from(command_id.request_id()))
+    .bind(now_ms)
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    if completed != 1 {
         return Err(GroupPersistenceError::LeaseLost);
     }
     Ok(())

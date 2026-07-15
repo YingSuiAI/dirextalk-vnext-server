@@ -3,6 +3,19 @@
 -- their schemas. Keep it explicit: if a new runtime requirement is added, the
 -- local cluster must fail closed until this matrix is updated deliberately.
 
+-- The init script runs only for a new Compose volume. Provisioning also creates
+-- this passwordless local principal so an existing disposable volume can pick
+-- up the Group Node without a manual reset. The role remains confined to the
+-- Compose network and loopback-only database publication.
+DO $roles$
+BEGIN
+    IF to_regrole('dtx_group_node') IS NULL THEN
+        CREATE ROLE dtx_group_node LOGIN IN ROLE dtx_group_runtime
+            NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+END
+$roles$;
+
 GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA identity TO dtx_identity_runtime;
 GRANT SELECT, INSERT, UPDATE ON identity.log_heads TO dtx_identity_runtime;
@@ -33,12 +46,18 @@ GRANT EXECUTE ON FUNCTION system.current_tenant_id() TO dtx_group_runtime;
 GRANT EXECUTE ON FUNCTION system.is_uuid_v7(uuid) TO dtx_group_runtime;
 GRANT USAGE ON SCHEMA groups TO dtx_group_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA groups TO dtx_group_runtime;
+GRANT USAGE ON SCHEMA identity TO dtx_group_runtime;
+GRANT EXECUTE ON FUNCTION identity.identity_group_reader_authorized()
+    TO dtx_group_runtime;
+GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
+    TO dtx_group_runtime;
 GRANT SELECT, INSERT, UPDATE ON groups.policy_heads TO dtx_group_runtime;
 GRANT SELECT, INSERT, UPDATE ON groups.admin_terms TO dtx_group_runtime;
 GRANT SELECT, INSERT ON groups.members TO dtx_group_runtime;
 GRANT SELECT, INSERT, UPDATE ON groups.invites TO dtx_group_runtime;
 GRANT SELECT, INSERT, UPDATE ON groups.join_records TO dtx_group_runtime;
 GRANT SELECT, INSERT ON groups.membership_commands TO dtx_group_runtime;
+GRANT SELECT, INSERT ON groups.control_commands TO dtx_group_runtime;
 GRANT SELECT, INSERT, UPDATE ON groups.membership_workflows TO dtx_group_runtime;
 GRANT SELECT, INSERT, UPDATE ON groups.sequencer_outbox TO dtx_group_runtime;
 
