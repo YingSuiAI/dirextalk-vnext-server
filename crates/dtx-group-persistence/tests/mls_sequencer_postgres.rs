@@ -63,10 +63,37 @@ fn command(
     key_byte: u8,
     authorization: MlsCommitAuthorization,
 ) -> MlsCommitCommand {
+    command_for_scope(
+        scope(),
+        submission,
+        actor,
+        actor_device,
+        candidate_device,
+        epoch,
+        head,
+        commit_byte,
+        key_byte,
+        authorization,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_for_scope(
+    target_scope: GroupScope,
+    submission: &str,
+    actor: IdentityId,
+    actor_device: DeviceId,
+    candidate_device: DeviceId,
+    epoch: u64,
+    head: Sha256Digest,
+    commit_byte: u8,
+    key_byte: u8,
+    authorization: MlsCommitAuthorization,
+) -> MlsCommitCommand {
     let commit = vec![commit_byte; 48];
     MlsCommitCommand::new(
         request(submission),
-        scope(),
+        target_scope,
         actor,
         actor_device,
         owner(),
@@ -225,6 +252,95 @@ async fn bootstrap_replay_confirmation_and_concurrent_device_add_are_fenced()
             .is_device_active(&store, tenant(), scope(), owner(), owner_device)
             .await?
     );
+
+    let other_scope = GroupScope::PrivateConversation(ConversationId::from_str(
+        "0190f2a5-7b1c-7abc-8def-0123456789b0",
+    )?);
+    GroupMembershipRepository
+        .bootstrap(
+            &store,
+            tenant(),
+            &GroupPolicy::new(other_scope, owner()),
+            2_150,
+        )
+        .await?;
+    let conflict_cases = [
+        (
+            "cross-scope submission reuse",
+            command_for_scope(
+                other_scope,
+                "0190f2a5-7b1c-7abc-8def-0123456789a3",
+                owner(),
+                owner_device,
+                owner_device,
+                0,
+                digest(0),
+                0x91,
+                0x81,
+                MlsCommitAuthorization::OwnerBootstrap,
+            ),
+            false,
+        ),
+        (
+            "same commit digest with changed key",
+            command(
+                "0190f2a5-7b1c-7abc-8def-0123456789b1",
+                owner(),
+                owner_device,
+                device("0190f2a5-7b1c-7abc-8def-0123456789b2"),
+                1,
+                execution.receipt().head_digest(),
+                0x11,
+                0x82,
+                MlsCommitAuthorization::ExistingMemberDeviceAdd {
+                    controller_device_id: owner_device,
+                    controller_consent_digest: digest(0x83),
+                },
+            ),
+            false,
+        ),
+        (
+            "same device second admission",
+            command(
+                "0190f2a5-7b1c-7abc-8def-0123456789b3",
+                owner(),
+                owner_device,
+                owner_device,
+                1,
+                execution.receipt().head_digest(),
+                0x92,
+                0x84,
+                MlsCommitAuthorization::ExistingMemberDeviceAdd {
+                    controller_device_id: owner_device,
+                    controller_consent_digest: digest(0x85),
+                },
+            ),
+            true,
+        ),
+    ];
+    for (name, conflicting_command, authorization_rejection) in conflict_cases {
+        let error = repository
+            .submit(
+                &store,
+                tenant(),
+                &conflicting_command,
+                2_160,
+                signer_public,
+                |_| Ok(()),
+                |_| Ok(()),
+                |input| Ok(sign(&signer, input)),
+            )
+            .await
+            .expect_err(name);
+        assert!(
+            if authorization_rejection {
+                matches!(error, GroupPersistenceError::MlsAuthorizationRejected)
+            } else {
+                matches!(error, GroupPersistenceError::MlsCommitConflict)
+            },
+            "{name}: unexpected error {error}"
+        );
+    }
     assert!(
         repository
             .confirm(&store, tenant(), confirmation, 2_101, signer_public)
@@ -593,6 +709,42 @@ async fn confirmed_approved_device_waits_for_gm1_identity_finalize() -> Result<(
             |input| Ok(sign(&signer, input)),
         )
         .await?;
+    let second_commit = vec![0x56; 48];
+    let duplicate_approval = MlsCommitCommand::new(
+        request("0190f2a5-7b1c-7abc-8def-0123456789b4"),
+        scope(),
+        owner(),
+        owner_device,
+        candidate,
+        candidate_device,
+        digest(0x71),
+        digest(0x72),
+        digest(0x73),
+        2,
+        accepted.receipt().head_digest(),
+        second_commit.clone(),
+        mls_opaque_commit_digest(&second_commit),
+        digest(0x74),
+        MlsCommitAuthorization::ApprovedIdentityJoin {
+            membership_command_id: approval_id,
+            authorization_digest,
+        },
+    )?;
+    assert!(matches!(
+        MlsCommitSequencerRepository
+            .submit(
+                &store,
+                tenant(),
+                &duplicate_approval,
+                2_250,
+                public,
+                |_| Ok(()),
+                |_| Ok(()),
+                |input| Ok(sign(&signer, input)),
+            )
+            .await,
+        Err(GroupPersistenceError::MlsAuthorizationRejected)
+    ));
     let unsigned = MlsDeviceJoinConfirmation {
         submission_id: approved.submission_id(),
         identity_id: candidate,

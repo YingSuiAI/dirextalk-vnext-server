@@ -546,7 +546,33 @@ where
         "{}:mls-idempotency:{}:{}:{}:{}",
         tenant_id, kind, id, command.actor_identity_id, command.idempotency_key_hash
     );
-    let mut locks = [submission_lock, idempotency_lock];
+    let commit_lock = format!(
+        "{}:mls-commit:{}:{}:{}",
+        tenant_id, kind, id, command.commit_digest
+    );
+    let candidate_lock = format!(
+        "{}:mls-candidate:{}:{}:{}:{}",
+        tenant_id, kind, id, command.candidate_identity_id, command.candidate_device_id
+    );
+    let mut locks = vec![
+        submission_lock,
+        idempotency_lock,
+        commit_lock,
+        candidate_lock,
+    ];
+    if let MlsCommitAuthorization::ApprovedIdentityJoin {
+        membership_command_id,
+        ..
+    } = command.authorization
+    {
+        locks.push(format!(
+            "{}:mls-membership-command:{}:{}:{}",
+            tenant_id,
+            kind,
+            id,
+            membership_command_id.request_id()
+        ));
+    }
     locks.sort();
     for lock in locks {
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -574,6 +600,12 @@ where
         load_existing_idempotency(connection, tenant_id, command, sequencer_signing_key).await?
     {
         return replay_or_conflict(existing, command);
+    }
+    if commit_digest_exists(connection, tenant_id, command).await? {
+        return Err(GroupPersistenceError::MlsCommitConflict);
+    }
+    if membership_command_was_admitted(connection, tenant_id, command).await? {
+        return Err(GroupPersistenceError::MlsAuthorizationRejected);
     }
 
     verify_candidate_proof(command)?;
@@ -1052,6 +1084,51 @@ async fn load_existing_idempotency(
         expected_signing_key,
     )
     .await
+}
+
+async fn commit_digest_exists(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    command: &MlsCommitCommand,
+) -> Result<bool, GroupPersistenceError> {
+    let (kind, id) = scope_columns(command.scope);
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM groups.mls_commit_intents
+          WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND commit_digest=$4)",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(kind)
+    .bind(id)
+    .bind(command.commit_digest.as_bytes().as_slice())
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(Into::into)
+}
+
+async fn membership_command_was_admitted(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    command: &MlsCommitCommand,
+) -> Result<bool, GroupPersistenceError> {
+    let MlsCommitAuthorization::ApprovedIdentityJoin {
+        membership_command_id,
+        ..
+    } = command.authorization
+    else {
+        return Ok(false);
+    };
+    let (kind, id) = scope_columns(command.scope);
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM groups.mls_commit_intents
+          WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND membership_command_id=$4)",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(kind)
+    .bind(id)
+    .bind(Uuid::from(membership_command_id.request_id()))
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(Into::into)
 }
 
 async fn load_receipt(

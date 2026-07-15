@@ -110,6 +110,10 @@ CREATE TABLE groups.mls_commit_receipts (
     CHECK (octet_length(signature) = 64)
 );
 
+CREATE UNIQUE INDEX groups_mls_commit_intents_membership_command_unique
+    ON groups.mls_commit_intents (tenant_id, scope_kind, scope_id, membership_command_id)
+    WHERE membership_command_id IS NOT NULL;
+
 CREATE TABLE groups.mls_sequencer_outbox (
     tenant_id uuid NOT NULL,
     submission_id uuid NOT NULL,
