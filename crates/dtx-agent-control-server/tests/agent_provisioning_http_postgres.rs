@@ -197,6 +197,62 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
     let router = agent_provisioning_owner_router(Arc::new(
         PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app.clone()),
     ));
+    let v1_connectors =
+        owner_get_with_accept(router.clone(), "/v1/connectors", &authorization, None).await?;
+    assert_eq!(v1_connectors.0, StatusCode::OK);
+    assert_eq!(
+        v1_connectors.1.as_deref(),
+        Some("application/vnd.dirextalk.connector-projection-page.v1+json")
+    );
+    let v1_connectors_json: serde_json::Value = serde_json::from_slice(&v1_connectors.2)?;
+    assert_eq!(v1_connectors_json["schema_version"], 1);
+    assert!(v1_connectors_json.get("tenant_id").is_none());
+
+    let v2_connectors = owner_get_with_accept(
+        router.clone(),
+        "/v1/connectors",
+        &authorization,
+        Some("application/vnd.dirextalk.connector-projection-page.v2+json"),
+    )
+    .await?;
+    assert_eq!(v2_connectors.0, StatusCode::OK);
+    assert_eq!(
+        v2_connectors.1.as_deref(),
+        Some("application/vnd.dirextalk.connector-projection-page.v2+json")
+    );
+    let v2_connectors_json: serde_json::Value = serde_json::from_slice(&v2_connectors.2)?;
+    assert_eq!(v2_connectors_json["schema_version"], 2);
+    assert_eq!(v2_connectors_json["tenant_id"], tenant_id.to_string());
+    assert_eq!(v2_connectors_json["items"], v1_connectors_json["items"]);
+    assert_eq!(
+        v2_connectors_json["next_cursor"],
+        v1_connectors_json["next_cursor"]
+    );
+
+    let unauthenticated_v2 = owner_get_with_accept(
+        router.clone(),
+        "/v1/connectors",
+        "",
+        Some("application/vnd.dirextalk.connector-projection-page.v2+json"),
+    )
+    .await?;
+    assert_eq!(unauthenticated_v2.0, StatusCode::UNAUTHORIZED);
+    let unauthenticated_v2_json: serde_json::Value = serde_json::from_slice(&unauthenticated_v2.2)?;
+    assert!(unauthenticated_v2_json.get("tenant_id").is_none());
+
+    let unsupported_accept = owner_get_with_accept(
+        router.clone(),
+        "/v1/connectors",
+        &authorization,
+        Some("application/json"),
+    )
+    .await?;
+    assert_eq!(unsupported_accept.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(unsupported_accept.1.as_deref(), Some("application/json"));
+    let unsupported_accept_json: serde_json::Value = serde_json::from_slice(&unsupported_accept.2)?;
+    assert_eq!(unsupported_accept_json["error"]["code"], "request_invalid");
+    assert!(unsupported_accept_json.get("tenant_id").is_none());
+
     let approval_id = dtx_domain::ApprovalId::new();
     let approval_body = approval_body(
         approval_id,
@@ -892,18 +948,29 @@ async fn owner_get(
     uri: &str,
     authorization: &str,
 ) -> Result<(StatusCode, Vec<u8>), Box<dyn Error>> {
-    let response = router
-        .oneshot(
-            Request::get(uri)
-                .header(header::AUTHORIZATION, authorization)
-                .body(Body::empty())?,
-        )
-        .await?;
+    let (status, _, body) = owner_get_with_accept(router, uri, authorization, None).await?;
+    Ok((status, body))
+}
+
+async fn owner_get_with_accept(
+    router: axum::Router,
+    uri: &str,
+    authorization: &str,
+    accept: Option<&str>,
+) -> Result<(StatusCode, Option<String>, Vec<u8>), Box<dyn Error>> {
+    let mut request = Request::get(uri).header(header::AUTHORIZATION, authorization);
+    if let Some(accept) = accept {
+        request = request.header(header::ACCEPT, accept);
+    }
+    let response = router.oneshot(request.body(Body::empty())?).await?;
     let status = response.status();
-    Ok((
-        status,
-        to_bytes(response.into_body(), 1_000_000).await?.to_vec(),
-    ))
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let body = to_bytes(response.into_body(), 1_000_000).await?.to_vec();
+    Ok((status, content_type, body))
 }
 
 async fn provision_tenant(store: &PgStore, tenant_id: TenantId) -> Result<(), Box<dyn Error>> {

@@ -15,6 +15,9 @@ use uuid::Uuid;
 /// Frozen response media type for the first read-only Connector projection.
 pub const CONNECTOR_PROJECTION_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.connector-projection-page.v1+json";
+/// Versioned Owner projection that additionally identifies the authenticated tenant.
+pub const CONNECTOR_PROJECTION_MEDIA_TYPE_V2: &str =
+    "application/vnd.dirextalk.connector-projection-page.v2+json";
 /// Default number of Connector instances returned by one page.
 pub const DEFAULT_CONNECTOR_PROJECTION_LIMIT: u16 = 32;
 /// Hard per-request Connector page ceiling.
@@ -36,6 +39,32 @@ pub struct ConnectorProjectionPageV1 {
     pub observed_at_ms: i64,
     pub items: Vec<ConnectorProjectionV1>,
     pub next_cursor: Option<String>,
+}
+
+/// V2 preserves the V1 page payload and adds its canonical tenant scope.
+///
+/// The Owner HTTP adapter only constructs this value after the Device Session
+/// has been authenticated within the tenant-scoped transaction.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConnectorProjectionPageV2 {
+    pub schema_version: u8,
+    pub tenant_id: String,
+    pub observed_at_ms: i64,
+    pub items: Vec<ConnectorProjectionV1>,
+    pub next_cursor: Option<String>,
+}
+
+impl ConnectorProjectionPageV2 {
+    #[must_use]
+    pub fn from_v1(tenant_id: TenantId, page: ConnectorProjectionPageV1) -> Self {
+        Self {
+            schema_version: 2,
+            tenant_id: tenant_id.to_string(),
+            observed_at_ms: page.observed_at_ms,
+            items: page.items,
+            next_cursor: page.next_cursor,
+        }
+    }
 }
 
 /// Non-secret state for one independent Connector process.
