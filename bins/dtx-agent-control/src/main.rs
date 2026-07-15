@@ -24,8 +24,9 @@ use axum::{
 use config::BootstrapConfig;
 use dtx_agent_control_server::{
     AgentRunIngressApplication, ConnectorCertificateAuthority, ConnectorControlApplication,
-    ConnectorCredentialAuthorizationIndex, PostgresConnectorControlApplication,
-    ProtobufDurableCommandDecoder, agent_run_ingress_service, connector_control_service,
+    ConnectorCredentialAuthorizationIndex, PostgresAgentProvisioningOwnerBackend,
+    PostgresConnectorControlApplication, ProtobufDurableCommandDecoder,
+    agent_provisioning_owner_router, agent_run_ingress_service, connector_control_service,
     connector_enrollment_service, connector_tls_incoming, tls_incoming,
 };
 use dtx_security::{
@@ -69,10 +70,25 @@ const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[
         "EXECUTE",
     ),
     ("agent.router_stable_names(text[])", "EXECUTE"),
+    ("identity.identity_agent_reader_authorized()", "EXECUTE"),
 ];
 const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.installations", "SELECT"),
     ("agent.agent_devices", "SELECT"),
+    ("identity.device_sessions", "SELECT"),
+    ("identity.log_heads", "SELECT"),
+    ("identity.log_entries", "SELECT"),
+    ("agent.agent_identity_approvals", "SELECT"),
+    ("agent.agent_identity_approvals", "INSERT"),
+    ("agent.agent_provisioning_recipients", "SELECT"),
+    ("agent.agent_provisioning_recipients", "INSERT"),
+    ("agent.agent_provisioning_recipients", "UPDATE"),
+    ("agent.agent_provisioning_deliveries", "SELECT"),
+    ("agent.agent_provisioning_deliveries", "INSERT"),
+    ("agent.agent_provisioning_deliveries", "UPDATE"),
+    ("agent.agent_provisioning_outbox", "INSERT"),
+    ("agent.agent_installation_revocations", "SELECT"),
+    ("agent.agent_installation_revocations", "INSERT"),
     ("agent.connector_conformance", "SELECT"),
     ("agent.binding_set_heads", "SELECT"),
     ("agent.installation_routing_policies", "SELECT"),
@@ -162,12 +178,16 @@ async fn run() -> Result<(), BootstrapError> {
     let health_listener = TcpListener::bind(config.health.listen)
         .await
         .map_err(|_| BootstrapError::Bind)?;
+    let owner_api_listener = TcpListener::bind(config.owner_api.listen)
+        .await
+        .map_err(|_| BootstrapError::Bind)?;
 
     let database_options = load_database_options(&config.database_url_file)?;
     let store = PgStore::connect(database_options, config.max_database_connections)
         .await
         .map_err(|_| BootstrapError::Database)?;
     let health_store = store.clone();
+    let owner_api_store = store.clone();
     let accepting_requests = Arc::new(AtomicBool::new(false));
 
     let authorization_index = Arc::new(ConnectorCredentialAuthorizationIndex::new());
@@ -232,6 +252,7 @@ async fn run() -> Result<(), BootstrapError> {
     let (control_shutdown_tx, control_shutdown_rx) = oneshot::channel();
     let (legacy_gateway_shutdown_tx, legacy_gateway_shutdown_rx) = oneshot::channel();
     let (health_shutdown_tx, health_shutdown_rx) = oneshot::channel();
+    let (owner_api_shutdown_tx, owner_api_shutdown_rx) = oneshot::channel();
     let enrollment_server = Server::builder().serve_with_incoming_shutdown(
         connector_enrollment_service(enrollment_application),
         tls_incoming(enrollment_listener, Arc::new(enrollment_server_config)),
@@ -267,10 +288,25 @@ async fn run() -> Result<(), BootstrapError> {
             })
             .await
     };
+    let owner_backend = Arc::new(PostgresAgentProvisioningOwnerBackend::new(
+        owner_api_store,
+        config.owner_api.tenant_id,
+    ));
+    let owner_api_server = async move {
+        axum::serve(
+            owner_api_listener,
+            agent_provisioning_owner_router(owner_backend),
+        )
+        .with_graceful_shutdown(async {
+            let _ = owner_api_shutdown_rx.await;
+        })
+        .await
+    };
     tokio::pin!(enrollment_server);
     tokio::pin!(control_server);
     tokio::pin!(legacy_gateway_server);
     let mut health_server = tokio::spawn(health_server);
+    let mut owner_api_server = tokio::spawn(owner_api_server);
 
     accepting_requests.store(true, Ordering::Release);
     report_ready(
@@ -278,6 +314,7 @@ async fn run() -> Result<(), BootstrapError> {
         config.control.listen,
         config.legacy_gateway.listen,
         config.health.listen,
+        config.owner_api.listen,
     )?;
     tokio::select! {
         result = &mut enrollment_server => {
@@ -287,7 +324,8 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let _ = tokio::join!(control_server.as_mut(), legacy_gateway_server.as_mut());
                 let _ = health_shutdown_tx.send(());
-                let _ = (&mut health_server).await;
+                let _ = owner_api_shutdown_tx.send(());
+                let _ = tokio::join!(&mut health_server, &mut owner_api_server);
             }).await;
             endpoint_result(&result)
         }
@@ -298,7 +336,8 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let _ = tokio::join!(enrollment_server.as_mut(), legacy_gateway_server.as_mut());
                 let _ = health_shutdown_tx.send(());
-                let _ = (&mut health_server).await;
+                let _ = owner_api_shutdown_tx.send(());
+                let _ = tokio::join!(&mut health_server, &mut owner_api_server);
             }).await;
             endpoint_result(&result)
         }
@@ -309,7 +348,8 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let _ = tokio::join!(enrollment_server.as_mut(), control_server.as_mut());
                 let _ = health_shutdown_tx.send(());
-                let _ = (&mut health_server).await;
+                let _ = owner_api_shutdown_tx.send(());
+                let _ = tokio::join!(&mut health_server, &mut owner_api_server);
             }).await;
             endpoint_result(&result)
         }
@@ -318,12 +358,30 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = enrollment_shutdown_tx.send(());
             let _ = control_shutdown_tx.send(());
             let _ = legacy_gateway_shutdown_tx.send(());
+            let _ = owner_api_shutdown_tx.send(());
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
-                tokio::join!(
+                let _ = tokio::join!(
                     enrollment_server.as_mut(),
                     control_server.as_mut(),
                     legacy_gateway_server.as_mut(),
-                )
+                );
+                let _ = (&mut owner_api_server).await;
+            }).await;
+            health_task_result(&result)
+        }
+        result = &mut owner_api_server => {
+            accepting_requests.store(false, Ordering::Release);
+            let _ = enrollment_shutdown_tx.send(());
+            let _ = control_shutdown_tx.send(());
+            let _ = legacy_gateway_shutdown_tx.send(());
+            let _ = health_shutdown_tx.send(());
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+                let _ = tokio::join!(
+                    enrollment_server.as_mut(),
+                    control_server.as_mut(),
+                    legacy_gateway_server.as_mut(),
+                );
+                let _ = (&mut health_server).await;
             }).await;
             health_task_result(&result)
         }
@@ -333,6 +391,7 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = enrollment_shutdown_tx.send(());
             let _ = control_shutdown_tx.send(());
             let _ = legacy_gateway_shutdown_tx.send(());
+            let _ = owner_api_shutdown_tx.send(());
             tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let (enrollment, control, legacy_gateway) = tokio::join!(
                     enrollment_server.as_mut(),
@@ -347,6 +406,10 @@ async fn run() -> Result<(), BootstrapError> {
                     .await
                     .map_err(|_| BootstrapError::Server)?;
                 health.map_err(|_| BootstrapError::Server)?;
+                let owner_api = (&mut owner_api_server)
+                    .await
+                    .map_err(|_| BootstrapError::Server)?;
+                owner_api.map_err(|_| BootstrapError::Server)?;
                 Ok::<(), BootstrapError>(())
             })
             .await
@@ -569,11 +632,12 @@ fn report_ready(
     control: SocketAddr,
     legacy_gateway: SocketAddr,
     health: SocketAddr,
+    owner_api: SocketAddr,
 ) -> Result<(), BootstrapError> {
     let mut output = io::stdout().lock();
     writeln!(
         output,
-        "dtx-agent-control ready enrollment={enrollment} control={control} legacy_gateway={legacy_gateway} health={health}"
+        "dtx-agent-control ready enrollment={enrollment} control={control} legacy_gateway={legacy_gateway} health={health} owner_api={owner_api}"
     )
     .map_err(|_| BootstrapError::Ready)?;
     output.flush().map_err(|_| BootstrapError::Ready)

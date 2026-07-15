@@ -775,6 +775,8 @@ dependencies = [
 name = "dtx-agent-control-server"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64ct",
  "dtx-agent-control",
  "dtx-agent-control-proto",
  "dtx-agent-host",
@@ -796,6 +798,8 @@ dependencies = [
  "prost",
  "rcgen",
  "rustls",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "sqlx",
  "testcontainers-modules",

@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use dtx_domain::TenantId;
 use serde::Deserialize;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1_024;
@@ -14,6 +15,7 @@ pub struct BootstrapConfig {
     pub database_url_file: PathBuf,
     pub max_database_connections: u32,
     pub health: HealthEndpoint,
+    pub owner_api: OwnerApiEndpoint,
     pub enrollment: PublicTlsEndpoint,
     pub control: ControlTlsEndpoint,
     pub legacy_gateway: InternalServiceTlsEndpoint,
@@ -23,6 +25,12 @@ pub struct BootstrapConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthEndpoint {
     pub listen: SocketAddr,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerApiEndpoint {
+    pub listen: SocketAddr,
+    pub tenant_id: TenantId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,6 +69,7 @@ struct RawBootstrapConfig {
     database_url_file: PathBuf,
     max_database_connections: u32,
     health: RawHealthEndpoint,
+    owner_api: RawOwnerApiEndpoint,
     enrollment: RawPublicTlsEndpoint,
     control: RawControlTlsEndpoint,
     legacy_gateway: RawControlTlsEndpoint,
@@ -71,6 +80,13 @@ struct RawBootstrapConfig {
 #[serde(deny_unknown_fields)]
 struct RawHealthEndpoint {
     listen: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOwnerApiEndpoint {
+    listen: String,
+    tenant_id: String,
 }
 
 #[derive(Deserialize)]
@@ -126,11 +142,21 @@ impl RawBootstrapConfig {
         let control_listen = parse_listen(&self.control.listen)?;
         let legacy_gateway_listen = parse_listen(&self.legacy_gateway.listen)?;
         let health_listen = parse_listen(&self.health.listen)?;
+        let owner_api_listen = parse_listen(&self.owner_api.listen)?;
+        if !owner_api_listen.ip().is_loopback() {
+            return Err(ConfigError::OwnerApiExposure);
+        }
+        let owner_tenant_id = self
+            .owner_api
+            .tenant_id
+            .parse::<TenantId>()
+            .map_err(|_| ConfigError::TenantId)?;
         if !listeners_are_distinct(&[
             enrollment_listen,
             control_listen,
             legacy_gateway_listen,
             health_listen,
+            owner_api_listen,
         ]) {
             return Err(ConfigError::ListenerCollision);
         }
@@ -139,6 +165,10 @@ impl RawBootstrapConfig {
             max_database_connections: self.max_database_connections,
             health: HealthEndpoint {
                 listen: health_listen,
+            },
+            owner_api: OwnerApiEndpoint {
+                listen: owner_api_listen,
+                tenant_id: owner_tenant_id,
             },
             enrollment: PublicTlsEndpoint {
                 listen: enrollment_listen,
@@ -213,6 +243,8 @@ pub enum ConfigError {
     DatabasePoolSize,
     ListenAddress,
     ListenerCollision,
+    OwnerApiExposure,
+    TenantId,
     EmptyPath,
 }
 
@@ -225,6 +257,8 @@ impl fmt::Display for ConfigError {
             Self::DatabasePoolSize => "database pool size is invalid",
             Self::ListenAddress => "listener address is invalid",
             Self::ListenerCollision => "listener addresses must be distinct",
+            Self::OwnerApiExposure => "Owner API listener must use a loopback address",
+            Self::TenantId => "Owner API tenant ID must be canonical UUIDv7",
             Self::EmptyPath => "bootstrap path is empty",
         })
     }
@@ -242,6 +276,10 @@ mod tests {
             "max_database_connections": 16,
             "health": {
                 "listen": "127.0.0.1:9080"
+            },
+            "owner_api": {
+                "listen": "127.0.0.1:9081",
+                "tenant_id": "01890f47-3a5b-7c1d-8e2f-123456789abc"
             },
             "enrollment": {
                 "listen": enrollment,
@@ -314,6 +352,13 @@ mod tests {
         assert_eq!(
             gateway_collision.resolve(Path::new(".")).unwrap_err(),
             ConfigError::ListenerCollision
+        );
+
+        let mut exposed_owner_api = raw("127.0.0.1:9443", "127.0.0.1:9444");
+        exposed_owner_api.owner_api.listen = "0.0.0.0:9081".to_owned();
+        assert_eq!(
+            exposed_owner_api.resolve(Path::new(".")).unwrap_err(),
+            ConfigError::OwnerApiExposure
         );
     }
 }

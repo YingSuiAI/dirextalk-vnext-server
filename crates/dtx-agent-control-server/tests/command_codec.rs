@@ -1,7 +1,7 @@
 use dtx_agent_control::{
     ApplyConfigCommand, CloseStreamCommand, CloseStreamReason, ConfigEntry,
-    DeliverAgentProvisioningCommand, RotateCredentialCommand, ServerCommandPayload, Sha256Digest,
-    command_payload_digest,
+    DeliverAgentProvisioningCommand, RevokeAgentProvisioningCommand, RotateCredentialCommand,
+    ServerCommandPayload, Sha256Digest, command_payload_digest,
 };
 use dtx_agent_control_proto::v1;
 use dtx_agent_control_server::{ProtobufDurableCommandDecoder, ProtobufDurableCommandEncoder};
@@ -167,6 +167,7 @@ fn maps_rotate_and_close_commands_without_losing_fields() {
 #[test]
 fn production_encoder_round_trips_every_closed_command_without_reconstruction() {
     let revision = Revision::new(7).unwrap();
+    let operation_id = OPERATION_ID.parse::<RequestId>().unwrap();
     let payloads = [
         ServerCommandPayload::ApplyConfig(
             ApplyConfigCommand::new(
@@ -209,9 +210,26 @@ fn production_encoder_round_trips_every_closed_command_without_reconstruction() 
             )
             .unwrap(),
         ),
+        ServerCommandPayload::RevokeAgentProvisioning(
+            RevokeAgentProvisioningCommand::new(
+                operation_id,
+                "01890f47-3a5b-7c1d-8e2f-123456789ab4"
+                    .parse::<InstallationId>()
+                    .unwrap(),
+                "01890f47-3a5b-7c1d-8e2f-123456789ab3"
+                    .parse::<BindingId>()
+                    .unwrap(),
+                Some(
+                    "01890f47-3a5b-7c1d-8e2f-123456789ab5"
+                        .parse::<AgentDeviceId>()
+                        .unwrap(),
+                ),
+                Revision::new(9).unwrap(),
+                2_000,
+            )
+            .unwrap(),
+        ),
     ];
-    let operation_id = OPERATION_ID.parse::<RequestId>().unwrap();
-
     for payload in payloads {
         let encoded = ProtobufDurableCommandEncoder
             .encode(1, operation_id, 3, revision, &payload)

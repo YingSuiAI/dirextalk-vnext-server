@@ -461,6 +461,7 @@ message DurableCommand {
     RotateCredential rotate_credential = 11;
     CloseStream close_stream = 12;
     DeliverAgentProvisioning deliver_agent_provisioning = 13;
+    RevokeAgentProvisioning revoke_agent_provisioning = 14;
   }
 }
 
@@ -476,6 +477,16 @@ message DeliverAgentProvisioning {
   bytes capsule_digest = 9; // Exact 32-byte V23 opaque capsule digest.
   bytes sealed_capsule = 10; // 1..196608 bytes; HPKE ciphertext only.
   uint64 expires_at_millis = 11; // Server-clock deadline; expired commands fail closed.
+}
+
+// Fail-closed local stop/delete after server-side routing was already revoked.
+message RevokeAgentProvisioning {
+  string revocation_id = 1;
+  string installation_id = 2;
+  string binding_id = 3; // Exact local bundle binding; never inferred from installation alone.
+  string agent_device_id = 4; // Empty only for installation-wide revocation.
+  uint64 revocation_revision = 5;
+  uint64 requested_at_millis = 6;
 }
 
 enum DesiredConnectorState {

@@ -19,6 +19,7 @@ mod gateway_authentication;
 mod gateway_service;
 mod gateway_wire;
 mod incoming;
+mod owner_http;
 mod postgres_application;
 mod provisioning;
 mod run_notifications;
@@ -58,6 +59,11 @@ pub use gateway_wire::{
 };
 pub use incoming::{
     MAX_CONCURRENT_TLS_HANDSHAKES, TLS_HANDSHAKE_TIMEOUT, connector_tls_incoming, tls_incoming,
+};
+pub use owner_http::{
+    AgentProvisioningOwnerBackend, AgentProvisioningOwnerError, CborOwnerReply,
+    DeliveryOwnerCommand, PostgresAgentProvisioningOwnerBackend, RevocationOwnerCommand,
+    agent_provisioning_owner_router,
 };
 pub use postgres_application::{
     AgentRunReconcileBatch, ApplyConnectorConfigurationRequest, CancelAgentRunRequest,

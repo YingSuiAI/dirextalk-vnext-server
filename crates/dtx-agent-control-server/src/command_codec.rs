@@ -1,7 +1,8 @@
 use dtx_agent_control::{
     ApplyConfigCommand, CloseStreamCommand, CloseStreamReason, CommandError, ConfigEntry,
-    DeliverAgentProvisioningCommand, ExactCommandBytes, MAX_COMMAND_BYTES, RotateCredentialCommand,
-    ServerCommandPayload, Sha256Digest, command_payload_digest,
+    DeliverAgentProvisioningCommand, ExactCommandBytes, MAX_COMMAND_BYTES,
+    RevokeAgentProvisioningCommand, RotateCredentialCommand, ServerCommandPayload, Sha256Digest,
+    command_payload_digest,
 };
 use dtx_agent_control_proto::v1;
 use dtx_agent_persistence::{
@@ -26,6 +27,7 @@ const DURABLE_COMMAND_RULES: &[FieldRule] = &[
     FieldRule::singular(11, WireType::LengthDelimited),
     FieldRule::singular(12, WireType::LengthDelimited),
     FieldRule::singular(13, WireType::LengthDelimited),
+    FieldRule::singular(14, WireType::LengthDelimited),
 ];
 const APPLY_CONFIG_RULES: &[FieldRule] = &[
     FieldRule::singular(1, WireType::Varint),
@@ -59,6 +61,14 @@ const DELIVER_AGENT_PROVISIONING_RULES: &[FieldRule] = &[
     FieldRule::singular(9, WireType::LengthDelimited),
     FieldRule::singular(10, WireType::LengthDelimited),
     FieldRule::singular(11, WireType::Varint),
+];
+const REVOKE_AGENT_PROVISIONING_RULES: &[FieldRule] = &[
+    FieldRule::singular(1, WireType::LengthDelimited),
+    FieldRule::singular(2, WireType::LengthDelimited),
+    FieldRule::singular(3, WireType::LengthDelimited),
+    FieldRule::singular(4, WireType::LengthDelimited),
+    FieldRule::singular(5, WireType::Varint),
+    FieldRule::singular(6, WireType::Varint),
 ];
 
 /// Canonical protobuf encoding needed by [`dtx_agent_control::CommandLog::append`].
@@ -187,6 +197,25 @@ fn encode_payload(
                 exact,
             ))
         }
+        ServerCommandPayload::RevokeAgentProvisioning(command) => {
+            let requested_at_millis = u64::try_from(command.requested_at_millis())
+                .map_err(|_| CommandError::InvalidCommandPayload)?;
+            let encoded = v1::RevokeAgentProvisioning {
+                revocation_id: command.revocation_id().to_string(),
+                installation_id: command.installation_id().to_string(),
+                binding_id: command.binding_id().to_string(),
+                agent_device_id: command
+                    .agent_device_id()
+                    .map_or_else(String::new, |id| id.to_string()),
+                revocation_revision: command.revocation_revision().get(),
+                requested_at_millis,
+            };
+            let exact = encoded.encode_to_vec();
+            Ok((
+                v1::durable_command::Command::RevokeAgentProvisioning(encoded),
+                exact,
+            ))
+        }
     }
 }
 
@@ -263,6 +292,9 @@ impl DurableCommandDecoder for ProtobufDurableCommandDecoder {
     }
 }
 
+// Keep the closed wire-tag dispatch in one place so every accepted tag is
+// checked against the exact embedded payload before reconstruction.
+#[allow(clippy::too_many_lines)]
 fn decode_payload(
     payload_field: u32,
     command: Option<v1::durable_command::Command>,
@@ -357,6 +389,40 @@ fn decode_payload(
             .map(ServerCommandPayload::DeliverAgentProvisioning)
             .map_err(|_| DurableCommandDecodeError)
         }
+        (14, Some(v1::durable_command::Command::RevokeAgentProvisioning(command))) => {
+            validate_wire_schema(exact_payload, REVOKE_AGENT_PROVISIONING_RULES)?;
+            let agent_device_id = if command.agent_device_id.is_empty() {
+                None
+            } else {
+                Some(
+                    command
+                        .agent_device_id
+                        .parse::<AgentDeviceId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                )
+            };
+            RevokeAgentProvisioningCommand::new(
+                command
+                    .revocation_id
+                    .parse::<RequestId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                command
+                    .installation_id
+                    .parse::<InstallationId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                command
+                    .binding_id
+                    .parse::<BindingId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                agent_device_id,
+                Revision::new(command.revocation_revision)
+                    .map_err(|_| DurableCommandDecodeError)?,
+                i64::try_from(command.requested_at_millis)
+                    .map_err(|_| DurableCommandDecodeError)?,
+            )
+            .map(ServerCommandPayload::RevokeAgentProvisioning)
+            .map_err(|_| DurableCommandDecodeError)
+        }
         _ => Err(DurableCommandDecodeError),
     }
 }
@@ -374,7 +440,7 @@ fn validate_apply_config_wire(bytes: &[u8]) -> DecodeResult<()> {
 fn selected_payload<'a>(fields: &[WireField<'a>]) -> DecodeResult<(u32, &'a [u8])> {
     let mut selected = None;
     for field in fields {
-        if matches!(field.number, 10..=13)
+        if matches!(field.number, 10..=14)
             && selected.replace((field.number, field.value)).is_some()
         {
             return Err(DurableCommandDecodeError);

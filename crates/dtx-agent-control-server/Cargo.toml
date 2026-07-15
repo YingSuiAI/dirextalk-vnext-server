@@ -6,6 +6,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+axum.workspace = true
+base64ct.workspace = true
 dtx-agent-control = { path = "../dtx-agent-control" }
 dtx-agent-control-proto = { path = "../dtx-agent-control-proto" }
 dtx-agent-host = { path = "../dtx-agent-host" }
@@ -26,6 +28,8 @@ getrandom.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 time.workspace = true

@@ -327,23 +327,47 @@ CREATE TABLE agent.agent_installation_revocations (
     tenant_id uuid NOT NULL,
     installation_id uuid NOT NULL,
     operation_id uuid NOT NULL,
+    binding_id uuid NOT NULL,
+    connector_id uuid NOT NULL,
+    agent_device_id uuid,
+    scope smallint NOT NULL,
+    committed_revision bigint NOT NULL,
+    command_sequence bigint NOT NULL,
+    command_payload_digest bytea NOT NULL,
+    encoded_command_digest bytea NOT NULL,
     idempotency_key_hash bytea NOT NULL,
     request_digest bytea NOT NULL,
-    stop_command_digest bytea NOT NULL,
     revoked_at_ms bigint NOT NULL,
-    PRIMARY KEY (tenant_id, installation_id),
+    PRIMARY KEY (tenant_id, operation_id),
     CONSTRAINT agent_installation_revocations_operation_unique UNIQUE (tenant_id, operation_id),
+    CONSTRAINT agent_installation_revocations_idempotency_unique UNIQUE (tenant_id, idempotency_key_hash),
     CONSTRAINT agent_installation_revocations_installation_fk FOREIGN KEY (tenant_id, installation_id)
         REFERENCES agent.installations (tenant_id, installation_id) ON DELETE RESTRICT,
+    CONSTRAINT agent_installation_revocations_binding_fk FOREIGN KEY (tenant_id, binding_id)
+        REFERENCES agent.connector_bindings (tenant_id, binding_id) ON DELETE RESTRICT,
     CONSTRAINT agent_installation_revocations_values_valid CHECK (
         system.is_uuid_v7(tenant_id) AND system.is_uuid_v7(installation_id)
-        AND system.is_uuid_v7(operation_id)
+        AND system.is_uuid_v7(operation_id) AND system.is_uuid_v7(binding_id)
+        AND system.is_uuid_v7(connector_id)
+        AND (agent_device_id IS NULL OR system.is_uuid_v7(agent_device_id))
+        AND scope IN (1, 2)
+        AND ((scope = 1 AND agent_device_id IS NULL) OR (scope = 2 AND agent_device_id IS NOT NULL))
+        AND committed_revision BETWEEN 1 AND 9007199254740991
+        AND command_sequence BETWEEN 1 AND 9007199254740991
         AND octet_length(idempotency_key_hash) = 32
         AND octet_length(request_digest) = 32
-        AND octet_length(stop_command_digest) = 32
+        AND octet_length(command_payload_digest) = 32
+        AND octet_length(encoded_command_digest) = 32
         AND revoked_at_ms BETWEEN 0 AND 9007199254740991
     )
 );
+
+CREATE UNIQUE INDEX agent_installation_revocations_installation_scope_unique
+    ON agent.agent_installation_revocations (tenant_id, installation_id)
+    WHERE scope = 1;
+CREATE UNIQUE INDEX agent_installation_revocations_device_scope_unique
+    ON agent.agent_installation_revocations (tenant_id, installation_id, agent_device_id)
+    WHERE scope = 2;
 
 CREATE TRIGGER agent_identity_approvals_append_only BEFORE UPDATE OR DELETE
 ON agent.agent_identity_approvals FOR EACH ROW EXECUTE FUNCTION agent.reject_immutable_mutation();

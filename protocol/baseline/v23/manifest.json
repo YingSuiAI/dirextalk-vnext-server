@@ -5,7 +5,7 @@
   "artifacts": {
     "protocol/cddl/agent-provisioning/v1/agent-provisioning-v1.cddl": "sha256:a0c268291a2aec41e9fe40581c48a251e19b6224f41f9e09f61247dbd4a2d344",
     "protocol/openapi/agent-provisioning/v1/openapi.yaml": "sha256:accb7035bc4e01b167ad675d30a2d4be645b60423bfec0c897101ae2515ed1ab",
-    "protocol/proto/dirextalk/agent_control/v1_3/agent_control.proto": "sha256:f6ff489b325776078c6b61676478fca2dde98e0f70783fef82627db23da04e97",
-    "protocol/test-vectors/agent-provisioning/v1/agent-provisioning-v1.json": "sha256:383b0f727c61d241ca6c89858721db3bbff5a8e0e5b1dcf2bc9f6e249cf104b4"
+    "protocol/proto/dirextalk/agent_control/v1_3/agent_control.proto": "sha256:6395d9d80f249c1197758c5168bf7aa05498031baacd47db1d929754a503eb60",
+    "protocol/test-vectors/agent-provisioning/v1/agent-provisioning-v1.json": "sha256:d24df341a6a8b3c87639e1f3d12c43902cc067b217156ead1ce8b1db45c4ee67"
   }
 }

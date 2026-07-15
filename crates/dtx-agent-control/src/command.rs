@@ -331,6 +331,68 @@ pub struct DeliverAgentProvisioningCommand {
     expires_at_millis: i64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RevokeAgentProvisioningCommand {
+    revocation_id: RequestId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_device_id: Option<AgentDeviceId>,
+    revocation_revision: Revision,
+    requested_at_millis: i64,
+}
+
+impl RevokeAgentProvisioningCommand {
+    /// Creates one local stop/delete instruction after server-side revocation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-positive timestamps.
+    pub fn new(
+        revocation_id: RequestId,
+        installation_id: InstallationId,
+        binding_id: BindingId,
+        agent_device_id: Option<AgentDeviceId>,
+        revocation_revision: Revision,
+        requested_at_millis: i64,
+    ) -> Result<Self, CommandError> {
+        if requested_at_millis <= 0 {
+            return Err(CommandError::InvalidCommandPayload);
+        }
+        Ok(Self {
+            revocation_id,
+            installation_id,
+            binding_id,
+            agent_device_id,
+            revocation_revision,
+            requested_at_millis,
+        })
+    }
+    #[must_use]
+    pub const fn revocation_id(&self) -> RequestId {
+        self.revocation_id
+    }
+    #[must_use]
+    pub const fn installation_id(&self) -> InstallationId {
+        self.installation_id
+    }
+    #[must_use]
+    pub const fn binding_id(&self) -> BindingId {
+        self.binding_id
+    }
+    #[must_use]
+    pub const fn agent_device_id(&self) -> Option<AgentDeviceId> {
+        self.agent_device_id
+    }
+    #[must_use]
+    pub const fn revocation_revision(&self) -> Revision {
+        self.revocation_revision
+    }
+    #[must_use]
+    pub const fn requested_at_millis(&self) -> i64 {
+        self.requested_at_millis
+    }
+}
+
 impl fmt::Debug for DeliverAgentProvisioningCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -447,6 +509,7 @@ pub enum ServerCommandPayload {
     RotateCredential(RotateCredentialCommand),
     CloseStream(CloseStreamCommand),
     DeliverAgentProvisioning(DeliverAgentProvisioningCommand),
+    RevokeAgentProvisioning(RevokeAgentProvisioningCommand),
 }
 
 /// One append-only, exactly replayable server command.
@@ -1228,6 +1291,11 @@ fn validate_payload(
                 || command.sealed_capsule.len() > MAX_PROVISIONING_CAPSULE_BYTES
                 || command.expires_at_millis <= 0
             {
+                return Err(CommandError::InvalidCommandPayload);
+            }
+        }
+        ServerCommandPayload::RevokeAgentProvisioning(command) => {
+            if command.requested_at_millis <= 0 {
                 return Err(CommandError::InvalidCommandPayload);
             }
         }

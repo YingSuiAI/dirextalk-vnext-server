@@ -12,7 +12,9 @@
     "delivery_signature": "dirextalk.agent-provisioning-delivery-signature.v1\\0",
     "installed_result_commit": "dirextalk.agent-provisioning-installed.v1",
     "installed_receipt": "dirextalk.agent-provisioning-installed-receipt.v1\\0",
-    "rejected_result_commit": "dirextalk.agent-provisioning-rejected.v1"
+    "rejected_result_commit": "dirextalk.agent-provisioning-rejected.v1",
+    "revocation_binding": "dirextalk.agent-provisioning-revocation-binding.v1\\0",
+    "revocation_signature": "dirextalk.agent-provisioning-revocation-signature.v1\\0"
   },
   "limits": {
     "opaque_capsule_bytes": 196608,

@@ -4,6 +4,10 @@
   "health": {
     "listen": "127.0.0.1:9080"
   },
+  "owner_api": {
+    "listen": "127.0.0.1:9081",
+    "tenant_id": "01890f47-3a5b-7c1d-8e2f-123456789abc"
+  },
   "enrollment": {
     "listen": "0.0.0.0:9443",
     "certificate_chain_pem": "tls/enrollment-chain.pem",

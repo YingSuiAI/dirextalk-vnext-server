@@ -2193,7 +2193,8 @@ impl PostgresConnectorControlApplication {
             ServerCommandPayload::ApplyConfig(configuration) => Some(configuration.clone()),
             ServerCommandPayload::RotateCredential(_)
             | ServerCommandPayload::CloseStream(_)
-            | ServerCommandPayload::DeliverAgentProvisioning(_) => None,
+            | ServerCommandPayload::DeliverAgentProvisioning(_)
+            | ServerCommandPayload::RevokeAgentProvisioning(_) => None,
         };
         if !acknowledgement_write.advanced() {
             session
@@ -2309,6 +2310,33 @@ impl PostgresConnectorControlApplication {
             .await
             .map_err(persistence_error)?;
         let commands = self.decode_command_batch(batch)?;
+        for command in &commands {
+            if let ServerCommandPayload::DeliverAgentProvisioning(delivery) = command.payload() {
+                sqlx::query(
+                    "UPDATE agent.agent_provisioning_deliveries
+                        SET state='dispatched', dispatched_at_ms=COALESCE(dispatched_at_ms,$3)
+                      WHERE tenant_id=$1 AND delivery_id=$2 AND state='pending'",
+                )
+                .bind(Uuid::from(fence.tenant_id()))
+                .bind(Uuid::from(delivery.delivery_id()))
+                .bind(now)
+                .execute(session.connection())
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                sqlx::query(
+                    "UPDATE agent.agent_provisioning_outbox
+                        SET dispatched_at_ms=COALESCE(dispatched_at_ms,$3),
+                            attempt_count=attempt_count+1, next_attempt_at_ms=$3
+                      WHERE tenant_id=$1 AND delivery_id=$2",
+                )
+                .bind(Uuid::from(fence.tenant_id()))
+                .bind(Uuid::from(delivery.delivery_id()))
+                .bind(now)
+                .execute(session.connection())
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            }
+        }
         session
             .commit()
             .await
