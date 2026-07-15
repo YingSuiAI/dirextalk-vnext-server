@@ -1,6 +1,7 @@
 use dtx_agent_control_proto::v1::{
-    ClientFrame, RunAvailable, RunClaim, RunLeaseGranted, RunRelease, ServerFrame, client_frame,
-    server_frame,
+    ClientFrame, RunAvailable, RunCancelRequested, RunCheckpoint, RunClaim, RunCompleted,
+    RunFailed, RunLeaseGranted, RunOutput, RunRelease, RunReportAcknowledged, ServerFrame,
+    client_frame, server_frame,
 };
 use prost::Message;
 use prost_types::{DescriptorProto, FileDescriptorProto, FileDescriptorSet};
@@ -20,6 +21,15 @@ fn additive_frames_are_generated_on_the_existing_v1_service() {
         Some(client_frame::Kind::RunRelease(_))
     ));
 
+    for kind in [
+        client_frame::Kind::RunCheckpoint(RunCheckpoint::default()),
+        client_frame::Kind::RunOutput(RunOutput::default()),
+        client_frame::Kind::RunCompleted(RunCompleted::default()),
+        client_frame::Kind::RunFailed(RunFailed::default()),
+    ] {
+        assert!(ClientFrame { kind: Some(kind) }.kind.is_some());
+    }
+
     let available = ServerFrame {
         kind: Some(server_frame::Kind::RunAvailable(RunAvailable::default())),
     };
@@ -37,12 +47,31 @@ fn additive_frames_are_generated_on_the_existing_v1_service() {
         granted.kind,
         Some(server_frame::Kind::RunLeaseGranted(_))
     ));
+
+    let cancel = ServerFrame {
+        kind: Some(server_frame::Kind::RunCancelRequested(
+            RunCancelRequested::default(),
+        )),
+    };
+    assert!(matches!(
+        cancel.kind,
+        Some(server_frame::Kind::RunCancelRequested(_))
+    ));
+    assert!(
+        ServerFrame {
+            kind: Some(server_frame::Kind::RunReportAcknowledged(
+                RunReportAcknowledged::default(),
+            )),
+        }
+        .kind
+        .is_some()
+    );
 }
 
 #[test]
 fn descriptor_keeps_offer_ack_distinct_from_execution_authority() {
     let descriptor = FileDescriptorSet::decode(dtx_agent_control_proto::v1::FILE_DESCRIPTOR_SET)
-        .expect("generated v1.1 descriptor is valid");
+        .expect("generated v1.2 descriptor is valid");
     let file = descriptor
         .file
         .iter()
@@ -59,6 +88,10 @@ fn descriptor_keeps_offer_ack_distinct_from_execution_authority() {
             "credential_rotation_proof",
             "run_claim",
             "run_release",
+            "run_checkpoint",
+            "run_output",
+            "run_completed",
+            "run_failed",
         ]
     );
     assert_eq!(
@@ -70,18 +103,12 @@ fn descriptor_keeps_offer_ack_distinct_from_execution_authority() {
             "credential_rotation_result",
             "run_available",
             "run_lease_granted",
+            "run_cancel_requested",
+            "run_report_acknowledged",
         ]
     );
     assert_run_fields(file);
-
-    for deferred in ["RunCheckpoint", "RunOutput", "RunCompleted", "RunFailed"] {
-        assert!(
-            file.message_type
-                .iter()
-                .all(|message| message.name.as_deref() != Some(deferred)),
-            "{deferred} belongs to AR3, not the MC3 additive artifact",
-        );
-    }
+    assert_privacy_preserving_execution_fields(file);
 }
 
 fn assert_run_fields(file: &FileDescriptorProto) {
@@ -129,6 +156,9 @@ fn assert_run_fields(file: &FileDescriptorProto) {
             "granted_at_millis",
             "run_lease_deadline_millis",
             "required_capabilities",
+            "conversation_id",
+            "input_event_id",
+            "grant_version",
         ]
     );
     assert_eq!(
@@ -154,6 +184,107 @@ fn assert_run_fields(file: &FileDescriptorProto) {
     let granted = field_names(message(file, "RunLeaseGranted"));
     assert!(granted.contains(&"run_lease_id"));
     assert!(granted.contains(&"run_lease_epoch"));
+}
+
+fn assert_privacy_preserving_execution_fields(file: &FileDescriptorProto) {
+    assert_eq!(
+        field_names(message(file, "RunExecutionFence")),
+        [
+            "connector_fence",
+            "run_id",
+            "request_id",
+            "installation_id",
+            "binding_id",
+            "connector_id",
+            "offer_attempt",
+            "run_lease_id",
+            "run_lease_epoch",
+            "run_lease_deadline_millis",
+        ]
+    );
+    assert_eq!(
+        field_names(message(file, "RunCheckpoint")),
+        [
+            "execution_fence",
+            "checkpoint_sequence",
+            "checkpoint_artifact_id",
+            "checkpoint_digest",
+        ]
+    );
+    assert_eq!(
+        field_names(message(file, "RunOutput")),
+        [
+            "execution_fence",
+            "output_sequence",
+            "output_event_id",
+            "output_digest",
+        ]
+    );
+    assert_eq!(
+        field_names(message(file, "RunCompleted")),
+        [
+            "execution_fence",
+            "terminal_sequence",
+            "result_event_id",
+            "result_digest",
+        ]
+    );
+    assert_eq!(
+        field_names(message(file, "RunFailed")),
+        [
+            "execution_fence",
+            "terminal_sequence",
+            "stable_error_code",
+            "evidence_artifact_id",
+            "evidence_digest",
+        ]
+    );
+    assert_eq!(
+        field_names(message(file, "RunCancelRequested")),
+        [
+            "execution_fence",
+            "stable_reason",
+            "requested_at_millis",
+            "cancel_deadline_millis",
+        ]
+    );
+    assert_eq!(
+        field_names(message(file, "RunReportAcknowledged")),
+        [
+            "run_id",
+            "run_lease_id",
+            "run_lease_epoch",
+            "report_kind",
+            "report_sequence",
+            "report_digest",
+        ]
+    );
+
+    let forbidden = [
+        "prompt",
+        "plaintext",
+        "content",
+        "output_bytes",
+        "checkpoint_bytes",
+        "provider_response",
+    ];
+    for name in [
+        "RunLeaseGranted",
+        "RunCheckpoint",
+        "RunOutput",
+        "RunCompleted",
+        "RunFailed",
+        "RunCancelRequested",
+        "RunReportAcknowledged",
+    ] {
+        let fields = field_names(message(file, name));
+        assert!(
+            forbidden
+                .iter()
+                .all(|forbidden| !fields.contains(forbidden)),
+            "{name} must carry references and digests only",
+        );
+    }
 }
 
 fn message<'a>(file: &'a FileDescriptorProto, name: &str) -> &'a DescriptorProto {

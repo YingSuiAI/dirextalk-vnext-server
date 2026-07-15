@@ -17,7 +17,10 @@ const DEVICE_SESSIONS_MIGRATION_VERSION: i64 = 202_607_140_010;
 const DEVICE_ENROLLMENT_CHALLENGES_MIGRATION_VERSION: i64 = 202_607_140_011;
 const KEY_PACKAGES_MIGRATION_VERSION: i64 = 202_607_150_012;
 const MAILBOXES_MIGRATION_VERSION: i64 = 202_607_150_013;
-const EXPECTED_MIGRATION_COUNT: i64 = 13;
+const GROUP_DEVICE_SESSION_READER_MIGRATION_VERSION: i64 = 202_607_160_014;
+const GROUP_CONTROL_COMMANDS_MIGRATION_VERSION: i64 = 202_607_160_015;
+const AGENT_RUN_EXECUTION_MIGRATION_VERSION: i64 = 202_607_160_016;
+const EXPECTED_MIGRATION_COUNT: i64 = 16;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -43,6 +46,12 @@ const DEVICE_ENROLLMENT_CHALLENGES_DOWN: &str =
 const KEY_PACKAGES_DOWN: &str =
     include_str!("../../../migrations/202607150012_key_packages.down.sql");
 const MAILBOXES_DOWN: &str = include_str!("../../../migrations/202607150013_mailboxes.down.sql");
+const GROUP_DEVICE_SESSION_READER_DOWN: &str =
+    include_str!("../../../migrations/202607160014_group_device_session_reader.down.sql");
+const GROUP_CONTROL_COMMANDS_DOWN: &str =
+    include_str!("../../../migrations/202607160015_group_control_commands.down.sql");
+const AGENT_RUN_EXECUTION_DOWN: &str =
+    include_str!("../../../migrations/202607160016_agent_run_execution.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -73,7 +82,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -88,8 +97,20 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(DEVICE_ENROLLMENT_CHALLENGES_MIGRATION_VERSION)
     .bind(KEY_PACKAGES_MIGRATION_VERSION)
     .bind(MAILBOXES_MIGRATION_VERSION)
+    .bind(GROUP_DEVICE_SESSION_READER_MIGRATION_VERSION)
+    .bind(GROUP_CONTROL_COMMANDS_MIGRATION_VERSION)
+    .bind(AGENT_RUN_EXECUTION_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(AGENT_RUN_EXECUTION_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(GROUP_CONTROL_COMMANDS_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(GROUP_DEVICE_SESSION_READER_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(MAILBOXES_DOWN)
         .execute(harness.admin_pool())
         .await?;

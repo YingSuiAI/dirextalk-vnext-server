@@ -1042,6 +1042,29 @@ impl AgentRun {
         self.advance(released_at_millis)
     }
 
+    /// Commits the execution terminal while the exact Connector and Run lease
+    /// fences are still live. The caller persists terminal evidence separately.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a stale execution fence, expired lease, invalid routing state,
+    /// or server-clock rollback.
+    pub fn finish(
+        &mut self,
+        run_lease_id: RunLeaseId,
+        run_lease_epoch: u64,
+        connector_fence: ConnectorLeaseFence,
+        finished_at_millis: i64,
+    ) -> Result<(), RouterError> {
+        self.ensure_time(finished_at_millis)?;
+        let lease = self.validate_active_lease(run_lease_id, run_lease_epoch, connector_fence)?;
+        if finished_at_millis >= lease.expires_at_millis {
+            return Err(RouterError::StaleRunLease);
+        }
+        self.state = RunRoutingState::ReconcileRequired;
+        self.advance(finished_at_millis)
+    }
+
     /// Validates both the Connector-control and Run-lease fences for a future
     /// checkpoint/result mutation.
     ///

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use dtx_agent_control::{Sha256Digest, run_failed_report_digest};
 use dtx_agent_router::{
     AgentRun, AgentRunSnapshot, ConnectorLeaseFence, DispatchMode, RouteCandidate, RouterError,
     RunLease, RunLeaseSnapshot, RunOffer, RunOfferSnapshot, RunRequest, RunRoutingState,
@@ -7,10 +8,10 @@ use dtx_agent_router::{
 };
 use dtx_connect_registry::RoutingPolicy;
 use dtx_domain::{
-    BindingId, BootId, Clock, ConnectorId, ConversationId, EventId, InstallationId, LeaseId,
-    RequestId, Revision, RunId, RunLeaseId, RunOfferId, TenantId,
+    ArtifactId, BindingId, BootId, Clock, ConnectorId, ConversationId, EventId, InstallationId,
+    LeaseId, RequestId, Revision, RunId, RunLeaseId, RunOfferId, TenantId,
 };
-use sqlx::{Connection, PgConnection, Row};
+use sqlx::{Connection, PgConnection, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -37,6 +38,52 @@ pub enum AgentRunCreate {
 pub enum AgentRunOfferNext {
     Offered(WriteDisposition<RunOffer>),
     Unavailable,
+}
+
+/// Complete immutable identity of one execution lease report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunExecutionFence {
+    pub tenant_id: TenantId,
+    pub run_id: RunId,
+    pub request_id: RequestId,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub connector_id: ConnectorId,
+    pub offer_attempt: u64,
+    pub run_lease_id: RunLeaseId,
+    pub run_lease_epoch: u64,
+    pub run_lease_deadline_millis: i64,
+    pub connector_fence: ConnectorLeaseFence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunExecutionReport {
+    Checkpoint {
+        sequence: u64,
+        artifact_id: ArtifactId,
+        digest: [u8; 32],
+    },
+    Output {
+        sequence: u64,
+        event_id: EventId,
+        digest: [u8; 32],
+    },
+    Completed {
+        sequence: u64,
+        result_event_id: EventId,
+        digest: [u8; 32],
+    },
+    Failed {
+        sequence: u64,
+        stable_error_code: String,
+        evidence: Option<(ArtifactId, [u8; 32])>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunExecutionWrite {
+    Inserted,
+    Existing,
 }
 
 /// One bounded, durable offer selected for an exact Connector control fence.
@@ -1149,6 +1196,561 @@ impl AgentRunRepository {
         transaction.commit().await?;
         Ok(run)
     }
+
+    /// Persists one exactly fenced execution report. Checkpoint and output
+    /// sequences are independently contiguous; terminal claims atomically
+    /// release capacity and close the routing aggregate.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale execution fences, non-contiguous or conflicting reports,
+    /// expired authority, corrupt persisted state, and database failures.
+    #[allow(clippy::too_many_lines)]
+    pub async fn record_execution(
+        self,
+        connection: &mut PgConnection,
+        fence: RunExecutionFence,
+        report: &RunExecutionReport,
+        clock: &dyn Clock,
+    ) -> Result<RunExecutionWrite, AgentPersistenceError> {
+        let mut transaction = connection.begin().await?;
+        let mut run = load_run(&mut transaction, fence.tenant_id, fence.run_id, true)
+            .await?
+            .ok_or(AgentPersistenceError::FenceConflict)?;
+        validate_execution_identity(&run, fence)?;
+
+        let existing_head = sqlx::query(
+            "SELECT run_lease_id, run_lease_epoch, connector_id, connector_boot_id,
+                    connector_generation, connector_lease_id, connector_lease_epoch,
+                    last_checkpoint_sequence, last_output_sequence, state
+               FROM agent.agent_run_execution_heads
+              WHERE tenant_id=$1 AND run_id=$2 FOR UPDATE",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(fence.run_id))
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(head) = existing_head.as_ref() {
+            validate_execution_head(head, fence)?;
+            if let Some(disposition) =
+                existing_execution_report(&mut transaction, &mut run, fence, report, head, clock)
+                    .await?
+            {
+                transaction.commit().await?;
+                return Ok(disposition);
+            }
+        }
+
+        let control_expires_at =
+            lock_current_control_expiry(&mut transaction, fence.connector_fence).await?;
+        let now_millis = clock
+            .now_utc_millis()
+            .map_err(|_| AgentPersistenceError::CorruptData("execution clock"))?;
+        let deadline = control_expires_at.min(fence.run_lease_deadline_millis);
+        if now_millis >= deadline {
+            return Err(AgentPersistenceError::FenceConflict);
+        }
+
+        if existing_head.is_none() {
+            sqlx::query(
+                "INSERT INTO agent.agent_run_execution_heads (
+                 tenant_id, run_id, run_lease_id, run_lease_epoch, connector_id,
+                 connector_boot_id, connector_generation, connector_lease_id,
+                 connector_lease_epoch, state, created_at_ms, updated_at_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$10)
+             ON CONFLICT DO NOTHING",
+            )
+            .bind(Uuid::from(fence.tenant_id))
+            .bind(Uuid::from(fence.run_id))
+            .bind(Uuid::from(fence.run_lease_id))
+            .bind(to_i64(fence.run_lease_epoch, "Run lease epoch")?)
+            .bind(Uuid::from(fence.connector_id))
+            .bind(Uuid::from(fence.connector_fence.boot_id()))
+            .bind(to_i64(
+                fence.connector_fence.connector_generation(),
+                "Connector generation",
+            )?)
+            .bind(Uuid::from(fence.connector_fence.connector_lease_id()))
+            .bind(to_i64(
+                fence.connector_fence.connector_lease_epoch(),
+                "Connector lease epoch",
+            )?)
+            .bind(now_millis)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        let head = sqlx::query(
+            "SELECT run_lease_id, run_lease_epoch, connector_id, connector_boot_id,
+                    connector_generation, connector_lease_id, connector_lease_epoch,
+                    last_checkpoint_sequence, last_output_sequence, state
+               FROM agent.agent_run_execution_heads
+              WHERE tenant_id=$1 AND run_id=$2 FOR UPDATE",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(fence.run_id))
+        .fetch_one(&mut *transaction)
+        .await?;
+        validate_execution_head(&head, fence)?;
+        let state: String = head.try_get("state")?;
+        let disposition = match report {
+            RunExecutionReport::Checkpoint {
+                sequence,
+                artifact_id,
+                digest,
+            } => {
+                if state != "active" {
+                    return Err(AgentPersistenceError::FenceConflict);
+                }
+                let last = nonnegative_u64(
+                    head.try_get("last_checkpoint_sequence")?,
+                    "checkpoint sequence",
+                )?;
+                if *sequence <= last {
+                    let existing = sqlx::query(
+                        "SELECT checkpoint_artifact_id, checkpoint_digest
+                           FROM agent.agent_run_checkpoints
+                          WHERE tenant_id=$1 AND run_id=$2 AND checkpoint_sequence=$3",
+                    )
+                    .bind(Uuid::from(fence.tenant_id))
+                    .bind(Uuid::from(fence.run_id))
+                    .bind(to_i64(*sequence, "checkpoint sequence")?)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                    let Some(existing) = existing else {
+                        return Err(AgentPersistenceError::CorruptData("checkpoint sequence"));
+                    };
+                    if existing.try_get::<Uuid, _>("checkpoint_artifact_id")?
+                        != Uuid::from(*artifact_id)
+                        || bytes_32(existing.try_get("checkpoint_digest")?, "checkpoint digest")?
+                            != *digest
+                    {
+                        return Err(AgentPersistenceError::ImmutableConflict("Run checkpoint"));
+                    }
+                    RunExecutionWrite::Existing
+                } else {
+                    if *sequence != last + 1 {
+                        return Err(AgentPersistenceError::RevisionConflict {
+                            current: Some(last),
+                        });
+                    }
+                    sqlx::query(
+                        "INSERT INTO agent.agent_run_checkpoints
+                             (tenant_id,run_id,checkpoint_sequence,checkpoint_artifact_id,checkpoint_digest,created_at_ms)
+                         VALUES ($1,$2,$3,$4,$5,$6)",
+                    )
+                    .bind(Uuid::from(fence.tenant_id))
+                    .bind(Uuid::from(fence.run_id))
+                    .bind(to_i64(*sequence, "checkpoint sequence")?)
+                    .bind(Uuid::from(*artifact_id))
+                    .bind(digest.to_vec())
+                    .bind(now_millis)
+                    .execute(&mut *transaction)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE agent.agent_run_execution_heads
+                            SET last_checkpoint_sequence=$3, updated_at_ms=$4
+                          WHERE tenant_id=$1 AND run_id=$2",
+                    )
+                    .bind(Uuid::from(fence.tenant_id))
+                    .bind(Uuid::from(fence.run_id))
+                    .bind(to_i64(*sequence, "checkpoint sequence")?)
+                    .bind(now_millis)
+                    .execute(&mut *transaction)
+                    .await?;
+                    RunExecutionWrite::Inserted
+                }
+            }
+            RunExecutionReport::Output {
+                sequence,
+                event_id,
+                digest,
+            } => {
+                if state != "active" {
+                    return Err(AgentPersistenceError::FenceConflict);
+                }
+                let last =
+                    nonnegative_u64(head.try_get("last_output_sequence")?, "output sequence")?;
+                if *sequence <= last {
+                    let existing = sqlx::query(
+                        "SELECT output_event_id, output_digest FROM agent.agent_run_outputs
+                          WHERE tenant_id=$1 AND run_id=$2 AND output_sequence=$3",
+                    )
+                    .bind(Uuid::from(fence.tenant_id))
+                    .bind(Uuid::from(fence.run_id))
+                    .bind(to_i64(*sequence, "output sequence")?)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                    let Some(existing) = existing else {
+                        return Err(AgentPersistenceError::CorruptData("output sequence"));
+                    };
+                    if existing.try_get::<Uuid, _>("output_event_id")? != Uuid::from(*event_id)
+                        || bytes_32(existing.try_get("output_digest")?, "output digest")? != *digest
+                    {
+                        return Err(AgentPersistenceError::ImmutableConflict("Run output"));
+                    }
+                    RunExecutionWrite::Existing
+                } else {
+                    if *sequence != last + 1 {
+                        return Err(AgentPersistenceError::RevisionConflict {
+                            current: Some(last),
+                        });
+                    }
+                    sqlx::query(
+                        "INSERT INTO agent.agent_run_outputs
+                             (tenant_id,run_id,output_sequence,output_event_id,output_digest,created_at_ms)
+                         VALUES ($1,$2,$3,$4,$5,$6)",
+                    )
+                    .bind(Uuid::from(fence.tenant_id))
+                    .bind(Uuid::from(fence.run_id))
+                    .bind(to_i64(*sequence, "output sequence")?)
+                    .bind(Uuid::from(*event_id))
+                    .bind(digest.to_vec())
+                    .bind(now_millis)
+                    .execute(&mut *transaction)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE agent.agent_run_execution_heads
+                            SET last_output_sequence=$3, updated_at_ms=$4
+                          WHERE tenant_id=$1 AND run_id=$2",
+                    )
+                    .bind(Uuid::from(fence.tenant_id))
+                    .bind(Uuid::from(fence.run_id))
+                    .bind(to_i64(*sequence, "output sequence")?)
+                    .bind(now_millis)
+                    .execute(&mut *transaction)
+                    .await?;
+                    RunExecutionWrite::Inserted
+                }
+            }
+            RunExecutionReport::Completed { .. } | RunExecutionReport::Failed { .. } => {
+                finish_execution(
+                    &mut transaction,
+                    &mut run,
+                    fence,
+                    report,
+                    &state,
+                    now_millis,
+                )
+                .await?
+            }
+        };
+        transaction.commit().await?;
+        Ok(disposition)
+    }
+}
+
+fn validate_execution_identity(
+    run: &AgentRun,
+    fence: RunExecutionFence,
+) -> Result<(), AgentPersistenceError> {
+    let request = run.request();
+    let candidate = run.current_candidate();
+    let lease = run
+        .current_lease()
+        .ok_or(AgentPersistenceError::FenceConflict)?;
+    if request.tenant_id() != fence.tenant_id
+        || request.run_id() != fence.run_id
+        || request.request_id() != fence.request_id
+        || request.installation_id() != fence.installation_id
+        || candidate.binding_id() != fence.binding_id
+        || candidate.connector_id() != fence.connector_id
+        || lease.offer_attempt() != fence.offer_attempt
+        || lease.run_lease_id() != fence.run_lease_id
+        || lease.run_lease_epoch() != fence.run_lease_epoch
+        || lease.expires_at_millis() != fence.run_lease_deadline_millis
+        || lease.connector_fence() != fence.connector_fence
+    {
+        return Err(AgentPersistenceError::FenceConflict);
+    }
+    Ok(())
+}
+
+fn validate_execution_head(
+    head: &sqlx::postgres::PgRow,
+    fence: RunExecutionFence,
+) -> Result<(), AgentPersistenceError> {
+    if head.try_get::<Uuid, _>("run_lease_id")? != Uuid::from(fence.run_lease_id)
+        || positive_u64(head.try_get("run_lease_epoch")?, "Run lease epoch")?
+            != fence.run_lease_epoch
+        || head.try_get::<Uuid, _>("connector_id")? != Uuid::from(fence.connector_id)
+        || head.try_get::<Uuid, _>("connector_boot_id")?
+            != Uuid::from(fence.connector_fence.boot_id())
+        || positive_u64(
+            head.try_get("connector_generation")?,
+            "Connector generation",
+        )? != fence.connector_fence.connector_generation()
+        || head.try_get::<Uuid, _>("connector_lease_id")?
+            != Uuid::from(fence.connector_fence.connector_lease_id())
+        || positive_u64(
+            head.try_get("connector_lease_epoch")?,
+            "Connector lease epoch",
+        )? != fence.connector_fence.connector_lease_epoch()
+    {
+        return Err(AgentPersistenceError::FenceConflict);
+    }
+    Ok(())
+}
+
+async fn existing_execution_report(
+    transaction: &mut Transaction<'_, Postgres>,
+    run: &mut AgentRun,
+    fence: RunExecutionFence,
+    report: &RunExecutionReport,
+    head: &sqlx::postgres::PgRow,
+    clock: &dyn Clock,
+) -> Result<Option<RunExecutionWrite>, AgentPersistenceError> {
+    let state: String = head.try_get("state")?;
+    match report {
+        RunExecutionReport::Checkpoint {
+            sequence,
+            artifact_id,
+            digest,
+        } => {
+            let last = nonnegative_u64(
+                head.try_get("last_checkpoint_sequence")?,
+                "checkpoint sequence",
+            )?;
+            if *sequence <= last {
+                let existing = sqlx::query(
+                    "SELECT checkpoint_artifact_id, checkpoint_digest
+                       FROM agent.agent_run_checkpoints
+                      WHERE tenant_id=$1 AND run_id=$2 AND checkpoint_sequence=$3",
+                )
+                .bind(Uuid::from(fence.tenant_id))
+                .bind(Uuid::from(fence.run_id))
+                .bind(to_i64(*sequence, "checkpoint sequence")?)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or(AgentPersistenceError::CorruptData("checkpoint sequence"))?;
+                if existing.try_get::<Uuid, _>("checkpoint_artifact_id")?
+                    != Uuid::from(*artifact_id)
+                    || bytes_32(existing.try_get("checkpoint_digest")?, "checkpoint digest")?
+                        != *digest
+                {
+                    return Err(AgentPersistenceError::ImmutableConflict("Run checkpoint"));
+                }
+                return Ok(Some(RunExecutionWrite::Existing));
+            }
+            if state != "active" {
+                return Err(AgentPersistenceError::FenceConflict);
+            }
+        }
+        RunExecutionReport::Output {
+            sequence,
+            event_id,
+            digest,
+        } => {
+            let last = nonnegative_u64(head.try_get("last_output_sequence")?, "output sequence")?;
+            if *sequence <= last {
+                let existing = sqlx::query(
+                    "SELECT output_event_id, output_digest FROM agent.agent_run_outputs
+                      WHERE tenant_id=$1 AND run_id=$2 AND output_sequence=$3",
+                )
+                .bind(Uuid::from(fence.tenant_id))
+                .bind(Uuid::from(fence.run_id))
+                .bind(to_i64(*sequence, "output sequence")?)
+                .fetch_optional(&mut **transaction)
+                .await?
+                .ok_or(AgentPersistenceError::CorruptData("output sequence"))?;
+                if existing.try_get::<Uuid, _>("output_event_id")? != Uuid::from(*event_id)
+                    || bytes_32(existing.try_get("output_digest")?, "output digest")? != *digest
+                {
+                    return Err(AgentPersistenceError::ImmutableConflict("Run output"));
+                }
+                return Ok(Some(RunExecutionWrite::Existing));
+            }
+            if state != "active" {
+                return Err(AgentPersistenceError::FenceConflict);
+            }
+        }
+        RunExecutionReport::Completed { .. } | RunExecutionReport::Failed { .. } => {
+            if state != "active" {
+                let now_millis = clock
+                    .now_utc_millis()
+                    .map_err(|_| AgentPersistenceError::CorruptData("execution clock"))?;
+                return finish_execution(transaction, run, fence, report, &state, now_millis)
+                    .await
+                    .map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn finish_execution(
+    transaction: &mut Transaction<'_, Postgres>,
+    run: &mut AgentRun,
+    fence: RunExecutionFence,
+    report: &RunExecutionReport,
+    execution_state: &str,
+    now_millis: i64,
+) -> Result<RunExecutionWrite, AgentPersistenceError> {
+    let (
+        sequence,
+        kind,
+        result_event_id,
+        stable_error_code,
+        evidence_artifact_id,
+        evidence_digest,
+        terminal_digest,
+    ) = match report {
+        RunExecutionReport::Completed {
+            sequence,
+            result_event_id,
+            digest,
+        } => (
+            *sequence,
+            "completed",
+            Some(*result_event_id),
+            None,
+            None,
+            None,
+            *digest,
+        ),
+        RunExecutionReport::Failed {
+            sequence,
+            stable_error_code,
+            evidence,
+        } => {
+            let terminal_digest = run_failed_report_digest(
+                stable_error_code,
+                evidence.map(|(artifact_id, digest)| {
+                    (
+                        *artifact_id.as_uuid().as_bytes(),
+                        Sha256Digest::from_bytes(digest),
+                    )
+                }),
+            )
+            .as_bytes();
+            (
+                *sequence,
+                "failed",
+                None,
+                Some(stable_error_code.as_str()),
+                evidence.map(|value| value.0),
+                evidence.map(|value| value.1),
+                terminal_digest,
+            )
+        }
+        _ => return Err(AgentPersistenceError::SnapshotRejected("Run terminal")),
+    };
+
+    if execution_state != "active" {
+        let row = sqlx::query(
+            "SELECT terminal_sequence, terminal_kind, result_event_id, stable_error_code,
+                    evidence_artifact_id, evidence_digest, terminal_digest
+               FROM agent.agent_run_terminals WHERE tenant_id=$1 AND run_id=$2",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(fence.run_id))
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(AgentPersistenceError::CorruptData("Run terminal"))?;
+        let exact = positive_u64(row.try_get("terminal_sequence")?, "terminal sequence")?
+            == sequence
+            && row.try_get::<String, _>("terminal_kind")? == kind
+            && row.try_get::<Option<Uuid>, _>("result_event_id")?
+                == result_event_id.map(Uuid::from)
+            && row
+                .try_get::<Option<String>, _>("stable_error_code")?
+                .as_deref()
+                == stable_error_code
+            && row.try_get::<Option<Uuid>, _>("evidence_artifact_id")?
+                == evidence_artifact_id.map(Uuid::from)
+            && optional_bytes_32(row.try_get("evidence_digest")?, "evidence digest")?
+                == evidence_digest
+            && bytes_32(row.try_get("terminal_digest")?, "terminal digest")? == terminal_digest;
+        return if exact {
+            Ok(RunExecutionWrite::Existing)
+        } else {
+            Err(AgentPersistenceError::ImmutableConflict("Run terminal"))
+        };
+    }
+
+    let expected_revision = run.revision();
+    let candidate = run.current_candidate();
+    let connector_capacity =
+        lock_connector_capacity(transaction, fence.tenant_id, fence.connector_id).await?;
+    let binding_capacity =
+        lock_binding_capacity(transaction, fence.tenant_id, fence.binding_id).await?;
+    if connector_capacity.active == 0 || binding_capacity.active == 0 {
+        return Err(AgentPersistenceError::CorruptData("Run execution capacity"));
+    }
+    run.finish(
+        fence.run_lease_id,
+        fence.run_lease_epoch,
+        fence.connector_fence,
+        now_millis,
+    )
+    .map_err(transition_error)?;
+
+    sqlx::query(
+        "INSERT INTO agent.agent_run_terminals
+             (tenant_id,run_id,terminal_sequence,terminal_kind,result_event_id,
+              stable_error_code,evidence_artifact_id,evidence_digest,terminal_digest,created_at_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+    )
+    .bind(Uuid::from(fence.tenant_id))
+    .bind(Uuid::from(fence.run_id))
+    .bind(to_i64(sequence, "terminal sequence")?)
+    .bind(kind)
+    .bind(result_event_id.map(Uuid::from))
+    .bind(stable_error_code)
+    .bind(evidence_artifact_id.map(Uuid::from))
+    .bind(evidence_digest.map(|value| value.to_vec()))
+    .bind(terminal_digest.to_vec())
+    .bind(now_millis)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE agent.agent_run_execution_heads
+            SET terminal_sequence=$3, terminal_kind=$4, state=$4, updated_at_ms=$5
+          WHERE tenant_id=$1 AND run_id=$2 AND state='active'",
+    )
+    .bind(Uuid::from(fence.tenant_id))
+    .bind(Uuid::from(fence.run_id))
+    .bind(to_i64(sequence, "terminal sequence")?)
+    .bind(kind)
+    .bind(now_millis)
+    .execute(&mut **transaction)
+    .await?;
+    let lease_update = sqlx::query(
+        "UPDATE agent.agent_run_leases SET status='released'
+          WHERE tenant_id=$1 AND run_id=$2 AND run_lease_id=$3 AND status='active'",
+    )
+    .bind(Uuid::from(fence.tenant_id))
+    .bind(Uuid::from(fence.run_id))
+    .bind(Uuid::from(fence.run_lease_id))
+    .execute(&mut **transaction)
+    .await?;
+    if lease_update.rows_affected() != 1 {
+        return Err(AgentPersistenceError::FenceConflict);
+    }
+    advance_connector_capacity(
+        transaction,
+        fence.tenant_id,
+        candidate.connector_id(),
+        connector_capacity,
+        ConnectorCapacity {
+            active: connector_capacity.active - 1,
+            ..connector_capacity
+        },
+        now_millis,
+    )
+    .await?;
+    advance_binding_capacity(
+        transaction,
+        fence.tenant_id,
+        candidate.binding_id(),
+        binding_capacity,
+        binding_capacity.active - 1,
+        now_millis,
+    )
+    .await?;
+    save_head(transaction, run, expected_revision).await?;
+    Ok(RunExecutionWrite::Inserted)
 }
 
 /// Encodes the non-secret tenant/Connector key carried by Run-offer notifications.
@@ -2285,6 +2887,13 @@ fn bytes_32(value: Vec<u8>, field: &'static str) -> Result<[u8; 32], AgentPersis
     value
         .try_into()
         .map_err(|_| AgentPersistenceError::CorruptData(field))
+}
+
+fn optional_bytes_32(
+    value: Option<Vec<u8>>,
+    field: &'static str,
+) -> Result<Option<[u8; 32]>, AgentPersistenceError> {
+    value.map(|value| bytes_32(value, field)).transpose()
 }
 
 fn positive_u64(value: i64, field: &'static str) -> Result<u64, AgentPersistenceError> {

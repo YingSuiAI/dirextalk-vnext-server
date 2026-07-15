@@ -9,8 +9,8 @@ use dtx_security::AuthenticatedConnectorPeer;
 
 use crate::wire::{
     ParsedCommandAcknowledgement, ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat,
-    ParsedHello, ParsedReady, ParsedRunClaim, ParsedRunRelease, RunAvailableWire,
-    RunLeaseGrantedWire,
+    ParsedHello, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted,
+    ParsedRunFailed, ParsedRunOutput, ParsedRunRelease, RunAvailableWire, RunLeaseGrantedWire,
 };
 use crate::{CommandNotificationSubscription, RunOfferNotificationSubscription};
 
@@ -166,6 +166,38 @@ pub trait ConnectorControlApplication: Send + Sync + 'static {
         &self,
         _peer: AuthenticatedConnectorPeer,
         _release: ParsedRunRelease,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    fn record_run_checkpoint(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _checkpoint: ParsedRunCheckpoint,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    fn record_run_output(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _output: ParsedRunOutput,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    fn complete_run(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _completed: ParsedRunCompleted,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    fn fail_run(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _failed: ParsedRunFailed,
     ) -> ApplicationFuture<'_, ()> {
         Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
     }

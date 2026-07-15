@@ -15,7 +15,9 @@ use crate::{
     SourceTransportAdmission, SourceTransportAdmissionConfig, authenticate_control_request,
     build_connect_lease, build_credential_rotation_result, build_durable_command_frame,
     build_enrollment_response, build_heartbeat_acknowledgement, build_run_available,
-    build_run_lease_granted, parse_client_frame, parse_enrollment_request, unix_time_from_millis,
+    build_run_checkpoint_ack, build_run_completed_ack, build_run_failed_ack,
+    build_run_lease_granted, build_run_output_ack, parse_client_frame, parse_enrollment_request,
+    unix_time_from_millis,
 };
 
 /// Maximum time an authenticated control RPC may remain silent before its first `Hello`.
@@ -372,6 +374,7 @@ async fn drive_control(
     let stream_fence = opened.lease.fence();
     let protocol_minor = opened.protocol_minor;
     let router_enabled = protocol_minor >= 1;
+    let execution_reporting_enabled = protocol_minor >= 2;
     // Subscribe before the final durable suffix query. This ordering closes the
     // commit-between-replay-and-wait race while allowing lossy/coalesced hints.
     let mut command_notifications =
@@ -563,6 +566,70 @@ async fn drive_control(
                     ParsedClientFrame::RunRelease(release) => {
                         if router_enabled {
                             application.release_run(peer, release).await
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::RunCheckpoint(checkpoint) => {
+                        if execution_reporting_enabled {
+                            let acknowledgement = build_run_checkpoint_ack(&checkpoint);
+                            match application.record_run_checkpoint(peer, checkpoint).await {
+                                Ok(()) => {
+                                    if !send_frame(&sender, v1::server_frame::Kind::RunReportAcknowledged(acknowledgement)).await {
+                                        return;
+                                    }
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::RunOutput(output) => {
+                        if execution_reporting_enabled {
+                            let acknowledgement = build_run_output_ack(&output);
+                            match application.record_run_output(peer, output).await {
+                                Ok(()) => {
+                                    if !send_frame(&sender, v1::server_frame::Kind::RunReportAcknowledged(acknowledgement)).await {
+                                        return;
+                                    }
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::RunCompleted(completed) => {
+                        if execution_reporting_enabled {
+                            let acknowledgement = build_run_completed_ack(&completed);
+                            match application.complete_run(peer, completed).await {
+                                Ok(()) => {
+                                    if !send_frame(&sender, v1::server_frame::Kind::RunReportAcknowledged(acknowledgement)).await {
+                                        return;
+                                    }
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::RunFailed(failed) => {
+                        if execution_reporting_enabled {
+                            let acknowledgement = build_run_failed_ack(&failed);
+                            match application.fail_run(peer, failed).await {
+                                Ok(()) => {
+                                    if !send_frame(&sender, v1::server_frame::Kind::RunReportAcknowledged(acknowledgement)).await {
+                                        return;
+                                    }
+                                    Ok(())
+                                }
+                                Err(error) => Err(error),
+                            }
                         } else {
                             Err(ConnectorControlApplicationError::PermissionDenied)
                         }

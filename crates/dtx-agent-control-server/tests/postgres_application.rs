@@ -454,7 +454,7 @@ async fn postgres_application_enrollment_is_atomic_idempotent_and_restart_safe()
                     minimum_major: 1,
                     minimum_minor: 0,
                     maximum_major: 1,
-                    maximum_minor: 0,
+                    maximum_minor: 2,
                 },
                 runtime_claims: RuntimeClaims::new(
                     AdapterKind::Codex,
@@ -476,6 +476,10 @@ async fn postgres_application_enrollment_is_atomic_idempotent_and_restart_safe()
         )
         .await?;
     assert_eq!(opened.acknowledged_command_sequence, 0);
+    assert_eq!(
+        opened.protocol_minor, 2,
+        "the production default negotiates the Agent Control 1.2 execution-report contract"
+    );
     assert!(opened.replay_commands.is_empty());
     assert_eq!(opened.lease.fence().tenant_id(), tenant_id);
     assert_eq!(

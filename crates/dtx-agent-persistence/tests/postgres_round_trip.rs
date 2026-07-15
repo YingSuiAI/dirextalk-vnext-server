@@ -9,8 +9,8 @@ use dtx_agent_persistence::{
     AgentDefinitionRepository, AgentDeviceRepository, AgentHostRepository,
     AgentInstallationRepository, AgentPersistenceError, AgentRunCreate, AgentRunOfferNext,
     AgentRunRepository, BindingSetRepository, ConnectorRepository, ConversationGrantRepository,
-    CurrentWrite, DefinitionInsert, RuntimeCapacity, RuntimeClaimRecord, RuntimeClaimRepository,
-    RuntimeClaimSource,
+    CurrentWrite, DefinitionInsert, RunExecutionFence, RunExecutionReport, RunExecutionWrite,
+    RuntimeCapacity, RuntimeClaimRecord, RuntimeClaimRepository, RuntimeClaimSource,
 };
 use dtx_agent_registry::{
     AgentConversationPermission, AgentConversationPermissions, AgentDevice, AgentDeviceCommand,
@@ -27,9 +27,10 @@ use dtx_connect_registry::{
     ConnectorObservedState, ConnectorSnapshot, LeaseStatus, RoutingPolicy, TenantRef,
 };
 use dtx_domain::{
-    AgentDeviceId, AgentId, BindingId, BootId, CloudConnectionId, ConnectorId, ConversationId,
-    DeviceId, Ed25519PublicKey, EventId, GrantId, HostCredentialId, HostId, IdentityId,
-    InstallationId, LeaseId, RequestId, Revision, RunId, RunLeaseId, RunOfferId, TenantId,
+    AgentDeviceId, AgentId, ArtifactId, BindingId, BootId, Clock, ClockError, CloudConnectionId,
+    ConnectorId, ConversationId, DeviceId, Ed25519PublicKey, EventId, GrantId, HostCredentialId,
+    HostId, IdentityId, InstallationId, LeaseId, RequestId, Revision, RunId, RunLeaseId,
+    RunOfferId, TenantId,
 };
 use dtx_storage::PgStore;
 use sqlx::PgConnection;
@@ -38,6 +39,14 @@ use uuid::Uuid;
 
 const AGENT_ID: &str = "dtxa17sv7zwzpr7aduy467sdm3pkmxe6if34eoarhaxdnau44fjwfseda";
 const OWNER_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+
+struct TestClock(i64);
+
+impl Clock for TestClock {
+    fn now_utc_millis(&self) -> Result<i64, ClockError> {
+        Ok(self.0)
+    }
+}
 
 struct PersistedFixture {
     tenant_id: TenantId,
@@ -374,6 +383,15 @@ async fn agent_router_claims_once_and_releases_capacity() -> Result<(), Box<dyn 
         0,
     )
     .await?;
+    assert_execution_reports_are_fenced_and_idempotent(
+        &store,
+        &fixture,
+        router_fence,
+        binding.binding_id,
+        routing_policy.policy,
+        routing_policy.revision,
+    )
+    .await?;
     let mut revoked_grant = fixture.grant.clone();
     revoked_grant.apply(
         &fixture.installation,
@@ -433,11 +451,272 @@ async fn grant_agent_router_runtime_access(
          GRANT SELECT, INSERT, UPDATE ON agent.binding_run_capacity_heads TO dtx_runtime_test;
          GRANT SELECT, INSERT, UPDATE ON agent.agent_run_offers TO dtx_runtime_test;
          GRANT SELECT, INSERT, UPDATE ON agent.agent_run_leases TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_run_execution_heads TO dtx_runtime_test;
+         GRANT SELECT, INSERT ON agent.agent_run_checkpoints TO dtx_runtime_test;
+         GRANT SELECT, INSERT ON agent.agent_run_outputs TO dtx_runtime_test;
+         GRANT SELECT, INSERT ON agent.agent_run_terminals TO dtx_runtime_test;
          GRANT EXECUTE ON FUNCTION agent.router_stable_names(text[]) TO dtx_runtime_test;",
     )
     .execute(harness.admin_pool())
     .await?;
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_execution_reports_are_fenced_and_idempotent(
+    store: &PgStore,
+    fixture: &PersistedFixture,
+    connector_fence: ConnectorLeaseFence,
+    binding_id: BindingId,
+    routing_policy: RoutingPolicy,
+    routing_policy_revision: Revision,
+) -> Result<(), Box<dyn Error>> {
+    let tenant_id = fixture.tenant_id;
+    let connector_id = connector_fence.connector_id();
+    let run = AgentRun::create(
+        RunRequest::new(
+            tenant_id,
+            RunId::new(),
+            RequestId::new(),
+            [0x71; 32],
+            [0x72; 32],
+            fixture.installation.installation_id(),
+            fixture.grant.conversation_id(),
+            EventId::new(),
+            Some(connector_id),
+            vec!["agent.run".to_owned()],
+            DispatchMode::Single,
+            routing_policy,
+            routing_policy_revision,
+            fixture.grant.grant_version().get(),
+            1_179,
+            1_161,
+        )?,
+        vec![RouteCandidate::new(binding_id, connector_id, 1, 2)?],
+    )?;
+    let repository = AgentRunRepository::new();
+    let mut session = store.begin_tenant(tenant_id).await?;
+    repository.create(session.connection(), &run).await?;
+    session.commit().await?;
+
+    let offer_id = RunOfferId::new();
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let (offered, offered_run) = repository
+        .offer_next(
+            session.connection(),
+            tenant_id,
+            run.request().run_id(),
+            run.revision(),
+            offer_id,
+            1_162,
+            1_174,
+        )
+        .await?;
+    session.commit().await?;
+    let offer = match offered {
+        AgentRunOfferNext::Offered(WriteDisposition::Inserted(offer)) => offer,
+        other => panic!("execution boundary fixture must insert an offer: {other:?}"),
+    };
+
+    let run_lease_id = RunLeaseId::new();
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let (_, leased) = repository
+        .claim(
+            session.connection(),
+            tenant_id,
+            run.request().run_id(),
+            offered_run.revision(),
+            offer.offer_id(),
+            offer.attempt(),
+            connector_fence,
+            run_lease_id,
+            1_163,
+            1_173,
+        )
+        .await?;
+    session.commit().await?;
+    assert_capacity(store, tenant_id, connector_id, binding_id, 1).await?;
+
+    let lease = leased.current_lease().expect("execution Run is leased");
+    let fence = RunExecutionFence {
+        tenant_id,
+        run_id: leased.request().run_id(),
+        request_id: leased.request().request_id(),
+        installation_id: leased.request().installation_id(),
+        binding_id,
+        connector_id,
+        offer_attempt: offer.attempt(),
+        run_lease_id,
+        run_lease_epoch: lease.run_lease_epoch(),
+        run_lease_deadline_millis: lease.expires_at_millis(),
+        connector_fence,
+    };
+    let clock = TestClock(1_164);
+    let checkpoint_id = ArtifactId::new();
+    let checkpoint = RunExecutionReport::Checkpoint {
+        sequence: 1,
+        artifact_id: checkpoint_id,
+        digest: [0x81; 32],
+    };
+    assert_eq!(
+        record_execution(store, fence, &checkpoint, &clock).await?,
+        RunExecutionWrite::Inserted
+    );
+    assert_eq!(
+        record_execution(store, fence, &checkpoint, &clock).await?,
+        RunExecutionWrite::Existing
+    );
+    let checkpoint_conflict = RunExecutionReport::Checkpoint {
+        sequence: 1,
+        artifact_id: ArtifactId::new(),
+        digest: [0x81; 32],
+    };
+    assert!(matches!(
+        record_execution(store, fence, &checkpoint_conflict, &clock).await,
+        Err(AgentPersistenceError::ImmutableConflict("Run checkpoint"))
+    ));
+    let checkpoint_gap = RunExecutionReport::Checkpoint {
+        sequence: 3,
+        artifact_id: ArtifactId::new(),
+        digest: [0x83; 32],
+    };
+    assert!(matches!(
+        record_execution(store, fence, &checkpoint_gap, &clock).await,
+        Err(AgentPersistenceError::RevisionConflict { current: Some(1) })
+    ));
+
+    let output_event_id = EventId::new();
+    let output = RunExecutionReport::Output {
+        sequence: 1,
+        event_id: output_event_id,
+        digest: [0x91; 32],
+    };
+    assert_eq!(
+        record_execution(store, fence, &output, &clock).await?,
+        RunExecutionWrite::Inserted
+    );
+    assert_eq!(
+        record_execution(store, fence, &output, &clock).await?,
+        RunExecutionWrite::Existing
+    );
+    let output_gap = RunExecutionReport::Output {
+        sequence: 3,
+        event_id: EventId::new(),
+        digest: [0x93; 32],
+    };
+    assert!(matches!(
+        record_execution(store, fence, &output_gap, &clock).await,
+        Err(AgentPersistenceError::RevisionConflict { current: Some(1) })
+    ));
+
+    let stale_fence = RunExecutionFence {
+        run_lease_epoch: fence.run_lease_epoch + 1,
+        ..fence
+    };
+    assert!(matches!(
+        record_execution(store, stale_fence, &output, &clock).await,
+        Err(AgentPersistenceError::FenceConflict)
+    ));
+
+    let result_event_id = EventId::new();
+    let completed = RunExecutionReport::Completed {
+        sequence: 1,
+        result_event_id,
+        digest: [0xa1; 32],
+    };
+    assert_eq!(
+        record_execution(store, fence, &completed, &clock).await?,
+        RunExecutionWrite::Inserted
+    );
+    assert_capacity(store, tenant_id, connector_id, binding_id, 0).await?;
+    let recovery_clock = TestClock(1_999);
+    assert_eq!(
+        record_execution(store, fence, &checkpoint, &recovery_clock).await?,
+        RunExecutionWrite::Existing,
+        "an exact checkpoint replay remains acknowledgeable after terminal and lease expiry"
+    );
+    assert_eq!(
+        record_execution(store, fence, &output, &recovery_clock).await?,
+        RunExecutionWrite::Existing,
+        "an exact output replay remains acknowledgeable after terminal and lease expiry"
+    );
+    assert_eq!(
+        record_execution(store, fence, &completed, &recovery_clock).await?,
+        RunExecutionWrite::Existing,
+        "an exact terminal replay remains acknowledgeable after lease expiry"
+    );
+    let post_terminal_checkpoint = RunExecutionReport::Checkpoint {
+        sequence: 2,
+        artifact_id: ArtifactId::new(),
+        digest: [0x82; 32],
+    };
+    assert!(matches!(
+        record_execution(store, fence, &post_terminal_checkpoint, &recovery_clock).await,
+        Err(AgentPersistenceError::FenceConflict)
+    ));
+    let terminal_conflict = RunExecutionReport::Completed {
+        sequence: 1,
+        result_event_id,
+        digest: [0xa2; 32],
+    };
+    assert!(matches!(
+        record_execution(store, fence, &terminal_conflict, &clock).await,
+        Err(AgentPersistenceError::ImmutableConflict("Run terminal"))
+    ));
+    assert_capacity(store, tenant_id, connector_id, binding_id, 0).await?;
+
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let stored_checkpoint: (Uuid, Vec<u8>) = sqlx::query_as(
+        "SELECT checkpoint_artifact_id, checkpoint_digest
+           FROM agent.agent_run_checkpoints WHERE tenant_id=$1 AND run_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(fence.run_id))
+    .fetch_one(session.connection())
+    .await?;
+    let stored_output: (Uuid, Vec<u8>) = sqlx::query_as(
+        "SELECT output_event_id, output_digest
+           FROM agent.agent_run_outputs WHERE tenant_id=$1 AND run_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(fence.run_id))
+    .fetch_one(session.connection())
+    .await?;
+    session.commit().await?;
+    assert_eq!(
+        stored_checkpoint,
+        (Uuid::from(checkpoint_id), vec![0x81; 32])
+    );
+    assert_eq!(stored_output, (Uuid::from(output_event_id), vec![0x91; 32]));
+    Ok(())
+}
+
+async fn record_execution(
+    store: &PgStore,
+    fence: RunExecutionFence,
+    report: &RunExecutionReport,
+    clock: &dyn Clock,
+) -> Result<RunExecutionWrite, AgentPersistenceError> {
+    let mut session = store
+        .begin_tenant(fence.tenant_id)
+        .await
+        .expect("test tenant session opens");
+    let result = AgentRunRepository::new()
+        .record_execution(session.connection(), fence, report, clock)
+        .await;
+    match result {
+        Ok(disposition) => {
+            session.commit().await.expect("test transaction commits");
+            Ok(disposition)
+        }
+        Err(error) => {
+            session
+                .rollback()
+                .await
+                .expect("test transaction rolls back");
+            Err(error)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

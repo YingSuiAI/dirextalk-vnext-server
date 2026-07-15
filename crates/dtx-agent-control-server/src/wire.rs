@@ -4,15 +4,16 @@ use dtx_agent_control::{
     CommandAck, ConnectorCredential, CredentialRotationRequest, CredentialRotationTranscript,
     DurableServerCommand, EnrollmentRequest, EnrollmentToken, EnrollmentTranscript,
     MAX_ACTIVE_RUN_IDS, MAX_RUNTIME_CAPABILITIES, MAX_RUNTIME_QUEUE_DEPTH, RuntimeClaims,
-    Sha256Digest,
+    Sha256Digest, run_failed_report_digest,
 };
 use dtx_agent_control_proto::v1;
 use dtx_connect_registry::{
     AdapterKind, ConnectorFence, ConnectorLease, HeartbeatAck, LeaseStatus,
 };
 use dtx_domain::{
-    BindingId, BootId, ConnectorCredentialId, ConnectorId, Ed25519PublicKey, HostId,
-    InstallationId, LeaseId, RequestId, Revision, RunId, RunLeaseId, TenantId,
+    ArtifactId, BindingId, BootId, ConnectorCredentialId, ConnectorId, ConversationId,
+    Ed25519PublicKey, EventId, HostId, InstallationId, LeaseId, RequestId, Revision, RunId,
+    RunLeaseId, TenantId,
 };
 use zeroize::Zeroize as _;
 
@@ -170,6 +171,56 @@ pub struct RunLeaseGrantedWire {
     pub granted_at_millis: i64,
     pub run_lease_deadline_millis: i64,
     pub required_capabilities: Vec<String>,
+    pub conversation_id: ConversationId,
+    pub input_event_id: EventId,
+    pub grant_version: u64,
+}
+
+/// Complete Connector and Run lease authority copied by every execution report.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParsedRunExecutionFence {
+    pub connector_fence: ParsedLeaseFence,
+    pub run_id: RunId,
+    pub request_id: RequestId,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub connector_id: ConnectorId,
+    pub offer_attempt: u64,
+    pub run_lease_id: RunLeaseId,
+    pub run_lease_epoch: u64,
+    pub run_lease_deadline_millis: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedRunCheckpoint {
+    pub execution_fence: ParsedRunExecutionFence,
+    pub checkpoint_sequence: u64,
+    pub checkpoint_artifact_id: ArtifactId,
+    pub checkpoint_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedRunOutput {
+    pub execution_fence: ParsedRunExecutionFence,
+    pub output_sequence: u64,
+    pub output_event_id: EventId,
+    pub output_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedRunCompleted {
+    pub execution_fence: ParsedRunExecutionFence,
+    pub terminal_sequence: u64,
+    pub result_event_id: EventId,
+    pub result_digest: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedRunFailed {
+    pub execution_fence: ParsedRunExecutionFence,
+    pub terminal_sequence: u64,
+    pub stable_error_code: String,
+    pub evidence: Option<(ArtifactId, Sha256Digest)>,
 }
 
 /// Validated first control-stream frame.
@@ -298,6 +349,10 @@ pub enum ParsedClientFrame {
     CredentialRotationProof(ParsedCredentialRotationProof),
     RunClaim(ParsedRunClaim),
     RunRelease(ParsedRunRelease),
+    RunCheckpoint(ParsedRunCheckpoint),
+    RunOutput(ParsedRunOutput),
+    RunCompleted(ParsedRunCompleted),
+    RunFailed(ParsedRunFailed),
 }
 
 /// Converts an enrollment protobuf message into proof-bound domain input.
@@ -527,6 +582,175 @@ pub fn parse_run_release(value: v1::RunRelease) -> Result<ParsedRunRelease, Wire
     })
 }
 
+fn parse_run_execution_fence(
+    value: v1::RunExecutionFence,
+) -> Result<ParsedRunExecutionFence, WireError> {
+    let connector_fence = parse_lease_fence(&required(value.connector_fence, "connector_fence")?)?;
+    let connector_id = parse_id(&value.connector_id, "connector_id")?;
+    if connector_id != connector_fence.connector_id {
+        return Err(invalid_value("connector_id"));
+    }
+    Ok(ParsedRunExecutionFence {
+        connector_fence,
+        run_id: parse_id(&value.run_id, "run_id")?,
+        request_id: parse_id(&value.request_id, "request_id")?,
+        installation_id: parse_id(&value.installation_id, "installation_id")?,
+        binding_id: parse_id(&value.binding_id, "binding_id")?,
+        connector_id,
+        offer_attempt: positive_safe(value.offer_attempt, "offer_attempt")?,
+        run_lease_id: parse_id(&value.run_lease_id, "run_lease_id")?,
+        run_lease_epoch: positive_safe(value.run_lease_epoch, "run_lease_epoch")?,
+        run_lease_deadline_millis: parse_wire_timestamp(
+            value.run_lease_deadline_millis,
+            "run_lease_deadline_millis",
+        )?,
+    })
+}
+
+/// Validates a fenced checkpoint reference and digest.
+///
+/// # Errors
+///
+/// Rejects missing or malformed fences, identifiers, counters, and digests.
+pub fn parse_run_checkpoint(value: v1::RunCheckpoint) -> Result<ParsedRunCheckpoint, WireError> {
+    Ok(ParsedRunCheckpoint {
+        execution_fence: parse_run_execution_fence(required(
+            value.execution_fence,
+            "execution_fence",
+        )?)?,
+        checkpoint_sequence: positive_safe(value.checkpoint_sequence, "checkpoint_sequence")?,
+        checkpoint_artifact_id: parse_id(&value.checkpoint_artifact_id, "checkpoint_artifact_id")?,
+        checkpoint_digest: parse_digest(value.checkpoint_digest, "checkpoint_digest")?,
+    })
+}
+
+/// Validates a fenced encrypted output-event reference and digest.
+///
+/// # Errors
+///
+/// Rejects missing or malformed fences, identifiers, counters, and digests.
+pub fn parse_run_output(value: v1::RunOutput) -> Result<ParsedRunOutput, WireError> {
+    Ok(ParsedRunOutput {
+        execution_fence: parse_run_execution_fence(required(
+            value.execution_fence,
+            "execution_fence",
+        )?)?,
+        output_sequence: positive_safe(value.output_sequence, "output_sequence")?,
+        output_event_id: parse_id(&value.output_event_id, "output_event_id")?,
+        output_digest: parse_digest(value.output_digest, "output_digest")?,
+    })
+}
+
+/// Validates a fenced successful terminal claim.
+///
+/// # Errors
+///
+/// Rejects missing or malformed fences, identifiers, counters, and digests.
+pub fn parse_run_completed(value: v1::RunCompleted) -> Result<ParsedRunCompleted, WireError> {
+    Ok(ParsedRunCompleted {
+        execution_fence: parse_run_execution_fence(required(
+            value.execution_fence,
+            "execution_fence",
+        )?)?,
+        terminal_sequence: positive_safe(value.terminal_sequence, "terminal_sequence")?,
+        result_event_id: parse_id(&value.result_event_id, "result_event_id")?,
+        result_digest: parse_digest(value.result_digest, "result_digest")?,
+    })
+}
+
+/// Validates a fenced stable failure claim containing references only.
+///
+/// # Errors
+///
+/// Rejects missing or malformed fences, counters, stable codes, or incomplete evidence pairs.
+pub fn parse_run_failed(value: v1::RunFailed) -> Result<ParsedRunFailed, WireError> {
+    if !valid_upper_stable_code(&value.stable_error_code) {
+        return Err(invalid_value("stable_error_code"));
+    }
+    let evidence = match (
+        value.evidence_artifact_id.is_empty(),
+        value.evidence_digest.is_empty(),
+    ) {
+        (true, true) => None,
+        (false, false) => Some((
+            parse_id(&value.evidence_artifact_id, "evidence_artifact_id")?,
+            parse_digest(value.evidence_digest, "evidence_digest")?,
+        )),
+        _ => return Err(invalid_value("evidence")),
+    };
+    Ok(ParsedRunFailed {
+        execution_fence: parse_run_execution_fence(required(
+            value.execution_fence,
+            "execution_fence",
+        )?)?,
+        terminal_sequence: positive_safe(value.terminal_sequence, "terminal_sequence")?,
+        stable_error_code: value.stable_error_code,
+        evidence,
+    })
+}
+
+#[must_use]
+pub fn build_run_checkpoint_ack(value: &ParsedRunCheckpoint) -> v1::RunReportAcknowledged {
+    build_run_report_ack(
+        value.execution_fence,
+        "checkpoint",
+        value.checkpoint_sequence,
+        value.checkpoint_digest.as_bytes(),
+    )
+}
+
+#[must_use]
+pub fn build_run_output_ack(value: &ParsedRunOutput) -> v1::RunReportAcknowledged {
+    build_run_report_ack(
+        value.execution_fence,
+        "output",
+        value.output_sequence,
+        value.output_digest.as_bytes(),
+    )
+}
+
+#[must_use]
+pub fn build_run_completed_ack(value: &ParsedRunCompleted) -> v1::RunReportAcknowledged {
+    build_run_report_ack(
+        value.execution_fence,
+        "completed",
+        value.terminal_sequence,
+        value.result_digest.as_bytes(),
+    )
+}
+
+#[must_use]
+pub fn build_run_failed_ack(value: &ParsedRunFailed) -> v1::RunReportAcknowledged {
+    let digest = run_failed_report_digest(
+        &value.stable_error_code,
+        value
+            .evidence
+            .map(|(artifact_id, digest)| (*artifact_id.as_uuid().as_bytes(), digest)),
+    );
+    build_run_report_ack(
+        value.execution_fence,
+        "failed",
+        value.terminal_sequence,
+        digest.as_bytes(),
+    )
+}
+
+fn build_run_report_ack(
+    fence: ParsedRunExecutionFence,
+    kind: &'static str,
+    sequence: u64,
+    digest: [u8; 32],
+) -> v1::RunReportAcknowledged {
+    v1::RunReportAcknowledged {
+        run_id: fence.run_id.to_string(),
+        run_lease_id: fence.run_lease_id.to_string(),
+        run_lease_epoch: fence.run_lease_epoch,
+        report_kind: kind.to_owned(),
+        report_sequence: sequence,
+        report_digest: digest.to_vec(),
+    }
+}
+
 /// Builds a v1.1 offer. Receiving this frame never authorizes execution.
 ///
 /// # Errors
@@ -587,6 +811,9 @@ pub fn build_run_lease_granted(
         granted_at_millis,
         run_lease_deadline_millis,
         required_capabilities: value.required_capabilities,
+        conversation_id: value.conversation_id.to_string(),
+        input_event_id: value.input_event_id.to_string(),
+        grant_version: positive_safe(value.grant_version, "grant_version")?,
     })
 }
 
@@ -610,6 +837,14 @@ pub fn parse_client_frame(value: v1::ClientFrame) -> Result<ParsedClientFrame, W
         }
         Kind::RunClaim(frame) => parse_run_claim(frame).map(ParsedClientFrame::RunClaim),
         Kind::RunRelease(frame) => parse_run_release(frame).map(ParsedClientFrame::RunRelease),
+        Kind::RunCheckpoint(frame) => {
+            parse_run_checkpoint(frame).map(ParsedClientFrame::RunCheckpoint)
+        }
+        Kind::RunOutput(frame) => parse_run_output(frame).map(ParsedClientFrame::RunOutput),
+        Kind::RunCompleted(frame) => {
+            parse_run_completed(frame).map(ParsedClientFrame::RunCompleted)
+        }
+        Kind::RunFailed(frame) => parse_run_failed(frame).map(ParsedClientFrame::RunFailed),
     }
 }
 
@@ -1013,6 +1248,8 @@ mod tests {
     const INSTALLATION_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a7";
     const BINDING_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a8";
     const RUN_LEASE_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a9";
+    const CONVERSATION_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789aa";
+    const INPUT_EVENT_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789ab";
 
     #[test]
     fn enrollment_token_wire_buffer_is_scrubbed_on_success_and_length_error() {
@@ -1175,6 +1412,9 @@ mod tests {
             granted_at_millis: 1_500,
             run_lease_deadline_millis: 2_500,
             required_capabilities: vec!["tools.web".into()],
+            conversation_id: CONVERSATION_ID.parse().expect("conversation id"),
+            input_event_id: INPUT_EVENT_ID.parse().expect("input event id"),
+            grant_version: 3,
         })
         .expect("coherent grant builds");
         assert_eq!(granted.run_lease_id, RUN_LEASE_ID);

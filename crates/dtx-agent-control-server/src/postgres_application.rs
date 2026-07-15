@@ -17,8 +17,8 @@ use dtx_agent_persistence::{
     ConnectorControlOperationRepository, ConnectorCredentialAuthorizationRepository,
     ConnectorRepository, ConversationGrantRepository, DurableCommandDecoder,
     EnrollmentIntentRepository, MAX_AGENT_RUN_EXPIRY_BATCH, MAX_AGENT_RUN_OFFER_PAGE,
-    PendingAgentRunOffer, PersistedCommandFrame, RuntimeCapacity, RuntimeClaimRecord,
-    RuntimeClaimRepository, RuntimeClaimSource,
+    PendingAgentRunOffer, PersistedCommandFrame, RunExecutionFence, RunExecutionReport,
+    RuntimeCapacity, RuntimeClaimRecord, RuntimeClaimRepository, RuntimeClaimSource,
 };
 use dtx_agent_registry::{AgentConversationPermission, AgentConversationPermissions};
 use dtx_agent_router::{
@@ -45,14 +45,15 @@ use crate::{
     ConnectorCredentialAuthorizationIndex, CredentialRotationCompletion, EnrollmentCompletion,
     HeartbeatCompletion, OpenControlCompletion, ParsedCapacity, ParsedCommandAcknowledgement,
     ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat, ParsedHello,
-    ParsedLeaseFence, ParsedReady, ParsedRunClaim, ParsedRunRelease, ProtobufDurableCommandEncoder,
-    RunAvailableWire, RunLeaseGrantedWire, RunOfferNotificationSubscription,
-    command_notifications::ConnectorCommandNotifications,
+    ParsedLeaseFence, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted,
+    ParsedRunExecutionFence, ParsedRunFailed, ParsedRunOutput, ParsedRunRelease,
+    ProtobufDurableCommandEncoder, RunAvailableWire, RunLeaseGrantedWire,
+    RunOfferNotificationSubscription, command_notifications::ConnectorCommandNotifications,
     run_notifications::ConnectorRunOfferNotifications,
 };
 
 const PROTOCOL_MAJOR: u32 = 1;
-const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 1;
+const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 2;
 const DEFAULT_HEARTBEAT_INTERVAL_MILLIS: u32 = 10_000;
 const DEFAULT_HEARTBEAT_TTL_MILLIS: u32 = 30_000;
 const CERTIFICATE_NOT_BEFORE_SKEW_MILLIS: i64 = 30_000;
@@ -2435,6 +2436,74 @@ impl PostgresConnectorControlApplication {
             .map_err(|_| ConnectorControlApplicationError::Unavailable)
     }
 
+    async fn record_execution_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        wire_fence: ParsedRunExecutionFence,
+        report: RunExecutionReport,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        ensure_peer_fence(peer, wire_fence.connector_fence)?;
+        let tenant_id = wire_fence.connector_fence.tenant_id;
+        let connector_id = wire_fence.connector_id;
+        let mut session = self
+            .store
+            .begin_tenant(tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        require_live_current_credential(
+            session.connection(),
+            peer,
+            tenant_id,
+            connector_id,
+            wire_fence.connector_fence.connector_generation,
+            self.now()?,
+        )
+        .await?;
+        let connector_fence = ConnectorLeaseFence::new(
+            tenant_id,
+            connector_id,
+            wire_fence.connector_fence.boot_id,
+            wire_fence.connector_fence.connector_generation,
+            wire_fence.connector_fence.lease_id,
+            wire_fence.connector_fence.lease_epoch,
+        )
+        .map_err(|_| ConnectorControlApplicationError::StaleLease)?;
+        AgentRunRepository::new()
+            .record_execution(
+                session.connection(),
+                RunExecutionFence {
+                    tenant_id,
+                    run_id: wire_fence.run_id,
+                    request_id: wire_fence.request_id,
+                    installation_id: wire_fence.installation_id,
+                    binding_id: wire_fence.binding_id,
+                    connector_id,
+                    offer_attempt: wire_fence.offer_attempt,
+                    run_lease_id: wire_fence.run_lease_id,
+                    run_lease_epoch: wire_fence.run_lease_epoch,
+                    run_lease_deadline_millis: wire_fence.run_lease_deadline_millis,
+                    connector_fence,
+                },
+                &report,
+                self.clock.as_ref(),
+            )
+            .await
+            .map_err(run_persistence_error)?;
+        require_live_current_credential(
+            session.connection(),
+            peer,
+            tenant_id,
+            connector_id,
+            wire_fence.connector_fence.connector_generation,
+            self.now()?,
+        )
+        .await?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn rotate_operation(
         &self,
@@ -2925,6 +2994,70 @@ impl ConnectorControlApplication for PostgresConnectorControlApplication {
     ) -> ApplicationFuture<'_, ()> {
         Box::pin(self.release_run_operation(peer, release))
     }
+
+    fn record_run_checkpoint(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        checkpoint: ParsedRunCheckpoint,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.record_execution_operation(
+            peer,
+            checkpoint.execution_fence,
+            RunExecutionReport::Checkpoint {
+                sequence: checkpoint.checkpoint_sequence,
+                artifact_id: checkpoint.checkpoint_artifact_id,
+                digest: checkpoint.checkpoint_digest.as_bytes(),
+            },
+        ))
+    }
+
+    fn record_run_output(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        output: ParsedRunOutput,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.record_execution_operation(
+            peer,
+            output.execution_fence,
+            RunExecutionReport::Output {
+                sequence: output.output_sequence,
+                event_id: output.output_event_id,
+                digest: output.output_digest.as_bytes(),
+            },
+        ))
+    }
+
+    fn complete_run(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        completed: ParsedRunCompleted,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.record_execution_operation(
+            peer,
+            completed.execution_fence,
+            RunExecutionReport::Completed {
+                sequence: completed.terminal_sequence,
+                result_event_id: completed.result_event_id,
+                digest: completed.result_digest.as_bytes(),
+            },
+        ))
+    }
+
+    fn fail_run(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        failed: ParsedRunFailed,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.record_execution_operation(
+            peer,
+            failed.execution_fence,
+            RunExecutionReport::Failed {
+                sequence: failed.terminal_sequence,
+                stable_error_code: failed.stable_error_code,
+                evidence: failed.evidence.map(|(id, digest)| (id, digest.as_bytes())),
+            },
+        ))
+    }
 }
 
 fn parsed_connector_fence(fence: ConnectorFence) -> ParsedLeaseFence {
@@ -2994,6 +3127,9 @@ fn run_lease_granted_wire(
         granted_at_millis: lease.issued_at_millis(),
         run_lease_deadline_millis: lease.expires_at_millis(),
         required_capabilities: run.request().required_capabilities().to_vec(),
+        conversation_id: run.request().conversation_id(),
+        input_event_id: run.request().request_event_id(),
+        grant_version: run.request().grant_version(),
     })
 }
 

@@ -18,16 +18,17 @@ use dtx_agent_control_server::{
     ConnectorCredentialAuthorizationIndex, CredentialRotationCompletion, EnrollmentCompletion,
     HeartbeatCompletion, OpenControlCompletion, ParsedCommandAcknowledgement,
     ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat, ParsedHello,
-    ParsedLeaseFence, ParsedReady, ParsedRunClaim, RunAvailableWire, RunLeaseGrantedWire,
-    connector_control_service, connector_tls_incoming,
+    ParsedLeaseFence, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, RunAvailableWire,
+    RunLeaseGrantedWire, connector_control_service, connector_tls_incoming,
 };
 use dtx_connect_registry::{
     AdapterKind, Connector, ConnectorDesiredState, ConnectorFence, ConnectorObservedState,
     ConnectorRevisionSnapshot, ConnectorSnapshot, LeaseStatus,
 };
 use dtx_domain::{
-    BindingId, BootId, ConnectorCredentialId, ConnectorId, Ed25519PublicKey, HostId,
-    InstallationId, LeaseId, RequestId, Revision, RunId, RunLeaseId, TenantId,
+    ArtifactId, BindingId, BootId, ConnectorCredentialId, ConnectorId, ConversationId,
+    Ed25519PublicKey, EventId, HostId, InstallationId, LeaseId, RequestId, Revision, RunId,
+    RunLeaseId, TenantId,
 };
 use dtx_security::{
     AuthenticatedConnectorPeer, ConnectorCredentialAuthorizer, ConnectorMtlsClientVerifier,
@@ -59,6 +60,8 @@ struct FakeRun {
     installation_id: InstallationId,
     binding_id: BindingId,
     run_lease_id: RunLeaseId,
+    conversation_id: ConversationId,
+    input_event_id: EventId,
     required_capabilities: Vec<String>,
 }
 
@@ -73,6 +76,8 @@ struct FakeApplication {
     command_poll_calls: AtomicUsize,
     run_claim_calls: AtomicUsize,
     run_reconcile_calls: AtomicUsize,
+    execution_report_calls: AtomicUsize,
+    reject_execution_reports: AtomicBool,
     command_page_size: usize,
     protocol_minor: u32,
     run: Option<FakeRun>,
@@ -147,6 +152,8 @@ impl FakeApplication {
             command_poll_calls: AtomicUsize::new(0),
             run_claim_calls: AtomicUsize::new(0),
             run_reconcile_calls: AtomicUsize::new(0),
+            execution_report_calls: AtomicUsize::new(0),
+            reject_execution_reports: AtomicBool::new(false),
             command_page_size: 64,
             protocol_minor: 0,
             run: None,
@@ -156,6 +163,11 @@ impl FakeApplication {
     fn with_router_run(mut self, run: FakeRun) -> Self {
         self.protocol_minor = 1;
         self.run = Some(run);
+        self
+    }
+
+    fn with_execution_reporting(mut self) -> Self {
+        self.protocol_minor = 2;
         self
     }
 
@@ -511,8 +523,27 @@ impl ConnectorControlApplication for FakeApplication {
                 granted_at_millis: self.now_millis + 1,
                 run_lease_deadline_millis: self.now_millis + 120_000,
                 required_capabilities: claim.required_capabilities,
+                conversation_id: run.conversation_id,
+                input_event_id: run.input_event_id,
+                grant_version: 1,
             })
         })();
+        application_result(result)
+    }
+
+    fn record_run_checkpoint(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        _checkpoint: ParsedRunCheckpoint,
+    ) -> ApplicationFuture<'_, ()> {
+        let result = self.validate_peer(peer).and_then(|()| {
+            self.execution_report_calls.fetch_add(1, Ordering::SeqCst);
+            if self.reject_execution_reports.load(Ordering::SeqCst) {
+                Err(ConnectorControlApplicationError::Unavailable)
+            } else {
+                Ok(())
+            }
+        });
         application_result(result)
     }
 }
@@ -880,6 +911,8 @@ async fn minor_one_offer_requires_claim_before_the_same_stream_grants_a_run_leas
         installation_id: InstallationId::new(),
         binding_id: BindingId::new(),
         run_lease_id: RunLeaseId::new(),
+        conversation_id: ConversationId::new(),
+        input_event_id: EventId::new(),
         required_capabilities: vec!["runtime.codex".to_owned(), "tools.web".to_owned()],
     };
     let (operation_id, command, payload_digest, _) = exact_command();
@@ -959,7 +992,185 @@ async fn minor_one_offer_requires_claim_before_the_same_stream_grants_a_run_leas
     assert_eq!(granted.run_lease_id, run.run_lease_id.to_string());
     assert_eq!(granted.run_lease_epoch, 1);
     assert_eq!(granted.connector_fence, available.connector_fence);
+    assert_eq!(granted.conversation_id, run.conversation_id.to_string());
+    assert_eq!(granted.input_event_id, run.input_event_id.to_string());
+    assert_eq!(granted.grant_version, 1);
     assert_eq!(application.run_claim_calls.load(Ordering::SeqCst), 1);
+
+    sender
+        .send(v1::ClientFrame {
+            kind: Some(v1::client_frame::Kind::RunCheckpoint(v1::RunCheckpoint {
+                execution_fence: Some(v1::RunExecutionFence {
+                    connector_fence: granted.connector_fence.clone(),
+                    run_id: granted.run_id.clone(),
+                    request_id: granted.request_id.clone(),
+                    installation_id: granted.installation_id.clone(),
+                    binding_id: granted.binding_id.clone(),
+                    connector_id: granted.connector_id.clone(),
+                    offer_attempt: granted.offer_attempt,
+                    run_lease_id: granted.run_lease_id.clone(),
+                    run_lease_epoch: granted.run_lease_epoch,
+                    run_lease_deadline_millis: granted.run_lease_deadline_millis,
+                }),
+                checkpoint_sequence: 1,
+                checkpoint_artifact_id: ArtifactId::new().to_string(),
+                checkpoint_digest: vec![0x81; 32],
+            })),
+        })
+        .await
+        .expect("a syntactically valid v1.2 report reaches the negotiated-minor gate");
+    let status = responses
+        .message()
+        .await
+        .expect_err("a minor-one stream cannot use v1.2 execution reports");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(status.message(), "PERMISSION_DENIED");
+
+    drop(sender);
+    drop(responses);
+    shutdown_sender.send(()).expect("server shutdown sent");
+    server
+        .await
+        .expect("control server task joins")
+        .expect("control server exits cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn minor_two_acknowledges_execution_reports_only_after_application_commit() {
+    let now_millis = current_time_millis();
+    let ca = TestCertificateAuthority::new(now_millis).expect("test CA created");
+    let identity = ConnectorWorkloadIdentity::new(TenantId::new(), ConnectorId::new());
+    let host_id = HostId::new();
+    let client_certificate = ca
+        .issue(
+            &WorkloadIdentity::from(identity),
+            CertificatePurpose::ClientAuth,
+            now_millis,
+            300,
+        )
+        .expect("Connector client certificate issued");
+    let server_certificate = ca
+        .issue(
+            &WorkloadIdentity::ControlServer {
+                dns_name: "localhost".to_owned(),
+            },
+            CertificatePurpose::ServerAuth,
+            now_millis,
+            300,
+        )
+        .expect("control server certificate issued");
+    let authorization_index = Arc::new(ConnectorCredentialAuthorizationIndex::new());
+    let verifier = Arc::new(
+        ConnectorMtlsClientVerifier::new(
+            test_roots(&ca),
+            authorization_index as Arc<dyn ConnectorCredentialAuthorizer>,
+        )
+        .expect("Connector verifier builds"),
+    );
+    let server_config = server_config(&server_certificate, verifier.as_ref().clone());
+    let client_tls = client_tls_config(&ca, &client_certificate);
+    let (operation_id, command, payload_digest, _) = exact_command();
+    let application = Arc::new(
+        FakeApplication::new(
+            now_millis,
+            identity,
+            host_id,
+            client_certificate.certificate_fingerprint(),
+            operation_id,
+            command,
+            payload_digest,
+        )
+        .with_execution_reporting(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback listener binds");
+    let address = listener.local_addr().expect("loopback address available");
+    let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel();
+    let server_application: Arc<dyn ConnectorControlApplication> = application.clone();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .serve_with_incoming_shutdown(
+                connector_control_service(server_application, Arc::clone(&verifier)),
+                connector_tls_incoming(listener, Arc::new(server_config)),
+                async {
+                    let _ = shutdown_receiver.await;
+                },
+            )
+            .await
+    });
+
+    let (sender, mut responses) = open_control(
+        address,
+        client_tls,
+        hello_through_minor(identity, host_id, BootId::new(), 2),
+    )
+    .await;
+    let connect_lease = expect_connect_lease(&mut responses).await;
+    assert_eq!(connect_lease.protocol_minor, 2);
+    let _command = expect_command(&mut responses).await;
+    let fence = v1::RunExecutionFence {
+        connector_fence: connect_lease.fence,
+        run_id: RunId::new().to_string(),
+        request_id: RequestId::new().to_string(),
+        installation_id: InstallationId::new().to_string(),
+        binding_id: BindingId::new().to_string(),
+        connector_id: identity.connector_id().to_string(),
+        offer_attempt: 1,
+        run_lease_id: RunLeaseId::new().to_string(),
+        run_lease_epoch: 1,
+        run_lease_deadline_millis: u64::try_from(now_millis + 60_000).expect("future timestamp"),
+    };
+    let artifact_id = ArtifactId::new();
+    sender
+        .send(v1::ClientFrame {
+            kind: Some(v1::client_frame::Kind::RunCheckpoint(v1::RunCheckpoint {
+                execution_fence: Some(fence.clone()),
+                checkpoint_sequence: 1,
+                checkpoint_artifact_id: artifact_id.to_string(),
+                checkpoint_digest: vec![0x81; 32],
+            })),
+        })
+        .await
+        .expect("committable checkpoint sent");
+    let acknowledgement = match responses
+        .message()
+        .await
+        .expect("ack response is readable")
+        .expect("ack response exists")
+        .kind
+        .expect("ack response kind exists")
+    {
+        v1::server_frame::Kind::RunReportAcknowledged(value) => value,
+        other => panic!("expected RunReportAcknowledged, got {other:?}"),
+    };
+    assert_eq!(acknowledgement.report_kind, "checkpoint");
+    assert_eq!(acknowledgement.report_sequence, 1);
+    assert_eq!(acknowledgement.report_digest, vec![0x81; 32]);
+    assert_eq!(application.execution_report_calls.load(Ordering::SeqCst), 1);
+
+    application
+        .reject_execution_reports
+        .store(true, Ordering::SeqCst);
+    sender
+        .send(v1::ClientFrame {
+            kind: Some(v1::client_frame::Kind::RunCheckpoint(v1::RunCheckpoint {
+                execution_fence: Some(fence),
+                checkpoint_sequence: 2,
+                checkpoint_artifact_id: ArtifactId::new().to_string(),
+                checkpoint_digest: vec![0x82; 32],
+            })),
+        })
+        .await
+        .expect("rejected checkpoint sent");
+    let status = responses
+        .message()
+        .await
+        .expect_err("a failed durable application operation emits no acknowledgement");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "UNAVAILABLE");
+    assert_eq!(application.execution_report_calls.load(Ordering::SeqCst), 2);
 
     drop(sender);
     drop(responses);
