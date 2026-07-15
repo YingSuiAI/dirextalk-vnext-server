@@ -1,4 +1,4 @@
-use dtx_domain::IdentityId;
+use dtx_domain::{DeviceId, IdentityId};
 use dtx_identity_log::IdentityLogV1;
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, SafeUint, Sha256Digest, UtcMillis, WireVersion,
@@ -112,6 +112,75 @@ impl IdentityAppendCommand {
     }
 
     /// Returns the original exact signed bytes. They are not reserialized.
+    #[must_use]
+    pub fn exact_event_bytes(&self) -> &[u8] {
+        &self.exact_event_bytes
+    }
+}
+
+/// One dedicated request to revoke another device from an identity log.
+///
+/// The authenticated session is supplied separately so its secret never
+/// becomes part of durable command state or an idempotency digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceRevokeCommand {
+    idempotency_key_hash: Sha256Digest,
+    identity_id: IdentityId,
+    target_device_id: DeviceId,
+    expected_head_hash: Sha256Digest,
+    exact_event_bytes: Vec<u8>,
+}
+
+impl DeviceRevokeCommand {
+    /// Builds a bounded transport command over one exact signed event.
+    ///
+    /// Event canonicality, V1.1 shape, route/body binding, and root authority
+    /// are checked by the repository inside the durable revoke boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty or oversized event before opening a transaction.
+    pub fn new(
+        idempotency_key_hash: Sha256Digest,
+        identity_id: IdentityId,
+        target_device_id: DeviceId,
+        expected_head_hash: Sha256Digest,
+        exact_event_bytes: Vec<u8>,
+    ) -> Result<Self, IdentityPersistenceError> {
+        if exact_event_bytes.is_empty() || exact_event_bytes.len() > MAX_IDENTITY_EVENT_BYTES {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "device revoke event byte length",
+            ));
+        }
+        Ok(Self {
+            idempotency_key_hash,
+            identity_id,
+            target_device_id,
+            expected_head_hash,
+            exact_event_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn idempotency_key_hash(&self) -> Sha256Digest {
+        self.idempotency_key_hash
+    }
+
+    #[must_use]
+    pub const fn identity_id(&self) -> IdentityId {
+        self.identity_id
+    }
+
+    #[must_use]
+    pub const fn target_device_id(&self) -> DeviceId {
+        self.target_device_id
+    }
+
+    #[must_use]
+    pub const fn expected_head_hash(&self) -> Sha256Digest {
+        self.expected_head_hash
+    }
+
     #[must_use]
     pub fn exact_event_bytes(&self) -> &[u8] {
         &self.exact_event_bytes

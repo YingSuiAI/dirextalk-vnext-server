@@ -46,7 +46,7 @@ pub use repository::{
 };
 pub use store::{IdentityPgStore, IdentitySession};
 pub use types::{
-    IDENTITY_APPEND_RECEIPT_HASH_DOMAIN, IDENTITY_APPEND_REQUEST_HASH_DOMAIN,
+    DeviceRevokeCommand, IDENTITY_APPEND_RECEIPT_HASH_DOMAIN, IDENTITY_APPEND_REQUEST_HASH_DOMAIN,
     IdentityAppendCommand, IdentityAppendOutcome, IdentityAppendReceipt, IdentityCommandPhase,
     IdentityForkEvidence, IdentityLogHead, IdentityLogSnapshot,
 };

@@ -35,8 +35,8 @@ use dtx_identity_persistence::{
     CreateDeviceEnrollmentChallengeCommand, DeviceEnrollmentApprovalCommand,
     DeviceEnrollmentCapability, DeviceEnrollmentChallenge, DeviceEnrollmentChallengeOutcome,
     DeviceEnrollmentChallengeState, DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository,
-    DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
-    DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome,
+    DeviceRevokeCommand, DeviceSessionCompletionCommand, DeviceSessionCredential,
+    DeviceSessionOutcome, DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome,
     IdentityLogPageReadOutcome, IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
     KeyPackageClaimCommand, KeyPackageClaimOutcome, KeyPackagePublishCommand,
     KeyPackagePublishOutcome, KeyPackageRepository, MAX_KEY_PACKAGE_PUBLISH_BYTES,
@@ -70,6 +70,9 @@ pub const KEY_PACKAGE_PUBLISH_PATH_TEMPLATE: &str = "/v1/key-packages/{package_i
 pub const KEY_PACKAGE_CLAIM_PATH: &str = "/v1/key-packages/claim";
 /// Public read-only route template for exact signed identity-log pages.
 pub const IDENTITY_LOG_PAGE_PATH_TEMPLATE: &str = "/v1/identities/{identity_id}/log";
+/// Active-device route for one exact root-signed revocation of another device.
+pub const DEVICE_REVOKE_PATH_TEMPLATE: &str =
+    "/v1/identities/{identity_id}/devices/{device_id}/revoke";
 pub const CONTACT_INVITES_PATH: &str = "/v1/contact-invites";
 pub const CONTACT_INVITE_PATH: &str = "/v1/contact-invites/{invite_id}";
 pub const CONTACT_REQUESTS_PATH: &str = "/v1/contact-requests";
@@ -149,6 +152,8 @@ const HTTP_DEVICE_ENROLLMENT_CHALLENGE_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.device-enrollment-http-challenge-idempotency-key.v1\0";
 const HTTP_DEVICE_ENROLLMENT_APPROVAL_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.device-enrollment-http-approval-idempotency-key.v1\0";
+const HTTP_DEVICE_REVOKE_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.device-revoke-http-idempotency-key.v1\0";
 const HTTP_KEY_PACKAGE_PUBLISH_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.key-package-http-publish-idempotency-key.v1\0";
 const HTTP_KEY_PACKAGE_CLAIM_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
@@ -233,6 +238,7 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
                 .delete(cancel_device_enrollment_challenge),
         )
         .route(DEVICE_ENROLLMENT_PATH, post(approve_device_enrollment))
+        .route(DEVICE_REVOKE_PATH_TEMPLATE, post(revoke_device))
         .route(KEY_PACKAGE_PUBLISH_PATH_TEMPLATE, put(publish_key_package))
         .route(KEY_PACKAGE_CLAIM_PATH, post(claim_key_package))
         .route(CONTACT_INVITES_PATH, post(create_contact_invite))
@@ -649,6 +655,22 @@ async fn approve_device_enrollment(
     }
 }
 
+async fn revoke_device(
+    State(state): State<IdentityBootstrapState>,
+    Path((identity_id, device_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .revoke_device(&identity_id, &device_id, &parts.headers, body)
+        .await
+    {
+        Ok(success) => device_revoke_success_response(success, request_id),
+        Err(failure) => device_revoke_failure_response(failure, request_id),
+    }
+}
+
 async fn publish_key_package(
     State(state): State<IdentityBootstrapState>,
     Path(package_id): Path<String>,
@@ -1037,6 +1059,62 @@ impl IdentityBootstrapState {
         }
     }
 
+    async fn revoke_device(
+        &self,
+        route_identity_id: &str,
+        route_device_id: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<DeviceRevokeSuccess, DeviceRevokeFailure> {
+        if !has_exact_event_content_type(headers)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+        {
+            return Err(DeviceRevokeFailure::InvalidRequest);
+        }
+        let identity_id = IdentityId::from_str(route_identity_id)
+            .map_err(|_| DeviceRevokeFailure::InvalidRequest)?;
+        let target_device_id =
+            DeviceId::from_str(route_device_id).map_err(|_| DeviceRevokeFailure::InvalidRequest)?;
+        let credential = parse_device_session_authorization(headers)
+            .map_err(|_| DeviceRevokeFailure::AuthenticationRejected)?;
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_DEVICE_REVOKE_IDEMPOTENCY_KEY_HASH_DOMAIN)
+                .map_err(|_| DeviceRevokeFailure::InvalidRequest)?;
+        let expected_head_hash = expected_device_revoke_head_hash(headers)?;
+        let exact_event_bytes = to_bytes(body, MAX_IDENTITY_BOOTSTRAP_EVENT_BYTES)
+            .await
+            .map_err(|_| DeviceRevokeFailure::InvalidRequest)?
+            .to_vec();
+        let command = DeviceRevokeCommand::new(
+            idempotency_key_hash,
+            identity_id,
+            target_device_id,
+            expected_head_hash,
+            exact_event_bytes,
+        )
+        .map_err(|_| DeviceRevokeFailure::InvalidRequest)?;
+        let now = self
+            .committed_at()
+            .map_err(|()| DeviceRevokeFailure::TemporarilyUnavailable)?;
+        match self
+            .repository
+            .revoke_device(&self.store, &command, &credential, now)
+            .await
+            .map_err(|error| map_device_revoke_persistence_error(&error))?
+        {
+            IdentityAppendOutcome::Committed(receipt) => Ok(DeviceRevokeSuccess {
+                status: StatusCode::CREATED,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+            IdentityAppendOutcome::Replayed(receipt) => Ok(DeviceRevokeSuccess {
+                status: StatusCode::OK,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+            IdentityAppendOutcome::Forked { .. } => Err(DeviceRevokeFailure::IdentityConflict),
+        }
+    }
+
     async fn publish_key_package(
         &self,
         route_package_id: &str,
@@ -1201,6 +1279,26 @@ fn expected_genesis_hash(headers: &HeaderMap) -> Result<Sha256Digest, InitialDev
     Sha256Digest::from_str(value).map_err(|_| InitialDeviceFailure::InvalidInitialDevice)
 }
 
+fn expected_device_revoke_head_hash(
+    headers: &HeaderMap,
+) -> Result<Sha256Digest, DeviceRevokeFailure> {
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let Some(value) = values.next() else {
+        return Err(DeviceRevokeFailure::InvalidRequest);
+    };
+    if values.next().is_some() {
+        return Err(DeviceRevokeFailure::InvalidRequest);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| DeviceRevokeFailure::InvalidRequest)?;
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or(DeviceRevokeFailure::InvalidRequest)?;
+    Sha256Digest::from_str(value).map_err(|_| DeviceRevokeFailure::InvalidRequest)
+}
+
 fn has_exact_json_content_type(headers: &HeaderMap) -> bool {
     has_exact_content_type(headers, "application/json")
 }
@@ -1293,6 +1391,7 @@ fn map_persistence_error(error: &IdentityPersistenceError) -> BootstrapFailure {
         | IdentityPersistenceError::IncompleteCommand
         | IdentityPersistenceError::ReceiptIntegrity
         | IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
         | IdentityPersistenceError::DeviceSessionChallengeRateLimited
@@ -1323,6 +1422,7 @@ fn map_initial_device_persistence_error(error: &IdentityPersistenceError) -> Ini
         | IdentityPersistenceError::IncompleteCommand
         | IdentityPersistenceError::ReceiptIntegrity
         | IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
         | IdentityPersistenceError::DeviceSessionChallengeRateLimited
@@ -1364,6 +1464,7 @@ fn map_device_session_persistence_error(error: &IdentityPersistenceError) -> Dev
         | IdentityPersistenceError::TenantContextLeak
         | IdentityPersistenceError::IncompleteCommand
         | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
         | IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
         | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
         | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
@@ -1409,6 +1510,7 @@ fn map_device_enrollment_persistence_error(
         | IdentityPersistenceError::TenantContextLeak
         | IdentityPersistenceError::IncompleteCommand
         | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
         | IdentityPersistenceError::DeviceSessionChallengeRateLimited
@@ -1417,6 +1519,39 @@ fn map_device_enrollment_persistence_error(
         | IdentityPersistenceError::CorruptData(_) => {
             DeviceEnrollmentFailure::TemporarilyUnavailable
         }
+    }
+}
+
+fn map_device_revoke_persistence_error(error: &IdentityPersistenceError) -> DeviceRevokeFailure {
+    match error {
+        IdentityPersistenceError::InvalidCommand(_) | IdentityPersistenceError::IdentityLog(_) => {
+            DeviceRevokeFailure::InvalidRequest
+        }
+        IdentityPersistenceError::IdempotencyConflict => DeviceRevokeFailure::IdempotencyConflict,
+        IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::IdentityInactive => DeviceRevokeFailure::AuthenticationRejected,
+        IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden => {
+            DeviceRevokeFailure::CurrentSessionForbidden
+        }
+        IdentityPersistenceError::HeadConflict { .. }
+        | IdentityPersistenceError::GenesisConflict => DeviceRevokeFailure::IdentityConflict,
+        IdentityPersistenceError::Database(_)
+        | IdentityPersistenceError::UnsafeRuntimeRole
+        | IdentityPersistenceError::RuntimeRoleUnauthorized
+        | IdentityPersistenceError::RuntimeRoleOverprivileged
+        | IdentityPersistenceError::TenantContextLeak
+        | IdentityPersistenceError::IncompleteCommand
+        | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::DeviceSessionChallengeExpired
+        | IdentityPersistenceError::DeviceSessionChallengeConsumed
+        | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+        | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
+        | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
+        | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
+        | IdentityPersistenceError::KeyPackageUnavailable
+        | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::CorruptData(_) => DeviceRevokeFailure::TemporarilyUnavailable,
     }
 }
 
@@ -1439,6 +1574,7 @@ fn map_key_package_persistence_error(error: &IdentityPersistenceError) -> KeyPac
         | IdentityPersistenceError::TenantContextLeak
         | IdentityPersistenceError::IncompleteCommand
         | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
         | IdentityPersistenceError::DeviceSessionChallengeRateLimited
@@ -1982,6 +2118,11 @@ struct DeviceEnrollmentApprovalSuccess {
     exact_receipt_bytes: Vec<u8>,
 }
 
+struct DeviceRevokeSuccess {
+    status: StatusCode,
+    exact_receipt_bytes: Vec<u8>,
+}
+
 struct KeyPackagePublishSuccess {
     status: StatusCode,
     exact_receipt_bytes: Vec<u8>,
@@ -2000,6 +2141,16 @@ enum DeviceEnrollmentFailure {
     ChallengeExpired,
     ChallengeCancelled,
     ChallengeApproved,
+    IdentityConflict,
+    IdempotencyConflict,
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DeviceRevokeFailure {
+    InvalidRequest,
+    AuthenticationRejected,
+    CurrentSessionForbidden,
     IdentityConflict,
     IdempotencyConflict,
     TemporarilyUnavailable,
@@ -2097,6 +2248,22 @@ enum DeviceEnrollmentErrorCode {
     ChallengeCancelled,
     #[serde(rename = "DEVICE_ENROLLMENT_CHALLENGE_ALREADY_APPROVED")]
     ChallengeApproved,
+    #[serde(rename = "IDENTITY_APPEND_CONFLICT")]
+    IdentityConflict,
+    #[serde(rename = "IDEMPOTENCY_CONFLICT")]
+    IdempotencyConflict,
+    #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, Serialize)]
+enum DeviceRevokeErrorCode {
+    #[serde(rename = "DEVICE_REVOKE_INVALID")]
+    InvalidRequest,
+    #[serde(rename = "DEVICE_AUTHENTICATION_FAILED")]
+    AuthenticationRejected,
+    #[serde(rename = "DEVICE_REVOKE_CURRENT_SESSION_FORBIDDEN")]
+    CurrentSessionForbidden,
     #[serde(rename = "IDENTITY_APPEND_CONFLICT")]
     IdentityConflict,
     #[serde(rename = "IDEMPOTENCY_CONFLICT")]
@@ -2373,6 +2540,51 @@ fn device_enrollment_approval_success_response(
         IDENTITY_APPEND_RECEIPT_CONTENT_TYPE,
         request_id,
     )
+}
+
+fn device_revoke_success_response(success: DeviceRevokeSuccess, request_id: RequestId) -> Response {
+    exact_cbor_response(
+        success.status,
+        success.exact_receipt_bytes,
+        IDENTITY_APPEND_RECEIPT_CONTENT_TYPE,
+        request_id,
+    )
+}
+
+fn device_revoke_failure_response(failure: DeviceRevokeFailure, request_id: RequestId) -> Response {
+    let (status, code, retryable) = match failure {
+        DeviceRevokeFailure::InvalidRequest => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            DeviceRevokeErrorCode::InvalidRequest,
+            false,
+        ),
+        DeviceRevokeFailure::AuthenticationRejected => (
+            StatusCode::UNAUTHORIZED,
+            DeviceRevokeErrorCode::AuthenticationRejected,
+            false,
+        ),
+        DeviceRevokeFailure::CurrentSessionForbidden => (
+            StatusCode::CONFLICT,
+            DeviceRevokeErrorCode::CurrentSessionForbidden,
+            false,
+        ),
+        DeviceRevokeFailure::IdentityConflict => (
+            StatusCode::CONFLICT,
+            DeviceRevokeErrorCode::IdentityConflict,
+            false,
+        ),
+        DeviceRevokeFailure::IdempotencyConflict => (
+            StatusCode::CONFLICT,
+            DeviceRevokeErrorCode::IdempotencyConflict,
+            false,
+        ),
+        DeviceRevokeFailure::TemporarilyUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            DeviceRevokeErrorCode::TemporarilyUnavailable,
+            true,
+        ),
+    };
+    safe_error_response(status, code, retryable, request_id)
 }
 
 fn device_enrollment_failure_response(

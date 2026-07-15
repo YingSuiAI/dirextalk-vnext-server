@@ -8,9 +8,9 @@ use sqlx::{PgConnection, Row};
 
 use crate::types::request_digest;
 use crate::{
-    IdentityAppendCommand, IdentityAppendOutcome, IdentityAppendReceipt, IdentityCommandPhase,
-    IdentityForkEvidence, IdentityLogHead, IdentityLogSnapshot, IdentityPersistenceError,
-    IdentityPgStore,
+    DeviceRevokeCommand, DeviceSessionCredential, DeviceSessionRepository, IdentityAppendCommand,
+    IdentityAppendOutcome, IdentityAppendReceipt, IdentityCommandPhase, IdentityForkEvidence,
+    IdentityLogHead, IdentityLogSnapshot, IdentityPersistenceError, IdentityPgStore,
 };
 
 const ACTIVE_LOG_STATE: &str = "active";
@@ -213,6 +213,106 @@ impl IdentityLogRepository {
             exact_event_bytes,
         )?;
         self.append(store, &command, committed_at).await
+    }
+
+    /// Atomically revokes another device using an active device session and
+    /// one exact root-signed V1.1 `DeviceRevoke` event.
+    ///
+    /// A byte-identical durable replay is recovered before session
+    /// reauthentication. This lets a caller recover the original receipt after
+    /// response loss even when either the initiator or target was subsequently
+    /// revoked. A new or changed request still requires an active session.
+    ///
+    /// # Errors
+    ///
+    /// Rejects path/body/head mismatch, non-revoke or non-V1.1 events,
+    /// inactive sessions, self-revoke by the current session, stale heads,
+    /// reused idempotency keys with different requests, and storage failures.
+    pub async fn revoke_device(
+        self,
+        store: &IdentityPgStore,
+        command: &DeviceRevokeCommand,
+        credential: &DeviceSessionCredential,
+        committed_at: UtcMillis,
+    ) -> Result<IdentityAppendOutcome, IdentityPersistenceError> {
+        let event = IdentityLogEventV1::decode_and_verify(command.exact_event_bytes())?;
+        validate_device_revoke_shape(command, &event)?;
+        let previous_sequence = event
+            .sequence()
+            .get()
+            .checked_sub(1)
+            .filter(|sequence| *sequence > 0)
+            .ok_or(IdentityPersistenceError::InvalidCommand(
+                "device revoke predecessor sequence",
+            ))?;
+        let previous_hash =
+            event
+                .previous_event_hash()
+                .ok_or(IdentityPersistenceError::InvalidCommand(
+                    "device revoke predecessor hash",
+                ))?;
+        let expected_head = IdentityLogHead::new(
+            command.identity_id(),
+            event.wire(),
+            SafeUint::new(previous_sequence).map_err(|_| {
+                IdentityPersistenceError::InvalidCommand("device revoke predecessor sequence")
+            })?,
+            previous_hash,
+        );
+        let append = IdentityAppendCommand::new(
+            command.idempotency_key_hash(),
+            Some(expected_head),
+            command.exact_event_bytes().to_vec(),
+        )?;
+        let request_digest = request_digest(&append, command.identity_id())?;
+
+        let mut session = store.begin().await?;
+        let result = async {
+            if let Some(replay) = existing_command_outcome(
+                session.connection(),
+                command.identity_id(),
+                command.idempotency_key_hash(),
+                request_digest,
+            )
+            .await?
+            {
+                return Ok(replay);
+            }
+
+            let authenticated = DeviceSessionRepository::authenticate_in_transaction(
+                session.connection(),
+                credential,
+                committed_at,
+            )
+            .await?;
+            if authenticated.identity_id() != command.identity_id() {
+                return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+            }
+            if authenticated.device_id() == command.target_device_id() {
+                return Err(IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden);
+            }
+
+            self.append_verified_in_transaction(
+                session.connection(),
+                &append,
+                &event,
+                command.identity_id(),
+                request_digest,
+                committed_at,
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                session.commit().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = session.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     /// Rehydrates the exact public head and pure reducer projection after a
@@ -522,6 +622,33 @@ impl IdentityLogRepository {
             committed_at,
         )
         .await
+    }
+}
+
+fn validate_device_revoke_shape(
+    command: &DeviceRevokeCommand,
+    event: &IdentityLogEventV1,
+) -> Result<(), IdentityPersistenceError> {
+    if event.wire() != IDENTITY_LOG_WIRE_VERSION
+        || event.identity_id() != command.identity_id()
+        || event.previous_event_hash() != Some(command.expected_head_hash())
+    {
+        return Err(IdentityPersistenceError::InvalidCommand(
+            "device revoke event binding",
+        ));
+    }
+    match event.payload() {
+        IdentityLogEventPayloadV1::DeviceRevoke { device_id }
+            if *device_id == command.target_device_id() =>
+        {
+            Ok(())
+        }
+        IdentityLogEventPayloadV1::DeviceRevoke { .. } => Err(
+            IdentityPersistenceError::InvalidCommand("device revoke target binding"),
+        ),
+        _ => Err(IdentityPersistenceError::InvalidCommand(
+            "device revoke event kind",
+        )),
     }
 }
 
@@ -967,6 +1094,59 @@ async fn claim_command(
         return Ok(CommandClaim::Execute);
     }
 
+    load_existing_command_claim(
+        connection,
+        identity_id,
+        idempotency_key_hash,
+        request_digest,
+    )
+    .await?
+    .ok_or(IdentityPersistenceError::IncompleteCommand)
+}
+
+async fn existing_command_outcome(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+    idempotency_key_hash: Sha256Digest,
+    request_digest: Sha256Digest,
+) -> Result<Option<IdentityAppendOutcome>, IdentityPersistenceError> {
+    let Some(claim) = load_existing_command_claim(
+        connection,
+        identity_id,
+        idempotency_key_hash,
+        request_digest,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    match claim {
+        CommandClaim::Replay(receipt) => Ok(Some(IdentityAppendOutcome::Replayed(receipt))),
+        CommandClaim::Forked(receipt) => {
+            let evidence =
+                load_fork_evidence_for_command(connection, identity_id, idempotency_key_hash)
+                    .await?;
+            if receipt.head() != evidence.observed_head()
+                || receipt.phase() != IdentityCommandPhase::Reconciling
+            {
+                return Err(IdentityPersistenceError::CorruptData(
+                    "forked receipt evidence",
+                ));
+            }
+            Ok(Some(IdentityAppendOutcome::Forked { receipt, evidence }))
+        }
+        CommandClaim::Execute => Err(IdentityPersistenceError::CorruptData(
+            "stored identity command execution state",
+        )),
+    }
+}
+
+async fn load_existing_command_claim(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+    idempotency_key_hash: Sha256Digest,
+    request_digest: Sha256Digest,
+) -> Result<Option<CommandClaim>, IdentityPersistenceError> {
     let row = sqlx::query(
         "SELECT request_digest, state,
                 receipt_protocol_major, receipt_protocol_minor,
@@ -979,8 +1159,11 @@ async fn claim_command(
     )
     .bind(identity_id.to_string())
     .bind(idempotency_key_hash.as_bytes().as_slice())
-    .fetch_one(&mut *connection)
+    .fetch_optional(&mut *connection)
     .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
     let stored_request = digest(
         &row.try_get::<Vec<u8>, _>("request_digest")?,
         "receipt request digest",
@@ -1024,8 +1207,8 @@ async fn claim_command(
     )?;
     receipt.verify_exact_bytes(&stored_bytes, stored_digest)?;
     match phase {
-        IdentityCommandPhase::Committed => Ok(CommandClaim::Replay(receipt)),
-        IdentityCommandPhase::Reconciling => Ok(CommandClaim::Forked(receipt)),
+        IdentityCommandPhase::Committed => Ok(Some(CommandClaim::Replay(receipt))),
+        IdentityCommandPhase::Reconciling => Ok(Some(CommandClaim::Forked(receipt))),
         IdentityCommandPhase::Pending => Err(IdentityPersistenceError::CorruptData(
             "identity command receipt phase",
         )),

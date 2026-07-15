@@ -38,6 +38,8 @@ pub enum IdentityPersistenceError {
     IdentityInactive,
     /// A device-session request was not authorized by an active certified device.
     DeviceAuthenticationRejected,
+    /// A session attempted to revoke the same device that owns the session.
+    CurrentSessionDeviceRevokeForbidden,
     /// A one-time device-session challenge was no longer within its validity window.
     DeviceSessionChallengeExpired,
     /// A one-time device-session challenge already issued a session.
@@ -85,6 +87,9 @@ impl fmt::Display for IdentityPersistenceError {
             Self::GenesisConflict => "identity genesis conflicts with an existing identity log",
             Self::IdentityInactive => "identity log is not active",
             Self::DeviceAuthenticationRejected => "device session authentication was rejected",
+            Self::CurrentSessionDeviceRevokeForbidden => {
+                "the current device session cannot revoke its own device"
+            }
             Self::DeviceSessionChallengeExpired => "device session challenge expired",
             Self::DeviceSessionChallengeConsumed => "device session challenge was consumed",
             Self::DeviceSessionChallengeRateLimited => "device session challenge rate limited",
@@ -116,6 +121,7 @@ impl Error for IdentityPersistenceError {
             | Self::GenesisConflict
             | Self::IdentityInactive
             | Self::DeviceAuthenticationRejected
+            | Self::CurrentSessionDeviceRevokeForbidden
             | Self::DeviceSessionChallengeExpired
             | Self::DeviceSessionChallengeConsumed
             | Self::DeviceSessionChallengeRateLimited
