@@ -68,15 +68,15 @@ pub use incoming::{
 };
 pub use owner_http::{
     AgentProvisioningOwnerBackend, AgentProvisioningOwnerError, CborOwnerReply,
-    DeliveryOwnerCommand, PostgresAgentProvisioningOwnerBackend, RevocationOwnerCommand,
-    agent_provisioning_owner_router,
+    ConnectorLifecycleOwnerCommand, DeliveryOwnerCommand, PostgresAgentProvisioningOwnerBackend,
+    RevocationOwnerCommand, agent_provisioning_owner_router,
 };
 pub use postgres_application::{
     AgentRunReconcileBatch, ApplyConnectorConfigurationRequest, CancelAgentRunRequest,
     CloseConnectorStreamRequest, ConnectorCommandFence, ConnectorControlPolicy,
-    CreateAgentRunRequest, CreateConnectorEnrollmentRequest, CreatedAgentRun,
-    CreatedConnectorEnrollment, PostgresConnectorControlApplication,
-    RotateConnectorCredentialRequest,
+    ConnectorLifecycleAction, ConnectorLifecycleCommandWrite, CreateAgentRunRequest,
+    CreateConnectorEnrollmentRequest, CreatedAgentRun, CreatedConnectorEnrollment,
+    PostgresConnectorControlApplication, RotateConnectorCredentialRequest,
 };
 pub use provisioning::*;
 pub use run_notifications::RunOfferNotificationSubscription;

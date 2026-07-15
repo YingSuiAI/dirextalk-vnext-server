@@ -149,7 +149,7 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
 
     let (issuer, ca_der) = certificate_issuer(now())?;
     let index = Arc::new(ConnectorCredentialAuthorizationIndex::new());
-    let app = application(store.clone(), issuer, index.clone());
+    let app = Arc::new(application(store.clone(), issuer, index.clone()));
     let enrollment = app
         .create_enrollment_intent(CreateConnectorEnrollmentRequest::new(
             tenant_id,
@@ -195,7 +195,7 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
     let fence = opened.lease.fence();
 
     let router = agent_provisioning_owner_router(Arc::new(
-        PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id),
+        PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app.clone()),
     ));
     let approval_id = dtx_domain::ApprovalId::new();
     let approval_body = approval_body(
@@ -419,7 +419,7 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
         &owner_device_key,
     )?;
     let revoked = owner_post(
-        router,
+        router.clone(),
         &format!("/v1/agent-installations/{installation_id}/revocations"),
         &authorization,
         "revoke_installation_1",
@@ -431,7 +431,7 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
 
     let revoke_commands = app
         .poll_commands(
-            authenticate(index, &ca_der, &completion.credential)?,
+            authenticate(index.clone(), &ca_der, &completion.credential)?,
             fence,
             delivery_command.sequence(),
         )
@@ -482,6 +482,88 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
     .await?;
     assert_eq!(stored_capsule, capsule);
     session.rollback().await?;
+    let lifecycle_fence = format!(
+        "\"g{}-r{}\"",
+        fence.generation().get(),
+        completion.credential.revision().get()
+    );
+    let drain_operation = RequestId::new();
+    let drain_uri = format!("/v1/connectors/{}/drain", connector.connector_id());
+    let first_drain = owner_lifecycle_post(
+        router.clone(),
+        &drain_uri,
+        &authorization,
+        drain_operation,
+        &lifecycle_fence,
+    )
+    .await?;
+    assert_eq!(first_drain.0, StatusCode::CREATED);
+    let drain_receipt: serde_json::Value = serde_json::from_slice(&first_drain.1)?;
+    assert_eq!(drain_receipt["action"], "drain");
+    assert_eq!(
+        drain_receipt["connector_id"],
+        connector.connector_id().to_string()
+    );
+    assert_eq!(drain_receipt["operation_id"], drain_operation.to_string());
+    let replayed_drain = owner_lifecycle_post(
+        router.clone(),
+        &drain_uri,
+        &authorization,
+        drain_operation,
+        &lifecycle_fence,
+    )
+    .await?;
+    assert_eq!(replayed_drain.0, StatusCode::OK);
+    assert_eq!(replayed_drain.1, first_drain.1);
+    let conflicting_retry = owner_lifecycle_post(
+        router.clone(),
+        &format!("/v1/connectors/{}/restart", connector.connector_id()),
+        &authorization,
+        drain_operation,
+        &lifecycle_fence,
+    )
+    .await?;
+    assert_eq!(conflicting_retry.0, StatusCode::CONFLICT);
+    let stale_fence = owner_lifecycle_post(
+        router.clone(),
+        &drain_uri,
+        &authorization,
+        RequestId::new(),
+        &format!("\"g{}-r2\"", fence.generation().get()),
+    )
+    .await?;
+    assert_eq!(stale_fence.0, StatusCode::CONFLICT);
+    let (_, foreign_authorization) = provision_owner_session(
+        &harness,
+        agent_identity_id,
+        identity_device_id,
+        agent_head,
+        [0x72; 32],
+    )
+    .await?;
+    let denied = owner_lifecycle_post(
+        router.clone(),
+        &drain_uri,
+        &foreign_authorization,
+        RequestId::new(),
+        &lifecycle_fence,
+    )
+    .await?;
+    assert_eq!(denied.0, StatusCode::FORBIDDEN);
+    let lifecycle_commands = app
+        .poll_commands(
+            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            fence,
+            delivery_command.sequence(),
+        )
+        .await?;
+    assert!(lifecycle_commands.iter().any(|command| {
+        matches!(
+            command.payload(),
+            ServerCommandPayload::CloseStream(close)
+                if close.reason() == dtx_agent_control::CloseStreamReason::Drained
+        )
+    }));
     drop(owner_credential);
     Ok(())
 }
@@ -501,6 +583,29 @@ async fn owner_post(
                 .header("idempotency-key", idempotency)
                 .header(header::CONTENT_TYPE, content_type)
                 .body(Body::from(body))?,
+        )
+        .await?;
+    let status = response.status();
+    Ok((
+        status,
+        to_bytes(response.into_body(), 1_000_000).await?.to_vec(),
+    ))
+}
+
+async fn owner_lifecycle_post(
+    router: axum::Router,
+    uri: &str,
+    authorization: &str,
+    operation_id: RequestId,
+    if_match: &str,
+) -> Result<(StatusCode, Vec<u8>), Box<dyn Error>> {
+    let response = router
+        .oneshot(
+            Request::post(uri)
+                .header(header::AUTHORIZATION, authorization)
+                .header("idempotency-key", operation_id.to_string())
+                .header(header::IF_MATCH, if_match)
+                .body(Body::empty())?,
         )
         .await?;
     let status = response.status();

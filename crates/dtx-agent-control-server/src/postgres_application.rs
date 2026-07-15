@@ -2,7 +2,8 @@ use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use dtx_agent_control::{
     ApplyConfigCommand, CloseStreamCommand, CommandError, CommandLog, CommandLogState, ConfigEntry,
-    ConnectorCredential, ConnectorCredentialAuthorization, ConnectorCredentialPresentation,
+    ConnectorCredential, ConnectorCredentialAuthorization,
+    ConnectorCredentialAuthorizationSnapshot, ConnectorCredentialPresentation,
     ConnectorCredentialStatus, CredentialHelloOutcome, CredentialRotationDisposition,
     DEFAULT_ENROLLMENT_TTL_MILLIS, DurableServerCommand, DurableServerCommandSnapshot,
     EnrollmentError, EnrollmentIntent, EnrollmentRequestDisposition, EnrollmentToken,
@@ -36,9 +37,14 @@ use dtx_domain::{
     ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, RunId, RunLeaseId,
     RunOfferId, SystemClock, TenantId, UuidV7Generator,
 };
+use dtx_identity_persistence::{
+    DeviceSessionCredential, DeviceSessionRepository, IdentityPersistenceError,
+};
 use dtx_security::{AuthenticatedConnectorPeer, ConnectorWorkloadIdentity};
 use dtx_storage::PgStore;
-use dtx_wire::{CanonicalValue, Sha256Digest as WireSha256Digest, encode_deterministic_cbor};
+use dtx_wire::{
+    CanonicalValue, Sha256Digest as WireSha256Digest, UtcMillis, encode_deterministic_cbor,
+};
 use ed25519_dalek::{Signature, VerifyingKey};
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
@@ -69,6 +75,7 @@ const DEFAULT_RUN_QUEUE_TTL_MILLIS: i64 = 300_000;
 const MAX_RUN_QUEUE_TTL_MILLIS: i64 = 3_600_000;
 const DEFAULT_RUN_OFFER_TTL_MILLIS: i64 = 15_000;
 const DEFAULT_RUN_LEASE_TTL_MILLIS: i64 = 30_000;
+const OWNER_CREDENTIAL_ROTATION_TTL_MILLIS: i64 = 300_000;
 
 /// Server-authenticated cancellation request for one exact active Run lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,6 +313,41 @@ pub struct ConnectorCommandFence {
     pub connector_id: ConnectorId,
     pub generation: u64,
     pub spec_revision: Revision,
+}
+
+/// Closed Owner-visible lifecycle actions for an already enrolled Connector.
+///
+/// These actions only operate on the durable Connector control stream. They
+/// do not create hosts, execute shell commands, or manage host processes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorLifecycleAction {
+    Drain,
+    Reconnect,
+    RotateCredential,
+}
+
+/// Result of one Owner-authenticated lifecycle command write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorLifecycleCommandWrite {
+    command: DurableServerCommand,
+    replayed: bool,
+}
+
+impl ConnectorLifecycleCommandWrite {
+    #[must_use]
+    pub const fn command(&self) -> &DurableServerCommand {
+        &self.command
+    }
+
+    #[must_use]
+    pub const fn replayed(&self) -> bool {
+        self.replayed
+    }
+}
+
+struct CloseStreamCommandWrite {
+    write: ConnectorLifecycleCommandWrite,
+    revoked_authorization: Option<ConnectorCredentialAuthorizationSnapshot>,
 }
 
 /// Owner request for one exact non-secret Connector configuration revision.
@@ -1372,49 +1414,64 @@ impl PostgresConnectorControlApplication {
         request: RotateConnectorCredentialRequest,
     ) -> Result<DurableServerCommand, ConnectorControlApplicationError> {
         let now = self.now()?;
-        let successor_revision = request
-            .fence
+        let fence = request.fence;
+        let mut session = self
+            .store
+            .begin_tenant(fence.tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let write = self
+            .enqueue_credential_rotation_in_transaction(
+                session.connection(),
+                fence,
+                request.operation_id,
+                Some(request.deadline_millis),
+                now,
+            )
+            .await?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        self.command_notifications
+            .publish(fence.tenant_id, fence.connector_id);
+        Ok(write.command)
+    }
+
+    #[allow(clippy::too_many_lines)] // Fence, namespace claim, nonce, and command append share one transaction.
+    async fn enqueue_credential_rotation_in_transaction(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        fence: ConnectorCommandFence,
+        operation_id: RequestId,
+        requested_deadline_millis: Option<i64>,
+        now: i64,
+    ) -> Result<ConnectorLifecycleCommandWrite, ConnectorControlApplicationError> {
+        let successor_revision = fence
             .spec_revision
             .checked_next()
             .map_err(|_| ConnectorControlApplicationError::StaleFence)?;
-        let mut session = self
-            .store
-            .begin_tenant(request.fence.tenant_id)
-            .await
-            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
         let connector = ConnectorRepository::new()
-            .load_control_head_for_update(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
-            )
+            .load_control_head_for_update(connection, fence.tenant_id, fence.connector_id)
             .await
             .map_err(persistence_error)?
             .ok_or(ConnectorControlApplicationError::NotFound)?;
         let authorization = ConnectorCredentialAuthorizationRepository::new()
-            .load_head(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
-            )
+            .load_head(connection, fence.tenant_id, fence.connector_id)
             .await
             .map_err(persistence_error)?
             .ok_or(ConnectorControlApplicationError::AuthenticationFailed)?;
         let command_repository = CommandLogRepository::new();
         let command_head = command_repository
-            .lock_head_for_update(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
-            )
+            .lock_head_for_update(connection, fence.tenant_id, fence.connector_id)
             .await
             .map_err(persistence_error)?;
         if let Some(existing) = command_repository
             .command_by_operation(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
-                request.operation_id,
+                connection,
+                fence.tenant_id,
+                fence.connector_id,
+                operation_id,
             )
             .await
             .map_err(persistence_error)?
@@ -1424,29 +1481,31 @@ impl PostgresConnectorControlApplication {
                 existing.payload(),
                 ServerCommandPayload::RotateCredential(command)
                     if command.successor_revision() == successor_revision
-                        && command.deadline_millis() == request.deadline_millis
+                        && requested_deadline_millis
+                            .is_none_or(|deadline| command.deadline_millis() == deadline)
             );
             if !matches
-                || existing.generation() != request.fence.generation
-                || existing.spec_revision() != request.fence.spec_revision
+                || existing.generation() != fence.generation
+                || existing.spec_revision() != fence.spec_revision
             {
                 return Err(ConnectorControlApplicationError::Conflict);
             }
-            session
-                .commit()
-                .await
-                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
-            self.command_notifications
-                .publish(request.fence.tenant_id, request.fence.connector_id);
-            return Ok(existing);
+            return Ok(ConnectorLifecycleCommandWrite {
+                command: existing,
+                replayed: true,
+            });
         }
-        if request.deadline_millis <= now {
+        let deadline_millis = requested_deadline_millis.unwrap_or(
+            now.checked_add(OWNER_CREDENTIAL_ROTATION_TTL_MILLIS)
+                .ok_or(ConnectorControlApplicationError::InvalidRequest)?,
+        );
+        if deadline_millis <= now {
             return Err(ConnectorControlApplicationError::InvalidRequest);
         }
         if command_head.acknowledged_sequence() != command_head.last_sequence() {
             return Err(ConnectorControlApplicationError::Conflict);
         }
-        ensure_owner_command_fence(&connector, command_head, request.fence)?;
+        ensure_owner_command_fence(&connector, command_head, fence)?;
         if connector.desired_state() == ConnectorDesiredState::Revoked {
             return Err(ConnectorControlApplicationError::PermissionDenied);
         }
@@ -1456,22 +1515,22 @@ impl PostgresConnectorControlApplication {
         let mut nonce = [0_u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| ConnectorControlApplicationError::Unavailable)?;
         let payload = ServerCommandPayload::RotateCredential(
-            RotateCredentialCommand::new(nonce, successor_revision, request.deadline_millis)
+            RotateCredentialCommand::new(nonce, successor_revision, deadline_millis)
                 .map_err(command_error)?,
         );
         let command = encode_durable_command(
             next_command_sequence(command_head)?,
-            request.fence.generation,
-            request.fence.spec_revision,
-            request.operation_id,
+            fence.generation,
+            fence.spec_revision,
+            operation_id,
             payload,
         )?;
         ConnectorControlOperationRepository::new()
             .claim(
-                session.connection(),
-                request.fence.tenant_id,
-                request.operation_id,
-                request.fence.connector_id,
+                connection,
+                fence.tenant_id,
+                operation_id,
+                fence.connector_id,
                 ConnectorControlOperationKind::RotateCredential,
                 now,
             )
@@ -1479,9 +1538,9 @@ impl PostgresConnectorControlApplication {
             .map_err(persistence_error)?;
         command_repository
             .append_locked(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
+                connection,
+                fence.tenant_id,
+                fence.connector_id,
                 command_head,
                 &command,
                 self.command_decoder.as_ref(),
@@ -1489,13 +1548,10 @@ impl PostgresConnectorControlApplication {
             )
             .await
             .map_err(persistence_error)?;
-        session
-            .commit()
-            .await
-            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
-        self.command_notifications
-            .publish(request.fence.tenant_id, request.fence.connector_id);
-        Ok(command)
+        Ok(ConnectorLifecycleCommandWrite {
+            command,
+            replayed: false,
+        })
     }
 
     /// Persists one exact close instruction.
@@ -1514,71 +1570,90 @@ impl PostgresConnectorControlApplication {
         request: CloseConnectorStreamRequest,
     ) -> Result<DurableServerCommand, ConnectorControlApplicationError> {
         let now = self.now()?;
-        let payload = ServerCommandPayload::CloseStream(request.command);
+        let fence = request.fence;
         let mut session = self
             .store
-            .begin_tenant(request.fence.tenant_id)
+            .begin_tenant(fence.tenant_id)
             .await
             .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let result = self
+            .enqueue_close_stream_in_transaction(
+                session.connection(),
+                fence,
+                request.operation_id,
+                request.command,
+                now,
+            )
+            .await?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if let Some(authorization) = result.revoked_authorization {
+            let _ = self.authorization_index.replace(&authorization);
+        }
+        self.command_notifications
+            .publish(fence.tenant_id, fence.connector_id);
+        Ok(result.write.command)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn enqueue_close_stream_in_transaction(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        fence: ConnectorCommandFence,
+        operation_id: RequestId,
+        close_command: CloseStreamCommand,
+        now: i64,
+    ) -> Result<CloseStreamCommandWrite, ConnectorControlApplicationError> {
+        let payload = ServerCommandPayload::CloseStream(close_command);
         let revoke = matches!(
             &payload,
             ServerCommandPayload::CloseStream(command)
                 if command.reason() == dtx_agent_control::CloseStreamReason::Revoked
         );
         let mut connector = ConnectorRepository::new()
-            .load_control_head_for_update(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
-            )
+            .load_control_head_for_update(connection, fence.tenant_id, fence.connector_id)
             .await
             .map_err(persistence_error)?
             .ok_or(ConnectorControlApplicationError::NotFound)?;
         let authorization_head = ConnectorCredentialAuthorizationRepository::new()
-            .load_head(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
-            )
+            .load_head(connection, fence.tenant_id, fence.connector_id)
             .await
             .map_err(persistence_error)?
             .ok_or(ConnectorControlApplicationError::AuthenticationFailed)?;
         let mut authorization = authorization_head.authorization().clone();
         let command_repository = CommandLogRepository::new();
         let command_head = command_repository
-            .lock_head_for_update(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
-            )
+            .lock_head_for_update(connection, fence.tenant_id, fence.connector_id)
             .await
             .map_err(persistence_error)?;
         if let Some(existing) = command_repository
             .command_by_operation(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
-                request.operation_id,
+                connection,
+                fence.tenant_id,
+                fence.connector_id,
+                operation_id,
             )
             .await
             .map_err(persistence_error)?
         {
             let existing = self.decode_persisted_command(&existing)?;
-            let existing = exact_command_retry(&existing, request.fence, &payload)?;
-            session
-                .commit()
-                .await
-                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
-            self.command_notifications
-                .publish(request.fence.tenant_id, request.fence.connector_id);
-            return Ok(existing);
+            let existing = exact_command_retry(&existing, fence, &payload)?;
+            return Ok(CloseStreamCommandWrite {
+                write: ConnectorLifecycleCommandWrite {
+                    command: existing,
+                    replayed: true,
+                },
+                revoked_authorization: None,
+            });
         }
         if !revoke
             && command_repository
                 .pending_fence_barrier_exists(
-                    session.connection(),
-                    request.fence.tenant_id,
-                    request.fence.connector_id,
+                    connection,
+                    fence.tenant_id,
+                    fence.connector_id,
                     command_head.acknowledged_sequence(),
                 )
                 .await
@@ -1586,7 +1661,7 @@ impl PostgresConnectorControlApplication {
         {
             return Err(ConnectorControlApplicationError::Conflict);
         }
-        ensure_owner_command_fence(&connector, command_head, request.fence)?;
+        ensure_owner_command_fence(&connector, command_head, fence)?;
         if connector.desired_state() == ConnectorDesiredState::Revoked {
             return Err(ConnectorControlApplicationError::PermissionDenied);
         }
@@ -1596,17 +1671,17 @@ impl PostgresConnectorControlApplication {
         let expected_connector = connector.snapshot();
         let command = encode_durable_command(
             next_command_sequence(command_head)?,
-            request.fence.generation,
-            request.fence.spec_revision,
-            request.operation_id,
+            fence.generation,
+            fence.spec_revision,
+            operation_id,
             payload,
         )?;
         ConnectorControlOperationRepository::new()
             .claim(
-                session.connection(),
-                request.fence.tenant_id,
-                request.operation_id,
-                request.fence.connector_id,
+                connection,
+                fence.tenant_id,
+                operation_id,
+                fence.connector_id,
                 ConnectorControlOperationKind::CloseStream,
                 now,
             )
@@ -1614,9 +1689,9 @@ impl PostgresConnectorControlApplication {
             .map_err(persistence_error)?;
         let appended_head = command_repository
             .append_locked(
-                session.connection(),
-                request.fence.tenant_id,
-                request.fence.connector_id,
+                connection,
+                fence.tenant_id,
+                fence.connector_id,
                 command_head,
                 &command,
                 self.command_decoder.as_ref(),
@@ -1626,39 +1701,30 @@ impl PostgresConnectorControlApplication {
             .map_err(persistence_error)?;
         let revoked_authorization = if revoke {
             connector
-                .set_desired_state(
-                    request.fence.spec_revision,
-                    ConnectorDesiredState::Revoked,
-                    now,
-                )
+                .set_desired_state(fence.spec_revision, ConnectorDesiredState::Revoked, now)
                 .map_err(|_| ConnectorControlApplicationError::StaleFence)?;
             authorization
                 .revoke()
                 .map_err(|_| ConnectorControlApplicationError::Internal)?;
             ConnectorRepository::new()
-                .save_owner_desired_state_head(
-                    session.connection(),
-                    &connector,
-                    expected_connector,
-                    now,
-                )
+                .save_owner_desired_state_head(connection, &connector, expected_connector, now)
                 .await
                 .map_err(persistence_error)?;
             ConnectorCredentialAuthorizationRepository::new()
                 .save_head(
-                    session.connection(),
+                    connection,
                     &authorization,
                     &authorization_head,
-                    request.operation_id,
+                    operation_id,
                     now,
                 )
                 .await
                 .map_err(persistence_error)?;
             command_repository
                 .finalize_terminal_fence_locked(
-                    session.connection(),
-                    request.fence.tenant_id,
-                    request.fence.connector_id,
+                    connection,
+                    fence.tenant_id,
+                    fence.connector_id,
                     appended_head,
                     connector.generation(),
                     connector.spec_revision(),
@@ -1670,16 +1736,116 @@ impl PostgresConnectorControlApplication {
         } else {
             None
         };
+        Ok(CloseStreamCommandWrite {
+            write: ConnectorLifecycleCommandWrite {
+                command,
+                replayed: false,
+            },
+            revoked_authorization,
+        })
+    }
+
+    /// Authenticates an Owner device and appends one fixed Connector lifecycle command.
+    ///
+    /// The ownership check, optimistic fence, command claim, and durable command
+    /// append all share the same tenant transaction. The action set is closed so
+    /// this boundary cannot become a host shell or arbitrary configuration API.
+    pub(crate) async fn enqueue_owner_lifecycle(
+        &self,
+        credential: &DeviceSessionCredential,
+        action: ConnectorLifecycleAction,
+        fence: ConnectorCommandFence,
+        operation_id: RequestId,
+    ) -> Result<ConnectorLifecycleCommandWrite, ConnectorControlApplicationError> {
+        let now = self.now()?;
+        let mut session = self
+            .store
+            .begin_tenant(fence.tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        self.authorize_owner_lifecycle(
+            session.connection(),
+            credential,
+            fence,
+            UtcMillis::new(now).map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .await?;
+        let write = match action {
+            ConnectorLifecycleAction::Drain => {
+                self.enqueue_close_stream_in_transaction(
+                    session.connection(),
+                    fence,
+                    operation_id,
+                    CloseStreamCommand::drained(),
+                    now,
+                )
+                .await?
+                .write
+            }
+            ConnectorLifecycleAction::Reconnect => {
+                self.enqueue_close_stream_in_transaction(
+                    session.connection(),
+                    fence,
+                    operation_id,
+                    CloseStreamCommand::reconnect(),
+                    now,
+                )
+                .await?
+                .write
+            }
+            ConnectorLifecycleAction::RotateCredential => {
+                self.enqueue_credential_rotation_in_transaction(
+                    session.connection(),
+                    fence,
+                    operation_id,
+                    None,
+                    now,
+                )
+                .await?
+            }
+        };
         session
             .commit()
             .await
             .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
-        if let Some(authorization) = revoked_authorization {
-            let _ = self.authorization_index.replace(&authorization);
-        }
         self.command_notifications
-            .publish(request.fence.tenant_id, request.fence.connector_id);
-        Ok(command)
+            .publish(fence.tenant_id, fence.connector_id);
+        Ok(write)
+    }
+
+    async fn authorize_owner_lifecycle(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        credential: &DeviceSessionCredential,
+        fence: ConnectorCommandFence,
+        now: UtcMillis,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        let authenticated =
+            DeviceSessionRepository::authenticate_in_transaction(connection, credential, now)
+                .await
+                .map_err(owner_session_error)?;
+        let owner_id = authenticated.identity_id().to_string();
+        let owned: Option<i32> = sqlx::query_scalar(
+            "SELECT 1
+               FROM agent.connector_instances connector
+               JOIN agent.hosts host
+                 ON host.tenant_id=connector.tenant_id
+                AND host.host_id=connector.host_id
+              WHERE connector.tenant_id=$1
+                AND connector.connector_id=$2
+                AND host.owner_id=$3",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(fence.connector_id))
+        .bind(owner_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if owned.is_some() {
+            Ok(())
+        } else {
+            Err(ConnectorControlApplicationError::PermissionDenied)
+        }
     }
 
     #[allow(clippy::too_many_lines)] // One transaction keeps issue/consume/log creation atomic and auditable.
@@ -4552,6 +4718,17 @@ fn persistence_error(error: AgentPersistenceError) -> ConnectorControlApplicatio
         AgentPersistenceError::CorruptData(_)
         | AgentPersistenceError::CommandDecodeRejected
         | AgentPersistenceError::SnapshotRejected(_) => ConnectorControlApplicationError::Internal,
+    }
+}
+
+fn owner_session_error(error: IdentityPersistenceError) -> ConnectorControlApplicationError {
+    match error {
+        IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::IdentityInactive => {
+            ConnectorControlApplicationError::AuthenticationFailed
+        }
+        IdentityPersistenceError::Database(_) => ConnectorControlApplicationError::Unavailable,
+        _ => ConnectorControlApplicationError::Internal,
     }
 }
 

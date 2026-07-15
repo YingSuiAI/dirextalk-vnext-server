@@ -247,6 +247,7 @@ async fn run() -> Result<(), BootstrapError> {
     ));
     let enrollment_application: Arc<dyn ConnectorControlApplication> = application.clone();
     let control_application: Arc<dyn ConnectorControlApplication> = application.clone();
+    let owner_application = application.clone();
     let gateway_application: Arc<dyn AgentRunIngressApplication> = application;
 
     let (enrollment_shutdown_tx, enrollment_shutdown_rx) = oneshot::channel();
@@ -292,6 +293,7 @@ async fn run() -> Result<(), BootstrapError> {
     let owner_backend = Arc::new(PostgresAgentProvisioningOwnerBackend::new(
         owner_api_store,
         config.owner_api.tenant_id,
+        owner_application,
     ));
     let owner_api_server = async move {
         axum::serve(

@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
+use dtx_agent_control::ServerCommandPayload;
 use dtx_agent_registry::DeviceCredentialFingerprint;
 use dtx_domain::{
     AgentDeviceId, ApprovalId, BindingId, ConnectorId, DeviceId, DeviceSessionId, IdentityId,
@@ -39,9 +40,11 @@ use crate::{AGENT_IDENTITY_APPROVAL_BINDING_DOMAIN, AgentIdentityApprovalCommand
 use crate::{
     AgentIdentityProvisioningError, AgentProvisioningDeliveryCommand,
     AgentProvisioningDeliveryReceipt, AgentProvisioningRevocationCommand,
-    AgentProvisioningRevocationReceipt, ProtobufDurableCommandDecoder, approve_agent_identity,
-    create_agent_provisioning_delivery, get_agent_identity_approval,
-    get_agent_provisioning_delivery, get_agent_provisioning_target, revoke_agent_provisioning,
+    AgentProvisioningRevocationReceipt, ConnectorCommandFence, ConnectorControlApplicationError,
+    ConnectorLifecycleAction, ConnectorLifecycleCommandWrite, PostgresConnectorControlApplication,
+    ProtobufDurableCommandDecoder, approve_agent_identity, create_agent_provisioning_delivery,
+    get_agent_identity_approval, get_agent_provisioning_delivery, get_agent_provisioning_target,
+    revoke_agent_provisioning,
 };
 
 const DEVICE_SESSION_SCHEME: &str = "DTX-Device-Session";
@@ -102,6 +105,16 @@ pub struct RevocationOwnerCommand {
     pub owner_signature: Ed25519Signature,
 }
 
+/// A closed Owner request for one already enrolled Connector lifecycle action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorLifecycleOwnerCommand {
+    pub connector_id: ConnectorId,
+    pub operation_id: RequestId,
+    pub generation: u64,
+    pub spec_revision: Revision,
+    pub action: ConnectorLifecycleAction,
+}
+
 /// Durable application interface. Parsing and stable HTTP errors stay independent of `PostgreSQL`.
 pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
     fn list_connectors(
@@ -109,6 +122,11 @@ pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
         credential: DeviceSessionCredential,
         query: ConnectorProjectionQueryV1,
         now: UtcMillis,
+    ) -> OwnerBackendFuture<'_>;
+    fn lifecycle(
+        &self,
+        credential: DeviceSessionCredential,
+        command: ConnectorLifecycleOwnerCommand,
     ) -> OwnerBackendFuture<'_>;
     fn approve(
         &self,
@@ -174,12 +192,21 @@ pub enum AgentProvisioningOwnerError {
 pub struct PostgresAgentProvisioningOwnerBackend {
     store: PgStore,
     tenant_id: TenantId,
+    connector_control: Arc<PostgresConnectorControlApplication>,
 }
 
 impl PostgresAgentProvisioningOwnerBackend {
     #[must_use]
-    pub const fn new(store: PgStore, tenant_id: TenantId) -> Self {
-        Self { store, tenant_id }
+    pub fn new(
+        store: PgStore,
+        tenant_id: TenantId,
+        connector_control: Arc<PostgresConnectorControlApplication>,
+    ) -> Self {
+        Self {
+            store,
+            tenant_id,
+            connector_control,
+        }
     }
 }
 
@@ -200,6 +227,43 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                 content_type: CONNECTOR_PROJECTION_MEDIA_TYPE_V1,
                 exact_cbor: serde_json::to_vec(&page)
                     .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?,
+            })
+        })
+    }
+
+    fn lifecycle(
+        &self,
+        credential: DeviceSessionCredential,
+        command: ConnectorLifecycleOwnerCommand,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            let write = self
+                .connector_control
+                .enqueue_owner_lifecycle(
+                    &credential,
+                    command.action,
+                    ConnectorCommandFence {
+                        tenant_id: self.tenant_id,
+                        connector_id: command.connector_id,
+                        generation: command.generation,
+                        spec_revision: command.spec_revision,
+                    },
+                    command.operation_id,
+                )
+                .await
+                .map_err(map_connector_control_error)?;
+            Ok(CborOwnerReply {
+                status: if write.replayed() {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                },
+                content_type: "application/vnd.dirextalk.connector-lifecycle-receipt.v1+json",
+                exact_cbor: connector_lifecycle_receipt_json(
+                    command.action,
+                    command.connector_id,
+                    &write,
+                )?,
             })
         })
     }
@@ -549,10 +613,104 @@ const fn map_connector_projection_error(
     }
 }
 
+const fn map_connector_control_error(
+    error: ConnectorControlApplicationError,
+) -> AgentProvisioningOwnerError {
+    match error {
+        ConnectorControlApplicationError::InvalidRequest => {
+            AgentProvisioningOwnerError::InvalidRequest
+        }
+        ConnectorControlApplicationError::AuthenticationFailed => {
+            AgentProvisioningOwnerError::AuthenticationRejected
+        }
+        ConnectorControlApplicationError::PermissionDenied => {
+            AgentProvisioningOwnerError::AccessDenied
+        }
+        ConnectorControlApplicationError::NotFound => AgentProvisioningOwnerError::NotFound,
+        ConnectorControlApplicationError::Conflict
+        | ConnectorControlApplicationError::StaleFence
+        | ConnectorControlApplicationError::StaleLease => AgentProvisioningOwnerError::Conflict,
+        ConnectorControlApplicationError::ResourceExhausted
+        | ConnectorControlApplicationError::Unavailable
+        | ConnectorControlApplicationError::Internal => {
+            AgentProvisioningOwnerError::TemporarilyUnavailable
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ConnectorLifecycleReceiptV1 {
+    schema_version: u8,
+    action: &'static str,
+    connector_id: String,
+    operation_id: String,
+    generation: u64,
+    spec_revision: u64,
+    command_sequence: u64,
+    command_payload_digest: String,
+    encoded_command_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rotation_deadline_ms: Option<i64>,
+}
+
+fn connector_lifecycle_receipt_json(
+    action: ConnectorLifecycleAction,
+    connector_id: ConnectorId,
+    write: &ConnectorLifecycleCommandWrite,
+) -> Result<Vec<u8>, AgentProvisioningOwnerError> {
+    let command = write.command();
+    let (action, rotation_deadline_ms) = match (action, command.payload()) {
+        (ConnectorLifecycleAction::Drain, ServerCommandPayload::CloseStream(close))
+            if close.reason() == dtx_agent_control::CloseStreamReason::Drained =>
+        {
+            ("drain", None)
+        }
+        (ConnectorLifecycleAction::Reconnect, ServerCommandPayload::CloseStream(close))
+            if close.reason() == dtx_agent_control::CloseStreamReason::Reconnect =>
+        {
+            ("restart", None)
+        }
+        (
+            ConnectorLifecycleAction::RotateCredential,
+            ServerCommandPayload::RotateCredential(rotation),
+        ) => ("rotate_credential", Some(rotation.deadline_millis())),
+        _ => return Err(AgentProvisioningOwnerError::TemporarilyUnavailable),
+    };
+    serde_json::to_vec(&ConnectorLifecycleReceiptV1 {
+        schema_version: 1,
+        action,
+        connector_id: connector_id.to_string(),
+        operation_id: command.operation_id().to_string(),
+        generation: command.generation(),
+        spec_revision: command.spec_revision().get(),
+        command_sequence: command.sequence(),
+        command_payload_digest: Base64UrlUnpadded::encode_string(
+            &command.payload_digest().as_bytes(),
+        ),
+        encoded_command_digest: Base64UrlUnpadded::encode_string(
+            &command.encoded_command_digest().as_bytes(),
+        ),
+        rotation_deadline_ms,
+    })
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
+}
+
 /// Builds the complete V23 Owner API router.
 pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBackend>) -> Router {
     Router::new()
         .route("/v1/connectors", get(get_connectors))
+        .route(
+            "/v1/connectors/{connector_id}/drain",
+            post(post_connector_drain),
+        )
+        .route(
+            "/v1/connectors/{connector_id}/restart",
+            post(post_connector_restart),
+        )
+        .route(
+            "/v1/connectors/{connector_id}/rotate-credential",
+            post(post_connector_credential_rotation),
+        )
         .route(
             "/v1/agent-installations/{installation_id}/identity-approvals",
             post(post_approval),
@@ -589,6 +747,88 @@ async fn get_connectors(
         let query = parse_connector_projection_query(uri.query())?;
         let credential = parse_device_session(&headers)?;
         backend.list_connectors(credential, query, now()?).await
+    }
+    .await;
+    owner_response(result)
+}
+
+async fn post_connector_drain(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path(connector_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    post_connector_lifecycle(
+        backend,
+        connector_id,
+        headers,
+        body,
+        ConnectorLifecycleAction::Drain,
+    )
+    .await
+}
+
+async fn post_connector_restart(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path(connector_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    post_connector_lifecycle(
+        backend,
+        connector_id,
+        headers,
+        body,
+        ConnectorLifecycleAction::Reconnect,
+    )
+    .await
+}
+
+async fn post_connector_credential_rotation(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path(connector_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    post_connector_lifecycle(
+        backend,
+        connector_id,
+        headers,
+        body,
+        ConnectorLifecycleAction::RotateCredential,
+    )
+    .await
+}
+
+async fn post_connector_lifecycle(
+    backend: Arc<dyn AgentProvisioningOwnerBackend>,
+    connector_id: String,
+    headers: HeaderMap,
+    body: Bytes,
+    action: ConnectorLifecycleAction,
+) -> Response {
+    let result = async {
+        if !body.is_empty() {
+            return Err(AgentProvisioningOwnerError::InvalidRequest);
+        }
+        let credential = parse_device_session(&headers)?;
+        let operation_id = parse_connector_lifecycle_operation(&headers)?;
+        let (generation, spec_revision) = parse_connector_lifecycle_fence(&headers)?;
+        let connector_id = connector_id
+            .parse::<ConnectorId>()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        backend
+            .lifecycle(
+                credential,
+                ConnectorLifecycleOwnerCommand {
+                    connector_id,
+                    operation_id,
+                    generation,
+                    spec_revision,
+                    action,
+                },
+            )
+            .await
     }
     .await;
     owner_response(result)
@@ -1073,6 +1313,63 @@ fn parse_idempotency(headers: &HeaderMap) -> Result<Sha256Digest, AgentProvision
     }
     Ok(Sha256Digest::hash_domain(IDEMPOTENCY_DOMAIN, bytes))
 }
+
+fn parse_connector_lifecycle_operation(
+    headers: &HeaderMap,
+) -> Result<RequestId, AgentProvisioningOwnerError> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let value = values
+        .next()
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    if values.next().is_some() {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    value
+        .to_str()
+        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?
+        .parse()
+        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)
+}
+
+fn parse_connector_lifecycle_fence(
+    headers: &HeaderMap,
+) -> Result<(u64, Revision), AgentProvisioningOwnerError> {
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let value = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    if values.next().is_some() {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let value = value
+        .strip_prefix("\"g")
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    let (generation, spec_revision) = value
+        .split_once("-r")
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    if generation.is_empty()
+        || spec_revision.is_empty()
+        || spec_revision.contains("-r")
+        || !generation.bytes().all(|value| value.is_ascii_digit())
+        || !spec_revision.bytes().all(|value| value.is_ascii_digit())
+    {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let generation = generation
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| Revision::new(*generation).is_ok())
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    let spec_revision = spec_revision
+        .parse::<u64>()
+        .ok()
+        .and_then(|revision| Revision::new(revision).ok())
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    Ok((generation, spec_revision))
+}
+
 const fn is_base64url(value: u8) -> bool {
     value.is_ascii_alphanumeric() || value == b'_' || value == b'-'
 }
@@ -1175,7 +1472,7 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
     use base64ct::{Base64UrlUnpadded, Encoding};
     use dtx_agent_control::Sha256Digest as ControlSha256Digest;
-    use dtx_domain::Revision;
+    use dtx_domain::{RequestId, Revision};
     use dtx_wire::{CanonicalValue, decode_deterministic_cbor, encode_deterministic_cbor};
     use dtx_wire::{Sha256Digest, UtcMillis};
     use serde_json::Value;
@@ -1216,6 +1513,44 @@ mod tests {
                 "query must be rejected: {rejected}"
             );
         }
+    }
+
+    #[test]
+    fn connector_lifecycle_requires_a_uuid_v7_operation_and_exact_fence() {
+        let operation_id = RequestId::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_str(&operation_id.to_string()).unwrap(),
+        );
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"g1-r1\""));
+        assert_eq!(
+            super::parse_connector_lifecycle_operation(&headers).unwrap(),
+            operation_id
+        );
+        assert_eq!(
+            super::parse_connector_lifecycle_fence(&headers).unwrap(),
+            (1, Revision::INITIAL)
+        );
+
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"g0-r1\""));
+        assert_eq!(
+            super::parse_connector_lifecycle_fence(&headers),
+            Err(AgentProvisioningOwnerError::InvalidRequest)
+        );
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"g+1-r1\""));
+        assert_eq!(
+            super::parse_connector_lifecycle_fence(&headers),
+            Err(AgentProvisioningOwnerError::InvalidRequest)
+        );
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_static("retry-key-not-a-v7-id"),
+        );
+        assert_eq!(
+            super::parse_connector_lifecycle_operation(&headers),
+            Err(AgentProvisioningOwnerError::InvalidRequest)
+        );
     }
 
     #[test]
