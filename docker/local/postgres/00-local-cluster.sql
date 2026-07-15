@@ -12,3 +12,4 @@ CREATE ROLE dtx_mailbox_node LOGIN IN ROLE dtx_mailbox_runtime NOSUPERUSER NOBYP
 
 CREATE DATABASE dtx_node_a OWNER postgres;
 CREATE DATABASE dtx_node_b OWNER postgres;
+CREATE DATABASE dtx_node_c OWNER postgres;

@@ -45,6 +45,36 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # The init SQL creates this database for a new volume. Keep this idempotent
+  # bootstrap for an existing A/B volume upgraded to the three-node topology.
+  bootstrap-c:
+    image: postgres:18.4-alpine3.24
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        psql --set=ON_ERROR_STOP=1 --username=postgres \
+          --dbname=postgres://postgres@postgres:5432/postgres?sslmode=disable \
+          --tuples-only --no-align \
+          --command="SELECT 1 FROM pg_database WHERE datname = 'dtx_node_c'" \
+          | grep -qx 1 \
+          || psql --set=ON_ERROR_STOP=1 --username=postgres \
+            --dbname=postgres://postgres@postgres:5432/postgres?sslmode=disable \
+            --command="CREATE DATABASE dtx_node_c OWNER postgres"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  migrate-c:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-dev-migrate"]
+    environment:
+      DTX_DATABASE_URL: postgres://postgres@postgres:5432/dtx_node_c?sslmode=disable
+    depends_on:
+      bootstrap-c:
+        condition: service_completed_successfully
+    restart: "no"
+
   provision-a:
     image: postgres:18.4-alpine3.24
     command:
@@ -79,6 +109,23 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
+  provision-c:
+    image: postgres:18.4-alpine3.24
+    command:
+      [
+        "psql",
+        "--set=ON_ERROR_STOP=1",
+        "--username=postgres",
+        "--dbname=postgres://postgres@postgres:5432/dtx_node_c?sslmode=disable",
+        "--file=/bootstrap/20-local-runtime-grants.sql",
+      ]
+    volumes:
+      - ./docker/local/postgres/20-local-runtime-grants.sql:/bootstrap/20-local-runtime-grants.sql:ro
+    depends_on:
+      migrate-c:
+        condition: service_completed_successfully
+    restart: "no"
+
   identity-a:
     <<: *dev-image
     command: ["/usr/local/bin/dtx-identity-local"]
@@ -110,6 +157,25 @@ services:
         condition: service_completed_successfully
     ports:
       - "127.0.0.1:18081:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8080; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+
+  identity-c:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-identity-local"]
+    environment:
+      DTX_DEV_DATABASE_URL: postgres://dtx_identity_node@postgres:5432/dtx_node_c?sslmode=disable
+      DTX_IDENTITY_DEVICE_SESSION_AUDIENCE: http://identity-c:8080
+      DTX_IDENTITY_LISTEN: 127.0.0.1:9080
+    depends_on:
+      provision-c:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:18082:8080"
     healthcheck:
       test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8080; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
       interval: 2s
@@ -153,6 +219,24 @@ services:
       retries: 15
       start_period: 2s
 
+  mailbox-c:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-mailbox-node"]
+    environment:
+      DTX_DATABASE_URL: postgres://dtx_mailbox_node@postgres:5432/dtx_node_c?sslmode=disable
+      DTX_MAILBOX_BIND: 0.0.0.0:4812
+    depends_on:
+      provision-c:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:14816:4812"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/4812; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+
   group-a:
     <<: *dev-image
     command: ["/usr/local/bin/dtx-group-node"]
@@ -184,6 +268,25 @@ services:
         condition: service_completed_successfully
     ports:
       - "127.0.0.1:14815:4814"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/4814; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 2s
+
+  group-c:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-group-node"]
+    environment:
+      DTX_DATABASE_URL: postgres://dtx_group_node@postgres:5432/dtx_node_c?sslmode=disable
+      DTX_GROUP_TENANT_ID: 0190f2a5-7b1c-7abc-8def-0123456789a2
+      DTX_GROUP_BIND: 0.0.0.0:4814
+    depends_on:
+      provision-c:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:14817:4814"
     healthcheck:
       test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/4814; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
       interval: 2s
