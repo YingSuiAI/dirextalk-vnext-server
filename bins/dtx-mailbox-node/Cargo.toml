@@ -27,6 +27,8 @@ uuid.workspace = true
 dtx-identity-log = { path = "../../crates/dtx-identity-log" }
 dtx-storage = { path = "../../crates/dtx-storage" }
 ed25519-dalek.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 testcontainers-modules.workspace = true
 tower.workspace = true
 
