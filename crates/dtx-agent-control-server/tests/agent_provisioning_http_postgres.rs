@@ -20,7 +20,8 @@ use dtx_agent_control::{
 use dtx_agent_control_server::{
     AgentProvisioningInstalledReceiptFacts, ConnectorCertificateAuthority,
     ConnectorControlApplication, ConnectorControlPolicy, ConnectorCredentialAuthorizationIndex,
-    CreateConnectorEnrollmentRequest, ParsedAgentProvisioningInstalled, ParsedCapacity,
+    CreateConnectorEnrollmentRequest, ParsedAgentProvisioningInstalled,
+    ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteRecipientReady, ParsedCapacity,
     ParsedEnrollment, ParsedHello, ParsedLeaseFence, ParsedProtocolRange,
     ParsedProvisioningRecipientAnnouncement, PostgresAgentProvisioningOwnerBackend,
     PostgresConnectorControlApplication, ProtobufDurableCommandDecoder,
@@ -1033,6 +1034,508 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
     Ok(())
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed()
+-> Result<(), Box<dyn Error>> {
+    TEST_NOW.get_or_init(|| {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis(),
+        )
+        .expect("current time fits i64")
+    });
+    let harness = PostgresHarness::start().await?;
+    grant_agent_route_run_runtime_access(&harness).await?;
+    let store = harness.runtime_store(12).await?;
+    let tenant_id = TenantId::new();
+    provision_tenant(&store, tenant_id).await?;
+
+    let owner_root = key(110);
+    let owner_device_key = key(111);
+    let owner_device_id = DeviceId::new();
+    let (owner_id, owner_head, _) = provision_identity(
+        &harness,
+        &owner_root,
+        &owner_device_key,
+        owner_device_id,
+        112,
+    )
+    .await?;
+    let (owner_credential, owner_authorization) =
+        provision_owner_session(&harness, owner_id, owner_device_id, owner_head, [0x71; 32])
+            .await?;
+
+    let agent_root = key(113);
+    let agent_device_key = key(114);
+    let agent_identity_device_id = DeviceId::new();
+    let (_, _, agent_certificate) = provision_identity(
+        &harness,
+        &agent_root,
+        &agent_device_key,
+        agent_identity_device_id,
+        115,
+    )
+    .await?;
+    let (host, connector) = provision_host_and_connector(&store, tenant_id, owner_id).await?;
+    let installation_id = InstallationId::new();
+    let agent_control_device_id = AgentDeviceId::new();
+    let binding_id = BindingId::new();
+    let fingerprint = DeviceCredentialFingerprint::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-device-credential-fingerprint.v1\0",
+            &agent_certificate.to_deterministic_cbor()?,
+        )
+        .as_bytes(),
+    );
+    provision_installation_binding(
+        &store,
+        tenant_id,
+        owner_id,
+        installation_id,
+        agent_control_device_id,
+        agent_identity_device_id,
+        fingerprint,
+        binding_id,
+        &connector,
+    )
+    .await?;
+    let source_conversation_id = ConversationId::new();
+    provision_private_conversation_owner(&harness, tenant_id, source_conversation_id, owner_id)
+        .await?;
+
+    let (issuer, ca_der) = certificate_issuer(now())?;
+    let index = Arc::new(ConnectorCredentialAuthorizationIndex::new());
+    let app = Arc::new(application(store.clone(), issuer, index.clone()));
+    let enrollment = app
+        .create_enrollment_intent(CreateConnectorEnrollmentRequest::new(
+            tenant_id,
+            connector.connector_id(),
+            RequestId::new(),
+            EnrollmentToken::from_bytes([0x72; 32]),
+            None,
+        )?)
+        .await?;
+    let enrollment_request = signed_enrollment_request(&enrollment, &[0x72; 32], 116, 117)?;
+    let completion = app
+        .enroll(ParsedEnrollment {
+            token: EnrollmentToken::from_bytes([0x72; 32]),
+            request: enrollment_request,
+        })
+        .await?;
+    app.hydrate_connector_authorization(tenant_id, connector.connector_id())
+        .await?;
+    let opened = app
+        .open_control(
+            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            ParsedHello {
+                tenant_id,
+                connector_id: connector.connector_id(),
+                host_id: host.host_id(),
+                boot_id: BootId::new(),
+                connector_generation: completion.credential.generation(),
+                spec_revision: completion.credential.revision(),
+                protocol: ParsedProtocolRange {
+                    minimum_major: 1,
+                    minimum_minor: 4,
+                    maximum_major: 1,
+                    maximum_minor: 4,
+                },
+                runtime_claims: claims()?,
+                capacity: capacity(),
+                last_applied_command_sequence: 0,
+                required_server_capabilities: Vec::new(),
+            },
+        )
+        .await?;
+    assert_eq!(opened.protocol_minor, 4);
+    let fence = opened.lease.fence();
+    let router = agent_provisioning_owner_router(Arc::new(
+        PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app.clone()),
+    ));
+
+    let grant_operation = RequestId::new();
+    let grant_uri =
+        format!("/v1/conversations/{source_conversation_id}/agent-grants/{installation_id}");
+    let grant = owner_conversation_grant_mutation(
+        router.clone(),
+        Method::PUT,
+        &grant_uri,
+        &owner_authorization,
+        grant_operation,
+        "\"g0\"",
+        conversation_grant_body(
+            1,
+            grant_operation,
+            tenant_id,
+            source_conversation_id,
+            installation_id,
+            None,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            Some(now() + 600_000),
+            Some([0x73; 32]),
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(grant.0, StatusCode::CREATED);
+
+    let route_id = ConversationId::new();
+    let route_fence = [0x74; 32];
+    let before_install_operation = RequestId::new();
+    let before_install_event = EventId::try_from(*before_install_operation.as_uuid())?;
+    let run_uri =
+        format!("/v1/conversations/{source_conversation_id}/agent-routes/{route_id}/runs");
+    let before_install = owner_agent_route_run(
+        router.clone(),
+        &run_uri,
+        &owner_authorization,
+        before_install_operation,
+        "\"g1\"",
+        agent_route_run_body(
+            tenant_id,
+            source_conversation_id,
+            route_id,
+            installation_id,
+            binding_id,
+            agent_control_device_id,
+            route_fence,
+            before_install_event,
+            before_install_operation,
+            Revision::INITIAL,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(before_install.0, StatusCode::CONFLICT);
+
+    let bootstrap_id = AgentRouteBootstrapId::new();
+    let bootstrap_expires_at = now() + 300_000;
+    let owner_signed_intent = vec![0x75; 128];
+    let begin_body = agent_route_bootstrap_begin_body(
+        bootstrap_id,
+        tenant_id,
+        installation_id,
+        binding_id,
+        agent_control_device_id,
+        owner_id,
+        owner_device_id,
+        bootstrap_expires_at,
+        owner_signed_intent,
+        &owner_device_key,
+    )?;
+    let begin = owner_post(
+        router.clone(),
+        "/v1/agent-route-bootstraps",
+        &owner_authorization,
+        "route_bootstrap_begin_1",
+        "application/vnd.dirextalk.agent-route-bootstrap.v1+cbor",
+        begin_body.clone(),
+    )
+    .await?;
+    assert_eq!(begin.0, StatusCode::CREATED);
+    let begin_replay = owner_post(
+        router.clone(),
+        "/v1/agent-route-bootstraps",
+        &owner_authorization,
+        "route_bootstrap_begin_1",
+        "application/vnd.dirextalk.agent-route-bootstrap.v1+cbor",
+        begin_body,
+    )
+    .await?;
+    assert_eq!(begin_replay.0, StatusCode::OK);
+    assert_eq!(begin_replay.1, begin.1);
+
+    let commands = app
+        .poll_commands(
+            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            fence,
+            0,
+        )
+        .await?;
+    let prepare_commands = commands
+        .iter()
+        .filter(|command| {
+            matches!(
+                command.payload(),
+                ServerCommandPayload::PrepareAgentRouteRecipient(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prepare_commands.len(), 1);
+    let prepare_command = prepare_commands[0];
+    let mut verify_session = store.begin_tenant(tenant_id).await?;
+    let prepare_outbox_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.agent_route_bootstrap_outbox
+          WHERE tenant_id=$1 AND bootstrap_id=$2 AND command_kind='prepare_recipient'",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(bootstrap_id))
+    .fetch_one(verify_session.connection())
+    .await?;
+    assert_eq!(prepare_outbox_count, 1);
+    verify_session.rollback().await?;
+
+    let recipient_id = AgentRouteRecipientId::new();
+    let opaque_recipient_capsule = vec![0x76; 256];
+    let recipient_capsule_digest = ControlDigest::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-route-recipient-capsule.v1\0",
+            &opaque_recipient_capsule,
+        )
+        .as_bytes(),
+    );
+    let recipient_result_digest = route_bootstrap_recipient_ready_result_digest(
+        bootstrap_id,
+        tenant_id,
+        installation_id,
+        binding_id,
+        agent_control_device_id,
+        recipient_id,
+        prepare_command.sequence(),
+        recipient_capsule_digest,
+        bootstrap_expires_at,
+    );
+    let ready = ParsedAgentRouteRecipientReady {
+        connector_fence: parsed_fence(fence),
+        bootstrap_id,
+        command_sequence: prepare_command.sequence(),
+        command_payload_digest: prepare_command.payload_digest(),
+        encoded_command_digest: prepare_command.encoded_command_digest(),
+        installation_id,
+        binding_id,
+        agent_control_device_id,
+        recipient_id,
+        recipient_capsule_digest,
+        opaque_recipient_capsule,
+        expires_at_millis: bootstrap_expires_at,
+        result_digest: recipient_result_digest,
+    };
+    let mut changed_ready = ready.clone();
+    changed_ready.result_digest = ControlDigest::from_bytes([0x77; 32]);
+    assert!(
+        app.record_agent_route_recipient_ready(
+            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            changed_ready,
+        )
+        .await
+        .is_err()
+    );
+    app.record_agent_route_recipient_ready(
+        authenticate(index.clone(), &ca_der, &completion.credential)?,
+        ready,
+    )
+    .await?;
+
+    let mut ready_session = store.begin_tenant(tenant_id).await?;
+    let (bootstrap_state, prepare_state): (String, String) = sqlx::query_as(
+        "SELECT b.state, o.state
+           FROM agent.agent_route_bootstraps AS b
+           JOIN agent.agent_route_bootstrap_outbox AS o
+             ON o.tenant_id=b.tenant_id AND o.bootstrap_id=b.bootstrap_id
+          WHERE b.tenant_id=$1 AND b.bootstrap_id=$2
+            AND o.command_kind='prepare_recipient'",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(bootstrap_id))
+    .fetch_one(ready_session.connection())
+    .await?;
+    assert_eq!(bootstrap_state, "recipient_ready");
+    assert_eq!(prepare_state, "acknowledged");
+    let acknowledged_after_ready: i64 = sqlx::query_scalar(
+        "SELECT acknowledged_command_sequence
+           FROM agent.connector_control_stream_heads
+          WHERE tenant_id=$1 AND connector_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(connector.connector_id()))
+    .fetch_one(ready_session.connection())
+    .await?;
+    assert_eq!(
+        acknowledged_after_ready,
+        i64::try_from(prepare_command.sequence())?
+    );
+    ready_session.rollback().await?;
+
+    let delivery_id = AgentRouteDeliveryId::new();
+    let opaque_sealed_bootstrap = vec![0x78; 512];
+    let bootstrap_capsule_digest = Sha256Digest::hash_domain(
+        b"dirextalk.agent-route-bootstrap-capsule.v1\0",
+        &opaque_sealed_bootstrap,
+    );
+    let delivery_body = agent_route_bootstrap_delivery_body(
+        bootstrap_id,
+        delivery_id,
+        tenant_id,
+        installation_id,
+        binding_id,
+        agent_control_device_id,
+        owner_id,
+        owner_device_id,
+        recipient_id,
+        route_id,
+        bootstrap_capsule_digest,
+        opaque_sealed_bootstrap,
+        bootstrap_expires_at,
+        &owner_device_key,
+    )?;
+    let delivery_uri =
+        format!("/v1/agent-route-bootstraps/{bootstrap_id}/deliveries/{delivery_id}");
+    let delivery = owner_agent_route_bootstrap_delivery(
+        router.clone(),
+        &delivery_uri,
+        &owner_authorization,
+        delivery_body,
+    )
+    .await?;
+    assert_eq!(delivery.0, StatusCode::CREATED);
+    let delivery_commands = app
+        .poll_commands(
+            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            fence,
+            prepare_command.sequence(),
+        )
+        .await?;
+    let delivery_commands = delivery_commands
+        .iter()
+        .filter(|command| {
+            matches!(
+                command.payload(),
+                ServerCommandPayload::DeliverAgentRouteBootstrap(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(delivery_commands.len(), 1);
+    let delivery_command = delivery_commands[0];
+
+    let mut delivery_session = store.begin_tenant(tenant_id).await?;
+    let delivery_outbox_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.agent_route_bootstrap_outbox
+          WHERE tenant_id=$1 AND delivery_id=$2 AND command_kind='deliver_bootstrap'",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(delivery_id))
+    .fetch_one(delivery_session.connection())
+    .await?;
+    assert_eq!(delivery_outbox_count, 1);
+    delivery_session.rollback().await?;
+
+    let installed_at = now();
+    let installed_capsule_digest = ControlDigest::from_bytes(*bootstrap_capsule_digest.as_bytes());
+    let installed = ParsedAgentRouteBootstrapInstalled {
+        connector_fence: parsed_fence(fence),
+        bootstrap_id,
+        delivery_id,
+        route_id,
+        command_sequence: delivery_command.sequence(),
+        command_payload_digest: delivery_command.payload_digest(),
+        encoded_command_digest: delivery_command.encoded_command_digest(),
+        installation_id,
+        binding_id,
+        agent_control_device_id,
+        recipient_id,
+        capsule_digest: installed_capsule_digest,
+        route_fence,
+        installed_at_millis: installed_at,
+        result_digest: route_bootstrap_installed_result_digest(
+            bootstrap_id,
+            delivery_id,
+            route_id,
+            installation_id,
+            binding_id,
+            agent_control_device_id,
+            recipient_id,
+            delivery_command.sequence(),
+            installed_capsule_digest,
+            route_fence,
+            installed_at,
+        ),
+    };
+    app.complete_agent_route_bootstrap(
+        authenticate(index.clone(), &ca_der, &completion.credential)?,
+        installed,
+    )
+    .await?;
+
+    let mut installed_session = store.begin_tenant(tenant_id).await?;
+    let installed_state: String = sqlx::query_scalar(
+        "SELECT state FROM agent.agent_route_bootstraps
+          WHERE tenant_id=$1 AND bootstrap_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(bootstrap_id))
+    .fetch_one(installed_session.connection())
+    .await?;
+    assert_eq!(installed_state, "installed");
+    let (head_route_id, head_route_fence): (Uuid, Vec<u8>) = sqlx::query_as(
+        "SELECT route_id, route_fence FROM agent.agent_route_binding_heads
+          WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3
+            AND installation_id=$4 AND binding_id=$5 AND agent_control_device_id=$6",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(owner_id.to_string())
+    .bind(Uuid::from(owner_device_id))
+    .bind(Uuid::from(installation_id))
+    .bind(Uuid::from(binding_id))
+    .bind(Uuid::from(agent_control_device_id))
+    .fetch_one(installed_session.connection())
+    .await?;
+    assert_eq!(head_route_id, Uuid::from(route_id));
+    assert_eq!(head_route_fence, route_fence);
+    let acknowledged_after_installed: i64 = sqlx::query_scalar(
+        "SELECT acknowledged_command_sequence
+           FROM agent.connector_control_stream_heads
+          WHERE tenant_id=$1 AND connector_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(connector.connector_id()))
+    .fetch_one(installed_session.connection())
+    .await?;
+    assert_eq!(
+        acknowledged_after_installed,
+        i64::try_from(delivery_command.sequence())?
+    );
+    installed_session.rollback().await?;
+
+    let admitted_operation = RequestId::new();
+    let admitted_event = EventId::try_from(*admitted_operation.as_uuid())?;
+    let admitted = owner_agent_route_run(
+        router,
+        &run_uri,
+        &owner_authorization,
+        admitted_operation,
+        "\"g1\"",
+        agent_route_run_body(
+            tenant_id,
+            source_conversation_id,
+            route_id,
+            installation_id,
+            binding_id,
+            agent_control_device_id,
+            route_fence,
+            admitted_event,
+            admitted_operation,
+            Revision::INITIAL,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(admitted.0, StatusCode::CREATED);
+
+    drop(owner_credential);
+    Ok(())
+}
+
 async fn owner_post(
     router: axum::Router,
     uri: &str,
@@ -1128,6 +1631,30 @@ async fn owner_agent_route_run(
                 .header(
                     header::CONTENT_TYPE,
                     "application/vnd.dirextalk.agent-route-run.v1+cbor",
+                )
+                .body(Body::from(body))?,
+        )
+        .await?;
+    let status = response.status();
+    Ok((
+        status,
+        to_bytes(response.into_body(), 1_000_000).await?.to_vec(),
+    ))
+}
+
+async fn owner_agent_route_bootstrap_delivery(
+    router: axum::Router,
+    uri: &str,
+    authorization: &str,
+    body: Vec<u8>,
+) -> Result<(StatusCode, Vec<u8>), Box<dyn Error>> {
+    let response = router
+        .oneshot(
+            Request::put(uri)
+                .header(header::AUTHORIZATION, authorization)
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.dirextalk.agent-route-bootstrap.v1+cbor",
                 )
                 .body(Body::from(body))?,
         )
@@ -1676,6 +2203,82 @@ fn agent_route_run_body(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn agent_route_bootstrap_begin_body(
+    bootstrap_id: AgentRouteBootstrapId,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    owner_id: IdentityId,
+    owner_device_id: DeviceId,
+    expires_at: i64,
+    owner_signed_intent: Vec<u8>,
+    owner_key: &SigningKey,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let binding = CanonicalValue::Map(vec![
+        (u(1), u(1)),
+        (u(2), text(bootstrap_id)),
+        (u(3), text(tenant_id)),
+        (u(4), text(installation_id)),
+        (u(5), text(binding_id)),
+        (u(6), text(agent_control_device_id)),
+        (u(7), text(owner_id)),
+        (u(8), text(owner_device_id)),
+        (u(9), UtcMillis::new(expires_at)?.to_canonical_value()),
+        (u(10), CanonicalValue::Bytes(owner_signed_intent)),
+    ]);
+    signed_owner_body(
+        binding,
+        b"dirextalk.agent-route-bootstrap-begin-binding.v1\0",
+        b"dirextalk.agent-route-bootstrap-begin-signature.v1\0",
+        owner_key,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_route_bootstrap_delivery_body(
+    bootstrap_id: AgentRouteBootstrapId,
+    delivery_id: AgentRouteDeliveryId,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    owner_id: IdentityId,
+    owner_device_id: DeviceId,
+    recipient_id: AgentRouteRecipientId,
+    route_id: ConversationId,
+    capsule_digest: Sha256Digest,
+    opaque_sealed_bootstrap: Vec<u8>,
+    expires_at: i64,
+    owner_key: &SigningKey,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let binding = CanonicalValue::Map(vec![
+        (u(1), u(1)),
+        (u(2), text(bootstrap_id)),
+        (u(3), text(delivery_id)),
+        (u(4), text(tenant_id)),
+        (u(5), text(installation_id)),
+        (u(6), text(binding_id)),
+        (u(7), text(agent_control_device_id)),
+        (u(8), text(owner_id)),
+        (u(9), text(owner_device_id)),
+        (u(10), text(recipient_id)),
+        (u(11), text(route_id)),
+        (u(12), bytes(capsule_digest.as_bytes())),
+        (u(13), CanonicalValue::Bytes(opaque_sealed_bootstrap)),
+        (u(14), UtcMillis::new(expires_at)?.to_canonical_value()),
+    ]);
+    signed_owner_body(
+        binding,
+        b"dirextalk.agent-route-bootstrap-delivery-binding.v1\0",
+        b"dirextalk.agent-route-bootstrap-delivery-signature.v1\0",
+        owner_key,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn approval_body(
     approval_id: dtx_domain::ApprovalId,
     tenant_id: TenantId,
@@ -1889,6 +2492,70 @@ fn provisioning_commit(domain: &[u8], parts: &[&[u8]]) -> ControlDigest {
         hasher.update(part);
     }
     ControlDigest::from_bytes(hasher.finalize().into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_bootstrap_recipient_ready_result_digest(
+    bootstrap_id: AgentRouteBootstrapId,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    recipient_id: AgentRouteRecipientId,
+    command_sequence: u64,
+    recipient_capsule_digest: ControlDigest,
+    expires_at_millis: i64,
+) -> ControlDigest {
+    provisioning_commit(
+        b"dirextalk.agent-route-recipient-ready.v1",
+        &[
+            Uuid::from(bootstrap_id).as_bytes(),
+            Uuid::from(tenant_id).as_bytes(),
+            Uuid::from(installation_id).as_bytes(),
+            Uuid::from(binding_id).as_bytes(),
+            Uuid::from(agent_control_device_id).as_bytes(),
+            Uuid::from(recipient_id).as_bytes(),
+            &command_sequence.to_be_bytes(),
+            &recipient_capsule_digest.as_bytes(),
+            &u64::try_from(expires_at_millis)
+                .expect("positive RouteBootstrap expiry")
+                .to_be_bytes(),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_bootstrap_installed_result_digest(
+    bootstrap_id: AgentRouteBootstrapId,
+    delivery_id: AgentRouteDeliveryId,
+    route_id: ConversationId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    recipient_id: AgentRouteRecipientId,
+    command_sequence: u64,
+    capsule_digest: ControlDigest,
+    route_fence: [u8; 32],
+    installed_at_millis: i64,
+) -> ControlDigest {
+    provisioning_commit(
+        b"dirextalk.agent-route-bootstrap-installed.v1",
+        &[
+            Uuid::from(bootstrap_id).as_bytes(),
+            Uuid::from(delivery_id).as_bytes(),
+            Uuid::from(route_id).as_bytes(),
+            Uuid::from(installation_id).as_bytes(),
+            Uuid::from(binding_id).as_bytes(),
+            Uuid::from(agent_control_device_id).as_bytes(),
+            Uuid::from(recipient_id).as_bytes(),
+            &command_sequence.to_be_bytes(),
+            &capsule_digest.as_bytes(),
+            &route_fence,
+            &u64::try_from(installed_at_millis)
+                .expect("positive RouteBootstrap installed timestamp")
+                .to_be_bytes(),
+        ],
+    )
 }
 
 fn push_lp(output: &mut Vec<u8>, value: &[u8]) {
