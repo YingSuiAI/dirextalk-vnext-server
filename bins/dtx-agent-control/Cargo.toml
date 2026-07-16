@@ -18,6 +18,9 @@ axum.workspace = true
 base64ct.workspace = true
 dtx-agent-control = { path = "../../crates/dtx-agent-control" }
 dtx-agent-control-server = { path = "../../crates/dtx-agent-control-server" }
+dtx-agent-host = { path = "../../crates/dtx-agent-host" }
+dtx-agent-persistence = { path = "../../crates/dtx-agent-persistence" }
+dtx-agent-registry = { path = "../../crates/dtx-agent-registry" }
 dtx-connect-registry = { path = "../../crates/dtx-connect-registry" }
 dtx-domain = { path = "../../crates/dtx-domain" }
 dtx-security = { path = "../../crates/dtx-security" }

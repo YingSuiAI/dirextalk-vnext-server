@@ -1,0 +1,97 @@
+# Agent Alpha Acceptance Operator
+
+`dtx-agent-provision` exposes a temporary, root-operated two-phase Alpha
+acceptance boundary. It creates no public HTTP API and starts no runtime or
+cloud process. The split keeps Connector enrollment independent from the real
+Agent identities that the client authority flow creates later.
+
+The non-secret plan contains one Host, exactly one `codex` and one
+`openclaw_acp` Connector, and the future Agent/Installation/Agent Device/Binding
+IDs. Each Agent entry also contains its canonical HTTPS `server_origin`.
+Immutable IDs, capacities, descriptor digests, and request IDs are replay
+checked; changed durable facts fail closed.
+
+## Prepare
+
+Validate without PostgreSQL or token creation:
+
+```text
+dtx-agent-provision acceptance-prepare \
+  --config-file /etc/dirextalk/agent-control.json \
+  --database-url-file /run/credentials/dtx-agent-control.service/database-url \
+  --plan-file /root/dtx-acceptance/plan.json \
+  --dry-run
+```
+
+Create/reuse the Host and two Connectors, then issue/recover one exact
+enrollment intent per Connector:
+
+```text
+install -d -m 0700 /root/dtx-acceptance
+dtx-agent-provision acceptance-prepare \
+  --config-file /etc/dirextalk/agent-control.json \
+  --database-url-file /run/credentials/dtx-agent-control.service/database-url \
+  --plan-file /root/dtx-acceptance/plan.json \
+  --handoff-file /root/dtx-acceptance/handoff.json
+```
+
+The handoff parent must be owned by the operator and mode `0700`. The command
+creates or atomically replaces a non-symlink `0600` handoff. Raw enrollment
+tokens exist only in that file: never in arguments, environment, stdout,
+errors, or logs. Stdout is a redacted prepare manifest containing the exact
+Installation IDs and origins needed by the client authority tool.
+
+## Real Agent authority facts
+
+Run the controlled client `provision_agent_authority` flow once per
+Installation against the origin from the prepare manifest. Each invocation
+must write one independent non-symlink `0600` JSON file with exactly this
+shape:
+
+```json
+{
+  "schema_version": 1,
+  "installation_id": "01900000-0000-7000-8000-000000000001",
+  "server_origin": "https://x3.dirextalk.ai",
+  "agent_identity_id": "dtxi1...",
+  "identity_device_id": "01900000-0000-7000-8000-000000000002",
+  "identity_head_sequence": 2,
+  "identity_head_hash": "base64url-unpadded-32-byte-digest",
+  "credential_fingerprint": "base64url-unpadded-32-byte-digest"
+}
+```
+
+Unknown fields, non-canonical Base64URL, duplicate identities/devices,
+zero-valued digests, an Owner identity/device reuse, an Installation/origin
+mismatch, or unsafe file permissions are rejected. The credential fingerprint
+must be produced from the real root-signed Agent `DeviceCertificateV1` using
+the protocol's `dirextalk.agent-device-credential-fingerprint.v1\0` hash
+domain. The operator never fabricates or substitutes this value; the root-only
+facts file is the trust handoff from the controlled client authority tool, so
+fixtures and random placeholder fingerprints are unsupported.
+
+## Finalize
+
+Validate both facts files without touching PostgreSQL:
+
+```text
+dtx-agent-provision acceptance-finalize \
+  --config-file /etc/dirextalk/agent-control.json \
+  --database-url-file /run/credentials/dtx-agent-control.service/database-url \
+  --plan-file /root/dtx-acceptance/plan.json \
+  --facts-file /root/dtx-acceptance/codex-agent-facts.json \
+  --facts-file /root/dtx-acceptance/openclaw-agent-facts.json \
+  --dry-run
+```
+
+Run the same command without `--dry-run` to create/reuse each verified Agent
+Definition, identity-bound Installation, active Agent Device, and enabled
+exclusive Binding. Finalize requires the exact prepared Host and Connectors;
+it never silently creates a missing foundation. Repeating the exact command is
+idempotent, while changed identity, certificate, descriptor, or routing facts
+fail closed.
+
+The database URL is read only from the explicit owner-controlled `0400`,
+`0440`, `0600`, or `0640` service secret. The Connector issuer is loaded from
+the running service configuration, so prepare issues credentials accepted by
+that Agent Control instance.
