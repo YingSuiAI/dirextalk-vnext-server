@@ -1550,6 +1550,182 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     Ok(())
 }
 
+#[tokio::test]
+async fn owner_agent_route_target_resolves_only_one_active_owned_binding()
+-> Result<(), Box<dyn Error>> {
+    TEST_NOW.get_or_init(|| {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis(),
+        )
+        .expect("current time fits i64")
+    });
+    let harness = PostgresHarness::start().await?;
+    let store = harness.runtime_store(12).await?;
+    let tenant_id = TenantId::new();
+    provision_tenant(&store, tenant_id).await?;
+
+    let owner_root = key(120);
+    let owner_device_key = key(121);
+    let owner_device_id = DeviceId::new();
+    let (owner_id, owner_head, _) = provision_identity(
+        &harness,
+        &owner_root,
+        &owner_device_key,
+        owner_device_id,
+        122,
+    )
+    .await?;
+    let (_owner_credential, owner_authorization) =
+        provision_owner_session(&harness, owner_id, owner_device_id, owner_head, [0x79; 32])
+            .await?;
+
+    let non_owner_root = key(123);
+    let non_owner_device_key = key(124);
+    let non_owner_device_id = DeviceId::new();
+    let (non_owner_id, non_owner_head, _) = provision_identity(
+        &harness,
+        &non_owner_root,
+        &non_owner_device_key,
+        non_owner_device_id,
+        125,
+    )
+    .await?;
+    let (_non_owner_credential, non_owner_authorization) = provision_owner_session(
+        &harness,
+        non_owner_id,
+        non_owner_device_id,
+        non_owner_head,
+        [0x7a; 32],
+    )
+    .await?;
+
+    let agent_root = key(126);
+    let agent_device_key = key(127);
+    let agent_identity_device_id = DeviceId::new();
+    let (_, _, agent_certificate) = provision_identity(
+        &harness,
+        &agent_root,
+        &agent_device_key,
+        agent_identity_device_id,
+        128,
+    )
+    .await?;
+    let (_, connector) = provision_host_and_connector(&store, tenant_id, owner_id).await?;
+    let installation_id = InstallationId::new();
+    let agent_control_device_id = AgentDeviceId::new();
+    let binding_id = BindingId::new();
+    let fingerprint = DeviceCredentialFingerprint::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-device-credential-fingerprint.v1\0",
+            &agent_certificate.to_deterministic_cbor()?,
+        )
+        .as_bytes(),
+    );
+    provision_installation_binding(
+        &store,
+        tenant_id,
+        owner_id,
+        installation_id,
+        agent_control_device_id,
+        agent_identity_device_id,
+        fingerprint,
+        binding_id,
+        &connector,
+    )
+    .await?;
+
+    let (issuer, _) = certificate_issuer(now())?;
+    let app = Arc::new(application(
+        store.clone(),
+        issuer,
+        Arc::new(ConnectorCredentialAuthorizationIndex::new()),
+    ));
+    let router = agent_provisioning_owner_router(Arc::new(
+        PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app),
+    ));
+    let target_uri = format!(
+        "/v1/agent-installations/{installation_id}/agent-route-target?binding_id={binding_id}"
+    );
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::get(&target_uri)
+                .header(header::AUTHORIZATION, &owner_authorization)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/vnd.dirextalk.agent-route-target.v1+cbor")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let target_body = to_bytes(response.into_body(), 16 * 1024).await?.to_vec();
+    let expected_target = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(tenant_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(installation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(binding_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(agent_control_device_id.to_string()),
+        ),
+    ]))?;
+    assert_eq!(target_body, expected_target);
+
+    let unauthenticated = owner_get(router.clone(), &target_uri, "").await?;
+    assert_eq!(unauthenticated.0, StatusCode::UNAUTHORIZED);
+    let non_owner = owner_get(router.clone(), &target_uri, &non_owner_authorization).await?;
+    assert_eq!(non_owner.0, StatusCode::NOT_FOUND);
+    let mismatched = owner_get(
+        router.clone(),
+        &format!(
+            "/v1/agent-installations/{installation_id}/agent-route-target?binding_id={}",
+            BindingId::new()
+        ),
+        &owner_authorization,
+    )
+    .await?;
+    assert_eq!(mismatched.0, StatusCode::NOT_FOUND);
+
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let repository = BindingSetRepository::new();
+    let mut bindings = repository.load(session.connection(), tenant_id).await?;
+    let binding_ref = TenantRef::new(tenant_id, binding_id);
+    let revision = bindings.binding(binding_ref)?.revision();
+    bindings.disable(binding_ref, revision)?;
+    repository
+        .save(session.connection(), &bindings, now())
+        .await?;
+    session.commit().await?;
+    let disabled = owner_get(router, &target_uri, &owner_authorization).await?;
+    assert_eq!(disabled.0, StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
 async fn owner_post(
     router: axum::Router,
     uri: &str,

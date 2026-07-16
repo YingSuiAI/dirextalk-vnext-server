@@ -60,7 +60,8 @@ use crate::{
     create_agent_provisioning_delivery,
     deliver_agent_route_bootstrap as deliver_agent_route_bootstrap_application,
     get_agent_identity_approval, get_agent_provisioning_delivery, get_agent_provisioning_target,
-    get_agent_route_bootstrap as get_agent_route_bootstrap_application, revoke_agent_provisioning,
+    get_agent_route_bootstrap as get_agent_route_bootstrap_application,
+    get_owned_agent_route_bootstrap_target, revoke_agent_provisioning,
 };
 
 const DEVICE_SESSION_SCHEME: &str = "DTX-Device-Session";
@@ -82,6 +83,8 @@ const AGENT_ROUTE_BOOTSTRAP_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.agent-route-bootstrap.v1+cbor";
 const AGENT_ROUTE_BOOTSTRAP_RECEIPT_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.agent-route-bootstrap-receipt.v1+cbor";
+const AGENT_ROUTE_TARGET_MEDIA_TYPE_V1: &str =
+    "application/vnd.dirextalk.agent-route-target.v1+cbor";
 const MAX_SMALL_BODY: usize = 16 * 1024;
 const MAX_DELIVERY_BODY: usize = 212_992;
 const MAX_GRANT_PROOF_LIFETIME_MS: i64 = 10 * 60 * 1000;
@@ -258,6 +261,19 @@ pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
         bootstrap_id: AgentRouteBootstrapId,
         now: UtcMillis,
     ) -> OwnerBackendFuture<'_>;
+    /// Resolves the one active AgentRoute control device for an Owner's binding.
+    ///
+    /// A default rejection preserves compatibility for backend implementations
+    /// that have not opted into RouteBootstrap target discovery.
+    fn get_agent_route_target(
+        &self,
+        _credential: DeviceSessionCredential,
+        _installation_id: InstallationId,
+        _binding_id: BindingId,
+        _now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async { Err(AgentProvisioningOwnerError::InvalidRequest) })
+    }
     fn deliver_agent_route_bootstrap(
         &self,
         credential: DeviceSessionCredential,
@@ -574,6 +590,37 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                 status: StatusCode::OK,
                 content_type: AGENT_ROUTE_BOOTSTRAP_RECEIPT_MEDIA_TYPE_V1,
                 exact_cbor: receipt.exact_cbor,
+            })
+        })
+    }
+
+    fn get_agent_route_target(
+        &self,
+        credential: DeviceSessionCredential,
+        installation_id: InstallationId,
+        binding_id: BindingId,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            let target = get_owned_agent_route_bootstrap_target(
+                &self.store,
+                &credential,
+                self.tenant_id,
+                installation_id,
+                binding_id,
+                now,
+            )
+            .await
+            .map_err(map_agent_route_bootstrap_error)?;
+            Ok(CborOwnerReply {
+                status: StatusCode::OK,
+                content_type: AGENT_ROUTE_TARGET_MEDIA_TYPE_V1,
+                exact_cbor: agent_route_target_cbor(
+                    self.tenant_id,
+                    installation_id,
+                    binding_id,
+                    target.agent_control_device_id,
+                )?,
             })
         })
     }
@@ -1340,6 +1387,34 @@ fn validate_agent_route_run_command(
     Ok(())
 }
 
+fn agent_route_target_cbor(
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+) -> Result<Vec<u8>, AgentProvisioningOwnerError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(tenant_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(installation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(binding_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(agent_control_device_id.to_string()),
+        ),
+    ]))
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
+}
+
 fn agent_route_run_receipt_cbor(
     command: &AgentRouteRunOwnerCommand,
     run_id: RunId,
@@ -2036,6 +2111,10 @@ pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBa
             get(get_target),
         )
         .route(
+            "/v1/agent-installations/{installation_id}/agent-route-target",
+            get(get_agent_route_target),
+        )
+        .route(
             "/v1/agent-installations/{installation_id}/provisioning-deliveries",
             post(post_delivery),
         )
@@ -2466,6 +2545,49 @@ async fn get_target(
     }
     .await;
     owner_response(result)
+}
+
+async fn get_agent_route_target(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path(installation_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let result = async {
+        let binding_id = parse_agent_route_target_query(uri.query())?;
+        let credential = parse_device_session(&headers)?;
+        let installation_id = installation_id
+            .parse()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        backend
+            .get_agent_route_target(credential, installation_id, binding_id, now()?)
+            .await
+    }
+    .await;
+    owner_response(result)
+}
+
+fn parse_agent_route_target_query(
+    query: Option<&str>,
+) -> Result<BindingId, AgentProvisioningOwnerError> {
+    let query = query.ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    let mut binding_id = None;
+    for pair in query.split('&') {
+        let (name, value) = pair
+            .split_once('=')
+            .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+        match name {
+            "binding_id" if binding_id.is_none() => {
+                binding_id = Some(
+                    value
+                        .parse()
+                        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+                );
+            }
+            _ => return Err(AgentProvisioningOwnerError::InvalidRequest),
+        }
+    }
+    binding_id.ok_or(AgentProvisioningOwnerError::InvalidRequest)
 }
 
 fn parse_target_query(query: Option<&str>) -> Result<TargetQuery, AgentProvisioningOwnerError> {

@@ -121,6 +121,17 @@ impl fmt::Display for AgentRouteBootstrapError {
 
 impl std::error::Error for AgentRouteBootstrapError {}
 
+/// One active, Owner-scoped Connector binding suitable for RouteBootstrap.
+///
+/// The Connector identifier is retained only for the in-process durable
+/// command append.  It must never be returned by the Owner HTTP target
+/// discovery representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AgentRouteBootstrapTarget {
+    pub connector_id: ConnectorId,
+    pub agent_control_device_id: AgentDeviceId,
+}
+
 /// Owner-signed Begin intent.  The MLS route fence does not exist yet at this
 /// point: it is created by the local import and accepted only from its
 /// authenticated `Installed` receipt.
@@ -350,6 +361,51 @@ pub async fn get_agent_route_bootstrap(
                 .await
                 .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
             Ok(receipt)
+        }
+        Err(error) => {
+            let _ = session.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+/// Resolves the single active RouteBootstrap target visible to the authenticated Owner.
+///
+/// The result intentionally contains only immutable routing identifiers.  It
+/// never loads a recipient, capsule, credential, or Connector secret.  An
+/// invalid owner/binding/device tuple is indistinguishable from an absent
+/// target at this read boundary.
+pub(crate) async fn get_owned_agent_route_bootstrap_target(
+    store: &PgStore,
+    credential: &DeviceSessionCredential,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    now: UtcMillis,
+) -> Result<AgentRouteBootstrapTarget, AgentRouteBootstrapError> {
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let result = async {
+        let owner = authenticate_owner(session.connection(), credential, now).await?;
+        resolve_owned_agent_route_bootstrap_target(
+            session.connection(),
+            tenant_id,
+            owner.0,
+            installation_id,
+            binding_id,
+        )
+        .await
+    }
+    .await;
+    match result {
+        Ok(target) => {
+            session
+                .commit()
+                .await
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+            Ok(target)
         }
         Err(error) => {
             let _ = session.rollback().await;
@@ -1153,8 +1209,36 @@ async fn ensure_owner_target(
     connection: &mut sqlx::PgConnection,
     command: &AgentRouteBootstrapBeginCommand,
 ) -> Result<ConnectorId, AgentRouteBootstrapError> {
-    let connector: Option<Uuid> = sqlx::query_scalar(
-        "SELECT b.connector_id
+    let target = resolve_owned_agent_route_bootstrap_target(
+        connection,
+        command.tenant_id,
+        command.owner_identity_id,
+        command.installation_id,
+        command.binding_id,
+    )
+    .await
+    .map_err(|error| match error {
+        // Begin historically classifies an unavailable target as a mutable
+        // route conflict.  Preserve that externally visible behavior while
+        // the discovery GET can safely use a non-enumerating NotFound.
+        AgentRouteBootstrapError::NotFound => AgentRouteBootstrapError::Conflict,
+        other => other,
+    })?;
+    if target.agent_control_device_id != command.agent_control_device_id {
+        return Err(AgentRouteBootstrapError::Conflict);
+    }
+    Ok(target.connector_id)
+}
+
+async fn resolve_owned_agent_route_bootstrap_target(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    owner_identity_id: IdentityId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+) -> Result<AgentRouteBootstrapTarget, AgentRouteBootstrapError> {
+    let target: Option<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT b.connector_id, b.agent_device_id
            FROM agent.installations i
            JOIN agent.connector_bindings b
              ON b.tenant_id=i.tenant_id AND b.installation_id=i.installation_id
@@ -1162,23 +1246,25 @@ async fn ensure_owner_target(
              ON d.tenant_id=i.tenant_id AND d.agent_device_id=b.agent_device_id
           WHERE i.tenant_id=$1 AND i.installation_id=$2 AND i.owner_id=$3
             AND i.desired_state <> 'revoked'
-            AND b.binding_id=$4 AND b.agent_device_id=$5 AND b.state='enabled'
+            AND b.binding_id=$4 AND b.state='enabled'
             AND d.installation_id=i.installation_id AND d.state <> 'revoked'
           FOR SHARE OF i, b, d",
     )
-    .bind(Uuid::from(command.tenant_id))
-    .bind(Uuid::from(command.installation_id))
-    .bind(command.owner_identity_id.to_string())
-    .bind(Uuid::from(command.binding_id))
-    .bind(Uuid::from(command.agent_control_device_id))
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(installation_id))
+    .bind(owner_identity_id.to_string())
+    .bind(Uuid::from(binding_id))
     .fetch_optional(&mut *connection)
     .await
     .map_err(map_sql)?;
-    connector
-        .ok_or(AgentRouteBootstrapError::Conflict)
-        .and_then(|value| {
-            ConnectorId::try_from(value).map_err(|_| AgentRouteBootstrapError::Unavailable)
-        })
+    let (connector_id, agent_control_device_id) =
+        target.ok_or(AgentRouteBootstrapError::NotFound)?;
+    Ok(AgentRouteBootstrapTarget {
+        connector_id: ConnectorId::try_from(connector_id)
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        agent_control_device_id: AgentDeviceId::try_from(agent_control_device_id)
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+    })
 }
 
 async fn expire_live_tuple(
