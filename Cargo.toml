@@ -2,6 +2,7 @@
 members = [
     "bins/dtx-agent-control",
     "bins/dtx-agent-host-supervisor",
+    "bins/dtx-dev-local-tls",
     "bins/dtx-dev-migrate",
     "bins/dtx-group-node",
     "bins/dtx-identity-node",
@@ -53,7 +54,7 @@ getrandom = "0.4.3"
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 prost = "0.14.4"
 protoc-bin-vendored = "3.2.0"
-rcgen = { version = "0.14.8", default-features = false, features = ["ring", "x509-parser", "zeroize"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring", "x509-parser", "zeroize"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
 x509-parser = { version = "0.18.1", default-features = false }
 oas3 = { version = "0.22.0", default-features = false, features = ["yaml-spec"] }

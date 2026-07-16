@@ -1,0 +1,19 @@
+[package]
+name = "dtx-dev-local-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "dtx-dev-local-tls"
+path = "src/main.rs"
+
+[dependencies]
+rcgen.workspace = true
+time = { workspace = true, features = ["std"] }
+x509-parser = { workspace = true, features = ["verify"] }
+zeroize.workspace = true
+
+[lints]
+workspace = true
