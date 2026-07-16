@@ -27,7 +27,7 @@ use dtx_group_node::{
     GROUP_QUERY_PROOF_HEADER, GROUP_SCOPE_PATH_TEMPLATE, GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE,
     GROUP_SERVICE_DESCRIPTOR_PATH, GroupNodeState, IDENTITY_ORIGIN_HEADER,
     MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE, MLS_COMMIT_CONTENT_TYPE, MLS_COMMIT_FEED_CONTENT_TYPE,
-    MLS_COMMIT_RECEIPT_CONTENT_TYPE, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE,
+    MLS_COMMIT_PROOF_HEADER, MLS_COMMIT_RECEIPT_CONTENT_TYPE, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE,
     MLS_COMMIT_V3_CONTENT_TYPE, MLS_CONFIRMATION_PROOF_HEADER, MLS_CONFIRMATION_V3_CONTENT_TYPE,
     RECEIPT_QUERY_PROOF_HEADER, group_router_with_state,
 };
@@ -72,6 +72,11 @@ const MLS_CONFIRMATION_BODY_HASH_DOMAIN: &[u8] = b"dirextalk.mls-confirmation-bo
 const MLS_CONFIRMATION_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.mls-confirmation-binding.v3\0";
 const MLS_CONFIRMATION_PROOF_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.mls-confirmation-proof-signature.v3\0";
+const MLS_COMMIT_REQUEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-request.v3\0";
+const MLS_COMMIT_FEDERATED_BINDING_HASH_DOMAIN: &[u8] =
+    b"dirextalk.mls-commit-federated-binding.v3\0";
+const MLS_COMMIT_FEDERATED_PROOF_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.mls-commit-federated-proof-signature.v3\0";
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -1496,31 +1501,185 @@ async fn group_http_replays_refreshed_proofs_and_preserves_membership_intents()
         approval_request_digest,
         candidate_key_package_digest,
     )?;
-    let committed = send_mutation(
-        app.clone(),
-        "POST",
-        &join_commit_path,
-        MLS_COMMIT_V3_CONTENT_TYPE,
-        join_commit_key,
+    let join_commit_request_digest = mls_v3_request_digest(&join_commit_body)?;
+    let join_commit_key_hash =
+        Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, join_commit_key.as_bytes());
+
+    // Every signed mismatch is rejected before any sequencer state can be
+    // written. This protects exact body/request/path/origin/action binding.
+    let mut tampered_body = join_commit_body.clone();
+    let CanonicalValue::Map(tampered_fields) = decode_deterministic_cbor(&tampered_body)? else {
+        return Err("V3 MLS commit body must be a map".into());
+    };
+    let mut tampered_fields = tampered_fields;
+    tampered_fields[13].1 = Sha256Digest::from_bytes([0x29; 32]).to_canonical_value();
+    tampered_body = encode(&CanonicalValue::Map(tampered_fields))?;
+    let valid_submit_proof = mls_commit_federated_proof(
         &owner,
+        &candidate_origin,
+        1,
+        scope,
+        &join_commit_path,
+        join_submission,
+        join_commit_request_digest,
+        join_commit_key_hash,
+        1_000,
+    )?;
+    for (label, body, proof) in [
+        ("body", tampered_body, valid_submit_proof.clone()),
+        (
+            "request digest",
+            join_commit_body.clone(),
+            mls_commit_federated_proof(
+                &owner,
+                &candidate_origin,
+                1,
+                scope,
+                &join_commit_path,
+                join_submission,
+                Sha256Digest::from_bytes([0x31; 32]),
+                join_commit_key_hash,
+                1_000,
+            )?,
+        ),
+        (
+            "path",
+            join_commit_body.clone(),
+            mls_commit_federated_proof(
+                &owner,
+                &candidate_origin,
+                1,
+                scope,
+                &format!("{join_commit_path}/tampered"),
+                join_submission,
+                join_commit_request_digest,
+                join_commit_key_hash,
+                1_000,
+            )?,
+        ),
+        (
+            "origin",
+            join_commit_body.clone(),
+            mls_commit_federated_proof(
+                &owner,
+                "https://tampered.invalid",
+                1,
+                scope,
+                &join_commit_path,
+                join_submission,
+                join_commit_request_digest,
+                join_commit_key_hash,
+                1_000,
+            )?,
+        ),
+        (
+            "action",
+            join_commit_body.clone(),
+            mls_commit_federated_proof(
+                &owner,
+                &candidate_origin,
+                2,
+                scope,
+                &join_commit_path,
+                join_submission,
+                join_commit_request_digest,
+                join_commit_key_hash,
+                1_000,
+            )?,
+        ),
+    ] {
+        let rejected = send_federated_mls_commit(
+            app.clone(),
+            &join_commit_path,
+            join_commit_key,
+            &candidate_origin,
+            proof,
+            body,
+        )
+        .await?;
+        assert_eq!(
+            rejected.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "signed {label} mismatch must fail closed"
+        );
+    }
+
+    let mixed_authorization = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&join_commit_path)
+                .header(header::CONTENT_TYPE, MLS_COMMIT_V3_CONTENT_TYPE)
+                .header("idempotency-key", join_commit_key)
+                .header(IDENTITY_ORIGIN_HEADER, &candidate_origin)
+                .header(MLS_COMMIT_PROOF_HEADER, valid_submit_proof.clone())
+                .header(
+                    header::AUTHORIZATION,
+                    device_session_authorization(owner.session_id, owner.session_secret),
+                )
+                .body(Body::from(join_commit_body.clone()))?,
+        )
+        .await?;
+    assert_eq!(
+        mixed_authorization.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let committed = send_federated_mls_commit(
+        app.clone(),
+        &join_commit_path,
+        join_commit_key,
+        &candidate_origin,
+        valid_submit_proof,
         join_commit_body.clone(),
     )
     .await?;
     assert_eq!(committed.status(), StatusCode::CREATED);
     assert_content_type(&committed, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE);
     let committed_receipt = response_bytes(committed).await?;
-    let committed_replay = send_mutation(
+    let committed_replay = send_federated_mls_commit(
         app.clone(),
-        "POST",
         &join_commit_path,
-        MLS_COMMIT_V3_CONTENT_TYPE,
         join_commit_key,
-        &owner,
+        &candidate_origin,
+        mls_commit_federated_proof(
+            &owner,
+            &candidate_origin,
+            1,
+            scope,
+            &join_commit_path,
+            join_submission,
+            join_commit_request_digest,
+            join_commit_key_hash,
+            1_500,
+        )?,
         join_commit_body,
     )
     .await?;
     assert_eq!(committed_replay.status(), StatusCode::OK);
     assert_eq!(response_bytes(committed_replay).await?, committed_receipt);
+
+    let readback = send_federated_mls_receipt_query(
+        app.clone(),
+        &join_commit_path,
+        &candidate_origin,
+        mls_commit_federated_proof(
+            &owner,
+            &candidate_origin,
+            2,
+            scope,
+            &join_commit_path,
+            join_submission,
+            join_commit_request_digest,
+            join_commit_key_hash,
+            1_600,
+        )?,
+    )
+    .await?;
+    assert_eq!(readback.status(), StatusCode::OK);
+    assert_content_type(&readback, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE);
+    assert_eq!(response_bytes(readback).await?, committed_receipt);
 
     let (receipt_digest, committed_head) = mls_receipt_facts(&committed_receipt)?;
     let confirmation_path = format!("{join_commit_path}/confirmations/{}", candidate.device_id);
@@ -2732,6 +2891,47 @@ async fn send_federated_confirmation(
     .map_err(Into::into)
 }
 
+async fn send_federated_mls_commit(
+    app: axum::Router,
+    path: &str,
+    idempotency_key: &str,
+    identity_origin: &str,
+    proof: String,
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, MLS_COMMIT_V3_CONTENT_TYPE)
+            .header("idempotency-key", idempotency_key)
+            .header(IDENTITY_ORIGIN_HEADER, identity_origin)
+            .header(MLS_COMMIT_PROOF_HEADER, proof)
+            .body(Body::from(body))?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn send_federated_mls_receipt_query(
+    app: axum::Router,
+    path: &str,
+    identity_origin: &str,
+    proof: String,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(header::ACCEPT, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE)
+            .header(IDENTITY_ORIGIN_HEADER, identity_origin)
+            .header(MLS_COMMIT_PROOF_HEADER, proof)
+            .body(Body::empty())?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
 async fn send_federated_get(
     app: axum::Router,
     path: &str,
@@ -3228,6 +3428,101 @@ fn mls_confirmation_proof(
         CanonicalValue::Unsigned(3),
         binding,
         CanonicalValue::Bytes(candidate.device.sign(&signature_input).to_bytes().to_vec()),
+    ]);
+    Ok(Base64UrlUnpadded::encode_string(
+        &encode_deterministic_cbor(&proof)?,
+    ))
+}
+
+fn mls_v3_request_digest(body: &[u8]) -> Result<Sha256Digest, Box<dyn Error>> {
+    let CanonicalValue::Map(fields) = decode_deterministic_cbor(body)? else {
+        return Err("V3 MLS commit body must be a map".into());
+    };
+    if fields.len() != 15
+        || fields.iter().enumerate().any(|(index, (key, _))| {
+            *key != CanonicalValue::Unsigned(u64::try_from(index + 1).expect("small field index"))
+        })
+    {
+        return Err("V3 MLS commit body fields must be exact".into());
+    }
+    let CanonicalValue::Map(authorization) = &fields[14].1 else {
+        return Err("V3 MLS authorization must be a map".into());
+    };
+    if authorization.len() != 5
+        || authorization.iter().enumerate().any(|(index, (key, _))| {
+            *key != CanonicalValue::Unsigned(u64::try_from(index + 1).expect("small field index"))
+        })
+        || authorization[0].1 != CanonicalValue::Unsigned(2)
+    {
+        return Err("V3 MLS approval authorization must be exact".into());
+    }
+    let request = numbered_map(vec![
+        fields[0].1.clone(),
+        fields[1].1.clone(),
+        fields[2].1.clone(),
+        fields[3].1.clone(),
+        fields[4].1.clone(),
+        fields[5].1.clone(),
+        fields[6].1.clone(),
+        fields[7].1.clone(),
+        Sha256Digest::from_bytes([0; 32]).to_canonical_value(),
+        fields[9].1.clone(),
+        fields[10].1.clone(),
+        fields[12].1.clone(),
+        fields[13].1.clone(),
+        CanonicalValue::Unsigned(1),
+        authorization[1].1.clone(),
+        authorization[2].1.clone(),
+        CanonicalValue::Null,
+        CanonicalValue::Null,
+        authorization[3].1.clone(),
+        authorization[4].1.clone(),
+    ]);
+    Ok(Sha256Digest::hash_domain(
+        MLS_COMMIT_REQUEST_DIGEST_DOMAIN,
+        &encode_deterministic_cbor(&request)?,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mls_commit_federated_proof(
+    actor: &ActiveDevice,
+    identity_origin: &str,
+    action: u64,
+    scope: GroupScope,
+    path: &str,
+    submission_id: RequestId,
+    request_digest: Sha256Digest,
+    idempotency_key_hash: Sha256Digest,
+    issued_at: i64,
+) -> Result<String, Box<dyn Error>> {
+    let expires_at = issued_at
+        .checked_add(120_000)
+        .ok_or("MLS commit proof expiry overflow")?;
+    let binding = numbered_map(vec![
+        CanonicalValue::Unsigned(3),
+        CanonicalValue::Unsigned(action),
+        CanonicalValue::Text(path.to_owned()),
+        scope_value(scope),
+        CanonicalValue::Text(submission_id.to_string()),
+        CanonicalValue::Text(actor.identity_id.to_string()),
+        CanonicalValue::Text(actor.device_id.to_string()),
+        request_digest.to_canonical_value(),
+        idempotency_key_hash.to_canonical_value(),
+        utc_value(issued_at),
+        utc_value(expires_at),
+        CanonicalValue::Text(identity_origin.to_owned()),
+    ]);
+    let digest = Sha256Digest::hash_domain(
+        MLS_COMMIT_FEDERATED_BINDING_HASH_DOMAIN,
+        &encode_deterministic_cbor(&binding)?,
+    );
+    let mut signature_input = MLS_COMMIT_FEDERATED_PROOF_SIGNATURE_DOMAIN.to_vec();
+    signature_input.extend_from_slice(digest.as_bytes());
+    let proof = numbered_map(vec![
+        CanonicalValue::Unsigned(3),
+        binding,
+        CanonicalValue::Bytes(actor.device.sign(&signature_input).to_bytes().to_vec()),
     ]);
     Ok(Base64UrlUnpadded::encode_string(
         &encode_deterministic_cbor(&proof)?,

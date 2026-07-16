@@ -172,6 +172,8 @@ pub const RECEIPT_QUERY_PROOF_HEADER: &str = "dtx-receipt-query-proof";
 pub const GROUP_QUERY_PROOF_HEADER: &str = "dtx-group-query-proof";
 /// Fresh route/body-bound proof for a federated V30 MLS confirmation.
 pub const MLS_CONFIRMATION_PROOF_HEADER: &str = "dtx-mls-confirmation-proof";
+/// Fresh route/request-bound proof for federated V30 commit submit/query.
+pub const MLS_COMMIT_PROOF_HEADER: &str = "dtx-mls-commit-proof";
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -202,6 +204,10 @@ const MLS_CONFIRMATION_BINDING_HASH_DOMAIN: &[u8] = b"dirextalk.mls-confirmation
 const MLS_CONFIRMATION_PROOF_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.mls-confirmation-proof-signature.v3\0";
 const MLS_CONFIRMATION_BODY_HASH_DOMAIN: &[u8] = b"dirextalk.mls-confirmation-body.v3\0";
+const MLS_COMMIT_FEDERATED_BINDING_HASH_DOMAIN: &[u8] =
+    b"dirextalk.mls-commit-federated-binding.v3\0";
+const MLS_COMMIT_FEDERATED_PROOF_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.mls-commit-federated-proof-signature.v3\0";
 const CONTROL_COMMAND_HASH_DOMAIN: &[u8] = b"dirextalk.group-control-command.v1\0";
 
 /// Shared state for a node that serves one trusted configured tenant.
@@ -1206,7 +1212,6 @@ async fn submit_mls_commit(
             idempotency_key_hash,
         )
         .await?;
-        let credential = parse_device_session_authorization(&parts.headers)?;
         let now = state.now()?;
         let signing_key = state
             .mls_signing_key
@@ -1214,7 +1219,25 @@ async fn submit_mls_commit(
             .ok_or(GroupFailure::TemporarilyUnavailable)?;
         let signing_public_key = SigningPublicKey::try_from(signing_key.verifying_key().to_bytes())
             .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
-        let execution = if parsed.command.protocol_version() == 3 {
+        let execution = if let Some(identity_origin) =
+            single_optional_header(&parts.headers, IDENTITY_ORIGIN_HEADER)?
+        {
+            submit_federated_mls_commit(
+                &state,
+                &parts.headers,
+                identity_origin,
+                &expected_path,
+                &parsed.command,
+                now,
+                signing_public_key,
+                Arc::clone(signing_key),
+            )
+            .await
+        } else if parsed.command.protocol_version() == 3 {
+            if parts.headers.contains_key(MLS_COMMIT_PROOF_HEADER) {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            let credential = parse_device_session_authorization(&parts.headers)?;
             let signer = Arc::clone(signing_key);
             state
                 .mls_repository
@@ -1228,7 +1251,12 @@ async fn submit_mls_commit(
                     move |input| Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes())),
                 )
                 .await
+                .map_err(|error| map_persistence_error(&error))
         } else {
+            if parts.headers.contains_key(MLS_COMMIT_PROOF_HEADER) {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            let credential = parse_device_session_authorization(&parts.headers)?;
             let signer = Arc::clone(signing_key);
             state
                 .mls_repository
@@ -1246,8 +1274,8 @@ async fn submit_mls_commit(
                     move |input| Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes())),
                 )
                 .await
-        }
-        .map_err(|error| map_persistence_error(&error))?;
+                .map_err(|error| map_persistence_error(&error))
+        }?;
         mls_commit_response(&execution)
     }
     .await;
@@ -1270,7 +1298,6 @@ async fn get_mls_commit_receipt(
         );
         require_exact_route(&parts.uri, &expected_path)?;
         require_empty_get(&parts.headers, body).await?;
-        let credential = parse_device_session_authorization(&parts.headers)?;
         let now = state.now()?;
         let signing_key = state
             .mls_signing_key
@@ -1278,19 +1305,39 @@ async fn get_mls_commit_receipt(
             .ok_or(GroupFailure::TemporarilyUnavailable)?;
         let signing_public_key = SigningPublicKey::try_from(signing_key.verifying_key().to_bytes())
             .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
-        let receipt = state
-            .mls_repository
-            .receipt_authenticated(
-                &state.store,
-                state.tenant_id,
-                &credential,
+        let receipt = if let Some(identity_origin) =
+            single_optional_header(&parts.headers, IDENTITY_ORIGIN_HEADER)?
+        {
+            load_federated_mls_commit_receipt(
+                &state,
+                &parts.headers,
+                identity_origin,
+                &expected_path,
                 scope,
                 submission_id,
-                now.get(),
+                now,
                 signing_public_key,
             )
             .await
-            .map_err(|error| map_persistence_error(&error))?;
+        } else {
+            if parts.headers.contains_key(MLS_COMMIT_PROOF_HEADER) {
+                return Err(GroupFailure::ActionProofInvalid);
+            }
+            let credential = parse_device_session_authorization(&parts.headers)?;
+            state
+                .mls_repository
+                .receipt_authenticated(
+                    &state.store,
+                    state.tenant_id,
+                    &credential,
+                    scope,
+                    submission_id,
+                    now.get(),
+                    signing_public_key,
+                )
+                .await
+                .map_err(|error| map_persistence_error(&error))
+        }?;
         Ok(cbor_response(
             StatusCode::OK,
             encode_mls_commit_receipt(&receipt)?,
@@ -1303,6 +1350,148 @@ async fn get_mls_commit_receipt(
     }
     .await;
     finish(result, request_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_federated_mls_commit(
+    state: &GroupNodeState,
+    headers: &HeaderMap,
+    identity_origin: &str,
+    expected_path: &str,
+    command: &MlsCommitCommand,
+    now: UtcMillis,
+    signing_public_key: SigningPublicKey,
+    signing_key: Arc<SigningKey>,
+) -> Result<MlsCommitExecution, GroupFailure> {
+    if command.protocol_version() != 3 || headers.contains_key(header::AUTHORIZATION) {
+        return Err(GroupFailure::ActionProofInvalid);
+    }
+    let proof = parse_mls_commit_proof_header(headers)?;
+    if proof.identity_origin != identity_origin {
+        return Err(GroupFailure::ActionProofInvalid);
+    }
+    let actor_signing_key = state
+        .federated_identity
+        .active_device_signing_key(
+            identity_origin,
+            proof.actor_identity_id,
+            proof.actor_device_id,
+        )
+        .await
+        .map_err(map_federated_identity_error)?;
+    let actor = VerifiedDeviceActor::new(
+        proof.actor_identity_id,
+        proof.actor_device_id,
+        actor_signing_key,
+    );
+    let expected_path = expected_path.to_owned();
+    let expected_origin = identity_origin.to_owned();
+    let expected_scope = command.scope();
+    let expected_submission_id = command.submission_id();
+    let expected_actor_identity_id = command.actor_identity_id();
+    let expected_actor_device_id = command.actor_device_id();
+    let expected_request_digest = command.request_digest();
+    let expected_idempotency_key_hash = command.idempotency_key_hash();
+    state
+        .mls_repository
+        .submit_verified_v3_with_proof(
+            &state.store,
+            state.tenant_id,
+            actor,
+            command,
+            now.get(),
+            signing_public_key,
+            move |device_signing_key| {
+                proof.verify(
+                    MlsCommitProofAction::Submit,
+                    &expected_path,
+                    expected_scope,
+                    expected_submission_id,
+                    expected_actor_identity_id,
+                    expected_actor_device_id,
+                    expected_request_digest,
+                    expected_idempotency_key_hash,
+                    &expected_origin,
+                    now,
+                    device_signing_key,
+                )
+            },
+            move |input| {
+                Ok(Ed25519Signature::from_bytes(
+                    signing_key.sign(input).to_bytes(),
+                ))
+            },
+        )
+        .await
+        .map_err(|error| map_persistence_error(&error))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_federated_mls_commit_receipt(
+    state: &GroupNodeState,
+    headers: &HeaderMap,
+    identity_origin: &str,
+    expected_path: &str,
+    scope: GroupScope,
+    submission_id: RequestId,
+    now: UtcMillis,
+    signing_public_key: SigningPublicKey,
+) -> Result<MlsCommitReceipt, GroupFailure> {
+    if headers.contains_key(header::AUTHORIZATION) {
+        return Err(GroupFailure::ActionProofInvalid);
+    }
+    require_exact_accept(headers, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE)?;
+    let proof = parse_mls_commit_proof_header(headers)?;
+    if proof.identity_origin != identity_origin {
+        return Err(GroupFailure::ActionProofInvalid);
+    }
+    let actor_signing_key = state
+        .federated_identity
+        .active_device_signing_key(
+            identity_origin,
+            proof.actor_identity_id,
+            proof.actor_device_id,
+        )
+        .await
+        .map_err(map_federated_identity_error)?;
+    let actor = VerifiedDeviceActor::new(
+        proof.actor_identity_id,
+        proof.actor_device_id,
+        actor_signing_key,
+    );
+    let proof_request_digest = proof.request_digest;
+    let proof_idempotency_key_hash = proof.idempotency_key_hash;
+    let expected_path = expected_path.to_owned();
+    let expected_origin = identity_origin.to_owned();
+    state
+        .mls_repository
+        .receipt_verified_v3_with_proof(
+            &state.store,
+            state.tenant_id,
+            actor,
+            scope,
+            submission_id,
+            proof_request_digest,
+            proof_idempotency_key_hash,
+            signing_public_key,
+            move |device_signing_key| {
+                proof.verify(
+                    MlsCommitProofAction::Query,
+                    &expected_path,
+                    scope,
+                    submission_id,
+                    actor.identity_id(),
+                    actor.device_id(),
+                    proof_request_digest,
+                    proof_idempotency_key_hash,
+                    &expected_origin,
+                    now,
+                    device_signing_key,
+                )
+            },
+        )
+        .await
+        .map_err(|error| map_persistence_error(&error))
 }
 
 async fn get_mls_commit_feed(
@@ -2305,6 +2494,144 @@ fn encode_pending_join_cursor(cursor: PendingJoinRequestCursor) -> Result<String
     ]))
     .map_err(|_| GroupFailure::TemporarilyUnavailable)?;
     Ok(Base64UrlUnpadded::encode_string(&bytes))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MlsCommitProofAction {
+    Submit,
+    Query,
+}
+
+impl MlsCommitProofAction {
+    const fn code(self) -> u64 {
+        match self {
+            Self::Submit => 1,
+            Self::Query => 2,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MlsCommitProof {
+    action: MlsCommitProofAction,
+    path: String,
+    scope: GroupScope,
+    submission_id: RequestId,
+    actor_identity_id: IdentityId,
+    actor_device_id: DeviceId,
+    request_digest: Sha256Digest,
+    idempotency_key_hash: Sha256Digest,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    identity_origin: String,
+    signature: [u8; 64],
+}
+
+impl MlsCommitProof {
+    fn binding_value(&self) -> CanonicalValue {
+        numbered_map(vec![
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Unsigned(self.action.code()),
+            CanonicalValue::Text(self.path.clone()),
+            scope_value(self.scope),
+            CanonicalValue::Text(self.submission_id.to_string()),
+            CanonicalValue::Text(self.actor_identity_id.to_string()),
+            CanonicalValue::Text(self.actor_device_id.to_string()),
+            self.request_digest.to_canonical_value(),
+            self.idempotency_key_hash.to_canonical_value(),
+            utc_value(self.issued_at),
+            utc_value(self.expires_at),
+            CanonicalValue::Text(self.identity_origin.clone()),
+        ])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify(
+        &self,
+        expected_action: MlsCommitProofAction,
+        expected_path: &str,
+        expected_scope: GroupScope,
+        expected_submission_id: RequestId,
+        expected_actor_identity_id: IdentityId,
+        expected_actor_device_id: DeviceId,
+        expected_request_digest: Sha256Digest,
+        expected_idempotency_key_hash: Sha256Digest,
+        expected_identity_origin: &str,
+        now: UtcMillis,
+        signing_key: SigningPublicKey,
+    ) -> Result<(), GroupPersistenceError> {
+        let lifetime = self
+            .expires_at
+            .get()
+            .checked_sub(self.issued_at.get())
+            .ok_or(GroupPersistenceError::ActionProofRejected)?;
+        if self.action != expected_action
+            || self.path != expected_path
+            || self.scope != expected_scope
+            || self.submission_id != expected_submission_id
+            || self.actor_identity_id != expected_actor_identity_id
+            || self.actor_device_id != expected_actor_device_id
+            || self.request_digest != expected_request_digest
+            || self.idempotency_key_hash != expected_idempotency_key_hash
+            || self.identity_origin != expected_identity_origin
+            || self.issued_at > now
+            || now >= self.expires_at
+            || !(1..=MAX_ACTION_PROOF_LIFETIME_MS).contains(&lifetime)
+        {
+            return Err(GroupPersistenceError::ActionProofRejected);
+        }
+        let binding = encode_deterministic_cbor(&self.binding_value())
+            .map_err(|_| GroupPersistenceError::ActionProofRejected)?;
+        let digest = Sha256Digest::hash_domain(MLS_COMMIT_FEDERATED_BINDING_HASH_DOMAIN, &binding);
+        let mut signature_input = Vec::with_capacity(
+            MLS_COMMIT_FEDERATED_PROOF_SIGNATURE_DOMAIN.len() + digest.as_bytes().len(),
+        );
+        signature_input.extend_from_slice(MLS_COMMIT_FEDERATED_PROOF_SIGNATURE_DOMAIN);
+        signature_input.extend_from_slice(digest.as_bytes());
+        let verifying_key = VerifyingKey::from_bytes(signing_key.as_bytes())
+            .map_err(|_| GroupPersistenceError::ActionProofRejected)?;
+        verifying_key
+            .verify_strict(&signature_input, &Signature::from_bytes(&self.signature))
+            .map_err(|_| GroupPersistenceError::ActionProofRejected)
+    }
+}
+
+fn parse_mls_commit_proof_header(headers: &HeaderMap) -> Result<MlsCommitProof, GroupFailure> {
+    let encoded = single_optional_header(headers, MLS_COMMIT_PROOF_HEADER)?
+        .ok_or(GroupFailure::ActionProofInvalid)?;
+    if encoded.len() > MAX_GROUP_QUERY_PROOF_BYTES || !encoded.bytes().all(is_base64url_byte) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let mut decoded = vec![0_u8; encoded.len()];
+    let exact = Base64UrlUnpadded::decode(encoded, &mut decoded)
+        .map_err(|_| GroupFailure::InvalidRequest)?;
+    if Base64UrlUnpadded::encode_string(exact) != encoded {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    let value = decode_deterministic_cbor(exact).map_err(|_| GroupFailure::InvalidRequest)?;
+    let fields = exact_fields(&value, 3)?;
+    require_numeric_version(field(fields, 1)?, 3)?;
+    let binding = exact_fields(field(fields, 2)?, 12)?;
+    require_numeric_version(field(binding, 1)?, 3)?;
+    let action = match field(binding, 2)? {
+        CanonicalValue::Unsigned(1) => MlsCommitProofAction::Submit,
+        CanonicalValue::Unsigned(2) => MlsCommitProofAction::Query,
+        _ => return Err(GroupFailure::InvalidRequest),
+    };
+    Ok(MlsCommitProof {
+        action,
+        path: parse_text(field(binding, 3)?, 1, 512)?,
+        scope: parse_scope_value(field(binding, 4)?)?,
+        submission_id: parse_request_id_value(field(binding, 5)?)?,
+        actor_identity_id: parse_identity_id_value(field(binding, 6)?)?,
+        actor_device_id: parse_device_id_value(field(binding, 7)?)?,
+        request_digest: parse_digest(field(binding, 8)?)?,
+        idempotency_key_hash: parse_digest(field(binding, 9)?)?,
+        issued_at: parse_utc_millis(field(binding, 10)?)?,
+        expires_at: parse_utc_millis(field(binding, 11)?)?,
+        identity_origin: parse_text(field(binding, 12)?, 10, 512)?,
+        signature: parse_exact_bytes(field(fields, 3)?)?,
+    })
 }
 
 #[derive(Clone)]

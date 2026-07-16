@@ -1055,35 +1055,63 @@ impl MlsCommitSequencerRepository {
             )
             .await;
         }
+        let result = submit_v3_in_transaction(
+            session.connection(),
+            tenant_id,
+            command,
+            now_ms,
+            sequencer_signing_key,
+            sign_receipt,
+        )
+        .await;
+        settle(session, result).await
+    }
+
+    /// Accepts a V30 approved join from a freshly resolved federated active
+    /// device. The route/request proof is verified inside the same database
+    /// transaction that checks the actor, replays or persists the commit, and
+    /// finalizes the exact GM1 approval.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_verified_v3_with_proof<FP, FS>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        actor: VerifiedDeviceActor,
+        command: &MlsCommitCommand,
+        now_ms: i64,
+        sequencer_signing_key: SigningPublicKey,
+        verify_proof: FP,
+        sign_receipt: FS,
+    ) -> Result<MlsCommitExecution, GroupPersistenceError>
+    where
+        FP: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+        FS: FnOnce(&[u8]) -> Result<Ed25519Signature, GroupPersistenceError>,
+    {
+        if command.protocol_version != 3
+            || !matches!(
+                command.authorization,
+                MlsCommitAuthorization::ApprovedIdentityJoinV3 { .. }
+            )
+        {
+            return Err(GroupPersistenceError::MlsAuthorizationRejected);
+        }
+        let mut session = store.begin(tenant_id).await?;
         let result = async {
-            let execution = submit_in_transaction(
+            if actor.identity_id() != command.actor_identity_id
+                || actor.device_id() != command.actor_device_id
+            {
+                return Err(GroupPersistenceError::DeviceAuthenticationRejected);
+            }
+            verify_proof(actor.signing_key())?;
+            submit_v3_in_transaction(
                 session.connection(),
                 tenant_id,
                 command,
                 now_ms,
                 sequencer_signing_key,
-                |_| Ok(()),
-                |_| Ok(()),
                 sign_receipt,
             )
-            .await?;
-            let MlsCommitAuthorization::ApprovedIdentityJoinV3 {
-                membership_command_id,
-                ..
-            } = command.authorization
-            else {
-                return Err(GroupPersistenceError::MlsAuthorizationRejected);
-            };
-            resolve_mls_commit_in_transaction(
-                session.connection(),
-                tenant_id,
-                command.scope,
-                membership_command_id,
-                execution.receipt.receipt_digest,
-                now_ms,
-            )
-            .await?;
-            Ok(execution)
+            .await
         }
         .await;
         settle(session, result).await
@@ -1130,6 +1158,63 @@ impl MlsCommitSequencerRepository {
                 return Err(GroupPersistenceError::DeviceAuthenticationRejected);
             }
             Ok(receipt)
+        }
+        .await;
+        settle(session, result).await
+    }
+
+    /// Returns an immutable V30 receipt to the freshly resolved federated
+    /// submission actor. Proof verification and durable actor/request/key
+    /// binding are checked in the same transaction as receipt readback.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn receipt_verified_v3_with_proof<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        actor: VerifiedDeviceActor,
+        scope: GroupScope,
+        submission_id: RequestId,
+        expected_request_digest: Sha256Digest,
+        expected_idempotency_key_hash: Sha256Digest,
+        expected_signing_key: SigningPublicKey,
+        verify_proof: F,
+    ) -> Result<MlsCommitReceipt, GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        let mut session = store.begin(tenant_id).await?;
+        let result = async {
+            verify_proof(actor.signing_key())?;
+            let (kind, id) = scope_columns(scope);
+            let allowed: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM groups.mls_commit_intents
+                  WHERE tenant_id=$1 AND submission_id=$2 AND scope_kind=$3 AND scope_id=$4
+                    AND protocol_version=3 AND actor_identity_id=$5 AND actor_device_id=$6
+                    AND request_digest=$7 AND idempotency_key_hash=$8)",
+            )
+            .bind(Uuid::from(tenant_id))
+            .bind(Uuid::from(submission_id))
+            .bind(kind)
+            .bind(id)
+            .bind(actor.identity_id().to_string())
+            .bind(Uuid::from(actor.device_id()))
+            .bind(expected_request_digest.as_bytes().as_slice())
+            .bind(expected_idempotency_key_hash.as_bytes().as_slice())
+            .fetch_one(session.connection())
+            .await?;
+            if !allowed {
+                return Err(GroupPersistenceError::ActionProofRejected);
+            }
+            load_receipt(
+                session.connection(),
+                tenant_id,
+                scope,
+                submission_id,
+                expected_signing_key,
+            )
+            .await?
+            .filter(|receipt| receipt.protocol_version() == 3)
+            .ok_or(GroupPersistenceError::ActionProofRejected)
         }
         .await;
         settle(session, result).await
@@ -1300,6 +1385,47 @@ impl MlsCommitSequencerRepository {
         .map_err(Into::into);
         settle(session, result).await
     }
+}
+
+async fn submit_v3_in_transaction<FS>(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    command: &MlsCommitCommand,
+    now_ms: i64,
+    sequencer_signing_key: SigningPublicKey,
+    sign_receipt: FS,
+) -> Result<MlsCommitExecution, GroupPersistenceError>
+where
+    FS: FnOnce(&[u8]) -> Result<Ed25519Signature, GroupPersistenceError>,
+{
+    let execution = submit_in_transaction(
+        connection,
+        tenant_id,
+        command,
+        now_ms,
+        sequencer_signing_key,
+        |_| Ok(()),
+        |_| Ok(()),
+        sign_receipt,
+    )
+    .await?;
+    let MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+        membership_command_id,
+        ..
+    } = command.authorization
+    else {
+        return Err(GroupPersistenceError::MlsAuthorizationRejected);
+    };
+    resolve_mls_commit_in_transaction(
+        connection,
+        tenant_id,
+        command.scope,
+        membership_command_id,
+        execution.receipt.receipt_digest,
+        now_ms,
+    )
+    .await?;
+    Ok(execution)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
