@@ -964,6 +964,20 @@ async fn deliver_in_transaction(
     {
         return Err(AgentRouteBootstrapError::Conflict);
     }
+    if !is_owned_agent_route_bootstrap_target_live(
+        connection,
+        command.tenant_id,
+        command.owner_identity_id,
+        command.installation_id,
+        command.binding_id,
+        command.agent_control_device_id,
+        row.connector_id,
+    )
+    .await?
+    {
+        return revoke_delivery_for_invalid_target(connection, &row, command, request_digest, now)
+            .await;
+    }
     let receipt = owner_receipt_cbor(
         command.tenant_id,
         command.bootstrap_id,
@@ -1057,6 +1071,62 @@ async fn deliver_in_transaction(
     Ok(AgentRouteBootstrapOwnerReceipt {
         replayed: false,
         state: AgentRouteBootstrapState::PendingDelivery,
+        exact_cbor: receipt,
+    })
+}
+
+/// Terminates a delivery request whose previously selected target is no longer
+/// usable.  No delivery command has been appended at this point, so persisting
+/// the exact terminal owner receipt is sufficient to make retries stable.
+async fn revoke_delivery_for_invalid_target(
+    connection: &mut sqlx::PgConnection,
+    row: &RouteBootstrapRecord,
+    command: &AgentRouteBootstrapDeliveryCommand,
+    request_digest: Sha256Digest,
+    now: UtcMillis,
+) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
+    let receipt = owner_receipt_cbor(
+        command.tenant_id,
+        command.bootstrap_id,
+        AgentRouteBootstrapState::Revoked,
+        None,
+        Some(command.delivery_id),
+        Some(command.route_id),
+        None,
+        row.expires_at,
+        now,
+        None,
+    )?;
+    let receipt_digest =
+        Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN, &receipt);
+    let changed = sqlx::query(
+        "UPDATE agent.agent_route_bootstraps
+            SET state='revoked', route_fence=NULL,
+                recipient_id=NULL, recipient_capsule_digest=NULL, opaque_recipient_capsule=NULL,
+                route_id=$3, delivery_id=$4, bootstrap_capsule_digest=NULL,
+                opaque_sealed_bootstrap=NULL, delivery_request_digest=$5,
+                delivery_receipt_bytes=$6, delivery_receipt_digest=$7,
+                rejection_code=NULL, updated_at_ms=$8
+          WHERE tenant_id=$1 AND bootstrap_id=$2
+            AND state='recipient_ready' AND delivery_id IS NULL",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.bootstrap_id))
+    .bind(Uuid::from(command.route_id))
+    .bind(Uuid::from(command.delivery_id))
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(&receipt)
+    .bind(receipt_digest.as_bytes().as_slice())
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+    if changed.rows_affected() != 1 {
+        return Err(AgentRouteBootstrapError::Conflict);
+    }
+    Ok(AgentRouteBootstrapOwnerReceipt {
+        replayed: false,
+        state: AgentRouteBootstrapState::Revoked,
         exact_cbor: receipt,
     })
 }
@@ -1245,9 +1315,9 @@ async fn resolve_owned_agent_route_bootstrap_target(
            JOIN agent.agent_devices d
              ON d.tenant_id=i.tenant_id AND d.agent_device_id=b.agent_device_id
           WHERE i.tenant_id=$1 AND i.installation_id=$2 AND i.owner_id=$3
-            AND i.desired_state <> 'revoked'
+            AND i.desired_state = 'enabled'
             AND b.binding_id=$4 AND b.state='enabled'
-            AND d.installation_id=i.installation_id AND d.state <> 'revoked'
+            AND d.installation_id=i.installation_id AND d.state = 'active'
           FOR SHARE OF i, b, d",
     )
     .bind(Uuid::from(tenant_id))
@@ -1265,6 +1335,35 @@ async fn resolve_owned_agent_route_bootstrap_target(
         agent_control_device_id: AgentDeviceId::try_from(agent_control_device_id)
             .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
     })
+}
+
+/// Revalidates the exact persisted tuple before accepting an asynchronous
+/// Connector receipt.  A missing or unusable tuple is a normal terminal
+/// condition; database failures remain unavailable so callers never convert
+/// an infrastructure failure into a revocation.
+pub(crate) async fn is_owned_agent_route_bootstrap_target_live(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    owner_identity_id: IdentityId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    connector_id: ConnectorId,
+) -> Result<bool, AgentRouteBootstrapError> {
+    match resolve_owned_agent_route_bootstrap_target(
+        connection,
+        tenant_id,
+        owner_identity_id,
+        installation_id,
+        binding_id,
+    )
+    .await
+    {
+        Ok(target) => Ok(target.agent_control_device_id == agent_control_device_id
+            && target.connector_id == connector_id),
+        Err(AgentRouteBootstrapError::NotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 async fn expire_live_tuple(

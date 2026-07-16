@@ -35,7 +35,8 @@ use dtx_agent_persistence::{
 };
 use dtx_agent_registry::{
     AgentDevice, AgentDeviceCommand, AgentDeviceState, AgentInstallation, DescriptorDigest,
-    DeviceCredentialFingerprint, ExecutionMode, InstallationDesiredState, VerifiedAgentDefinition,
+    DeviceCredentialFingerprint, ExecutionMode, InstallationCommand, InstallationDesiredState,
+    VerifiedAgentDefinition,
 };
 use dtx_connect_registry::{
     AdapterConformance, AdapterKind, BindingSet, BindingSpec, Connector, RoutingPolicy, TenantRef,
@@ -1563,6 +1564,7 @@ async fn owner_agent_route_target_resolves_only_one_active_owned_binding()
         .expect("current time fits i64")
     });
     let harness = PostgresHarness::start().await?;
+    grant_agent_route_run_runtime_access(&harness).await?;
     let store = harness.runtime_store(12).await?;
     let tenant_id = TenantId::new();
     provision_tenant(&store, tenant_id).await?;
@@ -1720,8 +1722,110 @@ async fn owner_agent_route_target_resolves_only_one_active_owned_binding()
         .save(session.connection(), &bindings, now())
         .await?;
     session.commit().await?;
-    let disabled = owner_get(router, &target_uri, &owner_authorization).await?;
-    assert_eq!(disabled.0, StatusCode::NOT_FOUND);
+    let disabled_binding = owner_get(router.clone(), &target_uri, &owner_authorization).await?;
+    assert_eq!(disabled_binding.0, StatusCode::NOT_FOUND);
+
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let installation = AgentInstallationRepository::new()
+        .load(session.connection(), tenant_id, installation_id)
+        .await?
+        .expect("installation remains");
+    let device = AgentDeviceRepository::new()
+        .load(session.connection(), tenant_id, agent_control_device_id)
+        .await?
+        .expect("device remains");
+    let repository = BindingSetRepository::new();
+    let mut bindings = repository.load(session.connection(), tenant_id).await?;
+    let revision = bindings.binding(binding_ref)?.revision();
+    bindings.enable(binding_ref, revision, &installation, &device)?;
+    repository
+        .save(session.connection(), &bindings, now())
+        .await?;
+    session.commit().await?;
+    let restored = owner_get(router.clone(), &target_uri, &owner_authorization).await?;
+    assert_eq!(restored.0, StatusCode::OK);
+
+    let mut session = store.begin_tenant(tenant_id).await?;
+    sqlx::query(
+        "UPDATE agent.agent_devices
+            SET state='provisioning', aggregate_revision=aggregate_revision+1,
+                updated_at_ms=$3
+          WHERE tenant_id=$1 AND agent_device_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(agent_control_device_id))
+    .bind(now())
+    .execute(session.connection())
+    .await?;
+    session.commit().await?;
+    let provisioning = owner_get(router.clone(), &target_uri, &owner_authorization).await?;
+    assert_eq!(provisioning.0, StatusCode::NOT_FOUND);
+
+    let mut session = store.begin_tenant(tenant_id).await?;
+    sqlx::query(
+        "UPDATE agent.agent_devices
+            SET state='active', aggregate_revision=aggregate_revision+1,
+                updated_at_ms=$3
+          WHERE tenant_id=$1 AND agent_device_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(agent_control_device_id))
+    .bind(now())
+    .execute(session.connection())
+    .await?;
+    session.commit().await?;
+    let active = owner_get(router.clone(), &target_uri, &owner_authorization).await?;
+    assert_eq!(active.0, StatusCode::OK);
+
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let repository = AgentInstallationRepository::new();
+    let mut installation = repository
+        .load(session.connection(), tenant_id, installation_id)
+        .await?
+        .expect("installation remains");
+    installation.apply(installation.revision(), InstallationCommand::Disable)?;
+    assert_eq!(
+        repository
+            .save(session.connection(), &installation, now())
+            .await?,
+        CurrentWrite::Advanced
+    );
+    session.commit().await?;
+    let disabled_installation =
+        owner_get(router.clone(), &target_uri, &owner_authorization).await?;
+    assert_eq!(disabled_installation.0, StatusCode::NOT_FOUND);
+    let rejected_begin = owner_post(
+        router,
+        "/v1/agent-route-bootstraps",
+        &owner_authorization,
+        "target_begin_1",
+        "application/vnd.dirextalk.agent-route-bootstrap.v1+cbor",
+        agent_route_bootstrap_begin_body(
+            AgentRouteBootstrapId::new(),
+            tenant_id,
+            installation_id,
+            binding_id,
+            agent_control_device_id,
+            owner_id,
+            owner_device_id,
+            now() + 300_000,
+            vec![0x7b; 128],
+            &owner_device_key,
+        )?,
+    )
+    .await?;
+    assert_eq!(rejected_begin.0, StatusCode::CONFLICT);
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let bootstrap_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.agent_route_bootstraps
+          WHERE tenant_id=$1 AND installation_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(installation_id))
+    .fetch_one(session.connection())
+    .await?;
+    assert_eq!(bootstrap_count, 0);
+    session.rollback().await?;
 
     Ok(())
 }
