@@ -8,6 +8,7 @@
 //! Live credential authorization remains inside the `PostgreSQL`-backed application boundary.
 
 mod agent_identity_provisioning;
+mod agent_route_bootstrap;
 mod application;
 mod authentication;
 mod authorization_index;
@@ -29,6 +30,7 @@ mod transport_admission;
 mod wire;
 
 pub use agent_identity_provisioning::*;
+pub use agent_route_bootstrap::*;
 pub use application::{
     ApplicationFuture, ConnectorControlApplication, ConnectorControlApplicationError,
     CredentialRotationCompletion, EnrollmentCompletion, HeartbeatCompletion, OpenControlCompletion,

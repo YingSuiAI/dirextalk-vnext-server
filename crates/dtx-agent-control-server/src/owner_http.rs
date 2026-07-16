@@ -27,9 +27,9 @@ use dtx_agent_registry::{
 };
 use dtx_agent_router::DispatchMode;
 use dtx_domain::{
-    AgentDeviceId, ApprovalId, BindingId, ConnectorId, ConversationId, DeviceId, DeviceSessionId,
-    EventId, GrantId, IdentityId, InstallationId, ProvisioningDeliveryId,
-    ProvisioningRecipientKeyId, RequestId, Revision, RunId, TenantId,
+    AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, ApprovalId, BindingId, ConnectorId,
+    ConversationId, DeviceId, DeviceSessionId, EventId, GrantId, IdentityId, InstallationId,
+    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, RunId, TenantId,
 };
 use dtx_identity_persistence::{DeviceSessionCredential, DeviceSessionRepository};
 use dtx_storage::PgStore;
@@ -52,11 +52,15 @@ use crate::{AGENT_IDENTITY_APPROVAL_BINDING_DOMAIN, AgentIdentityApprovalCommand
 use crate::{
     AgentIdentityProvisioningError, AgentProvisioningDeliveryCommand,
     AgentProvisioningDeliveryReceipt, AgentProvisioningRevocationCommand,
-    AgentProvisioningRevocationReceipt, ConnectorCommandFence, ConnectorControlApplicationError,
-    ConnectorLifecycleAction, ConnectorLifecycleCommandWrite, CreateAgentRunRequest,
-    PostgresConnectorControlApplication, ProtobufDurableCommandDecoder, approve_agent_identity,
-    create_agent_provisioning_delivery, get_agent_identity_approval,
-    get_agent_provisioning_delivery, get_agent_provisioning_target, revoke_agent_provisioning,
+    AgentProvisioningRevocationReceipt, AgentRouteBootstrapBeginCommand,
+    AgentRouteBootstrapDeliveryCommand, AgentRouteBootstrapError, ConnectorCommandFence,
+    ConnectorControlApplicationError, ConnectorLifecycleAction, ConnectorLifecycleCommandWrite,
+    CreateAgentRunRequest, PostgresConnectorControlApplication, ProtobufDurableCommandDecoder,
+    approve_agent_identity, begin_agent_route_bootstrap as begin_agent_route_bootstrap_application,
+    create_agent_provisioning_delivery,
+    deliver_agent_route_bootstrap as deliver_agent_route_bootstrap_application,
+    get_agent_identity_approval, get_agent_provisioning_delivery, get_agent_provisioning_target,
+    get_agent_route_bootstrap as get_agent_route_bootstrap_application, revoke_agent_provisioning,
 };
 
 const DEVICE_SESSION_SCHEME: &str = "DTX-Device-Session";
@@ -74,6 +78,10 @@ const AGENT_ROUTE_RUN_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.agent-route-run-sign
 const AGENT_ROUTE_RUN_REQUEST_DOMAIN: &[u8] = b"dirextalk.agent-route-run-request.v1\0";
 const AGENT_ROUTE_RUN_IDEMPOTENCY_DOMAIN: &[u8] = b"dirextalk.agent-route-run-idempotency.v1\0";
 const AGENT_ROUTE_RUN_RECEIPT_DOMAIN: &[u8] = b"dirextalk.agent-route-run-receipt.v1\0";
+const AGENT_ROUTE_BOOTSTRAP_MEDIA_TYPE_V1: &str =
+    "application/vnd.dirextalk.agent-route-bootstrap.v1+cbor";
+const AGENT_ROUTE_BOOTSTRAP_RECEIPT_MEDIA_TYPE_V1: &str =
+    "application/vnd.dirextalk.agent-route-bootstrap-receipt.v1+cbor";
 const MAX_SMALL_BODY: usize = 16 * 1024;
 const MAX_DELIVERY_BODY: usize = 212_992;
 const MAX_GRANT_PROOF_LIFETIME_MS: i64 = 10 * 60 * 1000;
@@ -186,6 +194,9 @@ pub struct AgentRouteRunOwnerCommand {
     pub source_conversation_id: ConversationId,
     pub route_id: ConversationId,
     pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub agent_control_device_id: AgentDeviceId,
+    pub route_fence: [u8; 32],
     pub request_event_id: EventId,
     pub operation_id: RequestId,
     pub grant_version: Revision,
@@ -231,6 +242,26 @@ pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
         &self,
         credential: DeviceSessionCredential,
         command: AgentRouteRunOwnerCommand,
+        exact_body: Vec<u8>,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_>;
+    fn begin_agent_route_bootstrap(
+        &self,
+        credential: DeviceSessionCredential,
+        command: AgentRouteBootstrapBeginCommand,
+        exact_body: Vec<u8>,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_>;
+    fn get_agent_route_bootstrap(
+        &self,
+        credential: DeviceSessionCredential,
+        bootstrap_id: AgentRouteBootstrapId,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_>;
+    fn deliver_agent_route_bootstrap(
+        &self,
+        credential: DeviceSessionCredential,
+        command: AgentRouteBootstrapDeliveryCommand,
         exact_body: Vec<u8>,
         now: UtcMillis,
     ) -> OwnerBackendFuture<'_>;
@@ -486,6 +517,94 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                     StatusCode::CREATED
                 },
                 content_type: AGENT_ROUTE_RUN_RECEIPT_MEDIA_TYPE_V1,
+                exact_cbor: receipt.exact_cbor,
+            })
+        })
+    }
+
+    fn begin_agent_route_bootstrap(
+        &self,
+        credential: DeviceSessionCredential,
+        command: AgentRouteBootstrapBeginCommand,
+        exact_body: Vec<u8>,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            if command.tenant_id != self.tenant_id {
+                return Err(AgentProvisioningOwnerError::AccessDenied);
+            }
+            let receipt = begin_agent_route_bootstrap_application(
+                &self.store,
+                &credential,
+                command,
+                exact_body,
+                now,
+            )
+            .await
+            .map_err(map_agent_route_bootstrap_error)?;
+            Ok(CborOwnerReply {
+                status: if receipt.replayed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                },
+                content_type: AGENT_ROUTE_BOOTSTRAP_RECEIPT_MEDIA_TYPE_V1,
+                exact_cbor: receipt.exact_cbor,
+            })
+        })
+    }
+
+    fn get_agent_route_bootstrap(
+        &self,
+        credential: DeviceSessionCredential,
+        bootstrap_id: AgentRouteBootstrapId,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            let receipt = get_agent_route_bootstrap_application(
+                &self.store,
+                &credential,
+                self.tenant_id,
+                bootstrap_id,
+                now,
+            )
+            .await
+            .map_err(map_agent_route_bootstrap_error)?;
+            Ok(CborOwnerReply {
+                status: StatusCode::OK,
+                content_type: AGENT_ROUTE_BOOTSTRAP_RECEIPT_MEDIA_TYPE_V1,
+                exact_cbor: receipt.exact_cbor,
+            })
+        })
+    }
+
+    fn deliver_agent_route_bootstrap(
+        &self,
+        credential: DeviceSessionCredential,
+        command: AgentRouteBootstrapDeliveryCommand,
+        exact_body: Vec<u8>,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            if command.tenant_id != self.tenant_id {
+                return Err(AgentProvisioningOwnerError::AccessDenied);
+            }
+            let receipt = deliver_agent_route_bootstrap_application(
+                &self.store,
+                &credential,
+                command,
+                exact_body,
+                now,
+            )
+            .await
+            .map_err(map_agent_route_bootstrap_error)?;
+            Ok(CborOwnerReply {
+                status: if receipt.replayed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                },
+                content_type: AGENT_ROUTE_BOOTSTRAP_RECEIPT_MEDIA_TYPE_V1,
                 exact_cbor: receipt.exact_cbor,
             })
         })
@@ -823,6 +942,21 @@ fn map_application_error(error: &AgentIdentityProvisioningError) -> AgentProvisi
     }
 }
 
+fn map_agent_route_bootstrap_error(error: AgentRouteBootstrapError) -> AgentProvisioningOwnerError {
+    match error {
+        AgentRouteBootstrapError::InvalidRequest => AgentProvisioningOwnerError::InvalidRequest,
+        AgentRouteBootstrapError::AuthenticationRejected => {
+            AgentProvisioningOwnerError::AuthenticationRejected
+        }
+        AgentRouteBootstrapError::Forbidden => AgentProvisioningOwnerError::AccessDenied,
+        AgentRouteBootstrapError::NotFound => AgentProvisioningOwnerError::NotFound,
+        AgentRouteBootstrapError::Conflict => AgentProvisioningOwnerError::Conflict,
+        AgentRouteBootstrapError::Unavailable => {
+            AgentProvisioningOwnerError::TemporarilyUnavailable
+        }
+    }
+}
+
 const fn map_connector_projection_error(
     error: ConnectorProjectionError,
 ) -> AgentProvisioningOwnerError {
@@ -968,7 +1102,8 @@ async fn create_private_agent_route_run_in_transaction(
     {
         return Ok(receipt);
     }
-    ensure_agent_route_owner_binding(connection, command).await?;
+    let (route_connector_id, route_head_expires_at) =
+        ensure_agent_route_installed_binding_head(connection, command, now()?).await?;
 
     let is_owner: bool =
         sqlx::query_scalar("SELECT groups.private_conversation_owner_authorized($1, $2, $3)")
@@ -1006,7 +1141,7 @@ async fn create_private_agent_route_run_in_transaction(
         command.installation_id,
         command.route_id,
         command.request_event_id,
-        None,
+        Some(route_connector_id),
         vec!["chat.streaming".to_owned()],
         DispatchMode::Single,
         command.grant_version.get(),
@@ -1014,10 +1149,21 @@ async fn create_private_agent_route_run_in_transaction(
     )
     .map_err(map_connector_control_error)?;
     let created = connector_control
-        .create_agent_run_in_transaction(connection, create, command.source_conversation_id, true)
+        .create_agent_run_in_transaction(
+            connection,
+            create,
+            command.source_conversation_id,
+            Some(command.binding_id),
+        )
         .await
         .map_err(map_connector_control_error)?;
     let committed_at = now()?;
+    if route_head_expires_at <= committed_at {
+        // `create_agent_run_in_transaction` inserted only inside this outer
+        // transaction, so rejecting here rolls it back rather than allowing a
+        // Run to cross the RouteBootstrap expiry boundary mid-request.
+        return Err(AgentProvisioningOwnerError::Conflict);
+    }
     validate_agent_route_run_command(command, committed_at)?;
     let receipt_bytes = agent_route_run_receipt_cbor(
         command,
@@ -1061,37 +1207,60 @@ async fn create_private_agent_route_run_in_transaction(
     })
 }
 
-async fn ensure_agent_route_owner_binding(
+async fn ensure_agent_route_installed_binding_head(
     connection: &mut sqlx::PgConnection,
     command: &AgentRouteRunOwnerCommand,
-) -> Result<(), AgentProvisioningOwnerError> {
+    authenticated_at: UtcMillis,
+) -> Result<(ConnectorId, UtcMillis), AgentProvisioningOwnerError> {
     let row = sqlx::query(
-        "SELECT installation_id, owner_identity_id
-           FROM agent.agent_route_run_operations
-          WHERE tenant_id=$1 AND route_id=$2
-          ORDER BY committed_at_ms, operation_id
-          LIMIT 1 FOR SHARE",
+        "SELECT bootstrap.connector_id, head.expires_at_ms
+           FROM agent.agent_route_binding_heads AS head
+           JOIN agent.agent_route_bootstraps AS bootstrap
+             ON bootstrap.tenant_id=head.tenant_id
+            AND bootstrap.bootstrap_id=head.bootstrap_id
+           JOIN agent.connector_bindings AS binding
+             ON binding.tenant_id=head.tenant_id
+            AND binding.binding_id=head.binding_id
+            AND binding.installation_id=head.installation_id
+            AND binding.agent_device_id=head.agent_control_device_id
+            AND binding.connector_id=bootstrap.connector_id
+            AND binding.state='enabled'
+          WHERE head.tenant_id=$1
+            AND head.owner_identity_id=$2 AND head.owner_device_id=$3
+            AND head.installation_id=$4 AND head.binding_id=$5
+            AND head.agent_control_device_id=$6
+            AND head.route_id=$7 AND head.route_fence=$8
+            AND head.expires_at_ms > $9
+            AND bootstrap.state='installed'
+            AND bootstrap.delivery_id=head.delivery_id
+            AND bootstrap.route_id=head.route_id
+            AND bootstrap.route_fence=head.route_fence
+          FOR SHARE OF head, bootstrap, binding",
     )
     .bind(Uuid::from(command.tenant_id))
+    .bind(command.owner_identity_id.to_string())
+    .bind(Uuid::from(command.owner_device_id))
+    .bind(Uuid::from(command.installation_id))
+    .bind(Uuid::from(command.binding_id))
+    .bind(Uuid::from(command.agent_control_device_id))
     .bind(Uuid::from(command.route_id))
+    .bind(command.route_fence.as_slice())
+    .bind(authenticated_at.get())
     .fetch_optional(&mut *connection)
     .await
     .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
-    let Some(row) = row else {
-        return Ok(());
-    };
-    let installation_id: Uuid = row
-        .try_get("installation_id")
+    let row = row.ok_or(AgentProvisioningOwnerError::Conflict)?;
+    let connector_id: Uuid = row
+        .try_get("connector_id")
         .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
-    let owner_identity_id: String = row
-        .try_get("owner_identity_id")
-        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
-    if installation_id != Uuid::from(command.installation_id)
-        || owner_identity_id != command.owner_identity_id.to_string()
-    {
-        return Err(AgentProvisioningOwnerError::Conflict);
-    }
-    Ok(())
+    let expires_at = UtcMillis::new(
+        row.try_get("expires_at_ms")
+            .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?,
+    )
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    ConnectorId::try_from(connector_id)
+        .map(|connector_id| (connector_id, expires_at))
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
 }
 
 async fn load_agent_route_run_operation(
@@ -1162,6 +1331,7 @@ fn validate_agent_route_run_command(
 ) -> Result<(), AgentProvisioningOwnerError> {
     if command.source_conversation_id == command.route_id
         || command.request_event_id.as_uuid() != command.operation_id.as_uuid()
+        || command.route_fence.iter().all(|byte| *byte == 0)
         || command.proof_expires_at.get() <= now.get()
         || command.proof_expires_at.get() > now.get().saturating_add(MAX_GRANT_PROOF_LIFETIME_MS)
     {
@@ -1217,6 +1387,18 @@ fn agent_route_run_receipt_cbor(
         (
             CanonicalValue::Unsigned(11),
             committed_at.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(12),
+            CanonicalValue::Text(command.binding_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(13),
+            CanonicalValue::Text(command.agent_control_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(14),
+            CanonicalValue::Bytes(command.route_fence.to_vec()),
         ),
     ]))
     .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
@@ -1830,6 +2012,18 @@ pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBa
             post(post_agent_route_run),
         )
         .route(
+            "/v1/agent-route-bootstraps",
+            post(post_agent_route_bootstrap),
+        )
+        .route(
+            "/v1/agent-route-bootstraps/{bootstrap_id}",
+            get(get_agent_route_bootstrap),
+        )
+        .route(
+            "/v1/agent-route-bootstraps/{bootstrap_id}/deliveries/{delivery_id}",
+            put(put_agent_route_bootstrap_delivery),
+        )
+        .route(
             "/v1/agent-installations/{installation_id}/identity-approvals",
             post(post_approval),
         )
@@ -2059,6 +2253,70 @@ async fn post_agent_route_run(
         }
         backend
             .create_agent_route_run(credential, command, body.to_vec(), now()?)
+            .await
+    }
+    .await;
+    owner_response(result)
+}
+
+async fn post_agent_route_bootstrap(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let result = async {
+        require_content_type(&headers, AGENT_ROUTE_BOOTSTRAP_MEDIA_TYPE_V1)?;
+        bounded(&body, MAX_SMALL_BODY)?;
+        let credential = parse_device_session(&headers)?;
+        let command = parse_agent_route_bootstrap_begin(&body)?;
+        backend
+            .begin_agent_route_bootstrap(credential, command, body.to_vec(), now()?)
+            .await
+    }
+    .await;
+    owner_response(result)
+}
+
+async fn get_agent_route_bootstrap(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path(bootstrap_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let result = async {
+        let credential = parse_device_session(&headers)?;
+        let bootstrap_id = bootstrap_id
+            .parse::<AgentRouteBootstrapId>()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        backend
+            .get_agent_route_bootstrap(credential, bootstrap_id, now()?)
+            .await
+    }
+    .await;
+    owner_response(result)
+}
+
+async fn put_agent_route_bootstrap_delivery(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path((bootstrap_id, delivery_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let result = async {
+        require_content_type(&headers, AGENT_ROUTE_BOOTSTRAP_MEDIA_TYPE_V1)?;
+        bounded(&body, MAX_DELIVERY_BODY)?;
+        let credential = parse_device_session(&headers)?;
+        let bootstrap_id = bootstrap_id
+            .parse::<AgentRouteBootstrapId>()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        let delivery_id = delivery_id
+            .parse::<AgentRouteDeliveryId>()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        let command = parse_agent_route_bootstrap_delivery(&body)?;
+        if command.bootstrap_id != bootstrap_id || command.delivery_id != delivery_id {
+            return Err(AgentProvisioningOwnerError::InvalidRequest);
+        }
+        backend
+            .deliver_agent_route_bootstrap(credential, command, body.to_vec(), now()?)
             .await
     }
     .await;
@@ -2482,6 +2740,73 @@ fn parse_conversation_grant(
     })
 }
 
+fn parse_agent_route_bootstrap_begin(
+    body: &[u8],
+) -> Result<AgentRouteBootstrapBeginCommand, AgentProvisioningOwnerError> {
+    let request = exact_map(
+        decode_deterministic_cbor(body).map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+        3,
+    )?;
+    let binding = map_value(&request, 1)?.clone();
+    let fields = exact_map(binding.clone(), 9)?;
+    expect_version(&fields)?;
+    let binding_digest = digest(map_value(&request, 2)?)?;
+    if binding_digest != binding_hash(crate::AGENT_ROUTE_BOOTSTRAP_BEGIN_BINDING_DOMAIN, &binding)?
+    {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    Ok(AgentRouteBootstrapBeginCommand {
+        bootstrap_id: text_id(&fields, 2)?,
+        tenant_id: text_id(&fields, 3)?,
+        installation_id: text_id(&fields, 4)?,
+        binding_id: text_id(&fields, 5)?,
+        agent_control_device_id: text_id(&fields, 6)?,
+        owner_identity_id: text_id(&fields, 7)?,
+        owner_device_id: text_id(&fields, 8)?,
+        expires_at: utc(&fields, 9)?,
+        binding_digest,
+        owner_signature: Ed25519Signature::from_bytes(bytes_array(map_value(&request, 3)?)?),
+    })
+}
+
+fn parse_agent_route_bootstrap_delivery(
+    body: &[u8],
+) -> Result<AgentRouteBootstrapDeliveryCommand, AgentProvisioningOwnerError> {
+    let request = exact_map(
+        decode_deterministic_cbor(body).map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+        3,
+    )?;
+    let binding = map_value(&request, 1)?.clone();
+    let fields = exact_map(binding.clone(), 14)?;
+    expect_version(&fields)?;
+    let binding_digest = digest(map_value(&request, 2)?)?;
+    if binding_digest
+        != binding_hash(
+            crate::AGENT_ROUTE_BOOTSTRAP_DELIVERY_BINDING_DOMAIN,
+            &binding,
+        )?
+    {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    Ok(AgentRouteBootstrapDeliveryCommand {
+        bootstrap_id: text_id(&fields, 2)?,
+        delivery_id: text_id(&fields, 3)?,
+        tenant_id: text_id(&fields, 4)?,
+        installation_id: text_id(&fields, 5)?,
+        binding_id: text_id(&fields, 6)?,
+        agent_control_device_id: text_id(&fields, 7)?,
+        owner_identity_id: text_id(&fields, 8)?,
+        owner_device_id: text_id(&fields, 9)?,
+        recipient_id: text_id(&fields, 10)?,
+        route_id: text_id(&fields, 11)?,
+        capsule_digest: digest(map_value(&fields, 12)?)?,
+        opaque_sealed_bootstrap: bytes(map_value(&fields, 13)?)?.to_vec(),
+        expires_at: utc(&fields, 14)?,
+        binding_digest,
+        owner_signature: Ed25519Signature::from_bytes(bytes_array(map_value(&request, 3)?)?),
+    })
+}
+
 fn parse_agent_route_run(
     body: &[u8],
 ) -> Result<AgentRouteRunOwnerCommand, AgentProvisioningOwnerError> {
@@ -2490,7 +2815,7 @@ fn parse_agent_route_run(
         3,
     )?;
     let binding = map_value(&request, 1)?.clone();
-    let fields = exact_map(binding.clone(), 11)?;
+    let fields = exact_map(binding.clone(), 14)?;
     expect_version(&fields)?;
     let supplied = digest(map_value(&request, 2)?)?;
     if supplied != binding_hash(AGENT_ROUTE_RUN_BINDING_DOMAIN, &binding)? {
@@ -2506,6 +2831,9 @@ fn parse_agent_route_run(
         source_conversation_id,
         route_id,
         installation_id: text_id(&fields, 5)?,
+        binding_id: text_id(&fields, 12)?,
+        agent_control_device_id: text_id(&fields, 13)?,
+        route_fence: bytes_array(map_value(&fields, 14)?)?,
         request_event_id: text_id(&fields, 6)?,
         operation_id: text_id(&fields, 7)?,
         grant_version: revision(&fields, 8)?,

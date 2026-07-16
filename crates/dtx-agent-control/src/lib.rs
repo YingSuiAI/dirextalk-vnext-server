@@ -8,6 +8,7 @@ mod credential;
 mod digest;
 mod enrollment;
 mod proof;
+mod route_bootstrap;
 
 pub use claims::*;
 pub use command::*;
@@ -15,3 +16,4 @@ pub use credential::*;
 pub use digest::*;
 pub use enrollment::*;
 pub use proof::*;
+pub use route_bootstrap::*;

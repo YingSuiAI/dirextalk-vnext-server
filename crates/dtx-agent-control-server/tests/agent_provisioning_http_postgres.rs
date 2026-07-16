@@ -40,10 +40,11 @@ use dtx_connect_registry::{
     AdapterConformance, AdapterKind, BindingSet, BindingSpec, Connector, RoutingPolicy, TenantRef,
 };
 use dtx_domain::{
-    AgentDeviceId, AgentId, BindingId, BootId, Clock, ConnectorId, ConversationId, DeviceId,
-    DeviceSessionId, Ed25519PublicKey, EventId, HostCredentialId, HostId, IdGenerator, IdentityId,
-    InstallationId, ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision,
-    SystemClock, TenantId, UuidV7Generator,
+    AgentDeviceId, AgentId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId,
+    BindingId, BootId, Clock, ConnectorId, ConversationId, DeviceId, DeviceSessionId,
+    Ed25519PublicKey, EventId, HostCredentialId, HostId, IdGenerator, IdentityId, InstallationId,
+    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, SystemClock, TenantId,
+    UuidV7Generator,
 };
 use dtx_identity_log::{
     DeviceCertificateV1, DeviceEncryptionPublicKey, IdentityLogEventPayloadV1, IdentityLogEventV1,
@@ -770,6 +771,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
     let route_id = ConversationId::new();
     let route_operation = RequestId::new();
     let route_event_id = EventId::try_from(*route_operation.as_uuid())?;
+    let route_fence = [0x95; 32];
     let route_uri = format!("/v1/conversations/{conversation_id}/agent-routes/{route_id}/runs");
     let route_proof_expires_at = i64::try_from(
         SystemTime::now()
@@ -782,6 +784,9 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         conversation_id,
         route_id,
         installation_id,
+        binding_id,
+        agent_device_id,
+        route_fence,
         route_event_id,
         route_operation,
         Revision::INITIAL,
@@ -790,6 +795,57 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         &owner_device_key,
         route_proof_expires_at,
     )?;
+    // A Run cannot infer route availability from prior Runs or the enabled
+    // binding.  Before an exact Installed RouteBootstrap head exists, it is
+    // fail-closed even though the Owner grant is active.
+    let no_head = owner_agent_route_run(
+        router.clone(),
+        &route_uri,
+        &owner_authorization,
+        route_operation,
+        "\"g1\"",
+        route_body.clone(),
+    )
+    .await?;
+    assert_eq!(no_head.0, StatusCode::CONFLICT);
+    install_agent_route_binding_head(
+        &store,
+        tenant_id,
+        owner_id,
+        owner_device_id,
+        installation_id,
+        binding_id,
+        agent_device_id,
+        &connector,
+        route_id,
+        route_fence,
+    )
+    .await?;
+    let wrong_fence = owner_agent_route_run(
+        router.clone(),
+        &route_uri,
+        &owner_authorization,
+        route_operation,
+        "\"g1\"",
+        agent_route_run_body(
+            tenant_id,
+            conversation_id,
+            route_id,
+            installation_id,
+            binding_id,
+            agent_device_id,
+            [0x96; 32],
+            route_event_id,
+            route_operation,
+            Revision::INITIAL,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(wrong_fence.0, StatusCode::CONFLICT);
     let route_first = owner_agent_route_run(
         router.clone(),
         &route_uri,
@@ -838,6 +894,9 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
             conversation_id,
             route_id,
             installation_id,
+            binding_id,
+            agent_device_id,
+            route_fence,
             route_event_id,
             route_operation,
             Revision::INITIAL,
@@ -1131,10 +1190,100 @@ async fn grant_agent_route_run_runtime_access(
          GRANT SELECT, INSERT, UPDATE ON agent.agent_run_offers TO dtx_runtime_test;
          GRANT SELECT, INSERT, UPDATE ON agent.agent_run_leases TO dtx_runtime_test;
          GRANT EXECUTE ON FUNCTION agent.router_stable_names(text[]) TO dtx_runtime_test;
-         GRANT SELECT, INSERT, UPDATE ON agent.agent_route_run_operations TO dtx_runtime_test;",
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_route_run_operations TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_route_bootstraps,
+             agent.agent_route_bootstrap_outbox, agent.agent_route_binding_heads
+             TO dtx_runtime_test;",
     )
     .execute(harness.admin_pool())
     .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn install_agent_route_binding_head(
+    store: &PgStore,
+    tenant_id: TenantId,
+    owner_identity_id: IdentityId,
+    owner_device_id: DeviceId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    connector: &Connector,
+    route_id: ConversationId,
+    route_fence: [u8; 32],
+) -> Result<(), Box<dyn Error>> {
+    let bootstrap_id = AgentRouteBootstrapId::new();
+    let delivery_id = AgentRouteDeliveryId::new();
+    let recipient_id = AgentRouteRecipientId::new();
+    let expires_at = now() + 300_000;
+    let installed_at = now();
+    let mut session = store.begin_tenant(tenant_id).await?;
+    sqlx::query(
+        "INSERT INTO agent.agent_route_bootstraps (
+             tenant_id, bootstrap_id, owner_identity_id, owner_device_id, installation_id,
+             binding_id, agent_control_device_id, connector_id, route_fence, owner_signed_intent,
+             request_digest, begin_receipt_bytes, begin_receipt_digest, recipient_id,
+             recipient_capsule_digest, opaque_recipient_capsule, route_id, delivery_id,
+             bootstrap_capsule_digest, opaque_sealed_bootstrap, delivery_request_digest,
+             delivery_receipt_bytes, delivery_receipt_digest, state, expires_at_ms,
+             created_at_ms, updated_at_ms
+         ) VALUES (
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+             $19,$20,$21,$22,$23,'installed',$24,$25,$26
+         )",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(bootstrap_id))
+    .bind(owner_identity_id.to_string())
+    .bind(Uuid::from(owner_device_id))
+    .bind(Uuid::from(installation_id))
+    .bind(Uuid::from(binding_id))
+    .bind(Uuid::from(agent_control_device_id))
+    .bind(Uuid::from(connector.connector_id()))
+    .bind(route_fence.as_slice())
+    .bind([0x01_u8].as_slice())
+    .bind([0x02_u8; 32].as_slice())
+    .bind([0x03_u8].as_slice())
+    .bind([0x04_u8; 32].as_slice())
+    .bind(Uuid::from(recipient_id))
+    .bind([0x05_u8; 32].as_slice())
+    .bind([0x06_u8].as_slice())
+    .bind(Uuid::from(route_id))
+    .bind(Uuid::from(delivery_id))
+    .bind([0x07_u8; 32].as_slice())
+    .bind([0x08_u8].as_slice())
+    .bind([0x09_u8; 32].as_slice())
+    .bind([0x0A_u8].as_slice())
+    .bind([0x0B_u8; 32].as_slice())
+    .bind(expires_at)
+    .bind(installed_at - 1)
+    .bind(installed_at)
+    .execute(session.connection())
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.agent_route_binding_heads (
+             tenant_id, owner_identity_id, owner_device_id, installation_id, binding_id,
+             agent_control_device_id, bootstrap_id, delivery_id, route_id, route_fence,
+             capsule_digest, expires_at_ms, installed_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(owner_identity_id.to_string())
+    .bind(Uuid::from(owner_device_id))
+    .bind(Uuid::from(installation_id))
+    .bind(Uuid::from(binding_id))
+    .bind(Uuid::from(agent_control_device_id))
+    .bind(Uuid::from(bootstrap_id))
+    .bind(Uuid::from(delivery_id))
+    .bind(Uuid::from(route_id))
+    .bind(route_fence.as_slice())
+    .bind([0x07_u8; 32].as_slice())
+    .bind(expires_at)
+    .bind(installed_at)
+    .execute(session.connection())
+    .await?;
+    session.commit().await?;
     Ok(())
 }
 
@@ -1487,6 +1636,9 @@ fn agent_route_run_body(
     source_conversation_id: ConversationId,
     route_id: ConversationId,
     installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    route_fence: [u8; 32],
     request_event_id: EventId,
     operation_id: RequestId,
     grant_version: Revision,
@@ -1510,6 +1662,9 @@ fn agent_route_run_body(
             u(11),
             UtcMillis::new(proof_expires_at)?.to_canonical_value(),
         ),
+        (u(12), text(binding_id)),
+        (u(13), text(agent_control_device_id)),
+        (u(14), bytes(&route_fence)),
     ]);
     signed_owner_body(
         binding,

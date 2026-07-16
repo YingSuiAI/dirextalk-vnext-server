@@ -640,7 +640,7 @@ async fn validate_new_run_authority(
     grant_conversation_id: ConversationId,
     bindings: &BindingSet,
     clock: &dyn Clock,
-    require_single_binding: bool,
+    selected_binding_id: Option<BindingId>,
 ) -> Result<ValidatedNewRunAuthority, ConnectorControlApplicationError> {
     let installation = AgentInstallationRepository::new()
         .load(connection, request.tenant_id, request.installation_id)
@@ -660,7 +660,7 @@ async fn validate_new_run_authority(
         .map_err(persistence_error)?
         .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
     let binding_snapshot = bindings.snapshot();
-    let enabled_bindings = binding_snapshot
+    let all_enabled_bindings = binding_snapshot
         .bindings
         .iter()
         .filter(|binding| {
@@ -668,17 +668,24 @@ async fn validate_new_run_authority(
                 && binding.state == BindingState::Enabled
         })
         .collect::<Vec<_>>();
-    if enabled_bindings.is_empty() || enabled_bindings.len() > MAX_ROUTE_CANDIDATES {
+    if all_enabled_bindings.is_empty() || all_enabled_bindings.len() > MAX_ROUTE_CANDIDATES {
         return Err(ConnectorControlApplicationError::InvalidRequest);
     }
-    // The first isolated AgentRoute ingress intentionally has no binding picker
-    // in its signed control metadata.  Requiring exactly one enabled Binding
-    // makes the data-plane Agent device unambiguous rather than silently
-    // selecting an unrelated Connector for a route MLS event.
-    if require_single_binding && enabled_bindings.len() != 1 {
+    // AgentRoute ingress selects one binding from an installed RouteBootstrap
+    // head.  A missing or duplicate selected binding must never fall back to
+    // a historical Run or a different enabled Connector.
+    let selected_bindings = all_enabled_bindings
+        .iter()
+        .copied()
+        .filter(|binding| {
+            selected_binding_id.is_none_or(|binding_id| binding.binding_id == binding_id)
+        })
+        .collect::<Vec<_>>();
+    if selected_bindings.is_empty() || selected_binding_id.is_some() && selected_bindings.len() != 1
+    {
         return Err(ConnectorControlApplicationError::InvalidRequest);
     }
-    let device_ids = enabled_bindings
+    let device_ids = all_enabled_bindings
         .into_iter()
         .map(|binding| binding.agent_device_id)
         .collect::<BTreeSet<_>>();
@@ -857,7 +864,7 @@ impl PostgresConnectorControlApplication {
                 session.connection(),
                 request,
                 grant_conversation_id,
-                false,
+                None,
             )
             .await?;
         session
@@ -889,7 +896,7 @@ impl PostgresConnectorControlApplication {
         connection: &mut sqlx::PgConnection,
         request: CreateAgentRunRequest,
         grant_conversation_id: ConversationId,
-        require_single_binding: bool,
+        selected_binding_id: Option<BindingId>,
     ) -> Result<CreatedAgentRun, ConnectorControlApplicationError> {
         let repository = AgentRunRepository::new();
         let (disposition, run, authority) = if let Some(existing) = repository
@@ -917,7 +924,7 @@ impl PostgresConnectorControlApplication {
                 grant_conversation_id,
                 &bindings,
                 self.clock.as_ref(),
-                require_single_binding,
+                selected_binding_id,
             )
             .await?;
             let run = build_agent_run(

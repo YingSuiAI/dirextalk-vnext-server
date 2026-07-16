@@ -1,0 +1,1412 @@
+//! Durable, opaque RouteBootstrapV1 application boundary.
+//!
+//! The control stream is intentionally not wired in this stage.  Its future
+//! drain must call the recipient/terminal functions below only after the
+//! existing authenticated Connector fence has been verified; no HTTP action
+//! can manufacture an `Installed` head.
+
+use std::fmt;
+
+use dtx_domain::{
+    AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId, BindingId,
+    ConnectorId, ConversationId, DeviceId, IdentityId, InstallationId, OutboxId, TenantId,
+};
+use dtx_identity_persistence::{DeviceSessionCredential, DeviceSessionRepository};
+use dtx_storage::PgStore;
+use dtx_wire::{
+    CanonicalEncode, CanonicalValue, Ed25519Signature, Sha256Digest, UtcMillis,
+    decode_deterministic_cbor, encode_deterministic_cbor,
+};
+use ed25519_dalek::{Signature, VerifyingKey};
+use sqlx::Row;
+use uuid::Uuid;
+
+pub const AGENT_ROUTE_BOOTSTRAP_BEGIN_BINDING_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-begin-binding.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_BEGIN_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-begin-signature.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_BEGIN_REQUEST_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-begin-request.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_BEGIN_RECEIPT_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-begin-receipt.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_BINDING_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-delivery-binding.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-delivery-signature.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_REQUEST_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-delivery-request.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-delivery-receipt.v1\0";
+pub const AGENT_ROUTE_RECIPIENT_CAPSULE_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-recipient-capsule.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_CAPSULE_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-capsule.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_OUTBOX_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-bootstrap-outbox.v1\0";
+
+const MAX_OPAQUE_BYTES: usize = 196_608;
+const MAX_RECEIPT_BYTES: usize = 65_536;
+const MAX_BOOTSTRAP_LIFETIME_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentRouteBootstrapState {
+    PendingRecipient,
+    RecipientReady,
+    PendingDelivery,
+    Installed,
+    Rejected,
+    Expired,
+    Revoked,
+}
+
+impl AgentRouteBootstrapState {
+    const fn receipt_code(self) -> u64 {
+        match self {
+            Self::PendingRecipient => 1,
+            Self::RecipientReady => 2,
+            Self::PendingDelivery => 3,
+            Self::Installed => 4,
+            Self::Rejected => 5,
+            Self::Expired => 6,
+            Self::Revoked => 7,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, AgentRouteBootstrapError> {
+        match value {
+            "pending_recipient" => Ok(Self::PendingRecipient),
+            "recipient_ready" => Ok(Self::RecipientReady),
+            "pending_delivery" => Ok(Self::PendingDelivery),
+            "installed" => Ok(Self::Installed),
+            "rejected" => Ok(Self::Rejected),
+            "expired" => Ok(Self::Expired),
+            "revoked" => Ok(Self::Revoked),
+            _ => Err(AgentRouteBootstrapError::Unavailable),
+        }
+    }
+}
+
+/// Stable public failure classification for the owner HTTP boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentRouteBootstrapError {
+    InvalidRequest,
+    AuthenticationRejected,
+    Forbidden,
+    NotFound,
+    Conflict,
+    Unavailable,
+}
+
+impl fmt::Display for AgentRouteBootstrapError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidRequest => "invalid AgentRoute bootstrap request",
+            Self::AuthenticationRejected => "AgentRoute bootstrap authentication rejected",
+            Self::Forbidden => "AgentRoute bootstrap forbidden",
+            Self::NotFound => "AgentRoute bootstrap not found",
+            Self::Conflict => "AgentRoute bootstrap conflict",
+            Self::Unavailable => "AgentRoute bootstrap temporarily unavailable",
+        })
+    }
+}
+
+impl std::error::Error for AgentRouteBootstrapError {}
+
+/// Owner-signed Begin intent.  The MLS route fence does not exist yet at this
+/// point: it is created by the local import and accepted only from its
+/// authenticated `Installed` receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRouteBootstrapBeginCommand {
+    pub bootstrap_id: AgentRouteBootstrapId,
+    pub tenant_id: TenantId,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub agent_control_device_id: AgentDeviceId,
+    pub owner_identity_id: IdentityId,
+    pub owner_device_id: DeviceId,
+    pub expires_at: UtcMillis,
+    pub binding_digest: Sha256Digest,
+    pub owner_signature: Ed25519Signature,
+}
+
+/// Owner-signed delivery of one encrypted MLS bootstrap.  The server never
+/// parses `opaque_sealed_bootstrap`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AgentRouteBootstrapDeliveryCommand {
+    pub bootstrap_id: AgentRouteBootstrapId,
+    pub delivery_id: AgentRouteDeliveryId,
+    pub tenant_id: TenantId,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub agent_control_device_id: AgentDeviceId,
+    pub owner_identity_id: IdentityId,
+    pub owner_device_id: DeviceId,
+    pub recipient_id: AgentRouteRecipientId,
+    pub route_id: ConversationId,
+    pub capsule_digest: Sha256Digest,
+    pub opaque_sealed_bootstrap: Vec<u8>,
+    pub expires_at: UtcMillis,
+    pub binding_digest: Sha256Digest,
+    pub owner_signature: Ed25519Signature,
+}
+
+impl fmt::Debug for AgentRouteBootstrapDeliveryCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentRouteBootstrapDeliveryCommand")
+            .field("bootstrap_id", &self.bootstrap_id)
+            .field("delivery_id", &self.delivery_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("installation_id", &self.installation_id)
+            .field("binding_id", &self.binding_id)
+            .field("agent_control_device_id", &self.agent_control_device_id)
+            .field("owner_identity_id", &self.owner_identity_id)
+            .field("owner_device_id", &self.owner_device_id)
+            .field("recipient_id", &self.recipient_id)
+            .field("route_id", &self.route_id)
+            .field("capsule_digest", &self.capsule_digest)
+            .field("opaque_sealed_bootstrap", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Authenticated Agent-Control recipient result.  The peer tuple comes from
+/// the control-stream authentication layer, not this untrusted payload.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AgentRouteRecipientReadyCommand {
+    pub bootstrap_id: AgentRouteBootstrapId,
+    pub recipient_id: AgentRouteRecipientId,
+    pub recipient_capsule_digest: Sha256Digest,
+    pub opaque_recipient_capsule: Vec<u8>,
+    pub expires_at: UtcMillis,
+}
+
+impl fmt::Debug for AgentRouteRecipientReadyCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentRouteRecipientReadyCommand")
+            .field("bootstrap_id", &self.bootstrap_id)
+            .field("recipient_id", &self.recipient_id)
+            .field("recipient_capsule_digest", &self.recipient_capsule_digest)
+            .field("opaque_recipient_capsule", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Authenticated terminal Agent-Control receipt.  `stable_code` is a closed,
+/// redacted token such as `INSTALLED` or `INVALID_CAPSULE`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRouteBootstrapTerminalCommand {
+    pub bootstrap_id: AgentRouteBootstrapId,
+    pub delivery_id: AgentRouteDeliveryId,
+    pub route_id: ConversationId,
+    pub capsule_digest: Sha256Digest,
+    /// Present only for the authenticated `Installed` receipt.  It is the
+    /// fence produced by the local route import, never an owner echo.
+    pub route_fence: Option<[u8; 32]>,
+    pub stable_code: String,
+}
+
+/// Compact owner-visible response.  Only `Get` may include an opaque
+/// recipient capsule, and only after authenticating the exact owner device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRouteBootstrapOwnerReceipt {
+    pub replayed: bool,
+    pub state: AgentRouteBootstrapState,
+    pub exact_cbor: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RouteBootstrapRecord {
+    bootstrap_id: AgentRouteBootstrapId,
+    tenant_id: TenantId,
+    owner_identity_id: IdentityId,
+    owner_device_id: DeviceId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    connector_id: ConnectorId,
+    route_fence: Option<[u8; 32]>,
+    state: AgentRouteBootstrapState,
+    recipient_id: Option<AgentRouteRecipientId>,
+    recipient_capsule_digest: Option<Sha256Digest>,
+    opaque_recipient_capsule: Option<Vec<u8>>,
+    route_id: Option<ConversationId>,
+    delivery_id: Option<AgentRouteDeliveryId>,
+    bootstrap_capsule_digest: Option<Sha256Digest>,
+    rejection_code: Option<String>,
+    expires_at: UtcMillis,
+    created_at: UtcMillis,
+    updated_at: UtcMillis,
+}
+
+/// Begins one RouteBootstrap and writes an opaque PrepareRecipient outbox row.
+///
+/// The outbox is durable but deliberately not drained until Control v1.4 frame
+/// wiring is added.  Therefore this function never creates a binding head.
+pub async fn begin_agent_route_bootstrap(
+    store: &PgStore,
+    credential: &DeviceSessionCredential,
+    command: AgentRouteBootstrapBeginCommand,
+    exact_body: Vec<u8>,
+    now: UtcMillis,
+) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
+    validate_begin(&command, &exact_body, now)?;
+    let request_digest =
+        Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_BEGIN_REQUEST_DOMAIN, &exact_body);
+    let mut session = store
+        .begin_tenant(command.tenant_id)
+        .await
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let result = begin_in_transaction(
+        session.connection(),
+        credential,
+        &command,
+        &exact_body,
+        request_digest,
+        now,
+    )
+    .await;
+    match result {
+        Ok(receipt) => {
+            session
+                .commit()
+                .await
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+            Ok(receipt)
+        }
+        Err(error) => {
+            let _ = session.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+/// Reads current status and the owner-encrypted recipient capsule, if ready.
+pub async fn get_agent_route_bootstrap(
+    store: &PgStore,
+    credential: &DeviceSessionCredential,
+    tenant_id: TenantId,
+    bootstrap_id: AgentRouteBootstrapId,
+    now: UtcMillis,
+) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let result = async {
+        let owner = authenticate_owner(session.connection(), credential, now).await?;
+        expire_bootstrap_if_due(session.connection(), tenant_id, bootstrap_id, now).await?;
+        let row = load_bootstrap_for_update(session.connection(), tenant_id, bootstrap_id)
+            .await?
+            .ok_or(AgentRouteBootstrapError::NotFound)?;
+        if row.owner_identity_id != owner.0 || row.owner_device_id != owner.1 {
+            return Err(AgentRouteBootstrapError::Forbidden);
+        }
+        let exact_cbor = owner_view_cbor(&row)?;
+        Ok(AgentRouteBootstrapOwnerReceipt {
+            replayed: false,
+            state: row.state,
+            exact_cbor,
+        })
+    }
+    .await;
+    match result {
+        Ok(receipt) => {
+            session
+                .commit()
+                .await
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+            Ok(receipt)
+        }
+        Err(error) => {
+            let _ = session.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+/// Stores one owner-authorized opaque bootstrap delivery and a durable outbox row.
+pub async fn deliver_agent_route_bootstrap(
+    store: &PgStore,
+    credential: &DeviceSessionCredential,
+    command: AgentRouteBootstrapDeliveryCommand,
+    exact_body: Vec<u8>,
+    now: UtcMillis,
+) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
+    validate_delivery(&command, &exact_body, now)?;
+    let request_digest =
+        Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_DELIVERY_REQUEST_DOMAIN, &exact_body);
+    let mut session = store
+        .begin_tenant(command.tenant_id)
+        .await
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let result = deliver_in_transaction(
+        session.connection(),
+        credential,
+        &command,
+        request_digest,
+        now,
+    )
+    .await;
+    match result {
+        Ok(receipt) => {
+            session
+                .commit()
+                .await
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+            Ok(receipt)
+        }
+        Err(error) => {
+            let _ = session.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+/// Records a recipient created by an already authenticated Agent-Control peer.
+pub async fn record_agent_route_recipient_ready(
+    store: &PgStore,
+    tenant_id: TenantId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    command: AgentRouteRecipientReadyCommand,
+    now: UtcMillis,
+) -> Result<(), AgentRouteBootstrapError> {
+    if command.opaque_recipient_capsule.is_empty()
+        || command.opaque_recipient_capsule.len() > MAX_OPAQUE_BYTES
+        || command.expires_at <= now
+        || Sha256Digest::hash_domain(
+            AGENT_ROUTE_RECIPIENT_CAPSULE_DOMAIN,
+            &command.opaque_recipient_capsule,
+        ) != command.recipient_capsule_digest
+    {
+        return Err(AgentRouteBootstrapError::InvalidRequest);
+    }
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let result = async {
+        let row = load_bootstrap_for_update(session.connection(), tenant_id, command.bootstrap_id)
+            .await?
+            .ok_or(AgentRouteBootstrapError::NotFound)?;
+        if row.binding_id != binding_id || row.agent_control_device_id != agent_control_device_id {
+            return Err(AgentRouteBootstrapError::Forbidden);
+        }
+        if row.expires_at <= now || command.expires_at > row.expires_at {
+            return Err(AgentRouteBootstrapError::Conflict);
+        }
+        match row.state {
+            AgentRouteBootstrapState::PendingRecipient => {
+                let updated = sqlx::query(
+                    "UPDATE agent.agent_route_bootstraps
+                        SET state='recipient_ready', recipient_id=$3,
+                            recipient_capsule_digest=$4, opaque_recipient_capsule=$5,
+                            updated_at_ms=$6
+                      WHERE tenant_id=$1 AND bootstrap_id=$2 AND state='pending_recipient'",
+                )
+                .bind(Uuid::from(tenant_id))
+                .bind(Uuid::from(command.bootstrap_id))
+                .bind(Uuid::from(command.recipient_id))
+                .bind(command.recipient_capsule_digest.as_bytes().as_slice())
+                .bind(&command.opaque_recipient_capsule)
+                .bind(now.get())
+                .execute(session.connection())
+                .await
+                .map_err(map_sql)?;
+                if updated.rows_affected() != 1 {
+                    return Err(AgentRouteBootstrapError::Conflict);
+                }
+                Ok(())
+            }
+            AgentRouteBootstrapState::RecipientReady
+                if row.recipient_id == Some(command.recipient_id)
+                    && row.recipient_capsule_digest == Some(command.recipient_capsule_digest)
+                    && row.opaque_recipient_capsule.as_deref()
+                        == Some(command.opaque_recipient_capsule.as_slice()) =>
+            {
+                Ok(())
+            }
+            _ => Err(AgentRouteBootstrapError::Conflict),
+        }
+    }
+    .await;
+    match result {
+        Ok(()) => session
+            .commit()
+            .await
+            .map_err(|_| AgentRouteBootstrapError::Unavailable),
+        Err(error) => {
+            let _ = session.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+/// Records an authenticated successful install and only then creates or moves
+/// the exact binding head used by AgentRoute Run ingress.
+pub async fn record_agent_route_bootstrap_installed(
+    store: &PgStore,
+    tenant_id: TenantId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    command: AgentRouteBootstrapTerminalCommand,
+    now: UtcMillis,
+) -> Result<(), AgentRouteBootstrapError> {
+    let route_fence = command
+        .route_fence
+        .filter(|value| !value.iter().all(|byte| *byte == 0))
+        .ok_or(AgentRouteBootstrapError::InvalidRequest)?;
+    if command.stable_code != "INSTALLED" {
+        return Err(AgentRouteBootstrapError::InvalidRequest);
+    }
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let result = async {
+        let row = terminal_target(
+            session.connection(),
+            tenant_id,
+            binding_id,
+            agent_control_device_id,
+            &command,
+            now,
+        )
+        .await?;
+        if row.state == AgentRouteBootstrapState::Installed {
+            return if row.route_fence == Some(route_fence) {
+                Ok(())
+            } else {
+                Err(AgentRouteBootstrapError::Conflict)
+            };
+        }
+        if row.state != AgentRouteBootstrapState::PendingDelivery {
+            return Err(AgentRouteBootstrapError::Conflict);
+        }
+        let changed = sqlx::query(
+            "UPDATE agent.agent_route_bootstraps
+                SET state='installed', route_fence=$3, updated_at_ms=$4
+              WHERE tenant_id=$1 AND bootstrap_id=$2 AND state='pending_delivery'",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(command.bootstrap_id))
+        .bind(route_fence.as_slice())
+        .bind(now.get())
+        .execute(session.connection())
+        .await
+        .map_err(map_sql)?;
+        if changed.rows_affected() != 1 {
+            return Err(AgentRouteBootstrapError::Conflict);
+        }
+        let upserted = sqlx::query(
+            "INSERT INTO agent.agent_route_binding_heads (
+                 tenant_id, owner_identity_id, owner_device_id, installation_id, binding_id,
+                 agent_control_device_id, bootstrap_id, delivery_id, route_id, route_fence,
+                 capsule_digest, expires_at_ms, installed_at_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             ON CONFLICT (tenant_id, owner_identity_id, owner_device_id, installation_id,
+                          binding_id, agent_control_device_id)
+             DO UPDATE SET bootstrap_id=EXCLUDED.bootstrap_id,
+                           delivery_id=EXCLUDED.delivery_id,
+                           route_id=EXCLUDED.route_id,
+                           route_fence=EXCLUDED.route_fence,
+                           capsule_digest=EXCLUDED.capsule_digest,
+                           expires_at_ms=EXCLUDED.expires_at_ms,
+                           installed_at_ms=EXCLUDED.installed_at_ms
+             WHERE agent.agent_route_binding_heads.bootstrap_id=EXCLUDED.bootstrap_id
+                OR agent.agent_route_binding_heads.expires_at_ms <= EXCLUDED.installed_at_ms",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(row.owner_identity_id.to_string())
+        .bind(Uuid::from(row.owner_device_id))
+        .bind(Uuid::from(row.installation_id))
+        .bind(Uuid::from(row.binding_id))
+        .bind(Uuid::from(row.agent_control_device_id))
+        .bind(Uuid::from(row.bootstrap_id))
+        .bind(Uuid::from(command.delivery_id))
+        .bind(Uuid::from(command.route_id))
+        .bind(route_fence.as_slice())
+        .bind(command.capsule_digest.as_bytes().as_slice())
+        .bind(row.expires_at.get())
+        .bind(now.get())
+        .execute(session.connection())
+        .await
+        .map_err(map_sql)?;
+        if upserted.rows_affected() != 1 {
+            return Err(AgentRouteBootstrapError::Conflict);
+        }
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => session
+            .commit()
+            .await
+            .map_err(|_| AgentRouteBootstrapError::Unavailable),
+        Err(error) => {
+            let _ = session.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+/// Records an authenticated terminal rejection; it deliberately never makes a
+/// binding head eligible for Run ingress.
+pub async fn record_agent_route_bootstrap_rejected(
+    store: &PgStore,
+    tenant_id: TenantId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    command: AgentRouteBootstrapTerminalCommand,
+    now: UtcMillis,
+) -> Result<(), AgentRouteBootstrapError> {
+    if command.route_fence.is_some()
+        || !valid_stable_code(&command.stable_code)
+        || command.stable_code == "INSTALLED"
+    {
+        return Err(AgentRouteBootstrapError::InvalidRequest);
+    }
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let result = async {
+        let row = terminal_target(
+            session.connection(),
+            tenant_id,
+            binding_id,
+            agent_control_device_id,
+            &command,
+            now,
+        )
+        .await?;
+        match row.state {
+            AgentRouteBootstrapState::Rejected
+                if row.rejection_code.as_deref() == Some(command.stable_code.as_str()) =>
+            {
+                Ok(())
+            }
+            AgentRouteBootstrapState::PendingDelivery => {
+                let changed = sqlx::query(
+                    "UPDATE agent.agent_route_bootstraps
+                        SET state='rejected', rejection_code=$3, updated_at_ms=$4
+                      WHERE tenant_id=$1 AND bootstrap_id=$2 AND state='pending_delivery'",
+                )
+                .bind(Uuid::from(tenant_id))
+                .bind(Uuid::from(command.bootstrap_id))
+                .bind(&command.stable_code)
+                .bind(now.get())
+                .execute(session.connection())
+                .await
+                .map_err(map_sql)?;
+                if changed.rows_affected() == 1 {
+                    Ok(())
+                } else {
+                    Err(AgentRouteBootstrapError::Conflict)
+                }
+            }
+            _ => Err(AgentRouteBootstrapError::Conflict),
+        }
+    }
+    .await;
+    match result {
+        Ok(()) => session
+            .commit()
+            .await
+            .map_err(|_| AgentRouteBootstrapError::Unavailable),
+        Err(error) => {
+            let _ = session.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+async fn begin_in_transaction(
+    connection: &mut sqlx::PgConnection,
+    credential: &DeviceSessionCredential,
+    command: &AgentRouteBootstrapBeginCommand,
+    exact_body: &[u8],
+    request_digest: Sha256Digest,
+    now: UtcMillis,
+) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
+    let owner = authenticate_owner(connection, credential, now).await?;
+    if owner.0 != command.owner_identity_id || owner.1 != command.owner_device_id {
+        return Err(AgentRouteBootstrapError::Forbidden);
+    }
+    verify_owner_signature(
+        owner.2,
+        command.binding_digest,
+        command.owner_signature,
+        AGENT_ROUTE_BOOTSTRAP_BEGIN_SIGNATURE_DOMAIN,
+    )?;
+    lock_uuid(connection, *command.bootstrap_id.as_uuid()).await?;
+    lock_uuid(connection, *command.binding_id.as_uuid()).await?;
+    if let Some(row) = sqlx::query(
+        "SELECT request_digest, begin_receipt_bytes, begin_receipt_digest
+           FROM agent.agent_route_bootstraps
+          WHERE tenant_id=$1 AND bootstrap_id=$2 FOR UPDATE",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.bootstrap_id))
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_sql)?
+    {
+        let stored_request: Vec<u8> = row
+            .try_get("request_digest")
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+        if stored_request.as_slice() != request_digest.as_bytes() {
+            return Err(AgentRouteBootstrapError::Conflict);
+        }
+        let bytes: Vec<u8> = row
+            .try_get("begin_receipt_bytes")
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+        let stored_digest = bytes32(
+            row.try_get("begin_receipt_digest")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )?;
+        if bytes.len() > MAX_RECEIPT_BYTES
+            || Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_BEGIN_RECEIPT_DOMAIN, &bytes)
+                .as_bytes()
+                != &stored_digest
+            || decode_deterministic_cbor(&bytes).is_err()
+        {
+            return Err(AgentRouteBootstrapError::Unavailable);
+        }
+        return Ok(AgentRouteBootstrapOwnerReceipt {
+            replayed: true,
+            state: AgentRouteBootstrapState::PendingRecipient,
+            exact_cbor: bytes,
+        });
+    }
+    let connector_id = ensure_owner_target(connection, command).await?;
+    expire_live_tuple(connection, command, now).await?;
+    let live: Option<Uuid> = sqlx::query_scalar(
+        "SELECT bootstrap_id FROM agent.agent_route_bootstraps
+          WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3
+            AND installation_id=$4 AND binding_id=$5 AND agent_control_device_id=$6
+            AND state IN ('pending_recipient','recipient_ready','pending_delivery','installed')
+          FOR UPDATE",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(command.owner_identity_id.to_string())
+    .bind(Uuid::from(command.owner_device_id))
+    .bind(Uuid::from(command.installation_id))
+    .bind(Uuid::from(command.binding_id))
+    .bind(Uuid::from(command.agent_control_device_id))
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+    if live.is_some() {
+        return Err(AgentRouteBootstrapError::Conflict);
+    }
+    let receipt = owner_receipt_cbor(
+        command.tenant_id,
+        command.bootstrap_id,
+        AgentRouteBootstrapState::PendingRecipient,
+        None,
+        None,
+        None,
+        None,
+        command.expires_at,
+        now,
+        None,
+    )?;
+    let receipt_digest =
+        Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_BEGIN_RECEIPT_DOMAIN, &receipt);
+    sqlx::query(
+        "INSERT INTO agent.agent_route_bootstraps (
+             tenant_id, bootstrap_id, owner_identity_id, owner_device_id, installation_id,
+             binding_id, agent_control_device_id, connector_id, owner_signed_intent,
+             request_digest, begin_receipt_bytes, begin_receipt_digest, state, expires_at_ms,
+             created_at_ms, updated_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending_recipient',$13,$14,$14)",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.bootstrap_id))
+    .bind(command.owner_identity_id.to_string())
+    .bind(Uuid::from(command.owner_device_id))
+    .bind(Uuid::from(command.installation_id))
+    .bind(Uuid::from(command.binding_id))
+    .bind(Uuid::from(command.agent_control_device_id))
+    .bind(Uuid::from(connector_id))
+    .bind(exact_body)
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(&receipt)
+    .bind(receipt_digest.as_bytes().as_slice())
+    .bind(command.expires_at.get())
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+
+    // TODO(control-v1.4): atomically translate this exact payload into the
+    // authenticated Connector command log and mark it dispatched on ack.
+    let payload = prepare_outbox_payload(command, exact_body)?;
+    let payload_digest = Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_OUTBOX_DOMAIN, &payload);
+    sqlx::query(
+        "INSERT INTO agent.agent_route_bootstrap_outbox (
+             tenant_id, outbox_id, bootstrap_id, connector_id, command_kind,
+             payload_digest, opaque_payload, state, created_at_ms
+         ) VALUES ($1,$2,$3,$4,'prepare_recipient',$5,$6,'pending',$7)",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(OutboxId::new()))
+    .bind(Uuid::from(command.bootstrap_id))
+    .bind(Uuid::from(connector_id))
+    .bind(payload_digest.as_bytes().as_slice())
+    .bind(payload)
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+    Ok(AgentRouteBootstrapOwnerReceipt {
+        replayed: false,
+        state: AgentRouteBootstrapState::PendingRecipient,
+        exact_cbor: receipt,
+    })
+}
+
+async fn deliver_in_transaction(
+    connection: &mut sqlx::PgConnection,
+    credential: &DeviceSessionCredential,
+    command: &AgentRouteBootstrapDeliveryCommand,
+    request_digest: Sha256Digest,
+    now: UtcMillis,
+) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
+    let owner = authenticate_owner(connection, credential, now).await?;
+    if owner.0 != command.owner_identity_id || owner.1 != command.owner_device_id {
+        return Err(AgentRouteBootstrapError::Forbidden);
+    }
+    verify_owner_signature(
+        owner.2,
+        command.binding_digest,
+        command.owner_signature,
+        AGENT_ROUTE_BOOTSTRAP_DELIVERY_SIGNATURE_DOMAIN,
+    )?;
+    lock_uuid(connection, *command.bootstrap_id.as_uuid()).await?;
+    lock_uuid(connection, *command.delivery_id.as_uuid()).await?;
+    expire_bootstrap_if_due(connection, command.tenant_id, command.bootstrap_id, now).await?;
+    let row = load_bootstrap_for_update(connection, command.tenant_id, command.bootstrap_id)
+        .await?
+        .ok_or(AgentRouteBootstrapError::NotFound)?;
+    if row.owner_identity_id != command.owner_identity_id
+        || row.owner_device_id != command.owner_device_id
+        || row.installation_id != command.installation_id
+        || row.binding_id != command.binding_id
+        || row.agent_control_device_id != command.agent_control_device_id
+    {
+        return Err(AgentRouteBootstrapError::Forbidden);
+    }
+    if let Some(delivery_id) = row.delivery_id {
+        if delivery_id != command.delivery_id {
+            return Err(AgentRouteBootstrapError::Conflict);
+        }
+        let replay = sqlx::query(
+            "SELECT delivery_request_digest, delivery_receipt_bytes, delivery_receipt_digest
+               FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND bootstrap_id=$2",
+        )
+        .bind(Uuid::from(command.tenant_id))
+        .bind(Uuid::from(command.bootstrap_id))
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(map_sql)?;
+        let stored_request: Vec<u8> = replay
+            .try_get("delivery_request_digest")
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+        if stored_request.as_slice() != request_digest.as_bytes() {
+            return Err(AgentRouteBootstrapError::Conflict);
+        }
+        let exact_cbor: Vec<u8> = replay
+            .try_get("delivery_receipt_bytes")
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+        let digest = bytes32(
+            replay
+                .try_get("delivery_receipt_digest")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )?;
+        if Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN, &exact_cbor)
+            .as_bytes()
+            != &digest
+            || decode_deterministic_cbor(&exact_cbor).is_err()
+        {
+            return Err(AgentRouteBootstrapError::Unavailable);
+        }
+        return Ok(AgentRouteBootstrapOwnerReceipt {
+            replayed: true,
+            state: row.state,
+            exact_cbor,
+        });
+    }
+    if row.state != AgentRouteBootstrapState::RecipientReady
+        || row.recipient_id != Some(command.recipient_id)
+        || row.expires_at <= now
+        || command.expires_at > row.expires_at
+    {
+        return Err(AgentRouteBootstrapError::Conflict);
+    }
+    let receipt = owner_receipt_cbor(
+        command.tenant_id,
+        command.bootstrap_id,
+        AgentRouteBootstrapState::PendingDelivery,
+        Some(command.recipient_id),
+        Some(command.delivery_id),
+        Some(command.route_id),
+        None,
+        row.expires_at,
+        now,
+        None,
+    )?;
+    let receipt_digest =
+        Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN, &receipt);
+    let changed = sqlx::query(
+        "UPDATE agent.agent_route_bootstraps
+            SET state='pending_delivery', route_id=$3, delivery_id=$4,
+                bootstrap_capsule_digest=$5, opaque_sealed_bootstrap=$6,
+                delivery_request_digest=$7, delivery_receipt_bytes=$8,
+                delivery_receipt_digest=$9, updated_at_ms=$10
+          WHERE tenant_id=$1 AND bootstrap_id=$2 AND state='recipient_ready' AND delivery_id IS NULL",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.bootstrap_id))
+    .bind(Uuid::from(command.route_id))
+    .bind(Uuid::from(command.delivery_id))
+    .bind(command.capsule_digest.as_bytes().as_slice())
+    .bind(&command.opaque_sealed_bootstrap)
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(&receipt)
+    .bind(receipt_digest.as_bytes().as_slice())
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+    if changed.rows_affected() != 1 {
+        return Err(AgentRouteBootstrapError::Conflict);
+    }
+    let payload = delivery_outbox_payload(command)?;
+    let payload_digest = Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_OUTBOX_DOMAIN, &payload);
+    sqlx::query(
+        "INSERT INTO agent.agent_route_bootstrap_outbox (
+             tenant_id, outbox_id, bootstrap_id, delivery_id, connector_id, command_kind,
+             payload_digest, opaque_payload, state, created_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,'deliver_bootstrap',$6,$7,'pending',$8)",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(OutboxId::new()))
+    .bind(Uuid::from(command.bootstrap_id))
+    .bind(Uuid::from(command.delivery_id))
+    .bind(Uuid::from(row.connector_id))
+    .bind(payload_digest.as_bytes().as_slice())
+    .bind(payload)
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+    Ok(AgentRouteBootstrapOwnerReceipt {
+        replayed: false,
+        state: AgentRouteBootstrapState::PendingDelivery,
+        exact_cbor: receipt,
+    })
+}
+
+async fn terminal_target(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    command: &AgentRouteBootstrapTerminalCommand,
+    now: UtcMillis,
+) -> Result<RouteBootstrapRecord, AgentRouteBootstrapError> {
+    expire_bootstrap_if_due(connection, tenant_id, command.bootstrap_id, now).await?;
+    let row = load_bootstrap_for_update(connection, tenant_id, command.bootstrap_id)
+        .await?
+        .ok_or(AgentRouteBootstrapError::NotFound)?;
+    if row.binding_id != binding_id
+        || row.agent_control_device_id != agent_control_device_id
+        || row.delivery_id != Some(command.delivery_id)
+        || row.route_id != Some(command.route_id)
+        || row.bootstrap_capsule_digest != Some(command.capsule_digest)
+        || row.expires_at <= now
+    {
+        return Err(AgentRouteBootstrapError::Conflict);
+    }
+    Ok(row)
+}
+
+async fn authenticate_owner(
+    connection: &mut sqlx::PgConnection,
+    credential: &DeviceSessionCredential,
+    now: UtcMillis,
+) -> Result<(IdentityId, DeviceId, [u8; 32]), AgentRouteBootstrapError> {
+    let authenticated = DeviceSessionRepository::authenticate_with_signing_key_in_transaction(
+        connection, credential, now,
+    )
+    .await
+    .map_err(|error| match error {
+        dtx_identity_persistence::IdentityPersistenceError::DeviceAuthenticationRejected => {
+            AgentRouteBootstrapError::AuthenticationRejected
+        }
+        _ => AgentRouteBootstrapError::Unavailable,
+    })?;
+    Ok((
+        authenticated.session().identity_id(),
+        authenticated.session().device_id(),
+        *authenticated.signing_key().as_bytes(),
+    ))
+}
+
+fn verify_owner_signature(
+    public_key: [u8; 32],
+    binding_digest: Sha256Digest,
+    signature: Ed25519Signature,
+    domain: &[u8],
+) -> Result<(), AgentRouteBootstrapError> {
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| AgentRouteBootstrapError::InvalidRequest)?;
+    let mut input = domain.to_vec();
+    input.extend_from_slice(binding_digest.as_bytes());
+    verifying_key
+        .verify_strict(&input, &Signature::from_bytes(signature.as_bytes()))
+        .map_err(|_| AgentRouteBootstrapError::InvalidRequest)
+}
+
+async fn ensure_owner_target(
+    connection: &mut sqlx::PgConnection,
+    command: &AgentRouteBootstrapBeginCommand,
+) -> Result<ConnectorId, AgentRouteBootstrapError> {
+    let connector: Option<Uuid> = sqlx::query_scalar(
+        "SELECT b.connector_id
+           FROM agent.installations i
+           JOIN agent.connector_bindings b
+             ON b.tenant_id=i.tenant_id AND b.installation_id=i.installation_id
+           JOIN agent.agent_devices d
+             ON d.tenant_id=i.tenant_id AND d.agent_device_id=b.agent_device_id
+          WHERE i.tenant_id=$1 AND i.installation_id=$2 AND i.owner_id=$3
+            AND i.desired_state <> 'revoked'
+            AND b.binding_id=$4 AND b.agent_device_id=$5 AND b.state='enabled'
+            AND d.installation_id=i.installation_id AND d.state <> 'revoked'
+          FOR SHARE OF i, b, d",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.installation_id))
+    .bind(command.owner_identity_id.to_string())
+    .bind(Uuid::from(command.binding_id))
+    .bind(Uuid::from(command.agent_control_device_id))
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+    connector
+        .ok_or(AgentRouteBootstrapError::Conflict)
+        .and_then(|value| {
+            ConnectorId::try_from(value).map_err(|_| AgentRouteBootstrapError::Unavailable)
+        })
+}
+
+async fn expire_live_tuple(
+    connection: &mut sqlx::PgConnection,
+    command: &AgentRouteBootstrapBeginCommand,
+    now: UtcMillis,
+) -> Result<(), AgentRouteBootstrapError> {
+    sqlx::query(
+        "UPDATE agent.agent_route_bootstraps SET state='expired', updated_at_ms=$7
+          WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3
+            AND installation_id=$4 AND binding_id=$5 AND agent_control_device_id=$6
+            AND state IN ('pending_recipient','recipient_ready','pending_delivery','installed')
+            AND expires_at_ms <= $7",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(command.owner_identity_id.to_string())
+    .bind(Uuid::from(command.owner_device_id))
+    .bind(Uuid::from(command.installation_id))
+    .bind(Uuid::from(command.binding_id))
+    .bind(Uuid::from(command.agent_control_device_id))
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+    Ok(())
+}
+
+async fn expire_bootstrap_if_due(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    bootstrap_id: AgentRouteBootstrapId,
+    now: UtcMillis,
+) -> Result<(), AgentRouteBootstrapError> {
+    sqlx::query(
+        "UPDATE agent.agent_route_bootstraps SET state='expired', updated_at_ms=$3
+          WHERE tenant_id=$1 AND bootstrap_id=$2
+            AND state IN ('pending_recipient','recipient_ready','pending_delivery','installed')
+            AND expires_at_ms <= $3",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(bootstrap_id))
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+    Ok(())
+}
+
+async fn load_bootstrap_for_update(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    bootstrap_id: AgentRouteBootstrapId,
+) -> Result<Option<RouteBootstrapRecord>, AgentRouteBootstrapError> {
+    let row = sqlx::query(
+        "SELECT bootstrap_id, tenant_id, owner_identity_id, owner_device_id, installation_id,
+                binding_id, agent_control_device_id, connector_id, route_fence, state,
+                recipient_id, recipient_capsule_digest, opaque_recipient_capsule, route_id,
+                delivery_id, bootstrap_capsule_digest, rejection_code, expires_at_ms,
+                created_at_ms, updated_at_ms
+           FROM agent.agent_route_bootstraps
+          WHERE tenant_id=$1 AND bootstrap_id=$2 FOR UPDATE",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(bootstrap_id))
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+    row.map(|row| route_bootstrap_record_from_row(&row))
+        .transpose()
+}
+
+fn route_bootstrap_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<RouteBootstrapRecord, AgentRouteBootstrapError> {
+    Ok(RouteBootstrapRecord {
+        bootstrap_id: AgentRouteBootstrapId::try_from(
+            row.try_get::<Uuid, _>("bootstrap_id")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        tenant_id: TenantId::try_from(
+            row.try_get::<Uuid, _>("tenant_id")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        owner_identity_id: row
+            .try_get::<String, _>("owner_identity_id")
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?
+            .parse()
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        owner_device_id: DeviceId::try_from(
+            row.try_get::<Uuid, _>("owner_device_id")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        installation_id: InstallationId::try_from(
+            row.try_get::<Uuid, _>("installation_id")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        binding_id: BindingId::try_from(
+            row.try_get::<Uuid, _>("binding_id")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        agent_control_device_id: AgentDeviceId::try_from(
+            row.try_get::<Uuid, _>("agent_control_device_id")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        connector_id: ConnectorId::try_from(
+            row.try_get::<Uuid, _>("connector_id")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        route_fence: optional_bytes32(row, "route_fence")?,
+        state: AgentRouteBootstrapState::parse(
+            &row.try_get::<String, _>("state")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )?,
+        recipient_id: optional_uuid(row, "recipient_id")?
+            .map(AgentRouteRecipientId::try_from)
+            .transpose()
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        recipient_capsule_digest: optional_bytes32(row, "recipient_capsule_digest")?
+            .map(Sha256Digest::from_bytes),
+        opaque_recipient_capsule: row
+            .try_get("opaque_recipient_capsule")
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        route_id: optional_uuid(row, "route_id")?
+            .map(ConversationId::try_from)
+            .transpose()
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        delivery_id: optional_uuid(row, "delivery_id")?
+            .map(AgentRouteDeliveryId::try_from)
+            .transpose()
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        bootstrap_capsule_digest: optional_bytes32(row, "bootstrap_capsule_digest")?
+            .map(Sha256Digest::from_bytes),
+        rejection_code: row
+            .try_get("rejection_code")
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        expires_at: UtcMillis::new(
+            row.try_get("expires_at_ms")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        created_at: UtcMillis::new(
+            row.try_get("created_at_ms")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        updated_at: UtcMillis::new(
+            row.try_get("updated_at_ms")
+                .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        )
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+    })
+}
+
+fn owner_receipt_cbor(
+    tenant_id: TenantId,
+    bootstrap_id: AgentRouteBootstrapId,
+    state: AgentRouteBootstrapState,
+    recipient_id: Option<AgentRouteRecipientId>,
+    delivery_id: Option<AgentRouteDeliveryId>,
+    route_id: Option<ConversationId>,
+    route_fence: Option<[u8; 32]>,
+    expires_at: UtcMillis,
+    updated_at: UtcMillis,
+    opaque_recipient_capsule: Option<&[u8]>,
+) -> Result<Vec<u8>, AgentRouteBootstrapError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(tenant_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(bootstrap_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Unsigned(state.receipt_code()),
+        ),
+        (CanonicalValue::Unsigned(5), optional_text(recipient_id)),
+        (CanonicalValue::Unsigned(6), optional_text(delivery_id)),
+        (CanonicalValue::Unsigned(7), optional_text(route_id)),
+        (
+            CanonicalValue::Unsigned(8),
+            route_fence.map_or(CanonicalValue::Null, |value| {
+                CanonicalValue::Bytes(value.to_vec())
+            }),
+        ),
+        (CanonicalValue::Unsigned(9), expires_at.to_canonical_value()),
+        (
+            CanonicalValue::Unsigned(10),
+            updated_at.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(11),
+            opaque_recipient_capsule.map_or(CanonicalValue::Null, |bytes| {
+                CanonicalValue::Bytes(bytes.to_vec())
+            }),
+        ),
+    ]))
+    .map_err(|_| AgentRouteBootstrapError::Unavailable)
+}
+
+fn owner_view_cbor(row: &RouteBootstrapRecord) -> Result<Vec<u8>, AgentRouteBootstrapError> {
+    owner_receipt_cbor(
+        row.tenant_id,
+        row.bootstrap_id,
+        row.state,
+        row.recipient_id,
+        row.delivery_id,
+        row.route_id,
+        row.route_fence,
+        row.expires_at,
+        row.updated_at,
+        row.opaque_recipient_capsule.as_deref(),
+    )
+}
+
+fn prepare_outbox_payload(
+    command: &AgentRouteBootstrapBeginCommand,
+    owner_signed_intent: &[u8],
+) -> Result<Vec<u8>, AgentRouteBootstrapError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(command.bootstrap_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(command.tenant_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(command.installation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(command.binding_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Text(command.agent_control_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Text(command.owner_identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Text(command.owner_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Bytes(owner_signed_intent.to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(10),
+            command.expires_at.to_canonical_value(),
+        ),
+    ]))
+    .map_err(|_| AgentRouteBootstrapError::Unavailable)
+}
+
+fn delivery_outbox_payload(
+    command: &AgentRouteBootstrapDeliveryCommand,
+) -> Result<Vec<u8>, AgentRouteBootstrapError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(command.bootstrap_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(command.delivery_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(command.route_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(command.recipient_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Bytes(command.capsule_digest.as_bytes().to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Bytes(command.opaque_sealed_bootstrap.clone()),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            command.expires_at.to_canonical_value(),
+        ),
+    ]))
+    .map_err(|_| AgentRouteBootstrapError::Unavailable)
+}
+
+fn validate_begin(
+    command: &AgentRouteBootstrapBeginCommand,
+    exact_body: &[u8],
+    now: UtcMillis,
+) -> Result<(), AgentRouteBootstrapError> {
+    if exact_body.is_empty()
+        || exact_body.len() > MAX_OPAQUE_BYTES
+        || command.expires_at <= now
+        || command.expires_at.get() > now.get().saturating_add(MAX_BOOTSTRAP_LIFETIME_MS)
+    {
+        return Err(AgentRouteBootstrapError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_delivery(
+    command: &AgentRouteBootstrapDeliveryCommand,
+    exact_body: &[u8],
+    now: UtcMillis,
+) -> Result<(), AgentRouteBootstrapError> {
+    if exact_body.is_empty()
+        || exact_body.len() > MAX_OPAQUE_BYTES
+        || command.opaque_sealed_bootstrap.is_empty()
+        || command.opaque_sealed_bootstrap.len() > MAX_OPAQUE_BYTES
+        || command.expires_at <= now
+        || Sha256Digest::hash_domain(
+            AGENT_ROUTE_BOOTSTRAP_CAPSULE_DOMAIN,
+            &command.opaque_sealed_bootstrap,
+        ) != command.capsule_digest
+    {
+        return Err(AgentRouteBootstrapError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn valid_stable_code(value: &str) -> bool {
+    (3..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        && value.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+}
+
+fn optional_text<T: ToString>(value: Option<T>) -> CanonicalValue {
+    value.map_or(CanonicalValue::Null, |value| {
+        CanonicalValue::Text(value.to_string())
+    })
+}
+
+fn bytes32(value: Vec<u8>) -> Result<[u8; 32], AgentRouteBootstrapError> {
+    value
+        .try_into()
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)
+}
+
+fn optional_bytes32(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<Option<[u8; 32]>, AgentRouteBootstrapError> {
+    row.try_get::<Option<Vec<u8>>, _>(field)
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?
+        .map(bytes32)
+        .transpose()
+}
+
+fn optional_uuid(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<Option<Uuid>, AgentRouteBootstrapError> {
+    row.try_get(field)
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)
+}
+
+async fn lock_uuid(
+    connection: &mut sqlx::PgConnection,
+    id: Uuid,
+) -> Result<(), AgentRouteBootstrapError> {
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&id.as_bytes()[..8]);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(i64::from_be_bytes(prefix) ^ i64::MIN)
+        .execute(&mut *connection)
+        .await
+        .map_err(map_sql)?;
+    Ok(())
+}
+
+fn map_sql(error: sqlx::Error) -> AgentRouteBootstrapError {
+    if error
+        .as_database_error()
+        .and_then(|database| database.code())
+        .is_some_and(|code| code == "23505")
+    {
+        AgentRouteBootstrapError::Conflict
+    } else {
+        AgentRouteBootstrapError::Unavailable
+    }
+}
