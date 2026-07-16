@@ -948,6 +948,7 @@ dependencies = [
  "dtx-storage",
  "dtx-wire",
  "ed25519-dalek",
+ "rcgen",
  "reqwest",
  "rustix 1.1.4",
  "rustls",
@@ -958,6 +959,7 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+ "x509-parser",
  "zeroize",
 ]
 

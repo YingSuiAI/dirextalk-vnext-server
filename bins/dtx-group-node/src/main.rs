@@ -1,11 +1,18 @@
 #![forbid(unsafe_code)]
 
-use std::{env, net::SocketAddr, path::Path, str::FromStr};
+use std::{
+    env, fs, io,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use dtx_domain::TenantId;
 use dtx_group_node::load_mls_sequencer_signing_key;
 use dtx_group_persistence::GroupPgStore;
 use sqlx::postgres::PgConnectOptions;
+
+const MAX_FEDERATED_IDENTITY_TRUST_ROOT_PEM_BYTES: u64 = 64 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,13 +38,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let additional_federated_identity_trust_root_pem =
+        load_optional_federated_identity_trust_root_pem()?;
     let state = dtx_group_node::GroupNodeState::new(store, tenant_id)
         .with_mls_sequencer_signing_key(sequencer_signing_key)
-        .with_public_origin_and_allowed_http_identity_origins(
+        .with_federated_identity_configuration(
             public_origin,
             allowed_http_identity_origins,
+            additional_federated_identity_trust_root_pem.as_deref(),
         )?;
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
     axum::serve(listener, dtx_group_node::group_router_with_state(state)).await?;
     Ok(())
+}
+
+fn load_optional_federated_identity_trust_root_pem() -> Result<Option<Vec<u8>>, io::Error> {
+    let Some(path) = env::var_os("DTX_GROUP_FEDERATED_IDENTITY_TRUST_ROOT_FILE") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let metadata = fs::metadata(&path)?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_FEDERATED_IDENTITY_TRUST_ROOT_PEM_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "federated identity trust root must be a non-empty regular PEM file within 64 KiB",
+        ));
+    }
+    let pem = fs::read(path)?;
+    if pem.is_empty()
+        || u64::try_from(pem.len()).unwrap_or(u64::MAX)
+            > MAX_FEDERATED_IDENTITY_TRUST_ROOT_PEM_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "federated identity trust root must be a non-empty regular PEM file within 64 KiB",
+        ));
+    }
+    Ok(Some(pem))
 }

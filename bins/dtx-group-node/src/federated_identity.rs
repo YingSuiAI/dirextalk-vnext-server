@@ -6,7 +6,9 @@ use dtx_identity_log::{
     MAX_IDENTITY_LOG_PAGE_BYTES, MAX_IDENTITY_LOG_PAGE_EVENTS,
 };
 use dtx_wire::SigningPublicKey;
-use reqwest::{Client, StatusCode, Url, header};
+use reqwest::{Certificate, Client, StatusCode, Url, header};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
+use x509_parser::parse_x509_certificate;
 
 const IDENTITY_LOG_PAGE_CONTENT_TYPE: &str = "application/vnd.dirextalk.identity-log-page.v1+cbor";
 const MAX_IDENTITY_LOG_TOTAL_BYTES: usize = 16 * 1024 * 1024;
@@ -21,6 +23,7 @@ pub(crate) struct FederatedIdentityVerifier {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FederatedIdentityError {
     InvalidOrigin,
+    InvalidTrustRoot,
     InvalidIdentityLog,
     DeviceUnavailable,
     TemporarilyUnavailable,
@@ -30,6 +33,7 @@ impl fmt::Display for FederatedIdentityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidOrigin => "federated identity origin is invalid",
+            Self::InvalidTrustRoot => "federated identity trust root is invalid",
             Self::InvalidIdentityLog => "federated identity log is invalid",
             Self::DeviceUnavailable => "federated identity device is unavailable",
             Self::TemporarilyUnavailable => "federated identity service is unavailable",
@@ -43,7 +47,6 @@ impl FederatedIdentityVerifier {
     pub(crate) fn new(
         allowed_http_origins: impl IntoIterator<Item = String>,
     ) -> Result<Self, FederatedIdentityError> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut canonical_http_origins = BTreeSet::new();
         for origin in allowed_http_origins {
             let canonical = canonical_origin(&origin, true)?;
@@ -52,26 +55,23 @@ impl FederatedIdentityVerifier {
             }
             canonical_http_origins.insert(canonical.origin().ascii_serialization());
         }
-        let client = Client::builder()
-            .https_only(false)
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(8))
-            .referer(false)
-            .build()
-            .map_err(|_| FederatedIdentityError::TemporarilyUnavailable)?;
+        let client = build_client(None)?;
         Ok(Self {
             client,
             allowed_http_origins: canonical_http_origins,
         })
     }
 
-    pub(crate) fn new_with_public_origin(
+    pub(crate) fn new_with_public_origin_and_additional_trust_root_pem(
         public_origin: &str,
         allowed_http_origins: impl IntoIterator<Item = String>,
+        additional_trust_root_pem: Option<&[u8]>,
     ) -> Result<(Self, String), FederatedIdentityError> {
         let verifier = Self::new(allowed_http_origins)?;
+        let verifier = match additional_trust_root_pem {
+            Some(trust_root_pem) => verifier.with_additional_trust_root_pem(trust_root_pem)?,
+            None => verifier,
+        };
         let public_origin = canonical_origin(public_origin, true)?;
         let canonical_public_origin = public_origin.origin().ascii_serialization();
         if public_origin.scheme() == "http"
@@ -82,6 +82,18 @@ impl FederatedIdentityVerifier {
             return Err(FederatedIdentityError::InvalidOrigin);
         }
         Ok((verifier, canonical_public_origin))
+    }
+
+    /// Extends the normal platform trust store with one explicitly configured CA root.
+    ///
+    /// The root is deliberately merged with the normal verifier instead of replacing it;
+    /// Rustls therefore continues to enforce normal certificate-chain and hostname checks.
+    fn with_additional_trust_root_pem(
+        mut self,
+        trust_root_pem: &[u8],
+    ) -> Result<Self, FederatedIdentityError> {
+        self.client = build_client(Some(parse_additional_trust_root_pem(trust_root_pem)?))?;
+        Ok(self)
     }
 
     pub(crate) async fn active_device_signing_key(
@@ -201,6 +213,47 @@ impl FederatedIdentityVerifier {
     }
 }
 
+fn build_client(
+    additional_trust_root: Option<Certificate>,
+) -> Result<Client, FederatedIdentityError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let builder = Client::builder()
+        .https_only(false)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(8))
+        .referer(false);
+    // `tls_certs_merge` retains the platform/WebPKI verifier and only appends this
+    // explicitly configured root. In particular, it does not disable hostname or
+    // certificate-chain validation.
+    let builder = match additional_trust_root {
+        Some(trust_root) => builder.tls_certs_merge([trust_root]),
+        None => builder,
+    };
+    builder
+        .build()
+        .map_err(|_| FederatedIdentityError::TemporarilyUnavailable)
+}
+
+fn parse_additional_trust_root_pem(
+    trust_root_pem: &[u8],
+) -> Result<Certificate, FederatedIdentityError> {
+    let certificates = CertificateDer::pem_slice_iter(trust_root_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| FederatedIdentityError::InvalidTrustRoot)?;
+    let [certificate] = certificates.as_slice() else {
+        return Err(FederatedIdentityError::InvalidTrustRoot);
+    };
+    let (remaining, parsed) = parse_x509_certificate(certificate.as_ref())
+        .map_err(|_| FederatedIdentityError::InvalidTrustRoot)?;
+    if !remaining.is_empty() || !parsed.is_ca() {
+        return Err(FederatedIdentityError::InvalidTrustRoot);
+    }
+    Certificate::from_der(certificate.as_ref())
+        .map_err(|_| FederatedIdentityError::InvalidTrustRoot)
+}
+
 fn active_signing_key(
     log: &IdentityLogV1,
     device_id: DeviceId,
@@ -259,4 +312,82 @@ fn require_single_header(
         return Err(FederatedIdentityError::InvalidIdentityLog);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use base64ct::{Base64, Encoding as _};
+    use rcgen::{
+        BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519,
+    };
+
+    use super::{FederatedIdentityError, FederatedIdentityVerifier};
+
+    #[test]
+    fn additional_trust_root_requires_one_ca_pem() -> Result<(), Box<dyn Error>> {
+        let ca_pem = ca_certificate_pem()?;
+        let (_, public_origin) =
+            FederatedIdentityVerifier::new_with_public_origin_and_additional_trust_root_pem(
+                "https://group.test",
+                std::iter::empty::<String>(),
+                Some(ca_pem.as_bytes()),
+            )?;
+        assert_eq!(public_origin, "https://group.test");
+
+        let leaf_key = KeyPair::generate_for(&PKCS_ED25519)?;
+        let leaf = CertificateParams::new(vec!["localhost".to_owned()])?.self_signed(&leaf_key)?;
+        let leaf_pem = pem_from_der(leaf.der().as_ref());
+        assert_eq!(
+            FederatedIdentityVerifier::new_with_public_origin_and_additional_trust_root_pem(
+                "https://group.test",
+                std::iter::empty::<String>(),
+                Some(leaf_pem.as_bytes()),
+            )
+            .err(),
+            Some(FederatedIdentityError::InvalidTrustRoot),
+        );
+
+        let duplicate_ca_pem = format!("{ca_pem}{ca_pem}");
+        assert_eq!(
+            FederatedIdentityVerifier::new_with_public_origin_and_additional_trust_root_pem(
+                "https://group.test",
+                std::iter::empty::<String>(),
+                Some(duplicate_ca_pem.as_bytes()),
+            )
+            .err(),
+            Some(FederatedIdentityError::InvalidTrustRoot),
+        );
+        assert_eq!(
+            FederatedIdentityVerifier::new_with_public_origin_and_additional_trust_root_pem(
+                "https://group.test",
+                std::iter::empty::<String>(),
+                Some(b"not a PEM certificate"),
+            )
+            .err(),
+            Some(FederatedIdentityError::InvalidTrustRoot),
+        );
+        Ok(())
+    }
+
+    fn ca_certificate_pem() -> Result<String, Box<dyn Error>> {
+        let key = KeyPair::generate_for(&PKCS_ED25519)?;
+        let mut parameters = CertificateParams::default();
+        parameters.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        parameters.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let certificate = parameters.self_signed(&key)?;
+        Ok(pem_from_der(certificate.der().as_ref()))
+    }
+
+    fn pem_from_der(der: &[u8]) -> String {
+        let encoded = Base64::encode_string(der);
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for line in encoded.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(line).expect("base64 output is ASCII"));
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+        pem
+    }
 }

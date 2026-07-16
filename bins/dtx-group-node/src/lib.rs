@@ -51,7 +51,7 @@ use crate::federated_identity::{FederatedIdentityError, FederatedIdentityVerifie
 
 pub use crate::sequencer_key::load_mls_sequencer_signing_key;
 
-/// Invalid local-development federation configuration.
+/// Invalid federation configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct GroupNodeConfigurationError(FederatedIdentityError);
 
@@ -267,14 +267,36 @@ impl GroupNodeState {
     /// an allowlist entry is not HTTP, or an HTTP public origin is not explicitly
     /// allowlisted.
     pub fn with_public_origin_and_allowed_http_identity_origins(
-        mut self,
+        self,
         public_origin: impl AsRef<str>,
         allowed_http_origins: impl IntoIterator<Item = String>,
     ) -> Result<Self, GroupNodeConfigurationError> {
+        self.with_federated_identity_configuration(public_origin, allowed_http_origins, None)
+    }
+
+    /// Atomically installs the federation origin policy and an optional additional
+    /// PEM-encoded CA root for federated identity HTTPS fetches.
+    ///
+    /// The optional root must contain exactly one X.509 CA certificate. It is merged
+    /// with the normal platform trust store, so certificate-chain and hostname
+    /// validation remain enabled. Passing `None` preserves the production default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupNodeConfigurationError`] for the origin-policy failures
+    /// documented by [`Self::with_public_origin_and_allowed_http_identity_origins`]
+    /// or when `additional_trust_root_pem` is not exactly one valid CA certificate.
+    pub fn with_federated_identity_configuration(
+        mut self,
+        public_origin: impl AsRef<str>,
+        allowed_http_origins: impl IntoIterator<Item = String>,
+        additional_trust_root_pem: Option<&[u8]>,
+    ) -> Result<Self, GroupNodeConfigurationError> {
         let (federated_identity, public_origin) =
-            FederatedIdentityVerifier::new_with_public_origin(
+            FederatedIdentityVerifier::new_with_public_origin_and_additional_trust_root_pem(
                 public_origin.as_ref(),
                 allowed_http_origins,
+                additional_trust_root_pem,
             )
             .map_err(GroupNodeConfigurationError)?;
         self.public_origin = Some(Arc::from(public_origin));
@@ -3343,6 +3365,7 @@ fn map_federated_identity_error(error: FederatedIdentityError) -> GroupFailure {
     match error {
         FederatedIdentityError::TemporarilyUnavailable => GroupFailure::TemporarilyUnavailable,
         FederatedIdentityError::InvalidOrigin
+        | FederatedIdentityError::InvalidTrustRoot
         | FederatedIdentityError::InvalidIdentityLog
         | FederatedIdentityError::DeviceUnavailable => GroupFailure::AuthenticationRejected,
     }
