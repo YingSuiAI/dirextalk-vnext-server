@@ -376,6 +376,7 @@ async fn drive_control(
     let router_enabled = protocol_minor >= 1;
     let execution_reporting_enabled = protocol_minor >= 2;
     let agent_provisioning_enabled = protocol_minor >= 3;
+    let agent_route_bootstrap_enabled = protocol_minor >= 4;
     // Subscribe before the final durable suffix query. This ordering closes the
     // commit-between-replay-and-wait race while allowing lossy/coalesced hints.
     let mut command_notifications =
@@ -424,6 +425,7 @@ async fn drive_control(
         application.as_ref(),
         peer,
         stream_fence,
+        protocol_minor,
         &mut last_delivered_sequence,
         &sender,
     )
@@ -676,6 +678,27 @@ async fn drive_control(
                             Err(ConnectorControlApplicationError::PermissionDenied)
                         }
                     }
+                    ParsedClientFrame::AgentRouteRecipientReady(ready) => {
+                        if agent_route_bootstrap_enabled {
+                            application.record_agent_route_recipient_ready(peer, ready).await
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::AgentRouteBootstrapInstalled(installed) => {
+                        if agent_route_bootstrap_enabled {
+                            application.complete_agent_route_bootstrap(peer, installed).await
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
+                    ParsedClientFrame::AgentRouteBootstrapRejected(rejected) => {
+                        if agent_route_bootstrap_enabled {
+                            application.reject_agent_route_bootstrap(peer, rejected).await
+                        } else {
+                            Err(ConnectorControlApplicationError::PermissionDenied)
+                        }
+                    }
                 };
                 if let Err(error) = result {
                     send_status(&sender, application_status(error)).await;
@@ -687,6 +710,7 @@ async fn drive_control(
                     application.as_ref(),
                     peer,
                     stream_fence,
+                    protocol_minor,
                     &mut last_delivered_sequence,
                     &sender,
                 ).await {
@@ -734,6 +758,7 @@ async fn drive_control(
                     application.as_ref(),
                     peer,
                     stream_fence,
+                    protocol_minor,
                     &mut last_delivered_sequence,
                     &sender,
                 ).await {
@@ -903,6 +928,7 @@ async fn poll_and_deliver_commands(
     application: &dyn ConnectorControlApplication,
     peer: AuthenticatedConnectorPeer,
     stream_fence: dtx_connect_registry::ConnectorFence,
+    protocol_minor: u32,
     last_delivered_sequence: &mut u64,
     sender: &mpsc::Sender<Result<v1::ServerFrame, Status>>,
 ) -> bool {
@@ -924,6 +950,18 @@ async fn poll_and_deliver_commands(
             if command.sequence() != last_delivered_sequence.saturating_add(1) {
                 send_status(sender, Status::internal("INTERNAL")).await;
                 return false;
+            }
+            if protocol_minor < 4
+                && matches!(
+                    command.payload(),
+                    dtx_agent_control::ServerCommandPayload::PrepareAgentRouteRecipient(_)
+                        | dtx_agent_control::ServerCommandPayload::DeliverAgentRouteBootstrap(_)
+                )
+            {
+                // RouteBootstrap commands intentionally remain at the durable
+                // head until this Connector upgrades and negotiates Control
+                // v1.4. Advancing past one would break the exact command cursor.
+                return true;
             }
             *last_delivered_sequence = command.sequence();
             if !send_frame(

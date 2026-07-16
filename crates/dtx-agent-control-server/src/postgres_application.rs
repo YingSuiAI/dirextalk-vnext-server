@@ -32,10 +32,11 @@ use dtx_connect_registry::{
     ConnectorFence, ConnectorLease, ConnectorObservedState,
 };
 use dtx_domain::{
-    AgentDeviceId, BindingId, Clock, ConnectorCredentialId, ConnectorId, ConversationId,
-    Ed25519PublicKey, EnrollmentIntentId, EventId, HostId, IdGenerator, InstallationId, LeaseId,
-    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, RunId, RunLeaseId,
-    RunOfferId, SystemClock, TenantId, UuidV7Generator,
+    AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId,
+    BindingId, Clock, ConnectorCredentialId, ConnectorId, ConversationId, DeviceId,
+    Ed25519PublicKey, EnrollmentIntentId, EventId, HostId, IdGenerator, IdentityId,
+    InstallationId, LeaseId, ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId,
+    Revision, RunId, RunLeaseId, RunOfferId, SystemClock, TenantId, UuidV7Generator,
 };
 use dtx_identity_persistence::{
     DeviceSessionCredential, DeviceSessionRepository, IdentityPersistenceError,
@@ -56,7 +57,9 @@ use crate::{
     ConnectorControlApplication, ConnectorControlApplicationError,
     ConnectorCredentialAuthorizationIndex, CredentialRotationCompletion, EnrollmentCompletion,
     HeartbeatCompletion, OpenControlCompletion, ParsedAgentProvisioningInstalled,
-    ParsedAgentProvisioningRejected, ParsedCapacity, ParsedCommandAcknowledgement,
+    ParsedAgentProvisioningRejected, ParsedAgentRouteBootstrapInstalled,
+    ParsedAgentRouteBootstrapRejected, ParsedAgentRouteRecipientReady, ParsedCapacity,
+    ParsedCommandAcknowledgement,
     ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat, ParsedHello,
     ParsedLeaseFence, ParsedProvisioningRecipientAnnouncement, ParsedReady, ParsedRunCheckpoint,
     ParsedRunClaim, ParsedRunCompleted, ParsedRunExecutionFence, ParsedRunFailed, ParsedRunOutput,
@@ -67,7 +70,7 @@ use crate::{
 };
 
 const PROTOCOL_MAJOR: u32 = 1;
-const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 3;
+const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 4;
 const DEFAULT_HEARTBEAT_INTERVAL_MILLIS: u32 = 10_000;
 const DEFAULT_HEARTBEAT_TTL_MILLIS: u32 = 30_000;
 const CERTIFICATE_NOT_BEFORE_SKEW_MILLIS: i64 = 30_000;
@@ -2411,7 +2414,9 @@ impl PostgresConnectorControlApplication {
             ServerCommandPayload::RotateCredential(_)
             | ServerCommandPayload::CloseStream(_)
             | ServerCommandPayload::DeliverAgentProvisioning(_)
-            | ServerCommandPayload::RevokeAgentProvisioning(_) => None,
+            | ServerCommandPayload::RevokeAgentProvisioning(_)
+            | ServerCommandPayload::PrepareAgentRouteRecipient(_)
+            | ServerCommandPayload::DeliverAgentRouteBootstrap(_) => None,
         };
         if !acknowledgement_write.advanced() {
             session
@@ -2472,6 +2477,589 @@ impl PostgresConnectorControlApplication {
         Ok(())
     }
 
+    async fn record_agent_route_recipient_ready_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        ready: ParsedAgentRouteRecipientReady,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        let fence = ready.connector_fence;
+        ensure_peer_fence(peer, fence)?;
+        let now = self.now()?;
+        let mut session = self
+            .store
+            .begin_tenant(fence.tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let connector = self
+            .load_authorized_connector(session.connection(), peer, fence, now)
+            .await?;
+        let resolved_fence = resolve_fence(&connector, fence)?;
+        connector
+            .validate_fence(&resolved_fence, now)
+            .map_err(|_| ConnectorControlApplicationError::StaleFence)?;
+
+        let row = sqlx::query(
+            "SELECT b.owner_identity_id, b.owner_device_id, b.installation_id, b.binding_id,
+                    b.agent_control_device_id, b.owner_signed_intent, b.expires_at_ms,
+                    b.state AS bootstrap_state, b.recipient_id, b.recipient_capsule_digest,
+                    b.opaque_recipient_capsule, o.operation_id, o.command_sequence,
+                    o.command_payload_digest, o.encoded_command_digest, o.state AS outbox_state,
+                    o.result_digest
+               FROM agent.agent_route_bootstraps AS b
+               JOIN agent.agent_route_bootstrap_outbox AS o
+                 ON o.tenant_id=b.tenant_id AND o.bootstrap_id=b.bootstrap_id
+              WHERE b.tenant_id=$1 AND b.bootstrap_id=$2 AND b.connector_id=$3
+                AND o.command_kind='prepare_recipient'
+              FOR UPDATE OF b, o",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(ready.bootstrap_id))
+        .bind(Uuid::from(fence.connector_id))
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?
+        .ok_or(ConnectorControlApplicationError::NotFound)?;
+        let installation_id = InstallationId::try_from(
+            row.try_get::<Uuid, _>("installation_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let binding_id = BindingId::try_from(
+            row.try_get::<Uuid, _>("binding_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let agent_control_device_id = AgentDeviceId::try_from(
+            row.try_get::<Uuid, _>("agent_control_device_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let owner_identity_id: IdentityId = row
+            .try_get::<String, _>("owner_identity_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .parse()
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let owner_device_id = DeviceId::try_from(
+            row.try_get::<Uuid, _>("owner_device_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let expires_at = row
+            .try_get::<i64, _>("expires_at_ms")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let command_sequence = u64::try_from(
+            row.try_get::<i64, _>("command_sequence")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_payload = digest_vec(&row, "command_payload_digest")?;
+        let stored_encoded = digest_vec(&row, "encoded_command_digest")?;
+        let stored_operation = RequestId::try_from(
+            row.try_get::<Uuid, _>("operation_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_intent: Vec<u8> = row
+            .try_get("owner_signed_intent")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        if expires_at <= now
+            || ready.installation_id != installation_id
+            || ready.binding_id != binding_id
+            || ready.agent_control_device_id != agent_control_device_id
+            || ready.expires_at_millis != expires_at
+            || ready.command_sequence != command_sequence
+            || ready.command_payload_digest != stored_payload
+            || ready.encoded_command_digest != stored_encoded
+            || stored_operation.as_uuid() != ready.bootstrap_id.as_uuid()
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let actual_capsule_digest = Sha256Digest::from_bytes(
+            *WireSha256Digest::hash_domain(
+                b"dirextalk.agent-route-recipient-capsule.v1\0",
+                &ready.opaque_recipient_capsule,
+            )
+            .as_bytes(),
+        );
+        if actual_capsule_digest != ready.recipient_capsule_digest {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let target = CommandLogRepository::new()
+            .command_by_sequence(
+                session.connection(),
+                fence.tenant_id,
+                fence.connector_id,
+                command_sequence,
+            )
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::StaleFence)?;
+        let decoded = self.decode_persisted_command(&target)?;
+        let ServerCommandPayload::PrepareAgentRouteRecipient(command) = decoded.payload() else {
+            return Err(ConnectorControlApplicationError::Conflict);
+        };
+        if command.bootstrap_id != ready.bootstrap_id
+            || command.tenant_id != fence.tenant_id
+            || command.installation_id != installation_id
+            || command.binding_id != binding_id
+            || command.agent_control_device_id != agent_control_device_id
+            || command.owner_identity_id != owner_identity_id
+            || command.owner_device_id != owner_device_id
+            || command.owner_signed_intent.as_slice() != stored_intent.as_slice()
+            || command.expires_at_millis != expires_at
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let expected_result = route_bootstrap_recipient_ready_result_digest(
+            ready.bootstrap_id,
+            fence.tenant_id,
+            installation_id,
+            binding_id,
+            agent_control_device_id,
+            ready.recipient_id,
+            command_sequence,
+            ready.recipient_capsule_digest,
+            expires_at,
+        )?;
+        if expected_result != ready.result_digest {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let bootstrap_state: String = row
+            .try_get("bootstrap_state")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let outbox_state: String = row
+            .try_get("outbox_state")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        if bootstrap_state == "recipient_ready" && outbox_state == "acknowledged" {
+            let stored_recipient = row
+                .try_get::<Option<Uuid>, _>("recipient_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?
+                .and_then(|value| AgentRouteRecipientId::try_from(value).ok());
+            let stored_capsule = optional_digest_vec(&row, "recipient_capsule_digest")?;
+            let stored_opaque = row
+                .try_get::<Option<Vec<u8>>, _>("opaque_recipient_capsule")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            if stored_recipient != Some(ready.recipient_id)
+                || stored_capsule != Some(ready.recipient_capsule_digest)
+                || stored_opaque.as_deref() != Some(ready.opaque_recipient_capsule.as_slice())
+                || row
+                    .try_get::<Option<Vec<u8>>, _>("result_digest")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?
+                    .as_deref()
+                    != Some(ready.result_digest.as_bytes().as_slice())
+            {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+            session
+                .commit()
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            return Ok(());
+        }
+        if bootstrap_state != "pending_recipient"
+            || !matches!(outbox_state.as_str(), "pending" | "dispatched")
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        CommandLogRepository::new()
+            .acknowledge_command(
+                session.connection(),
+                fence.tenant_id,
+                fence.connector_id,
+                fence.connector_generation,
+                command_sequence,
+                stored_payload,
+                stored_encoded,
+                now,
+            )
+            .await
+            .map_err(persistence_error)?;
+        let updated = sqlx::query(
+            "UPDATE agent.agent_route_bootstraps
+                SET state='recipient_ready', recipient_id=$3,
+                    recipient_capsule_digest=$4, opaque_recipient_capsule=$5,
+                    updated_at_ms=$6
+              WHERE tenant_id=$1 AND bootstrap_id=$2 AND state='pending_recipient'",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(ready.bootstrap_id))
+        .bind(Uuid::from(ready.recipient_id))
+        .bind(ready.recipient_capsule_digest.as_bytes().as_slice())
+        .bind(&ready.opaque_recipient_capsule)
+        .bind(now)
+        .execute(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if updated.rows_affected() != 1 {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let outbox_updated = sqlx::query(
+            "UPDATE agent.agent_route_bootstrap_outbox
+                SET state='acknowledged', result_digest=$3, resolved_at_ms=$4
+              WHERE tenant_id=$1 AND bootstrap_id=$2 AND command_kind='prepare_recipient'
+                AND state IN ('pending','dispatched')",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(ready.bootstrap_id))
+        .bind(ready.result_digest.as_bytes().as_slice())
+        .bind(now)
+        .execute(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if outbox_updated.rows_affected() != 1 {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)
+    }
+
+    async fn complete_agent_route_bootstrap_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        installed: ParsedAgentRouteBootstrapInstalled,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        self.resolve_agent_route_bootstrap_terminal(
+            peer,
+            RouteBootstrapTerminalResolution::Installed(installed),
+        )
+        .await
+    }
+
+    async fn reject_agent_route_bootstrap_operation(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        rejected: ParsedAgentRouteBootstrapRejected,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        self.resolve_agent_route_bootstrap_terminal(
+            peer,
+            RouteBootstrapTerminalResolution::Rejected(rejected),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn resolve_agent_route_bootstrap_terminal(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        resolution: RouteBootstrapTerminalResolution,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        let fence = resolution.fence();
+        ensure_peer_fence(peer, fence)?;
+        let now = self.now()?;
+        let mut session = self
+            .store
+            .begin_tenant(fence.tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let connector = self
+            .load_authorized_connector(session.connection(), peer, fence, now)
+            .await?;
+        let resolved_fence = resolve_fence(&connector, fence)?;
+        connector
+            .validate_fence(&resolved_fence, now)
+            .map_err(|_| ConnectorControlApplicationError::StaleFence)?;
+        let row = sqlx::query(
+            "SELECT b.owner_identity_id, b.owner_device_id, b.installation_id, b.binding_id,
+                    b.agent_control_device_id, b.expires_at_ms, b.state AS bootstrap_state,
+                    b.recipient_id, b.route_id, b.bootstrap_capsule_digest,
+                    b.opaque_sealed_bootstrap, b.route_fence, o.operation_id,
+                    o.command_sequence, o.command_payload_digest, o.encoded_command_digest,
+                    o.state AS outbox_state, o.result_digest, o.rejection_code
+               FROM agent.agent_route_bootstraps AS b
+               JOIN agent.agent_route_bootstrap_outbox AS o
+                 ON o.tenant_id=b.tenant_id AND o.bootstrap_id=b.bootstrap_id
+              WHERE b.tenant_id=$1 AND b.bootstrap_id=$2 AND b.delivery_id=$3
+                AND b.connector_id=$4 AND o.delivery_id=$3
+                AND o.command_kind='deliver_bootstrap'
+              FOR UPDATE OF b, o",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(resolution.bootstrap_id()))
+        .bind(Uuid::from(resolution.delivery_id()))
+        .bind(Uuid::from(fence.connector_id))
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?
+        .ok_or(ConnectorControlApplicationError::NotFound)?;
+        let installation_id = InstallationId::try_from(
+            row.try_get::<Uuid, _>("installation_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let binding_id = BindingId::try_from(
+            row.try_get::<Uuid, _>("binding_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let agent_control_device_id = AgentDeviceId::try_from(
+            row.try_get::<Uuid, _>("agent_control_device_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let owner_identity_id: IdentityId = row
+            .try_get::<String, _>("owner_identity_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .parse()
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let owner_device_id = DeviceId::try_from(
+            row.try_get::<Uuid, _>("owner_device_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let recipient_id = row
+            .try_get::<Option<Uuid>, _>("recipient_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .ok_or(ConnectorControlApplicationError::Internal)
+            .and_then(|value| {
+                AgentRouteRecipientId::try_from(value)
+                    .map_err(|_| ConnectorControlApplicationError::Internal)
+            })?;
+        let route_id = row
+            .try_get::<Option<Uuid>, _>("route_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .ok_or(ConnectorControlApplicationError::Internal)
+            .and_then(|value| {
+                ConversationId::try_from(value).map_err(|_| ConnectorControlApplicationError::Internal)
+            })?;
+        let capsule_digest = optional_digest_vec(&row, "bootstrap_capsule_digest")?
+            .ok_or(ConnectorControlApplicationError::Internal)?;
+        let sealed_bootstrap = row
+            .try_get::<Option<Vec<u8>>, _>("opaque_sealed_bootstrap")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .ok_or(ConnectorControlApplicationError::Internal)?;
+        let stored_route_fence = optional_bytes32(&row, "route_fence")?;
+        let expires_at = row
+            .try_get::<i64, _>("expires_at_ms")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let command_sequence = u64::try_from(
+            row.try_get::<i64, _>("command_sequence")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_payload = digest_vec(&row, "command_payload_digest")?;
+        let stored_encoded = digest_vec(&row, "encoded_command_digest")?;
+        let stored_operation = RequestId::try_from(
+            row.try_get::<Uuid, _>("operation_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        if expires_at <= now
+            || resolution.installation_id() != installation_id
+            || resolution.binding_id() != binding_id
+            || resolution.agent_control_device_id() != agent_control_device_id
+            || resolution.recipient_id() != recipient_id
+            || resolution.route_id() != route_id
+            || resolution.capsule_digest() != capsule_digest
+            || resolution.command_sequence() != command_sequence
+            || resolution.command_payload_digest() != stored_payload
+            || resolution.encoded_command_digest() != stored_encoded
+            || stored_operation.as_uuid() != resolution.delivery_id().as_uuid()
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let target = CommandLogRepository::new()
+            .command_by_sequence(
+                session.connection(),
+                fence.tenant_id,
+                fence.connector_id,
+                command_sequence,
+            )
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::StaleFence)?;
+        let decoded = self.decode_persisted_command(&target)?;
+        let ServerCommandPayload::DeliverAgentRouteBootstrap(command) = decoded.payload() else {
+            return Err(ConnectorControlApplicationError::Conflict);
+        };
+        if command.bootstrap_id != resolution.bootstrap_id()
+            || command.delivery_id != resolution.delivery_id()
+            || command.route_id != route_id
+            || command.recipient_id != recipient_id
+            || command.capsule_digest != capsule_digest
+            || command.opaque_sealed_bootstrap.as_slice() != sealed_bootstrap.as_slice()
+            || command.expires_at_millis != expires_at
+            || command.installation_id != installation_id
+            || command.binding_id != binding_id
+            || command.agent_control_device_id != agent_control_device_id
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        resolution.validate_result_digest(
+            installation_id,
+            binding_id,
+            agent_control_device_id,
+            recipient_id,
+            command_sequence,
+        )?;
+        let bootstrap_state: String = row
+            .try_get("bootstrap_state")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let outbox_state: String = row
+            .try_get("outbox_state")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let terminal_state = resolution.bootstrap_state();
+        let terminal_outbox_state = resolution.outbox_state();
+        if bootstrap_state == terminal_state && outbox_state == terminal_outbox_state {
+            let stored_result = optional_digest_vec(&row, "result_digest")?;
+            let stored_rejection: Option<String> = row
+                .try_get("rejection_code")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            if stored_result != Some(resolution.result_digest())
+                || stored_rejection.as_deref() != resolution.rejection_code()
+                || stored_route_fence != resolution.route_fence()
+            {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+            if let Some(route_fence) = resolution.route_fence() {
+                let head = sqlx::query(
+                    "SELECT route_id, route_fence, capsule_digest
+                       FROM agent.agent_route_binding_heads
+                      WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3
+                        AND installation_id=$4 AND binding_id=$5
+                        AND agent_control_device_id=$6
+                      FOR SHARE",
+                )
+                .bind(Uuid::from(fence.tenant_id))
+                .bind(owner_identity_id.to_string())
+                .bind(Uuid::from(owner_device_id))
+                .bind(Uuid::from(installation_id))
+                .bind(Uuid::from(binding_id))
+                .bind(Uuid::from(agent_control_device_id))
+                .fetch_optional(session.connection())
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?
+                .ok_or(ConnectorControlApplicationError::Conflict)?;
+                if head.try_get::<Uuid, _>("route_id").ok() != Some(Uuid::from(route_id))
+                    || optional_bytes32(&head, "route_fence")? != Some(route_fence)
+                    || optional_digest_vec(&head, "capsule_digest")? != Some(capsule_digest)
+                {
+                    return Err(ConnectorControlApplicationError::Conflict);
+                }
+            }
+            session
+                .commit()
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            return Ok(());
+        }
+        if bootstrap_state != "pending_delivery"
+            || !matches!(outbox_state.as_str(), "pending" | "dispatched")
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        CommandLogRepository::new()
+            .acknowledge_command(
+                session.connection(),
+                fence.tenant_id,
+                fence.connector_id,
+                fence.connector_generation,
+                command_sequence,
+                stored_payload,
+                stored_encoded,
+                now,
+            )
+            .await
+            .map_err(persistence_error)?;
+        match resolution.route_fence() {
+            Some(route_fence) => {
+                let updated = sqlx::query(
+                    "UPDATE agent.agent_route_bootstraps
+                        SET state='installed', route_fence=$3, updated_at_ms=$4
+                      WHERE tenant_id=$1 AND bootstrap_id=$2 AND state='pending_delivery'",
+                )
+                .bind(Uuid::from(fence.tenant_id))
+                .bind(Uuid::from(resolution.bootstrap_id()))
+                .bind(route_fence.as_slice())
+                .bind(now)
+                .execute(session.connection())
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                if updated.rows_affected() != 1 {
+                    return Err(ConnectorControlApplicationError::Conflict);
+                }
+                let upserted = sqlx::query(
+                    "INSERT INTO agent.agent_route_binding_heads (
+                         tenant_id, owner_identity_id, owner_device_id, installation_id, binding_id,
+                         agent_control_device_id, bootstrap_id, delivery_id, route_id, route_fence,
+                         capsule_digest, expires_at_ms, installed_at_ms
+                     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                     ON CONFLICT (tenant_id, owner_identity_id, owner_device_id, installation_id,
+                                  binding_id, agent_control_device_id)
+                     DO UPDATE SET bootstrap_id=EXCLUDED.bootstrap_id,
+                                   delivery_id=EXCLUDED.delivery_id,
+                                   route_id=EXCLUDED.route_id,
+                                   route_fence=EXCLUDED.route_fence,
+                                   capsule_digest=EXCLUDED.capsule_digest,
+                                   expires_at_ms=EXCLUDED.expires_at_ms,
+                                   installed_at_ms=EXCLUDED.installed_at_ms
+                     WHERE agent.agent_route_binding_heads.bootstrap_id=EXCLUDED.bootstrap_id
+                        OR agent.agent_route_binding_heads.expires_at_ms <= EXCLUDED.installed_at_ms",
+                )
+                .bind(Uuid::from(fence.tenant_id))
+                .bind(owner_identity_id.to_string())
+                .bind(Uuid::from(owner_device_id))
+                .bind(Uuid::from(installation_id))
+                .bind(Uuid::from(binding_id))
+                .bind(Uuid::from(agent_control_device_id))
+                .bind(Uuid::from(resolution.bootstrap_id()))
+                .bind(Uuid::from(resolution.delivery_id()))
+                .bind(Uuid::from(route_id))
+                .bind(route_fence.as_slice())
+                .bind(capsule_digest.as_bytes().as_slice())
+                .bind(expires_at)
+                .bind(now)
+                .execute(session.connection())
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                if upserted.rows_affected() != 1 {
+                    return Err(ConnectorControlApplicationError::Conflict);
+                }
+            }
+            None => {
+                let updated = sqlx::query(
+                    "UPDATE agent.agent_route_bootstraps
+                        SET state='rejected', rejection_code=$3, updated_at_ms=$4
+                      WHERE tenant_id=$1 AND bootstrap_id=$2 AND state='pending_delivery'",
+                )
+                .bind(Uuid::from(fence.tenant_id))
+                .bind(Uuid::from(resolution.bootstrap_id()))
+                .bind(resolution.rejection_code())
+                .bind(now)
+                .execute(session.connection())
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                if updated.rows_affected() != 1 {
+                    return Err(ConnectorControlApplicationError::Conflict);
+                }
+            }
+        }
+        let outbox_updated = sqlx::query(
+            "UPDATE agent.agent_route_bootstrap_outbox
+                SET state=$4, result_digest=$5, rejection_code=$6, resolved_at_ms=$7
+              WHERE tenant_id=$1 AND bootstrap_id=$2 AND delivery_id=$3
+                AND command_kind='deliver_bootstrap' AND state IN ('pending','dispatched')",
+        )
+        .bind(Uuid::from(fence.tenant_id))
+        .bind(Uuid::from(resolution.bootstrap_id()))
+        .bind(Uuid::from(resolution.delivery_id()))
+        .bind(terminal_outbox_state)
+        .bind(resolution.result_digest().as_bytes().as_slice())
+        .bind(resolution.rejection_code())
+        .bind(now)
+        .execute(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if outbox_updated.rows_affected() != 1 {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)
+    }
+
     async fn poll_commands_operation(
         &self,
         peer: AuthenticatedConnectorPeer,
@@ -2528,30 +3116,72 @@ impl PostgresConnectorControlApplication {
             .map_err(persistence_error)?;
         let commands = self.decode_command_batch(batch)?;
         for command in &commands {
-            if let ServerCommandPayload::DeliverAgentProvisioning(delivery) = command.payload() {
-                sqlx::query(
-                    "UPDATE agent.agent_provisioning_deliveries
-                        SET state='dispatched', dispatched_at_ms=COALESCE(dispatched_at_ms,$3)
-                      WHERE tenant_id=$1 AND delivery_id=$2 AND state='pending'",
-                )
-                .bind(Uuid::from(fence.tenant_id()))
-                .bind(Uuid::from(delivery.delivery_id()))
-                .bind(now)
-                .execute(session.connection())
-                .await
-                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
-                sqlx::query(
-                    "UPDATE agent.agent_provisioning_outbox
-                        SET dispatched_at_ms=COALESCE(dispatched_at_ms,$3),
-                            attempt_count=attempt_count+1, next_attempt_at_ms=$3
-                      WHERE tenant_id=$1 AND delivery_id=$2",
-                )
-                .bind(Uuid::from(fence.tenant_id()))
-                .bind(Uuid::from(delivery.delivery_id()))
-                .bind(now)
-                .execute(session.connection())
-                .await
-                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            match command.payload() {
+                ServerCommandPayload::DeliverAgentProvisioning(delivery) => {
+                    sqlx::query(
+                        "UPDATE agent.agent_provisioning_deliveries
+                            SET state='dispatched', dispatched_at_ms=COALESCE(dispatched_at_ms,$3)
+                          WHERE tenant_id=$1 AND delivery_id=$2 AND state='pending'",
+                    )
+                    .bind(Uuid::from(fence.tenant_id()))
+                    .bind(Uuid::from(delivery.delivery_id()))
+                    .bind(now)
+                    .execute(session.connection())
+                    .await
+                    .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                    sqlx::query(
+                        "UPDATE agent.agent_provisioning_outbox
+                            SET dispatched_at_ms=COALESCE(dispatched_at_ms,$3),
+                                attempt_count=attempt_count+1, next_attempt_at_ms=$3
+                          WHERE tenant_id=$1 AND delivery_id=$2",
+                    )
+                    .bind(Uuid::from(fence.tenant_id()))
+                    .bind(Uuid::from(delivery.delivery_id()))
+                    .bind(now)
+                    .execute(session.connection())
+                    .await
+                    .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                }
+                ServerCommandPayload::PrepareAgentRouteRecipient(prepare) => {
+                    sqlx::query(
+                        "UPDATE agent.agent_route_bootstrap_outbox
+                            SET state='dispatched', dispatched_at_ms=COALESCE(dispatched_at_ms,$4)
+                          WHERE tenant_id=$1 AND bootstrap_id=$2
+                            AND command_kind='prepare_recipient' AND command_sequence=$3
+                            AND state='pending'",
+                    )
+                    .bind(Uuid::from(fence.tenant_id()))
+                    .bind(Uuid::from(prepare.bootstrap_id))
+                    .bind(i64::try_from(command.sequence()).map_err(|_| {
+                        ConnectorControlApplicationError::Internal
+                    })?)
+                    .bind(now)
+                    .execute(session.connection())
+                    .await
+                    .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                }
+                ServerCommandPayload::DeliverAgentRouteBootstrap(delivery) => {
+                    sqlx::query(
+                        "UPDATE agent.agent_route_bootstrap_outbox
+                            SET state='dispatched', dispatched_at_ms=COALESCE(dispatched_at_ms,$4)
+                          WHERE tenant_id=$1 AND delivery_id=$2
+                            AND command_kind='deliver_bootstrap' AND command_sequence=$3
+                            AND state='pending'",
+                    )
+                    .bind(Uuid::from(fence.tenant_id()))
+                    .bind(Uuid::from(delivery.delivery_id))
+                    .bind(i64::try_from(command.sequence()).map_err(|_| {
+                        ConnectorControlApplicationError::Internal
+                    })?)
+                    .bind(now)
+                    .execute(session.connection())
+                    .await
+                    .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                }
+                ServerCommandPayload::ApplyConfig(_)
+                | ServerCommandPayload::RotateCredential(_)
+                | ServerCommandPayload::CloseStream(_)
+                | ServerCommandPayload::RevokeAgentProvisioning(_) => {}
             }
         }
         session
@@ -3685,6 +4315,235 @@ impl PostgresConnectorControlApplication {
 }
 
 #[derive(Clone, Debug)]
+enum RouteBootstrapTerminalResolution {
+    Installed(ParsedAgentRouteBootstrapInstalled),
+    Rejected(ParsedAgentRouteBootstrapRejected),
+}
+
+impl RouteBootstrapTerminalResolution {
+    fn fence(&self) -> ParsedLeaseFence {
+        match self {
+            Self::Installed(value) => value.connector_fence,
+            Self::Rejected(value) => value.connector_fence,
+        }
+    }
+
+    fn bootstrap_id(&self) -> AgentRouteBootstrapId {
+        match self {
+            Self::Installed(value) => value.bootstrap_id,
+            Self::Rejected(value) => value.bootstrap_id,
+        }
+    }
+
+    fn delivery_id(&self) -> AgentRouteDeliveryId {
+        match self {
+            Self::Installed(value) => value.delivery_id,
+            Self::Rejected(value) => value.delivery_id,
+        }
+    }
+
+    fn route_id(&self) -> ConversationId {
+        match self {
+            Self::Installed(value) => value.route_id,
+            Self::Rejected(value) => value.route_id,
+        }
+    }
+
+    fn command_sequence(&self) -> u64 {
+        match self {
+            Self::Installed(value) => value.command_sequence,
+            Self::Rejected(value) => value.command_sequence,
+        }
+    }
+
+    fn command_payload_digest(&self) -> Sha256Digest {
+        match self {
+            Self::Installed(value) => value.command_payload_digest,
+            Self::Rejected(value) => value.command_payload_digest,
+        }
+    }
+
+    fn encoded_command_digest(&self) -> Sha256Digest {
+        match self {
+            Self::Installed(value) => value.encoded_command_digest,
+            Self::Rejected(value) => value.encoded_command_digest,
+        }
+    }
+
+    fn installation_id(&self) -> InstallationId {
+        match self {
+            Self::Installed(value) => value.installation_id,
+            Self::Rejected(value) => value.installation_id,
+        }
+    }
+
+    fn binding_id(&self) -> BindingId {
+        match self {
+            Self::Installed(value) => value.binding_id,
+            Self::Rejected(value) => value.binding_id,
+        }
+    }
+
+    fn agent_control_device_id(&self) -> AgentDeviceId {
+        match self {
+            Self::Installed(value) => value.agent_control_device_id,
+            Self::Rejected(value) => value.agent_control_device_id,
+        }
+    }
+
+    fn recipient_id(&self) -> AgentRouteRecipientId {
+        match self {
+            Self::Installed(value) => value.recipient_id,
+            Self::Rejected(value) => value.recipient_id,
+        }
+    }
+
+    fn capsule_digest(&self) -> Sha256Digest {
+        match self {
+            Self::Installed(value) => value.capsule_digest,
+            Self::Rejected(value) => value.capsule_digest,
+        }
+    }
+
+    fn route_fence(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Installed(value) => Some(value.route_fence),
+            Self::Rejected(_) => None,
+        }
+    }
+
+    fn result_digest(&self) -> Sha256Digest {
+        match self {
+            Self::Installed(value) => value.result_digest,
+            Self::Rejected(value) => value.result_digest,
+        }
+    }
+
+    fn result_timestamp(&self) -> i64 {
+        match self {
+            Self::Installed(value) => value.installed_at_millis,
+            Self::Rejected(value) => value.rejected_at_millis,
+        }
+    }
+
+    fn bootstrap_state(&self) -> &'static str {
+        match self {
+            Self::Installed(_) => "installed",
+            Self::Rejected(_) => "rejected",
+        }
+    }
+
+    fn outbox_state(&self) -> &'static str {
+        match self {
+            Self::Installed(_) => "acknowledged",
+            Self::Rejected(_) => "rejected",
+        }
+    }
+
+    fn rejection_code(&self) -> Option<&str> {
+        match self {
+            Self::Installed(_) => None,
+            Self::Rejected(value) => Some(&value.stable_error_code),
+        }
+    }
+
+    fn validate_result_digest(
+        &self,
+        installation_id: InstallationId,
+        binding_id: BindingId,
+        agent_control_device_id: AgentDeviceId,
+        recipient_id: AgentRouteRecipientId,
+        command_sequence: u64,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        let sequence = command_sequence.to_be_bytes();
+        let timestamp = u64::try_from(self.result_timestamp())
+            .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?
+            .to_be_bytes();
+        let expected = match self {
+            Self::Installed(value) => provisioning_commit(
+                b"dirextalk.agent-route-bootstrap-installed.v1",
+                &[
+                    Uuid::from(value.bootstrap_id).as_bytes(),
+                    Uuid::from(value.delivery_id).as_bytes(),
+                    Uuid::from(value.route_id).as_bytes(),
+                    Uuid::from(installation_id).as_bytes(),
+                    Uuid::from(binding_id).as_bytes(),
+                    Uuid::from(agent_control_device_id).as_bytes(),
+                    Uuid::from(recipient_id).as_bytes(),
+                    &sequence,
+                    &value.capsule_digest.as_bytes(),
+                    &value.route_fence,
+                    &timestamp,
+                ],
+            ),
+            Self::Rejected(value) => {
+                if !valid_route_bootstrap_rejection(&value.stable_error_code) {
+                    return Err(ConnectorControlApplicationError::InvalidRequest);
+                }
+                provisioning_commit(
+                    b"dirextalk.agent-route-bootstrap-rejected.v1",
+                    &[
+                        Uuid::from(value.bootstrap_id).as_bytes(),
+                        Uuid::from(value.delivery_id).as_bytes(),
+                        Uuid::from(value.route_id).as_bytes(),
+                        Uuid::from(installation_id).as_bytes(),
+                        Uuid::from(binding_id).as_bytes(),
+                        Uuid::from(agent_control_device_id).as_bytes(),
+                        Uuid::from(recipient_id).as_bytes(),
+                        &sequence,
+                        &value.capsule_digest.as_bytes(),
+                        value.stable_error_code.as_bytes(),
+                        &timestamp,
+                    ],
+                )
+            }
+        };
+        if expected != self.result_digest() {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        Ok(())
+    }
+}
+
+fn route_bootstrap_recipient_ready_result_digest(
+    bootstrap_id: AgentRouteBootstrapId,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    recipient_id: AgentRouteRecipientId,
+    command_sequence: u64,
+    recipient_capsule_digest: Sha256Digest,
+    expires_at_millis: i64,
+) -> Result<Sha256Digest, ConnectorControlApplicationError> {
+    let sequence = command_sequence.to_be_bytes();
+    let expiry = u64::try_from(expires_at_millis)
+        .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?
+        .to_be_bytes();
+    Ok(provisioning_commit(
+        b"dirextalk.agent-route-recipient-ready.v1",
+        &[
+            Uuid::from(bootstrap_id).as_bytes(),
+            Uuid::from(tenant_id).as_bytes(),
+            Uuid::from(installation_id).as_bytes(),
+            Uuid::from(binding_id).as_bytes(),
+            Uuid::from(agent_control_device_id).as_bytes(),
+            Uuid::from(recipient_id).as_bytes(),
+            &sequence,
+            &recipient_capsule_digest.as_bytes(),
+            &expiry,
+        ],
+    ))
+}
+
+fn valid_route_bootstrap_rejection(value: &str) -> bool {
+    matches!(
+        value,
+        "INVALID_CAPSULE" | "EXPIRED" | "CONFLICT" | "LOCAL_UNAVAILABLE"
+    )
+}
+
+#[derive(Clone, Debug)]
 enum ProvisioningResolution {
     Installed(ParsedAgentProvisioningInstalled),
     Rejected(ParsedAgentProvisioningRejected),
@@ -3871,6 +4730,38 @@ fn digest_vec(
         .try_into()
         .map_err(|_| ConnectorControlApplicationError::Internal)?;
     Ok(Sha256Digest::from_bytes(bytes))
+}
+
+fn optional_digest_vec(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<Option<Sha256Digest>, ConnectorControlApplicationError> {
+    let Some(value) = row
+        .try_get::<Option<Vec<u8>>, _>(field)
+        .map_err(|_| ConnectorControlApplicationError::Internal)?
+    else {
+        return Ok(None);
+    };
+    let bytes: [u8; 32] = value
+        .try_into()
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+    Ok(Some(Sha256Digest::from_bytes(bytes)))
+}
+
+fn optional_bytes32(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<Option<[u8; 32]>, ConnectorControlApplicationError> {
+    let Some(value) = row
+        .try_get::<Option<Vec<u8>>, _>(field)
+        .map_err(|_| ConnectorControlApplicationError::Internal)?
+    else {
+        return Ok(None);
+    };
+    value
+        .try_into()
+        .map(Some)
+        .map_err(|_| ConnectorControlApplicationError::Internal)
 }
 
 fn positive_revision(value: i64) -> Result<Revision, ConnectorControlApplicationError> {
@@ -4107,6 +4998,30 @@ impl ConnectorControlApplication for PostgresConnectorControlApplication {
         rejected: ParsedAgentProvisioningRejected,
     ) -> ApplicationFuture<'_, ()> {
         Box::pin(self.reject_agent_provisioning_operation(peer, rejected))
+    }
+
+    fn record_agent_route_recipient_ready(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        ready: ParsedAgentRouteRecipientReady,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.record_agent_route_recipient_ready_operation(peer, ready))
+    }
+
+    fn complete_agent_route_bootstrap(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        installed: ParsedAgentRouteBootstrapInstalled,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.complete_agent_route_bootstrap_operation(peer, installed))
+    }
+
+    fn reject_agent_route_bootstrap(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        rejected: ParsedAgentRouteBootstrapRejected,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.reject_agent_route_bootstrap_operation(peer, rejected))
     }
 }
 

@@ -4,6 +4,23 @@
 -- deliberately does not contain MLS state, mailbox descriptors, prompts, or
 -- any decrypted capability material.
 
+ALTER TABLE agent.connector_control_operations
+    DROP CONSTRAINT connector_control_operations_kind_valid,
+    ADD CONSTRAINT connector_control_operations_kind_valid
+        CHECK (operation_kind IN (
+            'enrollment', 'apply_config', 'rotate_credential', 'close_stream',
+            'deliver_agent_provisioning', 'revoke_agent_provisioning',
+            'prepare_agent_route_recipient', 'deliver_agent_route_bootstrap'
+        ));
+ALTER TABLE agent.connector_control_commands
+    DROP CONSTRAINT connector_control_commands_kind_valid,
+    ADD CONSTRAINT connector_control_commands_kind_valid
+        CHECK (command_kind IN (
+            'apply_config', 'rotate_credential', 'close_stream',
+            'deliver_agent_provisioning', 'revoke_agent_provisioning',
+            'prepare_agent_route_recipient', 'deliver_agent_route_bootstrap'
+        ));
+
 CREATE TABLE agent.agent_route_bootstraps (
     tenant_id uuid NOT NULL,
     bootstrap_id uuid NOT NULL,
@@ -151,10 +168,17 @@ CREATE TABLE agent.agent_route_bootstrap_outbox (
     bootstrap_id uuid NOT NULL,
     delivery_id uuid,
     connector_id uuid NOT NULL,
+    operation_id uuid NOT NULL,
+    command_sequence bigint NOT NULL,
+    command_payload_digest bytea NOT NULL,
+    encoded_command_digest bytea NOT NULL,
     command_kind text NOT NULL,
     payload_digest bytea NOT NULL,
     opaque_payload bytea NOT NULL,
     state text NOT NULL,
+    result_digest bytea,
+    resolved_at_ms bigint,
+    rejection_code text,
     created_at_ms bigint NOT NULL,
     dispatched_at_ms bigint,
     PRIMARY KEY (tenant_id, outbox_id),
@@ -168,14 +192,30 @@ CREATE TABLE agent.agent_route_bootstrap_outbox (
         AND system.is_uuid_v7(bootstrap_id)
         AND (delivery_id IS NULL OR system.is_uuid_v7(delivery_id))
         AND system.is_uuid_v7(connector_id)
+        AND system.is_uuid_v7(operation_id)
     ),
     CONSTRAINT agent_route_bootstrap_outbox_values_valid CHECK (
         command_kind IN ('prepare_recipient', 'deliver_bootstrap')
+        AND command_sequence BETWEEN 1 AND 9007199254740991
+        AND octet_length(command_payload_digest) = 32
+        AND octet_length(encoded_command_digest) = 32
         AND octet_length(payload_digest) = 32
         AND octet_length(opaque_payload) BETWEEN 1 AND 196608
-        AND state IN ('pending', 'dispatched', 'cancelled')
+        AND state IN ('pending', 'dispatched', 'acknowledged', 'rejected', 'cancelled')
         AND created_at_ms BETWEEN 0 AND 253402300799999
         AND (dispatched_at_ms IS NULL OR dispatched_at_ms BETWEEN created_at_ms AND 253402300799999)
+        AND (
+            (state IN ('pending', 'dispatched', 'cancelled')
+             AND result_digest IS NULL AND resolved_at_ms IS NULL AND rejection_code IS NULL)
+            OR (state = 'acknowledged'
+                AND octet_length(result_digest) = 32
+                AND resolved_at_ms BETWEEN created_at_ms AND 253402300799999
+                AND rejection_code IS NULL)
+            OR (state = 'rejected'
+                AND octet_length(result_digest) = 32
+                AND resolved_at_ms BETWEEN created_at_ms AND 253402300799999
+                AND rejection_code ~ '^[A-Z][A-Z0-9_]{2,63}$')
+        )
         AND ((command_kind = 'prepare_recipient' AND delivery_id IS NULL)
           OR (command_kind = 'deliver_bootstrap' AND delivery_id IS NOT NULL))
     )

@@ -2748,7 +2748,7 @@ fn parse_agent_route_bootstrap_begin(
         3,
     )?;
     let binding = map_value(&request, 1)?.clone();
-    let fields = exact_map(binding.clone(), 9)?;
+    let fields = exact_map(binding.clone(), 10)?;
     expect_version(&fields)?;
     let binding_digest = digest(map_value(&request, 2)?)?;
     if binding_digest != binding_hash(crate::AGENT_ROUTE_BOOTSTRAP_BEGIN_BINDING_DOMAIN, &binding)?
@@ -2764,6 +2764,7 @@ fn parse_agent_route_bootstrap_begin(
         owner_identity_id: text_id(&fields, 7)?,
         owner_device_id: text_id(&fields, 8)?,
         expires_at: utc(&fields, 9)?,
+        owner_signed_intent: bytes(map_value(&fields, 10)?)?.to_vec(),
         binding_digest,
         owner_signature: Ed25519Signature::from_bytes(bytes_array(map_value(&request, 3)?)?),
     })

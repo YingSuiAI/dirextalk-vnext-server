@@ -1526,6 +1526,8 @@ fn command_kind(payload: &ServerCommandPayload) -> &'static str {
         ServerCommandPayload::CloseStream(_) => "close_stream",
         ServerCommandPayload::DeliverAgentProvisioning(_) => "deliver_agent_provisioning",
         ServerCommandPayload::RevokeAgentProvisioning(_) => "revoke_agent_provisioning",
+        ServerCommandPayload::PrepareAgentRouteRecipient(_) => "prepare_agent_route_recipient",
+        ServerCommandPayload::DeliverAgentRouteBootstrap(_) => "deliver_agent_route_bootstrap",
     }
 }
 

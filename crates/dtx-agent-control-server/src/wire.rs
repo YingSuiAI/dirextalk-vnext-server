@@ -11,6 +11,7 @@ use dtx_connect_registry::{
     AdapterKind, ConnectorFence, ConnectorLease, HeartbeatAck, LeaseStatus,
 };
 use dtx_domain::{
+    AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId,
     ArtifactId, BindingId, BootId, ConnectorCredentialId, ConnectorId, ConversationId,
     Ed25519PublicKey, EventId, HostId, InstallationId, LeaseId, RequestId, Revision, RunId,
     RunLeaseId, TenantId,
@@ -23,6 +24,7 @@ const MIN_HEARTBEAT_INTERVAL_MILLIS: u32 = 1_000;
 const MAX_HEARTBEAT_INTERVAL_MILLIS: u32 = 60_000;
 const MAX_HEARTBEAT_TTL_MILLIS: u32 = 300_000;
 const MAX_CONCURRENT_RUNS: u32 = 65_535;
+const MAX_AGENT_ROUTE_CAPSULE_BYTES: usize = 196_608;
 
 /// Sanitized category for a rejected protobuf field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +280,81 @@ pub struct ParsedAgentProvisioningRejected {
     pub result_digest: Sha256Digest,
 }
 
+/// Exact opaque recipient result for one durable RouteBootstrap prepare command.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ParsedAgentRouteRecipientReady {
+    pub connector_fence: ParsedLeaseFence,
+    pub bootstrap_id: AgentRouteBootstrapId,
+    pub command_sequence: u64,
+    pub command_payload_digest: Sha256Digest,
+    pub encoded_command_digest: Sha256Digest,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub agent_control_device_id: AgentDeviceId,
+    pub recipient_id: AgentRouteRecipientId,
+    pub recipient_capsule_digest: Sha256Digest,
+    pub opaque_recipient_capsule: Vec<u8>,
+    pub expires_at_millis: i64,
+    pub result_digest: Sha256Digest,
+}
+
+impl fmt::Debug for ParsedAgentRouteRecipientReady {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParsedAgentRouteRecipientReady")
+            .field("bootstrap_id", &self.bootstrap_id)
+            .field("command_sequence", &self.command_sequence)
+            .field("installation_id", &self.installation_id)
+            .field("binding_id", &self.binding_id)
+            .field("agent_control_device_id", &self.agent_control_device_id)
+            .field("recipient_id", &self.recipient_id)
+            .field("recipient_capsule_digest", &self.recipient_capsule_digest)
+            .field("opaque_recipient_capsule", &"[REDACTED]")
+            .field("expires_at_millis", &self.expires_at_millis)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact terminal success for one durable RouteBootstrap delivery command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedAgentRouteBootstrapInstalled {
+    pub connector_fence: ParsedLeaseFence,
+    pub bootstrap_id: AgentRouteBootstrapId,
+    pub delivery_id: AgentRouteDeliveryId,
+    pub route_id: ConversationId,
+    pub command_sequence: u64,
+    pub command_payload_digest: Sha256Digest,
+    pub encoded_command_digest: Sha256Digest,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub agent_control_device_id: AgentDeviceId,
+    pub recipient_id: AgentRouteRecipientId,
+    pub capsule_digest: Sha256Digest,
+    pub route_fence: [u8; 32],
+    pub installed_at_millis: i64,
+    pub result_digest: Sha256Digest,
+}
+
+/// Exact category-only terminal refusal for one RouteBootstrap delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedAgentRouteBootstrapRejected {
+    pub connector_fence: ParsedLeaseFence,
+    pub bootstrap_id: AgentRouteBootstrapId,
+    pub delivery_id: AgentRouteDeliveryId,
+    pub route_id: ConversationId,
+    pub command_sequence: u64,
+    pub command_payload_digest: Sha256Digest,
+    pub encoded_command_digest: Sha256Digest,
+    pub installation_id: InstallationId,
+    pub binding_id: BindingId,
+    pub agent_control_device_id: AgentDeviceId,
+    pub recipient_id: AgentRouteRecipientId,
+    pub capsule_digest: Sha256Digest,
+    pub stable_error_code: String,
+    pub rejected_at_millis: i64,
+    pub result_digest: Sha256Digest,
+}
+
 /// Validated first control-stream frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedHello {
@@ -411,6 +488,9 @@ pub enum ParsedClientFrame {
     ProvisioningRecipientAnnouncement(ParsedProvisioningRecipientAnnouncement),
     AgentProvisioningInstalled(ParsedAgentProvisioningInstalled),
     AgentProvisioningRejected(ParsedAgentProvisioningRejected),
+    AgentRouteRecipientReady(ParsedAgentRouteRecipientReady),
+    AgentRouteBootstrapInstalled(ParsedAgentRouteBootstrapInstalled),
+    AgentRouteBootstrapRejected(ParsedAgentRouteBootstrapRejected),
 }
 
 /// Converts an enrollment protobuf message into proof-bound domain input.
@@ -959,6 +1039,13 @@ pub fn parse_client_frame(value: v1::ClientFrame) -> Result<ParsedClientFrame, W
         Kind::AgentProvisioningRejected(frame) => {
             parse_provisioning_rejected(frame).map(ParsedClientFrame::AgentProvisioningRejected)
         }
+        Kind::AgentRouteRecipientReady(frame) => {
+            parse_agent_route_recipient_ready(frame).map(ParsedClientFrame::AgentRouteRecipientReady)
+        }
+        Kind::AgentRouteBootstrapInstalled(frame) => parse_agent_route_bootstrap_installed(frame)
+            .map(ParsedClientFrame::AgentRouteBootstrapInstalled),
+        Kind::AgentRouteBootstrapRejected(frame) => parse_agent_route_bootstrap_rejected(frame)
+            .map(ParsedClientFrame::AgentRouteBootstrapRejected),
     }
 }
 
@@ -1036,6 +1123,112 @@ fn parse_provisioning_rejected(
             "encoded_command_digest",
         )?,
         recipient_key_id: parse_id(&value.recipient_key_id, "recipient_key_id")?,
+        capsule_digest: parse_digest(value.capsule_digest, "capsule_digest")?,
+        stable_error_code: value.stable_error_code,
+        rejected_at_millis: parse_wire_timestamp(value.rejected_at_millis, "rejected_at_millis")?,
+        result_digest: parse_digest(value.result_digest, "result_digest")?,
+    })
+}
+
+fn parse_agent_route_recipient_ready(
+    value: v1::AgentRouteRecipientReady,
+) -> Result<ParsedAgentRouteRecipientReady, WireError> {
+    if value.opaque_recipient_capsule.is_empty()
+        || value.opaque_recipient_capsule.len() > MAX_AGENT_ROUTE_CAPSULE_BYTES
+    {
+        return Err(invalid_value("opaque_recipient_capsule"));
+    }
+    Ok(ParsedAgentRouteRecipientReady {
+        connector_fence: parse_required_lease_fence(value.connector_fence)?,
+        bootstrap_id: parse_id(&value.bootstrap_id, "bootstrap_id")?,
+        command_sequence: positive_safe(value.command_sequence, "command_sequence")?,
+        command_payload_digest: parse_digest(
+            value.command_payload_digest,
+            "command_payload_digest",
+        )?,
+        encoded_command_digest: parse_digest(
+            value.encoded_command_digest,
+            "encoded_command_digest",
+        )?,
+        installation_id: parse_id(&value.installation_id, "installation_id")?,
+        binding_id: parse_id(&value.binding_id, "binding_id")?,
+        agent_control_device_id: parse_id(
+            &value.agent_control_device_id,
+            "agent_control_device_id",
+        )?,
+        recipient_id: parse_id(&value.recipient_id, "recipient_id")?,
+        recipient_capsule_digest: parse_digest(
+            value.recipient_capsule_digest,
+            "recipient_capsule_digest",
+        )?,
+        opaque_recipient_capsule: value.opaque_recipient_capsule,
+        expires_at_millis: parse_wire_timestamp(value.expires_at_millis, "expires_at_millis")?,
+        result_digest: parse_digest(value.result_digest, "result_digest")?,
+    })
+}
+
+fn parse_agent_route_bootstrap_installed(
+    value: v1::AgentRouteBootstrapInstalled,
+) -> Result<ParsedAgentRouteBootstrapInstalled, WireError> {
+    let route_fence = exact_array(value.route_fence, "route_fence")?;
+    if route_fence.iter().all(|byte| *byte == 0) {
+        return Err(invalid_value("route_fence"));
+    }
+    Ok(ParsedAgentRouteBootstrapInstalled {
+        connector_fence: parse_required_lease_fence(value.connector_fence)?,
+        bootstrap_id: parse_id(&value.bootstrap_id, "bootstrap_id")?,
+        delivery_id: parse_id(&value.delivery_id, "delivery_id")?,
+        route_id: parse_id(&value.route_id, "route_id")?,
+        command_sequence: positive_safe(value.command_sequence, "command_sequence")?,
+        command_payload_digest: parse_digest(
+            value.command_payload_digest,
+            "command_payload_digest",
+        )?,
+        encoded_command_digest: parse_digest(
+            value.encoded_command_digest,
+            "encoded_command_digest",
+        )?,
+        installation_id: parse_id(&value.installation_id, "installation_id")?,
+        binding_id: parse_id(&value.binding_id, "binding_id")?,
+        agent_control_device_id: parse_id(
+            &value.agent_control_device_id,
+            "agent_control_device_id",
+        )?,
+        recipient_id: parse_id(&value.recipient_id, "recipient_id")?,
+        capsule_digest: parse_digest(value.capsule_digest, "capsule_digest")?,
+        route_fence,
+        installed_at_millis: parse_wire_timestamp(value.installed_at_millis, "installed_at_millis")?,
+        result_digest: parse_digest(value.result_digest, "result_digest")?,
+    })
+}
+
+fn parse_agent_route_bootstrap_rejected(
+    value: v1::AgentRouteBootstrapRejected,
+) -> Result<ParsedAgentRouteBootstrapRejected, WireError> {
+    if !valid_upper_stable_code(&value.stable_error_code) {
+        return Err(invalid_value("stable_error_code"));
+    }
+    Ok(ParsedAgentRouteBootstrapRejected {
+        connector_fence: parse_required_lease_fence(value.connector_fence)?,
+        bootstrap_id: parse_id(&value.bootstrap_id, "bootstrap_id")?,
+        delivery_id: parse_id(&value.delivery_id, "delivery_id")?,
+        route_id: parse_id(&value.route_id, "route_id")?,
+        command_sequence: positive_safe(value.command_sequence, "command_sequence")?,
+        command_payload_digest: parse_digest(
+            value.command_payload_digest,
+            "command_payload_digest",
+        )?,
+        encoded_command_digest: parse_digest(
+            value.encoded_command_digest,
+            "encoded_command_digest",
+        )?,
+        installation_id: parse_id(&value.installation_id, "installation_id")?,
+        binding_id: parse_id(&value.binding_id, "binding_id")?,
+        agent_control_device_id: parse_id(
+            &value.agent_control_device_id,
+            "agent_control_device_id",
+        )?,
+        recipient_id: parse_id(&value.recipient_id, "recipient_id")?,
         capsule_digest: parse_digest(value.capsule_digest, "capsule_digest")?,
         stable_error_code: value.stable_error_code,
         rejected_at_millis: parse_wire_timestamp(value.rejected_at_millis, "rejected_at_millis")?,

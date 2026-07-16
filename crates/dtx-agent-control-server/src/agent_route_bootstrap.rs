@@ -397,7 +397,7 @@ pub async fn deliver_agent_route_bootstrap(
 }
 
 /// Records a recipient created by an already authenticated Agent-Control peer.
-pub async fn record_agent_route_recipient_ready(
+async fn record_agent_route_recipient_ready(
     store: &PgStore,
     tenant_id: TenantId,
     binding_id: BindingId,
@@ -478,7 +478,7 @@ pub async fn record_agent_route_recipient_ready(
 
 /// Records an authenticated successful install and only then creates or moves
 /// the exact binding head used by AgentRoute Run ingress.
-pub async fn record_agent_route_bootstrap_installed(
+async fn record_agent_route_bootstrap_installed(
     store: &PgStore,
     tenant_id: TenantId,
     binding_id: BindingId,
@@ -586,7 +586,7 @@ pub async fn record_agent_route_bootstrap_installed(
 
 /// Records an authenticated terminal rejection; it deliberately never makes a
 /// binding head eligible for Run ingress.
-pub async fn record_agent_route_bootstrap_rejected(
+async fn record_agent_route_bootstrap_rejected(
     store: &PgStore,
     tenant_id: TenantId,
     binding_id: BindingId,

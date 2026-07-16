@@ -130,6 +130,9 @@ message ClientFrame {
     ProvisioningRecipientAnnouncement provisioning_recipient_announcement = 12;
     AgentProvisioningInstalled agent_provisioning_installed = 13;
     AgentProvisioningRejected agent_provisioning_rejected = 14;
+    AgentRouteRecipientReady agent_route_recipient_ready = 15;
+    AgentRouteBootstrapInstalled agent_route_bootstrap_installed = 16;
+    AgentRouteBootstrapRejected agent_route_bootstrap_rejected = 17;
   }
 }
 
@@ -345,6 +348,68 @@ message AgentProvisioningRejected {
   bytes result_digest = 10; // Exact rejected-result COMMIT defined above.
 }
 
+// Exact result for one durable PrepareAgentRouteRecipient command. The
+// recipient capsule is opaque to the Connector and Agent Control; it is
+// addressed to the Owner device and only native Rust may decrypt it.
+message AgentRouteRecipientReady {
+  LeaseFence connector_fence = 1;
+  string bootstrap_id = 2;
+  uint64 command_sequence = 3;
+  bytes command_payload_digest = 4;
+  bytes encoded_command_digest = 5;
+  string installation_id = 6;
+  string binding_id = 7;
+  string agent_control_device_id = 8;
+  string recipient_id = 9;
+  bytes recipient_capsule_digest = 10;
+  bytes opaque_recipient_capsule = 11;
+  uint64 expires_at_millis = 12;
+  bytes result_digest = 13;
+}
+
+// Terminal success for one durable DeliverAgentRouteBootstrap command. The
+// sidecar emits this only after it has atomically persisted the isolated route
+// engine and binding. route_fence is opaque native state used by later Run
+// admission; it is neither a route secret nor decryptable payload.
+message AgentRouteBootstrapInstalled {
+  LeaseFence connector_fence = 1;
+  string bootstrap_id = 2;
+  string delivery_id = 3;
+  string route_id = 4;
+  uint64 command_sequence = 5;
+  bytes command_payload_digest = 6;
+  bytes encoded_command_digest = 7;
+  string installation_id = 8;
+  string binding_id = 9;
+  string agent_control_device_id = 10;
+  string recipient_id = 11;
+  bytes capsule_digest = 12;
+  bytes route_fence = 13;
+  uint64 installed_at_millis = 14;
+  bytes result_digest = 15;
+}
+
+// Category-only terminal refusal for the same exact delivery. It preserves
+// non-sensitive binding facts and never carries a sidecar error string or
+// capsule plaintext.
+message AgentRouteBootstrapRejected {
+  LeaseFence connector_fence = 1;
+  string bootstrap_id = 2;
+  string delivery_id = 3;
+  string route_id = 4;
+  uint64 command_sequence = 5;
+  bytes command_payload_digest = 6;
+  bytes encoded_command_digest = 7;
+  string installation_id = 8;
+  string binding_id = 9;
+  string agent_control_device_id = 10;
+  string recipient_id = 11;
+  bytes capsule_digest = 12;
+  string stable_error_code = 13;
+  uint64 rejected_at_millis = 14;
+  bytes result_digest = 15;
+}
+
 message Hello {
   string tenant_id = 1; // Canonical lowercase UUIDv7 text.
   string connector_id = 2; // Canonical lowercase UUIDv7 text.
@@ -462,6 +527,8 @@ message DurableCommand {
     CloseStream close_stream = 12;
     DeliverAgentProvisioning deliver_agent_provisioning = 13;
     RevokeAgentProvisioning revoke_agent_provisioning = 14;
+    PrepareAgentRouteRecipient prepare_agent_route_recipient = 15;
+    DeliverAgentRouteBootstrap deliver_agent_route_bootstrap = 16;
   }
 }
 
@@ -487,6 +554,39 @@ message RevokeAgentProvisioning {
   string agent_device_id = 4; // Empty only for installation-wide revocation.
   uint64 revocation_revision = 5;
   uint64 requested_at_millis = 6;
+}
+
+// First phase of an isolated AgentRoute bootstrap. owner_signed_intent is an
+// already-signed opaque native request. The Connector validates only bounded
+// transport shape and immutable IDs before forwarding it to the sidecar; it
+// never verifies, parses, or logs the intent contents.
+message PrepareAgentRouteRecipient {
+  string bootstrap_id = 1;
+  string tenant_id = 2;
+  string installation_id = 3;
+  string binding_id = 4;
+  string agent_control_device_id = 5;
+  string owner_identity_id = 6;
+  string owner_device_id = 7;
+  bytes owner_signed_intent = 8;
+  uint64 expires_at_millis = 9;
+}
+
+// Second phase. The Owner has already created and persisted a separate MLS
+// AgentRoute before uploading this opaque capsule. The Connector validates
+// only exact identifiers, capsule digest, and deadline, then asks the sidecar
+// to import the opaque bytes durably.
+message DeliverAgentRouteBootstrap {
+  string bootstrap_id = 1;
+  string delivery_id = 2;
+  string route_id = 3;
+  string recipient_id = 4;
+  bytes capsule_digest = 5;
+  bytes opaque_sealed_bootstrap = 6;
+  uint64 expires_at_millis = 7;
+  string installation_id = 8;
+  string binding_id = 9;
+  string agent_control_device_id = 10;
 }
 
 enum DesiredConnectorState {

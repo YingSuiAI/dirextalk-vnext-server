@@ -8,6 +8,8 @@ use dtx_domain::{ConnectorId, TenantId};
 use dtx_security::AuthenticatedConnectorPeer;
 
 use crate::wire::{
+    ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteBootstrapRejected,
+    ParsedAgentRouteRecipientReady,
     ParsedAgentProvisioningInstalled, ParsedAgentProvisioningRejected,
     ParsedCommandAcknowledgement, ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat,
     ParsedHello, ParsedProvisioningRecipientAnnouncement, ParsedReady, ParsedRunCheckpoint,
@@ -235,6 +237,36 @@ pub trait ConnectorControlApplication: Send + Sync + 'static {
         &self,
         _peer: AuthenticatedConnectorPeer,
         _rejected: ParsedAgentProvisioningRejected,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    /// Commits one exact opaque RouteBootstrap recipient result after its
+    /// durable Prepare command has been authenticated and acknowledged.
+    fn record_agent_route_recipient_ready(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _ready: ParsedAgentRouteRecipientReady,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    /// Commits one exact terminal RouteBootstrap install and its Run-eligible
+    /// binding head in the same transaction as the durable command ACK.
+    fn complete_agent_route_bootstrap(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _installed: ParsedAgentRouteBootstrapInstalled,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
+
+    /// Commits one exact category-only RouteBootstrap refusal in the same
+    /// transaction as its durable command ACK; it never creates a binding head.
+    fn reject_agent_route_bootstrap(
+        &self,
+        _peer: AuthenticatedConnectorPeer,
+        _rejected: ParsedAgentRouteBootstrapRejected,
     ) -> ApplicationFuture<'_, ()> {
         Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
     }
