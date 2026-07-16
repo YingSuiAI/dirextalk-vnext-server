@@ -28,8 +28,8 @@ use dtx_agent_router::{
     RunRoutingState, resolve_route_plan,
 };
 use dtx_connect_registry::{
-    AdapterKind, BindingSet, BindingState, ConnectorControlHead, ConnectorDesiredState,
-    ConnectorFence, ConnectorLease, ConnectorObservedState,
+    AdapterKind, BindingSet, BindingSetSnapshot, BindingState, ConnectorControlHead,
+    ConnectorDesiredState, ConnectorFence, ConnectorLease, ConnectorObservedState,
 };
 use dtx_domain::{
     AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId,
@@ -561,9 +561,13 @@ fn build_agent_run(
     run_id: RunId,
     binding_set: &dtx_connect_registry::BindingSet,
     now_millis: i64,
+    selected_binding_id: Option<BindingId>,
 ) -> Result<AgentRun, ConnectorControlApplicationError> {
+    let selected_binding_set = selected_binding_id
+        .map(|binding_id| selected_route_binding_set(binding_set.snapshot(), binding_id))
+        .transpose()?;
     let route = resolve_route_plan(
-        binding_set,
+        selected_binding_set.as_ref().unwrap_or(binding_set),
         request.tenant_id,
         request.installation_id,
         request.preferred_connector_id,
@@ -594,6 +598,34 @@ fn build_agent_run(
     )
     .map_err(|_| ConnectorControlApplicationError::InvalidRequest)?;
     AgentRun::create(run_request, route.into_candidates())
+        .map_err(|_| ConnectorControlApplicationError::InvalidRequest)
+}
+
+/// Builds the narrow Binding registry used by one installed AgentRoute head.
+///
+/// AgentRoute bootstrap installation binds an isolated MLS route to one exact
+/// binding/device.  Route planning must therefore never choose a sibling
+/// binding merely because it shares the preferred Connector ID.
+fn selected_route_binding_set(
+    mut snapshot: BindingSetSnapshot,
+    selected_binding_id: BindingId,
+) -> Result<BindingSet, ConnectorControlApplicationError> {
+    let selected = snapshot
+        .bindings
+        .iter()
+        .copied()
+        .find(|binding| binding.binding_id == selected_binding_id)
+        .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
+    snapshot
+        .bindings
+        .retain(|binding| binding.binding_id == selected_binding_id);
+    snapshot
+        .connector_conformance
+        .retain(|connector| connector.connector_id == selected.connector_id);
+    snapshot
+        .routing_policies
+        .retain(|policy| policy.installation_id == selected.installation_id);
+    BindingSet::try_from_snapshot(snapshot)
         .map_err(|_| ConnectorControlApplicationError::InvalidRequest)
 }
 
@@ -936,6 +968,7 @@ impl PostgresConnectorControlApplication {
                     .map_err(|_| ConnectorControlApplicationError::Internal)?,
                 &bindings,
                 authority.evaluated_at_millis,
+                selected_binding_id,
             )?;
             let (disposition, persisted) = repository
                 .create(connection, &run)
@@ -5723,8 +5756,14 @@ fn stable_name(value: &str) -> bool {
 #[cfg(test)]
 mod run_permission_tests {
     use dtx_agent_registry::{AgentConversationPermission, AgentConversationPermissions};
+    use dtx_agent_router::{DispatchMode, resolve_route_plan};
+    use dtx_connect_registry::{
+        AdapterKind, BindingRecordSnapshot, BindingSetSnapshot, BindingState,
+        ConnectorConformanceSnapshot, RoutingPolicy, RoutingPolicySnapshot,
+    };
+    use dtx_domain::{AgentDeviceId, BindingId, ConnectorId, InstallationId, Revision, TenantId};
 
-    use super::permissions_authorize_run;
+    use super::{permissions_authorize_run, selected_route_binding_set};
 
     fn chat_permissions() -> AgentConversationPermissions {
         AgentConversationPermissions::none()
@@ -5770,5 +5809,66 @@ mod run_permission_tests {
             &send_only,
             &["agent.run".to_owned()]
         ));
+    }
+
+    #[test]
+    fn agent_route_selection_uses_the_exact_installed_binding() {
+        let tenant_id = TenantId::new();
+        let installation_id = InstallationId::new();
+        let connector_id = ConnectorId::new();
+        let selected_binding_id = BindingId::new();
+        let revision = Revision::new(2).expect("test revision is valid");
+        let binding_set = selected_route_binding_set(
+            BindingSetSnapshot {
+                tenant_id,
+                connector_conformance: vec![ConnectorConformanceSnapshot {
+                    connector_id,
+                    adapter_kind: AdapterKind::Codex,
+                    registry_revision: Revision::INITIAL,
+                    supports_multi_session: true,
+                    max_concurrency: 2,
+                }],
+                routing_policies: vec![RoutingPolicySnapshot {
+                    installation_id,
+                    policy: RoutingPolicy::OrderedFailover,
+                    revision: Revision::INITIAL,
+                }],
+                bindings: vec![
+                    BindingRecordSnapshot {
+                        binding_id: BindingId::new(),
+                        installation_id,
+                        connector_id,
+                        agent_device_id: AgentDeviceId::new(),
+                        priority: 0,
+                        max_concurrency: 1,
+                        state: BindingState::Enabled,
+                        revision,
+                    },
+                    BindingRecordSnapshot {
+                        binding_id: selected_binding_id,
+                        installation_id,
+                        connector_id,
+                        agent_device_id: AgentDeviceId::new(),
+                        priority: 1,
+                        max_concurrency: 1,
+                        state: BindingState::Enabled,
+                        revision,
+                    },
+                ],
+            },
+            selected_binding_id,
+        )
+        .expect("selected binding produces a valid one-binding route registry");
+
+        let route = resolve_route_plan(
+            &binding_set,
+            tenant_id,
+            installation_id,
+            Some(connector_id),
+            DispatchMode::Single,
+        )
+        .expect("selected binding route is valid");
+        assert_eq!(route.candidates().len(), 1);
+        assert_eq!(route.candidates()[0].binding_id(), selected_binding_id);
     }
 }

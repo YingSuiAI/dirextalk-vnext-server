@@ -1531,6 +1531,20 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     )
     .await?;
     assert_eq!(admitted.0, StatusCode::CREATED);
+    let mut admitted_session = store.begin_tenant(tenant_id).await?;
+    let admitted_binding: Uuid = sqlx::query_scalar(
+        "SELECT candidate.binding_id
+           FROM agent.agent_runs AS run
+           JOIN agent.agent_run_candidates AS candidate
+             ON candidate.tenant_id=run.tenant_id AND candidate.run_id=run.run_id
+          WHERE run.tenant_id=$1 AND run.request_id=$2 AND candidate.candidate_ordinal=0",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(admitted_operation))
+    .fetch_one(admitted_session.connection())
+    .await?;
+    assert_eq!(admitted_binding, Uuid::from(binding_id));
+    admitted_session.rollback().await?;
 
     drop(owner_credential);
     Ok(())
