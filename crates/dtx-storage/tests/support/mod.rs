@@ -373,6 +373,8 @@ impl PostgresHarness {
                 TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.conversation_grant_owner_operations
                 TO dtx_runtime_test;
+             GRANT SELECT, INSERT ON agent.connector_binding_state_owner_operations
+                TO dtx_runtime_test;
 
              GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
              GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA identity TO dtx_identity_runtime;

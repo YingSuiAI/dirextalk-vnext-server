@@ -18,7 +18,8 @@ use axum::{
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_agent_control::ServerCommandPayload;
 use dtx_agent_persistence::{
-    AgentInstallationRepository, AgentPersistenceError, ConversationGrantRepository,
+    AgentDeviceRepository, AgentInstallationRepository, AgentPersistenceError,
+    BindingSetRepository, ConversationGrantRepository,
 };
 use dtx_agent_registry::{
     AgentConversationPermission, AgentConversationPermissions, ConversationGrant,
@@ -26,6 +27,7 @@ use dtx_agent_registry::{
     PrivacyPolicyDigest, TriggerPolicy,
 };
 use dtx_agent_router::DispatchMode;
+use dtx_connect_registry::{BindingError, BindingState, TenantRef};
 use dtx_domain::{
     AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, ApprovalId, BindingId, ConnectorId,
     ConversationId, DeviceId, DeviceSessionId, EventId, GrantId, IdentityId, InstallationId,
@@ -74,6 +76,14 @@ const CONVERSATION_GRANT_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.conversation-agent-grant-signature.v1\0";
 const CONVERSATION_GRANT_REQUEST_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-request.v1\0";
 const CONVERSATION_GRANT_RECEIPT_DOMAIN: &[u8] = b"dirextalk.conversation-agent-grant-receipt.v1\0";
+const CONNECTOR_BINDING_STATE_BINDING_DOMAIN: &[u8] =
+    b"dirextalk.connector-binding-state-command-binding.v1\0";
+const CONNECTOR_BINDING_STATE_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.connector-binding-state-command-signature.v1\0";
+const CONNECTOR_BINDING_STATE_REQUEST_DOMAIN: &[u8] =
+    b"dirextalk.connector-binding-state-command-request.v1\0";
+const CONNECTOR_BINDING_STATE_RECEIPT_DOMAIN: &[u8] =
+    b"dirextalk.connector-binding-state-command-receipt.v1\0";
 const AGENT_ROUTE_RUN_BINDING_DOMAIN: &[u8] = b"dirextalk.agent-route-run-binding.v1\0";
 const AGENT_ROUTE_RUN_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.agent-route-run-signature.v1\0";
 const AGENT_ROUTE_RUN_REQUEST_DOMAIN: &[u8] = b"dirextalk.agent-route-run-request.v1\0";
@@ -89,11 +99,16 @@ const MAX_SMALL_BODY: usize = 16 * 1024;
 const MAX_DELIVERY_BODY: usize = 212_992;
 const MAX_GRANT_PROOF_LIFETIME_MS: i64 = 10 * 60 * 1000;
 const MAX_GRANT_LIFETIME_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+const MAX_BINDING_STATE_PROOF_LIFETIME_MS: i64 = 10 * 60 * 1000;
 
 const CONVERSATION_GRANT_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.conversation-agent-grant.v1+cbor";
 const CONVERSATION_GRANT_RECEIPT_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.conversation-agent-grant-receipt.v1+cbor";
+pub const CONNECTOR_BINDING_STATE_COMMAND_MEDIA_TYPE_V1: &str =
+    "application/vnd.dirextalk.connector-binding-state-command.v1+cbor";
+pub const CONNECTOR_BINDING_STATE_RECEIPT_MEDIA_TYPE_V1: &str =
+    "application/vnd.dirextalk.connector-binding-state-receipt.v1+cbor";
 const AGENT_ROUTE_RUN_MEDIA_TYPE_V1: &str = "application/vnd.dirextalk.agent-route-run.v1+cbor";
 const AGENT_ROUTE_RUN_RECEIPT_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.agent-route-run-receipt.v1+cbor";
@@ -185,6 +200,28 @@ pub struct ConversationGrantOwnerCommand {
     pub owner_signature: Ed25519Signature,
 }
 
+/// Closed state transition permitted on exactly one Owner-owned Connector Binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorBindingStateOwnerAction {
+    Enable,
+    Disable,
+}
+
+/// Device-signed Owner command for one Connector Binding lifecycle revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorBindingStateOwnerCommand {
+    pub action: ConnectorBindingStateOwnerAction,
+    pub operation_id: RequestId,
+    pub tenant_id: TenantId,
+    pub binding_id: BindingId,
+    pub expected_binding_revision: Revision,
+    pub owner_identity_id: IdentityId,
+    pub owner_device_id: DeviceId,
+    pub proof_expires_at: UtcMillis,
+    pub binding_digest: Sha256Digest,
+    pub owner_signature: Ed25519Signature,
+}
+
 /// Device-signed metadata-only ingress for one isolated AgentRoute Run.
 ///
 /// `source_conversation_id` is used solely for Owner/grant authorization and
@@ -244,6 +281,19 @@ pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
         credential: DeviceSessionCredential,
         command: ConnectorLifecycleOwnerCommand,
     ) -> OwnerBackendFuture<'_>;
+    /// Applies one durable, Owner-signed Connector Binding state transition.
+    ///
+    /// A conservative default preserves compatibility for non-PostgreSQL
+    /// backend implementations that have not opted into this public command.
+    fn mutate_connector_binding_state(
+        &self,
+        _credential: DeviceSessionCredential,
+        _command: ConnectorBindingStateOwnerCommand,
+        _exact_body: Vec<u8>,
+        _now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async { Err(AgentProvisioningOwnerError::InvalidRequest) })
+    }
     fn mutate_conversation_grant(
         &self,
         credential: DeviceSessionCredential,
@@ -516,6 +566,37 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                     command.connector_id,
                     &write,
                 )?,
+            })
+        })
+    }
+
+    fn mutate_connector_binding_state(
+        &self,
+        credential: DeviceSessionCredential,
+        command: ConnectorBindingStateOwnerCommand,
+        exact_body: Vec<u8>,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            if command.tenant_id != self.tenant_id {
+                return Err(AgentProvisioningOwnerError::AccessDenied);
+            }
+            let receipt = mutate_connector_binding_state_application(
+                &self.store,
+                &credential,
+                command,
+                exact_body,
+                now,
+            )
+            .await?;
+            Ok(CborOwnerReply {
+                status: if receipt.replayed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                },
+                content_type: CONNECTOR_BINDING_STATE_RECEIPT_MEDIA_TYPE_V1,
+                exact_cbor: receipt.exact_cbor,
             })
         })
     }
@@ -1097,6 +1178,13 @@ struct ConversationGrantOwnerReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct ConnectorBindingStateOwnerReceipt {
+    replayed: bool,
+    action: ConnectorBindingStateOwnerAction,
+    exact_cbor: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct AgentRouteRunOwnerReceipt {
     replayed: bool,
     run_id: RunId,
@@ -1579,6 +1667,188 @@ async fn mutate_private_conversation_grant(
     }
 }
 
+async fn mutate_connector_binding_state_application(
+    store: &PgStore,
+    credential: &DeviceSessionCredential,
+    command: ConnectorBindingStateOwnerCommand,
+    exact_body: Vec<u8>,
+    authenticated_at: UtcMillis,
+) -> Result<ConnectorBindingStateOwnerReceipt, AgentProvisioningOwnerError> {
+    let request_digest =
+        Sha256Digest::hash_domain(CONNECTOR_BINDING_STATE_REQUEST_DOMAIN, &exact_body);
+    let mut session = store
+        .begin_tenant(command.tenant_id)
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let result = mutate_connector_binding_state_in_transaction(
+        session.connection(),
+        credential,
+        &command,
+        request_digest,
+        authenticated_at,
+    )
+    .await;
+    match result {
+        Ok(receipt) => {
+            session
+                .commit()
+                .await
+                .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+            Ok(receipt)
+        }
+        Err(error) => {
+            let _ = session.rollback().await;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn mutate_connector_binding_state_in_transaction(
+    connection: &mut sqlx::PgConnection,
+    credential: &DeviceSessionCredential,
+    command: &ConnectorBindingStateOwnerCommand,
+    request_digest: Sha256Digest,
+    authenticated_at: UtcMillis,
+) -> Result<ConnectorBindingStateOwnerReceipt, AgentProvisioningOwnerError> {
+    let owner = DeviceSessionRepository::authenticate_with_signing_key_in_transaction(
+        connection,
+        credential,
+        authenticated_at,
+    )
+    .await
+    .map_err(map_conversation_grant_identity_error)?;
+    let owner_session = owner.session();
+    if owner_session.identity_id() != command.owner_identity_id
+        || owner_session.device_id() != command.owner_device_id
+    {
+        return Err(AgentProvisioningOwnerError::AccessDenied);
+    }
+    let signature = Signature::from_bytes(command.owner_signature.as_bytes());
+    let verifying_key = VerifyingKey::from_bytes(owner.signing_key().as_bytes())
+        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+    verifying_key
+        .verify_strict(
+            &connector_binding_state_signature_input(command.binding_digest),
+            &signature,
+        )
+        .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(connector_binding_state_operation_lock_key(
+            command.operation_id,
+        ))
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if let Some(receipt) = load_connector_binding_state_operation(
+        connection,
+        command.tenant_id,
+        command.operation_id,
+        command.action,
+        request_digest,
+    )
+    .await?
+    {
+        return Ok(receipt);
+    }
+
+    let binding_ref = TenantRef::new(command.tenant_id, command.binding_id);
+    let repository = BindingSetRepository::new();
+    let mut bindings = repository
+        .load(connection, command.tenant_id)
+        .await
+        .map_err(map_conversation_grant_persistence_error)?;
+    let binding = *bindings
+        .binding(binding_ref)
+        .map_err(map_connector_binding_state_error)?;
+    let installation = AgentInstallationRepository::new()
+        .load(connection, command.tenant_id, binding.installation_id())
+        .await
+        .map_err(map_conversation_grant_persistence_error)?
+        .ok_or(AgentProvisioningOwnerError::NotFound)?;
+    if installation.owner_id() != owner_session.identity_id() {
+        return Err(AgentProvisioningOwnerError::AccessDenied);
+    }
+
+    // Exact retries returned before this point.  A command that waited for a
+    // prior transition therefore cannot consume an already expired proof.
+    let committed_at = now()?;
+    validate_connector_binding_state_command(command, committed_at)?;
+    let result_revision = match command.action {
+        ConnectorBindingStateOwnerAction::Disable => bindings
+            .disable(binding_ref, command.expected_binding_revision)
+            .map_err(map_connector_binding_state_error)?,
+        ConnectorBindingStateOwnerAction::Enable => {
+            let device = AgentDeviceRepository::new()
+                .load(connection, command.tenant_id, binding.agent_device_id())
+                .await
+                .map_err(map_conversation_grant_persistence_error)?
+                .ok_or(AgentProvisioningOwnerError::Conflict)?;
+            bindings
+                .enable(
+                    binding_ref,
+                    command.expected_binding_revision,
+                    &installation,
+                    &device,
+                )
+                .map_err(map_connector_binding_state_error)?
+        }
+    };
+    repository
+        .save(connection, &bindings, committed_at.get())
+        .await
+        .map_err(map_conversation_grant_persistence_error)?;
+    let result_state = bindings
+        .binding(binding_ref)
+        .map_err(map_connector_binding_state_error)?
+        .state();
+    let receipt_bytes = connector_binding_state_receipt_cbor(
+        command.action,
+        command.tenant_id,
+        command.binding_id,
+        result_state,
+        result_revision,
+        owner_session.device_id(),
+        committed_at,
+        command.operation_id,
+        request_digest,
+    )?;
+    let receipt_digest =
+        Sha256Digest::hash_domain(CONNECTOR_BINDING_STATE_RECEIPT_DOMAIN, &receipt_bytes);
+    sqlx::query(
+        "INSERT INTO agent.connector_binding_state_owner_operations (
+             tenant_id, operation_id, binding_id, action, request_digest,
+             result_state, result_revision, owner_identity_id, owner_device_id,
+             owner_session_id, receipt_bytes, receipt_digest, committed_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+    )
+    .bind(Uuid::from(command.tenant_id))
+    .bind(Uuid::from(command.operation_id))
+    .bind(Uuid::from(command.binding_id))
+    .bind(connector_binding_state_action_code(command.action))
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(connector_binding_state_database_state(result_state)?)
+    .bind(
+        i64::try_from(result_revision.get())
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+    )
+    .bind(owner_session.identity_id().to_string())
+    .bind(Uuid::from(owner_session.device_id()))
+    .bind(Uuid::from(owner_session.session_id()))
+    .bind(&receipt_bytes)
+    .bind(receipt_digest.as_bytes().as_slice())
+    .bind(committed_at.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_connector_binding_state_operation_insert_error)?;
+    Ok(ConnectorBindingStateOwnerReceipt {
+        replayed: false,
+        action: command.action,
+        exact_cbor: receipt_bytes,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn mutate_private_conversation_grant_in_transaction(
     connection: &mut sqlx::PgConnection,
@@ -1646,6 +1916,16 @@ async fn mutate_private_conversation_grant_in_transaction(
         .ok_or(AgentProvisioningOwnerError::NotFound)?;
     if installation.owner_id() != owner_session.identity_id() {
         return Err(AgentProvisioningOwnerError::AccessDenied);
+    }
+    if command.action == ConversationGrantOwnerAction::Grant
+        && !installation_has_enabled_active_agent_device(
+            connection,
+            command.tenant_id,
+            command.installation_id,
+        )
+        .await?
+    {
+        return Err(AgentProvisioningOwnerError::Conflict);
     }
 
     let repository = ConversationGrantRepository::new();
@@ -1774,6 +2054,23 @@ async fn mutate_private_conversation_grant_in_transaction(
     })
 }
 
+fn validate_connector_binding_state_command(
+    command: &ConnectorBindingStateOwnerCommand,
+    now: UtcMillis,
+) -> Result<(), AgentProvisioningOwnerError> {
+    let proof_expires_at = command.proof_expires_at.get();
+    if proof_expires_at <= now.get()
+        || proof_expires_at
+            > now
+                .get()
+                .saturating_add(MAX_BINDING_STATE_PROOF_LIFETIME_MS)
+    {
+        Err(AgentProvisioningOwnerError::InvalidRequest)
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_conversation_grant_command(
     command: &ConversationGrantOwnerCommand,
     now: UtcMillis,
@@ -1862,6 +2159,36 @@ fn private_conversation_permissions() -> AgentConversationPermissions {
         .with(AgentConversationPermission::SendMessages)
 }
 
+async fn installation_has_enabled_active_agent_device(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+) -> Result<bool, AgentProvisioningOwnerError> {
+    // `FOR SHARE` prevents a concurrent Binding state update from committing
+    // between this grant precondition and the durable grant write below.
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT binding.binding_id
+           FROM agent.connector_bindings AS binding
+           JOIN agent.agent_devices AS device
+             ON device.tenant_id=binding.tenant_id
+            AND device.installation_id=binding.installation_id
+            AND device.agent_device_id=binding.agent_device_id
+          WHERE binding.tenant_id=$1
+            AND binding.installation_id=$2
+            AND binding.state='enabled'
+            AND device.state='active'
+          ORDER BY binding.binding_id
+          LIMIT 1
+          FOR SHARE OF binding",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(installation_id))
+    .fetch_optional(&mut *connection)
+    .await
+    .map(|binding| binding.is_some())
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
+}
+
 async fn load_conversation_grant_operation(
     connection: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -1910,6 +2237,60 @@ async fn load_conversation_grant_operation(
         return Err(AgentProvisioningOwnerError::TemporarilyUnavailable);
     }
     Ok(Some(ConversationGrantOwnerReceipt {
+        replayed: true,
+        action,
+        exact_cbor,
+    }))
+}
+
+async fn load_connector_binding_state_operation(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    operation_id: RequestId,
+    action: ConnectorBindingStateOwnerAction,
+    request_digest: Sha256Digest,
+) -> Result<Option<ConnectorBindingStateOwnerReceipt>, AgentProvisioningOwnerError> {
+    let row = sqlx::query(
+        "SELECT action, request_digest, receipt_bytes, receipt_digest
+           FROM agent.connector_binding_state_owner_operations
+          WHERE tenant_id=$1 AND operation_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(operation_id))
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if row
+        .try_get::<Vec<u8>, _>("request_digest")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?
+        .as_slice()
+        != request_digest.as_bytes()
+        || row
+            .try_get::<String, _>("action")
+            .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?
+            != connector_binding_state_action_code(action)
+    {
+        return Err(AgentProvisioningOwnerError::Conflict);
+    }
+    let exact_cbor = row
+        .try_get::<Vec<u8>, _>("receipt_bytes")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let stored_digest = row
+        .try_get::<Vec<u8>, _>("receipt_digest")
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let stored_digest: [u8; 32] = stored_digest
+        .try_into()
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    if *Sha256Digest::hash_domain(CONNECTOR_BINDING_STATE_RECEIPT_DOMAIN, &exact_cbor).as_bytes()
+        != stored_digest
+        || decode_deterministic_cbor(&exact_cbor).is_err()
+    {
+        return Err(AgentProvisioningOwnerError::TemporarilyUnavailable);
+    }
+    Ok(Some(ConnectorBindingStateOwnerReceipt {
         replayed: true,
         action,
         exact_cbor,
@@ -1982,8 +2363,67 @@ fn conversation_grant_receipt_cbor(
     .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
 }
 
+fn connector_binding_state_receipt_cbor(
+    action: ConnectorBindingStateOwnerAction,
+    tenant_id: TenantId,
+    binding_id: BindingId,
+    result_state: BindingState,
+    result_revision: Revision,
+    owner_device_id: DeviceId,
+    committed_at: UtcMillis,
+    operation_id: RequestId,
+    request_digest: Sha256Digest,
+) -> Result<Vec<u8>, AgentProvisioningOwnerError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Unsigned(connector_binding_state_action_value(action)),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(tenant_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(binding_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Unsigned(connector_binding_state_code(result_state)?),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Unsigned(result_revision.get()),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Text(owner_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            committed_at.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Text(operation_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(10),
+            CanonicalValue::Bytes(request_digest.as_bytes().to_vec()),
+        ),
+    ]))
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
+}
+
 fn conversation_grant_signature_input(binding_digest: Sha256Digest) -> Vec<u8> {
     let mut input = CONVERSATION_GRANT_SIGNATURE_DOMAIN.to_vec();
+    input.extend_from_slice(binding_digest.as_bytes());
+    input
+}
+
+fn connector_binding_state_signature_input(binding_digest: Sha256Digest) -> Vec<u8> {
+    let mut input = CONNECTOR_BINDING_STATE_SIGNATURE_DOMAIN.to_vec();
     input.extend_from_slice(binding_digest.as_bytes());
     input
 }
@@ -2001,10 +2441,50 @@ const fn conversation_grant_action_code(action: ConversationGrantOwnerAction) ->
     }
 }
 
+const fn connector_binding_state_action_value(action: ConnectorBindingStateOwnerAction) -> u64 {
+    match action {
+        ConnectorBindingStateOwnerAction::Enable => 1,
+        ConnectorBindingStateOwnerAction::Disable => 2,
+    }
+}
+
+const fn connector_binding_state_action_code(
+    action: ConnectorBindingStateOwnerAction,
+) -> &'static str {
+    match action {
+        ConnectorBindingStateOwnerAction::Enable => "enable",
+        ConnectorBindingStateOwnerAction::Disable => "disable",
+    }
+}
+
+fn connector_binding_state_code(state: BindingState) -> Result<u64, AgentProvisioningOwnerError> {
+    match state {
+        BindingState::Enabled => Ok(1),
+        BindingState::Disabled => Ok(2),
+        BindingState::Revoked => Err(AgentProvisioningOwnerError::Conflict),
+    }
+}
+
+fn connector_binding_state_database_state(
+    state: BindingState,
+) -> Result<&'static str, AgentProvisioningOwnerError> {
+    match state {
+        BindingState::Enabled => Ok("enabled"),
+        BindingState::Disabled => Ok("disabled"),
+        BindingState::Revoked => Err(AgentProvisioningOwnerError::Conflict),
+    }
+}
+
 fn conversation_grant_operation_lock_key(operation_id: RequestId) -> i64 {
     let mut prefix = [0_u8; 8];
     prefix.copy_from_slice(&operation_id.as_uuid().as_bytes()[..8]);
     i64::from_be_bytes(prefix)
+}
+
+fn connector_binding_state_operation_lock_key(operation_id: RequestId) -> i64 {
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&operation_id.as_uuid().as_bytes()[..8]);
+    i64::from_be_bytes(prefix) ^ i64::MIN
 }
 
 fn map_conversation_grant_identity_error(
@@ -2038,6 +2518,35 @@ fn map_conversation_grant_persistence_error(
     }
 }
 
+const fn map_connector_binding_state_error(error: BindingError) -> AgentProvisioningOwnerError {
+    match error {
+        BindingError::BindingNotFound => AgentProvisioningOwnerError::NotFound,
+        BindingError::WrongTenant
+        | BindingError::MissingConnectorConformance
+        | BindingError::ConformanceConflict
+        | BindingError::ConformanceAdapterMismatch
+        | BindingError::BindingIdConflict
+        | BindingError::DuplicateInstallationConnector
+        | BindingError::AgentDeviceReused
+        | BindingError::AgentDeviceScopeMismatch
+        | BindingError::AgentDeviceNotActive
+        | BindingError::AgentDeviceNotResolved
+        | BindingError::InstallationNotActive
+        | BindingError::InvalidBindingCapacity
+        | BindingError::RoutingPolicyConflict
+        | BindingError::RoutingPolicyNotFound
+        | BindingError::ExclusivePriorityMustBeZero
+        | BindingError::ExclusiveAlreadyEnabled
+        | BindingError::PriorityConflict
+        | BindingError::PriorityUpdateConflict
+        | BindingError::BindingInstallationMismatch
+        | BindingError::ConnectorSingleSession
+        | BindingError::InvalidTransition
+        | BindingError::RevisionConflict { .. }
+        | BindingError::CounterExhausted => AgentProvisioningOwnerError::Conflict,
+    }
+}
+
 fn map_conversation_grant_operation_insert_error(
     error: sqlx::Error,
 ) -> AgentProvisioningOwnerError {
@@ -2050,6 +2559,12 @@ fn map_conversation_grant_operation_insert_error(
     } else {
         AgentProvisioningOwnerError::TemporarilyUnavailable
     }
+}
+
+fn map_connector_binding_state_operation_insert_error(
+    error: sqlx::Error,
+) -> AgentProvisioningOwnerError {
+    map_conversation_grant_operation_insert_error(error)
 }
 
 #[derive(Serialize)]
@@ -2124,6 +2639,14 @@ pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBa
         .route(
             "/v1/connectors/{connector_id}/rotate-credential",
             post(post_connector_credential_rotation),
+        )
+        .route(
+            "/v1/connector-bindings/{binding_id}/enable",
+            post(post_connector_binding_enable),
+        )
+        .route(
+            "/v1/connector-bindings/{binding_id}/disable",
+            post(post_connector_binding_disable),
         )
         .route(
             "/v1/conversations/{conversation_id}/agent-grants/{installation_id}",
@@ -2277,6 +2800,70 @@ async fn post_connector_lifecycle(
                     action,
                 },
             )
+            .await
+    }
+    .await;
+    owner_response(result)
+}
+
+async fn post_connector_binding_enable(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path(binding_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    post_connector_binding_state(
+        backend,
+        binding_id,
+        headers,
+        body,
+        ConnectorBindingStateOwnerAction::Enable,
+    )
+    .await
+}
+
+async fn post_connector_binding_disable(
+    State(backend): State<Arc<dyn AgentProvisioningOwnerBackend>>,
+    Path(binding_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    post_connector_binding_state(
+        backend,
+        binding_id,
+        headers,
+        body,
+        ConnectorBindingStateOwnerAction::Disable,
+    )
+    .await
+}
+
+async fn post_connector_binding_state(
+    backend: Arc<dyn AgentProvisioningOwnerBackend>,
+    binding_id: String,
+    headers: HeaderMap,
+    body: Bytes,
+    action: ConnectorBindingStateOwnerAction,
+) -> Response {
+    let result = async {
+        require_content_type(&headers, CONNECTOR_BINDING_STATE_COMMAND_MEDIA_TYPE_V1)?;
+        require_accept(&headers, CONNECTOR_BINDING_STATE_RECEIPT_MEDIA_TYPE_V1)?;
+        bounded(&body, MAX_SMALL_BODY)?;
+        let credential = parse_device_session(&headers)?;
+        let operation_id = parse_connector_binding_state_operation(&headers)?;
+        let expected_binding_revision = parse_connector_binding_state_fence(&headers)?;
+        let binding_id = binding_id
+            .parse::<BindingId>()
+            .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?;
+        let command = parse_connector_binding_state(&body, action)?;
+        if command.operation_id != operation_id
+            || command.expected_binding_revision != expected_binding_revision
+            || command.binding_id != binding_id
+        {
+            return Err(AgentProvisioningOwnerError::InvalidRequest);
+        }
+        backend
+            .mutate_connector_binding_state(credential, command, body.to_vec(), now()?)
             .await
     }
     .await;
@@ -2859,6 +3446,43 @@ fn parse_revocation(body: &[u8]) -> Result<RevocationOwnerCommand, AgentProvisio
     })
 }
 
+fn parse_connector_binding_state(
+    body: &[u8],
+    expected_action: ConnectorBindingStateOwnerAction,
+) -> Result<ConnectorBindingStateOwnerCommand, AgentProvisioningOwnerError> {
+    let request = exact_map(
+        decode_deterministic_cbor(body).map_err(|_| AgentProvisioningOwnerError::InvalidRequest)?,
+        3,
+    )?;
+    let binding = map_value(&request, 1)?.clone();
+    let fields = exact_map(binding.clone(), 9)?;
+    expect_version(&fields)?;
+    let action = match unsigned_int(&fields, 2)? {
+        1 => ConnectorBindingStateOwnerAction::Enable,
+        2 => ConnectorBindingStateOwnerAction::Disable,
+        _ => return Err(AgentProvisioningOwnerError::InvalidRequest),
+    };
+    if action != expected_action {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let supplied = digest(map_value(&request, 2)?)?;
+    if supplied != binding_hash(CONNECTOR_BINDING_STATE_BINDING_DOMAIN, &binding)? {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    Ok(ConnectorBindingStateOwnerCommand {
+        action,
+        tenant_id: text_id(&fields, 3)?,
+        binding_id: text_id(&fields, 4)?,
+        expected_binding_revision: revision(&fields, 5)?,
+        operation_id: text_id(&fields, 6)?,
+        owner_identity_id: text_id(&fields, 7)?,
+        owner_device_id: text_id(&fields, 8)?,
+        proof_expires_at: utc(&fields, 9)?,
+        binding_digest: supplied,
+        owner_signature: Ed25519Signature::from_bytes(bytes_array(map_value(&request, 3)?)?),
+    })
+}
+
 fn parse_conversation_grant(
     body: &[u8],
     expected_action: ConversationGrantOwnerAction,
@@ -3234,6 +3858,12 @@ fn parse_conversation_grant_operation(
         .map_err(|_| AgentProvisioningOwnerError::InvalidRequest)
 }
 
+fn parse_connector_binding_state_operation(
+    headers: &HeaderMap,
+) -> Result<RequestId, AgentProvisioningOwnerError> {
+    parse_conversation_grant_operation(headers)
+}
+
 fn parse_agent_route_run_operation(
     headers: &HeaderMap,
 ) -> Result<RequestId, AgentProvisioningOwnerError> {
@@ -3276,6 +3906,34 @@ fn parse_agent_route_run_fence(
     headers: &HeaderMap,
 ) -> Result<Revision, AgentProvisioningOwnerError> {
     parse_conversation_grant_fence(headers)?.ok_or(AgentProvisioningOwnerError::InvalidRequest)
+}
+
+fn parse_connector_binding_state_fence(
+    headers: &HeaderMap,
+) -> Result<Revision, AgentProvisioningOwnerError> {
+    let mut values = headers.get_all(header::IF_MATCH).iter();
+    let value = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    if values.next().is_some() {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let value = value
+        .strip_prefix("\"b")
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    if value.is_empty()
+        || value.starts_with('0')
+        || !value.bytes().all(|value| value.is_ascii_digit())
+    {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .and_then(|revision| Revision::new(revision).ok())
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)
 }
 
 fn parse_connector_lifecycle_fence(
@@ -3328,6 +3986,17 @@ fn require_content_type(
     let value = values
         .next()
         .and_then(|v| v.to_str().ok())
+        .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
+    if values.next().is_some() || value != expected {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    Ok(())
+}
+fn require_accept(headers: &HeaderMap, expected: &str) -> Result<(), AgentProvisioningOwnerError> {
+    let mut values = headers.get_all(header::ACCEPT).iter();
+    let value = values
+        .next()
+        .and_then(|value| value.to_str().ok())
         .ok_or(AgentProvisioningOwnerError::InvalidRequest)?;
     if values.next().is_some() || value != expected {
         return Err(AgentProvisioningOwnerError::InvalidRequest);

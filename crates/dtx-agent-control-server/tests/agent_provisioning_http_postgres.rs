@@ -43,7 +43,7 @@ use dtx_agent_registry::{
     VerifiedAgentDefinition,
 };
 use dtx_connect_registry::{
-    AdapterConformance, AdapterKind, BindingSpec, Connector, RoutingPolicy, TenantRef,
+    AdapterConformance, AdapterKind, BindingSpec, BindingState, Connector, RoutingPolicy, TenantRef,
 };
 use dtx_domain::{
     AgentDeviceId, AgentId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId,
@@ -870,6 +870,378 @@ async fn owner_connector_projection_v3_shows_owner_visible_binding_state_and_rem
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn owner_connector_binding_state_http_is_exact_authorized_and_fenced()
+-> Result<(), Box<dyn Error>> {
+    TEST_NOW.get_or_init(|| {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis(),
+        )
+        .expect("current time fits i64")
+    });
+    let harness = PostgresHarness::start().await?;
+    let store = harness.runtime_store(12).await?;
+    let tenant_id = TenantId::new();
+    provision_tenant(&store, tenant_id).await?;
+
+    let owner_root = key(65);
+    let owner_device_key = key(66);
+    let owner_device_id = DeviceId::new();
+    let (owner_id, owner_head, _) = provision_identity(
+        &harness,
+        &owner_root,
+        &owner_device_key,
+        owner_device_id,
+        67,
+    )
+    .await?;
+    let (owner_credential, owner_authorization) =
+        provision_owner_session(&harness, owner_id, owner_device_id, owner_head, [0x68; 32])
+            .await?;
+
+    let foreign_root = key(69);
+    let foreign_device_key = key(70);
+    let foreign_device_id = DeviceId::new();
+    let (foreign_id, foreign_head, foreign_certificate) = provision_identity(
+        &harness,
+        &foreign_root,
+        &foreign_device_key,
+        foreign_device_id,
+        71,
+    )
+    .await?;
+    let (foreign_credential, foreign_authorization) = provision_owner_session(
+        &harness,
+        foreign_id,
+        foreign_device_id,
+        foreign_head,
+        [0x72; 32],
+    )
+    .await?;
+
+    let (_, connector) = provision_host_and_connector(&store, tenant_id, owner_id).await?;
+    let installation_id = InstallationId::new();
+    let agent_device_id = AgentDeviceId::new();
+    let binding_id = BindingId::new();
+    let fingerprint = fingerprint_for_binding(&foreign_certificate, 73)?;
+    provision_installation_binding(
+        &store,
+        tenant_id,
+        owner_id,
+        installation_id,
+        agent_device_id,
+        foreign_device_id,
+        fingerprint,
+        binding_id,
+        &connector,
+    )
+    .await?;
+
+    let (issuer, _) = certificate_issuer(now())?;
+    let app = Arc::new(application(
+        store.clone(),
+        issuer,
+        Arc::new(ConnectorCredentialAuthorizationIndex::new()),
+    ));
+    let router = agent_provisioning_owner_router(Arc::new(
+        PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app),
+    ));
+    let disable_uri = format!("/v1/connector-bindings/{binding_id}/disable");
+    let enable_uri = format!("/v1/connector-bindings/{binding_id}/enable");
+
+    let disable_operation = RequestId::new();
+    let disable_body = connector_binding_state_body(
+        2,
+        disable_operation,
+        tenant_id,
+        binding_id,
+        Revision::new(2)?,
+        owner_id,
+        owner_device_id,
+        &owner_device_key,
+        now() + 300_000,
+    )?;
+    // The signed command is not a bearer for a different URL, operation, or
+    // revision fence.  Every mismatch is rejected before the durable Owner
+    // backend can append an operation or transition the Binding.
+    let wrong_path = owner_connector_binding_state_mutation(
+        router.clone(),
+        &format!("/v1/connector-bindings/{}/disable", BindingId::new()),
+        &owner_authorization,
+        disable_operation,
+        "\"b2\"",
+        disable_body.clone(),
+    )
+    .await?;
+    assert_eq!(wrong_path.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let wrong_operation = owner_connector_binding_state_mutation(
+        router.clone(),
+        &disable_uri,
+        &owner_authorization,
+        RequestId::new(),
+        "\"b2\"",
+        disable_body.clone(),
+    )
+    .await?;
+    assert_eq!(wrong_operation.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let wrong_fence = owner_connector_binding_state_mutation(
+        router.clone(),
+        &disable_uri,
+        &owner_authorization,
+        disable_operation,
+        "\"b3\"",
+        disable_body.clone(),
+    )
+    .await?;
+    assert_eq!(wrong_fence.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let mut rejected_session = store.begin_tenant(tenant_id).await?;
+    let initial_bindings = BindingSetRepository::new()
+        .load(rejected_session.connection(), tenant_id)
+        .await?;
+    let initial_binding = initial_bindings.binding(TenantRef::new(tenant_id, binding_id))?;
+    assert_eq!(initial_binding.state(), BindingState::Enabled);
+    assert_eq!(initial_binding.revision(), Revision::new(2)?);
+    let rejected_operation_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.connector_binding_state_owner_operations
+          WHERE tenant_id=$1",
+    )
+    .bind(Uuid::from(tenant_id))
+    .fetch_one(rejected_session.connection())
+    .await?;
+    assert_eq!(rejected_operation_count, 0);
+    rejected_session.rollback().await?;
+
+    let disabled = owner_connector_binding_state_mutation(
+        router.clone(),
+        &disable_uri,
+        &owner_authorization,
+        disable_operation,
+        "\"b2\"",
+        disable_body.clone(),
+    )
+    .await?;
+    assert_eq!(disabled.0, StatusCode::CREATED);
+    assert_eq!(
+        disabled.1.as_deref(),
+        Some("application/vnd.dirextalk.connector-binding-state-receipt.v1+cbor")
+    );
+    assert_eq!(disabled.2.as_deref(), Some("no-store"));
+    let CanonicalValue::Map(disabled_receipt) = decode_deterministic_cbor(&disabled.3)? else {
+        panic!("Binding-state receipt must be a canonical map");
+    };
+    assert_eq!(disabled_receipt.len(), 10);
+    for (index, (key, _)) in disabled_receipt.iter().enumerate() {
+        assert_eq!(*key, u(u64::try_from(index + 1)?));
+    }
+    assert_eq!(disabled_receipt[0].1, u(1));
+    assert_eq!(disabled_receipt[1].1, u(2));
+    assert_eq!(disabled_receipt[2].1, text(tenant_id));
+    assert_eq!(disabled_receipt[3].1, text(binding_id));
+    assert_eq!(disabled_receipt[4].1, u(2));
+    assert_eq!(disabled_receipt[5].1, u(3));
+    assert_eq!(disabled_receipt[6].1, text(owner_device_id));
+    assert_eq!(disabled_receipt[8].1, text(disable_operation));
+    assert_eq!(
+        disabled_receipt[9].1,
+        CanonicalValue::Bytes(
+            Sha256Digest::hash_domain(
+                b"dirextalk.connector-binding-state-command-request.v1\0",
+                &disable_body,
+            )
+            .as_bytes()
+            .to_vec(),
+        )
+    );
+
+    let replay = owner_connector_binding_state_mutation(
+        router.clone(),
+        &disable_uri,
+        &owner_authorization,
+        disable_operation,
+        "\"b2\"",
+        disable_body,
+    )
+    .await?;
+    assert_eq!(replay.0, StatusCode::OK);
+    assert_eq!(replay.3, disabled.3);
+
+    // A new same-target operation is a domain-level no-op: it still receives
+    // a durable receipt, but the Binding revision remains at the supplied
+    // expected fence instead of incrementing again.
+    let same_target_operation = RequestId::new();
+    let same_target = owner_connector_binding_state_mutation(
+        router.clone(),
+        &disable_uri,
+        &owner_authorization,
+        same_target_operation,
+        "\"b3\"",
+        connector_binding_state_body(
+            2,
+            same_target_operation,
+            tenant_id,
+            binding_id,
+            Revision::new(3)?,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(same_target.0, StatusCode::CREATED);
+    let CanonicalValue::Map(same_target_receipt) = decode_deterministic_cbor(&same_target.3)?
+    else {
+        panic!("same-target Binding-state receipt must be a canonical map");
+    };
+    assert_eq!(same_target_receipt[4].1, u(2));
+    assert_eq!(same_target_receipt[5].1, u(3));
+
+    let stale_operation = RequestId::new();
+    let stale = owner_connector_binding_state_mutation(
+        router.clone(),
+        &enable_uri,
+        &owner_authorization,
+        stale_operation,
+        "\"b2\"",
+        connector_binding_state_body(
+            1,
+            stale_operation,
+            tenant_id,
+            binding_id,
+            Revision::new(2)?,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(stale.0, StatusCode::CONFLICT);
+
+    let reused_operation = owner_connector_binding_state_mutation(
+        router.clone(),
+        &enable_uri,
+        &owner_authorization,
+        disable_operation,
+        "\"b3\"",
+        connector_binding_state_body(
+            1,
+            disable_operation,
+            tenant_id,
+            binding_id,
+            Revision::new(3)?,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(reused_operation.0, StatusCode::CONFLICT);
+
+    let foreign_operation = RequestId::new();
+    let foreign = owner_connector_binding_state_mutation(
+        router.clone(),
+        &enable_uri,
+        &foreign_authorization,
+        foreign_operation,
+        "\"b3\"",
+        connector_binding_state_body(
+            1,
+            foreign_operation,
+            tenant_id,
+            binding_id,
+            Revision::new(3)?,
+            foreign_id,
+            foreign_device_id,
+            &foreign_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(foreign.0, StatusCode::FORBIDDEN);
+
+    let enable_operation = RequestId::new();
+    let enabled = owner_connector_binding_state_mutation(
+        router.clone(),
+        &enable_uri,
+        &owner_authorization,
+        enable_operation,
+        "\"b3\"",
+        connector_binding_state_body(
+            1,
+            enable_operation,
+            tenant_id,
+            binding_id,
+            Revision::new(3)?,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(enabled.0, StatusCode::CREATED);
+    let CanonicalValue::Map(enabled_receipt) = decode_deterministic_cbor(&enabled.3)? else {
+        panic!("Binding-state receipt must be a canonical map");
+    };
+    assert_eq!(enabled_receipt[1].1, u(1));
+    assert_eq!(enabled_receipt[4].1, u(1));
+    assert_eq!(enabled_receipt[5].1, u(4));
+
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let binding_ref = TenantRef::new(tenant_id, binding_id);
+    let bindings = BindingSetRepository::new()
+        .load(session.connection(), tenant_id)
+        .await?;
+    assert_eq!(
+        bindings.binding(binding_ref)?.state(),
+        BindingState::Enabled
+    );
+    assert_eq!(bindings.binding(binding_ref)?.revision(), Revision::new(4)?);
+    let operation_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.connector_binding_state_owner_operations
+          WHERE tenant_id=$1 AND operation_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(disable_operation))
+    .fetch_one(session.connection())
+    .await?;
+    assert_eq!(operation_count, 1);
+    session.rollback().await?;
+
+    set_binding_state(&store, tenant_id, binding_id, true).await?;
+    let revoked_enable_operation = RequestId::new();
+    let revoked_enable = owner_connector_binding_state_mutation(
+        router,
+        &enable_uri,
+        &owner_authorization,
+        revoked_enable_operation,
+        "\"b6\"",
+        connector_binding_state_body(
+            1,
+            revoked_enable_operation,
+            tenant_id,
+            binding_id,
+            Revision::new(6)?,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(revoked_enable.0, StatusCode::CONFLICT);
+
+    drop(foreign_credential);
+    drop(owner_credential);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persisted_grant()
 -> Result<(), Box<dyn Error>> {
     TEST_NOW.get_or_init(|| {
@@ -945,6 +1317,51 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         &connector,
     )
     .await?;
+    let inactive_installation_id = InstallationId::new();
+    let inactive_agent_device_id = AgentDeviceId::new();
+    let inactive_binding_id = BindingId::new();
+    provision_installation_binding(
+        &store,
+        tenant_id,
+        owner_id,
+        inactive_installation_id,
+        inactive_agent_device_id,
+        DeviceId::new(),
+        fingerprint_for_binding(&non_owner_certificate, 94)?,
+        inactive_binding_id,
+        &connector,
+    )
+    .await?;
+    revoke_agent_device(
+        &store,
+        tenant_id,
+        inactive_installation_id,
+        inactive_agent_device_id,
+    )
+    .await?;
+    let mut inactive_fixture_session = store.begin_tenant(tenant_id).await?;
+    let inactive_bindings = BindingSetRepository::new()
+        .load(inactive_fixture_session.connection(), tenant_id)
+        .await?;
+    assert_eq!(
+        inactive_bindings
+            .binding(TenantRef::new(tenant_id, inactive_binding_id))?
+            .state(),
+        BindingState::Enabled
+    );
+    assert_eq!(
+        AgentDeviceRepository::new()
+            .load(
+                inactive_fixture_session.connection(),
+                tenant_id,
+                inactive_agent_device_id,
+            )
+            .await?
+            .expect("inactive Agent Device fixture must exist")
+            .state(),
+        AgentDeviceState::Revoked
+    );
+    inactive_fixture_session.rollback().await?;
     let conversation_id = ConversationId::new();
     provision_private_conversation_owner(&harness, tenant_id, conversation_id, owner_id).await?;
 
@@ -1270,6 +1687,68 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
     assert!(grant.snapshot().revoked_at_ms.is_some());
     assert!(!grant.authorizes_version_for(&installation, now(), Revision::INITIAL));
     session.rollback().await?;
+
+    // Regrant is fail-closed once the installation no longer has an enabled
+    // Binding backed by an active Agent Device.  Without this gate the same
+    // valid owner signature and grant fence would restore the grant.
+    set_binding_state(&store, tenant_id, binding_id, false).await?;
+    let no_active_binding_operation = RequestId::new();
+    let no_active_binding = owner_conversation_grant_mutation(
+        router.clone(),
+        Method::PUT,
+        &uri,
+        &owner_authorization,
+        no_active_binding_operation,
+        "\"g2\"",
+        conversation_grant_body(
+            1,
+            no_active_binding_operation,
+            tenant_id,
+            conversation_id,
+            installation_id,
+            Some(Revision::new(2)?),
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            Some(now() + 600_000),
+            Some([0x94; 32]),
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(no_active_binding.0, StatusCode::CONFLICT);
+
+    // A Binding that remains enabled is still insufficient when the dedicated
+    // Agent Device has been revoked.  This uses a distinct installation and
+    // `g0` fence so it proves the gate also protects a new grant, not only a
+    // regrant whose existing Binding was disabled above.
+    let inactive_device_operation = RequestId::new();
+    let inactive_device_uri =
+        format!("/v1/conversations/{conversation_id}/agent-grants/{inactive_installation_id}");
+    let inactive_device_grant = owner_conversation_grant_mutation(
+        router.clone(),
+        Method::PUT,
+        &inactive_device_uri,
+        &owner_authorization,
+        inactive_device_operation,
+        "\"g0\"",
+        conversation_grant_body(
+            1,
+            inactive_device_operation,
+            tenant_id,
+            conversation_id,
+            inactive_installation_id,
+            None,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            Some(now() + 600_000),
+            Some([0x95; 32]),
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(inactive_device_grant.0, StatusCode::CONFLICT);
 
     drop(non_owner_credential);
     drop(owner_credential);
@@ -2149,6 +2628,50 @@ async fn owner_conversation_grant_mutation(
     ))
 }
 
+async fn owner_connector_binding_state_mutation(
+    router: axum::Router,
+    uri: &str,
+    authorization: &str,
+    operation_id: RequestId,
+    if_match: &str,
+    body: Vec<u8>,
+) -> Result<(StatusCode, Option<String>, Option<String>, Vec<u8>), Box<dyn Error>> {
+    let response = router
+        .oneshot(
+            Request::post(uri)
+                .header(header::AUTHORIZATION, authorization)
+                .header("idempotency-key", operation_id.to_string())
+                .header(header::IF_MATCH, if_match)
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/vnd.dirextalk.connector-binding-state-command.v1+cbor",
+                )
+                .header(
+                    header::ACCEPT,
+                    "application/vnd.dirextalk.connector-binding-state-receipt.v1+cbor",
+                )
+                .body(Body::from(body))?,
+        )
+        .await?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let cache_control = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    Ok((
+        status,
+        content_type,
+        cache_control,
+        to_bytes(response.into_body(), 1_000_000).await?.to_vec(),
+    ))
+}
+
 async fn owner_agent_route_run(
     router: axum::Router,
     uri: &str,
@@ -2609,25 +3132,50 @@ async fn set_binding_state(
     let binding_ref = TenantRef::new(tenant_id, binding_id);
     let disabled_revision =
         bindings.disable(binding_ref, bindings.binding(binding_ref)?.revision())?;
+    let stored_at = current_store_timestamp()?;
     repository
-        .save(
-            session.connection(),
-            &bindings,
-            next_binding_fixture_timestamp(),
-        )
+        .save(session.connection(), &bindings, stored_at)
         .await?;
     if revoke {
         bindings.revoke(binding_ref, disabled_revision)?;
         repository
-            .save(
-                session.connection(),
-                &bindings,
-                next_binding_fixture_timestamp(),
-            )
+            .save(session.connection(), &bindings, stored_at + 1)
             .await?;
     }
     session.commit().await?;
     Ok(())
+}
+
+async fn revoke_agent_device(
+    store: &PgStore,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    agent_device_id: AgentDeviceId,
+) -> Result<(), Box<dyn Error>> {
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let installation = AgentInstallationRepository::new()
+        .load(session.connection(), tenant_id, installation_id)
+        .await?
+        .expect("Agent Installation fixture must exist");
+    let mut device = AgentDeviceRepository::new()
+        .load(session.connection(), tenant_id, agent_device_id)
+        .await?
+        .expect("Agent Device fixture must exist");
+    device.apply(&installation, device.revision(), AgentDeviceCommand::Revoke)?;
+    AgentDeviceRepository::new()
+        .save(session.connection(), &device, current_store_timestamp()?)
+        .await?;
+    session.commit().await?;
+    Ok(())
+}
+
+fn current_store_timestamp() -> Result<i64, Box<dyn Error>> {
+    Ok(i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )? + 1)
 }
 
 fn fingerprint_for_binding(
@@ -2743,6 +3291,38 @@ fn conversation_grant_body(
         binding,
         b"dirextalk.conversation-agent-grant-binding.v1\0",
         b"dirextalk.conversation-agent-grant-signature.v1\0",
+        owner_key,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connector_binding_state_body(
+    action: u64,
+    operation_id: RequestId,
+    tenant_id: TenantId,
+    binding_id: BindingId,
+    expected_binding_revision: Revision,
+    owner_id: IdentityId,
+    owner_device_id: DeviceId,
+    owner_key: &SigningKey,
+    proof_expires_at: i64,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let binding = CanonicalValue::Map(vec![
+        (u(1), u(1)),
+        (u(2), u(action)),
+        (u(3), text(tenant_id)),
+        (u(4), text(binding_id)),
+        (u(5), u(expected_binding_revision.get())),
+        (u(6), text(operation_id)),
+        (u(7), text(owner_id)),
+        (u(8), text(owner_device_id)),
+        (u(9), UtcMillis::new(proof_expires_at)?.to_canonical_value()),
+    ]);
+    signed_owner_body(
+        binding,
+        b"dirextalk.connector-binding-state-command-binding.v1\0",
+        b"dirextalk.connector-binding-state-command-signature.v1\0",
         owner_key,
         None,
     )
