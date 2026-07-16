@@ -27,6 +27,7 @@ use dtx_domain::{
     Clock, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionChallengeId, DeviceSessionId,
     IdentityId, InviteCapabilityId, KeyPackageId, RequestId, SystemClock,
 };
+use dtx_federated_identity::{FederatedIdentityError, FederatedIdentityVerifier};
 use dtx_identity_log::{
     DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1,
     IdentityLogEventV1, IdentityLogPageV1, MAX_IDENTITY_LOG_PAGE_EVENTS,
@@ -36,7 +37,8 @@ use dtx_identity_persistence::{
     DeviceEnrollmentCapability, DeviceEnrollmentChallenge, DeviceEnrollmentChallengeOutcome,
     DeviceEnrollmentChallengeState, DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository,
     DeviceRevokeCommand, DeviceSessionCompletionCommand, DeviceSessionCredential,
-    DeviceSessionOutcome, DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome,
+    DeviceSessionOutcome, DeviceSessionRepository, FEDERATED_KEY_PACKAGE_CLAIM_PATH,
+    FederatedKeyPackageClaimProof, IdentityAppendCommand, IdentityAppendOutcome,
     IdentityLogPageReadOutcome, IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
     KeyPackageClaimCommand, KeyPackageClaimOutcome, KeyPackagePublishCommand,
     KeyPackagePublishOutcome, KeyPackageRepository, MAX_KEY_PACKAGE_PUBLISH_BYTES,
@@ -68,6 +70,8 @@ pub const DEVICE_ENROLLMENT_PATH: &str = "/v1/devices/enroll";
 pub const KEY_PACKAGE_PUBLISH_PATH_TEMPLATE: &str = "/v1/key-packages/{package_id}";
 /// Route that atomically consumes one opaque `KeyPackage` for a target device.
 pub const KEY_PACKAGE_CLAIM_PATH: &str = "/v1/key-packages/claim";
+/// Remote-device proof route for a claim against another identity origin.
+pub const KEY_PACKAGE_FEDERATED_CLAIM_PATH: &str = FEDERATED_KEY_PACKAGE_CLAIM_PATH;
 /// Public read-only route template for exact signed identity-log pages.
 pub const IDENTITY_LOG_PAGE_PATH_TEMPLATE: &str = "/v1/identities/{identity_id}/log";
 /// Active-device route for one exact root-signed revocation of another device.
@@ -108,6 +112,9 @@ pub const KEY_PACKAGE_PUBLISH_RECEIPT_CONTENT_TYPE: &str =
 /// Exact `KeyPackage` target claim request media type.
 pub const KEY_PACKAGE_CLAIM_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.key-package-claim.v1+cbor";
+/// V1 target body authenticated by a requester-origin V2 device proof.
+pub const KEY_PACKAGE_FEDERATED_CLAIM_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.key-package-claim.v2+cbor";
 /// Exact original publish envelope returned by a one-time claim.
 pub const KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.key-package-claim-receipt.v1+cbor";
@@ -123,6 +130,10 @@ pub const CONTACT_INVITE_SECRET_HEADER: &str = "DTX-Contact-Invite-Secret";
 pub const CONTACT_RECEIPT_SECRET_HEADER: &str = "DTX-Contact-Receipt-Secret";
 /// Header that carries a candidate-owned status/cancellation capability.
 pub const DEVICE_ENROLLMENT_CAPABILITY_HEADER: &str = "DTX-Enrollment-Capability";
+/// Canonical remote identity origin covered by the V2 claim proof.
+pub const IDENTITY_ORIGIN_HEADER: &str = "DTX-Identity-Origin";
+/// Base64url canonical-CBOR V2 remote device proof.
+pub const KEY_PACKAGE_FEDERATED_CLAIM_PROOF_HEADER: &str = "DTX-KeyPackage-Claim-Proof";
 /// Exact authorization scheme for short-lived device sessions.
 pub const DEVICE_SESSION_AUTHORIZATION_SCHEME: &str = "DTX-Device-Session";
 /// Largest accepted exact genesis event body.
@@ -135,6 +146,7 @@ pub const MAX_DEVICE_ENROLLMENT_CANDIDATE_BYTES: usize = 16_384;
 pub const MAX_DEVICE_ENROLLMENT_COMPLETION_BYTES: usize = 1_048_576;
 /// Largest accepted exact `KeyPackage` target claim body.
 pub const MAX_KEY_PACKAGE_CLAIM_BYTES: usize = 16_384;
+const MAX_KEY_PACKAGE_FEDERATED_CLAIM_PROOF_HEADER_BYTES: usize = 4_096;
 
 const DEFAULT_IDENTITY_LOG_PAGE_LIMIT: usize = 32;
 
@@ -169,6 +181,8 @@ pub struct IdentityBootstrapState {
     device_enrollments: DeviceEnrollmentRepository,
     key_packages: KeyPackageRepository,
     contacts: ContactRepository,
+    federated_identity: FederatedIdentityVerifier,
+    public_origin: Arc<str>,
     clock: Arc<dyn Clock>,
     device_session_audience: Arc<str>,
 }
@@ -190,12 +204,20 @@ impl IdentityBootstrapState {
     ///
     /// The current binary is loopback-only; a future public TLS host must set
     /// a unique canonical HTTPS audience rather than sharing this local value.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the process cannot construct its fixed HTTPS-only
+    /// identity-log HTTP client.
     #[must_use]
     pub fn with_clock_and_device_session_audience(
         store: IdentityPgStore,
         clock: Arc<dyn Clock>,
         audience: impl Into<Arc<str>>,
     ) -> Self {
+        let device_session_audience = audience.into();
+        let federated_identity = FederatedIdentityVerifier::new(std::iter::empty())
+            .expect("the fixed HTTPS-only federated identity client is valid");
         Self {
             store,
             repository: IdentityLogRepository::new(),
@@ -203,11 +225,50 @@ impl IdentityBootstrapState {
             device_enrollments: DeviceEnrollmentRepository,
             key_packages: KeyPackageRepository::new(),
             contacts: ContactRepository,
+            federated_identity,
+            public_origin: device_session_audience.clone(),
             clock,
-            device_session_audience: audience.into(),
+            device_session_audience,
         }
     }
+
+    /// Installs the canonical public origin, development-only HTTP allowlist,
+    /// and optional additional CA root used for remote identity-log proofs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-canonical origin, unsafe HTTP origin, or an
+    /// invalid additional trust root.
+    pub fn with_federated_identity_configuration(
+        mut self,
+        public_origin: impl AsRef<str>,
+        allowed_http_origins: impl IntoIterator<Item = String>,
+        additional_trust_root_pem: Option<&[u8]>,
+    ) -> Result<Self, IdentityNodeConfigurationError> {
+        let (federated_identity, public_origin) =
+            FederatedIdentityVerifier::new_with_public_origin_and_additional_trust_root_pem(
+                public_origin.as_ref(),
+                allowed_http_origins,
+                additional_trust_root_pem,
+            )
+            .map_err(IdentityNodeConfigurationError)?;
+        self.federated_identity = federated_identity;
+        self.public_origin = Arc::from(public_origin);
+        Ok(self)
+    }
 }
+
+/// Invalid federated identity configuration for the identity node.
+#[derive(Clone, Copy, Debug)]
+pub struct IdentityNodeConfigurationError(FederatedIdentityError);
+
+impl std::fmt::Display for IdentityNodeConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for IdentityNodeConfigurationError {}
 
 /// Builds the bootstrap router using production wall-clock time.
 pub fn identity_bootstrap_router(store: IdentityPgStore) -> Router {
@@ -241,6 +302,10 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
         .route(DEVICE_REVOKE_PATH_TEMPLATE, post(revoke_device))
         .route(KEY_PACKAGE_PUBLISH_PATH_TEMPLATE, put(publish_key_package))
         .route(KEY_PACKAGE_CLAIM_PATH, post(claim_key_package))
+        .route(
+            KEY_PACKAGE_FEDERATED_CLAIM_PATH,
+            post(claim_key_package_federated),
+        )
         .route(CONTACT_INVITES_PATH, post(create_contact_invite))
         .route(CONTACT_INVITE_PATH, delete(revoke_contact_invite))
         .route(
@@ -694,6 +759,21 @@ async fn claim_key_package(
     let request_id = RequestId::new();
     let (parts, body) = request.into_parts();
     match state.claim_key_package(&parts.headers, body).await {
+        Ok(success) => key_package_claim_success_response(success, request_id),
+        Err(failure) => key_package_failure_response(failure, request_id),
+    }
+}
+
+async fn claim_key_package_federated(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .claim_key_package_federated(&parts.uri, &parts.headers, body)
+        .await
+    {
         Ok(success) => key_package_claim_success_response(success, request_id),
         Err(failure) => key_package_failure_response(failure, request_id),
     }
@@ -1226,6 +1306,82 @@ impl IdentityBootstrapState {
         }
     }
 
+    async fn claim_key_package_federated(
+        &self,
+        uri: &axum::http::Uri,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<KeyPackageClaimSuccess, KeyPackageFailure> {
+        if uri.path() != KEY_PACKAGE_FEDERATED_CLAIM_PATH
+            || uri.query().is_some()
+            || !has_exact_content_type(headers, KEY_PACKAGE_FEDERATED_CLAIM_CONTENT_TYPE)
+            || !has_exact_header(
+                headers,
+                header::ACCEPT,
+                KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE,
+            )
+            || headers.contains_key(header::AUTHORIZATION)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+        {
+            return Err(KeyPackageFailure::InvalidRequest);
+        }
+        let identity_origin = single_graphic_header(headers, IDENTITY_ORIGIN_HEADER, 8, 512)
+            .map_err(|()| KeyPackageFailure::AuthenticationRejected)?;
+        if identity_origin == self.public_origin.as_ref() {
+            return Err(KeyPackageFailure::AuthenticationRejected);
+        }
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_KEY_PACKAGE_CLAIM_IDEMPOTENCY_KEY_HASH_DOMAIN)
+                .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let bytes = to_bytes(body, MAX_KEY_PACKAGE_CLAIM_BYTES)
+            .await
+            .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let claim = parse_key_package_claim(&bytes)?;
+        let command = KeyPackageClaimCommand::new(
+            idempotency_key_hash,
+            claim.target_identity_id,
+            claim.target_device_id,
+            bytes.to_vec(),
+        )
+        .map_err(|_| KeyPackageFailure::InvalidRequest)?;
+        let proof = parse_federated_key_package_claim_proof(headers)?;
+        if proof.requester_identity_origin() != identity_origin {
+            return Err(KeyPackageFailure::AuthenticationRejected);
+        }
+        let now = self
+            .committed_at()
+            .map_err(|()| KeyPackageFailure::TemporarilyUnavailable)?;
+        let signing_key = self
+            .federated_identity
+            .active_device_signing_key(
+                identity_origin,
+                proof.requester_identity_id(),
+                proof.requester_device_id(),
+            )
+            .await
+            .map_err(map_federated_identity_error)?;
+        let claimant = proof
+            .verify(&command, now, signing_key)
+            .map_err(|_| KeyPackageFailure::AuthenticationRejected)?;
+        match self
+            .key_packages
+            .claim_federated(&self.store, &command, &claimant, now)
+            .await
+            .map_err(|error| map_key_package_persistence_error(&error))?
+        {
+            KeyPackageClaimOutcome::Claimed(receipt) => Ok(KeyPackageClaimSuccess {
+                status: StatusCode::CREATED,
+                exact_publish_bytes: receipt.exact_publish_bytes().to_vec(),
+            }),
+            KeyPackageClaimOutcome::Replayed(receipt) => Ok(KeyPackageClaimSuccess {
+                status: StatusCode::OK,
+                exact_publish_bytes: receipt.exact_publish_bytes().to_vec(),
+            }),
+        }
+    }
+
     fn committed_at(&self) -> Result<UtcMillis, ()> {
         UtcMillis::new(self.clock.now_utc_millis().map_err(|_| ())?).map_err(|_| ())
     }
@@ -1239,6 +1395,32 @@ fn has_exact_content_type(headers: &HeaderMap, expected: &'static str) -> bool {
     let mut values = headers.get_all(header::CONTENT_TYPE).iter();
     matches!(values.next(), Some(value) if value.as_bytes() == expected.as_bytes())
         && values.next().is_none()
+}
+
+fn has_exact_header(headers: &HeaderMap, name: header::HeaderName, expected: &'static str) -> bool {
+    let mut values = headers.get_all(name).iter();
+    matches!(values.next(), Some(value) if value.as_bytes() == expected.as_bytes())
+        && values.next().is_none()
+}
+
+fn single_graphic_header<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+    minimum_bytes: usize,
+    maximum_bytes: usize,
+) -> Result<&'a str, ()> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next().ok_or(())?;
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?;
+    if !(minimum_bytes..=maximum_bytes).contains(&value.len())
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(());
+    }
+    Ok(value)
 }
 
 fn idempotency_key_hash(
@@ -1586,6 +1768,16 @@ fn map_key_package_persistence_error(error: &IdentityPersistenceError) -> KeyPac
     }
 }
 
+fn map_federated_identity_error(error: FederatedIdentityError) -> KeyPackageFailure {
+    match error {
+        FederatedIdentityError::TemporarilyUnavailable => KeyPackageFailure::TemporarilyUnavailable,
+        FederatedIdentityError::InvalidOrigin
+        | FederatedIdentityError::InvalidTrustRoot
+        | FederatedIdentityError::InvalidIdentityLog
+        | FederatedIdentityError::DeviceUnavailable => KeyPackageFailure::AuthenticationRejected,
+    }
+}
+
 async fn parse_json_body<T>(body: Body) -> Result<T, DeviceSessionFailure>
 where
     T: DeserializeOwned,
@@ -1744,6 +1936,108 @@ fn parse_key_package_claim(bytes: &[u8]) -> Result<KeyPackageClaimRequest, KeyPa
         target_identity_id: key_package_parse_identity_id(key_package_cbor_field(fields, 2)?)?,
         target_device_id: key_package_parse_device_id(key_package_cbor_field(fields, 3)?)?,
     })
+}
+
+fn parse_federated_key_package_claim_proof(
+    headers: &HeaderMap,
+) -> Result<FederatedKeyPackageClaimProof, KeyPackageFailure> {
+    let proof = single_graphic_header(
+        headers,
+        KEY_PACKAGE_FEDERATED_CLAIM_PROOF_HEADER,
+        1,
+        MAX_KEY_PACKAGE_FEDERATED_CLAIM_PROOF_HEADER_BYTES,
+    )
+    .map_err(|()| KeyPackageFailure::AuthenticationRejected)?;
+    if !proof.bytes().all(is_base64url_byte) {
+        return Err(KeyPackageFailure::AuthenticationRejected);
+    }
+    let mut decoded = vec![0_u8; MAX_KEY_PACKAGE_FEDERATED_CLAIM_PROOF_HEADER_BYTES * 3 / 4];
+    let exact = Base64UrlUnpadded::decode(proof, &mut decoded)
+        .map_err(|_| KeyPackageFailure::AuthenticationRejected)?;
+    if Base64UrlUnpadded::encode_string(exact) != proof {
+        decoded.zeroize();
+        return Err(KeyPackageFailure::AuthenticationRejected);
+    }
+    let value =
+        decode_deterministic_cbor(exact).map_err(|_| KeyPackageFailure::AuthenticationRejected)?;
+    decoded.zeroize();
+    let fields = key_package_cbor_fields(&value, 14)
+        .map_err(|_| KeyPackageFailure::AuthenticationRejected)?;
+    if key_package_cbor_field(fields, 1).map_err(|_| KeyPackageFailure::AuthenticationRejected)?
+        != &CanonicalValue::Unsigned(2)
+    {
+        return Err(KeyPackageFailure::AuthenticationRejected);
+    }
+    let text = |key| -> Result<String, KeyPackageFailure> {
+        match key_package_cbor_field(fields, key)
+            .map_err(|_| KeyPackageFailure::AuthenticationRejected)?
+        {
+            CanonicalValue::Text(value) => Ok(value.clone()),
+            _ => Err(KeyPackageFailure::AuthenticationRejected),
+        }
+    };
+    FederatedKeyPackageClaimProof::new(
+        text(2)?,
+        key_package_parse_identity_id(
+            key_package_cbor_field(fields, 3)
+                .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        )
+        .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        key_package_parse_device_id(
+            key_package_cbor_field(fields, 4)
+                .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        )
+        .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        key_package_parse_identity_id(
+            key_package_cbor_field(fields, 5)
+                .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        )
+        .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        key_package_parse_device_id(
+            key_package_cbor_field(fields, 6)
+                .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        )
+        .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        text(7)?,
+        text(8)?,
+        Sha256Digest::from_bytes(
+            key_package_parse_bytes::<32>(
+                key_package_cbor_field(fields, 9)
+                    .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+            )
+            .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        ),
+        key_package_parse_utc_millis(
+            key_package_cbor_field(fields, 10)
+                .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        )
+        .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        key_package_parse_utc_millis(
+            key_package_cbor_field(fields, 11)
+                .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        )
+        .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        key_package_parse_bytes::<32>(
+            key_package_cbor_field(fields, 12)
+                .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        )
+        .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        Sha256Digest::from_bytes(
+            key_package_parse_bytes::<32>(
+                key_package_cbor_field(fields, 13)
+                    .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+            )
+            .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        ),
+        Ed25519Signature::from_bytes(
+            key_package_parse_bytes::<64>(
+                key_package_cbor_field(fields, 14)
+                    .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+            )
+            .map_err(|_| KeyPackageFailure::AuthenticationRejected)?,
+        ),
+    )
+    .map_err(|_| KeyPackageFailure::AuthenticationRejected)
 }
 
 fn key_package_cbor_fields(

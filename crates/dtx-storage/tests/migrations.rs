@@ -36,7 +36,8 @@ const AGENT_ROUTE_RUN_INGRESS_MIGRATION_VERSION: i64 = 202_607_160_029;
 const AGENT_ROUTE_BOOTSTRAP_V1_MIGRATION_VERSION: i64 = 202_607_160_030;
 const CONNECTOR_BINDING_STATE_OWNER_API_MIGRATION_VERSION: i64 = 202_607_160_031;
 const HERMES_ACP_ADAPTER_MIGRATION_VERSION: i64 = 202_607_160_032;
-const EXPECTED_MIGRATION_COUNT: i64 = 32;
+const FEDERATED_KEY_PACKAGE_CLAIMS_MIGRATION_VERSION: i64 = 202_607_160_033;
+const EXPECTED_MIGRATION_COUNT: i64 = 33;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -100,6 +101,8 @@ const CONNECTOR_BINDING_STATE_OWNER_API_DOWN: &str =
     include_str!("../../../migrations/202607160031_connector_binding_state_owner_api.down.sql");
 const HERMES_ACP_ADAPTER_DOWN: &str =
     include_str!("../../../migrations/202607160032_hermes_acp_adapter.down.sql");
+const FEDERATED_KEY_PACKAGE_CLAIMS_DOWN: &str =
+    include_str!("../../../migrations/202607160033_federated_key_package_claims.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -203,7 +206,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -237,8 +240,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(AGENT_ROUTE_BOOTSTRAP_V1_MIGRATION_VERSION)
     .bind(CONNECTOR_BINDING_STATE_OWNER_API_MIGRATION_VERSION)
     .bind(HERMES_ACP_ADAPTER_MIGRATION_VERSION)
+    .bind(FEDERATED_KEY_PACKAGE_CLAIMS_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(FEDERATED_KEY_PACKAGE_CLAIMS_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(HERMES_ACP_ADAPTER_DOWN)
         .execute(harness.admin_pool())
         .await?;

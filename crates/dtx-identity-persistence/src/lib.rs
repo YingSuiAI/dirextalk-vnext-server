@@ -31,6 +31,10 @@ pub use device_session::{
 };
 pub use error::IdentityPersistenceError;
 pub use key_package::{
+    FEDERATED_KEY_PACKAGE_CLAIM_BINDING_HASH_DOMAIN, FEDERATED_KEY_PACKAGE_CLAIM_BODY_HASH_DOMAIN,
+    FEDERATED_KEY_PACKAGE_CLAIM_METHOD, FEDERATED_KEY_PACKAGE_CLAIM_PATH,
+    FEDERATED_KEY_PACKAGE_CLAIM_PROOF_MAX_LIFETIME_MILLIS,
+    FEDERATED_KEY_PACKAGE_CLAIM_SIGNATURE_DOMAIN, FederatedKeyPackageClaimProof,
     KEY_PACKAGE_BYTES_HASH_DOMAIN, KEY_PACKAGE_CLAIM_RECEIPT_HASH_DOMAIN,
     KEY_PACKAGE_CLAIM_REPLAY_RETENTION_MILLIS, KEY_PACKAGE_CLAIM_REQUEST_HASH_DOMAIN,
     KEY_PACKAGE_MAX_TTL_MILLIS, KEY_PACKAGE_PUBLISH_BINDING_HASH_DOMAIN,
@@ -38,8 +42,9 @@ pub use key_package::{
     KEY_PACKAGE_PUBLISH_SIGNATURE_DOMAIN, KeyPackageClaimCommand, KeyPackageClaimOutcome,
     KeyPackageClaimReceipt, KeyPackagePublishCommand, KeyPackagePublishOutcome,
     KeyPackagePublishReceipt, KeyPackageRepository, MAX_KEY_PACKAGE_BYTES,
-    MAX_KEY_PACKAGE_PUBLISH_BYTES, key_package_publish_binding_canonical_bytes,
-    key_package_publish_signature_input,
+    MAX_KEY_PACKAGE_PUBLISH_BYTES, VerifiedFederatedKeyPackageClaimant,
+    federated_key_package_claim_body_digest, federated_key_package_claim_signature_input,
+    key_package_publish_binding_canonical_bytes, key_package_publish_signature_input,
 };
 pub use repository::{
     IdentityLogPageReadOutcome, IdentityLogRepository, lock_and_load_active_snapshot,

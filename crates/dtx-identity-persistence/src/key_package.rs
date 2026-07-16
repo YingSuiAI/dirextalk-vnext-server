@@ -43,9 +43,25 @@ pub const KEY_PACKAGE_CLAIM_REQUEST_HASH_DOMAIN: &[u8] =
 /// Domain separator for the exact retained claim response envelope.
 pub const KEY_PACKAGE_CLAIM_RECEIPT_HASH_DOMAIN: &[u8] =
     b"dirextalk.key-package-claim-receipt.v1\0";
+/// V2 request path authenticated by a remote device proof instead of a bearer.
+pub const FEDERATED_KEY_PACKAGE_CLAIM_PATH: &str = "/v2/key-packages/claim";
+/// Exact HTTP method bound into every V2 federated claim proof.
+pub const FEDERATED_KEY_PACKAGE_CLAIM_METHOD: &str = "POST";
+/// Maximum lifetime accepted for one remote claim proof.
+pub const FEDERATED_KEY_PACKAGE_CLAIM_PROOF_MAX_LIFETIME_MILLIS: i64 = 300_000;
+/// Domain for the exact V1 claim-body digest carried by a V2 proof.
+pub const FEDERATED_KEY_PACKAGE_CLAIM_BODY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.key-package-federated-claim-body.v2\0";
+/// Domain for the canonical V2 proof binding digest.
+pub const FEDERATED_KEY_PACKAGE_CLAIM_BINDING_HASH_DOMAIN: &[u8] =
+    b"dirextalk.key-package-federated-claim-binding.v2\0";
+/// Domain prefixed to the remote device signature input.
+pub const FEDERATED_KEY_PACKAGE_CLAIM_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.key-package-federated-claim-signature.v2\0";
 
 const AVAILABLE_STATE: &str = "available";
 const CLAIMED_STATE: &str = "claimed";
+const LOCAL_CLAIMANT_ORIGIN: &str = "";
 const KEY_PACKAGE_PRUNE_BATCH_SIZE: i32 = 256;
 
 /// One exact, device-signed publish request. MLS bytes stay opaque: the
@@ -355,6 +371,255 @@ impl CanonicalEncode for KeyPackageClaimCommand {
             ),
         ])
     }
+}
+
+/// Parsed V2 proof fields which become authoritative only after the target
+/// node resolves the requester's current identity log and verifies this proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FederatedKeyPackageClaimProof {
+    requester_identity_origin: String,
+    requester_identity_id: IdentityId,
+    requester_device_id: DeviceId,
+    target_identity_id: IdentityId,
+    target_device_id: DeviceId,
+    method: String,
+    path: String,
+    body_digest: Sha256Digest,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    nonce: [u8; 32],
+    idempotency_key_hash: Sha256Digest,
+    signature: Ed25519Signature,
+}
+
+impl FederatedKeyPackageClaimProof {
+    /// Builds a parsed proof while retaining every signed coordinate.
+    /// Cryptographic and current-device verification happens in [`Self::verify`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-command error when the requester origin or nonce is
+    /// not suitable for a signed federated request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        requester_identity_origin: impl Into<String>,
+        requester_identity_id: IdentityId,
+        requester_device_id: DeviceId,
+        target_identity_id: IdentityId,
+        target_device_id: DeviceId,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        body_digest: Sha256Digest,
+        issued_at: UtcMillis,
+        expires_at: UtcMillis,
+        nonce: [u8; 32],
+        idempotency_key_hash: Sha256Digest,
+        signature: Ed25519Signature,
+    ) -> Result<Self, IdentityPersistenceError> {
+        let proof = Self {
+            requester_identity_origin: requester_identity_origin.into(),
+            requester_identity_id,
+            requester_device_id,
+            target_identity_id,
+            target_device_id,
+            method: method.into(),
+            path: path.into(),
+            body_digest,
+            issued_at,
+            expires_at,
+            nonce,
+            idempotency_key_hash,
+            signature,
+        };
+        if !(8..=512).contains(&proof.requester_identity_origin.len())
+            || !proof
+                .requester_identity_origin
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic())
+            || proof.nonce.iter().all(|byte| *byte == 0)
+        {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "federated key package claim proof",
+            ));
+        }
+        Ok(proof)
+    }
+
+    /// Returns the signed requester origin used for remote log resolution.
+    #[must_use]
+    pub fn requester_identity_origin(&self) -> &str {
+        &self.requester_identity_origin
+    }
+
+    /// Returns the signed requester identity.
+    #[must_use]
+    pub const fn requester_identity_id(&self) -> IdentityId {
+        self.requester_identity_id
+    }
+
+    /// Returns the signed requester device.
+    #[must_use]
+    pub const fn requester_device_id(&self) -> DeviceId {
+        self.requester_device_id
+    }
+
+    /// Verifies all HTTP, target, body, time, nonce and idempotency bindings
+    /// using the current active-device key fetched from the requester origin.
+    ///
+    /// # Errors
+    ///
+    /// Returns a uniform authentication rejection for any mismatch or invalid
+    /// remote signature.
+    pub fn verify(
+        &self,
+        command: &KeyPackageClaimCommand,
+        now: UtcMillis,
+        signing_key: SigningPublicKey,
+    ) -> Result<VerifiedFederatedKeyPackageClaimant, IdentityPersistenceError> {
+        let lifetime = self
+            .expires_at
+            .get()
+            .checked_sub(self.issued_at.get())
+            .ok_or(IdentityPersistenceError::DeviceAuthenticationRejected)?;
+        if self.target_identity_id != command.target_identity_id()
+            || self.target_device_id != command.target_device_id()
+            || self.method != FEDERATED_KEY_PACKAGE_CLAIM_METHOD
+            || self.path != FEDERATED_KEY_PACKAGE_CLAIM_PATH
+            || self.body_digest != federated_key_package_claim_body_digest(command)
+            || self.idempotency_key_hash != command.idempotency_key_hash()
+            || self.issued_at > now
+            || now >= self.expires_at
+            || !(1..=FEDERATED_KEY_PACKAGE_CLAIM_PROOF_MAX_LIFETIME_MILLIS).contains(&lifetime)
+        {
+            return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+        }
+        let signature_input = federated_key_package_claim_signature_input(
+            &self.requester_identity_origin,
+            self.requester_identity_id,
+            self.requester_device_id,
+            self.target_identity_id,
+            self.target_device_id,
+            &self.method,
+            &self.path,
+            self.body_digest,
+            self.issued_at,
+            self.expires_at,
+            self.nonce,
+            self.idempotency_key_hash,
+        )?;
+        let verifying_key = VerifyingKey::from_bytes(signing_key.as_bytes())
+            .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?;
+        verifying_key
+            .verify_strict(
+                &signature_input,
+                &Signature::from_bytes(self.signature.as_bytes()),
+            )
+            .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?;
+        Ok(VerifiedFederatedKeyPackageClaimant {
+            identity_origin: self.requester_identity_origin.clone(),
+            identity_id: self.requester_identity_id,
+            device_id: self.requester_device_id,
+        })
+    }
+}
+
+/// Remote claimant identity that can only be produced by a complete V2 proof
+/// verification against a freshly resolved active-device key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedFederatedKeyPackageClaimant {
+    identity_origin: String,
+    identity_id: IdentityId,
+    device_id: DeviceId,
+}
+
+/// Computes the exact signed body digest for a federated V2 claim.
+#[must_use]
+pub fn federated_key_package_claim_body_digest(command: &KeyPackageClaimCommand) -> Sha256Digest {
+    Sha256Digest::hash_domain(
+        FEDERATED_KEY_PACKAGE_CLAIM_BODY_HASH_DOMAIN,
+        &command.exact_claim_bytes,
+    )
+}
+
+/// Builds the canonical V2 remote-device signature input.
+///
+/// # Errors
+///
+/// Returns an error only when deterministic CBOR encoding fails.
+#[allow(clippy::too_many_arguments)]
+pub fn federated_key_package_claim_signature_input(
+    requester_identity_origin: &str,
+    requester_identity_id: IdentityId,
+    requester_device_id: DeviceId,
+    target_identity_id: IdentityId,
+    target_device_id: DeviceId,
+    method: &str,
+    path: &str,
+    body_digest: Sha256Digest,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    nonce: [u8; 32],
+    idempotency_key_hash: Sha256Digest,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    let binding = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(requester_identity_origin.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(requester_identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(requester_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(target_identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Text(target_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Text(method.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Text(path.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(9),
+            body_digest.to_canonical_value(),
+        ),
+        (CanonicalValue::Unsigned(10), issued_at.to_canonical_value()),
+        (
+            CanonicalValue::Unsigned(11),
+            expires_at.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(12),
+            CanonicalValue::Bytes(nonce.to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(13),
+            idempotency_key_hash.to_canonical_value(),
+        ),
+    ]))
+    .map_err(|_| {
+        IdentityPersistenceError::InvalidCommand("federated key package claim encoding")
+    })?;
+    let digest =
+        Sha256Digest::hash_domain(FEDERATED_KEY_PACKAGE_CLAIM_BINDING_HASH_DOMAIN, &binding);
+    let mut input = Vec::with_capacity(
+        FEDERATED_KEY_PACKAGE_CLAIM_SIGNATURE_DOMAIN.len() + digest.as_bytes().len(),
+    );
+    input.extend_from_slice(FEDERATED_KEY_PACKAGE_CLAIM_SIGNATURE_DOMAIN);
+    input.extend_from_slice(digest.as_bytes());
+    Ok(input)
 }
 
 /// Builds the canonical unsigned binding that an active device signs before a
@@ -748,38 +1013,58 @@ impl KeyPackageRepository {
                 now,
             )
             .await?;
-            prune_expired_key_package_state(session.connection(), now).await?;
-            match claim_claim_command(
+            claim_for_verified_claimant(
                 session.connection(),
+                LOCAL_CLAIMANT_ORIGIN,
                 claimant.identity_id(),
                 claimant.device_id(),
                 command,
                 request_digest,
                 now,
             )
-            .await?
-            {
-                ClaimCommandClaim::Replay(receipt) => {
-                    return Ok(KeyPackageClaimOutcome::Replayed(receipt));
-                }
-                ClaimCommandClaim::Execute => {}
-            }
-            ensure_target_active(
-                session.connection(),
-                command.target_identity_id(),
-                command.target_device_id(),
-            )
-            .await?;
-            let package = claim_available_package(
-                session.connection(),
-                claimant.identity_id(),
-                claimant.device_id(),
-                command,
-                now,
-            )
-            .await?;
-            Ok(KeyPackageClaimOutcome::Claimed(package))
+            .await
         }
+        .await;
+        match result {
+            Ok(outcome) => {
+                session.commit().await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = session.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Consumes a package for a requester whose signed V2 proof was verified
+    /// against a freshly resolved remote identity-log active device.
+    ///
+    /// Authentication still precedes idempotent replay: callers cannot create
+    /// this claimant value after the remote device is revoked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when target state, exact replay, or durable storage is
+    /// invalid or unavailable.
+    pub async fn claim_federated(
+        self,
+        store: &IdentityPgStore,
+        command: &KeyPackageClaimCommand,
+        claimant: &VerifiedFederatedKeyPackageClaimant,
+        now: UtcMillis,
+    ) -> Result<KeyPackageClaimOutcome, IdentityPersistenceError> {
+        let request_digest = command.request_digest();
+        let mut session = store.begin().await?;
+        let result = claim_for_verified_claimant(
+            session.connection(),
+            &claimant.identity_origin,
+            claimant.identity_id,
+            claimant.device_id,
+            command,
+            request_digest,
+            now,
+        )
         .await;
         match result {
             Ok(outcome) => {
@@ -802,6 +1087,51 @@ enum PublishCommandClaim {
 enum ClaimCommandClaim {
     Execute,
     Replay(KeyPackageClaimReceipt),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn claim_for_verified_claimant(
+    connection: &mut PgConnection,
+    claimant_identity_origin: &str,
+    claimant_identity_id: IdentityId,
+    claimant_device_id: DeviceId,
+    command: &KeyPackageClaimCommand,
+    request_digest: Sha256Digest,
+    now: UtcMillis,
+) -> Result<KeyPackageClaimOutcome, IdentityPersistenceError> {
+    prune_expired_key_package_state(connection, now).await?;
+    match claim_claim_command(
+        connection,
+        claimant_identity_origin,
+        claimant_identity_id,
+        claimant_device_id,
+        command,
+        request_digest,
+        now,
+    )
+    .await?
+    {
+        ClaimCommandClaim::Replay(receipt) => {
+            return Ok(KeyPackageClaimOutcome::Replayed(receipt));
+        }
+        ClaimCommandClaim::Execute => {}
+    }
+    ensure_target_active(
+        connection,
+        command.target_identity_id(),
+        command.target_device_id(),
+    )
+    .await?;
+    let package = claim_available_package(
+        connection,
+        claimant_identity_origin,
+        claimant_identity_id,
+        claimant_device_id,
+        command,
+        now,
+    )
+    .await?;
+    Ok(KeyPackageClaimOutcome::Claimed(package))
 }
 
 async fn claim_publish_command(
@@ -901,6 +1231,7 @@ async fn insert_key_package(
 
 async fn claim_claim_command(
     connection: &mut PgConnection,
+    claimant_identity_origin: &str,
     claimant_identity_id: IdentityId,
     claimant_device_id: DeviceId,
     command: &KeyPackageClaimCommand,
@@ -909,11 +1240,12 @@ async fn claim_claim_command(
 ) -> Result<ClaimCommandClaim, IdentityPersistenceError> {
     let inserted = sqlx::query(
         "INSERT INTO identity.key_package_claims (
-             claimant_identity_id, claimant_device_id, idempotency_key_hash,
+             claimant_identity_origin, claimant_identity_id, claimant_device_id, idempotency_key_hash,
              target_identity_id, target_device_id, request_digest, created_at_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
          ON CONFLICT DO NOTHING",
     )
+    .bind(claimant_identity_origin)
     .bind(claimant_identity_id.to_string())
     .bind(*claimant_device_id.as_uuid())
     .bind(command.idempotency_key_hash().as_bytes().as_slice())
@@ -931,8 +1263,12 @@ async fn claim_claim_command(
     let row = sqlx::query(
         "SELECT target_identity_id, target_device_id, request_digest
            FROM identity.key_package_claims
-          WHERE claimant_identity_id=$1 AND claimant_device_id=$2 AND idempotency_key_hash=$3",
+          WHERE claimant_identity_origin=$1
+            AND claimant_identity_id=$2
+            AND claimant_device_id=$3
+            AND idempotency_key_hash=$4",
     )
+    .bind(claimant_identity_origin)
     .bind(claimant_identity_id.to_string())
     .bind(*claimant_device_id.as_uuid())
     .bind(command.idempotency_key_hash().as_bytes().as_slice())
@@ -951,6 +1287,7 @@ async fn claim_claim_command(
     Ok(ClaimCommandClaim::Replay(
         load_claim_receipt(
             connection,
+            claimant_identity_origin,
             claimant_identity_id,
             claimant_device_id,
             command.idempotency_key_hash(),
@@ -988,6 +1325,7 @@ async fn ensure_target_active(
 
 async fn claim_available_package(
     connection: &mut PgConnection,
+    claimant_identity_origin: &str,
     claimant_identity_id: IdentityId,
     claimant_device_id: DeviceId,
     command: &KeyPackageClaimCommand,
@@ -1032,10 +1370,11 @@ async fn claim_available_package(
     let receipt = KeyPackageClaimReceipt::new(exact_publish_bytes)?;
     sqlx::query(
         "INSERT INTO identity.key_package_claim_receipts (
-             claimant_identity_id, claimant_device_id, idempotency_key_hash,
+             claimant_identity_origin, claimant_identity_id, claimant_device_id, idempotency_key_hash,
              package_id, receipt_bytes, receipt_digest, claimed_at_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
     )
+    .bind(claimant_identity_origin)
     .bind(claimant_identity_id.to_string())
     .bind(*claimant_device_id.as_uuid())
     .bind(command.idempotency_key_hash().as_bytes().as_slice())
@@ -1050,6 +1389,7 @@ async fn claim_available_package(
 
 async fn load_claim_receipt(
     connection: &mut PgConnection,
+    claimant_identity_origin: &str,
     claimant_identity_id: IdentityId,
     claimant_device_id: DeviceId,
     idempotency_key_hash: Sha256Digest,
@@ -1057,8 +1397,12 @@ async fn load_claim_receipt(
     let row = sqlx::query(
         "SELECT receipt_bytes, receipt_digest
            FROM identity.key_package_claim_receipts
-          WHERE claimant_identity_id=$1 AND claimant_device_id=$2 AND idempotency_key_hash=$3",
+          WHERE claimant_identity_origin=$1
+            AND claimant_identity_id=$2
+            AND claimant_device_id=$3
+            AND idempotency_key_hash=$4",
     )
+    .bind(claimant_identity_origin)
     .bind(claimant_identity_id.to_string())
     .bind(*claimant_device_id.as_uuid())
     .bind(idempotency_key_hash.as_bytes().as_slice())

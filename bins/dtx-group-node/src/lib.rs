@@ -6,7 +6,6 @@
 //! not invent an MLS result: a later Sequencer adapter is the only component
 //! allowed to turn that intent into a committed membership fact.
 
-mod federated_identity;
 mod sequencer_key;
 
 use std::{fmt::Write as _, sync::Arc};
@@ -24,6 +23,7 @@ use dtx_domain::{
     ChannelId, Clock, ConversationId, DeviceId, DeviceSessionId, IdentityId, InviteCapabilityId,
     JoinRequestId, RequestId, Revision, SystemClock, TenantId,
 };
+use dtx_federated_identity::{FederatedIdentityError, FederatedIdentityVerifier};
 use dtx_group_persistence::{
     GroupControlCommand, GroupControlDisposition, GroupControlExecution, GroupControlOperation,
     GroupControlReceipt, GroupControlRejection, GroupControlRepository, GroupMembershipRepository,
@@ -46,8 +46,6 @@ use dtx_wire::{
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
-
-use crate::federated_identity::{FederatedIdentityError, FederatedIdentityVerifier};
 
 pub use crate::sequencer_key::load_mls_sequencer_signing_key;
 

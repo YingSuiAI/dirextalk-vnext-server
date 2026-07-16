@@ -13,6 +13,7 @@ path = "src/main.rs"
 axum.workspace = true
 base64ct.workspace = true
 dtx-domain = { path = "../../crates/dtx-domain" }
+dtx-federated-identity = { path = "../../crates/dtx-federated-identity" }
 dtx-group-persistence = { path = "../../crates/dtx-group-persistence" }
 dtx-group-policy = { path = "../../crates/dtx-group-policy" }
 dtx-identity-log = { path = "../../crates/dtx-identity-log" }

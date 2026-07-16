@@ -977,12 +977,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-federated-identity"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "dtx-domain",
+ "dtx-identity-log",
+ "dtx-wire",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "x509-parser",
+]
+
+[[package]]
 name = "dtx-group-node"
 version = "0.1.0"
 dependencies = [
  "axum",
  "base64ct",
  "dtx-domain",
+ "dtx-federated-identity",
  "dtx-group-persistence",
  "dtx-group-policy",
  "dtx-identity-log",
@@ -1060,6 +1075,7 @@ dependencies = [
  "base64ct",
  "dtx-contact",
  "dtx-domain",
+ "dtx-federated-identity",
  "dtx-identity-log",
  "dtx-identity-persistence",
  "dtx-storage",

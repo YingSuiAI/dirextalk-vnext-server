@@ -1,3 +1,7 @@
+#![forbid(unsafe_code)]
+
+//! Hardened remote identity-log resolution shared by federated services.
+
 use std::{collections::BTreeSet, fmt, time::Duration};
 
 use dtx_domain::{DeviceId, IdentityId};
@@ -15,13 +19,13 @@ const MAX_IDENTITY_LOG_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IDENTITY_LOG_PAGES: usize = 256;
 
 #[derive(Clone)]
-pub(crate) struct FederatedIdentityVerifier {
+pub struct FederatedIdentityVerifier {
     client: Client,
     allowed_http_origins: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FederatedIdentityError {
+pub enum FederatedIdentityError {
     InvalidOrigin,
     InvalidTrustRoot,
     InvalidIdentityLog,
@@ -44,7 +48,14 @@ impl fmt::Display for FederatedIdentityError {
 impl std::error::Error for FederatedIdentityError {}
 
 impl FederatedIdentityVerifier {
-    pub(crate) fn new(
+    /// Builds a verifier that permits HTTPS origins and the explicitly listed
+    /// development-only HTTP origins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an HTTP origin is invalid or the hardened HTTP
+    /// client cannot be constructed.
+    pub fn new(
         allowed_http_origins: impl IntoIterator<Item = String>,
     ) -> Result<Self, FederatedIdentityError> {
         let mut canonical_http_origins = BTreeSet::new();
@@ -62,7 +73,16 @@ impl FederatedIdentityVerifier {
         })
     }
 
-    pub(crate) fn new_with_public_origin_and_additional_trust_root_pem(
+    /// Builds a verifier and canonicalizes the local node's public origin.
+    ///
+    /// An optional CA certificate extends the platform trust store without
+    /// replacing normal hostname and certificate-chain validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid public or allowed origin, an invalid CA
+    /// certificate, or a failure to construct the hardened HTTP client.
+    pub fn new_with_public_origin_and_additional_trust_root_pem(
         public_origin: &str,
         allowed_http_origins: impl IntoIterator<Item = String>,
         additional_trust_root_pem: Option<&[u8]>,
@@ -96,7 +116,15 @@ impl FederatedIdentityVerifier {
         Ok(self)
     }
 
-    pub(crate) async fn active_device_signing_key(
+    /// Resolves the current active signing key for one remote device from its
+    /// origin's canonical identity log.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the origin is not allowed, the remote service is
+    /// unavailable, the identity log is invalid, or the requested device is
+    /// absent or no longer active.
+    pub async fn active_device_signing_key(
         &self,
         origin: &str,
         identity_id: IdentityId,

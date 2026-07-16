@@ -92,7 +92,13 @@ async fn run() -> Result<(), NodeError> {
         identity_store,
         clock.clone(),
         public_origin.clone(),
-    );
+    )
+    .with_federated_identity_configuration(
+        &public_origin,
+        allowed_http_identity_origins.clone(),
+        additional_federated_identity_trust_root_pem.as_deref(),
+    )
+    .map_err(|_| NodeError::Configuration)?;
     let group_state = configured_group_state(
         group_store,
         tenant_id,

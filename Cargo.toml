@@ -21,6 +21,7 @@ members = [
     "crates/dtx-connect-registry",
     "crates/dtx-domain",
     "crates/dtx-contact",
+    "crates/dtx-federated-identity",
     "crates/dtx-group-policy",
     "crates/dtx-group-persistence",
     "crates/dtx-http-cache",

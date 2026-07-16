@@ -1,0 +1,21 @@
+[package]
+name = "dtx-federated-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+dtx-domain = { path = "../dtx-domain" }
+dtx-identity-log = { path = "../dtx-identity-log" }
+dtx-wire = { path = "../dtx-wire" }
+reqwest.workspace = true
+rustls.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+base64ct.workspace = true
+rcgen.workspace = true
+
+[lints]
+workspace = true
