@@ -1,15 +1,22 @@
 //! Durable, opaque RouteBootstrapV1 application boundary.
 //!
-//! The control stream is intentionally not wired in this stage.  Its future
-//! drain must call the recipient/terminal functions below only after the
-//! existing authenticated Connector fence has been verified; no HTTP action
-//! can manufacture an `Installed` head.
+//! Owner Begin and Delivery atomically append authenticated durable Connector
+//! commands with their bootstrap records.  Only the authenticated Connector
+//! result path may advance a bootstrap to `Installed`; no HTTP action can
+//! manufacture an eligible binding head.
 
 use std::fmt;
 
+use dtx_agent_control::{
+    DeliverAgentRouteBootstrap, DurableServerCommand, DurableServerCommandSnapshot,
+    OpaqueAgentRouteBytes, PrepareAgentRouteRecipient, ServerCommandPayload,
+    Sha256Digest as ControlSha256Digest,
+};
+use dtx_agent_persistence::{AgentPersistenceError, CommandLogRepository};
 use dtx_domain::{
     AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId, BindingId,
-    ConnectorId, ConversationId, DeviceId, IdentityId, InstallationId, OutboxId, TenantId,
+    ConnectorId, ConversationId, DeviceId, IdentityId, InstallationId, OutboxId, RequestId,
+    Revision, TenantId,
 };
 use dtx_identity_persistence::{DeviceSessionCredential, DeviceSessionRepository};
 use dtx_storage::PgStore;
@@ -20,6 +27,8 @@ use dtx_wire::{
 use ed25519_dalek::{Signature, VerifyingKey};
 use sqlx::Row;
 use uuid::Uuid;
+
+use crate::{ProtobufDurableCommandDecoder, ProtobufDurableCommandEncoder};
 
 pub const AGENT_ROUTE_BOOTSTRAP_BEGIN_BINDING_DOMAIN: &[u8] =
     b"dirextalk.agent-route-bootstrap-begin-binding.v1\0";
@@ -115,7 +124,7 @@ impl std::error::Error for AgentRouteBootstrapError {}
 /// Owner-signed Begin intent.  The MLS route fence does not exist yet at this
 /// point: it is created by the local import and accepted only from its
 /// authenticated `Installed` receipt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AgentRouteBootstrapBeginCommand {
     pub bootstrap_id: AgentRouteBootstrapId,
     pub tenant_id: TenantId,
@@ -124,9 +133,30 @@ pub struct AgentRouteBootstrapBeginCommand {
     pub agent_control_device_id: AgentDeviceId,
     pub owner_identity_id: IdentityId,
     pub owner_device_id: DeviceId,
+    /// Native-only opaque Owner intent for the isolated route.  It is neither
+    /// parsed nor logged by the server and is forwarded verbatim to Agent
+    /// Control inside the durable Prepare command.
+    pub owner_signed_intent: Vec<u8>,
     pub expires_at: UtcMillis,
     pub binding_digest: Sha256Digest,
     pub owner_signature: Ed25519Signature,
+}
+
+impl fmt::Debug for AgentRouteBootstrapBeginCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentRouteBootstrapBeginCommand")
+            .field("bootstrap_id", &self.bootstrap_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("installation_id", &self.installation_id)
+            .field("binding_id", &self.binding_id)
+            .field("agent_control_device_id", &self.agent_control_device_id)
+            .field("owner_identity_id", &self.owner_identity_id)
+            .field("owner_device_id", &self.owner_device_id)
+            .field("owner_signed_intent", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Owner-signed delivery of one encrypted MLS bootstrap.  The server never
@@ -629,7 +659,7 @@ async fn begin_in_transaction(
     connection: &mut sqlx::PgConnection,
     credential: &DeviceSessionCredential,
     command: &AgentRouteBootstrapBeginCommand,
-    exact_body: &[u8],
+    _exact_body: &[u8],
     request_digest: Sha256Digest,
     now: UtcMillis,
 ) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
@@ -734,7 +764,7 @@ async fn begin_in_transaction(
     .bind(Uuid::from(command.binding_id))
     .bind(Uuid::from(command.agent_control_device_id))
     .bind(Uuid::from(connector_id))
-    .bind(exact_body)
+    .bind(&command.owner_signed_intent)
     .bind(request_digest.as_bytes().as_slice())
     .bind(&receipt)
     .bind(receipt_digest.as_bytes().as_slice())
@@ -744,20 +774,49 @@ async fn begin_in_transaction(
     .await
     .map_err(map_sql)?;
 
-    // TODO(control-v1.4): atomically translate this exact payload into the
-    // authenticated Connector command log and mark it dispatched on ack.
-    let payload = prepare_outbox_payload(command, exact_body)?;
+    let operation_id = RequestId::try_from(Uuid::from(command.bootstrap_id))
+        .map_err(|_| AgentRouteBootstrapError::InvalidRequest)?;
+    let control_payload =
+        ServerCommandPayload::PrepareAgentRouteRecipient(PrepareAgentRouteRecipient {
+            bootstrap_id: command.bootstrap_id,
+            tenant_id: command.tenant_id,
+            installation_id: command.installation_id,
+            binding_id: command.binding_id,
+            agent_control_device_id: command.agent_control_device_id,
+            owner_identity_id: command.owner_identity_id,
+            owner_device_id: command.owner_device_id,
+            // The native-only Owner intent remains opaque to Agent Control.
+            owner_signed_intent: OpaqueAgentRouteBytes::new(command.owner_signed_intent.clone())
+                .map_err(|_| AgentRouteBootstrapError::InvalidRequest)?,
+            expires_at_millis: command.expires_at.get(),
+        });
+    let durable = append_route_bootstrap_command(
+        connection,
+        command.tenant_id,
+        connector_id,
+        operation_id,
+        "prepare_agent_route_recipient",
+        control_payload,
+        now,
+    )
+    .await?;
+    let payload = prepare_outbox_payload(command, &command.owner_signed_intent)?;
     let payload_digest = Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_OUTBOX_DOMAIN, &payload);
     sqlx::query(
         "INSERT INTO agent.agent_route_bootstrap_outbox (
-             tenant_id, outbox_id, bootstrap_id, connector_id, command_kind,
-             payload_digest, opaque_payload, state, created_at_ms
-         ) VALUES ($1,$2,$3,$4,'prepare_recipient',$5,$6,'pending',$7)",
+             tenant_id, outbox_id, bootstrap_id, connector_id, operation_id,
+             command_sequence, command_payload_digest, encoded_command_digest,
+             command_kind, payload_digest, opaque_payload, state, created_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'prepare_recipient',$9,$10,'pending',$11)",
     )
     .bind(Uuid::from(command.tenant_id))
     .bind(Uuid::from(OutboxId::new()))
     .bind(Uuid::from(command.bootstrap_id))
     .bind(Uuid::from(connector_id))
+    .bind(Uuid::from(operation_id))
+    .bind(i64::try_from(durable.sequence()).map_err(|_| AgentRouteBootstrapError::Unavailable)?)
+    .bind(durable.payload_digest().as_bytes().as_slice())
+    .bind(durable.encoded_command_digest().as_bytes().as_slice())
     .bind(payload_digest.as_bytes().as_slice())
     .bind(payload)
     .bind(now.get())
@@ -887,19 +946,52 @@ async fn deliver_in_transaction(
     if changed.rows_affected() != 1 {
         return Err(AgentRouteBootstrapError::Conflict);
     }
+    let operation_id = RequestId::try_from(Uuid::from(command.delivery_id))
+        .map_err(|_| AgentRouteBootstrapError::InvalidRequest)?;
+    let control_payload =
+        ServerCommandPayload::DeliverAgentRouteBootstrap(DeliverAgentRouteBootstrap {
+            bootstrap_id: command.bootstrap_id,
+            delivery_id: command.delivery_id,
+            route_id: command.route_id,
+            recipient_id: command.recipient_id,
+            capsule_digest: ControlSha256Digest::from_bytes(*command.capsule_digest.as_bytes()),
+            opaque_sealed_bootstrap: OpaqueAgentRouteBytes::new(
+                command.opaque_sealed_bootstrap.clone(),
+            )
+            .map_err(|_| AgentRouteBootstrapError::InvalidRequest)?,
+            expires_at_millis: command.expires_at.get(),
+            installation_id: command.installation_id,
+            binding_id: command.binding_id,
+            agent_control_device_id: command.agent_control_device_id,
+        });
+    let durable = append_route_bootstrap_command(
+        connection,
+        command.tenant_id,
+        row.connector_id,
+        operation_id,
+        "deliver_agent_route_bootstrap",
+        control_payload,
+        now,
+    )
+    .await?;
     let payload = delivery_outbox_payload(command)?;
     let payload_digest = Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_OUTBOX_DOMAIN, &payload);
     sqlx::query(
         "INSERT INTO agent.agent_route_bootstrap_outbox (
-             tenant_id, outbox_id, bootstrap_id, delivery_id, connector_id, command_kind,
-             payload_digest, opaque_payload, state, created_at_ms
-         ) VALUES ($1,$2,$3,$4,$5,'deliver_bootstrap',$6,$7,'pending',$8)",
+             tenant_id, outbox_id, bootstrap_id, delivery_id, connector_id, operation_id,
+             command_sequence, command_payload_digest, encoded_command_digest,
+             command_kind, payload_digest, opaque_payload, state, created_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'deliver_bootstrap',$10,$11,'pending',$12)",
     )
     .bind(Uuid::from(command.tenant_id))
     .bind(Uuid::from(OutboxId::new()))
     .bind(Uuid::from(command.bootstrap_id))
     .bind(Uuid::from(command.delivery_id))
     .bind(Uuid::from(row.connector_id))
+    .bind(Uuid::from(operation_id))
+    .bind(i64::try_from(durable.sequence()).map_err(|_| AgentRouteBootstrapError::Unavailable)?)
+    .bind(durable.payload_digest().as_bytes().as_slice())
+    .bind(durable.encoded_command_digest().as_bytes().as_slice())
     .bind(payload_digest.as_bytes().as_slice())
     .bind(payload)
     .bind(now.get())
@@ -911,6 +1003,89 @@ async fn deliver_in_transaction(
         state: AgentRouteBootstrapState::PendingDelivery,
         exact_cbor: receipt,
     })
+}
+
+/// Appends one RouteBootstrap command and its immutable operation publication
+/// beneath the Connector stream-head lock held by this tenant transaction.
+///
+/// The caller persists its bootstrap state and audit outbox in the same
+/// transaction.  The deferred publication trigger observes both the immutable
+/// operation row and the exact command projection only at commit.
+async fn append_route_bootstrap_command(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    connector_id: ConnectorId,
+    operation_id: RequestId,
+    operation_kind: &'static str,
+    control_payload: ServerCommandPayload,
+    now: UtcMillis,
+) -> Result<DurableServerCommand, AgentRouteBootstrapError> {
+    let repository = CommandLogRepository::new();
+    let head = repository
+        .lock_head_for_update(connection, tenant_id, connector_id)
+        .await
+        .map_err(map_command_log)?;
+    if head.state() != dtx_agent_control::CommandLogState::Active {
+        return Err(AgentRouteBootstrapError::Conflict);
+    }
+    let sequence = head
+        .last_sequence()
+        .checked_add(1)
+        .filter(|value| *value <= Revision::MAX)
+        .ok_or(AgentRouteBootstrapError::Conflict)?;
+
+    // The operation is deliberately inserted before the durable command.  Its
+    // publication trigger is deferred, so commit verifies the command has been
+    // appended without exposing an operation that has no exact command row.
+    sqlx::query(
+        "INSERT INTO agent.connector_control_operations (
+             tenant_id, operation_id, connector_id, operation_kind, created_at_ms
+         ) VALUES ($1,$2,$3,$4,$5)",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(operation_id))
+    .bind(Uuid::from(connector_id))
+    .bind(operation_kind)
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await
+    .map_err(map_sql)?;
+
+    let encoded = ProtobufDurableCommandEncoder
+        .encode(
+            sequence,
+            operation_id,
+            head.generation(),
+            head.spec_revision(),
+            &control_payload,
+        )
+        .map_err(|_| AgentRouteBootstrapError::InvalidRequest)?;
+    let payload_digest = encoded.payload_digest();
+    let exact_bytes = encoded.into_exact_bytes();
+    let durable = DurableServerCommand::try_from_snapshot(DurableServerCommandSnapshot {
+        sequence,
+        operation_id,
+        generation: head.generation(),
+        spec_revision: head.spec_revision(),
+        payload: control_payload,
+        payload_digest,
+        encoded_command_digest: exact_bytes.encoded_command_digest(),
+        exact_bytes,
+    })
+    .map_err(|_| AgentRouteBootstrapError::InvalidRequest)?;
+    repository
+        .append_locked(
+            connection,
+            tenant_id,
+            connector_id,
+            head,
+            &durable,
+            &ProtobufDurableCommandDecoder,
+            now.get(),
+        )
+        .await
+        .map_err(map_command_log)?;
+    Ok(durable)
 }
 
 async fn terminal_target(
@@ -1319,6 +1494,8 @@ fn validate_begin(
 ) -> Result<(), AgentRouteBootstrapError> {
     if exact_body.is_empty()
         || exact_body.len() > MAX_OPAQUE_BYTES
+        || command.owner_signed_intent.is_empty()
+        || command.owner_signed_intent.len() > MAX_OPAQUE_BYTES
         || command.expires_at <= now
         || command.expires_at.get() > now.get().saturating_add(MAX_BOOTSTRAP_LIFETIME_MS)
     {
@@ -1408,5 +1585,21 @@ fn map_sql(error: sqlx::Error) -> AgentRouteBootstrapError {
         AgentRouteBootstrapError::Conflict
     } else {
         AgentRouteBootstrapError::Unavailable
+    }
+}
+
+fn map_command_log(error: AgentPersistenceError) -> AgentRouteBootstrapError {
+    match error {
+        AgentPersistenceError::ImmutableConflict(_)
+        | AgentPersistenceError::RevisionConflict { .. }
+        | AgentPersistenceError::FenceConflict
+        | AgentPersistenceError::ClaimRejected(_)
+        | AgentPersistenceError::AuthorizationRejected(_)
+        | AgentPersistenceError::CursorConflict { .. } => AgentRouteBootstrapError::Conflict,
+        AgentPersistenceError::Database(error) => map_sql(error),
+        AgentPersistenceError::CorruptData(_)
+        | AgentPersistenceError::CommandDecodeRejected
+        | AgentPersistenceError::MaterializationLimitExceeded(_)
+        | AgentPersistenceError::SnapshotRejected(_) => AgentRouteBootstrapError::Unavailable,
     }
 }
