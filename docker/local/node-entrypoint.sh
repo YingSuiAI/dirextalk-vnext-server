@@ -41,12 +41,10 @@ export DTX_GROUP_MLS_SEQUENCER_KEY_FILE="$sequencer_key"
 
 dtx-node &
 node_pid=$!
-socat TCP-LISTEN:8080,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:9080 &
-proxy_pid=$!
 
 cleanup() {
-    kill "$proxy_pid" "$node_pid" 2>/dev/null || true
-    wait "$proxy_pid" "$node_pid" 2>/dev/null || true
+    kill "$node_pid" 2>/dev/null || true
+    wait "$node_pid" 2>/dev/null || true
     rm -rf "$secret_dir"
 }
 

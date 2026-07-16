@@ -46,6 +46,7 @@ rust-version = "1.97.0"
 
 [workspace.dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "query", "tokio"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 base64ct = { version = "1.8.3", features = ["alloc"] }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
 futures-core = "0.3.32"

@@ -4,15 +4,15 @@ x-dev-image: &dev-image
   image: dirextalk-vnext-local:dev
 
 x-node-healthcheck: &node-healthcheck
-  test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8080; printf \"GET /local-health HTTP/1.0\\r\\n\\r\\n\" >&3; IFS= read -r -t 2 <&3'"]
+  test: ["CMD-SHELL", "curl --fail --silent --show-error --cacert /run/dtx-local-tls/ca.pem https://localhost:8443/local-health >/dev/null"]
   interval: 2s
   timeout: 3s
   retries: 15
   start_period: 2s
 
 x-node-environment: &node-environment
-  DTX_NODE_LISTEN: 127.0.0.1:9080
-  DTX_GROUP_DEV_HTTP_IDENTITY_ORIGINS: http://node-a:8080,http://node-b:8080,http://node-c:8080
+  DTX_NODE_LISTEN: 0.0.0.0:8443
+  DTX_GROUP_FEDERATED_IDENTITY_TRUST_ROOT_FILE: /run/dtx-local-tls/ca.pem
 
 services:
   postgres:
@@ -25,7 +25,7 @@ services:
       - dtx-local-postgres:/var/lib/postgresql
       - ./docker/local/postgres/00-local-cluster.sql:/docker-entrypoint-initdb.d/00-local-cluster.sql:ro
     ports:
-      - "127.0.0.1:15432:5432"
+      - "127.0.0.1:${DTX_LOCAL_POSTGRES_PORT:-15432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d dtx_admin"]
       interval: 2s
@@ -41,6 +41,27 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: "no"
+
+  tls-volume-init:
+    <<: *dev-image
+    user: "0:0"
+    entrypoint: ["/bin/chown"]
+    command: ["10001:10001", "/run/dtx-local-tls"]
+    volumes:
+      - dtx-local-tls:/run/dtx-local-tls
+    restart: "no"
+
+  tls-bootstrap:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-dev-local-tls"]
+    environment:
+      DTX_LOCAL_TLS_DIR: /run/dtx-local-tls
+    volumes:
+      - dtx-local-tls:/run/dtx-local-tls
+    depends_on:
+      tls-volume-init:
+        condition: service_completed_successfully
     restart: "no"
 
   migrate-a:
@@ -136,14 +157,20 @@ services:
       DTX_DEV_MAILBOX_DATABASE_URL: postgres://dtx_mailbox_node@postgres:5432/dtx_node_a?sslmode=disable
       DTX_DEV_PUBLIC_FEED_DATABASE_URL: postgres://dtx_public_feed_node@postgres:5432/dtx_node_a?sslmode=disable
       DTX_DEV_INDEXER_DATABASE_URL: postgres://dtx_indexer_node@postgres:5432/dtx_node_a?sslmode=disable
-      DTX_NODE_PUBLIC_ORIGIN: http://node-a:8080
+      DTX_NODE_PUBLIC_ORIGIN: https://node-a:8443
+      DTX_NODE_TLS_CERTIFICATE_FILE: /run/dtx-local-tls/node-a-cert.pem
+      DTX_NODE_TLS_PRIVATE_KEY_FILE: /run/dtx-local-tls/node-a-key.pem
       DTX_NODE_TENANT_ID: 0190f2a5-7b1c-7abc-8def-0123456789a0
       DTX_NODE_INDEXER_ID: 0190f2a5-7b1c-7abc-8def-0123456789b0
     depends_on:
       provision-a:
         condition: service_completed_successfully
+      tls-bootstrap:
+        condition: service_completed_successfully
     ports:
-      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:18443:8443"
+    volumes:
+      - dtx-local-tls:/run/dtx-local-tls:ro
     healthcheck: *node-healthcheck
 
   node-b:
@@ -156,14 +183,20 @@ services:
       DTX_DEV_MAILBOX_DATABASE_URL: postgres://dtx_mailbox_node@postgres:5432/dtx_node_b?sslmode=disable
       DTX_DEV_PUBLIC_FEED_DATABASE_URL: postgres://dtx_public_feed_node@postgres:5432/dtx_node_b?sslmode=disable
       DTX_DEV_INDEXER_DATABASE_URL: postgres://dtx_indexer_node@postgres:5432/dtx_node_b?sslmode=disable
-      DTX_NODE_PUBLIC_ORIGIN: http://node-b:8080
+      DTX_NODE_PUBLIC_ORIGIN: https://node-b:8443
+      DTX_NODE_TLS_CERTIFICATE_FILE: /run/dtx-local-tls/node-b-cert.pem
+      DTX_NODE_TLS_PRIVATE_KEY_FILE: /run/dtx-local-tls/node-b-key.pem
       DTX_NODE_TENANT_ID: 0190f2a5-7b1c-7abc-8def-0123456789a1
       DTX_NODE_INDEXER_ID: 0190f2a5-7b1c-7abc-8def-0123456789b1
     depends_on:
       provision-b:
         condition: service_completed_successfully
+      tls-bootstrap:
+        condition: service_completed_successfully
     ports:
-      - "127.0.0.1:18081:8080"
+      - "127.0.0.1:18444:8443"
+    volumes:
+      - dtx-local-tls:/run/dtx-local-tls:ro
     healthcheck: *node-healthcheck
 
   node-c:
@@ -176,15 +209,22 @@ services:
       DTX_DEV_MAILBOX_DATABASE_URL: postgres://dtx_mailbox_node@postgres:5432/dtx_node_c?sslmode=disable
       DTX_DEV_PUBLIC_FEED_DATABASE_URL: postgres://dtx_public_feed_node@postgres:5432/dtx_node_c?sslmode=disable
       DTX_DEV_INDEXER_DATABASE_URL: postgres://dtx_indexer_node@postgres:5432/dtx_node_c?sslmode=disable
-      DTX_NODE_PUBLIC_ORIGIN: http://node-c:8080
+      DTX_NODE_PUBLIC_ORIGIN: https://node-c:8443
+      DTX_NODE_TLS_CERTIFICATE_FILE: /run/dtx-local-tls/node-c-cert.pem
+      DTX_NODE_TLS_PRIVATE_KEY_FILE: /run/dtx-local-tls/node-c-key.pem
       DTX_NODE_TENANT_ID: 0190f2a5-7b1c-7abc-8def-0123456789a2
       DTX_NODE_INDEXER_ID: 0190f2a5-7b1c-7abc-8def-0123456789b2
     depends_on:
       provision-c:
         condition: service_completed_successfully
+      tls-bootstrap:
+        condition: service_completed_successfully
     ports:
-      - "127.0.0.1:18082:8080"
+      - "127.0.0.1:18445:8443"
+    volumes:
+      - dtx-local-tls:/run/dtx-local-tls:ro
     healthcheck: *node-healthcheck
 
 volumes:
   dtx-local-postgres:
+  dtx-local-tls:

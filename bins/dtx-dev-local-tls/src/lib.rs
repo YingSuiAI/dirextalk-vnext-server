@@ -18,7 +18,7 @@ use std::{
 
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, PKCS_ED25519, PublicKeyData,
+    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, PublicKeyData, SignatureAlgorithm,
 };
 use time::{Duration, OffsetDateTime};
 use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::parse_x509_pem};
@@ -38,6 +38,9 @@ const MAX_OUTPUT_DIRECTORY_COMPONENTS: usize = 32;
 const MAX_ARTIFACT_BYTES: u64 = 65_536;
 const CERTIFICATE_LIFETIME: Duration = Duration::days(7);
 const NOT_BEFORE_SKEW: Duration = Duration::minutes(5);
+// P-256 is supported by Windows Schannel as well as Rustls and OpenSSL. Local
+// TLS must remain inspectable with the repository's Windows PowerShell tooling.
+const LOCAL_TLS_SIGNING_ALGORITHM: &SignatureAlgorithm = &PKCS_ECDSA_P256_SHA256;
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Fixed artifact paths emitted into a local TLS directory.
@@ -353,7 +356,7 @@ fn private_key_matches_certificate(
     let Ok(pem) = std::str::from_utf8(&bytes) else {
         return false;
     };
-    let Ok(key) = KeyPair::from_pem_and_sign_algo(pem, &PKCS_ED25519) else {
+    let Ok(key) = KeyPair::from_pem_and_sign_algo(pem, LOCAL_TLS_SIGNING_ALGORITHM) else {
         return false;
     };
     let key = Zeroizing::new(key);
@@ -414,7 +417,7 @@ fn generate_artifacts() -> Result<GeneratedArtifacts, BootstrapError> {
     ca_params.distinguished_name = ca_name;
 
     let ca_key = Zeroizing::new(
-        KeyPair::generate_for(&PKCS_ED25519)
+        KeyPair::generate_for(LOCAL_TLS_SIGNING_ALGORITHM)
             .map_err(|_| BootstrapError::CertificateGenerationFailed)?,
     );
     let ca_certificate = ca_params
@@ -459,7 +462,7 @@ fn issue_server_leaf(
     name.push(DnType::CommonName, format!("Dirextalk local {node_name}"));
     params.distinguished_name = name;
 
-    let key = Zeroizing::new(KeyPair::generate_for(&PKCS_ED25519)?);
+    let key = Zeroizing::new(KeyPair::generate_for(LOCAL_TLS_SIGNING_ALGORITHM)?);
     let certificate = params.signed_by(&*key, issuer)?.pem();
     let private_key = Zeroizing::new(key.serialize_pem());
     Ok(LeafArtifacts {

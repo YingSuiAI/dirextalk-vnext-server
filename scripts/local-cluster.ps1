@@ -19,6 +19,7 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 }
 
 $composePrefix = @('compose', '--project-directory', $repositoryRoot, '-f', $composeFile)
+$script:localTlsCaFile = Join-Path ([System.IO.Path]::GetTempPath()) 'dirextalk-vnext-local-ca.pem'
 
 function Invoke-LocalCompose {
     param([string[]]$ComposeArguments)
@@ -29,7 +30,16 @@ function Invoke-LocalCompose {
     }
 }
 
-function Get-LocalHttpStatus {
+function Export-LocalTlsCa {
+    Remove-Item -LiteralPath $script:localTlsCaFile -Force -ErrorAction SilentlyContinue
+    & docker @composePrefix cp 'tls-bootstrap:/run/dtx-local-tls/ca.pem' $script:localTlsCaFile
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $script:localTlsCaFile -PathType Leaf)) {
+        throw 'The local TLS test CA could not be exported from the bootstrap container.'
+    }
+    Write-Output "Local TLS test CA: $script:localTlsCaFile"
+}
+
+function Get-LocalHttpsStatus {
     param(
         [Parameter(Mandatory)]
         [string]$Uri,
@@ -38,15 +48,17 @@ function Get-LocalHttpStatus {
         [string]$Method
     )
 
-    try {
-        return [int](Invoke-WebRequest -Uri $Uri -Method $Method -UseBasicParsing -TimeoutSec 3).StatusCode
+    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+        throw 'curl.exe is required to validate the local HTTPS test CA.'
     }
-    catch {
-        if ($null -ne $_.Exception.Response) {
-            return [int]$_.Exception.Response.StatusCode
-        }
-        throw
+    # Windows Schannel cannot obtain revocation status for this disposable, offline local CA.
+    # --ssl-no-revoke preserves certificate-chain and hostname verification.
+    $status = & curl.exe --silent --show-error --output NUL --write-out '%{http_code}' `
+        --ssl-no-revoke --cacert $script:localTlsCaFile --request $Method --max-time 3 $Uri
+    if ($LASTEXITCODE -ne 0) {
+        throw "HTTPS request failed for $Uri."
     }
+    return [int]($status | Out-String).Trim()
 }
 
 function Confirm-LocalContractRoute {
@@ -66,7 +78,7 @@ function Confirm-LocalContractRoute {
     $lastFailure = $null
     do {
         try {
-            $status = Get-LocalHttpStatus -Uri $Uri -Method $Method
+            $status = Get-LocalHttpsStatus -Uri $Uri -Method $Method
             if ($status -eq $ExpectedStatus) {
                 return
             }
@@ -83,25 +95,37 @@ function Confirm-LocalContractRoute {
 
 function Confirm-LocalClusterEndpoints {
     $requests = @(
-        @{ Name = 'node-a identity'; Method = 'Post'; ExpectedStatus = 422; Uri = 'http://127.0.0.1:18080/v1/identity/bootstrap' },
-        @{ Name = 'node-a mailbox'; Method = 'Put'; ExpectedStatus = 422; Uri = 'http://127.0.0.1:18080/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
-        @{ Name = 'node-a group'; Method = 'Put'; ExpectedStatus = 422; Uri = 'http://127.0.0.1:18080/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
-        @{ Name = 'node-a public feed'; Method = 'Get'; ExpectedStatus = 400; Uri = 'http://127.0.0.1:18080/.well-known/dirextalk/public/v1/not-a-stable-id' },
-        @{ Name = 'node-a indexer'; Method = 'Get'; ExpectedStatus = 400; Uri = 'http://127.0.0.1:18080/v1/public-search' },
-        @{ Name = 'node-b identity'; Method = 'Post'; ExpectedStatus = 422; Uri = 'http://127.0.0.1:18081/v1/identity/bootstrap' },
-        @{ Name = 'node-b mailbox'; Method = 'Put'; ExpectedStatus = 422; Uri = 'http://127.0.0.1:18081/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
-        @{ Name = 'node-b group'; Method = 'Put'; ExpectedStatus = 422; Uri = 'http://127.0.0.1:18081/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
-        @{ Name = 'node-b public feed'; Method = 'Get'; ExpectedStatus = 400; Uri = 'http://127.0.0.1:18081/.well-known/dirextalk/public/v1/not-a-stable-id' },
-        @{ Name = 'node-b indexer'; Method = 'Get'; ExpectedStatus = 400; Uri = 'http://127.0.0.1:18081/v1/public-search' },
-        @{ Name = 'node-c identity'; Method = 'Post'; ExpectedStatus = 422; Uri = 'http://127.0.0.1:18082/v1/identity/bootstrap' },
-        @{ Name = 'node-c mailbox'; Method = 'Put'; ExpectedStatus = 422; Uri = 'http://127.0.0.1:18082/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
-        @{ Name = 'node-c group'; Method = 'Put'; ExpectedStatus = 422; Uri = 'http://127.0.0.1:18082/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
-        @{ Name = 'node-c public feed'; Method = 'Get'; ExpectedStatus = 400; Uri = 'http://127.0.0.1:18082/.well-known/dirextalk/public/v1/not-a-stable-id' },
-        @{ Name = 'node-c indexer'; Method = 'Get'; ExpectedStatus = 400; Uri = 'http://127.0.0.1:18082/v1/public-search' }
+        @{ Name = 'node-a identity'; Method = 'Post'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18443/v1/identity/bootstrap' },
+        @{ Name = 'node-a mailbox'; Method = 'Put'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18443/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
+        @{ Name = 'node-a group'; Method = 'Put'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18443/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
+        @{ Name = 'node-a public feed'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:18443/.well-known/dirextalk/public/v1/not-a-stable-id' },
+        @{ Name = 'node-a indexer'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:18443/v1/public-search' },
+        @{ Name = 'node-b identity'; Method = 'Post'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18444/v1/identity/bootstrap' },
+        @{ Name = 'node-b mailbox'; Method = 'Put'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18444/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
+        @{ Name = 'node-b group'; Method = 'Put'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18444/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
+        @{ Name = 'node-b public feed'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:18444/.well-known/dirextalk/public/v1/not-a-stable-id' },
+        @{ Name = 'node-b indexer'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:18444/v1/public-search' },
+        @{ Name = 'node-c identity'; Method = 'Post'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18445/v1/identity/bootstrap' },
+        @{ Name = 'node-c mailbox'; Method = 'Put'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18445/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
+        @{ Name = 'node-c group'; Method = 'Put'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18445/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
+        @{ Name = 'node-c public feed'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:18445/.well-known/dirextalk/public/v1/not-a-stable-id' },
+        @{ Name = 'node-c indexer'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:18445/v1/public-search' }
     )
 
     foreach ($request in $requests) {
         Confirm-LocalContractRoute -Name $request.Name -Uri $request.Uri -Method $request.Method -ExpectedStatus $request.ExpectedStatus
+    }
+}
+
+function Confirm-PlaintextHttpIsRejected {
+    if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
+        throw 'curl.exe is required to prove plaintext HTTP is unavailable.'
+    }
+    foreach ($port in @(18443, 18444, 18445)) {
+        & curl.exe --silent --output NUL --max-time 3 "http://127.0.0.1:$port/local-health"
+        if ($LASTEXITCODE -eq 0) {
+            throw "Local node on port $port accepted plaintext HTTP."
+        }
     }
 }
 
@@ -131,8 +155,10 @@ switch ($Action) {
             $composeArguments += '--build'
         }
         Invoke-LocalCompose $composeArguments
+        Export-LocalTlsCa
         Confirm-LocalDirectoryRoleIsolation
         Confirm-LocalClusterEndpoints
+        Confirm-PlaintextHttpIsRejected
     }
     'down' {
         Invoke-LocalCompose @('down', '--remove-orphans')

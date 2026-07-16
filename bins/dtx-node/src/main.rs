@@ -1,8 +1,12 @@
 #![forbid(unsafe_code)]
 
-use std::{env, fs, net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc};
+use std::{
+    env, fs, net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr, sync::Arc,
+    time::Duration,
+};
 
 use axum::{http::StatusCode, routing::get};
+use axum_server::{Handle, tls_rustls::RustlsConfig};
 use dtx_domain::{Clock, IndexerId, SystemClock, TenantId};
 use dtx_group_node::{GroupNodeState, group_router_with_state, load_mls_sequencer_signing_key};
 use dtx_group_persistence::GroupPgStore;
@@ -29,7 +33,14 @@ const PUBLIC_FEED_DATABASE_URL_FILE_ENV: &str = "DTX_PUBLIC_FEED_DATABASE_URL_FI
 const INDEXER_DATABASE_URL_FILE_ENV: &str = "DTX_INDEXER_DATABASE_URL_FILE";
 const INDEXER_ID_ENV: &str = "DTX_NODE_INDEXER_ID";
 const DEV_HTTP_IDENTITY_ORIGINS_ENV: &str = "DTX_GROUP_DEV_HTTP_IDENTITY_ORIGINS";
+const TLS_CERTIFICATE_FILE_ENV: &str = "DTX_NODE_TLS_CERTIFICATE_FILE";
+const TLS_PRIVATE_KEY_FILE_ENV: &str = "DTX_NODE_TLS_PRIVATE_KEY_FILE";
+const GROUP_FEDERATED_IDENTITY_TRUST_ROOT_FILE_ENV: &str =
+    "DTX_GROUP_FEDERATED_IDENTITY_TRUST_ROOT_FILE";
 const MAX_DATABASE_URL_BYTES: usize = 8_192;
+const MAX_TLS_PEM_BYTES: u64 = 1_048_576;
+const MAX_FEDERATED_IDENTITY_TRUST_ROOT_PEM_BYTES: usize = 64 * 1024;
+const TLS_GRACEFUL_SHUTDOWN: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -43,23 +54,36 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), NodeError> {
-    let config = NodeConfig::load()?;
-    let sequencer_signing_key =
-        load_mls_sequencer_signing_key(&config.group_mls_sequencer_key_file)
-            .map_err(|_| NodeError::Configuration)?;
-    let identity_store = IdentityPgStore::connect(config.identity_database, 8)
+    let NodeConfig {
+        listen,
+        tls,
+        public_origin,
+        tenant_id,
+        identity_database,
+        group_database,
+        group_mls_sequencer_key_file,
+        mailbox_database,
+        public_feed_database,
+        indexer_database,
+        indexer_id,
+        allowed_http_identity_origins,
+        additional_federated_identity_trust_root_pem,
+    } = NodeConfig::load()?;
+    let sequencer_signing_key = load_mls_sequencer_signing_key(&group_mls_sequencer_key_file)
+        .map_err(|_| NodeError::Configuration)?;
+    let identity_store = IdentityPgStore::connect(identity_database, 8)
         .await
         .map_err(|_| NodeError::Database("identity"))?;
-    let group_store = GroupPgStore::connect(config.group_database, 8)
+    let group_store = GroupPgStore::connect(group_database, 8)
         .await
         .map_err(|_| NodeError::Database("group"))?;
-    let mailbox_store = MailboxPgStore::connect(config.mailbox_database, 8)
+    let mailbox_store = MailboxPgStore::connect(mailbox_database, 8)
         .await
         .map_err(|_| NodeError::Database("mailbox"))?;
-    let public_feed_store = PublicFeedPgStore::connect(config.public_feed_database, 8)
+    let public_feed_store = PublicFeedPgStore::connect(public_feed_database, 8)
         .await
         .map_err(|_| NodeError::Database("public feed"))?;
-    let indexer_store = IndexerPgStore::connect(config.indexer_database, 8)
+    let indexer_store = IndexerPgStore::connect(indexer_database, 8)
         .await
         .map_err(|_| NodeError::Database("indexer"))?;
 
@@ -67,34 +91,61 @@ async fn run() -> Result<(), NodeError> {
     let identity_state = IdentityBootstrapState::with_clock_and_device_session_audience(
         identity_store,
         clock.clone(),
-        config.public_origin.clone(),
+        public_origin.clone(),
     );
     let group_state = configured_group_state(
         group_store,
-        config.tenant_id,
+        tenant_id,
         clock.clone(),
         sequencer_signing_key,
-        &config.public_origin,
-        config.allowed_http_identity_origins,
+        &public_origin,
+        allowed_http_identity_origins,
+        additional_federated_identity_trust_root_pem.as_deref(),
     )?;
     let mailbox_state = MailboxNodeState::with_clock(mailbox_store, clock);
 
     let router = identity_bootstrap_router_with_state(identity_state)
         .merge(group_router_with_state(group_state))
         .merge(mailbox_router_with_state(mailbox_state))
-        .merge(public_feed_router(public_feed_store, config.tenant_id))
+        .merge(public_feed_router(public_feed_store, tenant_id))
         .merge(indexer_router(
             indexer_store,
-            config.tenant_id,
-            config.indexer_id,
+            tenant_id,
+            indexer_id,
             Arc::new(PinnedHttpsBundleFetcher::default()),
         ))
         .route("/local-health", get(local_health));
-    let listener = TcpListener::bind(config.listen)
+    serve_node(router, listen, tls).await
+}
+
+async fn serve_node(
+    router: axum::Router,
+    listen: SocketAddr,
+    tls: Option<NodeTlsConfig>,
+) -> Result<(), NodeError> {
+    let Some(tls) = tls else {
+        let listener = TcpListener::bind(listen)
+            .await
+            .map_err(|_| NodeError::Bind)?;
+        return axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(|_| NodeError::Serve);
+    };
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let tls_config = RustlsConfig::from_pem_file(tls.certificate_file, tls.private_key_file)
         .await
-        .map_err(|_| NodeError::Bind)?;
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+        .map_err(|_| NodeError::Configuration)?;
+    let handle = Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_handle.graceful_shutdown(Some(TLS_GRACEFUL_SHUTDOWN));
+    });
+    axum_server::bind_rustls(listen, tls_config)
+        .handle(handle)
+        .serve(router.into_make_service())
         .await
         .map_err(|_| NodeError::Serve)
 }
@@ -106,12 +157,14 @@ fn configured_group_state(
     sequencer_signing_key: SigningKey,
     public_origin: &str,
     allowed_http_identity_origins: Vec<String>,
+    additional_federated_identity_trust_root_pem: Option<&[u8]>,
 ) -> Result<GroupNodeState, NodeError> {
     GroupNodeState::with_clock(group_store, tenant_id, clock)
         .with_mls_sequencer_signing_key(sequencer_signing_key)
-        .with_public_origin_and_allowed_http_identity_origins(
+        .with_federated_identity_configuration(
             public_origin,
             allowed_http_identity_origins,
+            additional_federated_identity_trust_root_pem,
         )
         .map_err(|_| NodeError::Configuration)
 }
@@ -122,6 +175,7 @@ async fn local_health() -> StatusCode {
 
 struct NodeConfig {
     listen: SocketAddr,
+    tls: Option<NodeTlsConfig>,
     public_origin: String,
     tenant_id: TenantId,
     identity_database: PgConnectOptions,
@@ -132,6 +186,27 @@ struct NodeConfig {
     indexer_database: PgConnectOptions,
     indexer_id: IndexerId,
     allowed_http_identity_origins: Vec<String>,
+    additional_federated_identity_trust_root_pem: Option<Vec<u8>>,
+}
+
+struct NodeTlsConfig {
+    certificate_file: PathBuf,
+    private_key_file: PathBuf,
+}
+
+impl NodeTlsConfig {
+    fn load() -> Result<Option<Self>, NodeError> {
+        let certificate_file = env::var_os(TLS_CERTIFICATE_FILE_ENV);
+        let private_key_file = env::var_os(TLS_PRIVATE_KEY_FILE_ENV);
+        match (certificate_file, private_key_file) {
+            (None, None) => Ok(None),
+            (Some(certificate_file), Some(private_key_file)) => Ok(Some(Self {
+                certificate_file: required_tls_pem_file(PathBuf::from(certificate_file))?,
+                private_key_file: required_tls_pem_file(PathBuf::from(private_key_file))?,
+            })),
+            _ => Err(NodeError::Configuration),
+        }
+    }
 }
 
 impl NodeConfig {
@@ -140,11 +215,10 @@ impl NodeConfig {
             .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned())
             .parse::<SocketAddr>()
             .map_err(|_| NodeError::Configuration)?;
-        if !listen.ip().is_loopback() {
-            return Err(NodeError::Configuration);
-        }
-
         let public_origin = required_graphic_env(PUBLIC_ORIGIN_ENV, 256)?;
+        let tls = NodeTlsConfig::load()?;
+        validate_public_transport(&public_origin, tls.is_some())?;
+        validate_listen_scope(listen, tls.is_some())?;
         let tenant_id = env::var(TENANT_ID_ENV)
             .map_err(|_| NodeError::Configuration)?
             .parse::<TenantId>()
@@ -164,9 +238,12 @@ impl NodeConfig {
                     .collect()
             })
             .unwrap_or_default();
+        let additional_federated_identity_trust_root_pem =
+            load_optional_federated_identity_trust_root_pem()?;
 
         Ok(Self {
             listen,
+            tls,
             public_origin,
             tenant_id,
             identity_database: load_database_options(IDENTITY_DATABASE_URL_FILE_ENV)?,
@@ -179,8 +256,57 @@ impl NodeConfig {
             indexer_database: load_database_options(INDEXER_DATABASE_URL_FILE_ENV)?,
             indexer_id,
             allowed_http_identity_origins,
+            additional_federated_identity_trust_root_pem,
         })
     }
+}
+
+fn validate_public_transport(public_origin: &str, tls_enabled: bool) -> Result<(), NodeError> {
+    let declares_https = public_origin.starts_with("https://");
+    let declares_http = public_origin.starts_with("http://");
+    if !declares_https && !declares_http || declares_https != tls_enabled {
+        return Err(NodeError::Configuration);
+    }
+    Ok(())
+}
+
+fn validate_listen_scope(listen: SocketAddr, tls_enabled: bool) -> Result<(), NodeError> {
+    if !listen.ip().is_loopback() && !tls_enabled {
+        return Err(NodeError::Configuration);
+    }
+    Ok(())
+}
+
+fn required_tls_pem_file(path: PathBuf) -> Result<PathBuf, NodeError> {
+    let metadata = fs::symlink_metadata(&path).map_err(|_| NodeError::Configuration)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_TLS_PEM_BYTES
+    {
+        return Err(NodeError::Configuration);
+    }
+    Ok(path)
+}
+
+fn load_optional_federated_identity_trust_root_pem() -> Result<Option<Vec<u8>>, NodeError> {
+    let Some(path) = env::var_os(GROUP_FEDERATED_IDENTITY_TRUST_ROOT_FILE_ENV) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let metadata = fs::symlink_metadata(&path).map_err(|_| NodeError::Configuration)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_FEDERATED_IDENTITY_TRUST_ROOT_PEM_BYTES as u64
+    {
+        return Err(NodeError::Configuration);
+    }
+    let pem = fs::read(path).map_err(|_| NodeError::Configuration)?;
+    if pem.is_empty() || pem.len() > MAX_FEDERATED_IDENTITY_TRUST_ROOT_PEM_BYTES {
+        return Err(NodeError::Configuration);
+    }
+    Ok(Some(pem))
 }
 
 fn required_graphic_env(name: &str, max_len: usize) -> Result<String, NodeError> {
@@ -246,7 +372,7 @@ impl std::fmt::Display for NodeError {
                 write!(formatter, "{service} database initialization failed")
             }
             Self::Bind => formatter.write_str("node loopback listener could not bind"),
-            Self::Serve => formatter.write_str("node HTTP server failed"),
+            Self::Serve => formatter.write_str("node HTTP(S) server failed"),
         }
     }
 }
@@ -272,7 +398,7 @@ mod tests {
 
     use super::{
         GroupPgStore, StatusCode, TenantId, configured_group_state, is_graphic_value,
-        test_support as support,
+        test_support as support, validate_listen_scope, validate_public_transport,
     };
 
     #[test]
@@ -281,6 +407,24 @@ mod tests {
         assert!(!is_graphic_value("https://node.example/ invalid", 256));
         assert!(!is_graphic_value("", 256));
         assert!(!is_graphic_value("toolong", 3));
+    }
+
+    #[test]
+    fn public_transport_cannot_claim_https_without_a_tls_listener() {
+        assert!(validate_public_transport("https://node.example", true).is_ok());
+        assert!(validate_public_transport("http://node.example", false).is_ok());
+        assert!(validate_public_transport("https://node.example", false).is_err());
+        assert!(validate_public_transport("http://node.example", true).is_err());
+        assert!(validate_public_transport("ftp://node.example", false).is_err());
+    }
+
+    #[test]
+    fn non_loopback_listener_requires_tls() {
+        let external = "0.0.0.0:8443".parse().expect("socket address");
+        let loopback = "127.0.0.1:9080".parse().expect("socket address");
+        assert!(validate_listen_scope(external, true).is_ok());
+        assert!(validate_listen_scope(external, false).is_err());
+        assert!(validate_listen_scope(loopback, false).is_ok());
     }
 
     #[tokio::test]
@@ -294,6 +438,7 @@ mod tests {
             SigningKey::from_bytes(&[73; 32]),
             "https://node.example",
             Vec::new(),
+            None,
         )?;
         let response = group_router_with_state(state)
             .oneshot(

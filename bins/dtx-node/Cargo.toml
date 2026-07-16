@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 axum.workspace = true
+axum-server.workspace = true
 dtx-domain = { path = "../../crates/dtx-domain" }
 dtx-group-node = { path = "../dtx-group-node" }
 dtx-group-persistence = { path = "../../crates/dtx-group-persistence" }
@@ -19,6 +20,7 @@ dtx-public-feed-node = { path = "../dtx-public-feed-node" }
 ed25519-dalek.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+rustls.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

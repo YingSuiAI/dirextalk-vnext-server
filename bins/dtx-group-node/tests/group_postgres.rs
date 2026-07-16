@@ -3,6 +3,7 @@ mod support;
 
 use std::{
     error::Error,
+    net::SocketAddr,
     str::FromStr,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -785,7 +786,7 @@ async fn active_member_fetches_exact_consecutive_v30_commit_feed_without_welcome
 #[tokio::test]
 #[ignore = "requires the disposable three-node Docker Compose cluster"]
 #[allow(clippy::too_many_lines)]
-async fn three_node_compose_runs_v30_peer_admission_and_exact_recovery()
+async fn three_node_compose_runs_v30_peer_admission_and_exact_recovery_over_tls()
 -> Result<(), Box<dyn Error>> {
     if std::env::var("DTX_THREE_NODE_COMPOSE_ACCEPTANCE").as_deref() != Ok("1") {
         return Err(
@@ -794,15 +795,21 @@ async fn three_node_compose_runs_v30_peer_admission_and_exact_recovery()
     }
 
     let now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
-    let admin_a =
-        sqlx::PgPool::connect("postgres://postgres@127.0.0.1:15432/dtx_node_a?sslmode=disable")
-            .await?;
-    let admin_b =
-        sqlx::PgPool::connect("postgres://postgres@127.0.0.1:15432/dtx_node_b?sslmode=disable")
-            .await?;
-    let admin_c =
-        sqlx::PgPool::connect("postgres://postgres@127.0.0.1:15432/dtx_node_c?sslmode=disable")
-            .await?;
+    let postgres_port = std::env::var("DTX_THREE_NODE_POSTGRES_PORT")
+        .unwrap_or_else(|_| "15432".to_owned())
+        .parse::<u16>()?;
+    let admin_a = sqlx::PgPool::connect(&format!(
+        "postgres://postgres@127.0.0.1:{postgres_port}/dtx_node_a?sslmode=disable"
+    ))
+    .await?;
+    let admin_b = sqlx::PgPool::connect(&format!(
+        "postgres://postgres@127.0.0.1:{postgres_port}/dtx_node_b?sslmode=disable"
+    ))
+    .await?;
+    let admin_c = sqlx::PgPool::connect(&format!(
+        "postgres://postgres@127.0.0.1:{postgres_port}/dtx_node_c?sslmode=disable"
+    ))
+    .await?;
     for (node, pool) in [("A", &admin_a), ("B", &admin_b), ("C", &admin_c)] {
         let migration_026_applied: bool = sqlx::query_scalar(
             "SELECT EXISTS (
@@ -818,41 +825,49 @@ async fn three_node_compose_runs_v30_peer_admission_and_exact_recovery()
     }
 
     let identity_a = IdentityPgStore::connect(
-        PgConnectOptions::from_str(
-            "postgres://dtx_identity_node@127.0.0.1:15432/dtx_node_a?sslmode=disable",
-        )?,
+        PgConnectOptions::from_str(&format!(
+            "postgres://dtx_identity_node@127.0.0.1:{postgres_port}/dtx_node_a?sslmode=disable"
+        ))?,
         2,
     )
     .await?;
     let identity_b = IdentityPgStore::connect(
-        PgConnectOptions::from_str(
-            "postgres://dtx_identity_node@127.0.0.1:15432/dtx_node_b?sslmode=disable",
-        )?,
+        PgConnectOptions::from_str(&format!(
+            "postgres://dtx_identity_node@127.0.0.1:{postgres_port}/dtx_node_b?sslmode=disable"
+        ))?,
         2,
     )
     .await?;
     let owner = enroll_active_device_at(&identity_a, 151, 152, 153, [154; 32], now).await?;
     let candidate = enroll_active_device_at(&identity_b, 161, 162, 163, [164; 32], now).await?;
 
+    let ca_file = std::env::var("DTX_THREE_NODE_TLS_CA_FILE").map_err(|_| {
+        "set DTX_THREE_NODE_TLS_CA_FILE to the local Compose CA emitted by scripts/local-cluster.ps1"
+    })?;
+    let local_test_ca = reqwest::Certificate::from_pem(&std::fs::read(ca_file)?)?;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
+        .add_root_certificate(local_test_ca)
+        .resolve("node-a", "127.0.0.1:18443".parse::<SocketAddr>()?)
+        .resolve("node-b", "127.0.0.1:18444".parse::<SocketAddr>()?)
+        .resolve("node-c", "127.0.0.1:18445".parse::<SocketAddr>()?)
         .build()?;
-    for (port, expected_origin) in [
-        (18_080, "http://node-a:8080"),
-        (18_081, "http://node-b:8080"),
-        (18_082, "http://node-c:8080"),
+    for (host, port, expected_origin) in [
+        ("node-a", 18_443, "https://node-a:8443"),
+        ("node-b", 18_444, "https://node-b:8443"),
+        ("node-c", 18_445, "https://node-c:8443"),
     ] {
         let health = client
-            .get(format!("http://127.0.0.1:{port}/local-health"))
+            .get(format!("https://{host}:{port}/local-health"))
             .send()
             .await?;
         assert_eq!(health.status(), StatusCode::NO_CONTENT);
         let response = client
             .get(format!(
-                "http://127.0.0.1:{port}{GROUP_SERVICE_DESCRIPTOR_PATH}"
+                "https://{host}:{port}{GROUP_SERVICE_DESCRIPTOR_PATH}"
             ))
             .send()
             .await?;
@@ -879,8 +894,8 @@ async fn three_node_compose_runs_v30_peer_admission_and_exact_recovery()
         assert_eq!(descriptor[3].1, CanonicalValue::Unsigned(5));
         assert_eq!(descriptor[4].1, CanonicalValue::Unsigned(64));
     }
-    let group_origin = "http://127.0.0.1:18080";
-    let candidate_identity_origin = "http://node-b:8080";
+    let group_origin = "https://node-a:18443";
+    let candidate_identity_origin = "https://node-b:8443";
     let scope = GroupScope::PrivateConversation(ConversationId::new());
     let scope_path = scope_path(scope);
 
