@@ -41,6 +41,19 @@ impl OpaqueAgentRouteBytes {
     }
 }
 
+fn validate_opaque_command_payload(
+    opaque_bytes: &OpaqueAgentRouteBytes,
+    expires_at_millis: i64,
+) -> Result<(), CommandError> {
+    if expires_at_millis <= 0
+        || opaque_bytes.as_slice().is_empty()
+        || opaque_bytes.as_slice().len() > MAX_AGENT_ROUTE_CAPSULE_BYTES
+    {
+        return Err(CommandError::InvalidCommandPayload);
+    }
+    Ok(())
+}
+
 impl fmt::Debug for OpaqueAgentRouteBytes {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -64,6 +77,19 @@ pub struct PrepareAgentRouteRecipient {
     pub expires_at_millis: i64,
 }
 
+impl PrepareAgentRouteRecipient {
+    /// Validates the bounded opaque command body and its positive deadline.
+    ///
+    /// Identifier and digest validity is carried by their domain value types.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty or oversized opaque intent, or a non-positive expiry.
+    pub fn validate(&self) -> Result<(), CommandError> {
+        validate_opaque_command_payload(&self.owner_signed_intent, self.expires_at_millis)
+    }
+}
+
 /// Agent-Control's opaque recipient answer for one bootstrap.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentRouteRecipientReady {
@@ -84,6 +110,25 @@ pub struct DeliverAgentRouteBootstrap {
     pub capsule_digest: Sha256Digest,
     pub opaque_sealed_bootstrap: OpaqueAgentRouteBytes,
     pub expires_at_millis: i64,
+    /// Exact installation selected by the Owner; never inferred from route ID.
+    pub installation_id: InstallationId,
+    /// Exact Connector binding selected by the Owner; never inferred from installation alone.
+    pub binding_id: BindingId,
+    /// Exact Agent Control device that must import this isolated route.
+    pub agent_control_device_id: AgentDeviceId,
+}
+
+impl DeliverAgentRouteBootstrap {
+    /// Validates the bounded opaque command body and its positive deadline.
+    ///
+    /// Identifier and digest validity is carried by their domain value types.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty or oversized opaque bootstrap, or a non-positive expiry.
+    pub fn validate(&self) -> Result<(), CommandError> {
+        validate_opaque_command_payload(&self.opaque_sealed_bootstrap, self.expires_at_millis)
+    }
 }
 
 /// Stable, non-secret reason returned by Agent-Control for a terminal result.

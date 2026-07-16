@@ -1,6 +1,7 @@
 use dtx_agent_control::{
     ApplyConfigCommand, CloseStreamCommand, CloseStreamReason, CommandError, ConfigEntry,
-    DeliverAgentProvisioningCommand, ExactCommandBytes, MAX_COMMAND_BYTES,
+    DeliverAgentProvisioningCommand, DeliverAgentRouteBootstrap, ExactCommandBytes,
+    MAX_COMMAND_BYTES, OpaqueAgentRouteBytes, PrepareAgentRouteRecipient,
     RevokeAgentProvisioningCommand, RotateCredentialCommand, ServerCommandPayload, Sha256Digest,
     command_payload_digest,
 };
@@ -10,8 +11,9 @@ use dtx_agent_persistence::{
 };
 use dtx_connect_registry::ConnectorDesiredState;
 use dtx_domain::{
-    AgentDeviceId, ApprovalId, BindingId, InstallationId, ProvisioningDeliveryId,
-    ProvisioningRecipientKeyId, RequestId, Revision,
+    AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId, ApprovalId,
+    BindingId, ConversationId, DeviceId, IdentityId, InstallationId, ProvisioningDeliveryId,
+    ProvisioningRecipientKeyId, RequestId, Revision, TenantId,
 };
 use prost::Message as _;
 
@@ -28,6 +30,8 @@ const DURABLE_COMMAND_RULES: &[FieldRule] = &[
     FieldRule::singular(12, WireType::LengthDelimited),
     FieldRule::singular(13, WireType::LengthDelimited),
     FieldRule::singular(14, WireType::LengthDelimited),
+    FieldRule::singular(15, WireType::LengthDelimited),
+    FieldRule::singular(16, WireType::LengthDelimited),
 ];
 const APPLY_CONFIG_RULES: &[FieldRule] = &[
     FieldRule::singular(1, WireType::Varint),
@@ -69,6 +73,29 @@ const REVOKE_AGENT_PROVISIONING_RULES: &[FieldRule] = &[
     FieldRule::singular(4, WireType::LengthDelimited),
     FieldRule::singular(5, WireType::Varint),
     FieldRule::singular(6, WireType::Varint),
+];
+const PREPARE_AGENT_ROUTE_RECIPIENT_RULES: &[FieldRule] = &[
+    FieldRule::singular(1, WireType::LengthDelimited),
+    FieldRule::singular(2, WireType::LengthDelimited),
+    FieldRule::singular(3, WireType::LengthDelimited),
+    FieldRule::singular(4, WireType::LengthDelimited),
+    FieldRule::singular(5, WireType::LengthDelimited),
+    FieldRule::singular(6, WireType::LengthDelimited),
+    FieldRule::singular(7, WireType::LengthDelimited),
+    FieldRule::singular(8, WireType::LengthDelimited),
+    FieldRule::singular(9, WireType::Varint),
+];
+const DELIVER_AGENT_ROUTE_BOOTSTRAP_RULES: &[FieldRule] = &[
+    FieldRule::singular(1, WireType::LengthDelimited),
+    FieldRule::singular(2, WireType::LengthDelimited),
+    FieldRule::singular(3, WireType::LengthDelimited),
+    FieldRule::singular(4, WireType::LengthDelimited),
+    FieldRule::singular(5, WireType::LengthDelimited),
+    FieldRule::singular(6, WireType::LengthDelimited),
+    FieldRule::singular(7, WireType::Varint),
+    FieldRule::singular(8, WireType::LengthDelimited),
+    FieldRule::singular(9, WireType::LengthDelimited),
+    FieldRule::singular(10, WireType::LengthDelimited),
 ];
 
 /// Canonical protobuf encoding needed by [`dtx_agent_control::CommandLog::append`].
@@ -213,6 +240,49 @@ fn encode_payload(
             let exact = encoded.encode_to_vec();
             Ok((
                 v1::durable_command::Command::RevokeAgentProvisioning(encoded),
+                exact,
+            ))
+        }
+        ServerCommandPayload::PrepareAgentRouteRecipient(command) => {
+            command.validate()?;
+            let expires_at_millis = u64::try_from(command.expires_at_millis)
+                .map_err(|_| CommandError::InvalidCommandPayload)?;
+            let encoded = v1::PrepareAgentRouteRecipient {
+                bootstrap_id: command.bootstrap_id.to_string(),
+                tenant_id: command.tenant_id.to_string(),
+                installation_id: command.installation_id.to_string(),
+                binding_id: command.binding_id.to_string(),
+                agent_control_device_id: command.agent_control_device_id.to_string(),
+                owner_identity_id: command.owner_identity_id.to_string(),
+                owner_device_id: command.owner_device_id.to_string(),
+                owner_signed_intent: command.owner_signed_intent.as_slice().to_vec(),
+                expires_at_millis,
+            };
+            let exact = encoded.encode_to_vec();
+            Ok((
+                v1::durable_command::Command::PrepareAgentRouteRecipient(encoded),
+                exact,
+            ))
+        }
+        ServerCommandPayload::DeliverAgentRouteBootstrap(command) => {
+            command.validate()?;
+            let expires_at_millis = u64::try_from(command.expires_at_millis)
+                .map_err(|_| CommandError::InvalidCommandPayload)?;
+            let encoded = v1::DeliverAgentRouteBootstrap {
+                bootstrap_id: command.bootstrap_id.to_string(),
+                delivery_id: command.delivery_id.to_string(),
+                route_id: command.route_id.to_string(),
+                recipient_id: command.recipient_id.to_string(),
+                capsule_digest: command.capsule_digest.as_bytes().to_vec(),
+                opaque_sealed_bootstrap: command.opaque_sealed_bootstrap.as_slice().to_vec(),
+                expires_at_millis,
+                installation_id: command.installation_id.to_string(),
+                binding_id: command.binding_id.to_string(),
+                agent_control_device_id: command.agent_control_device_id.to_string(),
+            };
+            let exact = encoded.encode_to_vec();
+            Ok((
+                v1::durable_command::Command::DeliverAgentRouteBootstrap(encoded),
                 exact,
             ))
         }
@@ -423,6 +493,87 @@ fn decode_payload(
             .map(ServerCommandPayload::RevokeAgentProvisioning)
             .map_err(|_| DurableCommandDecodeError)
         }
+        (15, Some(v1::durable_command::Command::PrepareAgentRouteRecipient(command))) => {
+            validate_wire_schema(exact_payload, PREPARE_AGENT_ROUTE_RECIPIENT_RULES)?;
+            let expires_at_millis = positive_expiry(command.expires_at_millis)?;
+            Ok(ServerCommandPayload::PrepareAgentRouteRecipient(
+                PrepareAgentRouteRecipient {
+                    bootstrap_id: command
+                        .bootstrap_id
+                        .parse::<AgentRouteBootstrapId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    tenant_id: command
+                        .tenant_id
+                        .parse::<TenantId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    installation_id: command
+                        .installation_id
+                        .parse::<InstallationId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    binding_id: command
+                        .binding_id
+                        .parse::<BindingId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    agent_control_device_id: command
+                        .agent_control_device_id
+                        .parse::<AgentDeviceId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    owner_identity_id: command
+                        .owner_identity_id
+                        .parse::<IdentityId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    owner_device_id: command
+                        .owner_device_id
+                        .parse::<DeviceId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    owner_signed_intent: OpaqueAgentRouteBytes::new(command.owner_signed_intent)
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    expires_at_millis,
+                },
+            ))
+        }
+        (16, Some(v1::durable_command::Command::DeliverAgentRouteBootstrap(command))) => {
+            validate_wire_schema(exact_payload, DELIVER_AGENT_ROUTE_BOOTSTRAP_RULES)?;
+            let expires_at_millis = positive_expiry(command.expires_at_millis)?;
+            Ok(ServerCommandPayload::DeliverAgentRouteBootstrap(
+                DeliverAgentRouteBootstrap {
+                    bootstrap_id: command
+                        .bootstrap_id
+                        .parse::<AgentRouteBootstrapId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    delivery_id: command
+                        .delivery_id
+                        .parse::<AgentRouteDeliveryId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    route_id: command
+                        .route_id
+                        .parse::<ConversationId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    recipient_id: command
+                        .recipient_id
+                        .parse::<AgentRouteRecipientId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    capsule_digest: digest(command.capsule_digest)?,
+                    opaque_sealed_bootstrap: OpaqueAgentRouteBytes::new(
+                        command.opaque_sealed_bootstrap,
+                    )
+                    .map_err(|_| DurableCommandDecodeError)?,
+                    expires_at_millis,
+                    installation_id: command
+                        .installation_id
+                        .parse::<InstallationId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    binding_id: command
+                        .binding_id
+                        .parse::<BindingId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    agent_control_device_id: command
+                        .agent_control_device_id
+                        .parse::<AgentDeviceId>()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                },
+            ))
+        }
         _ => Err(DurableCommandDecodeError),
     }
 }
@@ -440,7 +591,7 @@ fn validate_apply_config_wire(bytes: &[u8]) -> DecodeResult<()> {
 fn selected_payload<'a>(fields: &[WireField<'a>]) -> DecodeResult<(u32, &'a [u8])> {
     let mut selected = None;
     for field in fields {
-        if matches!(field.number, 10..=14)
+        if matches!(field.number, 10..=16)
             && selected.replace((field.number, field.value)).is_some()
         {
             return Err(DurableCommandDecodeError);
@@ -487,6 +638,14 @@ fn close_stream_reason(value: i32) -> DecodeResult<CloseStreamReason> {
 fn digest(bytes: Vec<u8>) -> DecodeResult<Sha256Digest> {
     let bytes: [u8; 32] = bytes.try_into().map_err(|_| DurableCommandDecodeError)?;
     Ok(Sha256Digest::from_bytes(bytes))
+}
+
+fn positive_expiry(value: u64) -> DecodeResult<i64> {
+    let expires_at_millis = i64::try_from(value).map_err(|_| DurableCommandDecodeError)?;
+    if expires_at_millis <= 0 {
+        return Err(DurableCommandDecodeError);
+    }
+    Ok(expires_at_millis)
 }
 
 #[derive(Clone, Copy)]

@@ -6,7 +6,9 @@ use dtx_domain::{
     ProvisioningRecipientKeyId, RequestId, Revision, TenantId,
 };
 
-use crate::{Sha256Digest, digest::domain_digest};
+use crate::{
+    DeliverAgentRouteBootstrap, PrepareAgentRouteRecipient, Sha256Digest, digest::domain_digest,
+};
 
 const COMMAND_PAYLOAD_DOMAIN: &[u8] = b"dirextalk.connector-command-payload.v1";
 const ENCODED_COMMAND_DOMAIN: &[u8] = b"dirextalk.connector-encoded-command.v1";
@@ -510,6 +512,10 @@ pub enum ServerCommandPayload {
     CloseStream(CloseStreamCommand),
     DeliverAgentProvisioning(DeliverAgentProvisioningCommand),
     RevokeAgentProvisioning(RevokeAgentProvisioningCommand),
+    /// Creates one one-time opaque recipient for an isolated AgentRoute.
+    PrepareAgentRouteRecipient(PrepareAgentRouteRecipient),
+    /// Delivers one already Owner-sealed isolated AgentRoute bootstrap.
+    DeliverAgentRouteBootstrap(DeliverAgentRouteBootstrap),
 }
 
 /// One append-only, exactly replayable server command.
@@ -1298,6 +1304,12 @@ fn validate_payload(
             if command.requested_at_millis <= 0 {
                 return Err(CommandError::InvalidCommandPayload);
             }
+        }
+        ServerCommandPayload::PrepareAgentRouteRecipient(command) => {
+            command.validate()?;
+        }
+        ServerCommandPayload::DeliverAgentRouteBootstrap(command) => {
+            command.validate()?;
         }
     }
     Ok(())

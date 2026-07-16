@@ -1,6 +1,7 @@
 use dtx_agent_control::{
     ApplyConfigCommand, CloseStreamCommand, CloseStreamReason, ConfigEntry,
-    DeliverAgentProvisioningCommand, RevokeAgentProvisioningCommand, RotateCredentialCommand,
+    DeliverAgentProvisioningCommand, DeliverAgentRouteBootstrap, OpaqueAgentRouteBytes,
+    PrepareAgentRouteRecipient, RevokeAgentProvisioningCommand, RotateCredentialCommand,
     ServerCommandPayload, Sha256Digest, command_payload_digest,
 };
 use dtx_agent_control_proto::v1;
@@ -8,12 +9,14 @@ use dtx_agent_control_server::{ProtobufDurableCommandDecoder, ProtobufDurableCom
 use dtx_agent_persistence::DurableCommandDecoder as _;
 use dtx_connect_registry::ConnectorDesiredState;
 use dtx_domain::{
-    AgentDeviceId, ApprovalId, BindingId, InstallationId, ProvisioningDeliveryId,
-    ProvisioningRecipientKeyId, RequestId, Revision,
+    AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId, ApprovalId,
+    BindingId, ConversationId, DeviceId, IdentityId, InstallationId, ProvisioningDeliveryId,
+    ProvisioningRecipientKeyId, RequestId, Revision, TenantId,
 };
 use prost::Message as _;
 
 const OPERATION_ID: &str = "01890f47-3a5b-7c1d-8e2f-123456789abc";
+const OWNER_IDENTITY_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
 
 #[test]
 fn decodes_the_exact_nested_payload_including_unknown_fields() {
@@ -229,6 +232,59 @@ fn production_encoder_round_trips_every_closed_command_without_reconstruction() 
             )
             .unwrap(),
         ),
+        ServerCommandPayload::PrepareAgentRouteRecipient(PrepareAgentRouteRecipient {
+            bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1"
+                .parse::<AgentRouteBootstrapId>()
+                .unwrap(),
+            tenant_id: "01890f47-3a5b-7c1d-8e2f-123456789ac2"
+                .parse::<TenantId>()
+                .unwrap(),
+            installation_id: "01890f47-3a5b-7c1d-8e2f-123456789ab4"
+                .parse::<InstallationId>()
+                .unwrap(),
+            binding_id: "01890f47-3a5b-7c1d-8e2f-123456789ab3"
+                .parse::<BindingId>()
+                .unwrap(),
+            agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5"
+                .parse::<AgentDeviceId>()
+                .unwrap(),
+            owner_identity_id: OWNER_IDENTITY_ID.parse::<IdentityId>().unwrap(),
+            owner_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ac4"
+                .parse::<DeviceId>()
+                .unwrap(),
+            owner_signed_intent: OpaqueAgentRouteBytes::new(b"private-owner-intent".to_vec())
+                .unwrap(),
+            expires_at_millis: 2_000,
+        }),
+        ServerCommandPayload::DeliverAgentRouteBootstrap(DeliverAgentRouteBootstrap {
+            bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1"
+                .parse::<AgentRouteBootstrapId>()
+                .unwrap(),
+            delivery_id: "01890f47-3a5b-7c1d-8e2f-123456789ac5"
+                .parse::<AgentRouteDeliveryId>()
+                .unwrap(),
+            route_id: "01890f47-3a5b-7c1d-8e2f-123456789ac6"
+                .parse::<ConversationId>()
+                .unwrap(),
+            recipient_id: "01890f47-3a5b-7c1d-8e2f-123456789ac7"
+                .parse::<AgentRouteRecipientId>()
+                .unwrap(),
+            capsule_digest: Sha256Digest::from_bytes([0x33; 32]),
+            opaque_sealed_bootstrap: OpaqueAgentRouteBytes::new(
+                b"private-sealed-bootstrap".to_vec(),
+            )
+            .unwrap(),
+            expires_at_millis: 2_000,
+            installation_id: "01890f47-3a5b-7c1d-8e2f-123456789ab4"
+                .parse::<InstallationId>()
+                .unwrap(),
+            binding_id: "01890f47-3a5b-7c1d-8e2f-123456789ab3"
+                .parse::<BindingId>()
+                .unwrap(),
+            agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5"
+                .parse::<AgentDeviceId>()
+                .unwrap(),
+        }),
     ];
     for payload in payloads {
         let encoded = ProtobufDurableCommandEncoder
@@ -248,6 +304,92 @@ fn production_encoder_round_trips_every_closed_command_without_reconstruction() 
             "the encoder is byte deterministic"
         );
     }
+}
+
+#[test]
+fn rejects_malformed_route_bootstrap_payloads_without_logging_opaque_bytes() {
+    let invalid_digest_payload = v1::DeliverAgentRouteBootstrap {
+        bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1".to_owned(),
+        delivery_id: "01890f47-3a5b-7c1d-8e2f-123456789ac5".to_owned(),
+        route_id: "01890f47-3a5b-7c1d-8e2f-123456789ac6".to_owned(),
+        recipient_id: "01890f47-3a5b-7c1d-8e2f-123456789ac7".to_owned(),
+        capsule_digest: vec![0x33; 31],
+        opaque_sealed_bootstrap: b"private-sealed-bootstrap".to_vec(),
+        expires_at_millis: 2_000,
+        installation_id: "01890f47-3a5b-7c1d-8e2f-123456789ab4".to_owned(),
+        binding_id: "01890f47-3a5b-7c1d-8e2f-123456789ab3".to_owned(),
+        agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5".to_owned(),
+    }
+    .encode_to_vec();
+    let invalid_digest = command_payload_digest(&invalid_digest_payload)
+        .expect("bounded payload")
+        .as_bytes();
+    assert!(
+        ProtobufDurableCommandDecoder
+            .decode(&encode_command(16, &invalid_digest_payload, invalid_digest))
+            .is_err()
+    );
+
+    let invalid_expiry_payload = v1::PrepareAgentRouteRecipient {
+        bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1".to_owned(),
+        tenant_id: "01890f47-3a5b-7c1d-8e2f-123456789ac2".to_owned(),
+        installation_id: "01890f47-3a5b-7c1d-8e2f-123456789ab4".to_owned(),
+        binding_id: "01890f47-3a5b-7c1d-8e2f-123456789ab3".to_owned(),
+        agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5".to_owned(),
+        owner_identity_id: OWNER_IDENTITY_ID.to_owned(),
+        owner_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ac4".to_owned(),
+        owner_signed_intent: b"private-owner-intent".to_vec(),
+        expires_at_millis: 0,
+    }
+    .encode_to_vec();
+    let invalid_expiry = command_payload_digest(&invalid_expiry_payload)
+        .expect("bounded payload")
+        .as_bytes();
+    assert!(
+        ProtobufDurableCommandDecoder
+            .decode(&encode_command(15, &invalid_expiry_payload, invalid_expiry))
+            .is_err()
+    );
+
+    let payload = PrepareAgentRouteRecipient {
+        bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1"
+            .parse::<AgentRouteBootstrapId>()
+            .unwrap(),
+        tenant_id: "01890f47-3a5b-7c1d-8e2f-123456789ac2"
+            .parse::<TenantId>()
+            .unwrap(),
+        installation_id: "01890f47-3a5b-7c1d-8e2f-123456789ab4"
+            .parse::<InstallationId>()
+            .unwrap(),
+        binding_id: "01890f47-3a5b-7c1d-8e2f-123456789ab3"
+            .parse::<BindingId>()
+            .unwrap(),
+        agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5"
+            .parse::<AgentDeviceId>()
+            .unwrap(),
+        owner_identity_id: OWNER_IDENTITY_ID.parse::<IdentityId>().unwrap(),
+        owner_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ac4"
+            .parse::<DeviceId>()
+            .unwrap(),
+        owner_signed_intent: OpaqueAgentRouteBytes::new(b"private-owner-intent".to_vec()).unwrap(),
+        expires_at_millis: 2_000,
+    };
+    let debug = format!("{payload:?}");
+    assert!(!debug.contains("private-owner-intent"));
+
+    let mut zero_expiry = payload;
+    zero_expiry.expires_at_millis = 0;
+    assert!(
+        ProtobufDurableCommandEncoder
+            .encode(
+                1,
+                OPERATION_ID.parse::<RequestId>().unwrap(),
+                3,
+                Revision::new(7).unwrap(),
+                &ServerCommandPayload::PrepareAgentRouteRecipient(zero_expiry),
+            )
+            .is_err()
+    );
 }
 
 fn encode_command(payload_field: u32, payload: &[u8], payload_digest: [u8; 32]) -> Vec<u8> {
