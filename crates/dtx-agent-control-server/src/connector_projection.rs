@@ -18,6 +18,9 @@ pub const CONNECTOR_PROJECTION_MEDIA_TYPE_V1: &str =
 /// Versioned Owner projection that additionally identifies the authenticated tenant.
 pub const CONNECTOR_PROJECTION_MEDIA_TYPE_V2: &str =
     "application/vnd.dirextalk.connector-projection-page.v2+json";
+/// Owner management projection with non-secret disabled Binding visibility.
+pub const CONNECTOR_PROJECTION_MEDIA_TYPE_V3: &str =
+    "application/vnd.dirextalk.connector-projection-page.v3+json";
 /// Default number of Connector instances returned by one page.
 pub const DEFAULT_CONNECTOR_PROJECTION_LIMIT: u16 = 32;
 /// Hard per-request Connector page ceiling.
@@ -67,6 +70,18 @@ impl ConnectorProjectionPageV2 {
     }
 }
 
+/// V3 preserves the V2 Connector fields, while making each owner-visible
+/// Binding lifecycle explicit. Only `enabled` and `disabled` Bindings may
+/// appear; revoked Bindings remain permanently absent from this read model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConnectorProjectionPageV3 {
+    pub schema_version: u8,
+    pub tenant_id: String,
+    pub observed_at_ms: i64,
+    pub items: Vec<ConnectorProjectionV3>,
+    pub next_cursor: Option<String>,
+}
+
 /// Non-secret state for one independent Connector process.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConnectorProjectionV1 {
@@ -103,6 +118,47 @@ pub struct ConnectorBindingProjectionV1 {
     pub installation_desired_state: String,
     pub installation_observed_state: String,
     pub installation_revision: u64,
+}
+
+/// V3 Connector view. Its fields deliberately match V2's Connector item;
+/// only the Binding item type changes to make lifecycle state explicit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConnectorProjectionV3 {
+    pub host_id: String,
+    pub connector_id: String,
+    pub adapter_kind: String,
+    pub generation: u64,
+    pub desired_state: String,
+    pub observed_state: String,
+    pub desired_revision: u64,
+    pub observed_revision: u64,
+    pub host_desired_revision: u64,
+    pub host_observed_revision: Option<u64>,
+    pub health: String,
+    pub max_concurrency: u32,
+    pub capacity_available: Option<u32>,
+    pub lease_epoch: Option<u64>,
+    pub lease_expires_at_ms: Option<i64>,
+    pub heartbeat_sequence: Option<u64>,
+    pub last_heartbeat_at_ms: Option<i64>,
+    pub bindings: Vec<ConnectorBindingProjectionV3>,
+    pub bindings_truncated: bool,
+}
+
+/// Owner-visible Binding lifecycle. It intentionally excludes Agent Device,
+/// Route, credential, endpoint, session, and all secret-bearing facts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConnectorBindingProjectionV3 {
+    pub binding_id: String,
+    pub installation_id: String,
+    pub routing_mode: String,
+    pub priority: u16,
+    pub max_concurrency: u32,
+    pub binding_revision: u64,
+    pub installation_desired_state: String,
+    pub installation_observed_state: String,
+    pub installation_revision: u64,
+    pub binding_state: String,
 }
 
 /// Stable, redacted failure vocabulary for the Owner HTTP adapter.
@@ -194,8 +250,14 @@ pub async fn list_connector_projection_v1(
         .iter()
         .map(|row| row.try_get::<Uuid, _>("connector_id"))
         .collect::<Result<Vec<_>, _>>()?;
-    let binding_rows =
-        load_bindings(session.connection(), tenant_id, &owner_id, &connector_ids).await?;
+    let binding_rows = load_bindings(
+        session.connection(),
+        tenant_id,
+        &owner_id,
+        &connector_ids,
+        BindingProjectionScope::EnabledOnly,
+    )
+    .await?;
 
     let mut item_indexes = HashMap::with_capacity(visible_rows.len());
     let mut items = visible_rows
@@ -231,18 +293,141 @@ pub async fn list_connector_projection_v1(
     })
 }
 
+/// Reads one tenant- and Owner-scoped V3 page after authenticating inside the
+/// same RLS transaction as V1. V3 admits only non-revoked Binding lifecycle
+/// state and never reads Agent Device or route data.
+///
+/// # Errors
+///
+/// Rejects stale/revoked Device Sessions and fails closed on malformed durable rows.
+pub async fn list_connector_projection_v3(
+    store: &PgStore,
+    tenant_id: TenantId,
+    credential: &DeviceSessionCredential,
+    query: ConnectorProjectionQueryV1,
+    observed_at: UtcMillis,
+) -> Result<ConnectorProjectionPageV3, ConnectorProjectionError> {
+    if query.limit == 0 || query.limit > MAX_CONNECTOR_PROJECTION_LIMIT {
+        return Err(ConnectorProjectionError::Unavailable);
+    }
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let authenticated = DeviceSessionRepository::authenticate_in_transaction(
+        session.connection(),
+        credential,
+        observed_at,
+    )
+    .await
+    .map_err(map_identity_error)?;
+    let owner_id = authenticated.identity_id().to_string();
+    let after = query.after.map(Uuid::from);
+    let fetch_limit = i64::from(query.limit) + 1;
+    let rows = sqlx::query(
+        "SELECT c.connector_id, c.host_id, c.adapter_kind, c.generation,
+                c.desired_state, c.observed_state, c.max_concurrency,
+                c.spec_revision AS observed_revision,
+                CASE WHEN EXISTS (
+                    SELECT 1 FROM agent.connector_control_commands command
+                    JOIN agent.connector_control_stream_heads stream
+                      ON stream.tenant_id=command.tenant_id
+                     AND stream.connector_id=command.connector_id
+                   WHERE command.tenant_id=c.tenant_id
+                     AND command.connector_id=c.connector_id
+                     AND command.command_kind='apply_config'
+                     AND command.command_sequence > stream.acknowledged_command_sequence
+                ) THEN c.spec_revision + 1 ELSE c.spec_revision END AS desired_revision,
+                h.desired_revision AS host_desired_revision,
+                h.observed_revision AS host_observed_revision,
+                l.lease_epoch, l.expires_at_ms AS lease_expires_at_ms,
+                l.last_heartbeat_sequence, l.last_heartbeat_at_ms,
+                l.observed_state AS lease_observed_state,
+                l.capacity_available
+           FROM agent.connector_instances c
+           JOIN agent.hosts h
+             ON h.tenant_id=c.tenant_id AND h.host_id=c.host_id
+      LEFT JOIN agent.connector_leases l
+             ON l.tenant_id=c.tenant_id AND l.connector_id=c.connector_id
+            AND l.status='active'
+          WHERE c.tenant_id=$1 AND h.owner_id=$2
+            AND ($3::uuid IS NULL OR c.connector_id > $3)
+          ORDER BY c.connector_id
+          LIMIT $4",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(&owner_id)
+    .bind(after)
+    .bind(fetch_limit)
+    .fetch_all(session.connection())
+    .await?;
+
+    let has_more = rows.len() > usize::from(query.limit);
+    let visible_rows = &rows[..rows.len().min(usize::from(query.limit))];
+    let connector_ids = visible_rows
+        .iter()
+        .map(|row| row.try_get::<Uuid, _>("connector_id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let binding_rows = load_bindings(
+        session.connection(),
+        tenant_id,
+        &owner_id,
+        &connector_ids,
+        BindingProjectionScope::OwnerVisible,
+    )
+    .await?;
+
+    let mut item_indexes = HashMap::with_capacity(visible_rows.len());
+    let mut items = visible_rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let item = connector_v3_from_v1(connector_from_row(row, observed_at.get())?);
+            item_indexes.insert(row.try_get::<Uuid, _>("connector_id")?, index);
+            Ok(item)
+        })
+        .collect::<Result<Vec<_>, ConnectorProjectionError>>()?;
+    for row in binding_rows {
+        let connector_id = row.try_get::<Uuid, _>("connector_id")?;
+        let Some(index) = item_indexes.get(&connector_id).copied() else {
+            return Err(ConnectorProjectionError::Unavailable);
+        };
+        let rank = positive_u64(row.try_get("binding_rank")?)?;
+        if rank > MAX_CONNECTOR_PROJECTION_BINDINGS as u64 {
+            items[index].bindings_truncated = true;
+        } else {
+            items[index].bindings.push(binding_v3_from_row(&row)?);
+        }
+    }
+    let next_cursor = has_more
+        .then(|| items.last().map(|item| item.connector_id.clone()))
+        .flatten();
+    session.commit().await?;
+    Ok(ConnectorProjectionPageV3 {
+        schema_version: 3,
+        tenant_id: tenant_id.to_string(),
+        observed_at_ms: observed_at.get(),
+        items,
+        next_cursor,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BindingProjectionScope {
+    EnabledOnly,
+    OwnerVisible,
+}
+
 async fn load_bindings(
     connection: &mut sqlx::PgConnection,
     tenant_id: TenantId,
     owner_id: &str,
     connector_ids: &[Uuid],
+    scope: BindingProjectionScope,
 ) -> Result<Vec<PgRow>, sqlx::Error> {
     if connector_ids.is_empty() {
         return Ok(Vec::new());
     }
     sqlx::query(
         "SELECT * FROM (
-            SELECT b.connector_id, b.binding_id, b.installation_id,
+            SELECT b.connector_id, b.binding_id, b.installation_id, b.state AS binding_state,
                    policy.routing_policy, b.priority, b.max_concurrency,
                    b.aggregate_revision AS binding_revision,
                    installation.desired_state AS installation_desired_state,
@@ -259,7 +444,8 @@ async fn load_bindings(
                 ON policy.tenant_id=b.tenant_id
                AND policy.installation_id=b.installation_id
              WHERE b.tenant_id=$1 AND installation.owner_id=$2
-               AND b.state='enabled' AND b.connector_id = ANY($3)
+               AND b.connector_id = ANY($3)
+               AND (b.state='enabled' OR ($5::boolean AND b.state='disabled'))
         ) bounded_bindings
         WHERE binding_rank <= $4
         ORDER BY connector_id, binding_rank",
@@ -268,6 +454,7 @@ async fn load_bindings(
     .bind(owner_id)
     .bind(connector_ids)
     .bind(i64::try_from(MAX_CONNECTOR_PROJECTION_BINDINGS + 1).unwrap_or(i64::MAX))
+    .bind(matches!(scope, BindingProjectionScope::OwnerVisible))
     .fetch_all(connection)
     .await
 }
@@ -341,6 +528,83 @@ fn binding_from_row(row: &PgRow) -> Result<ConnectorBindingProjectionV1, Connect
         installation_desired_state: row.try_get("installation_desired_state")?,
         installation_observed_state: row.try_get("installation_observed_state")?,
         installation_revision: positive_u64(row.try_get("installation_revision")?)?,
+    })
+}
+
+fn connector_v3_from_v1(value: ConnectorProjectionV1) -> ConnectorProjectionV3 {
+    let ConnectorProjectionV1 {
+        host_id,
+        connector_id,
+        adapter_kind,
+        generation,
+        desired_state,
+        observed_state,
+        desired_revision,
+        observed_revision,
+        host_desired_revision,
+        host_observed_revision,
+        health,
+        max_concurrency,
+        capacity_available,
+        lease_epoch,
+        lease_expires_at_ms,
+        heartbeat_sequence,
+        last_heartbeat_at_ms,
+        bindings: _,
+        bindings_truncated,
+    } = value;
+    ConnectorProjectionV3 {
+        host_id,
+        connector_id,
+        adapter_kind,
+        generation,
+        desired_state,
+        observed_state,
+        desired_revision,
+        observed_revision,
+        host_desired_revision,
+        host_observed_revision,
+        health,
+        max_concurrency,
+        capacity_available,
+        lease_epoch,
+        lease_expires_at_ms,
+        heartbeat_sequence,
+        last_heartbeat_at_ms,
+        bindings: Vec::new(),
+        bindings_truncated,
+    }
+}
+
+fn binding_v3_from_row(
+    row: &PgRow,
+) -> Result<ConnectorBindingProjectionV3, ConnectorProjectionError> {
+    let ConnectorBindingProjectionV1 {
+        binding_id,
+        installation_id,
+        routing_mode,
+        priority,
+        max_concurrency,
+        binding_revision,
+        installation_desired_state,
+        installation_observed_state,
+        installation_revision,
+    } = binding_from_row(row)?;
+    let binding_state: String = row.try_get("binding_state")?;
+    if !matches!(binding_state.as_str(), "enabled" | "disabled") {
+        return Err(ConnectorProjectionError::Unavailable);
+    }
+    Ok(ConnectorBindingProjectionV3 {
+        binding_id,
+        installation_id,
+        routing_mode,
+        priority,
+        max_concurrency,
+        binding_revision,
+        installation_desired_state,
+        installation_observed_state,
+        installation_revision,
+        binding_state,
     })
 }
 

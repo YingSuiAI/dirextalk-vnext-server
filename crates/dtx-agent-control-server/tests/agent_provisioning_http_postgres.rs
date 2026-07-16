@@ -4,7 +4,10 @@ mod support;
 use std::{
     error::Error,
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicI64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,12 +23,13 @@ use dtx_agent_control::{
 use dtx_agent_control_server::{
     AgentProvisioningInstalledReceiptFacts, ConnectorCertificateAuthority,
     ConnectorControlApplication, ConnectorControlPolicy, ConnectorCredentialAuthorizationIndex,
-    CreateConnectorEnrollmentRequest, ParsedAgentProvisioningInstalled,
-    ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteRecipientReady, ParsedCapacity,
-    ParsedEnrollment, ParsedHello, ParsedLeaseFence, ParsedProtocolRange,
-    ParsedProvisioningRecipientAnnouncement, PostgresAgentProvisioningOwnerBackend,
-    PostgresConnectorControlApplication, ProtobufDurableCommandDecoder,
-    agent_provisioning_installed_receipt_digest, agent_provisioning_owner_router,
+    CreateConnectorEnrollmentRequest, MAX_CONNECTOR_PROJECTION_BINDINGS,
+    ParsedAgentProvisioningInstalled, ParsedAgentRouteBootstrapInstalled,
+    ParsedAgentRouteRecipientReady, ParsedCapacity, ParsedEnrollment, ParsedHello,
+    ParsedLeaseFence, ParsedProtocolRange, ParsedProvisioningRecipientAnnouncement,
+    PostgresAgentProvisioningOwnerBackend, PostgresConnectorControlApplication,
+    ProtobufDurableCommandDecoder, agent_provisioning_installed_receipt_digest,
+    agent_provisioning_owner_router,
 };
 use dtx_agent_host::AgentHost;
 use dtx_agent_persistence::{
@@ -39,7 +43,7 @@ use dtx_agent_registry::{
     VerifiedAgentDefinition,
 };
 use dtx_connect_registry::{
-    AdapterConformance, AdapterKind, BindingSet, BindingSpec, Connector, RoutingPolicy, TenantRef,
+    AdapterConformance, AdapterKind, BindingSpec, Connector, RoutingPolicy, TenantRef,
 };
 use dtx_domain::{
     AgentDeviceId, AgentId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId,
@@ -80,6 +84,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 static TEST_NOW: OnceLock<i64> = OnceLock::new();
+static BINDING_FIXTURE_CLOCK_OFFSET: AtomicI64 = AtomicI64::new(0);
 const AGENT_ID: &str = "dtxa17sv7zwzpr7aduy467sdm3pkmxe6if34eoarhaxdnau44fjwfseda";
 
 #[tokio::test]
@@ -624,6 +629,242 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
         )
     }));
     drop(owner_credential);
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_connector_projection_v3_shows_owner_visible_binding_state_and_remains_bounded()
+-> Result<(), Box<dyn Error>> {
+    TEST_NOW.get_or_init(|| {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis(),
+        )
+        .expect("current time fits i64")
+    });
+    let harness = PostgresHarness::start().await?;
+    let store = harness.runtime_store(12).await?;
+    let tenant_id = TenantId::new();
+    provision_tenant(&store, tenant_id).await?;
+
+    let owner_device_id = DeviceId::new();
+    let (owner_id, owner_head, _) =
+        provision_identity(&harness, &key(31), &key(32), owner_device_id, 33).await?;
+    let (_owner_credential, authorization) =
+        provision_owner_session(&harness, owner_id, owner_device_id, owner_head, [0x34; 32])
+            .await?;
+    let identity_device_id = DeviceId::new();
+    let (_, _, agent_certificate) =
+        provision_identity(&harness, &key(35), &key(36), identity_device_id, 37).await?;
+    let (_, connector) = provision_host_and_connector(&store, tenant_id, owner_id).await?;
+
+    let enabled_binding_id = BindingId::new();
+    provision_installation_binding(
+        &store,
+        tenant_id,
+        owner_id,
+        InstallationId::new(),
+        AgentDeviceId::new(),
+        identity_device_id,
+        fingerprint_for_binding(&agent_certificate, 1)?,
+        enabled_binding_id,
+        &connector,
+    )
+    .await?;
+    let disabled_binding_id = BindingId::new();
+    provision_installation_binding(
+        &store,
+        tenant_id,
+        owner_id,
+        InstallationId::new(),
+        AgentDeviceId::new(),
+        DeviceId::new(),
+        fingerprint_for_binding(&agent_certificate, 2)?,
+        disabled_binding_id,
+        &connector,
+    )
+    .await?;
+    set_binding_state(&store, tenant_id, disabled_binding_id, false).await?;
+    let revoked_binding_id = BindingId::new();
+    provision_installation_binding(
+        &store,
+        tenant_id,
+        owner_id,
+        InstallationId::new(),
+        AgentDeviceId::new(),
+        DeviceId::new(),
+        fingerprint_for_binding(&agent_certificate, 3)?,
+        revoked_binding_id,
+        &connector,
+    )
+    .await?;
+    set_binding_state(&store, tenant_id, revoked_binding_id, true).await?;
+
+    let (issuer, _) = certificate_issuer(now())?;
+    let app = Arc::new(application(
+        store.clone(),
+        issuer,
+        Arc::new(ConnectorCredentialAuthorizationIndex::new()),
+    ));
+    let router = agent_provisioning_owner_router(Arc::new(
+        PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app),
+    ));
+
+    let v2 = owner_get_with_accept(
+        router.clone(),
+        "/v1/connectors",
+        &authorization,
+        Some("application/vnd.dirextalk.connector-projection-page.v2+json"),
+    )
+    .await?;
+    assert_eq!(v2.0, StatusCode::OK);
+    let v2_json: serde_json::Value = serde_json::from_slice(&v2.2)?;
+    assert_eq!(v2_json["schema_version"], 2);
+    let v2_bindings = v2_json["items"][0]["bindings"]
+        .as_array()
+        .expect("V2 binding list");
+    assert_eq!(v2_bindings.len(), 1, "V2 remains enabled-only");
+    assert_eq!(v2_bindings[0]["binding_id"], enabled_binding_id.to_string());
+    assert!(v2_bindings[0].get("binding_state").is_none());
+
+    let v3_media_type = "application/vnd.dirextalk.connector-projection-page.v3+json";
+    let v3 = owner_get_with_accept(
+        router.clone(),
+        "/v1/connectors",
+        &authorization,
+        Some(v3_media_type),
+    )
+    .await?;
+    assert_eq!(v3.0, StatusCode::OK);
+    assert_eq!(v3.1.as_deref(), Some(v3_media_type));
+    let v3_json: serde_json::Value = serde_json::from_slice(&v3.2)?;
+    assert_eq!(v3_json["schema_version"], 3);
+    assert_eq!(v3_json["tenant_id"], tenant_id.to_string());
+    let v3_bindings = v3_json["items"][0]["bindings"]
+        .as_array()
+        .expect("V3 binding list");
+    assert_eq!(v3_bindings.len(), 2);
+    assert!(v3_bindings.iter().any(|binding| {
+        binding["binding_id"] == enabled_binding_id.to_string()
+            && binding["binding_state"] == "enabled"
+    }));
+    assert!(v3_bindings.iter().any(|binding| {
+        binding["binding_id"] == disabled_binding_id.to_string()
+            && binding["binding_state"] == "disabled"
+    }));
+    assert!(
+        v3_bindings
+            .iter()
+            .all(|binding| binding["binding_id"] != revoked_binding_id.to_string())
+    );
+    assert!(v3_bindings.iter().all(|binding| {
+        binding.get("agent_device_id").is_none()
+            && binding.get("route_id").is_none()
+            && binding.get("credential").is_none()
+            && binding.get("secret").is_none()
+            && binding.get("endpoint").is_none()
+            && binding.get("session").is_none()
+    }));
+    assert!(
+        !v3_json["items"][0]["bindings_truncated"]
+            .as_bool()
+            .expect("V3 truncation flag")
+    );
+
+    let foreign_device_id = DeviceId::new();
+    let (foreign_owner, foreign_head, _) =
+        provision_identity(&harness, &key(38), &key(39), foreign_device_id, 40).await?;
+    let (_foreign_credential, foreign_authorization) = provision_owner_session(
+        &harness,
+        foreign_owner,
+        foreign_device_id,
+        foreign_head,
+        [0x41; 32],
+    )
+    .await?;
+    let non_owner = owner_get_with_accept(
+        router.clone(),
+        "/v1/connectors",
+        &foreign_authorization,
+        Some(v3_media_type),
+    )
+    .await?;
+    assert_eq!(non_owner.0, StatusCode::OK);
+    let non_owner_json: serde_json::Value = serde_json::from_slice(&non_owner.2)?;
+    assert_eq!(non_owner_json["items"], serde_json::json!([]));
+    let unknown_accept = owner_get_with_accept(
+        router.clone(),
+        "/v1/connectors",
+        &authorization,
+        Some("application/vnd.dirextalk.connector-projection-page.v99+json"),
+    )
+    .await?;
+    assert_eq!(unknown_accept.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+    for marker in 4..=(MAX_CONNECTOR_PROJECTION_BINDINGS + 2) {
+        let binding_id = BindingId::new();
+        provision_installation_binding(
+            &store,
+            tenant_id,
+            owner_id,
+            InstallationId::new(),
+            AgentDeviceId::new(),
+            DeviceId::new(),
+            fingerprint_for_binding(
+                &agent_certificate,
+                u8::try_from(marker).expect("projection fixture marker fits u8"),
+            )?,
+            binding_id,
+            &connector,
+        )
+        .await?;
+        set_binding_state(&store, tenant_id, binding_id, false).await?;
+    }
+    let bounded_v3 = owner_get_with_accept(
+        router.clone(),
+        "/v1/connectors",
+        &authorization,
+        Some(v3_media_type),
+    )
+    .await?;
+    assert_eq!(bounded_v3.0, StatusCode::OK);
+    let bounded_v3_json: serde_json::Value = serde_json::from_slice(&bounded_v3.2)?;
+    assert_eq!(
+        bounded_v3_json["items"][0]["bindings"]
+            .as_array()
+            .expect("bounded V3 bindings")
+            .len(),
+        MAX_CONNECTOR_PROJECTION_BINDINGS
+    );
+    assert!(
+        bounded_v3_json["items"][0]["bindings_truncated"]
+            .as_bool()
+            .expect("bounded V3 truncation flag")
+    );
+    let bounded_v2 = owner_get_with_accept(
+        router,
+        "/v1/connectors",
+        &authorization,
+        Some("application/vnd.dirextalk.connector-projection-page.v2+json"),
+    )
+    .await?;
+    assert_eq!(bounded_v2.0, StatusCode::OK);
+    let bounded_v2_json: serde_json::Value = serde_json::from_slice(&bounded_v2.2)?;
+    assert_eq!(
+        bounded_v2_json["items"][0]["bindings"]
+            .as_array()
+            .expect("bounded V2 bindings")
+            .len(),
+        1,
+        "V2 must remain enabled-only after V3 adds disabled bindings"
+    );
+    assert!(
+        !bounded_v2_json["items"][0]["bindings_truncated"]
+            .as_bool()
+            .expect("bounded V2 truncation flag")
+    );
     Ok(())
 }
 
@@ -2282,12 +2523,12 @@ async fn provision_installation_binding(
         DescriptorDigest::from_bytes([0x44; 32]),
         now() + 600_000,
     );
-    assert_eq!(
+    assert!(matches!(
         AgentDefinitionRepository::new()
             .insert(session.connection(), &definition, now() - 7_000)
             .await?,
-        DefinitionInsert::Inserted
-    );
+        DefinitionInsert::Inserted | DefinitionInsert::Existing
+    ));
     let installation = AgentInstallation::new(
         tenant_id,
         installation_id,
@@ -2326,7 +2567,10 @@ async fn provision_installation_binding(
             .await?,
         CurrentWrite::Advanced
     );
-    let mut bindings = BindingSet::new(tenant_id);
+    let binding_repository = BindingSetRepository::new();
+    let mut bindings = binding_repository
+        .load(session.connection(), tenant_id)
+        .await?;
     bindings.register_connector_conformance(
         connector,
         AdapterConformance::trusted_multi_session(AdapterKind::Codex, Revision::INITIAL),
@@ -2341,15 +2585,68 @@ async fn provision_installation_binding(
     )?;
     let binding_ref = spec.binding_ref();
     bindings.create_binding(spec, RoutingPolicy::Exclusive)?;
-    BindingSetRepository::new()
-        .save(session.connection(), &bindings, now() - 4_000)
+    let binding_stored_at = next_binding_fixture_timestamp();
+    binding_repository
+        .save(session.connection(), &bindings, binding_stored_at)
         .await?;
     bindings.enable(binding_ref, Revision::INITIAL, &installation, &device)?;
-    BindingSetRepository::new()
-        .save(session.connection(), &bindings, now() - 3_999)
+    binding_repository
+        .save(session.connection(), &bindings, binding_stored_at + 1)
         .await?;
     session.commit().await?;
     Ok(())
+}
+
+async fn set_binding_state(
+    store: &PgStore,
+    tenant_id: TenantId,
+    binding_id: BindingId,
+    revoke: bool,
+) -> Result<(), Box<dyn Error>> {
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let repository = BindingSetRepository::new();
+    let mut bindings = repository.load(session.connection(), tenant_id).await?;
+    let binding_ref = TenantRef::new(tenant_id, binding_id);
+    let disabled_revision =
+        bindings.disable(binding_ref, bindings.binding(binding_ref)?.revision())?;
+    repository
+        .save(
+            session.connection(),
+            &bindings,
+            next_binding_fixture_timestamp(),
+        )
+        .await?;
+    if revoke {
+        bindings.revoke(binding_ref, disabled_revision)?;
+        repository
+            .save(
+                session.connection(),
+                &bindings,
+                next_binding_fixture_timestamp(),
+            )
+            .await?;
+    }
+    session.commit().await?;
+    Ok(())
+}
+
+fn fingerprint_for_binding(
+    certificate: &DeviceCertificateV1,
+    marker: u8,
+) -> Result<DeviceCredentialFingerprint, Box<dyn Error>> {
+    let mut material = certificate.to_deterministic_cbor()?;
+    material.push(marker);
+    Ok(DeviceCredentialFingerprint::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-device-credential-fingerprint.v1\0",
+            &material,
+        )
+        .as_bytes(),
+    ))
+}
+
+fn next_binding_fixture_timestamp() -> i64 {
+    now() - 4_000 + BINDING_FIXTURE_CLOCK_OFFSET.fetch_add(2, Ordering::Relaxed)
 }
 
 fn application(

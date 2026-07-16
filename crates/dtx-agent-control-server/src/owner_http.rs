@@ -44,9 +44,9 @@ use uuid::Uuid;
 
 use crate::connector_projection::{
     CONNECTOR_PROJECTION_MEDIA_TYPE_V1, CONNECTOR_PROJECTION_MEDIA_TYPE_V2,
-    ConnectorProjectionError, ConnectorProjectionPageV2, ConnectorProjectionQueryV1,
-    DEFAULT_CONNECTOR_PROJECTION_LIMIT, MAX_CONNECTOR_PROJECTION_LIMIT,
-    list_connector_projection_v1,
+    CONNECTOR_PROJECTION_MEDIA_TYPE_V3, ConnectorProjectionError, ConnectorProjectionPageV2,
+    ConnectorProjectionQueryV1, DEFAULT_CONNECTOR_PROJECTION_LIMIT, MAX_CONNECTOR_PROJECTION_LIMIT,
+    list_connector_projection_v1, list_connector_projection_v3,
 };
 use crate::{AGENT_IDENTITY_APPROVAL_BINDING_DOMAIN, AgentIdentityApprovalCommand};
 use crate::{
@@ -229,6 +229,16 @@ pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
     ) -> OwnerBackendFuture<'_> {
         Box::pin(async { Err(AgentProvisioningOwnerError::InvalidRequest) })
     }
+    /// Returns the authenticated V3 Connector projection. The conservative
+    /// default prevents legacy backends from silently widening Binding facts.
+    fn list_connectors_v3(
+        &self,
+        _credential: DeviceSessionCredential,
+        _query: ConnectorProjectionQueryV1,
+        _now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async { Err(AgentProvisioningOwnerError::InvalidRequest) })
+    }
     fn lifecycle(
         &self,
         credential: DeviceSessionCredential,
@@ -369,6 +379,23 @@ impl PostgresAgentProvisioningOwnerBackend {
         observed_at: UtcMillis,
         representation: ConnectorProjectionRepresentation,
     ) -> Result<CborOwnerReply, AgentProvisioningOwnerError> {
+        if representation == ConnectorProjectionRepresentation::V3 {
+            let page = list_connector_projection_v3(
+                &self.store,
+                self.tenant_id,
+                &credential,
+                query,
+                observed_at,
+            )
+            .await
+            .map_err(map_connector_projection_error)?;
+            return Ok(CborOwnerReply {
+                status: StatusCode::OK,
+                content_type: CONNECTOR_PROJECTION_MEDIA_TYPE_V3,
+                exact_cbor: serde_json::to_vec(&page)
+                    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?,
+            });
+        }
         // `list_connector_projection_v1` authenticates the Device Session in
         // the tenant-scoped transaction before returning a page. Keep the V2
         // tenant field construction after that await so it cannot be exposed
@@ -391,6 +418,9 @@ impl PostgresAgentProvisioningOwnerBackend {
                 CONNECTOR_PROJECTION_MEDIA_TYPE_V1,
                 serde_json::to_vec(&page),
             ),
+            ConnectorProjectionRepresentation::V3 => {
+                return Err(AgentProvisioningOwnerError::TemporarilyUnavailable);
+            }
         };
         Ok(CborOwnerReply {
             status: StatusCode::OK,
@@ -431,6 +461,23 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                 query,
                 now,
                 ConnectorProjectionRepresentation::V2,
+            )
+            .await
+        })
+    }
+
+    fn list_connectors_v3(
+        &self,
+        credential: DeviceSessionCredential,
+        query: ConnectorProjectionQueryV1,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            self.connector_projection_reply(
+                credential,
+                query,
+                now,
+                ConnectorProjectionRepresentation::V3,
             )
             .await
         })
@@ -2145,6 +2192,9 @@ async fn get_connectors(
             ConnectorProjectionRepresentation::V2 => {
                 backend.list_connectors_v2(credential, query, now()?).await
             }
+            ConnectorProjectionRepresentation::V3 => {
+                backend.list_connectors_v3(credential, query, now()?).await
+            }
         }
     }
     .await;
@@ -2444,6 +2494,7 @@ fn parse_connector_projection_query(
 enum ConnectorProjectionRepresentation {
     V1,
     V2,
+    V3,
 }
 
 fn parse_connector_projection_representation(
@@ -2462,6 +2513,7 @@ fn parse_connector_projection_representation(
     {
         CONNECTOR_PROJECTION_MEDIA_TYPE_V1 => Ok(ConnectorProjectionRepresentation::V1),
         CONNECTOR_PROJECTION_MEDIA_TYPE_V2 => Ok(ConnectorProjectionRepresentation::V2),
+        CONNECTOR_PROJECTION_MEDIA_TYPE_V3 => Ok(ConnectorProjectionRepresentation::V3),
         _ => Err(AgentProvisioningOwnerError::InvalidRequest),
     }
 }
@@ -3522,7 +3574,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_projection_accept_selects_only_the_two_published_versions() {
+    fn connector_projection_accept_selects_only_published_versions() {
         let headers = HeaderMap::new();
         assert_eq!(
             parse_connector_projection_representation(&headers),
@@ -3537,6 +3589,10 @@ mod tests {
             (
                 crate::connector_projection::CONNECTOR_PROJECTION_MEDIA_TYPE_V2,
                 super::ConnectorProjectionRepresentation::V2,
+            ),
+            (
+                crate::connector_projection::CONNECTOR_PROJECTION_MEDIA_TYPE_V3,
+                super::ConnectorProjectionRepresentation::V3,
             ),
         ] {
             let mut headers = HeaderMap::new();
