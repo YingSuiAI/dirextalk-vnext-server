@@ -3,6 +3,7 @@
 **/build/
 **/coverage/
 /.codegraph/
+/.worktrees/
 /.idea/
 /.vscode/
 .env
