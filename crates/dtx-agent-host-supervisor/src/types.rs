@@ -945,5 +945,6 @@ const fn adapter_tag(adapter: AdapterKind) -> u8 {
         AdapterKind::Rig => 4,
         AdapterKind::ClaudeCode => 5,
         AdapterKind::CustomAcp => 6,
+        AdapterKind::HermesAcp => 7,
     }
 }

@@ -131,6 +131,7 @@ impl AdapterWire {
             Self::Rig => AdapterKind::Rig,
             Self::ClaudeCode => AdapterKind::ClaudeCode,
             Self::CustomAcp => AdapterKind::CustomAcp,
+            Self::HermesAcp => AdapterKind::HermesAcp,
         }
     }
 }

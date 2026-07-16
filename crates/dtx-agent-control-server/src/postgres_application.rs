@@ -5772,6 +5772,7 @@ const fn adapter_kind_code(kind: AdapterKind) -> &'static str {
         AdapterKind::Rig => "rig",
         AdapterKind::ClaudeCode => "claude_code",
         AdapterKind::CustomAcp => "custom_acp",
+        AdapterKind::HermesAcp => "hermes_acp",
     }
 }
 
@@ -5809,7 +5810,9 @@ fn registered_adapter_config_entry(adapter_kind: AdapterKind, entry: &ConfigEntr
                 "adapter" | "endpoint-profile" | "model" | "profile"
             )
         }
-        AdapterKind::OpenClawAcp => matches!(entry.key(), "adapter" | "endpoint" | "profile"),
+        AdapterKind::OpenClawAcp | AdapterKind::HermesAcp => {
+            matches!(entry.key(), "adapter" | "endpoint" | "profile")
+        }
         AdapterKind::Eino | AdapterKind::Rig => {
             matches!(entry.key(), "adapter" | "endpoint" | "model" | "profile")
         }
@@ -5826,6 +5829,7 @@ fn registered_adapter_config_entry(adapter_kind: AdapterKind, entry: &ConfigEntr
                 AdapterKind::Rig => entry.value() == "rig",
                 AdapterKind::ClaudeCode => entry.value() == "claude-code",
                 AdapterKind::CustomAcp => true,
+                AdapterKind::HermesAcp => entry.value() == "hermes-acp",
             })
 }
 

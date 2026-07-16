@@ -201,6 +201,7 @@ enum AdapterCode {
     Rig,
     ClaudeCode,
     CustomAcp,
+    HermesAcp,
 }
 
 impl AdapterCode {
@@ -212,6 +213,7 @@ impl AdapterCode {
             Self::Rig => AdapterKind::Rig,
             Self::ClaudeCode => AdapterKind::ClaudeCode,
             Self::CustomAcp => AdapterKind::CustomAcp,
+            Self::HermesAcp => AdapterKind::HermesAcp,
         }
     }
 }
@@ -959,6 +961,16 @@ mod tests {
         assert_eq!(
             parse_plan(duplicate.as_bytes()).err(),
             Some(ProvisionError::Plan)
+        );
+        let hermes = PLAN.replacen(
+            "\"adapter_kind\":\"codex\"",
+            "\"adapter_kind\":\"hermes_acp\"",
+            1,
+        );
+        let hermes = parse_plan(hermes.as_bytes()).expect("Hermes plan parses");
+        assert_eq!(
+            hermes.connectors[0].adapter_kind.domain(),
+            AdapterKind::HermesAcp,
         );
     }
 

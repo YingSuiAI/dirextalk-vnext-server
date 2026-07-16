@@ -15,6 +15,7 @@ pub enum AdapterKind {
     Rig,
     ClaudeCode,
     CustomAcp,
+    HermesAcp,
 }
 
 /// Owner-controlled target state for one connector process.

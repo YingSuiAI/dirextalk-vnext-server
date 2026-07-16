@@ -1483,6 +1483,7 @@ fn parse_adapter_kind(value: &str) -> Result<AdapterKind, WireError> {
         "rig" => Ok(AdapterKind::Rig),
         "claude_code" => Ok(AdapterKind::ClaudeCode),
         "custom_acp" => Ok(AdapterKind::CustomAcp),
+        "hermes_acp" => Ok(AdapterKind::HermesAcp),
         _ => Err(WireError {
             kind: WireErrorKind::UnsupportedValue,
             field: "runtime_kind",
@@ -1693,6 +1694,24 @@ mod tests {
         })
         .expect_err("overcommitted report must be rejected");
         assert_eq!(error.field(), "capacity");
+    }
+
+    #[test]
+    fn runtime_claims_admit_only_the_exact_hermes_adapter_code() {
+        let parsed = parse_runtime_claims(v1::RuntimeClaims {
+            runtime_kind: "hermes_acp".into(),
+            runtime_version: "0.18.2".into(),
+            adapter_build_digest: vec![0x42; 32],
+            capabilities: vec!["agent.control".into()],
+            queue_depth: 0,
+            active_run_ids: Vec::new(),
+            stable_error_code: String::new(),
+        })
+        .expect("Hermes ACP is a registered runtime kind");
+        assert_eq!(parsed.adapter_kind(), AdapterKind::HermesAcp);
+
+        let error = parse_adapter_kind("hermes").expect_err("near matches fail closed");
+        assert_eq!(error.kind(), WireErrorKind::UnsupportedValue);
     }
 
     #[test]

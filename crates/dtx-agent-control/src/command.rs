@@ -1363,7 +1363,13 @@ fn registered_config_entry_is_valid(key: &str, value: &str) -> bool {
     match key {
         "adapter" => matches!(
             value,
-            "codex-app-server" | "openclaw-acp" | "eino" | "rig" | "claude-code" | "vendor-v1"
+            "codex-app-server"
+                | "openclaw-acp"
+                | "eino"
+                | "rig"
+                | "claude-code"
+                | "vendor-v1"
+                | "hermes-acp"
         ),
         "endpoint" => matches!(value, "local" | "private" | "public"),
         "endpoint-profile" => matches!(value, "local" | "private" | "public"),

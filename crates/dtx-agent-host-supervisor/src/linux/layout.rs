@@ -207,6 +207,7 @@ pub(super) const fn adapter_name(adapter: AdapterKind) -> &'static str {
         AdapterKind::Rig => "rig",
         AdapterKind::ClaudeCode => "claude-code",
         AdapterKind::CustomAcp => "custom-acp",
+        AdapterKind::HermesAcp => "hermes-acp",
     }
 }
 

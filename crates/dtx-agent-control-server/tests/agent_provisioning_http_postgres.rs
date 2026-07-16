@@ -658,7 +658,16 @@ async fn owner_connector_projection_v3_shows_owner_visible_binding_state_and_rem
     let identity_device_id = DeviceId::new();
     let (_, _, agent_certificate) =
         provision_identity(&harness, &key(35), &key(36), identity_device_id, 37).await?;
-    let (_, connector) = provision_host_and_connector(&store, tenant_id, owner_id).await?;
+    let (host, connector) = provision_host_and_connector(&store, tenant_id, owner_id).await?;
+    let hermes_connector_id =
+        ConnectorId::try_from(Uuid::parse_str("01890f47-5fd4-7cc2-8f8f-5f9476f4f001")?)?;
+    let hermes_connector =
+        Connector::register(&host, hermes_connector_id, AdapterKind::HermesAcp, 1)?;
+    let mut session = store.begin_tenant(tenant_id).await?;
+    ConnectorRepository::new()
+        .save(session.connection(), &hermes_connector, None, now() - 7_997)
+        .await?;
+    session.commit().await?;
 
     let enabled_binding_id = BindingId::new();
     provision_installation_binding(
@@ -712,9 +721,25 @@ async fn owner_connector_projection_v3_shows_owner_visible_binding_state_and_rem
         PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app),
     ));
 
+    let v1 = owner_get_with_accept(
+        router.clone(),
+        &format!("/v1/connectors?after={hermes_connector_id}&limit=1"),
+        &authorization,
+        None,
+    )
+    .await?;
+    assert_eq!(v1.0, StatusCode::OK);
+    let v1_json: serde_json::Value = serde_json::from_slice(&v1.2)?;
+    assert_eq!(v1_json["schema_version"], 1);
+    assert_eq!(
+        v1_json["items"][0]["connector_id"],
+        connector.connector_id().to_string()
+    );
+    assert_eq!(v1_json["next_cursor"], serde_json::Value::Null);
+
     let v2 = owner_get_with_accept(
         router.clone(),
-        "/v1/connectors",
+        "/v1/connectors?limit=1",
         &authorization,
         Some("application/vnd.dirextalk.connector-projection-page.v2+json"),
     )
@@ -722,6 +747,18 @@ async fn owner_connector_projection_v3_shows_owner_visible_binding_state_and_rem
     assert_eq!(v2.0, StatusCode::OK);
     let v2_json: serde_json::Value = serde_json::from_slice(&v2.2)?;
     assert_eq!(v2_json["schema_version"], 2);
+    assert_eq!(
+        v2_json["items"][0]["connector_id"],
+        connector.connector_id().to_string()
+    );
+    assert_eq!(v2_json["next_cursor"], serde_json::Value::Null);
+    assert!(
+        v2_json["items"]
+            .as_array()
+            .expect("V2 items")
+            .iter()
+            .all(|item| item["adapter_kind"] != "hermes_acp")
+    );
     let v2_bindings = v2_json["items"][0]["bindings"]
         .as_array()
         .expect("V2 binding list");
@@ -732,7 +769,7 @@ async fn owner_connector_projection_v3_shows_owner_visible_binding_state_and_rem
     let v3_media_type = "application/vnd.dirextalk.connector-projection-page.v3+json";
     let v3 = owner_get_with_accept(
         router.clone(),
-        "/v1/connectors",
+        "/v1/connectors?limit=1",
         &authorization,
         Some(v3_media_type),
     )
@@ -742,6 +779,12 @@ async fn owner_connector_projection_v3_shows_owner_visible_binding_state_and_rem
     let v3_json: serde_json::Value = serde_json::from_slice(&v3.2)?;
     assert_eq!(v3_json["schema_version"], 3);
     assert_eq!(v3_json["tenant_id"], tenant_id.to_string());
+    assert_eq!(
+        v3_json["items"][0]["connector_id"],
+        connector.connector_id().to_string(),
+        "legacy filtering must happen before ORDER/LIMIT so Hermes cannot starve V3 pages",
+    );
+    assert_eq!(v3_json["next_cursor"], serde_json::Value::Null);
     let v3_bindings = v3_json["items"][0]["bindings"]
         .as_array()
         .expect("V3 binding list");
@@ -771,6 +814,30 @@ async fn owner_connector_projection_v3_shows_owner_visible_binding_state_and_rem
         !v3_json["items"][0]["bindings_truncated"]
             .as_bool()
             .expect("V3 truncation flag")
+    );
+
+    let v4_media_type = "application/vnd.dirextalk.connector-projection-page.v4+json";
+    let v4 = owner_get_with_accept(
+        router.clone(),
+        "/v1/connectors",
+        &authorization,
+        Some(v4_media_type),
+    )
+    .await?;
+    assert_eq!(v4.0, StatusCode::OK);
+    assert_eq!(v4.1.as_deref(), Some(v4_media_type));
+    let v4_json: serde_json::Value = serde_json::from_slice(&v4.2)?;
+    assert_eq!(v4_json["schema_version"], 4);
+    assert_eq!(v4_json["tenant_id"], tenant_id.to_string());
+    assert!(
+        v4_json["items"]
+            .as_array()
+            .expect("V4 items")
+            .iter()
+            .any(
+                |item| item["connector_id"] == hermes_connector_id.to_string()
+                    && item["adapter_kind"] == "hermes_acp"
+            )
     );
 
     let foreign_device_id = DeviceId::new();
@@ -3132,7 +3199,7 @@ async fn set_binding_state(
     let binding_ref = TenantRef::new(tenant_id, binding_id);
     let disabled_revision =
         bindings.disable(binding_ref, bindings.binding(binding_ref)?.revision())?;
-    let stored_at = current_store_timestamp()?;
+    let stored_at = next_binding_fixture_timestamp();
     repository
         .save(session.connection(), &bindings, stored_at)
         .await?;
@@ -3194,7 +3261,19 @@ fn fingerprint_for_binding(
 }
 
 fn next_binding_fixture_timestamp() -> i64 {
-    now() - 4_000 + BINDING_FIXTURE_CLOCK_OFFSET.fetch_add(2, Ordering::Relaxed)
+    let wall_clock = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )
+    .expect("current time fits i64");
+    let previous = BINDING_FIXTURE_CLOCK_OFFSET
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
+            Some(previous.saturating_add(2).max(wall_clock))
+        })
+        .expect("binding fixture clock update cannot fail");
+    previous.saturating_add(2).max(wall_clock)
 }
 
 fn application(

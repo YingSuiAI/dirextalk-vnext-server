@@ -89,6 +89,7 @@ pub enum AdapterWire {
     Rig,
     ClaudeCode,
     CustomAcp,
+    HermesAcp,
 }
 
 #[derive(Clone, Debug, Serialize)]

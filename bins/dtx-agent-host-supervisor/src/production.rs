@@ -396,6 +396,7 @@ const fn adapter_name(adapter: AdapterKind) -> &'static str {
         AdapterKind::Rig => "rig",
         AdapterKind::ClaudeCode => "claude_code",
         AdapterKind::CustomAcp => "custom_acp",
+        AdapterKind::HermesAcp => "hermes_acp",
     }
 }
 

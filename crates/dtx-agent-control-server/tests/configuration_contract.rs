@@ -83,6 +83,18 @@ fn owner_configuration_is_canonical_and_adapter_scoped() {
         .map(|request| request.adapter_kind()),
         Ok(AdapterKind::CustomAcp),
     );
+    assert_eq!(
+        ApplyConnectorConfigurationRequest::new(
+            fence(),
+            RequestId::new(),
+            ConnectorDesiredState::Running,
+            AdapterKind::HermesAcp,
+            vec![entry("adapter", "hermes-acp"), entry("profile", "safe")],
+            vec![entry("policy-id", "policy-v1")],
+        )
+        .map(|request| request.adapter_kind()),
+        Ok(AdapterKind::HermesAcp),
+    );
 }
 
 #[test]

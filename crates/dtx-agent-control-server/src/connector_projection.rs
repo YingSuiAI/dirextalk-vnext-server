@@ -21,6 +21,9 @@ pub const CONNECTOR_PROJECTION_MEDIA_TYPE_V2: &str =
 /// Owner management projection with non-secret disabled Binding visibility.
 pub const CONNECTOR_PROJECTION_MEDIA_TYPE_V3: &str =
     "application/vnd.dirextalk.connector-projection-page.v3+json";
+/// Owner management projection that advertises Hermes ACP capability.
+pub const CONNECTOR_PROJECTION_MEDIA_TYPE_V4: &str =
+    "application/vnd.dirextalk.connector-projection-page.v4+json";
 /// Default number of Connector instances returned by one page.
 pub const DEFAULT_CONNECTOR_PROJECTION_LIMIT: u16 = 32;
 /// Hard per-request Connector page ceiling.
@@ -75,6 +78,17 @@ impl ConnectorProjectionPageV2 {
 /// appear; revoked Bindings remain permanently absent from this read model.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConnectorProjectionPageV3 {
+    pub schema_version: u8,
+    pub tenant_id: String,
+    pub observed_at_ms: i64,
+    pub items: Vec<ConnectorProjectionV3>,
+    pub next_cursor: Option<String>,
+}
+
+/// V4 preserves V3's bounded, non-secret shape and widens the adapter
+/// vocabulary with `hermes_acp`. Clients opt in with the exact V4 media type.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ConnectorProjectionPageV4 {
     pub schema_version: u8,
     pub tenant_id: String,
     pub observed_at_ms: i64,
@@ -233,6 +247,9 @@ pub async fn list_connector_projection_v1(
              ON l.tenant_id=c.tenant_id AND l.connector_id=c.connector_id
             AND l.status='active'
           WHERE c.tenant_id=$1 AND h.owner_id=$2
+            AND c.adapter_kind IN (
+                'codex', 'openclaw_acp', 'eino', 'rig', 'claude_code', 'custom_acp'
+            )
             AND ($3::uuid IS NULL OR c.connector_id > $3)
           ORDER BY c.connector_id
           LIMIT $4",
@@ -307,6 +324,76 @@ pub async fn list_connector_projection_v3(
     query: ConnectorProjectionQueryV1,
     observed_at: UtcMillis,
 ) -> Result<ConnectorProjectionPageV3, ConnectorProjectionError> {
+    let page = list_connector_projection_management(
+        store,
+        tenant_id,
+        credential,
+        query,
+        observed_at,
+        AdapterProjectionScope::Legacy,
+    )
+    .await?;
+    Ok(ConnectorProjectionPageV3 {
+        schema_version: 3,
+        tenant_id: page.tenant_id,
+        observed_at_ms: page.observed_at_ms,
+        items: page.items,
+        next_cursor: page.next_cursor,
+    })
+}
+
+/// Reads one V4 page after authenticating within the same tenant transaction.
+/// V4 is the first Connector projection that can expose `hermes_acp`.
+///
+/// # Errors
+///
+/// Rejects stale/revoked Device Sessions and fails closed on malformed durable rows.
+pub async fn list_connector_projection_v4(
+    store: &PgStore,
+    tenant_id: TenantId,
+    credential: &DeviceSessionCredential,
+    query: ConnectorProjectionQueryV1,
+    observed_at: UtcMillis,
+) -> Result<ConnectorProjectionPageV4, ConnectorProjectionError> {
+    let page = list_connector_projection_management(
+        store,
+        tenant_id,
+        credential,
+        query,
+        observed_at,
+        AdapterProjectionScope::V4,
+    )
+    .await?;
+    Ok(ConnectorProjectionPageV4 {
+        schema_version: 4,
+        tenant_id: page.tenant_id,
+        observed_at_ms: page.observed_at_ms,
+        items: page.items,
+        next_cursor: page.next_cursor,
+    })
+}
+
+struct ConnectorProjectionManagementPage {
+    tenant_id: String,
+    observed_at_ms: i64,
+    items: Vec<ConnectorProjectionV3>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdapterProjectionScope {
+    Legacy,
+    V4,
+}
+
+async fn list_connector_projection_management(
+    store: &PgStore,
+    tenant_id: TenantId,
+    credential: &DeviceSessionCredential,
+    query: ConnectorProjectionQueryV1,
+    observed_at: UtcMillis,
+    adapter_scope: AdapterProjectionScope,
+) -> Result<ConnectorProjectionManagementPage, ConnectorProjectionError> {
     if query.limit == 0 || query.limit > MAX_CONNECTOR_PROJECTION_LIMIT {
         return Err(ConnectorProjectionError::Unavailable);
     }
@@ -348,6 +435,10 @@ pub async fn list_connector_projection_v3(
              ON l.tenant_id=c.tenant_id AND l.connector_id=c.connector_id
             AND l.status='active'
           WHERE c.tenant_id=$1 AND h.owner_id=$2
+            AND c.adapter_kind IN (
+                'codex', 'openclaw_acp', 'eino', 'rig', 'claude_code', 'custom_acp', 'hermes_acp'
+            )
+            AND ($5::boolean OR c.adapter_kind <> 'hermes_acp')
             AND ($3::uuid IS NULL OR c.connector_id > $3)
           ORDER BY c.connector_id
           LIMIT $4",
@@ -356,6 +447,7 @@ pub async fn list_connector_projection_v3(
     .bind(&owner_id)
     .bind(after)
     .bind(fetch_limit)
+    .bind(matches!(adapter_scope, AdapterProjectionScope::V4))
     .fetch_all(session.connection())
     .await?;
 
@@ -400,8 +492,7 @@ pub async fn list_connector_projection_v3(
         .then(|| items.last().map(|item| item.connector_id.clone()))
         .flatten();
     session.commit().await?;
-    Ok(ConnectorProjectionPageV3 {
-        schema_version: 3,
+    Ok(ConnectorProjectionManagementPage {
         tenant_id: tenant_id.to_string(),
         observed_at_ms: observed_at.get(),
         items,

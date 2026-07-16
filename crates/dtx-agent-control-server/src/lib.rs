@@ -50,8 +50,9 @@ pub use command_codec::{
 pub use command_notifications::CommandNotificationSubscription;
 pub use connector_projection::{
     CONNECTOR_PROJECTION_MEDIA_TYPE_V1, CONNECTOR_PROJECTION_MEDIA_TYPE_V2,
-    CONNECTOR_PROJECTION_MEDIA_TYPE_V3, ConnectorBindingProjectionV1, ConnectorBindingProjectionV3,
-    ConnectorProjectionPageV1, ConnectorProjectionPageV3, ConnectorProjectionQueryV1,
+    CONNECTOR_PROJECTION_MEDIA_TYPE_V3, CONNECTOR_PROJECTION_MEDIA_TYPE_V4,
+    ConnectorBindingProjectionV1, ConnectorBindingProjectionV3, ConnectorProjectionPageV1,
+    ConnectorProjectionPageV3, ConnectorProjectionPageV4, ConnectorProjectionQueryV1,
     ConnectorProjectionV1, ConnectorProjectionV3, DEFAULT_CONNECTOR_PROJECTION_LIMIT,
     MAX_CONNECTOR_PROJECTION_BINDINGS, MAX_CONNECTOR_PROJECTION_LIMIT,
 };

@@ -1015,6 +1015,7 @@ enum AdapterWire {
     Rig,
     ClaudeCode,
     CustomAcp,
+    HermesAcp,
 }
 
 impl AdapterWire {
@@ -1026,6 +1027,7 @@ impl AdapterWire {
             AdapterKind::Rig => Self::Rig,
             AdapterKind::ClaudeCode => Self::ClaudeCode,
             AdapterKind::CustomAcp => Self::CustomAcp,
+            AdapterKind::HermesAcp => Self::HermesAcp,
         }
     }
 
@@ -1037,6 +1039,7 @@ impl AdapterWire {
             Self::Rig => AdapterKind::Rig,
             Self::ClaudeCode => AdapterKind::ClaudeCode,
             Self::CustomAcp => AdapterKind::CustomAcp,
+            Self::HermesAcp => AdapterKind::HermesAcp,
         }
     }
 }

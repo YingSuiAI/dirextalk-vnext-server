@@ -435,6 +435,7 @@ pub(crate) fn adapter_kind_code(value: AdapterKind) -> &'static str {
         AdapterKind::Rig => "rig",
         AdapterKind::ClaudeCode => "claude_code",
         AdapterKind::CustomAcp => "custom_acp",
+        AdapterKind::HermesAcp => "hermes_acp",
     }
 }
 
@@ -446,7 +447,24 @@ pub(crate) fn parse_adapter_kind(value: &str) -> Result<AdapterKind, AgentPersis
         "rig" => Ok(AdapterKind::Rig),
         "claude_code" => Ok(AdapterKind::ClaudeCode),
         "custom_acp" => Ok(AdapterKind::CustomAcp),
+        "hermes_acp" => Ok(AdapterKind::HermesAcp),
         _ => Err(AgentPersistenceError::CorruptData("connector adapter kind")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{adapter_kind_code, parse_adapter_kind};
+    use dtx_connect_registry::AdapterKind;
+
+    #[test]
+    fn hermes_adapter_kind_has_an_exact_durable_code() {
+        assert_eq!(adapter_kind_code(AdapterKind::HermesAcp), "hermes_acp");
+        assert_eq!(
+            parse_adapter_kind("hermes_acp").expect("registered adapter parses"),
+            AdapterKind::HermesAcp,
+        );
+        assert!(parse_adapter_kind("hermes").is_err());
     }
 }
 

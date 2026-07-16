@@ -35,7 +35,8 @@ const CONVERSATION_GRANT_OWNER_RUNTIME_PRIVILEGES_MIGRATION_VERSION: i64 = 202_6
 const AGENT_ROUTE_RUN_INGRESS_MIGRATION_VERSION: i64 = 202_607_160_029;
 const AGENT_ROUTE_BOOTSTRAP_V1_MIGRATION_VERSION: i64 = 202_607_160_030;
 const CONNECTOR_BINDING_STATE_OWNER_API_MIGRATION_VERSION: i64 = 202_607_160_031;
-const EXPECTED_MIGRATION_COUNT: i64 = 31;
+const HERMES_ACP_ADAPTER_MIGRATION_VERSION: i64 = 202_607_160_032;
+const EXPECTED_MIGRATION_COUNT: i64 = 32;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -97,6 +98,8 @@ const AGENT_ROUTE_BOOTSTRAP_V1_DOWN: &str =
     include_str!("../../../migrations/202607160030_agent_route_bootstrap_v1.down.sql");
 const CONNECTOR_BINDING_STATE_OWNER_API_DOWN: &str =
     include_str!("../../../migrations/202607160031_connector_binding_state_owner_api.down.sql");
+const HERMES_ACP_ADAPTER_DOWN: &str =
+    include_str!("../../../migrations/202607160032_hermes_acp_adapter.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -117,6 +120,79 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
+async fn hermes_adapter_down_migration_refuses_to_orphan_durable_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    let tenant_id = Uuid::now_v7();
+    let host_id = Uuid::now_v7();
+    let connector_id = Uuid::now_v7();
+    let mut transaction = harness.admin_pool().begin().await?;
+    sqlx::query("INSERT INTO system.tenant_stream_heads (tenant_id, last_sequence) VALUES ($1, 0)")
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        "INSERT INTO agent.hosts (
+             tenant_id, host_id, owner_id, lifecycle, desired_revision,
+             observed_revision, aggregate_revision, created_at_ms, updated_at_ms
+         ) VALUES ($1, $2, $3, 'active', 1, 1, 1, 0, 0)",
+    )
+    .bind(tenant_id)
+    .bind(host_id)
+    .bind("dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la")
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.connector_instances (
+             tenant_id, connector_id, host_id, adapter_kind, generation,
+             desired_state, observed_state, max_concurrency, spec_revision,
+             created_at_ms, updated_at_ms
+         ) VALUES ($1, $2, $3, 'hermes_acp', 1, 'running', 'enrolling', 1, 1, 0, 0)",
+    )
+    .bind(tenant_id)
+    .bind(connector_id)
+    .bind(host_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.connector_revisions (
+             tenant_id, connector_id, spec_revision, generation, adapter_kind,
+             desired_state, max_concurrency, recorded_at_ms
+         ) VALUES ($1, $2, 1, 1, 'hermes_acp', 'running', 1, 0)",
+    )
+    .bind(tenant_id)
+    .bind(connector_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    let error = sqlx::raw_sql(HERMES_ACP_ADAPTER_DOWN)
+        .execute(harness.admin_pool())
+        .await
+        .expect_err("rollback must fail while Hermes rows exist");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.code()),
+        Some(std::borrow::Cow::Borrowed("55000")),
+    );
+    let hermes_constraints: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM pg_constraint
+          WHERE conname IN (
+                    'connector_instances_adapter_kind_valid',
+                    'connector_revisions_adapter_kind_valid',
+                    'connector_conformance_adapter_kind_valid'
+                )
+            AND pg_get_constraintdef(oid) LIKE '%hermes_acp%'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(hermes_constraints, 3);
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(
     clippy::too_many_lines,
     reason = "one reversible migration test keeps the full ordered schema teardown auditable"
@@ -127,7 +203,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -160,8 +236,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(AGENT_ROUTE_RUN_INGRESS_MIGRATION_VERSION)
     .bind(AGENT_ROUTE_BOOTSTRAP_V1_MIGRATION_VERSION)
     .bind(CONNECTOR_BINDING_STATE_OWNER_API_MIGRATION_VERSION)
+    .bind(HERMES_ACP_ADAPTER_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(HERMES_ACP_ADAPTER_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(CONNECTOR_BINDING_STATE_OWNER_API_DOWN)
         .execute(harness.admin_pool())
         .await?;
