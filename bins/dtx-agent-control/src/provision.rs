@@ -91,6 +91,25 @@ const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.connector_control_credential_heads", "SELECT"),
 ];
 const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[("system.current_tenant_id()", "EXECUTE")];
+const ACCEPTANCE_PREPARE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
+    ("system.schema_versions", "SELECT"),
+    ("system.tenant_stream_heads", "INSERT"),
+    ("agent.hosts", "SELECT"),
+    ("agent.hosts", "INSERT"),
+    ("agent.host_credentials", "SELECT"),
+    ("agent.host_credentials", "INSERT"),
+    ("agent.connector_instances", "SELECT"),
+    ("agent.connector_instances", "INSERT"),
+    ("agent.connector_revisions", "SELECT"),
+    ("agent.connector_revisions", "INSERT"),
+    ("agent.connector_boots", "SELECT"),
+    ("agent.connector_leases", "SELECT"),
+    ("agent.connector_control_operations", "SELECT"),
+    ("agent.connector_control_operations", "INSERT"),
+    ("agent.connector_enrollment_intents", "SELECT"),
+    ("agent.connector_enrollment_intents", "INSERT"),
+    ("agent.connector_control_credential_heads", "SELECT"),
+];
 const ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.agent_definitions", "SELECT"),
     ("agent.agent_definitions", "INSERT"),
@@ -233,7 +252,7 @@ async fn run_acceptance() -> Result<(), AcceptanceError> {
         .await
         .map_err(|_| AcceptanceError::Database)?;
     let required_table_privileges = match arguments.phase {
-        AcceptancePhase::Prepare => REQUIRED_TABLE_PRIVILEGES,
+        AcceptancePhase::Prepare => ACCEPTANCE_PREPARE_TABLE_PRIVILEGES,
         AcceptancePhase::Finalize => ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES,
     };
     if !store
@@ -2716,9 +2735,29 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_prepare_preflight_covers_new_host_writes() {
-        assert!(REQUIRED_TABLE_PRIVILEGES.contains(&("agent.hosts", "INSERT")));
-        assert!(REQUIRED_TABLE_PRIVILEGES.contains(&("agent.host_credentials", "INSERT")));
+    fn acceptance_prepare_preflight_is_exact() {
+        assert_eq!(
+            ACCEPTANCE_PREPARE_TABLE_PRIVILEGES,
+            &[
+                ("system.schema_versions", "SELECT"),
+                ("system.tenant_stream_heads", "INSERT"),
+                ("agent.hosts", "SELECT"),
+                ("agent.hosts", "INSERT"),
+                ("agent.host_credentials", "SELECT"),
+                ("agent.host_credentials", "INSERT"),
+                ("agent.connector_instances", "SELECT"),
+                ("agent.connector_instances", "INSERT"),
+                ("agent.connector_revisions", "SELECT"),
+                ("agent.connector_revisions", "INSERT"),
+                ("agent.connector_boots", "SELECT"),
+                ("agent.connector_leases", "SELECT"),
+                ("agent.connector_control_operations", "SELECT"),
+                ("agent.connector_control_operations", "INSERT"),
+                ("agent.connector_enrollment_intents", "SELECT"),
+                ("agent.connector_enrollment_intents", "INSERT"),
+                ("agent.connector_control_credential_heads", "SELECT"),
+            ]
+        );
     }
 
     #[cfg(unix)]

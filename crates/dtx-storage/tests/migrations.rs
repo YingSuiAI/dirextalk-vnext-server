@@ -44,7 +44,8 @@ const MCP_REFERENCE_QUERIES_MIGRATION_VERSION: i64 = 202_607_170_037;
 const AGENT_MCP_CREDENTIALS_MIGRATION_VERSION: i64 = 202_607_170_038;
 const AGENT_ACCEPTANCE_FINALIZE_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_170_039;
 const AGENT_ACCEPTANCE_PREPARE_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_180_040;
-const EXPECTED_MIGRATION_COUNT: i64 = 40;
+const AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_180_041;
+const EXPECTED_MIGRATION_COUNT: i64 = 41;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -132,6 +133,12 @@ const AGENT_ACCEPTANCE_PREPARE_PRIVILEGES_DOWN: &str =
     include_str!("../../../migrations/202607180040_agent_acceptance_prepare_privileges.down.sql");
 const AGENT_ACCEPTANCE_PREPARE_PRIVILEGES_UP: &str =
     include_str!("../../../migrations/202607180040_agent_acceptance_prepare_privileges.up.sql");
+const AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_DOWN: &str = include_str!(
+    "../../../migrations/202607180041_agent_acceptance_tenant_stream_privileges.down.sql"
+);
+const AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_UP: &str = include_str!(
+    "../../../migrations/202607180041_agent_acceptance_tenant_stream_privileges.up.sql"
+);
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -796,6 +803,70 @@ async fn agent_acceptance_prepare_privileges_are_exact_and_reversible()
 }
 
 #[tokio::test]
+async fn agent_acceptance_tenant_stream_privileges_are_exact_and_reversible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(
+        "DO $role$
+         BEGIN
+             IF to_regrole('dtx_agent_runtime') IS NULL THEN
+                 CREATE ROLE dtx_agent_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS
+                     NOCREATEDB NOCREATEROLE NOREPLICATION;
+             END IF;
+         END
+         $role$;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+
+    let expected_rights = "SELECT count(*)
+           FROM (VALUES
+             ('system.tenant_stream_heads', 'INSERT')
+           ) AS expected(relation_name, privilege_name)
+          WHERE has_table_privilege(
+              'dtx_agent_runtime', relation_name, privilege_name
+          )";
+    let before: i64 = sqlx::query_scalar(expected_rights)
+        .fetch_one(harness.admin_pool())
+        .await?;
+    assert_eq!(before, 0);
+
+    sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    let granted: i64 = sqlx::query_scalar(expected_rights)
+        .fetch_one(harness.admin_pool())
+        .await?;
+    assert_eq!(granted, 1);
+    let excess: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM (VALUES
+             ('system.tenant_stream_heads', 'SELECT'),
+             ('system.tenant_stream_heads', 'UPDATE'),
+             ('system.tenant_stream_heads', 'DELETE')
+           ) AS denied(relation_name, privilege_name)
+          WHERE has_table_privilege(
+              'dtx_agent_runtime', relation_name, privilege_name
+          )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(excess, 0);
+
+    sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    let after: i64 = sqlx::query_scalar(expected_rights)
+        .fetch_one(harness.admin_pool())
+        .await?;
+    assert_eq!(after, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn public_cache_generation_migration_backfills_visible_indexers_only()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
@@ -944,7 +1015,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -986,8 +1057,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(AGENT_MCP_CREDENTIALS_MIGRATION_VERSION)
     .bind(AGENT_ACCEPTANCE_FINALIZE_PRIVILEGES_MIGRATION_VERSION)
     .bind(AGENT_ACCEPTANCE_PREPARE_PRIVILEGES_MIGRATION_VERSION)
+    .bind(AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(AGENT_ACCEPTANCE_PREPARE_PRIVILEGES_DOWN)
         .execute(harness.admin_pool())
         .await?;
