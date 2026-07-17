@@ -50,6 +50,8 @@ const MAX_REFERENCE_QUERY_BYTES: usize = 256;
 const MAX_REFERENCES: u16 = 32;
 const MAX_POST_SCAN: i32 = 256;
 const MAX_REFERENCE_TITLE_CHARS: usize = 120;
+const CHANNEL_ID_SCHEMA_PATTERN: &str = "^dtxc1[a-z2-7]{51}[aq]$";
+const POST_ID_SCHEMA_PATTERN: &str = "^dtxc1[a-z2-7]{51}[aq]:[1-9][0-9]{0,15}$";
 const REFERENCE_KIND_ROOM: u8 = 1;
 const REFERENCE_KIND_CHANNEL: u8 = 2;
 const REFERENCE_KIND_POST: u8 = 4;
@@ -305,7 +307,38 @@ fn parse_references(reply: &CborOwnerReply) -> Result<Value, AgentProvisioningOw
     if !references.is_array() {
         return Err(AgentProvisioningOwnerError::TemporarilyUnavailable);
     }
+    if !references_have_canonical_channel_ids(&references) {
+        return Err(AgentProvisioningOwnerError::TemporarilyUnavailable);
+    }
     Ok(references)
+}
+
+fn references_have_canonical_channel_ids(references: &Value) -> bool {
+    references
+        .as_array()
+        .is_some_and(|references| references.iter().all(reference_has_canonical_channel_ids))
+}
+
+fn reference_has_canonical_channel_ids(reference: &Value) -> bool {
+    let target = &reference["target"];
+    match reference["kind"].as_str() {
+        Some("channel") => {
+            is_canonical_channel_id(reference["stable_id"].as_str())
+                && is_canonical_channel_id(target["channel_id"].as_str())
+        }
+        Some("post") => {
+            reference["stable_id"]
+                .as_str()
+                .and_then(|stable_id| stable_id.rsplit_once(':'))
+                .is_some_and(|(channel_id, _)| is_canonical_channel_id(Some(channel_id)))
+                && is_canonical_channel_id(target["channel_id"].as_str())
+        }
+        _ => true,
+    }
+}
+
+fn is_canonical_channel_id(channel_id: Option<&str>) -> bool {
+    channel_id.is_some_and(|channel_id| channel_id.parse::<ChannelId>().is_ok())
 }
 
 enum DispatchData {
@@ -487,14 +520,14 @@ fn references_tool() -> Value {
                                 "required": ["kind", "stable_id", "title", "target"],
                                 "properties": {
                                     "kind": { "const": "channel" },
-                                    "stable_id": { "type": "string", "pattern": "^dtxc1[a-z2-7]{52}$" },
+                                    "stable_id": { "type": "string", "pattern": CHANNEL_ID_SCHEMA_PATTERN },
                                     "title": { "type": "string", "minLength": 1, "maxLength": MAX_REFERENCE_TITLE_CHARS },
                                     "target": {
                                         "type": "object",
                                         "required": ["kind", "channel_id"],
                                         "properties": {
                                             "kind": { "const": "public_channel" },
-                                            "channel_id": { "type": "string", "pattern": "^dtxc1[a-z2-7]{52}$" }
+                                            "channel_id": { "type": "string", "pattern": CHANNEL_ID_SCHEMA_PATTERN }
                                         },
                                         "additionalProperties": false
                                     }
@@ -508,7 +541,7 @@ fn references_tool() -> Value {
                                     "kind": { "const": "post" },
                                     "stable_id": {
                                         "type": "string",
-                                        "pattern": "^dtxc1[a-z2-7]{52}:[1-9][0-9]{0,15}$"
+                                        "pattern": POST_ID_SCHEMA_PATTERN
                                     },
                                     "title": { "type": "string", "minLength": 1, "maxLength": MAX_REFERENCE_TITLE_CHARS },
                                     "target": {
@@ -516,7 +549,7 @@ fn references_tool() -> Value {
                                         "required": ["kind", "channel_id", "sequence"],
                                         "properties": {
                                             "kind": { "const": "public_channel_post" },
-                                            "channel_id": { "type": "string", "pattern": "^dtxc1[a-z2-7]{52}$" },
+                                            "channel_id": { "type": "string", "pattern": CHANNEL_ID_SCHEMA_PATTERN },
                                             "sequence": {
                                                 "type": "integer",
                                                 "minimum": 1,
@@ -1253,11 +1286,11 @@ mod tests {
                 },
                 {
                     "kind": "post",
-                    "stable_id": format!("dtxc1{}:7", "b".repeat(52)),
+                    "stable_id": format!("dtxc1{}q:7", "b".repeat(51)),
                     "title": "首个帖子",
                     "target": {
                         "kind": "public_channel_post",
-                        "channel_id": format!("dtxc1{}", "b".repeat(52)),
+                        "channel_id": format!("dtxc1{}q", "b".repeat(51)),
                         "sequence": 7
                     }
                 }
@@ -1284,6 +1317,97 @@ mod tests {
                 response_json(response).await["result"]["structuredContent"]["references"],
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn reference_tool_schema_requires_canonical_channel_ids() {
+        let schema = super::references_tool();
+        let variants = &schema["outputSchema"]["properties"]["references"]["items"]["oneOf"];
+        let channel = &variants[1];
+        let post = &variants[2];
+
+        assert_eq!(
+            channel["properties"]["stable_id"]["pattern"],
+            "^dtxc1[a-z2-7]{51}[aq]$"
+        );
+        assert_eq!(
+            channel["properties"]["target"]["properties"]["channel_id"]["pattern"],
+            "^dtxc1[a-z2-7]{51}[aq]$"
+        );
+        assert_eq!(
+            post["properties"]["stable_id"]["pattern"],
+            "^dtxc1[a-z2-7]{51}[aq]:[1-9][0-9]{0,15}$"
+        );
+        assert_eq!(
+            post["properties"]["target"]["properties"]["channel_id"]["pattern"],
+            "^dtxc1[a-z2-7]{51}[aq]$"
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_tool_rejects_noncanonical_channel_ids_from_backend() {
+        let canonical = format!("dtxc1{}", "a".repeat(52));
+        let noncanonical = format!("dtxc1{}t", "a".repeat(51));
+        let cases = [
+            json!([{
+                "kind": "channel",
+                "stable_id": noncanonical.clone(),
+                "title": "公开频道",
+                "target": {
+                    "kind": "public_channel",
+                    "channel_id": canonical.clone()
+                }
+            }]),
+            json!([{
+                "kind": "channel",
+                "stable_id": canonical.clone(),
+                "title": "公开频道",
+                "target": {
+                    "kind": "public_channel",
+                    "channel_id": noncanonical.clone()
+                }
+            }]),
+            json!([{
+                "kind": "post",
+                "stable_id": format!("{noncanonical}:7"),
+                "title": "频道帖子",
+                "target": {
+                    "kind": "public_channel_post",
+                    "channel_id": canonical.clone(),
+                    "sequence": 7
+                }
+            }]),
+            json!([{
+                "kind": "post",
+                "stable_id": format!("{canonical}:7"),
+                "title": "频道帖子",
+                "target": {
+                    "kind": "public_channel_post",
+                    "channel_id": noncanonical,
+                    "sequence": 7
+                }
+            }]),
+        ];
+
+        for references in cases {
+            let router = mcp_router_with_backend(Arc::new(FakeBackend {
+                result: Ok(references),
+            }));
+            let response = router
+                .oneshot(request(json!({
+                    "jsonrpc": "2.0",
+                    "id": "references",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "dirextalk.query_references",
+                        "arguments": { "query": "", "limit": 32 }
+                    }
+                })))
+                .await
+                .expect("reference response");
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
