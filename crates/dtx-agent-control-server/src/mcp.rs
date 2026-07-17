@@ -19,16 +19,18 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{ChannelId, ConversationId, TenantId};
 use dtx_identity_persistence::{
     DeviceSessionCredential, DeviceSessionRepository, IdentityPersistenceError,
 };
 use dtx_public_feed::{PublicFeedPayloadV1, SignedPublicFeedEventV1};
 use dtx_storage::PgStore;
-use dtx_wire::UtcMillis;
+use dtx_wire::{Sha256Digest, UtcMillis};
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
+use zeroize::Zeroize;
 
 use crate::{
     AgentProvisioningOwnerBackend, AgentProvisioningOwnerError, ConnectorProjectionQueryV1,
@@ -41,12 +43,16 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_JSON_MEDIA_TYPE: &str = "application/json";
 const MCP_SSE_MEDIA_TYPE: &str = "text/event-stream";
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
+const AGENT_NODE_ID_HEADER: &str = "dirextalk-agent-node-id";
+const AGENT_BEARER_SCHEME: &str = "Bearer";
+const AGENT_MCP_TOKEN_DIGEST_DOMAIN: &[u8] = b"dirextalk.agent-mcp-token.v1\0";
 const MAX_MCP_BODY_BYTES: usize = 64 * 1024;
 const CONNECTORS_TOOL_NAME: &str = "dirextalk.list_connectors";
 const REFERENCES_TOOL_NAME: &str = "dirextalk.query_references";
 const CONNECTORS_RESOURCE_URI: &str = "dirextalk://connectors";
 const MCP_REFERENCES_MEDIA_TYPE_V1: &str = "application/vnd.dirextalk.mcp-references.v1+json";
-const MAX_REFERENCE_QUERY_BYTES: usize = 256;
+const MAX_REFERENCE_QUERY_CHARS: usize = 256;
+const MAX_REFERENCE_QUERY_BYTES: usize = 1024;
 const MAX_REFERENCES: u16 = 32;
 const MAX_POST_SCAN: i32 = 256;
 const MAX_REFERENCE_TITLE_CHARS: usize = 120;
@@ -59,6 +65,19 @@ const REFERENCE_KIND_ALL: u8 = REFERENCE_KIND_ROOM | REFERENCE_KIND_CHANNEL | RE
 
 type McpBackendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CborOwnerReply, AgentProvisioningOwnerError>> + Send + 'a>>;
+type McpAuthenticationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), AgentProvisioningOwnerError>> + Send + 'a>>;
+
+#[derive(Clone)]
+struct AgentMcpCredential {
+    token_digest: [u8; 32],
+    node_id: String,
+}
+
+enum McpAuthentication {
+    Owner(DeviceSessionCredential),
+    Agent(AgentMcpCredential),
+}
 
 trait McpOwnerBackend: Send + Sync + 'static {
     fn connector_projection(
@@ -69,6 +88,19 @@ trait McpOwnerBackend: Send + Sync + 'static {
     fn references(
         &self,
         credential: DeviceSessionCredential,
+        query: String,
+        kind_mask: u8,
+        limit: u16,
+        now: UtcMillis,
+    ) -> McpBackendFuture<'_>;
+    fn authenticate_agent(
+        &self,
+        credential: AgentMcpCredential,
+        now: UtcMillis,
+    ) -> McpAuthenticationFuture<'_>;
+    fn agent_references(
+        &self,
+        credential: AgentMcpCredential,
         query: String,
         kind_mask: u8,
         limit: u16,
@@ -107,6 +139,33 @@ impl McpOwnerBackend for AgentProvisioningMcpBackend {
         self.backend
             .query_mcp_references(credential, query, kind_mask, limit, now)
     }
+
+    fn authenticate_agent(
+        &self,
+        credential: AgentMcpCredential,
+        now: UtcMillis,
+    ) -> McpAuthenticationFuture<'_> {
+        self.backend
+            .authenticate_agent_mcp(credential.token_digest, credential.node_id, now)
+    }
+
+    fn agent_references(
+        &self,
+        credential: AgentMcpCredential,
+        query: String,
+        kind_mask: u8,
+        limit: u16,
+        now: UtcMillis,
+    ) -> McpBackendFuture<'_> {
+        self.backend.query_agent_mcp_references(
+            credential.token_digest,
+            credential.node_id,
+            query,
+            kind_mask,
+            limit,
+            now,
+        )
+    }
 }
 
 pub(crate) fn mcp_router(backend: Arc<dyn AgentProvisioningOwnerBackend>) -> Router {
@@ -126,8 +185,8 @@ async fn post_mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let credential = match validate_http_boundary(&headers, &body) {
-        Ok(credential) => credential,
+    let authentication = match validate_http_boundary(&headers, &body) {
+        Ok(authentication) => authentication,
         Err(error) => return error.into_response(),
     };
     let request = match parse_request(&body) {
@@ -147,33 +206,63 @@ async fn post_mcp(
         Err(error) => return backend_error_response(error),
     };
     let reference_query = parse_reference_query(&request).ok().flatten();
-    let data = if let Some(reference_query) = reference_query {
-        match backend
-            .references(
-                credential,
-                reference_query.query,
-                reference_query.kind_mask,
-                reference_query.limit,
-                authenticated_at,
-            )
-            .await
-        {
-            Ok(reply) => match parse_references(&reply) {
-                Ok(references) => DispatchData::References(references),
+    let data = match (authentication, reference_query) {
+        (McpAuthentication::Owner(credential), Some(reference_query)) => {
+            match backend
+                .references(
+                    credential,
+                    reference_query.query,
+                    reference_query.kind_mask,
+                    reference_query.limit,
+                    authenticated_at,
+                )
+                .await
+            {
+                Ok(reply) => match parse_references(&reply) {
+                    Ok(references) => DispatchData::OwnerReferences(references),
+                    Err(error) => return backend_error_response(error),
+                },
                 Err(error) => return backend_error_response(error),
-            },
-            Err(error) => return backend_error_response(error),
+            }
         }
-    } else {
-        match backend
-            .connector_projection(credential, authenticated_at)
-            .await
-        {
-            Ok(reply) => match parse_projection(&reply) {
-                Ok(projection) => DispatchData::ConnectorProjection(projection),
+        (McpAuthentication::Owner(credential), None) => {
+            match backend
+                .connector_projection(credential, authenticated_at)
+                .await
+            {
+                Ok(reply) => match parse_projection(&reply) {
+                    Ok(projection) => DispatchData::OwnerConnectorProjection(projection),
+                    Err(error) => return backend_error_response(error),
+                },
                 Err(error) => return backend_error_response(error),
-            },
-            Err(error) => return backend_error_response(error),
+            }
+        }
+        (McpAuthentication::Agent(credential), Some(reference_query)) => {
+            match backend
+                .agent_references(
+                    credential,
+                    reference_query.query,
+                    reference_query.kind_mask,
+                    reference_query.limit,
+                    authenticated_at,
+                )
+                .await
+            {
+                Ok(reply) => match parse_references(&reply) {
+                    Ok(references) => DispatchData::AgentReferences(references),
+                    Err(error) => return backend_error_response(error),
+                },
+                Err(error) => return backend_error_response(error),
+            }
+        }
+        (McpAuthentication::Agent(credential), None) => {
+            match backend
+                .authenticate_agent(credential, authenticated_at)
+                .await
+            {
+                Ok(()) => DispatchData::AgentAuthorized,
+                Err(error) => return backend_error_response(error),
+            }
         }
     };
     dispatch(request, &data)
@@ -182,7 +271,7 @@ async fn post_mcp(
 fn validate_http_boundary(
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<DeviceSessionCredential, HttpBoundaryError> {
+) -> Result<McpAuthentication, HttpBoundaryError> {
     if headers.contains_key(header::ORIGIN) {
         return Err(HttpBoundaryError::Protocol(
             StatusCode::FORBIDDEN,
@@ -201,7 +290,76 @@ fn validate_http_boundary(
             JsonRpcError::invalid_request("Streamable HTTP media types are required"),
         ));
     }
-    parse_device_session(headers).map_err(HttpBoundaryError::Backend)
+    parse_mcp_authentication(headers).map_err(HttpBoundaryError::Backend)
+}
+
+fn parse_mcp_authentication(
+    headers: &HeaderMap,
+) -> Result<McpAuthentication, AgentProvisioningOwnerError> {
+    let mut authorization_values = headers.get_all(header::AUTHORIZATION).iter();
+    let authorization = authorization_values
+        .next()
+        .ok_or(AgentProvisioningOwnerError::AuthenticationRejected)?;
+    if authorization_values.next().is_some() {
+        return Err(AgentProvisioningOwnerError::AuthenticationRejected);
+    }
+    let authorization = authorization
+        .to_str()
+        .map_err(|_| AgentProvisioningOwnerError::AuthenticationRejected)?;
+
+    let mut node_values = headers.get_all(AGENT_NODE_ID_HEADER).iter();
+    let node = node_values.next();
+    if node_values.next().is_some() {
+        return Err(AgentProvisioningOwnerError::AuthenticationRejected);
+    }
+
+    if authorization.starts_with(&format!("{AGENT_BEARER_SCHEME} ")) {
+        let node_id = node
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| valid_agent_node_id(value))
+            .ok_or(AgentProvisioningOwnerError::AuthenticationRejected)?;
+        let token = authorization
+            .strip_prefix(&format!("{AGENT_BEARER_SCHEME} "))
+            .filter(|token| {
+                token.len() == 43
+                    && token
+                        .bytes()
+                        .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+            })
+            .ok_or(AgentProvisioningOwnerError::AuthenticationRejected)?;
+        let mut raw_token = [0_u8; 32];
+        let decoded_len = match Base64UrlUnpadded::decode(token, &mut raw_token) {
+            Ok(decoded) => decoded.len(),
+            Err(_) => {
+                raw_token.zeroize();
+                return Err(AgentProvisioningOwnerError::AuthenticationRejected);
+            }
+        };
+        if decoded_len != 32 {
+            raw_token.zeroize();
+            return Err(AgentProvisioningOwnerError::AuthenticationRejected);
+        }
+        let digest = Sha256Digest::hash_domain(AGENT_MCP_TOKEN_DIGEST_DOMAIN, &raw_token);
+        raw_token.zeroize();
+        return Ok(McpAuthentication::Agent(AgentMcpCredential {
+            token_digest: *digest.as_bytes(),
+            node_id: node_id.to_owned(),
+        }));
+    }
+
+    if node.is_some() {
+        return Err(AgentProvisioningOwnerError::AuthenticationRejected);
+    }
+    parse_device_session(headers).map(McpAuthentication::Owner)
+}
+
+fn valid_agent_node_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().enumerate().all(|(index, value)| {
+            value.is_ascii_alphanumeric()
+                || (index > 0 && matches!(value, b'.' | b'_' | b':' | b'-'))
+        })
 }
 
 enum HttpBoundaryError {
@@ -342,8 +500,10 @@ fn is_canonical_channel_id(channel_id: Option<&str>) -> bool {
 }
 
 enum DispatchData {
-    ConnectorProjection(Value),
-    References(Value),
+    OwnerConnectorProjection(Value),
+    OwnerReferences(Value),
+    AgentAuthorized,
+    AgentReferences(Value),
 }
 
 fn dispatch(request: JsonRpcRequest, data: &DispatchData) -> Response {
@@ -355,7 +515,7 @@ fn dispatch(request: JsonRpcRequest, data: &DispatchData) -> Response {
         );
     }
     match request.method.as_str() {
-        "initialize" => initialize(request),
+        "initialize" => initialize(request, data),
         "notifications/initialized" => {
             if request.id.is_some() || !empty_object(&request.params) {
                 json_rpc_error_response(
@@ -368,12 +528,16 @@ fn dispatch(request: JsonRpcRequest, data: &DispatchData) -> Response {
             }
         }
         "ping" => success(request.id, &json!({})),
-        "tools/list" => success(
-            request.id,
-            &json!({ "tools": [connectors_tool(), references_tool()] }),
-        ),
+        "tools/list" => {
+            let tools = if is_agent_access(data) {
+                json!([references_tool()])
+            } else {
+                json!([connectors_tool(), references_tool()])
+            };
+            success(request.id, &json!({ "tools": tools }))
+        }
         "tools/call" => call_tool(request, data),
-        "resources/list" => success(
+        "resources/list" if !is_agent_access(data) => success(
             request.id,
             &json!({
                 "resources": [{
@@ -384,7 +548,9 @@ fn dispatch(request: JsonRpcRequest, data: &DispatchData) -> Response {
                 }]
             }),
         ),
-        "resources/read" => read_resource(request, connector_projection(data)),
+        "resources/read" if !is_agent_access(data) => {
+            read_resource(request, connector_projection(data))
+        }
         _ => json_rpc_error_response(
             StatusCode::OK,
             request.id,
@@ -393,16 +559,26 @@ fn dispatch(request: JsonRpcRequest, data: &DispatchData) -> Response {
     }
 }
 
+fn is_agent_access(data: &DispatchData) -> bool {
+    matches!(
+        data,
+        DispatchData::AgentAuthorized | DispatchData::AgentReferences(_)
+    )
+}
+
 fn connector_projection(data: &DispatchData) -> &Value {
     match data {
-        DispatchData::ConnectorProjection(projection) => projection,
-        DispatchData::References(_) => {
+        DispatchData::OwnerConnectorProjection(projection) => projection,
+        DispatchData::OwnerReferences(_) => {
             unreachable!("reference data is only selected for the reference tool")
+        }
+        DispatchData::AgentAuthorized | DispatchData::AgentReferences(_) => {
+            unreachable!("Agent credentials cannot access Connector resources")
         }
     }
 }
 
-fn initialize(request: JsonRpcRequest) -> Response {
+fn initialize(request: JsonRpcRequest, data: &DispatchData) -> Response {
     let Some(protocol_version) = request
         .params
         .get("protocolVersion")
@@ -421,19 +597,29 @@ fn initialize(request: JsonRpcRequest) -> Response {
             JsonRpcError::invalid_params("protocolVersion is not supported"),
         );
     }
+    let capabilities = if is_agent_access(data) {
+        json!({ "tools": { "listChanged": false } })
+    } else {
+        json!({
+            "tools": { "listChanged": false },
+            "resources": { "subscribe": false, "listChanged": false }
+        })
+    };
+    let instructions = if is_agent_access(data) {
+        "Read-only Agent-scoped reference lookup. Credentials and prompts are not accepted."
+    } else {
+        "Read-only Owner management surface. Agent prompts and credentials are not accepted."
+    };
     success(
         request.id,
         &json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {
-                "tools": { "listChanged": false },
-                "resources": { "subscribe": false, "listChanged": false }
-            },
+            "capabilities": capabilities,
             "serverInfo": {
                 "name": "dirextalk-vnext-agent-control",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Read-only Owner management surface. Agent prompts and credentials are not accepted."
+            "instructions": instructions
         }),
     )
 }
@@ -470,7 +656,7 @@ fn references_tool() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": { "type": "string", "maxLength": MAX_REFERENCE_QUERY_BYTES },
+                "query": { "type": "string", "maxLength": MAX_REFERENCE_QUERY_CHARS },
                 "types": {
                     "type": "array",
                     "items": { "enum": ["room", "channel", "post"] },
@@ -600,7 +786,10 @@ fn parse_reference_query(request: &JsonRpcRequest) -> Result<Option<ReferenceQue
         .map(|value| {
             value
                 .as_str()
-                .filter(|query| query.len() <= MAX_REFERENCE_QUERY_BYTES)
+                .filter(|query| {
+                    query.chars().count() <= MAX_REFERENCE_QUERY_CHARS
+                        && query.len() <= MAX_REFERENCE_QUERY_BYTES
+                })
                 .map(str::to_owned)
                 .ok_or_else(|| JsonRpcError::invalid_params("query is invalid"))
         })
@@ -658,12 +847,16 @@ fn call_tool(request: JsonRpcRequest, data: &DispatchData) -> Response {
                 JsonRpcError::invalid_params("reference arguments are invalid"),
             );
         }
-        let DispatchData::References(references) = data else {
-            return json_rpc_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                request.id,
-                JsonRpcError::internal_error("reference query result is unavailable"),
-            );
+        let references = match data {
+            DispatchData::OwnerReferences(references)
+            | DispatchData::AgentReferences(references) => references,
+            _ => {
+                return json_rpc_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    request.id,
+                    JsonRpcError::internal_error("reference query result is unavailable"),
+                );
+            }
         };
         let structured_content = json!({ "references": references });
         let Ok(text) = serde_json::to_string(&structured_content) else {
@@ -684,6 +877,7 @@ fn call_tool(request: JsonRpcRequest, data: &DispatchData) -> Response {
     }
     if name != Some(CONNECTORS_TOOL_NAME)
         || arguments.is_some_and(|arguments| !empty_object(arguments))
+        || is_agent_access(data)
     {
         return json_rpc_error_response(
             StatusCode::OK,
@@ -691,7 +885,7 @@ fn call_tool(request: JsonRpcRequest, data: &DispatchData) -> Response {
             JsonRpcError::invalid_params("unknown tool or invalid arguments"),
         );
     }
-    let DispatchData::ConnectorProjection(projection) = data else {
+    let DispatchData::OwnerConnectorProjection(projection) = data else {
         return json_rpc_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             request.id,
@@ -851,7 +1045,7 @@ fn backend_error_response(error: AgentProvisioningOwnerError) -> Response {
     if status == StatusCode::UNAUTHORIZED {
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("DTX-Device-Session"),
+            HeaderValue::from_static("Bearer, DTX-Device-Session"),
         );
     }
     response
@@ -912,6 +1106,18 @@ impl ReferenceV1 {
         Self {
             kind: "room",
             title: format!("私密会话 {short}"),
+            target: ReferenceTargetV1::PrivateConversation {
+                conversation_id: stable_id.clone(),
+            },
+            stable_id,
+        }
+    }
+
+    fn current_room(conversation_id: ConversationId) -> Self {
+        let stable_id = conversation_id.to_string();
+        Self {
+            kind: "room",
+            title: "当前私密会话".to_owned(),
             target: ReferenceTargetV1::PrivateConversation {
                 conversation_id: stable_id.clone(),
             },
@@ -990,12 +1196,7 @@ pub(crate) async fn query_postgres_references(
     limit: u16,
     now: UtcMillis,
 ) -> Result<CborOwnerReply, AgentProvisioningOwnerError> {
-    if query.len() > MAX_REFERENCE_QUERY_BYTES
-        || kind_mask == 0
-        || kind_mask & !REFERENCE_KIND_ALL != 0
-        || limit == 0
-        || limit > MAX_REFERENCES
-    {
+    if !valid_reference_query(&query, kind_mask, limit) {
         return Err(AgentProvisioningOwnerError::InvalidRequest);
     }
     let mut session = store
@@ -1034,6 +1235,113 @@ pub(crate) async fn query_postgres_references(
         }
     }
 
+    append_public_references(
+        session.connection(),
+        &mut references,
+        tenant_id,
+        &query,
+        kind_mask,
+        now,
+    )
+    .await?;
+
+    finish_reference_query(session, references, limit).await
+}
+
+pub(crate) async fn authenticate_postgres_agent_mcp(
+    store: &PgStore,
+    tenant_id: TenantId,
+    token_digest: [u8; 32],
+    node_id: String,
+    now: UtcMillis,
+) -> Result<(), AgentProvisioningOwnerError> {
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    authenticate_agent_mcp_scope(session.connection(), tenant_id, token_digest, &node_id, now)
+        .await?;
+    session
+        .commit()
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
+}
+
+pub(crate) async fn query_postgres_agent_references(
+    store: &PgStore,
+    tenant_id: TenantId,
+    token_digest: [u8; 32],
+    node_id: String,
+    query: String,
+    kind_mask: u8,
+    limit: u16,
+    now: UtcMillis,
+) -> Result<CborOwnerReply, AgentProvisioningOwnerError> {
+    if !valid_reference_query(&query, kind_mask, limit) {
+        return Err(AgentProvisioningOwnerError::InvalidRequest);
+    }
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    let conversation_id =
+        authenticate_agent_mcp_scope(session.connection(), tenant_id, token_digest, &node_id, now)
+            .await?;
+    let mut references = Vec::new();
+    if kind_mask & REFERENCE_KIND_ROOM != 0 {
+        references.push(ReferenceV1::current_room(conversation_id));
+    }
+    append_public_references(
+        session.connection(),
+        &mut references,
+        tenant_id,
+        &query,
+        kind_mask,
+        now,
+    )
+    .await?;
+    finish_reference_query(session, references, limit).await
+}
+
+fn valid_reference_query(query: &str, kind_mask: u8, limit: u16) -> bool {
+    query.chars().count() <= MAX_REFERENCE_QUERY_CHARS
+        && query.len() <= MAX_REFERENCE_QUERY_BYTES
+        && kind_mask != 0
+        && kind_mask & !REFERENCE_KIND_ALL == 0
+        && (1..=MAX_REFERENCES).contains(&limit)
+}
+
+async fn authenticate_agent_mcp_scope(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    token_digest: [u8; 32],
+    node_id: &str,
+    now: UtcMillis,
+) -> Result<ConversationId, AgentProvisioningOwnerError> {
+    let conversation_id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT conversation_id
+           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, $4)",
+    )
+    .bind(*tenant_id.as_uuid())
+    .bind(token_digest.to_vec())
+    .bind(node_id)
+    .bind(now.get())
+    .fetch_optional(connection)
+    .await
+    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
+    conversation_id
+        .and_then(|value| ConversationId::try_from(value).ok())
+        .ok_or(AgentProvisioningOwnerError::AuthenticationRejected)
+}
+
+async fn append_public_references(
+    connection: &mut PgConnection,
+    references: &mut Vec<ReferenceV1>,
+    tenant_id: TenantId,
+    query: &str,
+    kind_mask: u8,
+    now: UtcMillis,
+) -> Result<(), AgentProvisioningOwnerError> {
     if kind_mask & (REFERENCE_KIND_CHANNEL | REFERENCE_KIND_POST) != 0 {
         let rows = sqlx::query(
             "SELECT reference_kind, subject_id, sequence, exact_cbor
@@ -1045,7 +1353,7 @@ pub(crate) async fn query_postgres_references(
         ))
         .bind(MAX_POST_SCAN)
         .bind(now.get())
-        .fetch_all(session.connection())
+        .fetch_all(&mut *connection)
         .await
         .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)?;
         let normalized_query = query.to_lowercase();
@@ -1098,7 +1406,14 @@ pub(crate) async fn query_postgres_references(
             }
         }
     }
+    Ok(())
+}
 
+async fn finish_reference_query(
+    session: dtx_storage::TenantSession<'_>,
+    mut references: Vec<ReferenceV1>,
+    limit: u16,
+) -> Result<CborOwnerReply, AgentProvisioningOwnerError> {
     references.sort_by(|left, right| {
         left.kind_rank()
             .cmp(&right.kind_rank())
@@ -1143,15 +1458,18 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AgentProvisioningOwnerError, CborOwnerReply, MCP_JSON_MEDIA_TYPE, MCP_PROTOCOL_VERSION,
-        MCP_PROTOCOL_VERSION_HEADER, MCP_SSE_MEDIA_TYPE, McpBackendFuture, McpOwnerBackend,
-        ReferenceV1, StatusCode, UtcMillis, mcp_router_with_backend,
+        AgentMcpCredential, AgentProvisioningOwnerError, CborOwnerReply, MCP_JSON_MEDIA_TYPE,
+        MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION_HEADER, MCP_SSE_MEDIA_TYPE,
+        McpAuthenticationFuture, McpBackendFuture, McpOwnerBackend, ReferenceV1, StatusCode,
+        UtcMillis, mcp_router_with_backend,
     };
 
     const AUTHORIZATION: &str = concat!(
         "DTX-Device-Session 019f75cc-f2db-7a50-8747-9f4a292f361c.",
         "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
     );
+    const AGENT_AUTHORIZATION: &str = "Bearer AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
+    const AGENT_NODE_ID: &str = "codex-alpha-x3";
 
     struct FakeBackend {
         result: Result<Value, AgentProvisioningOwnerError>,
@@ -1174,6 +1492,31 @@ mod tests {
         fn references(
             &self,
             _credential: dtx_identity_persistence::DeviceSessionCredential,
+            _query: String,
+            _kind_mask: u8,
+            _limit: u16,
+            _now: UtcMillis,
+        ) -> McpBackendFuture<'_> {
+            let result = self.result.clone().map(|value| CborOwnerReply {
+                status: StatusCode::OK,
+                content_type: super::MCP_REFERENCES_MEDIA_TYPE_V1,
+                exact_cbor: serde_json::to_vec(&value).expect("references serialize"),
+            });
+            Box::pin(async move { result })
+        }
+
+        fn authenticate_agent(
+            &self,
+            _credential: AgentMcpCredential,
+            _now: UtcMillis,
+        ) -> McpAuthenticationFuture<'_> {
+            let result = self.result.clone().map(|_| ());
+            Box::pin(async move { result })
+        }
+
+        fn agent_references(
+            &self,
+            _credential: AgentMcpCredential,
             _query: String,
             _kind_mask: u8,
             _limit: u16,
@@ -1209,6 +1552,19 @@ mod tests {
             .header(MCP_PROTOCOL_VERSION_HEADER, MCP_PROTOCOL_VERSION)
             .body(Body::from(body.to_string()))
             .expect("request")
+    }
+
+    fn agent_request(body: Value) -> Request<Body> {
+        let mut request = request(body);
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static(AGENT_AUTHORIZATION),
+        );
+        request.headers_mut().insert(
+            super::AGENT_NODE_ID_HEADER,
+            HeaderValue::from_static(AGENT_NODE_ID),
+        );
+        request
     }
 
     async fn response_json(response: Response) -> Value {
@@ -1456,6 +1812,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_bearer_sees_only_reference_tool_and_no_resources() {
+        let router = mcp_router_with_backend(Arc::new(FakeBackend {
+            result: Ok(json!([])),
+        }));
+        let response = router
+            .clone()
+            .oneshot(agent_request(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            })))
+            .await
+            .expect("tools response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["result"]["tools"].as_array().expect("tools").len(), 1);
+        assert_eq!(
+            body["result"]["tools"][0]["name"],
+            "dirextalk.query_references"
+        );
+
+        let response = router
+            .oneshot(agent_request(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/list",
+                "params": {}
+            })))
+            .await
+            .expect("resources response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn agent_room_reference_is_exact_even_for_natural_language_query() {
+        let conversation_id = "019f75cc-f2db-7a50-8747-9f4a292f361c";
+        let expected = json!([{
+            "kind": "room",
+            "stable_id": conversation_id,
+            "title": "当前私密会话",
+            "target": {
+                "kind": "private_conversation",
+                "conversation_id": conversation_id
+            }
+        }]);
+        let router = mcp_router_with_backend(Arc::new(FakeBackend {
+            result: Ok(expected.clone()),
+        }));
+        let response = router
+            .oneshot(agent_request(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "dirextalk.query_references",
+                    "arguments": {
+                        "query": "当前房间里刚才讨论的部署",
+                        "types": ["room"],
+                        "limit": 32
+                    }
+                }
+            })))
+            .await
+            .expect("reference response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["result"]["structuredContent"]["references"],
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_query_uses_unicode_scalar_and_utf8_bounds() {
+        for query in ["界".repeat(256), "😀".repeat(256)] {
+            let router = mcp_router_with_backend(Arc::new(FakeBackend {
+                result: Ok(json!([])),
+            }));
+            let response = router
+                .oneshot(request(json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "dirextalk.query_references",
+                        "arguments": { "query": query, "limit": 32 }
+                    }
+                })))
+                .await
+                .expect("bounded query response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response_json(response).await.get("result").is_some());
+        }
+
+        let router = mcp_router_with_backend(Arc::new(FakeBackend {
+            result: Ok(json!([])),
+        }));
+        let response = router
+            .oneshot(request(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "dirextalk.query_references",
+                    "arguments": { "query": "界".repeat(257), "limit": 32 }
+                }
+            })))
+            .await
+            .expect("oversize query response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
     async fn authentication_and_owner_authorization_fail_closed() {
         let router = mcp_router_with_backend(Arc::new(FakeBackend {
             result: Ok(projection()),
@@ -1487,6 +1958,77 @@ mod tests {
             .await
             .expect("authorization response");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn bearer_and_device_session_headers_are_strict_and_never_mix() {
+        let router = mcp_router_with_backend(Arc::new(FakeBackend {
+            result: Ok(json!([])),
+        }));
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        });
+
+        let mut missing_node = agent_request(body.clone());
+        missing_node
+            .headers_mut()
+            .remove(super::AGENT_NODE_ID_HEADER);
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(missing_node)
+                .await
+                .expect("missing node response")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut owner_with_node = request(body.clone());
+        owner_with_node.headers_mut().insert(
+            super::AGENT_NODE_ID_HEADER,
+            HeaderValue::from_static(AGENT_NODE_ID),
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(owner_with_node)
+                .await
+                .expect("mixed response")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut repeated_node = agent_request(body.clone());
+        repeated_node.headers_mut().append(
+            super::AGENT_NODE_ID_HEADER,
+            HeaderValue::from_static("other-node"),
+        );
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(repeated_node)
+                .await
+                .expect("repeated node response")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut repeated_authorization = agent_request(body);
+        repeated_authorization.headers_mut().append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static(AUTHORIZATION),
+        );
+        assert_eq!(
+            router
+                .oneshot(repeated_authorization)
+                .await
+                .expect("repeated authorization response")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

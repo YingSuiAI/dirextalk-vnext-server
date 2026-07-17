@@ -95,3 +95,26 @@ The database URL is read only from the explicit owner-controlled `0400`,
 `0440`, `0600`, or `0640` service secret. The Connector issuer is loaded from
 the running service configuration, so prepare issues credentials accepted by
 that Agent Control instance.
+
+## Short-lived Agent MCP credential
+
+After the real Agent Device, enabled Binding, and active ConversationGrant
+exist, the peer operator may issue a 32-byte random bearer locally. Keep the
+raw Base64URL-no-pad token only in the Connector's owner-controlled secret
+handoff. Never place it in SQL, stdout, logs, or the Owner Device Session
+surface.
+
+Register only
+`SHA-256("dirextalk.agent-mcp-token.v1\0" || raw_32_token_bytes)` through
+`agent.register_mcp_credential_digest(...)`. The function also requires the
+exact tenant, UUIDv7 credential, Installation, Binding, Agent Device,
+Connector node ID, private conversation, `mcp.references.v1` capability,
+creation time, and expiry. Expiry is strictly capped at 24 hours. At most two
+unexpired credentials may coexist for one Binding so rotation can install the
+new Connector secret before revoking the old digest.
+
+Revoke through `agent.revoke_mcp_credential_digest(...)` with the exact
+credential ID and digest. Both functions are available only to the optional
+`dtx_agent_peer_admin` role and require the transaction-local tenant context.
+The Agent runtime receives only the authentication function; it has no direct
+table, registration, or revocation access.

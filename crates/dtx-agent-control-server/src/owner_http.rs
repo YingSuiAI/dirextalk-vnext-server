@@ -302,6 +302,29 @@ pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
     ) -> OwnerBackendFuture<'_> {
         Box::pin(async { Err(AgentProvisioningOwnerError::InvalidRequest) })
     }
+    /// Revalidates one short-lived, digest-only Agent MCP credential.
+    ///
+    /// Raw bearer material never crosses this boundary.
+    fn authenticate_agent_mcp(
+        &self,
+        _token_digest: [u8; 32],
+        _node_id: String,
+        _now: UtcMillis,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AgentProvisioningOwnerError>> + Send + '_>> {
+        Box::pin(async { Err(AgentProvisioningOwnerError::InvalidRequest) })
+    }
+    /// Returns references scoped to one authenticated Agent MCP credential.
+    fn query_agent_mcp_references(
+        &self,
+        _token_digest: [u8; 32],
+        _node_id: String,
+        _query: String,
+        _kind_mask: u8,
+        _limit: u16,
+        _now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async { Err(AgentProvisioningOwnerError::InvalidRequest) })
+    }
     fn lifecycle(
         &self,
         credential: DeviceSessionCredential,
@@ -612,6 +635,48 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                 &self.store,
                 self.tenant_id,
                 credential,
+                query,
+                kind_mask,
+                limit,
+                now,
+            )
+            .await
+        })
+    }
+
+    fn authenticate_agent_mcp(
+        &self,
+        token_digest: [u8; 32],
+        node_id: String,
+        now: UtcMillis,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AgentProvisioningOwnerError>> + Send + '_>> {
+        Box::pin(async move {
+            crate::mcp::authenticate_postgres_agent_mcp(
+                &self.store,
+                self.tenant_id,
+                token_digest,
+                node_id,
+                now,
+            )
+            .await
+        })
+    }
+
+    fn query_agent_mcp_references(
+        &self,
+        token_digest: [u8; 32],
+        node_id: String,
+        query: String,
+        kind_mask: u8,
+        limit: u16,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            crate::mcp::query_postgres_agent_references(
+                &self.store,
+                self.tenant_id,
+                token_digest,
+                node_id,
                 query,
                 kind_mask,
                 limit,

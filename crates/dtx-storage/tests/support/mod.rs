@@ -376,6 +376,8 @@ impl PostgresHarness {
               GRANT USAGE ON SCHEMA directory TO dtx_runtime_test;
               GRANT EXECUTE ON FUNCTION directory.mcp_public_reference_facts(uuid, integer, integer, bigint)
                  TO dtx_runtime_test;
+              GRANT EXECUTE ON FUNCTION agent.authenticate_mcp_reference_credential(uuid, bytea, text, bigint)
+                 TO dtx_runtime_test;
               GRANT SELECT, INSERT ON agent.conversation_grant_owner_operations
                 TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.connector_binding_state_owner_operations

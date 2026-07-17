@@ -41,7 +41,8 @@ const PUBLIC_CACHE_GENERATIONS_MIGRATION_VERSION: i64 = 202_607_160_034;
 const AGENT_RUN_RUNTIME_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_170_035;
 const GROUP_MEMBER_REMOVAL_V32_MIGRATION_VERSION: i64 = 202_607_170_036;
 const MCP_REFERENCE_QUERIES_MIGRATION_VERSION: i64 = 202_607_170_037;
-const EXPECTED_MIGRATION_COUNT: i64 = 37;
+const AGENT_MCP_CREDENTIALS_MIGRATION_VERSION: i64 = 202_607_170_038;
+const EXPECTED_MIGRATION_COUNT: i64 = 38;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -119,6 +120,8 @@ const GROUP_MEMBER_REMOVAL_V32_DOWN: &str =
     include_str!("../../../migrations/202607170036_group_member_removal_v32.down.sql");
 const MCP_REFERENCE_QUERIES_DOWN: &str =
     include_str!("../../../migrations/202607170037_mcp_reference_queries.down.sql");
+const AGENT_MCP_CREDENTIALS_DOWN: &str =
+    include_str!("../../../migrations/202607170038_agent_mcp_credentials.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -255,6 +258,253 @@ async fn mcp_reference_queries_filter_private_rooms_and_return_public_facts()
             (3, channel_id, Some(7), Some(vec![1_u8])),
         ]
     );
+    transaction.rollback().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_mcp_credentials_are_digest_only_rotatable_and_exactly_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    let tenant_id = Uuid::now_v7();
+    let installation_id = Uuid::now_v7();
+    let agent_device_id = Uuid::now_v7();
+    let host_id = Uuid::now_v7();
+    let connector_id = Uuid::now_v7();
+    let binding_id = Uuid::now_v7();
+    let conversation_id = Uuid::now_v7();
+    let grant_id = Uuid::now_v7();
+    let approved_device_id = Uuid::now_v7();
+    let owner_id = format!("dtxi1{}", "a".repeat(52));
+    let agent_id = format!("dtxa1{}", "a".repeat(52));
+    let mut transaction = harness.admin_pool().begin().await?;
+    PostgresHarness::set_tenant(&mut transaction, tenant_id).await?;
+
+    sqlx::query("INSERT INTO system.tenant_stream_heads(tenant_id) VALUES($1)")
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        "INSERT INTO agent.agent_definitions(
+             agent_id, definition_version, publisher_id, descriptor_hash,
+             expires_at_ms, admitted_at_ms
+         ) VALUES($1, 1, $2, $3, 100000, 1)",
+    )
+    .bind(&agent_id)
+    .bind(&owner_id)
+    .bind(vec![1_u8; 32])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.installations(
+             tenant_id, installation_id, agent_id, owner_id, execution_mode,
+             descriptor_version, descriptor_hash, policy_revision,
+             desired_state, observed_state, aggregate_revision,
+             created_at_ms, updated_at_ms, agent_identity_id
+         ) VALUES($1, $2, $3, $4, 'connector_managed', 1, $5, 1,
+                  'enabled', 'ready', 1, 1, 1, $4)",
+    )
+    .bind(tenant_id)
+    .bind(installation_id)
+    .bind(&agent_id)
+    .bind(&owner_id)
+    .bind(vec![1_u8; 32])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.agent_devices(
+             tenant_id, agent_device_id, installation_id,
+             credential_fingerprint, state, aggregate_revision,
+             created_at_ms, updated_at_ms, identity_device_id
+         ) VALUES($1, $2, $3, $4, 'active', 1, 1, 1, $5)",
+    )
+    .bind(tenant_id)
+    .bind(agent_device_id)
+    .bind(installation_id)
+    .bind(vec![2_u8; 32])
+    .bind(approved_device_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.hosts(
+             tenant_id, host_id, owner_id, lifecycle, desired_revision,
+             observed_revision, reported_health, heartbeat_observed_at_ms,
+             heartbeat_expires_at_ms, aggregate_revision, created_at_ms, updated_at_ms
+         ) VALUES($1, $2, $3, 'active', 1, 1, 'healthy', 1, 10000, 1, 1, 1)",
+    )
+    .bind(tenant_id)
+    .bind(host_id)
+    .bind(&owner_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.connector_instances(
+             tenant_id, connector_id, host_id, adapter_kind, generation,
+             desired_state, observed_state, max_concurrency, spec_revision,
+             highest_lease_epoch, created_at_ms, updated_at_ms
+         ) VALUES($1, $2, $3, 'codex', 1, 'running', 'ready', 1, 1, 0, 1, 1)",
+    )
+    .bind(tenant_id)
+    .bind(connector_id)
+    .bind(host_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.binding_set_heads(
+             tenant_id, mutation_sequence, created_at_ms, updated_at_ms
+         ) VALUES($1, 0, 1, 1)",
+    )
+    .bind(tenant_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.installation_routing_policies(
+             tenant_id, installation_id, routing_policy, policy_revision,
+             created_at_ms, updated_at_ms
+         ) VALUES($1, $2, 'exclusive', 1, 1, 1)",
+    )
+    .bind(tenant_id)
+    .bind(installation_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.connector_bindings(
+             tenant_id, binding_id, installation_id, connector_id,
+             agent_device_id, priority, max_concurrency, state,
+             aggregate_revision, created_at_ms, updated_at_ms
+         ) VALUES($1, $2, $3, $4, $5, 0, 1, 'enabled', 1, 1, 1)",
+    )
+    .bind(tenant_id)
+    .bind(binding_id)
+    .bind(installation_id)
+    .bind(connector_id)
+    .bind(agent_device_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.conversation_grant_ids(
+             tenant_id, grant_id, conversation_id, installation_id, reserved_at_ms
+         ) VALUES($1, $2, $3, $4, 1)",
+    )
+    .bind(tenant_id)
+    .bind(grant_id)
+    .bind(conversation_id)
+    .bind(installation_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.conversation_grant_versions(
+             tenant_id, conversation_id, installation_id, grant_version,
+             grant_id, trigger_policy, privacy_policy_hash,
+             approved_by_device_id, approved_at_ms, expires_at_ms,
+             revoked_at_ms, recorded_at_ms
+         ) VALUES($1, $2, $3, 1, $4, 'mention_only', $5, $6, 1, NULL, NULL, 1)",
+    )
+    .bind(tenant_id)
+    .bind(conversation_id)
+    .bind(installation_id)
+    .bind(grant_id)
+    .bind(vec![3_u8; 32])
+    .bind(approved_device_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.conversation_grant_heads(
+             tenant_id, conversation_id, installation_id,
+             current_grant_version, current_grant_id, created_at_ms, updated_at_ms
+         ) VALUES($1, $2, $3, 1, $4, 1, 1)",
+    )
+    .bind(tenant_id)
+    .bind(conversation_id)
+    .bind(installation_id)
+    .bind(grant_id)
+    .execute(&mut *transaction)
+    .await?;
+
+    let credentials = [
+        (Uuid::now_v7(), vec![11_u8; 32]),
+        (Uuid::now_v7(), vec![12_u8; 32]),
+    ];
+    for (credential_id, digest) in &credentials {
+        sqlx::query(
+            "SELECT agent.register_mcp_credential_digest(
+                 $1, $2, $3, $4, $5, $6, 'codex-alpha-x3', $7,
+                 'mcp.references.v1', 1000, 2000
+             )",
+        )
+        .bind(tenant_id)
+        .bind(credential_id)
+        .bind(digest)
+        .bind(installation_id)
+        .bind(binding_id)
+        .bind(agent_device_id)
+        .bind(conversation_id)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    sqlx::query("SAVEPOINT third_agent_mcp_credential")
+        .execute(&mut *transaction)
+        .await?;
+    let third = sqlx::query(
+        "SELECT agent.register_mcp_credential_digest(
+             $1, $2, $3, $4, $5, $6, 'codex-alpha-x3', $7,
+             'mcp.references.v1', 1000, 2000
+         )",
+    )
+    .bind(tenant_id)
+    .bind(Uuid::now_v7())
+    .bind(vec![13_u8; 32])
+    .bind(installation_id)
+    .bind(binding_id)
+    .bind(agent_device_id)
+    .bind(conversation_id)
+    .execute(&mut *transaction)
+    .await;
+    assert!(third.is_err(), "a third live credential must be rejected");
+    sqlx::query("ROLLBACK TO SAVEPOINT third_agent_mcp_credential")
+        .execute(&mut *transaction)
+        .await?;
+
+    let authorized: Option<Uuid> = sqlx::query_scalar(
+        "SELECT conversation_id
+           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, 1500)",
+    )
+    .bind(tenant_id)
+    .bind(&credentials[0].1)
+    .bind("codex-alpha-x3")
+    .fetch_optional(&mut *transaction)
+    .await?;
+    assert_eq!(authorized, Some(conversation_id));
+    let wrong_node: Option<Uuid> = sqlx::query_scalar(
+        "SELECT conversation_id
+           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, 1500)",
+    )
+    .bind(tenant_id)
+    .bind(&credentials[0].1)
+    .bind("other-node")
+    .fetch_optional(&mut *transaction)
+    .await?;
+    assert_eq!(wrong_node, None);
+
+    let revoked: bool =
+        sqlx::query_scalar("SELECT agent.revoke_mcp_credential_digest($1, $2, $3, 1600)")
+            .bind(tenant_id)
+            .bind(credentials[0].0)
+            .bind(&credentials[0].1)
+            .fetch_one(&mut *transaction)
+            .await?;
+    assert!(revoked);
+    let after_revoke: Option<Uuid> = sqlx::query_scalar(
+        "SELECT conversation_id
+           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, 1601)",
+    )
+    .bind(tenant_id)
+    .bind(&credentials[0].1)
+    .bind("codex-alpha-x3")
+    .fetch_optional(&mut *transaction)
+    .await?;
+    assert_eq!(after_revoke, None);
+
     transaction.rollback().await?;
     Ok(())
 }
@@ -484,7 +734,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -523,8 +773,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(AGENT_RUN_RUNTIME_PRIVILEGES_MIGRATION_VERSION)
     .bind(GROUP_MEMBER_REMOVAL_V32_MIGRATION_VERSION)
     .bind(MCP_REFERENCE_QUERIES_MIGRATION_VERSION)
+    .bind(AGENT_MCP_CREDENTIALS_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(AGENT_MCP_CREDENTIALS_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(MCP_REFERENCE_QUERIES_DOWN)
         .execute(harness.admin_pool())
         .await?;
@@ -799,6 +1053,7 @@ async fn runtime_role_is_non_owner_rls_bound_and_has_no_ddl()
     for function in [
         "groups.mcp_visible_private_conversations(uuid,text,text,integer)",
         "directory.mcp_public_reference_facts(uuid,integer,integer,bigint)",
+        "agent.authenticate_mcp_reference_credential(uuid,bytea,text,bigint)",
     ] {
         let available: bool = sqlx::query_scalar(
             "SELECT has_function_privilege('dtx_runtime_test', $1::regprocedure, 'EXECUTE')",
@@ -808,6 +1063,19 @@ async fn runtime_role_is_non_owner_rls_bound_and_has_no_ddl()
         .await?;
         assert!(available, "{function} must be the only MCP read capability");
     }
+    let direct_agent_mcp_table_access: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege(
+                    'dtx_runtime_test',
+                    'agent.mcp_credentials',
+                    'SELECT,INSERT,UPDATE,DELETE'
+                )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(
+        !direct_agent_mcp_table_access,
+        "runtime must authenticate only through the scoped digest function"
+    );
     assert_append_only_tables_have_no_update(&harness).await?;
 
     assert!(
