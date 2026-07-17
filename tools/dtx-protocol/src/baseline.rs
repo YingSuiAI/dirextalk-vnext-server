@@ -153,6 +153,11 @@ const V31_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/conversation-agent-grant/v1",
     "protocol/test-vectors/conversation-agent-grant/v1",
 ];
+const V32_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/mls-sequencer/v4",
+    "protocol/openapi/mls-sequencer/v4",
+    "protocol/test-vectors/mls-sequencer/v4",
+];
 const V33_ARTIFACT_PATHS: &[&str] = &[
     "protocol/cddl/public-search-pagination/v1",
     "protocol/openapi/public-search-pagination/v1",
@@ -359,6 +364,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v31/manifest.json",
         includes_registries: false,
         artifact_paths: V31_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 32,
+        path: "protocol/baseline/v32/manifest.json",
+        includes_registries: false,
+        artifact_paths: V32_ARTIFACT_PATHS,
     },
     BaselineSpec {
         version: 33,

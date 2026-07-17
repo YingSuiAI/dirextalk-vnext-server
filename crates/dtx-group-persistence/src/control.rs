@@ -629,9 +629,9 @@ fn map_policy_rejection(
     match error {
         GroupPolicyError::RevisionConflict { .. } => Ok(GroupControlRejection::RevisionConflict),
         GroupPolicyError::AdminLimitReached => Ok(GroupControlRejection::AdminLimitReached),
-        GroupPolicyError::Unauthorized | GroupPolicyError::OwnerCannotBeAdmin => {
-            Ok(GroupControlRejection::PolicyDenied)
-        }
+        GroupPolicyError::Unauthorized
+        | GroupPolicyError::OwnerCannotBeAdmin
+        | GroupPolicyError::OwnerCannotBeRemoved => Ok(GroupControlRejection::PolicyDenied),
         GroupPolicyError::AlreadyAdmin
         | GroupPolicyError::NotAdmin
         | GroupPolicyError::InviteAlreadyExists
@@ -640,6 +640,7 @@ fn map_policy_rejection(
         | GroupPolicyError::InviteNotFound
         | GroupPolicyError::InviteAlreadyRevoked
         | GroupPolicyError::AlreadyMember
+        | GroupPolicyError::MemberNotFound
         | GroupPolicyError::JoinRequestAlreadyPending
         | GroupPolicyError::CandidateJoinInFlight
         | GroupPolicyError::PendingJoinNotFound

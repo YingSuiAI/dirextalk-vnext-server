@@ -417,7 +417,7 @@ impl PostgresHarness {
              GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA groups TO dtx_group_runtime;
              GRANT SELECT, INSERT, UPDATE ON groups.policy_heads TO dtx_group_runtime;
              GRANT SELECT, INSERT, UPDATE ON groups.admin_terms TO dtx_group_runtime;
-             GRANT SELECT, INSERT ON groups.members TO dtx_group_runtime;
+             GRANT SELECT, INSERT, DELETE ON groups.members TO dtx_group_runtime;
              GRANT SELECT, INSERT, UPDATE ON groups.invites TO dtx_group_runtime;
              GRANT SELECT, INSERT, UPDATE ON groups.join_records TO dtx_group_runtime;
              GRANT SELECT, INSERT ON groups.membership_commands TO dtx_group_runtime;

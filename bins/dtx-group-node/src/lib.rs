@@ -148,14 +148,22 @@ pub const GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE: &str =
 pub const MLS_COMMIT_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v2+cbor";
 /// V30 approved-identity commit request media type.
 pub const MLS_COMMIT_V3_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v3+cbor";
+/// V32 Owner-authored single-member removal commit request media type.
+pub const MLS_COMMIT_V4_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v4+cbor";
 /// Exact V2 signed receipt media type.
 pub const MLS_COMMIT_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mls-commit-receipt.v2+cbor";
 /// V30 receipt media type binding candidate package, join, and approval digests.
 pub const MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mls-commit-receipt.v3+cbor";
+/// V32 receipt binding the removed leaf and product-policy revision fence.
+pub const MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.mls-commit-receipt.v4+cbor";
 /// Exact V30 active-member commit catch-up page media type.
 pub const MLS_COMMIT_FEED_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit-feed.v1+cbor";
+/// V32 catch-up feed carrying consecutive V3 admissions and V4 removals.
+pub const MLS_COMMIT_FEED_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.mls-commit-feed.v2+cbor";
 /// Exact V2 candidate confirmation media type.
 pub const MLS_CONFIRMATION_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mls-device-join-confirmation.v2+cbor";
@@ -981,6 +989,10 @@ async fn request_join(
     finish(result, request_id)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one handler keeps local and federated pending-join authorization symmetric"
+)]
 async fn list_join_requests(
     State(state): State<GroupNodeState>,
     Path((scope_kind, scope_id)): Path<(String, String)>,
@@ -1188,6 +1200,10 @@ async fn get_membership_receipt(
     finish(result, request_id)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one submission boundary dispatches the versioned local and federated authentication paths"
+)]
 async fn submit_mls_commit(
     State(state): State<GroupNodeState>,
     Path((scope_kind, scope_id, submission_id)): Path<(String, String, String)>,
@@ -1233,25 +1249,45 @@ async fn submit_mls_commit(
                 Arc::clone(signing_key),
             )
             .await
-        } else if parsed.command.protocol_version() == 3 {
+        } else if matches!(parsed.command.protocol_version(), 3 | 4) {
             if parts.headers.contains_key(MLS_COMMIT_PROOF_HEADER) {
                 return Err(GroupFailure::ActionProofInvalid);
             }
             let credential = parse_device_session_authorization(&parts.headers)?;
             let signer = Arc::clone(signing_key);
-            state
-                .mls_repository
-                .submit_authenticated_v3(
-                    &state.store,
-                    state.tenant_id,
-                    &credential,
-                    &parsed.command,
-                    now.get(),
-                    signing_public_key,
-                    move |input| Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes())),
-                )
-                .await
-                .map_err(|error| map_persistence_error(&error))
+            if parsed.command.protocol_version() == 4 {
+                state
+                    .mls_repository
+                    .submit_authenticated_v4(
+                        &state.store,
+                        state.tenant_id,
+                        &credential,
+                        &parsed.command,
+                        now.get(),
+                        signing_public_key,
+                        move |input| {
+                            Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes()))
+                        },
+                    )
+                    .await
+                    .map_err(|error| map_persistence_error(&error))
+            } else {
+                state
+                    .mls_repository
+                    .submit_authenticated_v3(
+                        &state.store,
+                        state.tenant_id,
+                        &credential,
+                        &parsed.command,
+                        now.get(),
+                        signing_public_key,
+                        move |input| {
+                            Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes()))
+                        },
+                    )
+                    .await
+                    .map_err(|error| map_persistence_error(&error))
+            }
         } else {
             if parts.headers.contains_key(MLS_COMMIT_PROOF_HEADER) {
                 return Err(GroupFailure::ActionProofInvalid);
@@ -1341,11 +1377,7 @@ async fn get_mls_commit_receipt(
         Ok(cbor_response(
             StatusCode::OK,
             encode_mls_commit_receipt(&receipt)?,
-            if receipt.protocol_version() == 3 {
-                MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE
-            } else {
-                MLS_COMMIT_RECEIPT_CONTENT_TYPE
-            },
+            mls_commit_receipt_content_type(receipt.protocol_version()),
         ))
     }
     .await;
@@ -1363,7 +1395,7 @@ async fn submit_federated_mls_commit(
     signing_public_key: SigningPublicKey,
     signing_key: Arc<SigningKey>,
 ) -> Result<MlsCommitExecution, GroupFailure> {
-    if command.protocol_version() != 3 || headers.contains_key(header::AUTHORIZATION) {
+    if !matches!(command.protocol_version(), 3 | 4) || headers.contains_key(header::AUTHORIZATION) {
         return Err(GroupFailure::ActionProofInvalid);
     }
     let proof = parse_mls_commit_proof_header(headers)?;
@@ -1392,38 +1424,72 @@ async fn submit_federated_mls_commit(
     let expected_actor_device_id = command.actor_device_id();
     let expected_request_digest = command.request_digest();
     let expected_idempotency_key_hash = command.idempotency_key_hash();
-    state
-        .mls_repository
-        .submit_verified_v3_with_proof(
-            &state.store,
-            state.tenant_id,
-            actor,
-            command,
-            now.get(),
-            signing_public_key,
-            move |device_signing_key| {
-                proof.verify(
-                    MlsCommitProofAction::Submit,
-                    &expected_path,
-                    expected_scope,
-                    expected_submission_id,
-                    expected_actor_identity_id,
-                    expected_actor_device_id,
-                    expected_request_digest,
-                    expected_idempotency_key_hash,
-                    &expected_origin,
-                    now,
-                    device_signing_key,
-                )
-            },
-            move |input| {
-                Ok(Ed25519Signature::from_bytes(
-                    signing_key.sign(input).to_bytes(),
-                ))
-            },
-        )
-        .await
-        .map_err(|error| map_persistence_error(&error))
+    let result = if command.protocol_version() == 4 {
+        state
+            .mls_repository
+            .submit_verified_v4_with_proof(
+                &state.store,
+                state.tenant_id,
+                actor,
+                command,
+                now.get(),
+                signing_public_key,
+                move |device_signing_key| {
+                    proof.verify(
+                        MlsCommitProofAction::Submit,
+                        &expected_path,
+                        expected_scope,
+                        expected_submission_id,
+                        expected_actor_identity_id,
+                        expected_actor_device_id,
+                        expected_request_digest,
+                        expected_idempotency_key_hash,
+                        &expected_origin,
+                        now,
+                        device_signing_key,
+                    )
+                },
+                move |input| {
+                    Ok(Ed25519Signature::from_bytes(
+                        signing_key.sign(input).to_bytes(),
+                    ))
+                },
+            )
+            .await
+    } else {
+        state
+            .mls_repository
+            .submit_verified_v3_with_proof(
+                &state.store,
+                state.tenant_id,
+                actor,
+                command,
+                now.get(),
+                signing_public_key,
+                move |device_signing_key| {
+                    proof.verify(
+                        MlsCommitProofAction::Submit,
+                        &expected_path,
+                        expected_scope,
+                        expected_submission_id,
+                        expected_actor_identity_id,
+                        expected_actor_device_id,
+                        expected_request_digest,
+                        expected_idempotency_key_hash,
+                        &expected_origin,
+                        now,
+                        device_signing_key,
+                    )
+                },
+                move |input| {
+                    Ok(Ed25519Signature::from_bytes(
+                        signing_key.sign(input).to_bytes(),
+                    ))
+                },
+            )
+            .await
+    };
+    result.map_err(|error| map_persistence_error(&error))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1440,7 +1506,13 @@ async fn load_federated_mls_commit_receipt(
     if headers.contains_key(header::AUTHORIZATION) {
         return Err(GroupFailure::ActionProofInvalid);
     }
-    require_exact_accept(headers, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE)?;
+    let expected_protocol_version = if has_exact_accept(headers, MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE)
+    {
+        4
+    } else {
+        require_exact_accept(headers, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE)?;
+        3
+    };
     let proof = parse_mls_commit_proof_header(headers)?;
     if proof.identity_origin != identity_origin {
         return Err(GroupFailure::ActionProofInvalid);
@@ -1463,7 +1535,7 @@ async fn load_federated_mls_commit_receipt(
     let proof_idempotency_key_hash = proof.idempotency_key_hash;
     let expected_path = expected_path.to_owned();
     let expected_origin = identity_origin.to_owned();
-    state
+    let receipt = state
         .mls_repository
         .receipt_verified_v3_with_proof(
             &state.store,
@@ -1491,9 +1563,17 @@ async fn load_federated_mls_commit_receipt(
             },
         )
         .await
-        .map_err(|error| map_persistence_error(&error))
+        .map_err(|error| map_persistence_error(&error))?;
+    if receipt.protocol_version() != expected_protocol_version {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    Ok(receipt)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one feed boundary keeps media negotiation and final-epoch authorization coupled"
+)]
 async fn get_mls_commit_feed(
     State(state): State<GroupNodeState>,
     Path((scope_kind, scope_id)): Path<(String, String)>,
@@ -1505,7 +1585,12 @@ async fn get_mls_commit_feed(
         let scope = parse_scope(&scope_kind, &scope_id)?;
         let collection_path = format!("{}/mls-commits", canonical_scope_path(scope));
         let query = parse_mls_commit_feed_query(&parts.uri, &collection_path)?;
-        require_exact_accept(&parts.headers, MLS_COMMIT_FEED_CONTENT_TYPE)?;
+        let include_v4 = if has_exact_accept(&parts.headers, MLS_COMMIT_FEED_V2_CONTENT_TYPE) {
+            true
+        } else {
+            require_exact_accept(&parts.headers, MLS_COMMIT_FEED_CONTENT_TYPE)?;
+            false
+        };
         require_empty_get(&parts.headers, body).await?;
         let proof = parse_group_query_proof_header(&parts.headers)?;
         let now = state.now()?;
@@ -1595,8 +1680,12 @@ async fn get_mls_commit_feed(
         .map_err(|error| map_persistence_error(&error))?;
         Ok(cbor_response(
             StatusCode::OK,
-            encode_mls_commit_feed(&page)?,
-            MLS_COMMIT_FEED_CONTENT_TYPE,
+            encode_mls_commit_feed(&page, include_v4)?,
+            if include_v4 {
+                MLS_COMMIT_FEED_V2_CONTENT_TYPE
+            } else {
+                MLS_COMMIT_FEED_CONTENT_TYPE
+            },
         ))
     }
     .await;
@@ -1707,11 +1796,7 @@ fn mls_commit_response(execution: &MlsCommitExecution) -> Result<Response, Group
             StatusCode::CREATED
         },
         encode_mls_commit_receipt(execution.receipt())?,
-        if execution.receipt().protocol_version() == 3 {
-            MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE
-        } else {
-            MLS_COMMIT_RECEIPT_CONTENT_TYPE
-        },
+        mls_commit_receipt_content_type(execution.receipt().protocol_version()),
     ))
 }
 
@@ -1738,7 +1823,18 @@ fn encode_mls_commit_receipt(receipt: &MlsCommitReceipt) -> Result<Vec<u8>, Grou
     .map_err(|_| GroupFailure::TemporarilyUnavailable)
 }
 
-fn encode_mls_commit_feed(page: &MlsCommitFeedPage) -> Result<Vec<u8>, GroupFailure> {
+fn encode_mls_commit_feed(
+    page: &MlsCommitFeedPage,
+    include_v4: bool,
+) -> Result<Vec<u8>, GroupFailure> {
+    if !include_v4
+        && page
+            .items()
+            .iter()
+            .any(|item| item.receipt().protocol_version() == 4)
+    {
+        return Err(GroupFailure::InvalidRequest);
+    }
     let items = page
         .items()
         .iter()
@@ -1750,7 +1846,7 @@ fn encode_mls_commit_feed(page: &MlsCommitFeedPage) -> Result<Vec<u8>, GroupFail
         })
         .collect::<Result<Vec<_>, GroupFailure>>()?;
     encode_deterministic_cbor(&numbered_map(vec![
-        CanonicalValue::Unsigned(1),
+        CanonicalValue::Unsigned(if include_v4 { 2 } else { 1 }),
         CanonicalValue::Unsigned(page.after_epoch()),
         CanonicalValue::Array(items),
     ]))
@@ -1893,7 +1989,7 @@ struct MlsCommitBody {
     controller_signature: Option<Ed25519Signature>,
 }
 
-#[allow(clippy::too_many_lines)] // V2/V3 exact-field validation stays contiguous so no version can bypass a bound field.
+#[allow(clippy::too_many_lines)] // Versioned exact-field validation stays contiguous so no path can bypass a bound field.
 async fn parse_mls_commit_body(
     headers: &HeaderMap,
     body: Body,
@@ -1901,7 +1997,9 @@ async fn parse_mls_commit_body(
     expected_submission_id: RequestId,
     idempotency_key_hash: Sha256Digest,
 ) -> Result<MlsCommitBody, GroupFailure> {
-    let protocol_version: u8 = if has_exact_content_type(headers, MLS_COMMIT_V3_CONTENT_TYPE) {
+    let protocol_version: u8 = if has_exact_content_type(headers, MLS_COMMIT_V4_CONTENT_TYPE) {
+        4
+    } else if has_exact_content_type(headers, MLS_COMMIT_V3_CONTENT_TYPE) {
         3
     } else if has_exact_content_type(headers, MLS_COMMIT_CONTENT_TYPE) {
         2
@@ -1911,10 +2009,11 @@ async fn parse_mls_commit_body(
     let value = decode_body(
         headers,
         body,
-        if protocol_version == 2 {
-            MLS_COMMIT_CONTENT_TYPE
-        } else {
-            MLS_COMMIT_V3_CONTENT_TYPE
+        match protocol_version {
+            2 => MLS_COMMIT_CONTENT_TYPE,
+            3 => MLS_COMMIT_V3_CONTENT_TYPE,
+            4 => MLS_COMMIT_V4_CONTENT_TYPE,
+            _ => return Err(GroupFailure::InvalidRequest),
         },
         MAX_MLS_COMMIT_BODY_BYTES,
     )
@@ -1930,7 +2029,15 @@ async fn parse_mls_commit_body(
     let actor_device_id = parse_device_id_value(field(fields, 5)?)?;
     let candidate_identity_id = parse_identity_id_value(field(fields, 6)?)?;
     let candidate_device_id = parse_device_id_value(field(fields, 7)?)?;
-    let candidate_key_package_digest = parse_digest(field(fields, 8)?)?;
+    let zero = Sha256Digest::from_bytes([0; 32]);
+    let candidate_key_package_digest = if protocol_version == 4 {
+        if field(fields, 8)? != &CanonicalValue::Null {
+            return Err(GroupFailure::InvalidRequest);
+        }
+        zero
+    } else {
+        parse_digest(field(fields, 8)?)?
+    };
     let candidate_proof = if protocol_version == 2 {
         let (digest, signature) = parse_mls_device_proof(field(fields, 9)?)?;
         Some((digest, signature))
@@ -1949,7 +2056,14 @@ async fn parse_mls_commit_body(
     if commit_digest != mls_opaque_commit_digest(&commit_bytes) {
         return Err(GroupFailure::InvalidRequest);
     }
-    let welcome_digest = parse_digest(field(fields, 14)?)?;
+    let welcome_digest = if protocol_version == 4 {
+        if field(fields, 14)? != &CanonicalValue::Null {
+            return Err(GroupFailure::InvalidRequest);
+        }
+        zero
+    } else {
+        parse_digest(field(fields, 14)?)?
+    };
     let authorization_len = match field(fields, 15)? {
         CanonicalValue::Map(values) => values.len(),
         _ => return Err(GroupFailure::InvalidRequest),
@@ -1997,6 +2111,14 @@ async fn parse_mls_commit_body(
                     controller_consent_digest,
                 },
                 Some(signature),
+            )
+        }
+        CanonicalValue::Unsigned(4) if protocol_version == 4 && authorization_fields.len() == 2 => {
+            (
+                MlsCommitAuthorization::MemberRemovalV4 {
+                    expected_policy_revision: parse_revision(field(authorization_fields, 2)?)?,
+                },
+                None,
             )
         }
         _ => return Err(GroupFailure::InvalidRequest),
@@ -2048,6 +2170,25 @@ async fn parse_mls_commit_body(
             authorization_digest,
             join_request_digest,
             approval_request_digest,
+        ),
+        (
+            4,
+            MlsCommitAuthorization::MemberRemovalV4 {
+                expected_policy_revision,
+            },
+        ) => MlsCommitCommand::new_v4_member_removal(
+            submission_id,
+            scope,
+            actor_identity_id,
+            actor_device_id,
+            candidate_identity_id,
+            candidate_device_id,
+            idempotency_key_hash,
+            expected_epoch,
+            expected_head,
+            expected_policy_revision,
+            commit_bytes,
+            commit_digest,
         ),
         _ => return Err(GroupFailure::InvalidRequest),
     }
@@ -3516,6 +3657,20 @@ fn has_exact_content_type(headers: &HeaderMap, expected: &'static str) -> bool {
     let mut values = headers.get_all(header::CONTENT_TYPE).iter();
     matches!(values.next(), Some(value) if value.as_bytes() == expected.as_bytes())
         && values.next().is_none()
+}
+
+fn has_exact_accept(headers: &HeaderMap, expected: &'static str) -> bool {
+    let mut values = headers.get_all(header::ACCEPT).iter();
+    matches!(values.next(), Some(value) if value.as_bytes() == expected.as_bytes())
+        && values.next().is_none()
+}
+
+const fn mls_commit_receipt_content_type(protocol_version: u8) -> &'static str {
+    match protocol_version {
+        3 => MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE,
+        4 => MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE,
+        _ => MLS_COMMIT_RECEIPT_CONTENT_TYPE,
+    }
 }
 
 fn membership_mutation_version(

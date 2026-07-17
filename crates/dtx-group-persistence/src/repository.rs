@@ -985,6 +985,49 @@ pub(crate) async fn resolve_mls_commit_in_transaction(
     Ok(receipt)
 }
 
+/// Applies the product-policy half of an Owner-authored member removal in the
+/// caller's MLS Sequencer transaction.
+///
+/// The normalized member row is explicitly deleted because the canonical
+/// policy persistence path is otherwise append/update oriented. Its V4 intent
+/// must already exist in this transaction so the database removal guard can
+/// bind the DELETE to the exact product and parent-MLS heads. A current
+/// administrator term is deactivated by the same persisted policy image.
+pub(crate) async fn remove_group_member_in_transaction(
+    connection: &mut PgConnection,
+    tenant_id: TenantId,
+    scope: GroupScope,
+    expected_revision: Revision,
+    actor_identity_id: IdentityId,
+    target_identity_id: IdentityId,
+    now_ms: i64,
+) -> Result<Revision, GroupPersistenceError> {
+    let key = ScopeKey::from_scope(tenant_id, scope);
+    let mut policy = load_policy(connection, key, true)
+        .await?
+        .ok_or(GroupPersistenceError::GroupNotFound)?;
+    let revision =
+        policy.remove_member(expected_revision, actor_identity_id, target_identity_id)?;
+    persist_policy(connection, tenant_id, &policy, now_ms, false).await?;
+    let deleted = sqlx::query(
+        "DELETE FROM groups.members
+          WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND identity_id=$4",
+    )
+    .bind(key.tenant_id())
+    .bind(key.kind)
+    .bind(key.id())
+    .bind(target_identity_id.to_string())
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    if deleted != 1 {
+        return Err(GroupPersistenceError::CorruptData(
+            "group removal target membership",
+        ));
+    }
+    Ok(revision)
+}
+
 #[allow(clippy::too_many_lines)] // Authorization, projection-head capture, integrity checks, and stable paging intentionally share one transaction boundary.
 async fn list_pending_join_requests_in_transaction(
     connection: &mut PgConnection,
@@ -2948,6 +2991,7 @@ fn local_policy_rejection(error: GroupPolicyError) -> Option<MembershipRejection
             None
         }
         GroupPolicyError::OwnerCannotBeAdmin
+        | GroupPolicyError::OwnerCannotBeRemoved
         | GroupPolicyError::AlreadyAdmin
         | GroupPolicyError::NotAdmin
         | GroupPolicyError::AdminLimitReached
@@ -2957,6 +3001,7 @@ fn local_policy_rejection(error: GroupPolicyError) -> Option<MembershipRejection
         | GroupPolicyError::InviteNotFound
         | GroupPolicyError::InviteAlreadyRevoked
         | GroupPolicyError::AlreadyMember
+        | GroupPolicyError::MemberNotFound
         | GroupPolicyError::JoinRequestAlreadyPending
         | GroupPolicyError::CandidateJoinInFlight
         | GroupPolicyError::PendingJoinNotFound

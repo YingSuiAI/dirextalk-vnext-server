@@ -622,6 +622,8 @@ pub enum GroupPolicyError {
     Unauthorized,
     /// The sole owner cannot also occupy an administrator slot.
     OwnerCannotBeAdmin,
+    /// The sole owner cannot be removed by a membership command.
+    OwnerCannotBeRemoved,
     /// The identity already occupies an administrator slot.
     AlreadyAdmin,
     /// The identity does not occupy an administrator slot.
@@ -642,6 +644,8 @@ pub enum GroupPolicyError {
     InviteAlreadyRevoked,
     /// The candidate already belongs to the group.
     AlreadyMember,
+    /// The requested removal target is not a current group member.
+    MemberNotFound,
     /// The request identity is already pending for a candidate.
     JoinRequestAlreadyPending,
     /// The candidate already has another pending or reserved admission workflow.
@@ -684,6 +688,7 @@ impl fmt::Display for GroupPolicyError {
             Self::OwnerCannotBeAdmin => {
                 formatter.write_str("group owner cannot also be an administrator")
             }
+            Self::OwnerCannotBeRemoved => formatter.write_str("group owner cannot be removed"),
             Self::AlreadyAdmin => formatter.write_str("identity is already a group administrator"),
             Self::NotAdmin => formatter.write_str("identity is not a group administrator"),
             Self::AdminLimitReached => formatter.write_str("group administrator limit reached"),
@@ -700,6 +705,7 @@ impl fmt::Display for GroupPolicyError {
                 formatter.write_str("group invitation is already revoked")
             }
             Self::AlreadyMember => formatter.write_str("candidate is already a group member"),
+            Self::MemberNotFound => formatter.write_str("group member was not found"),
             Self::JoinRequestAlreadyPending => {
                 formatter.write_str("group join request is already pending")
             }
@@ -947,6 +953,37 @@ impl GroupPolicy {
         }
 
         self.administrators.remove(&administrator_id);
+        self.revision = next_revision;
+        Ok(next_revision)
+    }
+
+    /// Removes one non-owner identity from the group at the exact policy revision.
+    ///
+    /// A current administrator loses that term in the same state transition.
+    /// Historical authorization generations and invitations remain auditable;
+    /// their issuer-authority checks fail closed once the term is inactive.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the revision is stale, the actor is not the owner,
+    /// the target is the owner, or the target is not a current member.
+    pub fn remove_member(
+        &mut self,
+        expected_revision: Revision,
+        actor_id: IdentityId,
+        member_id: IdentityId,
+    ) -> Result<Revision, GroupPolicyError> {
+        let next_revision = self.next_mutation_revision(expected_revision)?;
+        self.ensure_owner(actor_id)?;
+        if member_id == self.owner_id {
+            return Err(GroupPolicyError::OwnerCannotBeRemoved);
+        }
+        if !self.members.contains(&member_id) {
+            return Err(GroupPolicyError::MemberNotFound);
+        }
+
+        self.administrators.remove(&member_id);
+        self.members.remove(&member_id);
         self.revision = next_revision;
         Ok(next_revision)
     }

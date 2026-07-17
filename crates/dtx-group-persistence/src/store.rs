@@ -179,6 +179,7 @@ async fn validate_group_runtime_role(pool: &PgPool) -> Result<(), GroupPersisten
              AND has_table_privilege(current_user, 'groups.admin_terms', 'UPDATE')
              AND has_table_privilege(current_user, 'groups.members', 'SELECT')
              AND has_table_privilege(current_user, 'groups.members', 'INSERT')
+             AND has_table_privilege(current_user, 'groups.members', 'DELETE')
              AND has_table_privilege(current_user, 'groups.invites', 'SELECT')
              AND has_table_privilege(current_user, 'groups.invites', 'INSERT')
              AND has_table_privilege(current_user, 'groups.invites', 'UPDATE')
@@ -369,7 +370,8 @@ async fn role_has_excess_group_privileges(pool: &PgPool) -> Result<bool, GroupPe
                                                 'mls_commit_intents', 'mls_commit_receipts',
                                                 'mls_sequencer_outbox', 'mls_device_members',
                                                 'mls_join_confirmations')
-                          AND (has_table_privilege(current_user, relation.oid, 'DELETE')
+                          AND ((relation.relname <> 'members'
+                                AND has_table_privilege(current_user, relation.oid, 'DELETE'))
                             OR has_table_privilege(current_user, relation.oid, 'TRUNCATE')
                             OR has_table_privilege(current_user, relation.oid, 'REFERENCES')
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER')

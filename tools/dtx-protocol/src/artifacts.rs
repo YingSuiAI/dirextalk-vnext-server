@@ -149,6 +149,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_group_membership_discovery_v1(root)?;
     validate_private_messaging_artifacts(root)?;
     validate_v30_peer_admission(root)?;
+    validate_mls_sequencer_v4(root)?;
     validate_conversation_agent_grant_v1(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
@@ -394,6 +395,219 @@ fn validate_v30_peer_admission(root: &Path) -> Result<(), ProtocolToolError> {
         decode_lower_hex_fixed::<64>(json_string(&mls, "confirmation_proof_signature_hex")?)?,
         "MLS V3 confirmation proof",
     )?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one frozen V32 audit keeps the removal request, receipt, signature, and feed linked"
+)]
+fn validate_mls_sequencer_v4(root: &Path) -> Result<(), ProtocolToolError> {
+    const COMMIT_MEDIA_TYPE: &str = "application/vnd.dirextalk.mls-commit.v4+cbor";
+    const RECEIPT_MEDIA_TYPE: &str = "application/vnd.dirextalk.mls-commit-receipt.v4+cbor";
+    const FEED_MEDIA_TYPE: &str = "application/vnd.dirextalk.mls-commit-feed.v2+cbor";
+    const REQUEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-request.v4\0";
+    const COMMIT_DOMAIN: &[u8] = b"dirextalk.mls-opaque-commit.v1\0";
+    const HEAD_DOMAIN: &[u8] = b"dirextalk.mls-sequencer-head.v1\0";
+    const RECEIPT_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt.v4\0";
+    const SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt-signature.v4\0";
+
+    let cddl_path = root.join("protocol/cddl/mls-sequencer/v4/mls-sequencer-v4.cddl");
+    let cddl = read(&cddl_path)?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse MLS Sequencer V4 CDDL {}: {error}",
+            cddl_path.display()
+        ))
+    })?;
+
+    let openapi_path = root.join("protocol/openapi/mls-sequencer/v4/openapi.yaml");
+    let openapi = read(&openapi_path)?;
+    let spec = oas3::from_yaml(&openapi).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse MLS Sequencer V4 OpenAPI {}: {error}",
+            openapi_path.display()
+        ))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V4 OpenAPI must declare 3.1.0",
+        ));
+    }
+    for required in [
+        COMMIT_MEDIA_TYPE,
+        RECEIPT_MEDIA_TYPE,
+        FEED_MEDIA_TYPE,
+        "Owner-only",
+        "removed at epoch N may fetch through N",
+    ] {
+        if !openapi.contains(required) {
+            return Err(ProtocolToolError::new(format!(
+                "MLS Sequencer V4 OpenAPI is missing {required}"
+            )));
+        }
+    }
+
+    let vector =
+        read_json(&root.join("protocol/test-vectors/mls-sequencer/v4/mls-sequencer-v4.json"))?;
+    if vector.get("version").and_then(Value::as_u64) != Some(4)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(32)
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V4 vector version/baseline must be 4/32",
+        ));
+    }
+    for (field, expected) in [
+        ("commit_content_type", COMMIT_MEDIA_TYPE.as_bytes()),
+        ("receipt_content_type", RECEIPT_MEDIA_TYPE.as_bytes()),
+        ("feed_content_type", FEED_MEDIA_TYPE.as_bytes()),
+        ("request_digest_domain", REQUEST_DOMAIN),
+        ("commit_digest_domain", COMMIT_DOMAIN),
+        ("head_digest_domain", HEAD_DOMAIN),
+        ("receipt_digest_domain", RECEIPT_DOMAIN),
+        ("receipt_signature_domain", SIGNATURE_DOMAIN),
+    ] {
+        if json_string(&vector, field)?.as_bytes() != expected {
+            return Err(ProtocolToolError::new(format!(
+                "MLS Sequencer V4 {field} drift"
+            )));
+        }
+    }
+    validate_uuid_fields(
+        &vector,
+        &[
+            "/submission_id",
+            "/conversation_id",
+            "/owner_device_id",
+            "/target_device_id",
+        ],
+    )?;
+    validate_identity_id(
+        json_string(&vector, "owner_identity_id")?,
+        "MLS V4 Owner identity",
+    )?;
+    validate_identity_id(
+        json_string(&vector, "target_identity_id")?,
+        "MLS V4 target identity",
+    )?;
+    for (rule, field) in [
+        ("mls-commit-request-v4", "request_canonical_cbor_hex"),
+        (
+            "mls-request-digest-transcript-v4",
+            "request_digest_transcript_canonical_cbor_hex",
+        ),
+        ("mls-commit-receipt-v4", "receipt_inner_canonical_cbor_hex"),
+        (
+            "signed-mls-commit-receipt-v4",
+            "signed_receipt_canonical_cbor_hex",
+        ),
+        ("mls-commit-feed-v2", "feed_canonical_cbor_hex"),
+    ] {
+        validate_cddl_hex(rule, &cddl, json_string(&vector, field)?)?;
+    }
+    for (domain, exact_field, digest_field, label) in [
+        (
+            REQUEST_DOMAIN,
+            "request_digest_transcript_canonical_cbor_hex",
+            "request_digest_hex",
+            "MLS V4 request",
+        ),
+        (
+            HEAD_DOMAIN,
+            "head_digest_transcript_canonical_cbor_hex",
+            "result_head_digest_hex",
+            "MLS V4 head",
+        ),
+        (
+            RECEIPT_DOMAIN,
+            "receipt_inner_canonical_cbor_hex",
+            "receipt_digest_hex",
+            "MLS V4 receipt",
+        ),
+    ] {
+        ensure_domain_digest(
+            domain,
+            json_string(&vector, exact_field)?,
+            json_string(&vector, digest_field)?,
+            label,
+        )?;
+    }
+    let commit_bytes = decode_hex(json_string(&vector, "commit_bytes_hex")?)?;
+    let mut commit_hasher = Sha256::new();
+    commit_hasher.update(COMMIT_DOMAIN);
+    commit_hasher.update(&commit_bytes);
+    let commit_digest: [u8; 32] = commit_hasher.finalize().into();
+    if lowercase_hex(&commit_digest) != json_string(&vector, "commit_digest_hex")? {
+        return Err(ProtocolToolError::new("MLS V4 opaque commit digest drift"));
+    }
+    verify_domain_digest_signature(
+        decode_lower_hex_fixed::<32>(json_string(&vector, "signing_public_key_hex")?)?,
+        SIGNATURE_DOMAIN,
+        decode_lower_hex_fixed::<32>(json_string(&vector, "receipt_digest_hex")?)?,
+        decode_lower_hex_fixed::<64>(json_string(&vector, "receipt_signature_hex")?)?,
+        "MLS V4 receipt",
+    )?;
+
+    let receipt = decode_deterministic_cbor(&decode_hex(json_string(
+        &vector,
+        "receipt_inner_canonical_cbor_hex",
+    )?)?)
+    .map_err(|error| ProtocolToolError::new(format!("decode MLS V4 receipt: {error}")))?;
+    let receipt_digest = decode_lower_hex_fixed::<32>(json_string(&vector, "receipt_digest_hex")?)?;
+    let signing_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "signing_public_key_hex")?)?;
+    let signature = decode_lower_hex_fixed::<64>(json_string(&vector, "receipt_signature_hex")?)?;
+    let expected_signed = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), receipt),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Bytes(receipt_digest.to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Bytes(signing_key.to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Bytes(signature.to_vec()),
+        ),
+    ]);
+    let signed_bytes = decode_hex(json_string(&vector, "signed_receipt_canonical_cbor_hex")?)?;
+    if decode_deterministic_cbor(&signed_bytes)
+        .map_err(|error| ProtocolToolError::new(format!("decode MLS V4 signed receipt: {error}")))?
+        != expected_signed
+    {
+        return Err(ProtocolToolError::new(
+            "MLS V4 signed receipt linkage drift",
+        ));
+    }
+    let parent_epoch = vector
+        .get("parent_epoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("MLS V4 parent_epoch must be unsigned"))?;
+    let expected_feed = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Unsigned(parent_epoch),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Array(vec![CanonicalValue::Array(vec![
+                CanonicalValue::Bytes(signed_bytes),
+                CanonicalValue::Bytes(commit_bytes),
+            ])]),
+        ),
+    ]);
+    if decode_deterministic_cbor(&decode_hex(json_string(
+        &vector,
+        "feed_canonical_cbor_hex",
+    )?)?)
+    .map_err(|error| ProtocolToolError::new(format!("decode MLS V4 feed: {error}")))?
+        != expected_feed
+    {
+        return Err(ProtocolToolError::new("MLS V4 feed linkage drift"));
+    }
     Ok(())
 }
 

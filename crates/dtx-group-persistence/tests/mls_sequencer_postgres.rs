@@ -4,11 +4,12 @@ mod support;
 use std::{error::Error, str::FromStr};
 
 use dtx_domain::{
-    ConversationId, DeviceId, IdentityId, InviteCapabilityId, JoinRequestId, RequestId, TenantId,
+    ConversationId, DeviceId, IdentityId, InviteCapabilityId, JoinRequestId, RequestId, Revision,
+    TenantId,
 };
 use dtx_group_persistence::{
     GroupMembershipRepository, GroupPersistenceError, GroupPgStore, MlsCommitAuthorization,
-    MlsCommitCommand, MlsCommitSequencerRepository, MlsDeviceJoinConfirmation,
+    MlsCommitCommand, MlsCommitSequencerRepository, MlsDeviceJoinConfirmation, VerifiedDeviceActor,
     mls_device_confirmation_signature_input, mls_opaque_commit_digest,
 };
 use dtx_group_policy::{GroupPolicy, GroupScope};
@@ -33,6 +34,11 @@ fn tenant() -> TenantId {
 }
 fn owner() -> IdentityId {
     IdentityId::from_str(OWNER).unwrap()
+}
+fn identity(slot: u8) -> IdentityId {
+    format!("dtxi1{}{}", char::from(b'a' + slot), "a".repeat(51))
+        .parse()
+        .expect("fixture identity is canonical")
 }
 fn scope() -> GroupScope {
     GroupScope::PrivateConversation(
@@ -119,6 +125,238 @@ async fn seeded_store() -> Result<(support::PostgresHarness, GroupPgStore), Box<
         .bootstrap(&store, tenant(), &GroupPolicy::new(scope(), owner()), 1_000)
         .await?;
     Ok((harness, store))
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one PostgreSQL boundary test proves removal atomicity, replay, conflict, and convergence"
+)]
+async fn owner_removal_atomically_advances_mls_and_policy_and_replays_exact_receipt()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let store = GroupPgStore::connect(harness.group_runtime_options(), 8).await?;
+    let admin = identity(1);
+    let target = identity(2);
+    let owner_device = device("0190f2a5-7b1c-7abc-8def-0123456789b1");
+    let admin_device = device("0190f2a5-7b1c-7abc-8def-0123456789b2");
+    let target_device = device("0190f2a5-7b1c-7abc-8def-0123456789b3");
+    let mut policy = GroupPolicy::new(scope(), owner());
+    policy.grant_admin(policy.revision(), owner(), admin)?;
+    policy.grant_admin(policy.revision(), owner(), target)?;
+    policy.revoke_admin(policy.revision(), owner(), target)?;
+    let expected_policy_revision = policy.revision();
+    GroupMembershipRepository
+        .bootstrap(&store, tenant(), &policy, 1_000)
+        .await?;
+
+    let parent_head = digest(0x41);
+    let mut seed = harness.group_runtime_pool().begin().await?;
+    support::PostgresHarness::set_tenant(&mut seed, tenant().into()).await?;
+    sqlx::query(
+        "INSERT INTO groups.mls_heads
+          (tenant_id,scope_kind,scope_id,epoch,head_digest,updated_at_ms)
+         VALUES ($1,'private_conversation',$2,1,$3,1000)",
+    )
+    .bind(uuid::Uuid::from(tenant()))
+    .bind(match scope() {
+        GroupScope::PrivateConversation(id) => id.to_string(),
+        GroupScope::ControlledPublicChannel(_) => unreachable!(),
+    })
+    .bind(parent_head.as_bytes().as_slice())
+    .execute(&mut *seed)
+    .await?;
+    for (identity, device, marker) in [
+        (owner(), owner_device, 0x51_u8),
+        (admin, admin_device, 0x52_u8),
+        (target, target_device, 0x53_u8),
+    ] {
+        sqlx::query(
+            "INSERT INTO groups.mls_device_members
+              (tenant_id,scope_kind,scope_id,identity_id,device_id,admitted_epoch,
+               commit_digest,state,updated_at_ms)
+             VALUES ($1,'private_conversation',$2,$3,$4,1,$5,'active',1000)",
+        )
+        .bind(uuid::Uuid::from(tenant()))
+        .bind(match scope() {
+            GroupScope::PrivateConversation(id) => id.to_string(),
+            GroupScope::ControlledPublicChannel(_) => unreachable!(),
+        })
+        .bind(identity.to_string())
+        .bind(uuid::Uuid::from(device))
+        .bind(digest(marker).as_bytes().as_slice())
+        .execute(&mut *seed)
+        .await?;
+    }
+    seed.commit().await?;
+
+    let commit = vec![0x61; 64];
+    let admin_attempt = MlsCommitCommand::new_v4_member_removal(
+        request("0190f2a5-7b1c-7abc-8def-0123456789b4"),
+        scope(),
+        admin,
+        admin_device,
+        target,
+        target_device,
+        digest(0x62),
+        1,
+        parent_head,
+        expected_policy_revision,
+        commit.clone(),
+        mls_opaque_commit_digest(&commit),
+    )?;
+    let repository = MlsCommitSequencerRepository;
+    let signer = signing_key();
+    let signer_public = public_key(&signer);
+    assert!(matches!(
+        repository
+            .submit(
+                &store,
+                tenant(),
+                &admin_attempt,
+                2_000,
+                signer_public,
+                |_| Ok(()),
+                |_| Ok(()),
+                |input| Ok(sign(&signer, input)),
+            )
+            .await,
+        Err(GroupPersistenceError::MlsAuthorizationRejected)
+    ));
+
+    let removal = MlsCommitCommand::new_v4_member_removal(
+        request("0190f2a5-7b1c-7abc-8def-0123456789b5"),
+        scope(),
+        owner(),
+        owner_device,
+        target,
+        target_device,
+        digest(0x63),
+        1,
+        parent_head,
+        expected_policy_revision,
+        commit,
+        admin_attempt.commit_digest(),
+    )?;
+    let execution = repository
+        .submit(
+            &store,
+            tenant(),
+            &removal,
+            2_100,
+            signer_public,
+            |_| Ok(()),
+            |_| Ok(()),
+            |input| Ok(sign(&signer, input)),
+        )
+        .await?;
+    assert!(!execution.replayed());
+    assert_eq!(execution.receipt().protocol_version(), 4);
+    assert_eq!(
+        execution.receipt().removal_policy_revisions(),
+        Some((
+            expected_policy_revision,
+            Revision::new(expected_policy_revision.get() + 1)?
+        ))
+    );
+
+    let replay = repository
+        .submit(
+            &store,
+            tenant(),
+            &removal,
+            2_200,
+            signer_public,
+            |_| panic!("replay does not revalidate an already exact command"),
+            |_| panic!("replay does not reauthorize an already exact command"),
+            |_| panic!("replay does not sign a second receipt"),
+        )
+        .await?;
+    assert!(replay.replayed());
+    assert_eq!(execution.receipt(), replay.receipt());
+
+    let changed_commit = vec![0x64; 64];
+    let conflicting_replay = MlsCommitCommand::new_v4_member_removal(
+        removal.submission_id(),
+        scope(),
+        owner(),
+        owner_device,
+        target,
+        target_device,
+        digest(0x63),
+        1,
+        parent_head,
+        expected_policy_revision,
+        changed_commit.clone(),
+        mls_opaque_commit_digest(&changed_commit),
+    )?;
+    assert!(matches!(
+        repository
+            .submit(
+                &store,
+                tenant(),
+                &conflicting_replay,
+                2_300,
+                signer_public,
+                |_| panic!("conflict is decided from the durable submission"),
+                |_| panic!("conflict is decided from the durable submission"),
+                |_| panic!("conflict never signs another receipt"),
+            )
+            .await,
+        Err(GroupPersistenceError::MlsCommitConflict)
+    ));
+
+    let member_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM groups.members
+          WHERE tenant_id=$1 AND identity_id=$2)",
+    )
+    .bind(uuid::Uuid::from(tenant()))
+    .bind(target.to_string())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!member_exists);
+    let removed_epoch: Option<i64> = sqlx::query_scalar(
+        "SELECT removed_epoch FROM groups.mls_device_members
+          WHERE tenant_id=$1 AND identity_id=$2 AND device_id=$3 AND state='removed'",
+    )
+    .bind(uuid::Uuid::from(tenant()))
+    .bind(target.to_string())
+    .bind(uuid::Uuid::from(target_device))
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(removed_epoch, Some(2));
+
+    let target_actor = VerifiedDeviceActor::new(target, target_device, signer_public);
+    let final_page = repository
+        .commit_feed_verified_with_proof(
+            &store,
+            tenant(),
+            target_actor,
+            scope(),
+            1,
+            8,
+            signer_public,
+            |_| Ok(()),
+        )
+        .await?;
+    assert_eq!(final_page.items().len(), 1);
+    assert_eq!(final_page.items()[0].receipt(), execution.receipt());
+    assert!(matches!(
+        repository
+            .commit_feed_verified_with_proof(
+                &store,
+                tenant(),
+                target_actor,
+                scope(),
+                2,
+                8,
+                signer_public,
+                |_| Ok(()),
+            )
+            .await,
+        Err(GroupPersistenceError::DeviceAuthenticationRejected)
+    ));
+    Ok(())
 }
 
 #[tokio::test]

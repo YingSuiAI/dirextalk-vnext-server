@@ -21,14 +21,16 @@ use dtx_domain::{
 use dtx_group_node::{
     DEVICE_SESSION_AUTHORIZATION_SCHEME, GROUP_ACTION_RECEIPT_CONTENT_TYPE,
     GROUP_APPROVE_JOIN_CONTENT_TYPE, GROUP_APPROVE_JOIN_V2_CONTENT_TYPE, GROUP_CREATE_CONTENT_TYPE,
-    GROUP_ISSUE_INVITE_CONTENT_TYPE, GROUP_JOIN_REQUEST_CONTENT_TYPE,
-    GROUP_JOIN_REQUEST_PAGE_CONTENT_TYPE, GROUP_JOIN_REQUEST_PAGE_V2_CONTENT_TYPE,
-    GROUP_JOIN_REQUEST_V2_CONTENT_TYPE, GROUP_MEMBERSHIP_RECEIPT_PATH_TEMPLATE,
-    GROUP_QUERY_PROOF_HEADER, GROUP_SCOPE_PATH_TEMPLATE, GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE,
-    GROUP_SERVICE_DESCRIPTOR_PATH, GroupNodeState, IDENTITY_ORIGIN_HEADER,
-    MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE, MLS_COMMIT_CONTENT_TYPE, MLS_COMMIT_FEED_CONTENT_TYPE,
-    MLS_COMMIT_PROOF_HEADER, MLS_COMMIT_RECEIPT_CONTENT_TYPE, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE,
-    MLS_COMMIT_V3_CONTENT_TYPE, MLS_CONFIRMATION_PROOF_HEADER, MLS_CONFIRMATION_V3_CONTENT_TYPE,
+    GROUP_GRANT_ADMIN_CONTENT_TYPE, GROUP_ISSUE_INVITE_CONTENT_TYPE,
+    GROUP_JOIN_REQUEST_CONTENT_TYPE, GROUP_JOIN_REQUEST_PAGE_CONTENT_TYPE,
+    GROUP_JOIN_REQUEST_PAGE_V2_CONTENT_TYPE, GROUP_JOIN_REQUEST_V2_CONTENT_TYPE,
+    GROUP_MEMBERSHIP_RECEIPT_PATH_TEMPLATE, GROUP_QUERY_PROOF_HEADER, GROUP_SCOPE_PATH_TEMPLATE,
+    GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE, GROUP_SERVICE_DESCRIPTOR_PATH, GroupNodeState,
+    IDENTITY_ORIGIN_HEADER, MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE, MLS_COMMIT_CONTENT_TYPE,
+    MLS_COMMIT_FEED_CONTENT_TYPE, MLS_COMMIT_FEED_V2_CONTENT_TYPE, MLS_COMMIT_PROOF_HEADER,
+    MLS_COMMIT_RECEIPT_CONTENT_TYPE, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE,
+    MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE, MLS_COMMIT_V3_CONTENT_TYPE, MLS_COMMIT_V4_CONTENT_TYPE,
+    MLS_CONFIRMATION_CONTENT_TYPE, MLS_CONFIRMATION_PROOF_HEADER, MLS_CONFIRMATION_V3_CONTENT_TYPE,
     RECEIPT_QUERY_PROOF_HEADER, group_router_with_state,
 };
 use dtx_group_persistence::{
@@ -645,7 +647,7 @@ async fn owner_admin_discovery_is_bound_paged_cached_and_restart_safe() -> Resul
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn active_member_fetches_exact_consecutive_v30_commit_feed_without_welcome()
+async fn active_member_fetches_consecutive_v30_v32_feed_and_removed_member_converges()
 -> Result<(), Box<dyn Error>> {
     let harness = support::PostgresHarness::start().await?;
     let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 6).await?;
@@ -703,7 +705,29 @@ async fn active_member_fetches_exact_consecutive_v30_commit_feed_without_welcome
     )
     .await?;
     assert_eq!(bootstrap.status(), StatusCode::CREATED);
-    let bootstrap_head = mls_receipt_head(&response_bytes(bootstrap).await?)?;
+    let bootstrap_receipt = response_bytes(bootstrap).await?;
+    let (bootstrap_receipt_digest, bootstrap_head) = mls_receipt_facts(&bootstrap_receipt)?;
+    let bootstrap_confirmation_path = format!("{bootstrap_path}/confirmations/{}", owner.device_id);
+    let bootstrap_confirmation = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&bootstrap_confirmation_path)
+                .header(header::CONTENT_TYPE, MLS_CONFIRMATION_CONTENT_TYPE)
+                .header(
+                    header::AUTHORIZATION,
+                    device_session_authorization(owner.session_id, owner.session_secret),
+                )
+                .body(Body::from(mls_confirmation_body(
+                    &owner,
+                    bootstrap_submission,
+                    bootstrap_receipt_digest,
+                    bootstrap_head,
+                )?))?,
+        )
+        .await?;
+    assert_eq!(bootstrap_confirmation.status(), StatusCode::NO_CONTENT);
 
     let (member_receipt, member_head) = admit_local_v30_member(
         app.clone(),
@@ -719,12 +743,37 @@ async fn active_member_fetches_exact_consecutive_v30_commit_feed_without_welcome
     )
     .await?;
     assert_eq!(mls_receipt_epoch(&member_receipt)?, 2);
+    let grant_revision = GroupMembershipRepository
+        .load_policy(&group_store, tenant_id, scope)
+        .await?
+        .revision();
+    let grant_path = format!("{scope_path}/admins/{}", member.identity_id);
+    let grant_key = "commit-feed-grant-admin-0001";
+    let grant = send_mutation(
+        app.clone(),
+        "PUT",
+        &grant_path,
+        GROUP_GRANT_ADMIN_CONTENT_TYPE,
+        grant_key,
+        &owner,
+        grant_admin_body(
+            &owner,
+            scope,
+            &grant_path,
+            grant_key,
+            1_050,
+            grant_revision,
+            member.identity_id,
+        )?,
+    )
+    .await?;
+    assert_eq!(grant.status(), StatusCode::CREATED);
     let next_revision = GroupMembershipRepository
         .load_policy(&group_store, tenant_id, scope)
         .await?
         .revision();
     let peer_commit = vec![0x63; 48];
-    let (peer_receipt, _) = admit_local_v30_member(
+    let (peer_receipt, peer_head) = admit_local_v30_member(
         app.clone(),
         &owner,
         &peer,
@@ -756,7 +805,7 @@ async fn active_member_fetches_exact_consecutive_v30_commit_feed_without_welcome
         Some("no-store")
     );
     let feed_bytes = response_bytes(feed).await?;
-    let items = decode_commit_feed(&feed_bytes, 2)?;
+    let items = decode_commit_feed(&feed_bytes, 1, 2)?;
     assert_eq!(items, vec![(peer_receipt.clone(), peer_commit.clone())]);
 
     let caught_up_target = format!("{scope_path}/mls-commits?after_epoch=3&limit=64");
@@ -768,10 +817,10 @@ async fn active_member_fetches_exact_consecutive_v30_commit_feed_without_welcome
     )
     .await?;
     assert_eq!(caught_up.status(), StatusCode::OK);
-    assert!(decode_commit_feed(&response_bytes(caught_up).await?, 3)?.is_empty());
+    assert!(decode_commit_feed(&response_bytes(caught_up).await?, 1, 3)?.is_empty());
 
     let denied = send_local_commit_feed(
-        app,
+        app.clone(),
         &target,
         &outsider,
         group_query_proof_for_action(&outsider, AUDIENCE, scope, &target, 2, 1_300)?,
@@ -785,6 +834,163 @@ async fn active_member_fetches_exact_consecutive_v30_commit_feed_without_welcome
             .and_then(|value| value.to_str().ok()),
         Some(MLS_COMMIT_FEED_CONTENT_TYPE)
     );
+
+    let removal_revision = GroupMembershipRepository
+        .load_policy(&group_store, tenant_id, scope)
+        .await?
+        .revision();
+    let scope_id = scope_path.rsplit('/').next().ok_or("scope id")?;
+    let removal_preconditions: (i64, String, bool, i64, bool, i64, Vec<u8>) = sqlx::query_as(
+        "SELECT policy.policy_revision,policy.owner_identity_id,
+                EXISTS (SELECT 1 FROM groups.members member
+                         WHERE member.tenant_id=policy.tenant_id
+                           AND member.scope_kind=policy.scope_kind
+                           AND member.scope_id=policy.scope_id AND member.identity_id=$3),
+                (SELECT count(*) FROM groups.mls_device_members leaf
+                  WHERE leaf.tenant_id=policy.tenant_id AND leaf.scope_kind=policy.scope_kind
+                    AND leaf.scope_id=policy.scope_id AND leaf.identity_id=$3
+                    AND leaf.state IN ('pending_confirmation','active')),
+                EXISTS (SELECT 1 FROM groups.mls_device_members leaf
+                         WHERE leaf.tenant_id=policy.tenant_id
+                           AND leaf.scope_kind=policy.scope_kind
+                           AND leaf.scope_id=policy.scope_id AND leaf.identity_id=$3
+                           AND leaf.device_id=$4 AND leaf.state='active'),
+                head.epoch,head.head_digest
+           FROM groups.policy_heads policy
+           JOIN groups.mls_heads head USING (tenant_id,scope_kind,scope_id)
+          WHERE policy.tenant_id=$1 AND policy.scope_kind='private_conversation'
+            AND policy.scope_id=$2",
+    )
+    .bind(uuid::Uuid::from(tenant_id))
+    .bind(scope_id)
+    .bind(peer.identity_id.to_string())
+    .bind(uuid::Uuid::from(peer.device_id))
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(
+        removal_preconditions.0,
+        i64::try_from(removal_revision.get())?
+    );
+    assert_eq!(removal_preconditions.1, owner.identity_id.to_string());
+    assert!(removal_preconditions.2);
+    assert_eq!(removal_preconditions.3, 1);
+    assert!(removal_preconditions.4);
+    assert_eq!(removal_preconditions.5, 3);
+    assert_eq!(removal_preconditions.6, peer_head.as_bytes());
+    let admin_submission = RequestId::new();
+    let admin_path = format!("{scope_path}/mls-commits/{admin_submission}");
+    let admin_attempt = send_mutation(
+        app.clone(),
+        "POST",
+        &admin_path,
+        MLS_COMMIT_V4_CONTENT_TYPE,
+        "commit-feed-admin-remove-0001",
+        &member,
+        mls_commit_body_v4(
+            &member,
+            &peer,
+            scope,
+            admin_submission,
+            3,
+            peer_head,
+            removal_revision,
+            vec![0x74; 48],
+        )?,
+    )
+    .await?;
+    assert_eq!(admin_attempt.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let removal_submission = RequestId::new();
+    let removal_path = format!("{scope_path}/mls-commits/{removal_submission}");
+    let removal_key = "commit-feed-owner-remove-0001";
+    let removal_body = mls_commit_body_v4(
+        &owner,
+        &peer,
+        scope,
+        removal_submission,
+        3,
+        peer_head,
+        removal_revision,
+        vec![0x75; 48],
+    )?;
+    let removed = send_mutation(
+        app.clone(),
+        "POST",
+        &removal_path,
+        MLS_COMMIT_V4_CONTENT_TYPE,
+        removal_key,
+        &owner,
+        removal_body.clone(),
+    )
+    .await?;
+    assert_eq!(removed.status(), StatusCode::CREATED);
+    assert_content_type(&removed, MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE);
+    let removal_receipt = response_bytes(removed).await?;
+    assert_eq!(mls_receipt_epoch(&removal_receipt)?, 4);
+
+    let replay = send_mutation(
+        app.clone(),
+        "POST",
+        &removal_path,
+        MLS_COMMIT_V4_CONTENT_TYPE,
+        removal_key,
+        &owner,
+        removal_body,
+    )
+    .await?;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(response_bytes(replay).await?, removal_receipt);
+    let conflict = send_mutation(
+        app.clone(),
+        "POST",
+        &removal_path,
+        MLS_COMMIT_V4_CONTENT_TYPE,
+        removal_key,
+        &owner,
+        mls_commit_body_v4(
+            &owner,
+            &peer,
+            scope,
+            removal_submission,
+            3,
+            peer_head,
+            removal_revision,
+            vec![0x76; 48],
+        )?,
+    )
+    .await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let removal_target = format!("{scope_path}/mls-commits?after_epoch=3&limit=64");
+    let legacy_feed = send_local_commit_feed(
+        app.clone(),
+        &removal_target,
+        &owner,
+        group_query_proof_for_action(&owner, AUDIENCE, scope, &removal_target, 2, 1_400)?,
+    )
+    .await?;
+    assert_eq!(legacy_feed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let final_feed = send_local_commit_feed_v2(
+        app.clone(),
+        &removal_target,
+        &peer,
+        group_query_proof_for_action(&peer, AUDIENCE, scope, &removal_target, 2, 1_500)?,
+    )
+    .await?;
+    assert_eq!(final_feed.status(), StatusCode::OK);
+    assert_content_type(&final_feed, MLS_COMMIT_FEED_V2_CONTENT_TYPE);
+    let final_items = decode_commit_feed(&response_bytes(final_feed).await?, 2, 3)?;
+    assert_eq!(final_items.len(), 1);
+    assert_eq!(final_items[0].0, removal_receipt);
+    let after_removal_target = format!("{scope_path}/mls-commits?after_epoch=4&limit=64");
+    let removed_access = send_local_commit_feed_v2(
+        app,
+        &after_removal_target,
+        &peer,
+        group_query_proof_for_action(&peer, AUDIENCE, scope, &after_removal_target, 2, 1_600)?,
+    )
+    .await?;
+    assert_eq!(removed_access.status(), StatusCode::UNAUTHORIZED);
     Ok(())
 }
 
@@ -2997,6 +3203,28 @@ async fn send_local_commit_feed(
     .map_err(Into::into)
 }
 
+async fn send_local_commit_feed_v2(
+    app: axum::Router,
+    target: &str,
+    active: &ActiveDevice,
+    proof: String,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("GET")
+            .uri(target)
+            .header(header::ACCEPT, MLS_COMMIT_FEED_V2_CONTENT_TYPE)
+            .header(
+                header::AUTHORIZATION,
+                device_session_authorization(active.session_id, active.session_secret),
+            )
+            .header(GROUP_QUERY_PROOF_HEADER, proof)
+            .body(Body::empty())?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_network_mutation(
     client: &reqwest::Client,
@@ -3209,6 +3437,9 @@ fn mls_commit_body(
         MlsCommitAuthorization::ApprovedIdentityJoinV3 { .. } => {
             return Err("V3 approved-join uses the dedicated helper".into());
         }
+        MlsCommitAuthorization::MemberRemovalV4 { .. } => {
+            return Err("V4 removal uses the dedicated helper".into());
+        }
     };
     encode(&numbered_map(vec![
         CanonicalValue::Unsigned(2),
@@ -3271,6 +3502,40 @@ fn mls_commit_body_v3(
     ]))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn mls_commit_body_v4(
+    actor: &ActiveDevice,
+    target: &ActiveDevice,
+    scope: GroupScope,
+    submission_id: RequestId,
+    expected_epoch: u64,
+    expected_head: Sha256Digest,
+    expected_policy_revision: Revision,
+    commit_bytes: Vec<u8>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let commit_digest = mls_opaque_commit_digest(&commit_bytes);
+    encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(4),
+        CanonicalValue::Text(submission_id.to_string()),
+        scope_value(scope),
+        CanonicalValue::Text(actor.identity_id.to_string()),
+        CanonicalValue::Text(actor.device_id.to_string()),
+        CanonicalValue::Text(target.identity_id.to_string()),
+        CanonicalValue::Text(target.device_id.to_string()),
+        CanonicalValue::Null,
+        CanonicalValue::Null,
+        CanonicalValue::Unsigned(expected_epoch),
+        expected_head.to_canonical_value(),
+        CanonicalValue::Bytes(commit_bytes),
+        commit_digest.to_canonical_value(),
+        CanonicalValue::Null,
+        numbered_map(vec![
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Unsigned(expected_policy_revision.get()),
+        ]),
+    ]))
+}
+
 fn mls_receipt_head(bytes: &[u8]) -> Result<Sha256Digest, Box<dyn Error>> {
     let CanonicalValue::Map(outer) = decode_deterministic_cbor(bytes)? else {
         return Err("MLS receipt wrapper must be a map".into());
@@ -3292,8 +3557,11 @@ fn mls_receipt_facts(bytes: &[u8]) -> Result<(Sha256Digest, Sha256Digest), Box<d
     let CanonicalValue::Map(inner) = &outer[0].1 else {
         return Err("MLS receipt payload must be a map".into());
     };
-    if inner.first().map(|field| &field.1) != Some(&CanonicalValue::Unsigned(3)) {
-        return Err("MLS receipt must use V3 inner facts".into());
+    if !matches!(
+        inner.first().map(|field| &field.1),
+        Some(CanonicalValue::Unsigned(1 | 3 | 4))
+    ) {
+        return Err("MLS receipt must use a supported inner version".into());
     }
     let CanonicalValue::Bytes(receipt_digest) = &outer[1].1 else {
         return Err("MLS receipt digest must be bytes".into());
@@ -3320,15 +3588,22 @@ fn mls_receipt_epoch(bytes: &[u8]) -> Result<u64, Box<dyn Error>> {
     }
 }
 
+type EncodedCommitFeedItem = (Vec<u8>, Vec<u8>);
+
 fn decode_commit_feed(
     bytes: &[u8],
+    expected_version: u64,
     expected_after_epoch: u64,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Box<dyn Error>> {
+) -> Result<Vec<EncodedCommitFeedItem>, Box<dyn Error>> {
     let CanonicalValue::Map(fields) = decode_deterministic_cbor(bytes)? else {
         return Err("MLS commit feed must be a map".into());
     };
     if fields.len() != 3
-        || fields[0] != (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1))
+        || fields[0]
+            != (
+                CanonicalValue::Unsigned(1),
+                CanonicalValue::Unsigned(expected_version),
+            )
         || fields[1]
             != (
                 CanonicalValue::Unsigned(2),

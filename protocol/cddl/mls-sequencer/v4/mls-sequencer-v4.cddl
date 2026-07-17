@@ -1,0 +1,64 @@
+; Dirextalk MLS Commit Sequencer V4 member removal (baseline V32).
+; The Owner authors one opaque MLS Remove commit. The Group service verifies
+; product policy and the exact active target leaf without decoding MLS bytes.
+
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+channel-id = tstr .size 57
+sha256 = bstr .size 32
+signature = bstr .size 64
+safe-epoch = 0..9007199254740991
+safe-revision = 1..9007199254740990
+scope = { 1: 1, 2: uuid-v7 } / { 1: 2, 2: channel-id }
+
+member-removal-v4 = {
+  1: 4,
+  2: safe-revision ; product policy revision before removal
+}
+
+mls-commit-request-v4 = {
+  1: 4, 2: uuid-v7, 3: scope,
+  4: identity-id, 5: uuid-v7, ; exact Owner identity/device
+  6: identity-id, 7: uuid-v7, ; exact removed identity/device leaf
+  8: null, 9: null,           ; no KeyPackage or candidate proof
+  10: 0..9007199254740990, 11: sha256,
+  12: bstr .size (1..1048576), 13: sha256, 14: null,
+  15: member-removal-v4
+}
+
+; SHA-256(`dirextalk.mls-commit-request.v4\0` || exact transcript).
+mls-request-digest-transcript-v4 = {
+  1: 4, 2: uuid-v7, 3: scope, 4: identity-id, 5: uuid-v7,
+  6: identity-id, 7: uuid-v7, 8: null, 9: null,
+  10: 0..9007199254740990, 11: sha256, 12: sha256, 13: null,
+  14: 3, 15: null, 16: safe-revision, 17: null, 18: null
+}
+
+mls-commit-receipt-v4 = {
+  1: 4, 2: uuid-v7, 3: scope, 4: sha256, 5: 1..9007199254740991,
+  6: sha256, 7: sha256, 8: null, 9: identity-id, 10: uuid-v7,
+  11: safe-revision, 12: 2..9007199254740991
+}
+signed-mls-commit-receipt-v4 = {
+  1: mls-commit-receipt-v4, 2: sha256, 3: bstr .size 32, 4: signature
+}
+
+; V2 feed is selected by its media type and carries consecutive V3 admissions
+; and V4 removals. Exact V3 receipt validation remains frozen by baseline V30.
+mls-commit-receipt-v3 = {
+  1: 3, 2: uuid-v7, 3: scope, 4: sha256, 5: 1..9007199254740991,
+  6: sha256, 7: sha256, 8: sha256, 9: identity-id, 10: uuid-v7,
+  11: sha256, 12: sha256, 13: sha256
+}
+signed-mls-commit-receipt-v3 = {
+  1: mls-commit-receipt-v3, 2: sha256, 3: bstr .size 32, 4: signature
+}
+mls-commit-feed-item-v2 = [
+  bstr .size (1..4096), ; exact encoded signed V3/V4 receipt
+  bstr .size (1..1048576)
+]
+mls-commit-feed-v2 = {
+  1: 2,
+  2: safe-epoch,
+  3: [* mls-commit-feed-item-v2]
+}

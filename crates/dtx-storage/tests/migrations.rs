@@ -39,7 +39,8 @@ const HERMES_ACP_ADAPTER_MIGRATION_VERSION: i64 = 202_607_160_032;
 const FEDERATED_KEY_PACKAGE_CLAIMS_MIGRATION_VERSION: i64 = 202_607_160_033;
 const PUBLIC_CACHE_GENERATIONS_MIGRATION_VERSION: i64 = 202_607_160_034;
 const AGENT_RUN_RUNTIME_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_170_035;
-const EXPECTED_MIGRATION_COUNT: i64 = 35;
+const GROUP_MEMBER_REMOVAL_V32_MIGRATION_VERSION: i64 = 202_607_170_036;
+const EXPECTED_MIGRATION_COUNT: i64 = 36;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -113,6 +114,8 @@ const AGENT_RUN_RUNTIME_PRIVILEGES_DOWN: &str =
     include_str!("../../../migrations/202607170035_agent_run_runtime_privileges.down.sql");
 const AGENT_RUN_RUNTIME_PRIVILEGES_UP: &str =
     include_str!("../../../migrations/202607170035_agent_run_runtime_privileges.up.sql");
+const GROUP_MEMBER_REMOVAL_V32_DOWN: &str =
+    include_str!("../../../migrations/202607170036_group_member_removal_v32.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -327,7 +330,7 @@ async fn hermes_adapter_down_migration_refuses_to_orphan_durable_rows()
     assert_eq!(
         error
             .as_database_error()
-            .and_then(|database| database.code()),
+            .and_then(sqlx::error::DatabaseError::code),
         Some(std::borrow::Cow::Borrowed("55000")),
     );
     let hermes_constraints: i64 = sqlx::query_scalar(
@@ -357,7 +360,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -394,8 +397,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(FEDERATED_KEY_PACKAGE_CLAIMS_MIGRATION_VERSION)
     .bind(PUBLIC_CACHE_GENERATIONS_MIGRATION_VERSION)
     .bind(AGENT_RUN_RUNTIME_PRIVILEGES_MIGRATION_VERSION)
+    .bind(GROUP_MEMBER_REMOVAL_V32_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(GROUP_MEMBER_REMOVAL_V32_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(AGENT_RUN_RUNTIME_PRIVILEGES_DOWN)
         .execute(harness.admin_pool())
         .await?;

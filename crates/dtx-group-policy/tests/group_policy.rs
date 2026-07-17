@@ -99,6 +99,55 @@ fn only_owner_can_manage_up_to_five_additional_admins() {
 }
 
 #[test]
+fn only_owner_can_remove_a_non_owner_member_at_the_exact_revision() {
+    let owner = owner();
+    let admin = identity(1);
+    let member = identity(2);
+    let mut group = private_group(owner);
+    group
+        .grant_admin(group.revision(), owner, admin)
+        .expect("owner grants the admin role");
+    group
+        .grant_admin(group.revision(), owner, member)
+        .expect("owner admits the future ordinary member");
+    group
+        .revoke_admin(group.revision(), owner, member)
+        .expect("revoking admin preserves ordinary membership");
+
+    let before = group.clone();
+    assert_eq!(
+        group.remove_member(group.revision(), admin, member),
+        Err(GroupPolicyError::Unauthorized)
+    );
+    assert_eq!(group, before);
+    assert_eq!(
+        group.remove_member(group.revision(), owner, owner),
+        Err(GroupPolicyError::OwnerCannotBeRemoved)
+    );
+    assert_eq!(group, before);
+
+    let removal_revision = group.revision();
+    let next = group
+        .remove_member(removal_revision, owner, member)
+        .expect("owner removes the ordinary member");
+    assert_eq!(next, group.revision());
+    assert_eq!(group.role_of(member), None);
+    assert!(!group.is_member(member));
+    assert_eq!(
+        group.remove_member(removal_revision, owner, admin),
+        Err(GroupPolicyError::RevisionConflict {
+            current: group.revision(),
+        })
+    );
+
+    group
+        .remove_member(group.revision(), owner, admin)
+        .expect("owner may remove a current administrator");
+    assert_eq!(group.role_of(admin), None);
+    assert_eq!(group.admin_count(), 0);
+}
+
+#[test]
 fn sixth_admin_race_has_one_success_then_a_revision_conflict_or_current_limit() {
     let owner = owner();
     let mut group = private_group(owner);
