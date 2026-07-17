@@ -93,6 +93,7 @@ const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
 const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[("system.current_tenant_id()", "EXECUTE")];
 const ACCEPTANCE_PREPARE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("system.schema_versions", "SELECT"),
+    ("system.tenant_stream_heads", "SELECT"),
     ("system.tenant_stream_heads", "INSERT"),
     ("agent.hosts", "SELECT"),
     ("agent.hosts", "INSERT"),
@@ -2740,6 +2741,7 @@ mod tests {
             ACCEPTANCE_PREPARE_TABLE_PRIVILEGES,
             &[
                 ("system.schema_versions", "SELECT"),
+                ("system.tenant_stream_heads", "SELECT"),
                 ("system.tenant_stream_heads", "INSERT"),
                 ("agent.hosts", "SELECT"),
                 ("agent.hosts", "INSERT"),

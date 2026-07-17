@@ -45,7 +45,8 @@ const AGENT_MCP_CREDENTIALS_MIGRATION_VERSION: i64 = 202_607_170_038;
 const AGENT_ACCEPTANCE_FINALIZE_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_170_039;
 const AGENT_ACCEPTANCE_PREPARE_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_180_040;
 const AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_180_041;
-const EXPECTED_MIGRATION_COUNT: i64 = 41;
+const AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_MIGRATION_VERSION: i64 = 202_607_180_042;
+const EXPECTED_MIGRATION_COUNT: i64 = 42;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -139,6 +140,10 @@ const AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_DOWN: &str = include_str!(
 const AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_UP: &str = include_str!(
     "../../../migrations/202607180041_agent_acceptance_tenant_stream_privileges.up.sql"
 );
+const AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_DOWN: &str =
+    include_str!("../../../migrations/202607180042_agent_acceptance_tenant_stream_select.down.sql");
+const AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_UP: &str =
+    include_str!("../../../migrations/202607180042_agent_acceptance_tenant_stream_select.up.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -867,6 +872,65 @@ async fn agent_acceptance_tenant_stream_privileges_are_exact_and_reversible()
 }
 
 #[tokio::test]
+async fn agent_acceptance_tenant_stream_select_is_exact_and_reversible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(
+        "DO $role$
+         BEGIN
+             IF to_regrole('dtx_agent_runtime') IS NULL THEN
+                 CREATE ROLE dtx_agent_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS
+                     NOCREATEDB NOCREATEROLE NOREPLICATION;
+             END IF;
+         END
+         $role$;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+
+    let expected_right = "SELECT has_table_privilege(
+        'dtx_agent_runtime', 'system.tenant_stream_heads', 'SELECT'
+    )";
+    let before: bool = sqlx::query_scalar(expected_right)
+        .fetch_one(harness.admin_pool())
+        .await?;
+    assert!(!before);
+
+    sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    let granted: bool = sqlx::query_scalar(expected_right)
+        .fetch_one(harness.admin_pool())
+        .await?;
+    assert!(granted);
+    let excess: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM (VALUES
+             ('system.tenant_stream_heads', 'UPDATE'),
+             ('system.tenant_stream_heads', 'DELETE')
+           ) AS denied(relation_name, privilege_name)
+          WHERE has_table_privilege(
+              'dtx_agent_runtime', relation_name, privilege_name
+          )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(excess, 0);
+
+    sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    let after: bool = sqlx::query_scalar(expected_right)
+        .fetch_one(harness.admin_pool())
+        .await?;
+    assert!(!after);
+    Ok(())
+}
+
+#[tokio::test]
 async fn public_cache_generation_migration_backfills_visible_indexers_only()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
@@ -1015,7 +1079,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -1058,8 +1122,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(AGENT_ACCEPTANCE_FINALIZE_PRIVILEGES_MIGRATION_VERSION)
     .bind(AGENT_ACCEPTANCE_PREPARE_PRIVILEGES_MIGRATION_VERSION)
     .bind(AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_MIGRATION_VERSION)
+    .bind(AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_DOWN)
         .execute(harness.admin_pool())
         .await?;
