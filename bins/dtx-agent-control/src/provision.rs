@@ -232,14 +232,14 @@ async fn run_acceptance() -> Result<(), AcceptanceError> {
     let store = PgStore::connect(database_options, 2)
         .await
         .map_err(|_| AcceptanceError::Database)?;
-    if matches!(arguments.phase, AcceptancePhase::Finalize)
-        && !store
-            .readiness_check(
-                ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES,
-                REQUIRED_FUNCTION_PRIVILEGES,
-            )
-            .await
-            .map_err(|_| AcceptanceError::Database)?
+    let required_table_privileges = match arguments.phase {
+        AcceptancePhase::Prepare => REQUIRED_TABLE_PRIVILEGES,
+        AcceptancePhase::Finalize => ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES,
+    };
+    if !store
+        .readiness_check(required_table_privileges, REQUIRED_FUNCTION_PRIVILEGES)
+        .await
+        .map_err(|_| AcceptanceError::Database)?
     {
         return Err(AcceptanceError::Database);
     }
@@ -2713,6 +2713,12 @@ mod tests {
         assert!(
             ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES.contains(&("agent.connector_revisions", "SELECT"))
         );
+    }
+
+    #[test]
+    fn acceptance_prepare_preflight_covers_new_host_writes() {
+        assert!(REQUIRED_TABLE_PRIVILEGES.contains(&("agent.hosts", "INSERT")));
+        assert!(REQUIRED_TABLE_PRIVILEGES.contains(&("agent.host_credentials", "INSERT")));
     }
 
     #[cfg(unix)]
