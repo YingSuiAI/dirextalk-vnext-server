@@ -38,7 +38,8 @@ const CONNECTOR_BINDING_STATE_OWNER_API_MIGRATION_VERSION: i64 = 202_607_160_031
 const HERMES_ACP_ADAPTER_MIGRATION_VERSION: i64 = 202_607_160_032;
 const FEDERATED_KEY_PACKAGE_CLAIMS_MIGRATION_VERSION: i64 = 202_607_160_033;
 const PUBLIC_CACHE_GENERATIONS_MIGRATION_VERSION: i64 = 202_607_160_034;
-const EXPECTED_MIGRATION_COUNT: i64 = 34;
+const AGENT_RUN_RUNTIME_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_170_035;
+const EXPECTED_MIGRATION_COUNT: i64 = 35;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -108,6 +109,10 @@ const PUBLIC_CACHE_GENERATIONS_DOWN: &str =
     include_str!("../../../migrations/202607160034_public_cache_generations.down.sql");
 const PUBLIC_CACHE_GENERATIONS_UP: &str =
     include_str!("../../../migrations/202607160034_public_cache_generations.up.sql");
+const AGENT_RUN_RUNTIME_PRIVILEGES_DOWN: &str =
+    include_str!("../../../migrations/202607170035_agent_run_runtime_privileges.down.sql");
+const AGENT_RUN_RUNTIME_PRIVILEGES_UP: &str =
+    include_str!("../../../migrations/202607170035_agent_run_runtime_privileges.up.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -124,6 +129,82 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(applied, EXPECTED_MIGRATION_COUNT);
     assert_eq!(visible, applied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_run_runtime_privileges_are_forward_and_reversible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(
+        "DO $role$
+         BEGIN
+             IF to_regrole('dtx_agent_runtime') IS NULL THEN
+                 CREATE ROLE dtx_agent_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS
+                     NOCREATEDB NOCREATEROLE NOREPLICATION;
+             END IF;
+         END
+         $role$;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::raw_sql(AGENT_RUN_RUNTIME_PRIVILEGES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+
+    let expected_rights = "SELECT count(*)
+           FROM (VALUES
+             ('agent.agent_run_execution_heads', 'SELECT'),
+             ('agent.agent_run_execution_heads', 'INSERT'),
+             ('agent.agent_run_execution_heads', 'UPDATE'),
+             ('agent.agent_run_checkpoints', 'SELECT'),
+             ('agent.agent_run_checkpoints', 'INSERT'),
+             ('agent.agent_run_outputs', 'SELECT'),
+             ('agent.agent_run_outputs', 'INSERT'),
+             ('agent.agent_run_terminals', 'SELECT'),
+             ('agent.agent_run_terminals', 'INSERT'),
+             ('agent.agent_run_cancellation_intents', 'SELECT'),
+             ('agent.agent_run_cancellation_intents', 'INSERT')
+           ) AS expected(relation_name, privilege_name)
+          WHERE has_table_privilege(
+              'dtx_agent_runtime', relation_name, privilege_name
+          )";
+    let before: i64 = sqlx::query_scalar(expected_rights)
+        .fetch_one(harness.admin_pool())
+        .await?;
+    assert_eq!(before, 0);
+
+    sqlx::raw_sql(AGENT_RUN_RUNTIME_PRIVILEGES_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    let granted: i64 = sqlx::query_scalar(expected_rights)
+        .fetch_one(harness.admin_pool())
+        .await?;
+    assert_eq!(granted, 11);
+    let excess: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM (VALUES
+             ('agent.agent_run_execution_heads', 'DELETE'),
+             ('agent.agent_run_checkpoints', 'UPDATE'),
+             ('agent.agent_run_outputs', 'UPDATE'),
+             ('agent.agent_run_terminals', 'UPDATE'),
+             ('agent.agent_run_cancellation_intents', 'UPDATE')
+           ) AS denied(relation_name, privilege_name)
+          WHERE has_table_privilege(
+              'dtx_agent_runtime', relation_name, privilege_name
+          )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(excess, 0);
+
+    sqlx::raw_sql(AGENT_RUN_RUNTIME_PRIVILEGES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    let after: i64 = sqlx::query_scalar(expected_rights)
+        .fetch_one(harness.admin_pool())
+        .await?;
+    assert_eq!(after, 0);
     Ok(())
 }
 
@@ -276,7 +357,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -312,8 +393,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(HERMES_ACP_ADAPTER_MIGRATION_VERSION)
     .bind(FEDERATED_KEY_PACKAGE_CLAIMS_MIGRATION_VERSION)
     .bind(PUBLIC_CACHE_GENERATIONS_MIGRATION_VERSION)
+    .bind(AGENT_RUN_RUNTIME_PRIVILEGES_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(AGENT_RUN_RUNTIME_PRIVILEGES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(PUBLIC_CACHE_GENERATIONS_DOWN)
         .execute(harness.admin_pool())
         .await?;

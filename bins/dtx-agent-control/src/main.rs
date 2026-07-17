@@ -162,6 +162,17 @@ const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.agent_run_leases", "SELECT"),
     ("agent.agent_run_leases", "INSERT"),
     ("agent.agent_run_leases", "UPDATE"),
+    ("agent.agent_run_execution_heads", "SELECT"),
+    ("agent.agent_run_execution_heads", "INSERT"),
+    ("agent.agent_run_execution_heads", "UPDATE"),
+    ("agent.agent_run_checkpoints", "SELECT"),
+    ("agent.agent_run_checkpoints", "INSERT"),
+    ("agent.agent_run_outputs", "SELECT"),
+    ("agent.agent_run_outputs", "INSERT"),
+    ("agent.agent_run_terminals", "SELECT"),
+    ("agent.agent_run_terminals", "INSERT"),
+    ("agent.agent_run_cancellation_intents", "SELECT"),
+    ("agent.agent_run_cancellation_intents", "INSERT"),
 ];
 
 #[tokio::main]
