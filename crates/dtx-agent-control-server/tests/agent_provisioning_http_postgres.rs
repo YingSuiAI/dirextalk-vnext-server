@@ -38,9 +38,10 @@ use dtx_agent_persistence::{
     ConversationGrantRepository, CurrentWrite, DefinitionInsert,
 };
 use dtx_agent_registry::{
-    AgentDevice, AgentDeviceCommand, AgentDeviceState, AgentInstallation, DescriptorDigest,
+    AgentConversationPermission, AgentDevice, AgentDeviceCommand, AgentDeviceState,
+    AgentInstallation, ConversationGrantCommand, ConversationGrantUpdate, DescriptorDigest,
     DeviceCredentialFingerprint, ExecutionMode, InstallationCommand, InstallationDesiredState,
-    VerifiedAgentDefinition,
+    PermissionExpansionConfirmation, VerifiedAgentDefinition,
 };
 use dtx_connect_registry::{
     AdapterConformance, AdapterKind, BindingSpec, BindingState, Connector, RoutingPolicy, TenantRef,
@@ -1573,12 +1574,115 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
     )
     .await?;
     assert_eq!(wrong_fence.0, StatusCode::CONFLICT);
-    let route_first = owner_agent_route_run(
+    let insufficient_tool_authority = owner_agent_route_run(
         router.clone(),
         &route_uri,
         &owner_authorization,
         route_operation,
         "\"g1\"",
+        route_body.clone(),
+    )
+    .await?;
+    assert_eq!(
+        insufficient_tool_authority.0,
+        StatusCode::FORBIDDEN,
+        "an AgentRoute Run that can reach Connector tools must require InvokeTools"
+    );
+    let mut denied_session = store.begin_tenant(tenant_id).await?;
+    let denied_run_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.agent_runs
+          WHERE tenant_id=$1 AND request_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(route_operation))
+    .fetch_one(denied_session.connection())
+    .await?;
+    let denied_operation_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.agent_route_run_operations
+          WHERE tenant_id=$1 AND operation_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(route_operation))
+    .fetch_one(denied_session.connection())
+    .await?;
+    assert_eq!((denied_run_count, denied_operation_count), (0, 0));
+
+    let installation = AgentInstallationRepository::new()
+        .load(denied_session.connection(), tenant_id, installation_id)
+        .await?
+        .expect("target installation persists");
+    let grants = ConversationGrantRepository::new();
+    let mut tool_grant = grants
+        .load_for_share(
+            denied_session.connection(),
+            tenant_id,
+            conversation_id,
+            installation_id,
+        )
+        .await?
+        .expect("chat grant persists");
+    let prior = tool_grant.snapshot();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let approved_at = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )?;
+    tool_grant.apply(
+        &installation,
+        Revision::INITIAL,
+        ConversationGrantCommand::Update {
+            update: ConversationGrantUpdate::new(
+                prior
+                    .permissions
+                    .with(AgentConversationPermission::InvokeTools),
+                prior.trigger_policy,
+                prior.privacy_policy_hash,
+                owner_device_id,
+                approved_at,
+                Some(approved_at + 600_000),
+            ),
+            permission_expansion: Some(PermissionExpansionConfirmation::confirmed()),
+            all_messages: None,
+        },
+    )?;
+    assert_eq!(
+        grants
+            .save(denied_session.connection(), &tool_grant, approved_at)
+            .await?,
+        CurrentWrite::Advanced
+    );
+    denied_session.commit().await?;
+
+    let tool_route_proof_expires_at = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_millis(),
+    )? + 3_000;
+    let route_body = agent_route_run_body(
+        tenant_id,
+        conversation_id,
+        route_id,
+        installation_id,
+        binding_id,
+        agent_device_id,
+        route_fence,
+        route_event_id,
+        route_operation,
+        Revision::new(2)?,
+        owner_id,
+        owner_device_id,
+        &owner_device_key,
+        tool_route_proof_expires_at,
+    )?;
+    let route_first = owner_agent_route_run(
+        router.clone(),
+        &route_uri,
+        &owner_authorization,
+        route_operation,
+        "\"g2\"",
         route_body.clone(),
     )
     .await?;
@@ -1604,7 +1708,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         &route_uri,
         &owner_authorization,
         route_operation,
-        "\"g1\"",
+        "\"g2\"",
         route_body,
     )
     .await?;
@@ -1615,7 +1719,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         &route_uri,
         &owner_authorization,
         route_operation,
-        "\"g1\"",
+        "\"g2\"",
         agent_route_run_body(
             tenant_id,
             conversation_id,
@@ -1626,7 +1730,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
             route_fence,
             route_event_id,
             route_operation,
-            Revision::INITIAL,
+            Revision::new(2)?,
             owner_id,
             owner_device_id,
             &owner_device_key,
@@ -1636,14 +1740,20 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
     .await?;
     assert_eq!(route_conflict.0, StatusCode::CONFLICT);
     let mut route_session = store.begin_tenant(tenant_id).await?;
-    let route_run_conversation: Uuid = sqlx::query_scalar(
-        "SELECT conversation_id FROM agent.agent_runs WHERE tenant_id=$1 AND request_id=$2",
+    let (route_run_conversation, route_run_capabilities): (Uuid, Vec<String>) = sqlx::query_as(
+        "SELECT conversation_id, required_capability_codes
+           FROM agent.agent_runs
+          WHERE tenant_id=$1 AND request_id=$2",
     )
     .bind(Uuid::from(tenant_id))
     .bind(Uuid::from(route_operation))
     .fetch_one(route_session.connection())
     .await?;
     assert_eq!(route_run_conversation, Uuid::from(route_id));
+    assert_eq!(
+        route_run_capabilities,
+        ["chat.streaming".to_owned(), "tool.invoke".to_owned()]
+    );
     let operation_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM agent.agent_route_run_operations
           WHERE tenant_id=$1 AND operation_id=$2
@@ -1717,14 +1827,14 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         &uri,
         &owner_authorization,
         revoke_operation,
-        "\"g1\"",
+        "\"g2\"",
         conversation_grant_body(
             2,
             revoke_operation,
             tenant_id,
             conversation_id,
             installation_id,
-            Some(Revision::INITIAL),
+            Some(Revision::new(2)?),
             owner_id,
             owner_device_id,
             &owner_device_key,
@@ -1750,7 +1860,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         )
         .await?
         .expect("grant persists after owner revoke");
-    assert_eq!(grant.grant_version(), Revision::new(2)?);
+    assert_eq!(grant.grant_version(), Revision::new(3)?);
     assert!(grant.snapshot().revoked_at_ms.is_some());
     assert!(!grant.authorizes_version_for(&installation, now(), Revision::INITIAL));
     session.rollback().await?;
@@ -1766,14 +1876,14 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         &uri,
         &owner_authorization,
         no_active_binding_operation,
-        "\"g2\"",
+        "\"g3\"",
         conversation_grant_body(
             1,
             no_active_binding_operation,
             tenant_id,
             conversation_id,
             installation_id,
-            Some(Revision::new(2)?),
+            Some(Revision::new(3)?),
             owner_id,
             owner_device_id,
             &owner_device_key,

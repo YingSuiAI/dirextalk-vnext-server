@@ -114,6 +114,7 @@ pub const CONNECTOR_BINDING_STATE_RECEIPT_MEDIA_TYPE_V1: &str =
 const AGENT_ROUTE_RUN_MEDIA_TYPE_V1: &str = "application/vnd.dirextalk.agent-route-run.v1+cbor";
 const AGENT_ROUTE_RUN_RECEIPT_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.agent-route-run-receipt.v1+cbor";
+const PRIVATE_AGENT_ROUTE_RUN_REQUIRED_CAPABILITIES: [&str; 2] = ["chat.streaming", "tool.invoke"];
 
 pub type OwnerBackendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CborOwnerReply, AgentProvisioningOwnerError>> + Send + 'a>>;
@@ -1477,7 +1478,11 @@ async fn create_private_agent_route_run_in_transaction(
         command.route_id,
         command.request_event_id,
         Some(route_connector_id),
-        vec!["chat.streaming".to_owned()],
+        // The frozen v1 AgentRoute request carries no trustworthy pure-chat
+        // intent. Its Connector execution boundary can reach runtime tools and
+        // MCP, so admission must fail closed on InvokeTools until a future
+        // signed contract can explicitly select a narrower execution profile.
+        Vec::from(PRIVATE_AGENT_ROUTE_RUN_REQUIRED_CAPABILITIES.map(str::to_owned)),
         DispatchMode::Single,
         command.grant_version.get(),
         None,
