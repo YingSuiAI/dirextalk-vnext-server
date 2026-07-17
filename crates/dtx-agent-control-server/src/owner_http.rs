@@ -51,6 +51,7 @@ use crate::connector_projection::{
     DEFAULT_CONNECTOR_PROJECTION_LIMIT, MAX_CONNECTOR_PROJECTION_LIMIT,
     list_connector_projection_v1, list_connector_projection_v3, list_connector_projection_v4,
 };
+use crate::mcp::mcp_router;
 use crate::{AGENT_IDENTITY_APPROVAL_BINDING_DOMAIN, AgentIdentityApprovalCommand};
 use crate::{
     AgentIdentityProvisioningError, AgentProvisioningDeliveryCommand,
@@ -2677,6 +2678,7 @@ fn connector_lifecycle_receipt_json(
 
 /// Builds the complete V23 Owner API router.
 pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBackend>) -> Router {
+    let mcp = mcp_router(backend.clone());
     Router::new()
         .route("/v1/connectors", get(get_connectors))
         .route(
@@ -2748,6 +2750,7 @@ pub fn agent_provisioning_owner_router(backend: Arc<dyn AgentProvisioningOwnerBa
             post(post_revocation),
         )
         .with_state(backend)
+        .merge(mcp)
 }
 
 async fn get_connectors(
@@ -3832,7 +3835,7 @@ fn binding_hash(
     Ok(Sha256Digest::hash_domain(domain, &bytes))
 }
 
-fn parse_device_session(
+pub(crate) fn parse_device_session(
     headers: &HeaderMap,
 ) -> Result<DeviceSessionCredential, AgentProvisioningOwnerError> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();

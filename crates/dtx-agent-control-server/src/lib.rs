@@ -21,6 +21,7 @@ mod gateway_authentication;
 mod gateway_service;
 mod gateway_wire;
 mod incoming;
+mod mcp;
 mod owner_http;
 mod postgres_application;
 mod provisioning;
