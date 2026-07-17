@@ -91,6 +91,33 @@ const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.connector_control_credential_heads", "SELECT"),
 ];
 const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[("system.current_tenant_id()", "EXECUTE")];
+const ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
+    ("agent.agent_definitions", "SELECT"),
+    ("agent.agent_definitions", "INSERT"),
+    ("agent.agent_definition_heads", "SELECT"),
+    ("agent.agent_definition_heads", "INSERT"),
+    ("agent.agent_definition_heads", "UPDATE"),
+    ("agent.installations", "SELECT"),
+    ("agent.installations", "INSERT"),
+    ("agent.installations", "UPDATE"),
+    ("agent.agent_devices", "SELECT"),
+    ("agent.agent_devices", "INSERT"),
+    ("agent.agent_devices", "UPDATE"),
+    ("agent.hosts", "SELECT"),
+    ("agent.host_credentials", "SELECT"),
+    ("agent.connector_instances", "SELECT"),
+    ("agent.connector_revisions", "SELECT"),
+    ("agent.connector_conformance", "SELECT"),
+    ("agent.connector_conformance", "INSERT"),
+    ("agent.binding_set_heads", "SELECT"),
+    ("agent.binding_set_heads", "INSERT"),
+    ("agent.binding_set_heads", "UPDATE"),
+    ("agent.installation_routing_policies", "SELECT"),
+    ("agent.installation_routing_policies", "INSERT"),
+    ("agent.connector_bindings", "SELECT"),
+    ("agent.connector_bindings", "INSERT"),
+    ("agent.connector_bindings", "UPDATE"),
+];
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -205,6 +232,17 @@ async fn run_acceptance() -> Result<(), AcceptanceError> {
     let store = PgStore::connect(database_options, 2)
         .await
         .map_err(|_| AcceptanceError::Database)?;
+    if matches!(arguments.phase, AcceptancePhase::Finalize)
+        && !store
+            .readiness_check(
+                ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES,
+                REQUIRED_FUNCTION_PRIVILEGES,
+            )
+            .await
+            .map_err(|_| AcceptanceError::Database)?
+    {
+        return Err(AcceptanceError::Database);
+    }
     match arguments.phase {
         AcceptancePhase::Prepare => {
             let handoff_path = arguments
@@ -2668,6 +2706,13 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.phase, AcceptancePhase::Finalize);
         assert_eq!(parsed.facts_files.len(), 2);
+    }
+
+    #[test]
+    fn acceptance_finalize_preflight_covers_connector_revision_reads() {
+        assert!(
+            ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES.contains(&("agent.connector_revisions", "SELECT"))
+        );
     }
 
     #[cfg(unix)]
