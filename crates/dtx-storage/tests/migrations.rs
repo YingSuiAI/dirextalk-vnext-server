@@ -425,11 +425,17 @@ async fn agent_mcp_credentials_are_digest_only_rotatable_and_exactly_scoped()
         (Uuid::now_v7(), vec![11_u8; 32]),
         (Uuid::now_v7(), vec![12_u8; 32]),
     ];
+    let now_ms: i64 =
+        sqlx::query_scalar("SELECT floor(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(&mut *transaction)
+            .await?;
+    let created_at_ms = now_ms - 1_000;
+    let expires_at_ms = now_ms + 60_000;
     for (credential_id, digest) in &credentials {
         sqlx::query(
             "SELECT agent.register_mcp_credential_digest(
                  $1, $2, $3, $4, $5, $6, 'codex-alpha-x3', $7,
-                 'mcp.references.v1', 1000, 2000
+                 'mcp.references.v1', $8, $9
              )",
         )
         .bind(tenant_id)
@@ -439,6 +445,8 @@ async fn agent_mcp_credentials_are_digest_only_rotatable_and_exactly_scoped()
         .bind(binding_id)
         .bind(agent_device_id)
         .bind(conversation_id)
+        .bind(created_at_ms)
+        .bind(expires_at_ms)
         .execute(&mut *transaction)
         .await?;
     }
@@ -448,7 +456,7 @@ async fn agent_mcp_credentials_are_digest_only_rotatable_and_exactly_scoped()
     let third = sqlx::query(
         "SELECT agent.register_mcp_credential_digest(
              $1, $2, $3, $4, $5, $6, 'codex-alpha-x3', $7,
-             'mcp.references.v1', 1000, 2000
+             'mcp.references.v1', $8, $9
          )",
     )
     .bind(tenant_id)
@@ -458,6 +466,8 @@ async fn agent_mcp_credentials_are_digest_only_rotatable_and_exactly_scoped()
     .bind(binding_id)
     .bind(agent_device_id)
     .bind(conversation_id)
+    .bind(created_at_ms)
+    .bind(expires_at_ms)
     .execute(&mut *transaction)
     .await;
     assert!(third.is_err(), "a third live credential must be rejected");
@@ -465,42 +475,88 @@ async fn agent_mcp_credentials_are_digest_only_rotatable_and_exactly_scoped()
         .execute(&mut *transaction)
         .await?;
 
+    sqlx::query("SAVEPOINT future_agent_mcp_credential")
+        .execute(&mut *transaction)
+        .await?;
+    let future = sqlx::query(
+        "SELECT agent.register_mcp_credential_digest(
+             $1, $2, $3, $4, $5, $6, 'codex-alpha-x3', $7,
+             'mcp.references.v1', $8, $9
+         )",
+    )
+    .bind(tenant_id)
+    .bind(Uuid::now_v7())
+    .bind(vec![14_u8; 32])
+    .bind(installation_id)
+    .bind(binding_id)
+    .bind(agent_device_id)
+    .bind(conversation_id)
+    .bind(now_ms + 120_000)
+    .bind(now_ms + 180_000)
+    .execute(&mut *transaction)
+    .await;
+    assert!(
+        future.is_err(),
+        "a future creation timestamp must not bypass registration limits"
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT future_agent_mcp_credential")
+        .execute(&mut *transaction)
+        .await?;
+
     let authorized: Option<Uuid> = sqlx::query_scalar(
         "SELECT conversation_id
-           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, 1500)",
+           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, $4)",
     )
     .bind(tenant_id)
     .bind(&credentials[0].1)
     .bind("codex-alpha-x3")
+    .bind(now_ms)
     .fetch_optional(&mut *transaction)
     .await?;
     assert_eq!(authorized, Some(conversation_id));
+    let before_creation: Option<Uuid> = sqlx::query_scalar(
+        "SELECT conversation_id
+           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, $4)",
+    )
+    .bind(tenant_id)
+    .bind(&credentials[0].1)
+    .bind("codex-alpha-x3")
+    .bind(created_at_ms - 1)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    assert_eq!(
+        before_creation, None,
+        "credentials must not authenticate before their creation time"
+    );
     let wrong_node: Option<Uuid> = sqlx::query_scalar(
         "SELECT conversation_id
-           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, 1500)",
+           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, $4)",
     )
     .bind(tenant_id)
     .bind(&credentials[0].1)
     .bind("other-node")
+    .bind(now_ms)
     .fetch_optional(&mut *transaction)
     .await?;
     assert_eq!(wrong_node, None);
 
     let revoked: bool =
-        sqlx::query_scalar("SELECT agent.revoke_mcp_credential_digest($1, $2, $3, 1600)")
+        sqlx::query_scalar("SELECT agent.revoke_mcp_credential_digest($1, $2, $3, $4)")
             .bind(tenant_id)
             .bind(credentials[0].0)
             .bind(&credentials[0].1)
+            .bind(now_ms)
             .fetch_one(&mut *transaction)
             .await?;
     assert!(revoked);
     let after_revoke: Option<Uuid> = sqlx::query_scalar(
         "SELECT conversation_id
-           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, 1601)",
+           FROM agent.authenticate_mcp_reference_credential($1, $2, $3, $4)",
     )
     .bind(tenant_id)
     .bind(&credentials[0].1)
     .bind("codex-alpha-x3")
+    .bind(now_ms + 1)
     .fetch_optional(&mut *transaction)
     .await?;
     assert_eq!(after_revoke, None);

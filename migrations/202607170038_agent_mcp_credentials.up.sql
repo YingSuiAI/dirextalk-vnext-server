@@ -138,9 +138,17 @@ SET search_path = pg_catalog, agent, system
 AS $$
 DECLARE
     active_count integer;
+    registration_now_ms bigint;
 BEGIN
     IF requested_tenant_id IS DISTINCT FROM system.current_tenant_id() THEN
         RAISE EXCEPTION 'tenant scope rejected' USING ERRCODE = '42501';
+    END IF;
+
+    registration_now_ms :=
+        floor(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint;
+    IF requested_created_at_ms > registration_now_ms THEN
+        RAISE EXCEPTION 'future Agent MCP credential creation rejected'
+            USING ERRCODE = '22008';
     END IF;
 
     PERFORM 1
@@ -160,7 +168,7 @@ BEGIN
      WHERE tenant_id = requested_tenant_id
        AND binding_id = requested_binding_id
        AND revoked_at_ms IS NULL
-       AND expires_at_ms > requested_created_at_ms;
+       AND expires_at_ms > registration_now_ms;
     IF active_count >= 2 THEN
         RAISE EXCEPTION 'at most two live Agent MCP credentials are allowed'
             USING ERRCODE = '23514';
@@ -249,6 +257,7 @@ AS $$
        AND credential.node_id = requested_node_id
        AND credential.capability = 'mcp.references.v1'
        AND credential.revoked_at_ms IS NULL
+       AND credential.created_at_ms <= requested_now_ms
        AND credential.expires_at_ms > requested_now_ms
        AND installation.desired_state = 'enabled'
        AND installation.observed_state = 'ready'
