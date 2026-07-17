@@ -45,6 +45,14 @@ pub enum InstallationCommand {
         /// Verified identity-log subject for this installation.
         identity_id: IdentityId,
     },
+    /// Confirms an operator-staged identity using the owner's signed approval.
+    ///
+    /// This compatibility transition advances the aggregate revision only when
+    /// the immutable identity already equals the signed approval subject.
+    ConfirmAgentIdentity {
+        /// Verified identity-log subject from the signed Owner approval.
+        identity_id: IdentityId,
+    },
     /// Reconciler observed a conforming ready route.
     MarkReady,
     /// Reconciler observed impaired health.
@@ -295,6 +303,11 @@ impl AgentInstallation {
                 agent_identity_id = Some(identity_id);
             }
             InstallationCommand::BindAgentIdentity { .. } => {
+                return Err(InstallationError::AgentIdentityAlreadyBound);
+            }
+            InstallationCommand::ConfirmAgentIdentity { identity_id }
+                if agent_identity_id == Some(identity_id) => {}
+            InstallationCommand::ConfirmAgentIdentity { .. } => {
                 return Err(InstallationError::AgentIdentityAlreadyBound);
             }
             InstallationCommand::MarkReady

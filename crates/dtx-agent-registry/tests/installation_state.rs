@@ -9,6 +9,7 @@ use dtx_domain::{AgentId, IdentityId, InstallationId, Revision, TenantId};
 const UUID_V7: &str = "0190f2a5-7b1c-7abc-8def-0123456789ab";
 const AGENT_ID: &str = "dtxa17sv7zwzpr7aduy467sdm3pkmxe6if34eoarhaxdnau44fjwfseda";
 const OWNER_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+const OTHER_ID: &str = "dtxi1cteymucsdoxo3y2ssyv3lbxqcmuivts5g4bpgocvobmv3i5xbjna";
 
 fn installation() -> AgentInstallation {
     AgentInstallation::new(
@@ -182,8 +183,28 @@ fn agent_identity_is_bind_once_and_required_before_ready() {
         .unwrap();
     assert_eq!(installation.agent_identity_id(), Some(agent_identity));
     assert_eq!(
+        installation
+            .apply(
+                Revision::new(2).unwrap(),
+                InstallationCommand::ConfirmAgentIdentity {
+                    identity_id: agent_identity,
+                },
+            )
+            .unwrap(),
+        Revision::new(3).unwrap()
+    );
+    assert_eq!(
         installation.apply(
-            Revision::new(2).unwrap(),
+            Revision::new(3).unwrap(),
+            InstallationCommand::ConfirmAgentIdentity {
+                identity_id: IdentityId::from_str(OTHER_ID).unwrap(),
+            },
+        ),
+        Err(InstallationError::AgentIdentityAlreadyBound)
+    );
+    assert_eq!(
+        installation.apply(
+            Revision::new(3).unwrap(),
             InstallationCommand::BindAgentIdentity {
                 identity_id: agent_identity,
             },
@@ -191,6 +212,6 @@ fn agent_identity_is_bind_once_and_required_before_ready() {
         Err(InstallationError::AgentIdentityAlreadyBound)
     );
     installation
-        .apply(Revision::new(2).unwrap(), InstallationCommand::MarkReady)
+        .apply(Revision::new(3).unwrap(), InstallationCommand::MarkReady)
         .unwrap();
 }

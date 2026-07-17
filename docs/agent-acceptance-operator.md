@@ -85,8 +85,10 @@ dtx-agent-provision acceptance-finalize \
 ```
 
 Run the same command without `--dry-run` to create/reuse each verified Agent
-Definition, identity-bound Installation, active Agent Device, and enabled
-exclusive Binding. Finalize requires the exact prepared Host and Connectors;
+Definition, owner-approval-pending Installation, active Agent Device, and
+enabled exclusive Binding. The client's signed Owner approval remains the
+only operation allowed to bind the Agent identity to its Installation.
+Finalize requires the exact prepared Host and Connectors;
 it never silently creates a missing foundation. Repeating the exact command is
 idempotent, while changed identity, certificate, descriptor, or routing facts
 fail closed.

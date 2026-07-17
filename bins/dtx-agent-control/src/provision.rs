@@ -33,8 +33,7 @@ use dtx_agent_persistence::{
 };
 use dtx_agent_registry::{
     AgentDevice, AgentDeviceCommand, AgentDeviceState, AgentInstallation, DescriptorDigest,
-    DeviceCredentialFingerprint, ExecutionMode, InstallationCommand, InstallationDesiredState,
-    VerifiedAgentDefinition,
+    DeviceCredentialFingerprint, ExecutionMode, InstallationDesiredState, VerifiedAgentDefinition,
 };
 use dtx_connect_registry::{
     AdapterConformance, AdapterKind, BindingSpec, BindingState, Connector, ConnectorDesiredState,
@@ -1588,25 +1587,22 @@ async fn ensure_acceptance_installation(
         {
             return Err(AcceptanceError::TopologyConflict);
         }
-        if installation.agent_identity_id().is_some() {
-            return Ok((installation, false));
-        }
-        let mut installation = installation;
-        installation
-            .apply(
-                installation.revision(),
-                InstallationCommand::BindAgentIdentity {
-                    identity_id: facts.agent_identity_id,
-                },
-            )
-            .map_err(|_| AcceptanceError::Topology)?;
-        repository
-            .save(connection, &installation, stored_at_millis)
-            .await
-            .map_err(|_| AcceptanceError::Topology)?;
-        return Ok((installation, true));
+        return Ok((installation, false));
     }
-    let mut installation = AgentInstallation::new(
+    let installation = new_acceptance_installation(plan, agent, definition);
+    let write = repository
+        .save(connection, &installation, stored_at_millis)
+        .await
+        .map_err(|_| AcceptanceError::Topology)?;
+    Ok((installation, write != CurrentWrite::Existing))
+}
+
+fn new_acceptance_installation(
+    plan: &AcceptancePlan,
+    agent: &AcceptanceAgentPlan,
+    definition: &VerifiedAgentDefinition,
+) -> AgentInstallation {
+    AgentInstallation::new(
         plan.tenant_id,
         agent.installation_id,
         agent.agent_id,
@@ -1614,20 +1610,7 @@ async fn ensure_acceptance_installation(
         ExecutionMode::ConnectorManaged,
         definition.version(),
         definition.descriptor_hash(),
-    );
-    installation
-        .apply(
-            installation.revision(),
-            InstallationCommand::BindAgentIdentity {
-                identity_id: facts.agent_identity_id,
-            },
-        )
-        .map_err(|_| AcceptanceError::Topology)?;
-    let write = repository
-        .save(connection, &installation, stored_at_millis)
-        .await
-        .map_err(|_| AcceptanceError::Topology)?;
-    Ok((installation, write != CurrentWrite::Existing))
+    )
 }
 
 async fn ensure_acceptance_agent_device(
@@ -2685,6 +2668,24 @@ mod tests {
             validate_and_sort_acceptance_plan(&mut decoded, 1_800_000_000_000),
             Err(AcceptanceError::Plan)
         );
+    }
+
+    #[test]
+    fn acceptance_finalize_leaves_identity_binding_for_signed_owner_approval() {
+        let plan = acceptance_plan();
+        let agent = &plan.agents[0];
+        let definition = VerifiedAgentDefinition::new(
+            agent.agent_id,
+            plan.owner_identity_id,
+            Revision::new(agent.definition_version).unwrap(),
+            DescriptorDigest::from_bytes(agent.descriptor_hash.bytes()),
+            agent.definition_expires_at_millis,
+        );
+
+        let installation = new_acceptance_installation(&plan, agent, &definition);
+
+        assert_eq!(installation.agent_identity_id(), None);
+        assert_eq!(installation.revision(), Revision::INITIAL);
     }
 
     #[test]

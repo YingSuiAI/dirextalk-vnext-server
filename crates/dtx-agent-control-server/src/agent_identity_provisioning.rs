@@ -1493,14 +1493,18 @@ async fn approve_in_transaction(
         return Err(AgentIdentityProvisioningError::Conflict);
     }
 
+    let identity_command = if installation.agent_identity_id().is_none() {
+        InstallationCommand::BindAgentIdentity {
+            identity_id: command.agent_identity_id,
+        }
+    } else {
+        InstallationCommand::ConfirmAgentIdentity {
+            identity_id: command.agent_identity_id,
+        }
+    };
     let mut updated = installation;
     updated
-        .apply(
-            command.expected_revision,
-            InstallationCommand::BindAgentIdentity {
-                identity_id: command.agent_identity_id,
-            },
-        )
+        .apply(command.expected_revision, identity_command)
         .map_err(|_| AgentIdentityProvisioningError::Conflict)?;
     if AgentInstallationRepository::new()
         .save(connection, &updated, now.get())
