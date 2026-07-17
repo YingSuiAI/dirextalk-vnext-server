@@ -1223,8 +1223,19 @@ async fn ensure_acceptance_foundation(
         .await
         .map_err(|_| AcceptanceError::Database)?;
     let result = async {
+        let tenant_inserted = sqlx::query(
+            "INSERT INTO system.tenant_stream_heads (tenant_id, last_sequence)
+             VALUES ($1, 0) ON CONFLICT (tenant_id) DO NOTHING",
+        )
+        .bind(plan.tenant_id.as_uuid())
+        .execute(session.connection())
+        .await
+        .map_err(|_| AcceptanceError::Topology)?
+        .rows_affected()
+            == 1;
         let (host, mut changed) =
             ensure_acceptance_host(session.connection(), plan, stored_at_millis).await?;
+        changed |= tenant_inserted;
         for agent in &plan.agents {
             let (_, connector_changed) =
                 ensure_acceptance_connector(session.connection(), &host, agent, stored_at_millis)
