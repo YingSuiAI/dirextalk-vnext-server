@@ -260,21 +260,89 @@ impl PublicFeedPgStore {
         Ok(AppendOutcome::Created)
     }
 
-    /// Reads the exact current signed descriptor bytes.
+    /// Reads the narrow persistent descriptor head without loading exact bytes.
     ///
     /// # Errors
     /// Returns `NotFound` or a database error.
+    pub async fn descriptor_revision(
+        &self,
+        tenant: TenantId,
+        subject: &PublicSubjectId,
+    ) -> Result<Option<(u64, Sha256Digest)>, StoreError> {
+        let mut tx = self.begin(tenant).await?;
+        let row=sqlx::query("SELECT descriptor_head_sequence,descriptor_head_hash FROM directory.public_subjects WHERE tenant_id=$1 AND subject_id=$2")
+            .bind(tenant.as_uuid()).bind(subject.to_string()).fetch_optional(&mut *tx).await?;
+        let revision = row
+            .map(|row| {
+                let sequence = u64::try_from(row.try_get::<i64, _>("descriptor_head_sequence")?)
+                    .map_err(|_| StoreError::Conflict)?;
+                let hash = row
+                    .try_get::<Vec<u8>, _>("descriptor_head_hash")?
+                    .try_into()
+                    .map(Sha256Digest::from_bytes)
+                    .map_err(|_| StoreError::Conflict)?;
+                Ok::<(u64, Sha256Digest), StoreError>((sequence, hash))
+            })
+            .transpose()?;
+        tx.commit().await?;
+        Ok(revision)
+    }
+
+    /// Reads the exact current signed descriptor bytes at a previously probed
+    /// persistent revision.
+    ///
+    /// # Errors
+    /// Returns `NotFound`, `Conflict` when the head changed after the probe, or
+    /// a database error.
     pub async fn descriptor(
         &self,
         tenant: TenantId,
         subject: &PublicSubjectId,
+        expected_revision: Option<(u64, Sha256Digest)>,
     ) -> Result<Vec<u8>, StoreError> {
         let mut tx = self.begin(tenant).await?;
-        let row=sqlx::query("SELECT d.exact_cbor FROM directory.public_subjects s JOIN directory.descriptor_versions d ON d.tenant_id=s.tenant_id AND d.subject_id=s.subject_id AND d.sequence=s.descriptor_head_sequence WHERE s.tenant_id=$1 AND s.subject_id=$2")
-            .bind(tenant.as_uuid()).bind(subject.to_string()).fetch_optional(&mut *tx).await?.ok_or(StoreError::NotFound)?;
+        let Some((sequence, hash)) = expected_revision else {
+            return Err(StoreError::NotFound);
+        };
+        let row=sqlx::query("SELECT d.exact_cbor FROM directory.public_subjects s JOIN directory.descriptor_versions d ON d.tenant_id=s.tenant_id AND d.subject_id=s.subject_id AND d.sequence=s.descriptor_head_sequence WHERE s.tenant_id=$1 AND s.subject_id=$2 AND s.descriptor_head_sequence=$3 AND s.descriptor_head_hash=$4")
+            .bind(tenant.as_uuid()).bind(subject.to_string()).bind(i64::try_from(sequence).map_err(|_|StoreError::Conflict)?).bind(hash.as_bytes().as_slice()).fetch_optional(&mut *tx).await?.ok_or(StoreError::Conflict)?;
         let bytes = row.try_get("exact_cbor")?;
         tx.commit().await?;
         Ok(bytes)
+    }
+
+    /// Reads the narrow persistent root-feed revision without loading page
+    /// bytes. A subject without a first event has no feed revision yet.
+    ///
+    /// # Errors
+    /// Returns a database or corrupt-revision error.
+    pub async fn feed_revision(
+        &self,
+        tenant: TenantId,
+        subject: &PublicSubjectId,
+    ) -> Result<Option<(u64, Sha256Digest)>, StoreError> {
+        let mut tx = self.begin(tenant).await?;
+        let row=sqlx::query("SELECT feed_head_sequence,feed_head_hash FROM directory.public_subjects WHERE tenant_id=$1 AND subject_id=$2")
+            .bind(tenant.as_uuid()).bind(subject.to_string()).fetch_optional(&mut *tx).await?;
+        let revision = match row {
+            None => None,
+            Some(row) => {
+                let sequence: Option<i64> = row.try_get("feed_head_sequence")?;
+                let hash: Option<Vec<u8>> = row.try_get("feed_head_hash")?;
+                match (sequence, hash) {
+                    (None, None) => None,
+                    (Some(sequence), Some(hash)) => Some((
+                        u64::try_from(sequence).map_err(|_| StoreError::Conflict)?,
+                        Sha256Digest::from_bytes(
+                            hash.try_into().map_err(|_| StoreError::Conflict)?,
+                        ),
+                    )),
+                    _ => return Err(StoreError::Conflict),
+                }
+            }
+        };
+        tx.commit().await?;
+        Ok(revision)
     }
 
     /// Appends or exactly replays one publisher-authenticated public event.
@@ -342,6 +410,7 @@ impl PublicFeedPgStore {
         subject: &PublicSubjectId,
         cursor: Option<&str>,
         limit: u16,
+        expected_root_revision: Option<(u64, Sha256Digest)>,
     ) -> Result<FeedPage, StoreError> {
         let mut tx = self.begin(tenant).await?;
         let (after, snapshot_seq, snapshot_hash) = if let Some(raw) = cursor {
@@ -362,19 +431,15 @@ impl PublicFeedPgStore {
                 c.snapshot_hash(),
             )
         } else {
-            let row=sqlx::query("SELECT feed_head_sequence,feed_head_hash FROM directory.public_subjects WHERE tenant_id=$1 AND subject_id=$2").bind(tenant.as_uuid()).bind(subject.to_string()).fetch_optional(&mut *tx).await?.ok_or(StoreError::NotFound)?;
-            let seq: Option<i64> = row.try_get("feed_head_sequence")?;
-            let hash: Option<Vec<u8>> = row.try_get("feed_head_hash")?;
-            let seq = seq.ok_or(StoreError::NotFound)?;
-            (
-                0,
-                u64::try_from(seq).map_err(|_| StoreError::Conflict)?,
-                Sha256Digest::from_bytes(
-                    hash.ok_or(StoreError::Conflict)?
-                        .try_into()
-                        .map_err(|_| StoreError::Conflict)?,
-                ),
-            )
+            let Some((seq, hash)) = expected_root_revision else {
+                return Err(StoreError::NotFound);
+            };
+            let matches: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM directory.public_subjects WHERE tenant_id=$1 AND subject_id=$2 AND feed_head_sequence=$3 AND feed_head_hash=$4)")
+                .bind(tenant.as_uuid()).bind(subject.to_string()).bind(i64::try_from(seq).map_err(|_|StoreError::Conflict)?).bind(hash.as_bytes().as_slice()).fetch_one(&mut *tx).await?;
+            if !matches {
+                return Err(StoreError::Conflict);
+            }
+            (0, seq, hash)
         };
         let rows=sqlx::query("SELECT sequence,exact_cbor FROM directory.feed_entries WHERE tenant_id=$1 AND subject_id=$2 AND sequence>$3 AND sequence<=$4 ORDER BY sequence LIMIT $5")
             .bind(tenant.as_uuid()).bind(subject.to_string()).bind(i64::try_from(after).map_err(|_|StoreError::InvalidCursor)?).bind(i64::try_from(snapshot_seq).map_err(|_|StoreError::InvalidCursor)?).bind(i64::from(limit)+1).fetch_all(&mut *tx).await?;
@@ -508,43 +573,62 @@ async fn get_descriptor(
     let Ok(subject) = parse_subject(&id) else {
         return failure(StatusCode::BAD_REQUEST);
     };
-    if !shared_cache_eligible(&headers) {
-        return match s.store.descriptor(s.tenant, &subject).await {
-            Ok(bytes) => conditional_success(
-                &headers,
-                DESCRIPTOR_CONTENT_TYPE,
-                &CachedBody::new(bytes),
-                "no-store",
-            ),
-            Err(error) => map_error(&error),
+    for attempt in 0..2 {
+        let revision = match s.store.descriptor_revision(s.tenant, &subject).await {
+            Ok(value) => value,
+            Err(error) => return map_error(&error),
         };
+        if !shared_cache_eligible(&headers) {
+            return match s.store.descriptor(s.tenant, &subject, revision).await {
+                Ok(bytes) => conditional_success(
+                    &headers,
+                    DESCRIPTOR_CONTENT_TYPE,
+                    &CachedBody::new(bytes),
+                    "no-store",
+                ),
+                Err(StoreError::NotFound) => failure(StatusCode::NOT_FOUND),
+                Err(StoreError::Conflict) if attempt == 0 => continue,
+                Err(error) => map_error(&error),
+            };
+        }
+        let revision_key = revision.map_or_else(
+            || "missing".to_owned(),
+            |(sequence, digest)| format!("{sequence}:{digest}"),
+        );
+        let key = format!(
+            "{}:{CACHE_NAMESPACE}:{subject}:descriptor:{revision_key}",
+            s.tenant
+        );
+        match s
+            .cache
+            .load_optional(
+                key,
+                Duration::from_mins(1),
+                PUBLIC_NOT_FOUND_TTL,
+                || async {
+                    match s.store.descriptor(s.tenant, &subject, revision).await {
+                        Ok(bytes) => Ok(Some(bytes)),
+                        Err(StoreError::NotFound) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                },
+            )
+            .await
+        {
+            Ok(CachedLookup::Found(body)) => {
+                return conditional_success(
+                    &headers,
+                    DESCRIPTOR_CONTENT_TYPE,
+                    &body,
+                    "public, max-age=60, must-revalidate",
+                );
+            }
+            Ok(CachedLookup::NotFound) => return public_not_found(),
+            Err(StoreError::Conflict) if attempt == 0 => {}
+            Err(error) => return map_error(&error),
+        }
     }
-    let key = format!("{}:{CACHE_NAMESPACE}:{subject}:descriptor", s.tenant);
-    match s
-        .cache
-        .load_optional(
-            key,
-            Duration::from_mins(1),
-            PUBLIC_NOT_FOUND_TTL,
-            || async {
-                match s.store.descriptor(s.tenant, &subject).await {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(StoreError::NotFound) => Ok(None),
-                    Err(error) => Err(error),
-                }
-            },
-        )
-        .await
-    {
-        Ok(CachedLookup::Found(body)) => conditional_success(
-            &headers,
-            DESCRIPTOR_CONTENT_TYPE,
-            &body,
-            "public, max-age=60, must-revalidate",
-        ),
-        Ok(CachedLookup::NotFound) => public_not_found(),
-        Err(e) => map_error(&e),
-    }
+    failure(StatusCode::CONFLICT)
 }
 async fn put_descriptor(
     State(s): State<AppState>,
@@ -595,6 +679,10 @@ async fn put_descriptor(
     }
     response
 }
+#[allow(
+    clippy::too_many_lines,
+    reason = "one HTTP boundary validates immutable cursors and root revision-fenced caching"
+)]
 async fn get_page(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -617,22 +705,6 @@ async fn get_page(
     {
         return failure(StatusCode::BAD_REQUEST);
     }
-    if !shared_cache_eligible(&headers) {
-        return match s
-            .store
-            .page(s.tenant, &subject, q.cursor.as_deref(), limit)
-            .await
-            .and_then(|page| page.encode())
-        {
-            Ok(bytes) => conditional_success(
-                &headers,
-                PAGE_CONTENT_TYPE,
-                &CachedBody::new(bytes),
-                "no-store",
-            ),
-            Err(error) => map_error(&error),
-        };
-    }
     let cursor = q.cursor.clone().unwrap_or_default();
     let ttl = if q.cursor.is_some() { 300 } else { 10 };
     let cache_control = if q.cursor.is_some() {
@@ -645,37 +717,86 @@ async fn get_page(
     } else {
         "root"
     };
-    let key = format!(
-        "{}:{CACHE_NAMESPACE}:{subject}:feed:{page_kind}:{cursor}:{limit}",
-        s.tenant
-    );
-    match s
-        .cache
-        .load_optional(
-            key,
-            Duration::from_secs(ttl),
-            PUBLIC_NOT_FOUND_TTL,
-            || async {
-                match s
-                    .store
-                    .page(s.tenant, &subject, q.cursor.as_deref(), limit)
-                    .await
-                    .and_then(|v| v.encode())
-                {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(StoreError::NotFound) => Ok(None),
-                    Err(error) => Err(error),
-                }
-            },
-        )
-        .await
-    {
-        Ok(CachedLookup::Found(body)) => {
-            conditional_success(&headers, PAGE_CONTENT_TYPE, &body, cache_control)
+    for attempt in 0..2 {
+        let root_revision = if q.cursor.is_some() {
+            None
+        } else {
+            match s.store.feed_revision(s.tenant, &subject).await {
+                Ok(value) => value,
+                Err(error) => return map_error(&error),
+            }
+        };
+        if !shared_cache_eligible(&headers) {
+            return match s
+                .store
+                .page(
+                    s.tenant,
+                    &subject,
+                    q.cursor.as_deref(),
+                    limit,
+                    root_revision,
+                )
+                .await
+                .and_then(|page| page.encode())
+            {
+                Ok(bytes) => conditional_success(
+                    &headers,
+                    PAGE_CONTENT_TYPE,
+                    &CachedBody::new(bytes),
+                    "no-store",
+                ),
+                Err(StoreError::Conflict) if q.cursor.is_none() && attempt == 0 => continue,
+                Err(error) => map_error(&error),
+            };
         }
-        Ok(CachedLookup::NotFound) => public_not_found(),
-        Err(e) => map_error(&e),
+        let revision_key = if q.cursor.is_some() {
+            "immutable".to_owned()
+        } else {
+            root_revision.map_or_else(
+                || "missing".to_owned(),
+                |(sequence, digest)| format!("{sequence}:{digest}"),
+            )
+        };
+        let key = format!(
+            "{}:{CACHE_NAMESPACE}:{subject}:feed:{page_kind}:{revision_key}:{cursor}:{limit}",
+            s.tenant
+        );
+        match s
+            .cache
+            .load_optional(
+                key,
+                Duration::from_secs(ttl),
+                PUBLIC_NOT_FOUND_TTL,
+                || async {
+                    match s
+                        .store
+                        .page(
+                            s.tenant,
+                            &subject,
+                            q.cursor.as_deref(),
+                            limit,
+                            root_revision,
+                        )
+                        .await
+                        .and_then(|v| v.encode())
+                    {
+                        Ok(bytes) => Ok(Some(bytes)),
+                        Err(StoreError::NotFound) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                },
+            )
+            .await
+        {
+            Ok(CachedLookup::Found(body)) => {
+                return conditional_success(&headers, PAGE_CONTENT_TYPE, &body, cache_control);
+            }
+            Ok(CachedLookup::NotFound) => return public_not_found(),
+            Err(StoreError::Conflict) if q.cursor.is_none() && attempt == 0 => {}
+            Err(error) => return map_error(&error),
+        }
     }
+    failure(StatusCode::CONFLICT)
 }
 async fn append_event(
     State(s): State<AppState>,

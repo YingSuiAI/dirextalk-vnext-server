@@ -1,0 +1,24 @@
+public-search-pagination-version-v1 = {1: 1, 2: 0}
+public-search-pagination-wire-v1 = {
+  1: public-search-pagination-version-v1,
+  2: public-search-pagination-version-v1
+}
+public-search-pagination-uuid-v7-v1 = bstr .size 16
+public-search-pagination-digest-v1 = bstr .size 32
+public-search-kind-v1 = 1 / 2 / null
+public-search-cursor-scope-v1 = {
+  1: public-search-pagination-uuid-v7-v1,
+  2: public-search-pagination-uuid-v7-v1,
+  3: tstr .size (1..256),
+  4: public-search-kind-v1,
+  5: 1..9007199254740991,
+  6: 1..10000,
+  7: 1..50
+}
+public-search-cursor-v1 = {
+  1: public-search-pagination-wire-v1,
+  2: public-search-pagination-digest-v1,
+  3: 1..9007199254740991,
+  4: 1..10000,
+  5: 1..50
+}

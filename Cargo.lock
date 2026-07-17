@@ -1115,12 +1115,14 @@ dependencies = [
 name = "dtx-indexer"
 version = "0.1.0"
 dependencies = [
+ "base64ct",
  "dtx-domain",
  "dtx-public-descriptor",
  "dtx-public-feed",
  "dtx-wire",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "uuid",
 ]
 

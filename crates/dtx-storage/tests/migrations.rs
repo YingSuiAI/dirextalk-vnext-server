@@ -37,7 +37,8 @@ const AGENT_ROUTE_BOOTSTRAP_V1_MIGRATION_VERSION: i64 = 202_607_160_030;
 const CONNECTOR_BINDING_STATE_OWNER_API_MIGRATION_VERSION: i64 = 202_607_160_031;
 const HERMES_ACP_ADAPTER_MIGRATION_VERSION: i64 = 202_607_160_032;
 const FEDERATED_KEY_PACKAGE_CLAIMS_MIGRATION_VERSION: i64 = 202_607_160_033;
-const EXPECTED_MIGRATION_COUNT: i64 = 33;
+const PUBLIC_CACHE_GENERATIONS_MIGRATION_VERSION: i64 = 202_607_160_034;
+const EXPECTED_MIGRATION_COUNT: i64 = 34;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -103,6 +104,10 @@ const HERMES_ACP_ADAPTER_DOWN: &str =
     include_str!("../../../migrations/202607160032_hermes_acp_adapter.down.sql");
 const FEDERATED_KEY_PACKAGE_CLAIMS_DOWN: &str =
     include_str!("../../../migrations/202607160033_federated_key_package_claims.down.sql");
+const PUBLIC_CACHE_GENERATIONS_DOWN: &str =
+    include_str!("../../../migrations/202607160034_public_cache_generations.down.sql");
+const PUBLIC_CACHE_GENERATIONS_UP: &str =
+    include_str!("../../../migrations/202607160034_public_cache_generations.up.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -119,6 +124,71 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(applied, EXPECTED_MIGRATION_COUNT);
     assert_eq!(visible, applied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_cache_generation_migration_backfills_visible_indexers_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(PUBLIC_CACHE_GENERATIONS_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+
+    let tenant = Uuid::now_v7();
+    let visible_indexer = Uuid::now_v7();
+    let rejected_indexer = Uuid::now_v7();
+    for (subject, status, updated_at) in [
+        ("dtxc1published", 2_i16, 10_i64),
+        ("dtxc1revoked", 5_i16, 20_i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO directory.index_registrations(tenant_id,registration_id,indexer_id,subject_id,subject_kind,status,descriptor_sequence,descriptor_hash,descriptor_exact_cbor,created_at_ms,updated_at_ms) VALUES($1,$2,$3,$4,1,$5,1,$6,$7,$8,$8)",
+        )
+        .bind(tenant)
+        .bind(Uuid::now_v7())
+        .bind(visible_indexer)
+        .bind(subject)
+        .bind(status)
+        .bind([u8::try_from(status)?; 32].as_slice())
+        .bind([u8::try_from(status)?].as_slice())
+        .bind(updated_at)
+        .execute(harness.admin_pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO directory.index_registrations(tenant_id,registration_id,indexer_id,subject_id,subject_kind,status,descriptor_sequence,descriptor_hash,descriptor_exact_cbor,created_at_ms,updated_at_ms) VALUES($1,$2,$3,'dtxc1rejected',1,3,1,$4,$5,30,30)",
+    )
+    .bind(tenant)
+    .bind(Uuid::now_v7())
+    .bind(rejected_indexer)
+    .bind([3_u8; 32].as_slice())
+    .bind([3_u8].as_slice())
+    .execute(harness.admin_pool())
+    .await?;
+
+    sqlx::raw_sql(PUBLIC_CACHE_GENERATIONS_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    let rows: Vec<(Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT indexer_id,generation,updated_at_ms FROM directory.index_cache_generations WHERE tenant_id=$1 ORDER BY indexer_id",
+    )
+    .bind(tenant)
+    .fetch_all(harness.admin_pool())
+    .await?;
+    assert_eq!(rows, vec![(visible_indexer, 1, 20)]);
+    let security: (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity,relforcerowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='directory' AND c.relname='index_cache_generations'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(security, (true, true));
+    let public_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.table_privileges WHERE table_schema='directory' AND table_name='index_cache_generations' AND grantee='PUBLIC'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(public_grants, 0);
     Ok(())
 }
 
@@ -206,7 +276,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -241,8 +311,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(CONNECTOR_BINDING_STATE_OWNER_API_MIGRATION_VERSION)
     .bind(HERMES_ACP_ADAPTER_MIGRATION_VERSION)
     .bind(FEDERATED_KEY_PACKAGE_CLAIMS_MIGRATION_VERSION)
+    .bind(PUBLIC_CACHE_GENERATIONS_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(PUBLIC_CACHE_GENERATIONS_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(FEDERATED_KEY_PACKAGE_CLAIMS_DOWN)
         .execute(harness.admin_pool())
         .await?;

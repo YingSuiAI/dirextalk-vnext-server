@@ -8,18 +8,25 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
-use dtx_domain::{DirectoryRegistrationId, IndexerId, PublicSubjectId};
+use base64ct::{Base64UrlUnpadded, Encoding as _};
+use dtx_domain::{DirectoryRegistrationId, IndexerId, PublicSubjectId, TenantId};
 use dtx_public_descriptor::{DescriptorHeadV1, SignedPublicDescriptorV1};
 use dtx_public_feed::{PublicFeedHeadV1, PublicFeedPayloadV1, SignedPublicFeedEventV1};
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, ProtocolVersion, SafeUint, Sha256Digest, UtcMillis,
     WireVersion, decode_deterministic_cbor, encode_deterministic_cbor,
 };
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 const MAX_RESOLVED_ADDRESSES: usize = 16;
 const MAX_FEED_PAGES: usize = 64;
 const MAX_FEED_ENTRIES: usize = 4_096;
+const MAX_SEARCH_QUERY_BYTES: usize = 256;
+const MAX_SEARCH_PAGE_SIZE: u16 = 50;
+const MAX_SEARCH_OFFSET: u64 = 10_000;
+const MAX_SEARCH_CURSOR_CHARS: usize = 512;
+const SEARCH_CURSOR_BINDING_DOMAIN: &[u8] = b"dirextalk.public-search-cursor.v1\0";
 
 /// Durable per-Indexer registration projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +68,7 @@ pub enum IndexerError {
     Downgrade,
     InvalidFeed,
     FeedTooLarge,
+    InvalidCursor,
 }
 impl fmt::Display for IndexerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -74,8 +82,255 @@ impl fmt::Display for IndexerError {
             Self::Downgrade => "public descriptor would downgrade accepted state",
             Self::InvalidFeed => "invalid signed public feed proof",
             Self::FeedTooLarge => "public feed proof exceeds indexing bounds",
+            Self::InvalidCursor => "invalid public search cursor",
         })
     }
+}
+
+/// Returns the one canonical query representation used by SQL, cache keys,
+/// and cursor bindings. Oversized or whitespace-only input is rejected before
+/// allocating an unbounded normalized value.
+#[must_use]
+pub fn normalize_public_search_query(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > MAX_SEARCH_QUERY_BYTES {
+        return None;
+    }
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    (!normalized.is_empty() && normalized.len() <= MAX_SEARCH_QUERY_BYTES).then_some(normalized)
+}
+
+/// Opaque continuation for one durable Indexer search generation.
+///
+/// The cursor carries no authority. Its binding digest prevents accidental or
+/// partial field substitution, while the HTTP boundary also compares its
+/// generation with the current persistent projection and bounds the offset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicSearchCursorV1 {
+    binding_digest: Sha256Digest,
+    generation: SafeUint,
+    offset: SafeUint,
+    limit: u16,
+}
+
+impl PublicSearchCursorV1 {
+    /// Creates a query/filter/limit/generation-bound continuation.
+    ///
+    /// # Errors
+    /// Returns `InvalidCursor` for noncanonical input or unsafe bounds.
+    pub fn new(
+        tenant: TenantId,
+        indexer: IndexerId,
+        normalized_query: &str,
+        kind: Option<u8>,
+        generation: u64,
+        offset: u64,
+        limit: u16,
+    ) -> Result<Self, IndexerError> {
+        if normalize_public_search_query(normalized_query).as_deref() != Some(normalized_query)
+            || !matches!(kind, None | Some(1 | 2))
+            || generation == 0
+            || offset == 0
+            || offset > MAX_SEARCH_OFFSET
+            || !(1..=MAX_SEARCH_PAGE_SIZE).contains(&limit)
+            || !offset.is_multiple_of(u64::from(limit))
+        {
+            return Err(IndexerError::InvalidCursor);
+        }
+        let generation = SafeUint::new(generation).map_err(|_| IndexerError::InvalidCursor)?;
+        let offset = SafeUint::new(offset).map_err(|_| IndexerError::InvalidCursor)?;
+        let binding_digest = public_search_scope_digest(
+            tenant,
+            indexer,
+            normalized_query,
+            kind,
+            generation.get(),
+            offset.get(),
+            limit,
+        )?;
+        Ok(Self {
+            binding_digest,
+            generation,
+            offset,
+            limit,
+        })
+    }
+
+    /// Decodes exact canonical CBOR from unpadded base64url and validates the
+    /// current durable generation plus every canonical query dimension.
+    ///
+    /// An omitted requested limit adopts the cursor's bound limit. A supplied
+    /// limit must match exactly.
+    ///
+    /// # Errors
+    /// Returns `InvalidCursor` for malformed, stale, cross-query, cross-tenant,
+    /// cross-Indexer, or limit-substituted cursors.
+    pub fn decode_for(
+        value: &str,
+        tenant: TenantId,
+        indexer: IndexerId,
+        normalized_query: &str,
+        kind: Option<u8>,
+        current_generation: u64,
+        requested_limit: Option<u16>,
+    ) -> Result<Self, IndexerError> {
+        if value.len() > MAX_SEARCH_CURSOR_CHARS {
+            return Err(IndexerError::InvalidCursor);
+        }
+        let bytes =
+            Base64UrlUnpadded::decode_vec(value).map_err(|_| IndexerError::InvalidCursor)?;
+        let root = decode_deterministic_cbor(&bytes).map_err(|_| IndexerError::InvalidCursor)?;
+        let fields = map(&root, 5).map_err(|_| IndexerError::InvalidCursor)?;
+        wire(field(fields, 1).map_err(|_| IndexerError::InvalidCursor)?)
+            .map_err(|_| IndexerError::InvalidCursor)?;
+        let binding_digest = Sha256Digest::from_bytes(
+            bytes32(field(fields, 2).map_err(|_| IndexerError::InvalidCursor)?)
+                .map_err(|_| IndexerError::InvalidCursor)?,
+        );
+        let generation = unsigned(field(fields, 3).map_err(|_| IndexerError::InvalidCursor)?)
+            .map_err(|_| IndexerError::InvalidCursor)?;
+        let offset = unsigned(field(fields, 4).map_err(|_| IndexerError::InvalidCursor)?)
+            .map_err(|_| IndexerError::InvalidCursor)?;
+        let limit = u16::try_from(
+            unsigned(field(fields, 5).map_err(|_| IndexerError::InvalidCursor)?)
+                .map_err(|_| IndexerError::InvalidCursor)?,
+        )
+        .map_err(|_| IndexerError::InvalidCursor)?;
+        if current_generation != generation || requested_limit.is_some_and(|v| v != limit) {
+            return Err(IndexerError::InvalidCursor);
+        }
+        let decoded = Self::new(
+            tenant,
+            indexer,
+            normalized_query,
+            kind,
+            generation,
+            offset,
+            limit,
+        )?;
+        if decoded.binding_digest != binding_digest || decoded.encode()? != value {
+            return Err(IndexerError::InvalidCursor);
+        }
+        Ok(decoded)
+    }
+
+    /// Encodes exact canonical CBOR as unpadded base64url.
+    ///
+    /// # Errors
+    /// Returns `InvalidCursor` if deterministic encoding fails.
+    pub fn encode(&self) -> Result<String, IndexerError> {
+        Ok(Base64UrlUnpadded::encode_string(
+            &encode_deterministic_cbor(self).map_err(|_| IndexerError::InvalidCursor)?,
+        ))
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset.get()
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> u16 {
+        self.limit
+    }
+}
+
+impl CanonicalEncode for PublicSearchCursorV1 {
+    fn to_canonical_value(&self) -> CanonicalValue {
+        CanonicalValue::Map(vec![
+            (
+                CanonicalValue::Unsigned(1),
+                WireVersion::new(ProtocolVersion::new(1, 0), ProtocolVersion::new(1, 0))
+                    .to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(2),
+                self.binding_digest.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                self.generation.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                self.offset.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(5),
+                CanonicalValue::Unsigned(u64::from(self.limit)),
+            ),
+        ])
+    }
+}
+
+/// Computes the collision-safe canonical digest used by cache keys and cursor
+/// bindings. Generation zero is valid only for an empty pre-publication root
+/// search; continuation constructors enforce a positive durable generation.
+///
+/// # Errors
+/// Returns `InvalidCursor` for a noncanonical query/filter or unsafe bounds.
+pub fn public_search_scope_digest(
+    tenant: TenantId,
+    indexer: IndexerId,
+    normalized_query: &str,
+    kind: Option<u8>,
+    generation: u64,
+    offset: u64,
+    limit: u16,
+) -> Result<Sha256Digest, IndexerError> {
+    if normalize_public_search_query(normalized_query).as_deref() != Some(normalized_query)
+        || !matches!(kind, None | Some(1 | 2))
+        || generation > SafeUint::MAX
+        || offset > MAX_SEARCH_OFFSET
+        || !(1..=MAX_SEARCH_PAGE_SIZE).contains(&limit)
+    {
+        return Err(IndexerError::InvalidCursor);
+    }
+    let exact = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (
+            CanonicalValue::Unsigned(1),
+            CanonicalValue::Bytes(tenant.as_uuid().as_bytes().to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Bytes(indexer.as_uuid().as_bytes().to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(normalized_query.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            kind.map_or(CanonicalValue::Null, |v| {
+                CanonicalValue::Unsigned(u64::from(v))
+            }),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Unsigned(generation),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Unsigned(offset),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Unsigned(u64::from(limit)),
+        ),
+    ]))
+    .map_err(|_| IndexerError::InvalidCursor)?;
+    let mut hash = Sha256::new();
+    hash.update(SEARCH_CURSOR_BINDING_DOMAIN);
+    hash.update(exact);
+    Ok(Sha256Digest::from_bytes(hash.finalize().into()))
 }
 impl Error for IndexerError {}
 

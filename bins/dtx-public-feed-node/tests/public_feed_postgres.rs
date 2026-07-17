@@ -120,10 +120,9 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
     let tenant = TenantId::new();
-    let app = public_feed_router(
-        PublicFeedPgStore::from_prevalidated_pool(harness.admin_pool().clone()),
-        tenant,
-    );
+    let store = PublicFeedPgStore::from_prevalidated_pool(harness.admin_pool().clone());
+    let app = public_feed_router(store.clone(), tenant);
+    let replica = public_feed_router(store, tenant);
     let now = now_ms();
     let descriptor = descriptor(now);
     let subject = descriptor.subject_id();
@@ -148,7 +147,7 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
             Some("no-store")
         );
     }
-    let response = app
+    let response = replica
         .clone()
         .oneshot(Request::builder().uri(&root).body(Body::empty())?)
         .await?;
@@ -172,12 +171,13 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         .await?;
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(
-        app.clone()
+        replica
+            .clone()
             .oneshot(Request::builder().uri(&root).body(Body::empty())?)
             .await?
             .status(),
         StatusCode::OK,
-        "descriptor publish must invalidate the local negative cache"
+        "descriptor publish must bypass another replica's cached miss"
     );
     let private_read = app
         .clone()
@@ -198,7 +198,7 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         "credential-bearing reads must bypass the shared cache"
     );
     assert!(private_read.headers().contains_key(header::ETAG));
-    let response = app
+    let response = replica
         .clone()
         .oneshot(
             Request::builder()
@@ -235,6 +235,19 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         ))
         .await?;
     assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        replica
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{feed}?limit=1"))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::OK,
+        "feed append must bypass another replica's cached root miss"
+    );
     let second = event(
         subject,
         2,
@@ -257,7 +270,7 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         ))
         .await?;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let response = app
+    let response = replica
         .clone()
         .oneshot(
             Request::builder()
@@ -278,7 +291,7 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
     let CanonicalValue::Text(cursor) = map_field(&fields, 4) else {
         panic!("cursor")
     };
-    let response = app
+    let response = replica
         .clone()
         .oneshot(
             Request::builder()
@@ -289,7 +302,7 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         .await?;
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
     assert_eq!(response.headers().get(header::ETAG), Some(&root_etag));
-    let response = app
+    let response = replica
         .clone()
         .oneshot(
             Request::builder()
@@ -332,7 +345,7 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         ))
         .await?;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let response = app
+    let response = replica
         .clone()
         .oneshot(
             Request::builder()
@@ -363,6 +376,6 @@ async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
         .await?;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let forced:i64=sqlx::query_scalar("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='directory' AND c.relrowsecurity AND c.relforcerowsecurity").fetch_one(harness.admin_pool()).await?;
-    assert_eq!(forced, 8);
+    assert_eq!(forced, 9);
     Ok(())
 }

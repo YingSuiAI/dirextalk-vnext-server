@@ -6,10 +6,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+base64ct.workspace = true
 dtx-domain = { path = "../dtx-domain" }
 dtx-public-descriptor = { path = "../dtx-public-descriptor" }
 dtx-public-feed = { path = "../dtx-public-feed" }
 dtx-wire = { path = "../dtx-wire" }
+sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

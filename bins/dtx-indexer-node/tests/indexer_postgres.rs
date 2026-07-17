@@ -42,7 +42,10 @@ fn now() -> i64 {
     .expect("time")
 }
 fn key() -> SigningKey {
-    SigningKey::from_bytes(&[42; 32])
+    key_for(42)
+}
+fn key_for(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
 }
 fn public() -> SigningPublicKey {
     SigningPublicKey::try_from(key().verifying_key().to_bytes()).expect("key")
@@ -56,7 +59,17 @@ fn descriptor_version(
     previous: Option<Sha256Digest>,
     tombstone: bool,
 ) -> SignedPublicDescriptorV1 {
-    let public = public();
+    descriptor_version_for(42, now, sequence, previous, tombstone)
+}
+fn descriptor_version_for(
+    seed: u8,
+    now: i64,
+    sequence: u64,
+    previous: Option<Sha256Digest>,
+    tombstone: bool,
+) -> SignedPublicDescriptorV1 {
+    let key = key_for(seed);
+    let public = SigningPublicKey::try_from(key.verifying_key().to_bytes()).expect("key");
     let issued = UtcMillis::new(now - 1000).expect("time");
     let payload = if tombstone {
         PublicDescriptorPayloadV1::Tombstone
@@ -87,7 +100,7 @@ fn descriptor_version(
     let input = unsigned.signature_input().expect("input");
     SignedPublicDescriptorV1::signed(
         unsigned,
-        Ed25519Signature::from_bytes(key().sign(&input).to_bytes()),
+        Ed25519Signature::from_bytes(key.sign(&input).to_bytes()),
     )
     .expect("signed")
 }
@@ -228,6 +241,32 @@ async fn search_count(
         return Err("search results must be an array".into());
     };
     Ok(results.len())
+}
+
+async fn insert_published_subject(
+    pool: &sqlx::PgPool,
+    tenant: TenantId,
+    indexer: IndexerId,
+    descriptor: &SignedPublicDescriptorV1,
+    search_document: &str,
+    now: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let hash = descriptor.entry_hash()?;
+    sqlx::query(
+        "INSERT INTO directory.index_registrations(tenant_id,registration_id,indexer_id,subject_id,subject_kind,status,descriptor_sequence,descriptor_hash,descriptor_exact_cbor,feed_origin,search_document,created_at_ms,updated_at_ms) VALUES($1,$2,$3,$4,1,2,$5,$6,$7,'https://feed.example',$8,$9,$9)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(DirectoryRegistrationId::new().as_uuid())
+    .bind(indexer.as_uuid())
+    .bind(descriptor.subject_id().to_string())
+    .bind(i64::try_from(descriptor.sequence().get())?)
+    .bind(hash.as_bytes().as_slice())
+    .bind(descriptor.to_deterministic_cbor()?)
+    .bind(search_document)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -400,6 +439,7 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
     let store = IndexerPgStore::from_prevalidated_pool(harness.admin_pool().clone());
     let shared: Arc<dyn PublicBundleFetcher> = Arc::new(fetcher.clone());
     let first_app = indexer_router(store.clone(), tenant, first_indexer, Arc::clone(&shared));
+    let first_replica = indexer_router(store.clone(), tenant, first_indexer, Arc::clone(&shared));
     let second_app = indexer_router(store, tenant, second_indexer, shared);
     for (app, indexer, registration) in [
         (first_app.clone(), first_indexer, first_registration),
@@ -487,6 +527,38 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
         assert!(private_read.headers().contains_key(header::ETAG));
     }
 
+    let first_subject_path = format!("/v1/public-subjects/{subject}?indexer_id={first_indexer}");
+    let initial_subject = first_replica
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&first_subject_path)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(initial_subject.status(), StatusCode::OK);
+    let initial_subject_etag = initial_subject
+        .headers()
+        .get(header::ETAG)
+        .ok_or("missing initial subject ETag")?
+        .clone();
+    let initial_search = first_replica
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/public-search?indexer_id={first_indexer}&q=alpha"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(initial_search.status(), StatusCode::OK);
+    let initial_search_etag = initial_search
+        .headers()
+        .get(header::ETAG)
+        .ok_or("missing initial search ETag")?
+        .clone();
+
     let v2 = descriptor_version(now, 2, Some(v1.entry_hash()?), false);
     let second = event(subject, 2, Some(first.entry_hash()?), "updated beta", now);
     *fetcher.bundle.lock().await = FetchedPublicBundle {
@@ -512,6 +584,36 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
             .status(),
         StatusCode::CREATED
     );
+    let updated_subject = first_replica
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&first_subject_path)
+                .header(header::IF_NONE_MATCH, initial_subject_etag)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(
+        updated_subject.status(),
+        StatusCode::OK,
+        "another replica must observe the persistent subject revision"
+    );
+    let updated_search = first_replica
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/public-search?indexer_id={first_indexer}&q=alpha"
+                ))
+                .header(header::IF_NONE_MATCH, initial_search_etag)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(
+        updated_search.status(),
+        StatusCode::OK,
+        "another replica must observe the persistent search generation"
+    );
     assert_eq!(
         second_app
             .clone()
@@ -536,7 +638,7 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
         search_count(second_app.clone(), second_indexer, "alpha").await?,
         1
     );
-    let cached = first_app
+    let cached = first_replica
         .clone()
         .oneshot(
             Request::builder()
@@ -552,7 +654,7 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
         .ok_or("missing ETag")?
         .clone();
     assert_eq!(
-        first_app
+        first_replica
             .clone()
             .oneshot(
                 Request::builder()
@@ -624,7 +726,7 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
         return Err("receipt must be a map".into());
     };
     assert_eq!(field(&fields, 5), &CanonicalValue::Unsigned(5));
-    let revoked_subject = first_app
+    let revoked_subject = first_replica
         .clone()
         .oneshot(
             Request::builder()
@@ -643,11 +745,11 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
         Some("public, max-age=2, must-revalidate")
     );
     assert_eq!(
-        search_count(first_app.clone(), first_indexer, "alpha").await?,
+        search_count(first_replica.clone(), first_indexer, "alpha").await?,
         0
     );
     assert_eq!(
-        first_app
+        first_replica
             .clone()
             .oneshot(
                 Request::builder()
@@ -673,5 +775,278 @@ async fn descriptor_head_updates_atomically_and_tombstone_cannot_be_resurrected(
             .status(),
         StatusCode::CONFLICT
     );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one public pagination, cursor rejection, and replica invalidation contract"
+)]
+async fn search_pagination_is_stable_bound_and_invalidated_across_replicas()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    let tenant = TenantId::new();
+    let indexer = IndexerId::new();
+    let now = now();
+    let descriptors = [11_u8, 22, 33].map(|seed| descriptor_version_for(seed, now, 1, None, false));
+    for descriptor in &descriptors {
+        insert_published_subject(
+            harness.admin_pool(),
+            tenant,
+            indexer,
+            descriptor,
+            "stable pagination",
+            now,
+        )
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO directory.index_cache_generations(tenant_id,indexer_id,generation,updated_at_ms) VALUES($1,$2,1,$3)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(indexer.as_uuid())
+    .bind(now)
+    .execute(harness.admin_pool())
+    .await?;
+
+    let unused_bundle = FetchedPublicBundle {
+        descriptor: descriptors[0].to_deterministic_cbor()?,
+        pages: vec![],
+    };
+    let fetcher: Arc<dyn PublicBundleFetcher> = Arc::new(FixtureFetcher {
+        failed: indexer,
+        bundle: unused_bundle,
+    });
+    let store = IndexerPgStore::from_prevalidated_pool(harness.admin_pool().clone());
+    let reader = indexer_router(store.clone(), tenant, indexer, Arc::clone(&fetcher));
+    let _writer_replica = indexer_router(store, tenant, indexer, fetcher);
+
+    let first = reader
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/public-search?indexer_id={indexer}&q=%20Stable%20%20Pagination%20&limit=1"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_etag = first
+        .headers()
+        .get(header::ETAG)
+        .ok_or("missing first page ETag")?
+        .clone();
+    let first_cursor = first
+        .headers()
+        .get("x-dtx-next-cursor")
+        .ok_or("missing first continuation")?
+        .to_str()?
+        .to_owned();
+    let first_page = decode_deterministic_cbor(&to_bytes(first.into_body(), 100_000).await?)?;
+    let CanonicalValue::Map(first_fields) = first_page else {
+        return Err("first search page must be a map".into());
+    };
+    let CanonicalValue::Array(first_results) = field(&first_fields, 2) else {
+        return Err("first search results must be an array".into());
+    };
+    assert_eq!(first_results.len(), 1);
+
+    let conditional = reader
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/public-search?indexer_id={indexer}&q=stable%20pagination&limit=1"
+                ))
+                .header(header::IF_NONE_MATCH, first_etag)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        conditional
+            .headers()
+            .get("x-dtx-next-cursor")
+            .and_then(|value| value.to_str().ok()),
+        Some(first_cursor.as_str())
+    );
+
+    for rejected_uri in [
+        format!("/v1/public-search?indexer_id={indexer}&q=different&cursor={first_cursor}"),
+        format!(
+            "/v1/public-search?indexer_id={indexer}&q=stable%20pagination&kind=agent&cursor={first_cursor}"
+        ),
+        format!(
+            "/v1/public-search?indexer_id={indexer}&q=stable%20pagination&limit=2&cursor={first_cursor}"
+        ),
+    ] {
+        assert_eq!(
+            reader
+                .clone()
+                .oneshot(Request::builder().uri(rejected_uri).body(Body::empty())?)
+                .await?
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let mut tampered = first_cursor.clone().into_bytes();
+    let last = tampered.last_mut().ok_or("empty cursor")?;
+    *last = if *last == b'A' { b'B' } else { b'A' };
+    let tampered = String::from_utf8(tampered)?;
+    assert_eq!(
+        reader
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/public-search?indexer_id={indexer}&q=stable%20pagination&cursor={tampered}"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let mut seen = Vec::new();
+    let mut cursor = Some(first_cursor.clone());
+    let CanonicalValue::Map(first_result) = &first_results[0] else {
+        return Err("search result must be a map".into());
+    };
+    let CanonicalValue::Text(first_subject) = field(first_result, 2) else {
+        return Err("search result subject must be text".into());
+    };
+    seen.push(first_subject.clone());
+    for _ in 0..3 {
+        let Some(current) = cursor.take() else {
+            break;
+        };
+        let response = reader
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/public-search?indexer_id={indexer}&q=stable%20pagination&cursor={current}"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        cursor = response
+            .headers()
+            .get("x-dtx-next-cursor")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let page = decode_deterministic_cbor(&to_bytes(response.into_body(), 100_000).await?)?;
+        let CanonicalValue::Map(fields) = page else {
+            return Err("search page must be a map".into());
+        };
+        let CanonicalValue::Array(results) = field(&fields, 2) else {
+            return Err("search results must be an array".into());
+        };
+        if results.is_empty() {
+            assert!(cursor.is_none());
+            break;
+        }
+        assert_eq!(results.len(), 1);
+        let CanonicalValue::Map(result) = &results[0] else {
+            return Err("search result must be a map".into());
+        };
+        let CanonicalValue::Text(subject) = field(result, 2) else {
+            return Err("search result subject must be text".into());
+        };
+        seen.push(subject.clone());
+    }
+    let mut sorted = seen.clone();
+    sorted.sort();
+    assert_eq!(
+        seen, sorted,
+        "equal-rank pages need a stable subject tie-break"
+    );
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen.iter().collect::<HashSet<_>>().len(), 3);
+
+    let root_before_mutation = reader
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/public-search?indexer_id={indexer}&q=stable%20pagination"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(root_before_mutation.status(), StatusCode::OK);
+    let stale_etag = root_before_mutation
+        .headers()
+        .get(header::ETAG)
+        .ok_or("missing root ETag")?
+        .clone();
+
+    let added = descriptor_version_for(44, now, 1, None, false);
+    let mut mutation = harness.admin_pool().begin().await?;
+    let added_hash = added.entry_hash()?;
+    sqlx::query(
+        "INSERT INTO directory.index_registrations(tenant_id,registration_id,indexer_id,subject_id,subject_kind,status,descriptor_sequence,descriptor_hash,descriptor_exact_cbor,feed_origin,search_document,created_at_ms,updated_at_ms) VALUES($1,$2,$3,$4,1,2,1,$5,$6,'https://feed.example','stable pagination',$7,$7)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(DirectoryRegistrationId::new().as_uuid())
+    .bind(indexer.as_uuid())
+    .bind(added.subject_id().to_string())
+    .bind(added_hash.as_bytes().as_slice())
+    .bind(added.to_deterministic_cbor()?)
+    .bind(now)
+    .execute(&mut *mutation)
+    .await?;
+    sqlx::query(
+        "UPDATE directory.index_cache_generations SET generation=2,updated_at_ms=$3 WHERE tenant_id=$1 AND indexer_id=$2 AND generation=1",
+    )
+    .bind(tenant.as_uuid())
+    .bind(indexer.as_uuid())
+    .bind(now + 1)
+    .execute(&mut *mutation)
+    .await?;
+    mutation.commit().await?;
+
+    assert_eq!(
+        reader
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/public-search?indexer_id={indexer}&q=stable%20pagination&cursor={first_cursor}"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::BAD_REQUEST,
+        "a cursor from an older durable generation must fail closed"
+    );
+    let refreshed = reader
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v1/public-search?indexer_id={indexer}&q=stable%20pagination"
+                ))
+                .header(header::IF_NONE_MATCH, stale_etag)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(
+        refreshed.status(),
+        StatusCode::OK,
+        "persistent generation must bypass another process-local cache"
+    );
+    let refreshed = decode_deterministic_cbor(&to_bytes(refreshed.into_body(), 100_000).await?)?;
+    let CanonicalValue::Map(fields) = refreshed else {
+        return Err("refreshed page must be a map".into());
+    };
+    let CanonicalValue::Array(results) = field(&fields, 2) else {
+        return Err("refreshed results must be an array".into());
+    };
+    assert_eq!(results.len(), 4);
     Ok(())
 }

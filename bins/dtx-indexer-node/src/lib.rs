@@ -13,8 +13,9 @@ use axum::{
 use dtx_domain::{DirectoryRegistrationId, IndexerId, PublicSubjectId, TenantId};
 use dtx_http_cache::{CachedBody, CachedLookup, ResponseCache};
 use dtx_indexer::{
-    IndexRegistrationRequestV1, IndexerError, PinnedOriginV1, RegistrationStatusV1,
-    VerifiedPublicBundleV1,
+    IndexRegistrationRequestV1, IndexerError, PinnedOriginV1, PublicSearchCursorV1,
+    RegistrationStatusV1, VerifiedPublicBundleV1, normalize_public_search_query,
+    public_search_scope_digest,
 };
 use dtx_public_descriptor::{PublicDescriptorKindV1, SignedPublicDescriptorV1};
 use dtx_public_feed::SignedPublicFeedEventV1;
@@ -49,6 +50,9 @@ const RATE_LIMIT: u32 = 120;
 const CACHE_NAMESPACE: &str = "public-conditional-cache-v1";
 const PUBLIC_NOT_FOUND_TTL: Duration = Duration::from_secs(2);
 const PUBLIC_NOT_FOUND_CACHE_CONTROL: &str = "public, max-age=2, must-revalidate";
+const SEARCH_DEFAULT_LIMIT: u16 = 50;
+const SEARCH_MAX_LIMIT: u16 = 50;
+const SEARCH_NEXT_CURSOR_HEADER: &str = "x-dtx-next-cursor";
 
 #[derive(Debug)]
 pub enum NodeError {
@@ -292,7 +296,7 @@ impl IndexerPgStore {
             .max_connections(max.max(1))
             .connect_with(options)
             .await?;
-        let allowed:bool=sqlx::query_scalar("SELECT directory.public_feed_runtime_authorized() AND NOT r.rolsuper AND NOT r.rolbypassrls AND current_user<>pg_get_userbyid(n.nspowner) AND has_table_privilege(current_user,'directory.index_registrations','SELECT,INSERT,UPDATE') FROM pg_roles r JOIN pg_namespace n ON n.nspname='directory' WHERE r.rolname=current_user").fetch_one(&pool).await?;
+        let allowed:bool=sqlx::query_scalar("SELECT directory.public_feed_runtime_authorized() AND NOT r.rolsuper AND NOT r.rolbypassrls AND current_user<>pg_get_userbyid(n.nspowner) AND has_table_privilege(current_user,'directory.index_registrations','SELECT,INSERT,UPDATE') AND has_table_privilege(current_user,'directory.index_cache_generations','SELECT,INSERT,UPDATE') FROM pg_roles r JOIN pg_namespace n ON n.nspname='directory' WHERE r.rolname=current_user").fetch_one(&pool).await?;
         if !allowed {
             pool.close().await;
             return Err(NodeError::UnauthorizedDatabaseRole);
@@ -486,6 +490,22 @@ impl IndexerPgStore {
             return Err(NodeError::Conflict);
         }
         sqlx::query("UPDATE directory.index_registration_attempts SET status=$5,failure_code=$6,updated_at_ms=$7 WHERE tenant_id=$1 AND indexer_id=$2 AND subject_id=$3 AND descriptor_sequence=$4 AND descriptor_hash=$8").bind(tenant.as_uuid()).bind(request.indexer_id().as_uuid()).bind(descriptor.subject_id().to_string()).bind(i64::try_from(descriptor.sequence().get()).map_err(|_|NodeError::Conflict)?).bind(status.code()).bind(failure).bind(now).bind(hash.as_bytes().as_slice()).execute(&mut*tx).await?;
+        let generation: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO directory.index_cache_generations(tenant_id,indexer_id,generation,updated_at_ms)
+             VALUES($1,$2,1,$3)
+             ON CONFLICT(tenant_id,indexer_id) DO UPDATE
+             SET generation=directory.index_cache_generations.generation+1,updated_at_ms=EXCLUDED.updated_at_ms
+             WHERE directory.index_cache_generations.generation<9007199254740991
+             RETURNING generation",
+        )
+        .bind(tenant.as_uuid())
+        .bind(request.indexer_id().as_uuid())
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if generation.is_none() {
+            return Err(NodeError::Conflict);
+        }
         tx.commit().await?;
         Ok(RegistrationReceipt {
             registration_id: request.registration_id(),
@@ -518,28 +538,110 @@ impl IndexerPgStore {
         tx.commit().await?;
         Ok(receipt)
     }
-    /// Searches published subjects within one immutable logical Indexer.
+    /// Reads the narrow durable generation guarding one logical Indexer's
+    /// complete search projection. Zero denotes an Indexer with no published
+    /// or revoked subject yet.
+    ///
+    /// # Errors
+    /// Returns an error for failed isolated database access.
+    pub async fn search_generation(
+        &self,
+        tenant: TenantId,
+        indexer: IndexerId,
+    ) -> Result<u64, NodeError> {
+        let mut tx = self.begin(tenant).await?;
+        let generation: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM directory.index_cache_generations
+             WHERE tenant_id=$1 AND indexer_id=$2",
+        )
+        .bind(tenant.as_uuid())
+        .bind(indexer.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        generation.map_or(Ok(0), |value| {
+            u64::try_from(value).map_err(|_| NodeError::Conflict)
+        })
+    }
+
+    /// Searches one stable durable generation with bounded offset pagination.
     ///
     /// # Errors
     /// Returns an error for an invalid query or failed isolated database access.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the durable search fence is bound to every public query dimension"
+    )]
     pub async fn search(
         &self,
         tenant: TenantId,
         indexer: IndexerId,
         q: &str,
         kind: Option<i16>,
+        expected_generation: u64,
+        offset: u64,
+        limit: u16,
     ) -> Result<Vec<SearchResult>, NodeError> {
-        if q.is_empty() || q.len() > 256 {
+        if normalize_public_search_query(q).as_deref() != Some(q)
+            || offset > 10_000
+            || !(1..=SEARCH_MAX_LIMIT).contains(&limit)
+        {
             return Err(NodeError::InvalidRequest);
         }
         let mut tx = self.begin(tenant).await?;
-        let rows=sqlx::query("SELECT indexer_id,subject_id,subject_kind,descriptor_exact_cbor FROM directory.index_registrations WHERE tenant_id=$1 AND indexer_id=$2 AND status=2 AND ($4::smallint IS NULL OR subject_kind=$4) AND (subject_id=$3 OR search_vector@@plainto_tsquery('simple',$3) OR search_document % $3) ORDER BY (subject_id=$3) DESC,ts_rank(search_vector,plainto_tsquery('simple',$3)) DESC,similarity(search_document,$3) DESC,subject_id LIMIT 50").bind(tenant.as_uuid()).bind(indexer.as_uuid()).bind(q).bind(kind).fetch_all(&mut*tx).await?;
+        let generation: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM directory.index_cache_generations
+             WHERE tenant_id=$1 AND indexer_id=$2
+             FOR SHARE",
+        )
+        .bind(tenant.as_uuid())
+        .bind(indexer.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let generation = generation.map_or(Ok(0), |value| {
+            u64::try_from(value).map_err(|_| NodeError::Conflict)
+        })?;
+        if generation != expected_generation {
+            return Err(NodeError::Conflict);
+        }
+        let rows=sqlx::query("SELECT indexer_id,subject_id,subject_kind,descriptor_exact_cbor FROM directory.index_registrations WHERE tenant_id=$1 AND indexer_id=$2 AND status=2 AND ($4::smallint IS NULL OR subject_kind=$4) AND (subject_id=$3 OR search_vector@@plainto_tsquery('simple',$3) OR search_document % $3) ORDER BY (subject_id=$3) DESC,ts_rank(search_vector,plainto_tsquery('simple',$3)) DESC,similarity(search_document,$3) DESC,subject_id LIMIT $5 OFFSET $6").bind(tenant.as_uuid()).bind(indexer.as_uuid()).bind(q).bind(kind).bind(i64::from(limit)).bind(i64::try_from(offset).map_err(|_|NodeError::InvalidRequest)?).fetch_all(&mut*tx).await?;
         let values = rows
             .into_iter()
             .map(|row| search_from_row(&row))
             .collect::<Result<Vec<_>, _>>()?;
         tx.commit().await?;
         Ok(values)
+    }
+
+    /// Reads the current published subject revision without loading descriptor
+    /// bytes. `None` is a stable public miss for the current database snapshot.
+    ///
+    /// # Errors
+    /// Returns an error for failed isolated database access or corrupt revision
+    /// columns.
+    pub async fn subject_revision(
+        &self,
+        tenant: TenantId,
+        indexer: IndexerId,
+        subject: PublicSubjectId,
+    ) -> Result<Option<(u64, Sha256Digest)>, NodeError> {
+        let mut tx = self.begin(tenant).await?;
+        let row=sqlx::query("SELECT descriptor_sequence,descriptor_hash FROM directory.index_registrations WHERE tenant_id=$1 AND indexer_id=$2 AND subject_id=$3 AND status=2")
+            .bind(tenant.as_uuid()).bind(indexer.as_uuid()).bind(subject.to_string()).fetch_optional(&mut*tx).await?;
+        let revision = row
+            .map(|row| {
+                let sequence = u64::try_from(row.try_get::<i64, _>("descriptor_sequence")?)
+                    .map_err(|_| NodeError::Conflict)?;
+                let hash = row
+                    .try_get::<Vec<u8>, _>("descriptor_hash")?
+                    .try_into()
+                    .map(Sha256Digest::from_bytes)
+                    .map_err(|_| NodeError::Conflict)?;
+                Ok::<(u64, Sha256Digest), NodeError>((sequence, hash))
+            })
+            .transpose()?;
+        tx.commit().await?;
+        Ok(revision)
     }
     /// Reads the exact published descriptor for a stable subject ID.
     ///
@@ -550,9 +652,13 @@ impl IndexerPgStore {
         tenant: TenantId,
         indexer: IndexerId,
         subject: PublicSubjectId,
+        expected_revision: Option<(u64, Sha256Digest)>,
     ) -> Result<Vec<u8>, NodeError> {
         let mut tx = self.begin(tenant).await?;
-        let value=sqlx::query_scalar("SELECT descriptor_exact_cbor FROM directory.index_registrations WHERE tenant_id=$1 AND indexer_id=$2 AND subject_id=$3 AND status=2").bind(tenant.as_uuid()).bind(indexer.as_uuid()).bind(subject.to_string()).fetch_optional(&mut*tx).await?.ok_or(NodeError::NotFound)?;
+        let Some((sequence, hash)) = expected_revision else {
+            return Err(NodeError::NotFound);
+        };
+        let value=sqlx::query_scalar("SELECT descriptor_exact_cbor FROM directory.index_registrations WHERE tenant_id=$1 AND indexer_id=$2 AND subject_id=$3 AND status=2 AND descriptor_sequence=$4 AND descriptor_hash=$5").bind(tenant.as_uuid()).bind(indexer.as_uuid()).bind(subject.to_string()).bind(i64::try_from(sequence).map_err(|_|NodeError::Conflict)?).bind(hash.as_bytes().as_slice()).fetch_optional(&mut*tx).await?.ok_or(NodeError::Conflict)?;
         tx.commit().await?;
         Ok(value)
     }
@@ -786,7 +892,7 @@ async fn register(State(state): State<AppState>, request: Request) -> Response {
         Ok(value) => {
             state
                 .cache
-                .invalidate(&format!("{}subject:{subject}", cache_prefix(&state)))
+                .invalidate_prefix(&format!("{}subject:{subject}:", cache_prefix(&state)))
                 .await;
             state
                 .cache
@@ -811,13 +917,19 @@ struct SearchQuery {
     q: String,
     indexer_id: String,
     kind: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u16>,
 }
+#[allow(
+    clippy::too_many_lines,
+    reason = "one HTTP boundary validates, fences, caches, and resumes a public search page"
+)]
 async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<SearchQuery>,
 ) -> Response {
-    if validated_if_none_match(&headers).is_err() || query.q.len() > 256 {
+    if validated_if_none_match(&headers).is_err() {
         return failure(StatusCode::BAD_REQUEST);
     }
     let Ok(indexer) = query.indexer_id.parse() else {
@@ -828,41 +940,104 @@ async fn search(
     }
     let kind = match query.kind.as_deref() {
         None => None,
-        Some("channel") => Some(1),
-        Some("agent") => Some(2),
+        Some("channel") => Some(1_u8),
+        Some("agent") => Some(2_u8),
         _ => return failure(StatusCode::BAD_REQUEST),
     };
-    let normalized = normalize_query(&query.q);
-    if normalized.is_empty() || normalized.len() > 256 {
+    let Some(normalized) = normalize_public_search_query(&query.q) else {
+        return failure(StatusCode::BAD_REQUEST);
+    };
+    if query
+        .limit
+        .is_some_and(|limit| !(1..=SEARCH_MAX_LIMIT).contains(&limit))
+    {
         return failure(StatusCode::BAD_REQUEST);
     }
-    if !shared_cache_eligible(&headers) {
-        return match search_bytes(&state, indexer, &normalized, kind).await {
-            Ok(bytes) => conditional_success(
-                &headers,
-                SEARCH_CONTENT_TYPE,
-                &CachedBody::new(bytes),
-                "no-store",
-            ),
-            Err(error) => map_error(&error),
+    for attempt in 0..2 {
+        let generation = match state.store.search_generation(state.tenant, indexer).await {
+            Ok(value) => value,
+            Err(error) => return map_error(&error),
         };
+        let (offset, limit) = if let Some(cursor) = query.cursor.as_deref() {
+            match PublicSearchCursorV1::decode_for(
+                cursor,
+                state.tenant,
+                indexer,
+                &normalized,
+                kind,
+                generation,
+                query.limit,
+            ) {
+                Ok(value) => (value.offset(), value.limit()),
+                Err(_) => return failure(StatusCode::BAD_REQUEST),
+            }
+        } else {
+            (0, query.limit.unwrap_or(SEARCH_DEFAULT_LIMIT))
+        };
+        let Ok(scope) = public_search_scope_digest(
+            state.tenant,
+            indexer,
+            &normalized,
+            kind,
+            generation,
+            offset,
+            limit,
+        ) else {
+            return failure(StatusCode::BAD_REQUEST);
+        };
+        let loaded = if shared_cache_eligible(&headers) {
+            let key = format!("{}search:{scope}", cache_prefix(&state));
+            state
+                .cache
+                .load(key, Duration::from_secs(15), || async {
+                    search_bytes(
+                        &state,
+                        indexer,
+                        &normalized,
+                        kind.map(i16::from),
+                        generation,
+                        offset,
+                        limit,
+                    )
+                    .await
+                })
+                .await
+                .map(|body| (body, "public, max-age=15, must-revalidate"))
+        } else {
+            search_bytes(
+                &state,
+                indexer,
+                &normalized,
+                kind.map(i16::from),
+                generation,
+                offset,
+                limit,
+            )
+            .await
+            .map(|bytes| (CachedBody::new(bytes), "no-store"))
+        };
+        match loaded {
+            Ok((body, cache_control)) => {
+                let next = match next_search_cursor(
+                    &body,
+                    state.tenant,
+                    indexer,
+                    &normalized,
+                    kind,
+                    generation,
+                    offset,
+                    limit,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return map_error(&error),
+                };
+                return conditional_search_success(&headers, &body, cache_control, next.as_deref());
+            }
+            Err(NodeError::Conflict) if query.cursor.is_none() && attempt == 0 => {}
+            Err(error) => return map_error(&error),
+        }
     }
-    let key = format!("{}search:{normalized}:{kind:?}", cache_prefix(&state));
-    match state
-        .cache
-        .load(key, Duration::from_secs(15), || async {
-            search_bytes(&state, indexer, &normalized, kind).await
-        })
-        .await
-    {
-        Ok(body) => conditional_success(
-            &headers,
-            SEARCH_CONTENT_TYPE,
-            &body,
-            "public, max-age=15, must-revalidate",
-        ),
-        Err(error) => map_error(&error),
-    }
+    failure(StatusCode::CONFLICT)
 }
 #[derive(Deserialize)]
 struct SubjectQuery {
@@ -886,53 +1061,92 @@ async fn get_subject(
     let Ok(subject) = id.parse() else {
         return failure(StatusCode::BAD_REQUEST);
     };
-    if !shared_cache_eligible(&headers) {
-        return match state.store.subject(state.tenant, indexer, subject).await {
-            Ok(bytes) => conditional_success(
-                &headers,
-                DESCRIPTOR_CONTENT_TYPE,
-                &CachedBody::new(bytes),
-                "no-store",
-            ),
-            Err(error) => map_error(&error),
+    for attempt in 0..2 {
+        let revision = match state
+            .store
+            .subject_revision(state.tenant, indexer, subject)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => return map_error(&error),
         };
+        if !shared_cache_eligible(&headers) {
+            return match state
+                .store
+                .subject(state.tenant, indexer, subject, revision)
+                .await
+            {
+                Ok(bytes) => conditional_success(
+                    &headers,
+                    DESCRIPTOR_CONTENT_TYPE,
+                    &CachedBody::new(bytes),
+                    "no-store",
+                ),
+                Err(NodeError::NotFound) => failure(StatusCode::NOT_FOUND),
+                Err(NodeError::Conflict) if attempt == 0 => continue,
+                Err(error) => map_error(&error),
+            };
+        }
+        let revision_key = revision.map_or_else(
+            || "missing".to_owned(),
+            |(sequence, digest)| format!("{sequence}:{digest}"),
+        );
+        let key = format!("{}subject:{subject}:{revision_key}", cache_prefix(&state));
+        match state
+            .cache
+            .load_optional(
+                key,
+                Duration::from_mins(1),
+                PUBLIC_NOT_FOUND_TTL,
+                || async {
+                    match state
+                        .store
+                        .subject(state.tenant, indexer, subject, revision)
+                        .await
+                    {
+                        Ok(bytes) => Ok(Some(bytes)),
+                        Err(NodeError::NotFound) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                },
+            )
+            .await
+        {
+            Ok(CachedLookup::Found(body)) => {
+                return conditional_success(
+                    &headers,
+                    DESCRIPTOR_CONTENT_TYPE,
+                    &body,
+                    "public, max-age=60, must-revalidate",
+                );
+            }
+            Ok(CachedLookup::NotFound) => return public_not_found(),
+            Err(NodeError::Conflict) if attempt == 0 => {}
+            Err(error) => return map_error(&error),
+        }
     }
-    let key = format!("{}subject:{subject}", cache_prefix(&state));
-    match state
-        .cache
-        .load_optional(
-            key,
-            Duration::from_mins(1),
-            PUBLIC_NOT_FOUND_TTL,
-            || async {
-                match state.store.subject(state.tenant, indexer, subject).await {
-                    Ok(bytes) => Ok(Some(bytes)),
-                    Err(NodeError::NotFound) => Ok(None),
-                    Err(error) => Err(error),
-                }
-            },
-        )
-        .await
-    {
-        Ok(CachedLookup::Found(body)) => conditional_success(
-            &headers,
-            DESCRIPTOR_CONTENT_TYPE,
-            &body,
-            "public, max-age=60, must-revalidate",
-        ),
-        Ok(CachedLookup::NotFound) => public_not_found(),
-        Err(error) => map_error(&error),
-    }
+    failure(StatusCode::CONFLICT)
 }
 async fn search_bytes(
     state: &AppState,
     indexer: IndexerId,
     normalized: &str,
     kind: Option<i16>,
+    generation: u64,
+    offset: u64,
+    limit: u16,
 ) -> Result<Vec<u8>, NodeError> {
     state
         .store
-        .search(state.tenant, indexer, normalized, kind)
+        .search(
+            state.tenant,
+            indexer,
+            normalized,
+            kind,
+            generation,
+            offset,
+            limit,
+        )
         .await
         .and_then(|results| {
             encode_deterministic_cbor(&SearchPage(results)).map_err(|_| NodeError::Conflict)
@@ -941,12 +1155,76 @@ async fn search_bytes(
 fn cache_prefix(state: &AppState) -> String {
     format!("{}:{}:{CACHE_NAMESPACE}:", state.tenant, state.indexer_id)
 }
-fn normalize_query(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the continuation must bind every stable search scope dimension"
+)]
+fn next_search_cursor(
+    body: &CachedBody,
+    tenant: TenantId,
+    indexer: IndexerId,
+    normalized: &str,
+    kind: Option<u8>,
+    generation: u64,
+    offset: u64,
+    limit: u16,
+) -> Result<Option<String>, NodeError> {
+    let count = search_result_count(body.bytes())?;
+    if count != usize::from(limit) {
+        return Ok(None);
+    }
+    let next_offset = offset
+        .checked_add(u64::try_from(count).map_err(|_| NodeError::Conflict)?)
+        .ok_or(NodeError::Conflict)?;
+    if next_offset > 10_000 || generation == 0 {
+        return Ok(None);
+    }
+    PublicSearchCursorV1::new(
+        tenant,
+        indexer,
+        normalized,
+        kind,
+        generation,
+        next_offset,
+        limit,
+    )
+    .and_then(|cursor| cursor.encode())
+    .map(Some)
+    .map_err(NodeError::from)
+}
+fn search_result_count(bytes: &[u8]) -> Result<usize, NodeError> {
+    let CanonicalValue::Map(fields) =
+        decode_deterministic_cbor(bytes).map_err(|_| NodeError::Conflict)?
+    else {
+        return Err(NodeError::Conflict);
+    };
+    if fields.len() != 2 {
+        return Err(NodeError::Conflict);
+    }
+    let Some(CanonicalValue::Array(results)) = fields
+        .iter()
+        .find_map(|(key, value)| (*key == CanonicalValue::Unsigned(2)).then_some(value))
+    else {
+        return Err(NodeError::Conflict);
+    };
+    Ok(results.len())
+}
+fn conditional_search_success(
+    headers: &HeaderMap,
+    body: &CachedBody,
+    cache: &'static str,
+    next_cursor: Option<&str>,
+) -> Response {
+    let mut response = conditional_success(headers, SEARCH_CONTENT_TYPE, body, cache);
+    if let Some(cursor) = next_cursor {
+        let Ok(value) = HeaderValue::from_str(cursor) else {
+            return failure(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        response
+            .headers_mut()
+            .insert(SEARCH_NEXT_CURSOR_HEADER, value);
+    }
+    response
 }
 fn conditional_success(
     headers: &HeaderMap,

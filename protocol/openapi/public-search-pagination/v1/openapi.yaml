@@ -1,0 +1,71 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Public Search Pagination V1
+  version: 1.0.0
+paths:
+  /v1/public-search:
+    get:
+      summary: Search one durable logical-Indexer generation with a query-bound continuation
+      description: >-
+        q is canonicalized by trimming, collapsing whitespace, and lowercasing. Results use the
+        stable order exact-subject match descending, full-text rank descending, trigram similarity
+        descending, then subject_id ascending. A cursor is bound to tenant, logical Indexer,
+        canonical q, kind, durable generation, offset, and limit. Malformed, stale, cross-scope,
+        or noncanonical cursors fail closed with 400. If limit is omitted with a cursor, the bound
+        limit is adopted; if supplied, it must match exactly.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 256 }
+        - name: kind
+          in: query
+          required: false
+          schema: { type: string, enum: [channel, agent] }
+        - name: indexer_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 50 }
+        - name: cursor
+          in: query
+          required: false
+          description: Canonical-CBOR PublicSearchCursorV1 encoded as unpadded base64url
+          schema: { type: string, minLength: 1, maxLength: 512, pattern: '^[A-Za-z0-9_-]+$' }
+        - name: If-None-Match
+          in: header
+          required: false
+          schema: { type: string, pattern: '^"dtx-[0-9a-f]{64}"$' }
+      responses:
+        '200':
+          description: One stable page from the current durable generation
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+            X-DTX-Next-Cursor: { $ref: '#/components/headers/NextCursor' }
+        '304':
+          description: Exact cached representation remains current; continuation is repeated when present
+          headers:
+            ETag: { $ref: '#/components/headers/ETag' }
+            Cache-Control: { $ref: '#/components/headers/CacheControl' }
+            X-DTX-Next-Cursor: { $ref: '#/components/headers/NextCursor' }
+        '400':
+          description: Invalid query, filter, limit, conditional validator, or fail-closed cursor
+        '409':
+          description: The durable generation changed while the root page was loading; retry from page one
+components:
+  headers:
+    ETag:
+      required: true
+      schema: { type: string, pattern: '^"dtx-[0-9a-f]{64}"$' }
+    CacheControl:
+      required: true
+      description: Shared public reads use max-age=15 and must-revalidate; credential-bearing reads use no-store
+      schema: { type: string }
+    NextCursor:
+      required: false
+      description: Omitted when no continuation is available
+      schema: { type: string, minLength: 1, maxLength: 512, pattern: '^[A-Za-z0-9_-]+$' }

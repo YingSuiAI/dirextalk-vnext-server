@@ -144,6 +144,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_public_feed_v1(root)?;
     validate_indexer_v1(root)?;
     validate_conditional_cache_v1(root)?;
+    validate_public_search_pagination_v1(root)?;
     validate_membership_federation_v1(root)?;
     validate_group_membership_discovery_v1(root)?;
     validate_private_messaging_artifacts(root)?;
@@ -821,6 +822,112 @@ fn validate_conditional_cache_v1(root: &Path) -> Result<(), ProtocolToolError> {
     if decode_lower_hex_fixed::<32>(advertised)? != digest {
         return Err(ProtocolToolError::new(
             "conditional cache V1 strong ETag digest mismatch",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Keep the versioned CDDL, OpenAPI, and vector audit atomic.
+fn validate_public_search_pagination_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    const BINDING_DOMAIN: &[u8] = b"dirextalk.public-search-cursor.v1\0";
+    let cddl = read(
+        &root.join("protocol/cddl/public-search-pagination/v1/public-search-pagination-v1.cddl"),
+    )?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse public search pagination V1 CDDL: {error}"))
+    })?;
+    let source = read(&root.join("protocol/openapi/public-search-pagination/v1/openapi.yaml"))?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse public search pagination V1 OpenAPI: {error}"
+        ))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "public search pagination V1 OpenAPI must declare 3.1.0",
+        ));
+    }
+    for required in [
+        "X-DTX-Next-Cursor",
+        "subject_id ascending",
+        "maximum: 50",
+        "maxLength: 512",
+        "fail closed with 400",
+        "credential-bearing reads use no-store",
+    ] {
+        if !source.contains(required) {
+            return Err(ProtocolToolError::new(format!(
+                "public search pagination V1 OpenAPI is missing {required}"
+            )));
+        }
+    }
+
+    let vector = read_json(&root.join(
+        "protocol/test-vectors/public-search-pagination/v1/public-search-pagination-v1.json",
+    ))?;
+    validate_vector_version(&vector, "public-search-pagination-v1")?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(33) {
+        return Err(ProtocolToolError::new(
+            "public search pagination V1 vector baseline must be 33",
+        ));
+    }
+    validate_uuid_fields(&vector, &["/tenant_id", "/indexer_id"])?;
+    if json_string(&vector, "cursor_binding_domain")? != "dirextalk.public-search-cursor.v1\0" {
+        return Err(ProtocolToolError::new(
+            "public search pagination V1 cursor binding domain drift",
+        ));
+    }
+    validate_cddl_hex(
+        "public-search-cursor-scope-v1",
+        &cddl,
+        json_string(&vector, "scope_canonical_cbor_hex")?,
+    )?;
+    validate_cddl_hex(
+        "public-search-cursor-v1",
+        &cddl,
+        json_string(&vector, "cursor_canonical_cbor_hex")?,
+    )?;
+    ensure_domain_digest(
+        BINDING_DOMAIN,
+        json_string(&vector, "scope_canonical_cbor_hex")?,
+        json_string(&vector, "binding_digest_hex")?,
+        "public search cursor scope",
+    )?;
+    let cursor = decode_hex(json_string(&vector, "cursor_canonical_cbor_hex")?)?;
+    let encoded = json_string(&vector, "cursor_base64url")?;
+    let decoded = Base64UrlUnpadded::decode_vec(encoded)
+        .map_err(|_| ProtocolToolError::new("public search cursor is not unpadded base64url"))?;
+    if decoded != cursor || Base64UrlUnpadded::encode_string(&decoded) != encoded {
+        return Err(ProtocolToolError::new(
+            "public search cursor base64url differs from canonical CBOR",
+        ));
+    }
+    if vector.get("max_offset").and_then(Value::as_u64) != Some(10_000)
+        || vector.get("default_limit").and_then(Value::as_u64) != Some(50)
+        || vector.get("max_limit").and_then(Value::as_u64) != Some(50)
+        || json_string(&vector, "next_cursor_header")? != "X-DTX-Next-Cursor"
+    {
+        return Err(ProtocolToolError::new(
+            "public search pagination V1 bounds/header drift",
+        ));
+    }
+    let stable_order = vector
+        .get("stable_order")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProtocolToolError::new("public search stable order vector missing"))?;
+    let expected = [
+        "exact_subject_desc",
+        "ts_rank_desc",
+        "similarity_desc",
+        "subject_id_asc",
+    ];
+    if stable_order
+        .iter()
+        .map(Value::as_str)
+        .ne(expected.into_iter().map(Some))
+    {
+        return Err(ProtocolToolError::new(
+            "public search stable order vector drift",
         ));
     }
     Ok(())

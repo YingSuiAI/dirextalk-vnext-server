@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "baseline": 33,
+  "cursor_binding_domain": "dirextalk.public-search-cursor.v1\u0000",
+  "tenant_id": "01890f00-0000-7000-8000-000000000001",
+  "indexer_id": "01890f00-0000-7000-8000-000000000002",
+  "normalized_query": "secure agent",
+  "kind": 2,
+  "generation": 7,
+  "offset": 25,
+  "limit": 25,
+  "stable_order": [
+    "exact_subject_desc",
+    "ts_rank_desc",
+    "similarity_desc",
+    "subject_id_asc"
+  ],
+  "scope_canonical_cbor_hex": "a7015001890f00000070008000000000000001025001890f00000070008000000000000002036c736563757265206167656e7404020507061819071819",
+  "binding_digest_hex": "07cc9e6b5ed7cb54a7873ee70f24cb2e490690365c8bc2a16b0527c9d5a14929",
+  "cursor_canonical_cbor_hex": "a501a201a20101020002a20101020002582007cc9e6b5ed7cb54a7873ee70f24cb2e490690365c8bc2a16b0527c9d5a149290307041819051819",
+  "cursor_base64url": "pQGiAaIBAQIAAqIBAQIAAlggB8yea17Xy1Snhz7nDyTLLkkGkDZci8KhawUnydWhSSkDBwQYGQUYGQ",
+  "next_cursor_header": "X-DTX-Next-Cursor",
+  "max_offset": 10000,
+  "default_limit": 50,
+  "max_limit": 50
+}
