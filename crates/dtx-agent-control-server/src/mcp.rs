@@ -652,7 +652,7 @@ fn references_tool() -> Value {
     json!({
         "name": REFERENCES_TOOL_NAME,
         "title": "Query Dirextalk references",
-        "description": "Queries private rooms visible to the authenticated identity and locally authoritative public Channels and posts.",
+        "description": "Queries private rooms (including group-backed private conversations) visible to the authenticated identity and locally authoritative public Channels and posts.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1100,12 +1100,14 @@ enum ReferenceTargetV1 {
 }
 
 impl ReferenceV1 {
+    // PrivateConversation is the existing scope-neutral client navigation target:
+    // both 1:1 and group-backed private rooms use the same conversation UUID.
     fn room(conversation_id: ConversationId) -> Self {
         let stable_id = conversation_id.to_string();
         let short = stable_id.get(..8).unwrap_or(&stable_id);
         Self {
             kind: "room",
-            title: format!("私密会话 {short}"),
+            title: format!("私密房间 {short}"),
             target: ReferenceTargetV1::PrivateConversation {
                 conversation_id: stable_id.clone(),
             },
@@ -1117,7 +1119,7 @@ impl ReferenceV1 {
         let stable_id = conversation_id.to_string();
         Self {
             kind: "room",
-            title: "当前私密会话".to_owned(),
+            title: "当前私密房间".to_owned(),
             target: ReferenceTargetV1::PrivateConversation {
                 conversation_id: stable_id.clone(),
             },
@@ -1453,7 +1455,7 @@ mod tests {
         http::{HeaderValue, Request, header},
         response::Response,
     };
-    use dtx_domain::ChannelId;
+    use dtx_domain::{ChannelId, ConversationId};
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -1624,7 +1626,7 @@ mod tests {
             json!([{
                 "kind": "room",
                 "stable_id": "019f75cc-f2db-7a50-8747-9f4a292f361c",
-                "title": "私密会话 019f75cc",
+                "title": "私密房间 019f75cc",
                 "target": {
                     "kind": "private_conversation",
                     "conversation_id": "019f75cc-f2db-7a50-8747-9f4a292f361c"
@@ -1811,6 +1813,24 @@ mod tests {
         assert_eq!(title.chars().count(), 120);
     }
 
+    #[test]
+    fn generated_private_room_reference_uses_scope_neutral_navigation_target() {
+        let conversation_id = ConversationId::from_str("019f75cc-f2db-7a50-8747-9f4a292f361c")
+            .expect("valid conversation ID");
+        assert_eq!(
+            serde_json::to_value(ReferenceV1::room(conversation_id)).expect("room serializes"),
+            json!({
+                "kind": "room",
+                "stable_id": conversation_id.to_string(),
+                "title": "私密房间 019f75cc",
+                "target": {
+                    "kind": "private_conversation",
+                    "conversation_id": conversation_id.to_string()
+                }
+            })
+        );
+    }
+
     #[tokio::test]
     async fn agent_bearer_sees_only_reference_tool_and_no_resources() {
         let router = mcp_router_with_backend(Arc::new(FakeBackend {
@@ -1853,7 +1873,7 @@ mod tests {
         let expected = json!([{
             "kind": "room",
             "stable_id": conversation_id,
-            "title": "当前私密会话",
+            "title": "当前私密房间",
             "target": {
                 "kind": "private_conversation",
                 "conversation_id": conversation_id

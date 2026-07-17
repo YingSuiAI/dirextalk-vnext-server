@@ -171,6 +171,7 @@ async fn mcp_reference_queries_filter_private_rooms_and_return_public_facts()
     let tenant_id = Uuid::now_v7();
     let visible_identity = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la".to_owned();
     let foreign_identity = "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobiq".to_owned();
+    let other_group_member = "dtxi1sff4d5opynr3adqmxu4c66uz5zchoj6eb7i7ndbkzr6oet2vwm5q".to_owned();
     let owned_room = Uuid::now_v7();
     let joined_room = Uuid::now_v7();
     let foreign_room = Uuid::now_v7();
@@ -194,11 +195,14 @@ async fn mcp_reference_queries_filter_private_rooms_and_return_public_facts()
     sqlx::query(
         "INSERT INTO groups.members(
              tenant_id, scope_kind, scope_id, identity_id, admitted_at_ms
-         ) VALUES($1, 'private_conversation', $2, $3, 1)",
+         ) VALUES
+             ($1, 'private_conversation', $2, $3, 1),
+             ($1, 'private_conversation', $2, $4, 1)",
     )
     .bind(tenant_id)
     .bind(joined_room.to_string())
     .bind(&visible_identity)
+    .bind(&other_group_member)
     .execute(harness.admin_pool())
     .await?;
     let channel_id = format!("dtxc1c{}", "a".repeat(51));
@@ -246,6 +250,16 @@ async fn mcp_reference_queries_filter_private_rooms_and_return_public_facts()
     assert!(visible.contains(&owned_room.to_string()));
     assert!(visible.contains(&joined_room.to_string()));
     assert!(!visible.contains(&foreign_room.to_string()));
+
+    let group_member_visible: Vec<String> = sqlx::query_scalar(
+        "SELECT scope_id
+           FROM groups.mcp_visible_private_conversations($1, $2, '', 32)",
+    )
+    .bind(tenant_id)
+    .bind(&other_group_member)
+    .fetch_all(&mut *transaction)
+    .await?;
+    assert_eq!(group_member_visible, vec![joined_room.to_string()]);
 
     let one: Vec<String> = sqlx::query_scalar(
         "SELECT scope_id
