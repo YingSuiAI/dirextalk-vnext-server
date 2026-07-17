@@ -40,7 +40,8 @@ const FEDERATED_KEY_PACKAGE_CLAIMS_MIGRATION_VERSION: i64 = 202_607_160_033;
 const PUBLIC_CACHE_GENERATIONS_MIGRATION_VERSION: i64 = 202_607_160_034;
 const AGENT_RUN_RUNTIME_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_170_035;
 const GROUP_MEMBER_REMOVAL_V32_MIGRATION_VERSION: i64 = 202_607_170_036;
-const EXPECTED_MIGRATION_COUNT: i64 = 36;
+const MCP_REFERENCE_QUERIES_MIGRATION_VERSION: i64 = 202_607_170_037;
+const EXPECTED_MIGRATION_COUNT: i64 = 37;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -116,6 +117,8 @@ const AGENT_RUN_RUNTIME_PRIVILEGES_UP: &str =
     include_str!("../../../migrations/202607170035_agent_run_runtime_privileges.up.sql");
 const GROUP_MEMBER_REMOVAL_V32_DOWN: &str =
     include_str!("../../../migrations/202607170036_group_member_removal_v32.down.sql");
+const MCP_REFERENCE_QUERIES_DOWN: &str =
+    include_str!("../../../migrations/202607170037_mcp_reference_queries.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -132,6 +135,127 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(applied, EXPECTED_MIGRATION_COUNT);
     assert_eq!(visible, applied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_reference_queries_filter_private_rooms_and_return_public_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    MigrationRunner::new().run(harness.admin_pool()).await?;
+    let tenant_id = Uuid::now_v7();
+    let visible_identity = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la".to_owned();
+    let foreign_identity = "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobiq".to_owned();
+    let owned_room = Uuid::now_v7();
+    let joined_room = Uuid::now_v7();
+    let foreign_room = Uuid::now_v7();
+    for (room, owner) in [
+        (owned_room, &visible_identity),
+        (joined_room, &foreign_identity),
+        (foreign_room, &foreign_identity),
+    ] {
+        sqlx::query(
+            "INSERT INTO groups.policy_heads(
+                 tenant_id, scope_kind, scope_id, owner_identity_id,
+                 policy_revision, created_at_ms, updated_at_ms
+             ) VALUES($1, 'private_conversation', $2, $3, 1, 1, 1)",
+        )
+        .bind(tenant_id)
+        .bind(room.to_string())
+        .bind(owner)
+        .execute(harness.admin_pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO groups.members(
+             tenant_id, scope_kind, scope_id, identity_id, admitted_at_ms
+         ) VALUES($1, 'private_conversation', $2, $3, 1)",
+    )
+    .bind(tenant_id)
+    .bind(joined_room.to_string())
+    .bind(&visible_identity)
+    .execute(harness.admin_pool())
+    .await?;
+    let channel_id = format!("dtxc1c{}", "a".repeat(51));
+    sqlx::query(
+        "INSERT INTO directory.public_subjects(
+             tenant_id, subject_id, subject_kind, publisher_identity_id,
+             publisher_signing_key, descriptor_head_sequence, descriptor_head_hash,
+             descriptor_expires_at_ms
+         ) VALUES($1, $2, 1, $3, $4, 1, $5, 2_000_000_000_000)",
+    )
+    .bind(tenant_id)
+    .bind(&channel_id)
+    .bind(&visible_identity)
+    .bind(vec![42_u8; 32])
+    .bind(vec![43_u8; 32])
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO directory.feed_entries(
+             tenant_id, subject_id, sequence, entry_hash, published_at_ms,
+             exact_cbor, tombstone
+         ) VALUES($1, $2, 7, $3, 1, $4, false)",
+    )
+    .bind(tenant_id)
+    .bind(&channel_id)
+    .bind(vec![44_u8; 32])
+    .bind(vec![1_u8])
+    .execute(harness.admin_pool())
+    .await?;
+
+    let mut transaction = harness.runtime_pool().begin().await?;
+    sqlx::query("SELECT set_config('dtx.tenant_id', $1, true)")
+        .bind(tenant_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    let visible: Vec<String> = sqlx::query_scalar(
+        "SELECT scope_id
+           FROM groups.mcp_visible_private_conversations($1, $2, '', 32)",
+    )
+    .bind(tenant_id)
+    .bind(&visible_identity)
+    .fetch_all(&mut *transaction)
+    .await?;
+    assert_eq!(visible.len(), 2);
+    assert!(visible.contains(&owned_room.to_string()));
+    assert!(visible.contains(&joined_room.to_string()));
+    assert!(!visible.contains(&foreign_room.to_string()));
+
+    let one: Vec<String> = sqlx::query_scalar(
+        "SELECT scope_id
+           FROM groups.mcp_visible_private_conversations($1, $2, $3, 32)",
+    )
+    .bind(tenant_id)
+    .bind(&visible_identity)
+    .bind(joined_room.to_string())
+    .fetch_all(&mut *transaction)
+    .await?;
+    assert_eq!(one, vec![joined_room.to_string()]);
+    let none: Vec<String> = sqlx::query_scalar(
+        "SELECT scope_id
+           FROM groups.mcp_visible_private_conversations($1, $2, 'no-match', 32)",
+    )
+    .bind(tenant_id)
+    .bind(&visible_identity)
+    .fetch_all(&mut *transaction)
+    .await?;
+    assert!(none.is_empty());
+    let public_facts: Vec<(i16, String, Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT reference_kind, subject_id, sequence, exact_cbor
+           FROM directory.mcp_public_reference_facts($1, 6, 256, 1)",
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    assert_eq!(
+        public_facts,
+        vec![
+            (2, channel_id.clone(), None, None),
+            (3, channel_id, Some(7), Some(vec![1_u8])),
+        ]
+    );
+    transaction.rollback().await?;
     Ok(())
 }
 
@@ -360,7 +484,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -398,8 +522,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(PUBLIC_CACHE_GENERATIONS_MIGRATION_VERSION)
     .bind(AGENT_RUN_RUNTIME_PRIVILEGES_MIGRATION_VERSION)
     .bind(GROUP_MEMBER_REMOVAL_V32_MIGRATION_VERSION)
+    .bind(MCP_REFERENCE_QUERIES_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(MCP_REFERENCE_QUERIES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(GROUP_MEMBER_REMOVAL_V32_DOWN)
         .execute(harness.admin_pool())
         .await?;
@@ -649,6 +777,15 @@ async fn runtime_role_is_non_owner_rls_bound_and_has_no_ddl()
     .fetch_one(harness.admin_pool())
     .await?;
     assert_eq!(direct_group_table_grants, 0);
+    let direct_directory_table_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM information_schema.table_privileges
+          WHERE grantee = 'dtx_runtime_test'
+            AND table_schema = 'directory'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(direct_directory_table_grants, 0);
     let private_owner_assertion_available: bool = sqlx::query_scalar(
         "SELECT has_function_privilege(
                     'dtx_runtime_test',
@@ -659,6 +796,18 @@ async fn runtime_role_is_non_owner_rls_bound_and_has_no_ddl()
     .fetch_one(harness.admin_pool())
     .await?;
     assert!(private_owner_assertion_available);
+    for function in [
+        "groups.mcp_visible_private_conversations(uuid,text,text,integer)",
+        "directory.mcp_public_reference_facts(uuid,integer,integer,bigint)",
+    ] {
+        let available: bool = sqlx::query_scalar(
+            "SELECT has_function_privilege('dtx_runtime_test', $1::regprocedure, 'EXECUTE')",
+        )
+        .bind(function)
+        .fetch_one(harness.admin_pool())
+        .await?;
+        assert!(available, "{function} must be the only MCP read capability");
+    }
     assert_append_only_tables_have_no_update(&harness).await?;
 
     assert!(

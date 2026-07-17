@@ -824,6 +824,7 @@ dependencies = [
  "dtx-domain",
  "dtx-identity-log",
  "dtx-identity-persistence",
+ "dtx-public-feed",
  "dtx-security",
  "dtx-storage",
  "dtx-testkit",

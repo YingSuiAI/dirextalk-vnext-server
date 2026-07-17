@@ -75,6 +75,14 @@ const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[
         "groups.private_conversation_owner_authorized(uuid,uuid,text)",
         "EXECUTE",
     ),
+    (
+        "groups.mcp_visible_private_conversations(uuid,text,text,integer)",
+        "EXECUTE",
+    ),
+    (
+        "directory.mcp_public_reference_facts(uuid,integer,integer,bigint)",
+        "EXECUTE",
+    ),
 ];
 const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.hosts", "SELECT"),

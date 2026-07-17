@@ -369,9 +369,14 @@ impl PostgresHarness {
              -- function. The test runtime gets the same narrow capability,
              -- never direct access to groups.policy_heads.
              GRANT USAGE ON SCHEMA groups TO dtx_runtime_test;
-             GRANT EXECUTE ON FUNCTION groups.private_conversation_owner_authorized(uuid, uuid, text)
-                TO dtx_runtime_test;
-             GRANT SELECT, INSERT ON agent.conversation_grant_owner_operations
+              GRANT EXECUTE ON FUNCTION groups.private_conversation_owner_authorized(uuid, uuid, text)
+                 TO dtx_runtime_test;
+              GRANT EXECUTE ON FUNCTION groups.mcp_visible_private_conversations(uuid, text, text, integer)
+                 TO dtx_runtime_test;
+              GRANT USAGE ON SCHEMA directory TO dtx_runtime_test;
+              GRANT EXECUTE ON FUNCTION directory.mcp_public_reference_facts(uuid, integer, integer, bigint)
+                 TO dtx_runtime_test;
+              GRANT SELECT, INSERT ON agent.conversation_grant_owner_operations
                 TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.connector_binding_state_owner_operations
                 TO dtx_runtime_test;

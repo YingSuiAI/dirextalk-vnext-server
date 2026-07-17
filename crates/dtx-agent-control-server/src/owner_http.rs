@@ -288,6 +288,20 @@ pub trait AgentProvisioningOwnerBackend: Send + Sync + 'static {
     ) -> OwnerBackendFuture<'_> {
         Box::pin(async { Err(AgentProvisioningOwnerError::InvalidRequest) })
     }
+    /// Returns bounded references visible to the authenticated Owner device.
+    ///
+    /// The conservative default prevents alternate backends from inventing a
+    /// room, Channel, or post authorization source.
+    fn query_mcp_references(
+        &self,
+        _credential: DeviceSessionCredential,
+        _query: String,
+        _kind_mask: u8,
+        _limit: u16,
+        _now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async { Err(AgentProvisioningOwnerError::InvalidRequest) })
+    }
     fn lifecycle(
         &self,
         credential: DeviceSessionCredential,
@@ -580,6 +594,28 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                 query,
                 now,
                 ConnectorProjectionRepresentation::V4,
+            )
+            .await
+        })
+    }
+
+    fn query_mcp_references(
+        &self,
+        credential: DeviceSessionCredential,
+        query: String,
+        kind_mask: u8,
+        limit: u16,
+        now: UtcMillis,
+    ) -> OwnerBackendFuture<'_> {
+        Box::pin(async move {
+            crate::mcp::query_postgres_references(
+                &self.store,
+                self.tenant_id,
+                credential,
+                query,
+                kind_mask,
+                limit,
+                now,
             )
             .await
         })
