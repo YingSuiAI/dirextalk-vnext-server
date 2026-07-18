@@ -1,0 +1,8 @@
+{
+  "version": 35,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/proto/dirextalk/agent_control/v1_4/agent_control.proto": "sha256:2f546fded10942f1ac8fa9c3a33928ffb89fa02d53de768a4a11b2812d376a05"
+  }
+}

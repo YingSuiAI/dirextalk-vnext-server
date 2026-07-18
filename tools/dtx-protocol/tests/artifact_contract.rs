@@ -76,6 +76,47 @@ fn private_agent_approval_v6_v7_is_a_disjoint_validated_v34_contract() {
 }
 
 #[test]
+fn restored_v23_and_additive_v35_are_disjoint_and_frozen() {
+    let root = repository_root();
+    let v23_path = root.join("protocol/baseline/v23/manifest.json");
+    let v35_path = root.join("protocol/baseline/v35/manifest.json");
+    let v23_before = fs::read(&v23_path).expect("V23 manifest is present");
+    let v35_before = fs::read(&v35_path).expect("V35 manifest is present");
+    let v23: Value = serde_json::from_slice(&v23_before).expect("V23 manifest is valid JSON");
+    let v35: Value = serde_json::from_slice(&v35_before).expect("V35 manifest is valid JSON");
+
+    assert_eq!(v23["version"].as_u64(), Some(23));
+    assert_eq!(
+        v23["artifacts"]["protocol/proto/dirextalk/agent_control/v1_3/agent_control.proto"]
+            .as_str(),
+        Some("sha256:6395d9d80f249c1197758c5168bf7aa05498031baacd47db1d929754a503eb60")
+    );
+    assert_eq!(v35["version"].as_u64(), Some(35));
+    let v35_artifacts = v35["artifacts"].as_object().expect("V35 artifacts");
+    assert_eq!(v35_artifacts.len(), 1);
+    let v1_4_path = "protocol/proto/dirextalk/agent_control/v1_4/agent_control.proto";
+    let mut digest = String::from("sha256:");
+    for byte in Sha256::digest(fs::read(root.join(v1_4_path)).expect("V1.4 source")) {
+        write!(&mut digest, "{byte:02x}").unwrap();
+    }
+    assert_eq!(
+        v35_artifacts.get(v1_4_path).and_then(Value::as_str),
+        Some(digest.as_str())
+    );
+    assert!(
+        v23["artifacts"]
+            .as_object()
+            .expect("V23 artifacts")
+            .keys()
+            .all(|path| !v35_artifacts.contains_key(path))
+    );
+
+    freeze_baseline(&root).expect("published baselines verify without refreezing");
+    assert_eq!(fs::read(v23_path).unwrap(), v23_before);
+    assert_eq!(fs::read(v35_path).unwrap(), v35_before);
+}
+
+#[test]
 fn freezing_a_new_version_preserves_the_published_v1_manifest() {
     let root = isolated_protocol_tree();
     let v1 = root.join("protocol/baseline/v1/manifest.json");

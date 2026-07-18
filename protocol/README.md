@@ -88,7 +88,8 @@ Layout:
   self-certifying Agent identity/device and an opaque, one-time provisioning
   handoff. Agent Control 1.3 adds only a Connector-signed sidecar recipient,
   the durable sealed-capsule delivery command, and installed/rejected results;
-  it does not add secrets or plaintext to Run grants.
+  it does not add secrets or plaintext to Run grants. Its Protobuf source is
+  retained byte-for-byte; later AgentRoute fields do not belong to V23.
   `baseline/v30/manifest.json` freezes peer conversation admission, Membership
   V2, federated Membership V2, and MLS Sequencer V3. Candidate `KeyPackage`,
   join, and approval digests are bound end to end; the server treats admission
@@ -103,6 +104,12 @@ Layout:
   operational servers, relays, Agent Control, and storage still treat the MLS
   plaintext as opaque and never decode or persist approval title, detail, or
   payload bytes.
+  `baseline/v35/manifest.json` independently freezes Agent Control 1.4. It is
+  the additive wire-compatible home of the opaque, fenced AgentRoute bootstrap
+  fields and preserves every earlier package, service, message, field number,
+  and durable command byte. Negotiated minor 1.5 reuses this exact codec and
+  changes only the ordinary-ACK rule after an expired recipient has been
+  durably retired; runtime peers continue to negotiate supported minors 2–5.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen
