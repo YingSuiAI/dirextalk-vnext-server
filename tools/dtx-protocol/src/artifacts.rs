@@ -25,6 +25,10 @@ const PRIVATE_EVENT_MLS_GROUP_ID_DOMAIN: &[u8] = b"dirextalk.mls-group-id.conver
 const PRIVATE_EVENT_MLS_CIPHERTEXT_DIGEST_DOMAIN: &[u8] =
     b"dirextalk.private-event-mls-ciphertext.v1\0";
 const PRIVATE_EVENT_MAX_MLS_CIPHERTEXT_BYTES: usize = 262_144;
+const PRIVATE_AGENT_APPROVAL_BASELINE: u64 = 34;
+const PRIVATE_AGENT_APPROVAL_MAX_REQUEST_TTL_MS: i64 = 300_000;
+const PRIVATE_AGENT_APPROVAL_MAX_TITLE_SCALARS: usize = 120;
+const PRIVATE_AGENT_APPROVAL_MAX_DETAIL_BYTES: usize = 4_096;
 const CONTACT_CARD_QR_PREFIX: &str = "dtxc1:";
 const CONTACT_CARD_MAX_DECODED_CBOR_BYTES: usize = 4_096;
 const CONTACT_CARD_MAX_UNPADDED_BASE64URL_CHARS: usize =
@@ -1204,8 +1208,974 @@ fn validate_public_feed_v1(root: &Path) -> Result<(), ProtocolToolError> {
 
 fn validate_private_messaging_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_private_event_v1(root)?;
+    validate_private_agent_approval_v6_v7(root)?;
     validate_mls_sequencer_v1(root)?;
     validate_mls_sequencer_v2(root)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateAgentApprovalShape {
+    Request {
+        version: u64,
+        runtime: u64,
+        action: u64,
+    },
+    Decision {
+        version: u64,
+        decision: u64,
+    },
+}
+
+#[allow(clippy::too_many_lines)] // The V34 gate keeps every frozen JSON ordinal and vector family together.
+fn validate_private_agent_approval_v6_v7(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl_path =
+        root.join("protocol/cddl/private-event/v6_v7/private-agent-approval-v6-v7.cddl");
+    let cddl = read(&cddl_path)?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse private Agent approval V6/V7 CDDL {}: {error}",
+            cddl_path.display()
+        ))
+    })?;
+
+    let vector = read_json(
+        &root.join("protocol/test-vectors/private-event/v6_v7/private-agent-approval-v6-v7.json"),
+    )?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "baseline",
+            "wire_versions",
+            "ordinals",
+            "max_canonical_cbor_bytes",
+            "max_request_ttl_ms",
+            "max_title_unicode_scalars",
+            "max_detail_utf8_bytes",
+            "events",
+            "invalid_events",
+        ],
+        "private Agent approval V6/V7 vector",
+    )?;
+    if vector.get("baseline").and_then(Value::as_u64) != Some(PRIVATE_AGENT_APPROVAL_BASELINE)
+        || vector
+            .get("max_canonical_cbor_bytes")
+            .and_then(Value::as_u64)
+            != Some(PRIVATE_EVENT_MAX_ENCODED_BYTES as u64)
+        || vector.get("max_request_ttl_ms").and_then(Value::as_i64)
+            != Some(PRIVATE_AGENT_APPROVAL_MAX_REQUEST_TTL_MS)
+        || vector
+            .get("max_title_unicode_scalars")
+            .and_then(Value::as_u64)
+            != Some(PRIVATE_AGENT_APPROVAL_MAX_TITLE_SCALARS as u64)
+        || vector.get("max_detail_utf8_bytes").and_then(Value::as_u64)
+            != Some(PRIVATE_AGENT_APPROVAL_MAX_DETAIL_BYTES as u64)
+    {
+        return Err(ProtocolToolError::new(
+            "private Agent approval V6/V7 baseline or bounds drifted",
+        ));
+    }
+
+    require_exact_u64_object(
+        vector.get("wire_versions").ok_or_else(|| {
+            ProtocolToolError::new("private Agent approval wire_versions are missing")
+        })?,
+        &[("existing_approval", 6), ("hermes_request", 7)],
+        "private Agent approval wire_versions",
+    )?;
+    let ordinals = vector
+        .get("ordinals")
+        .ok_or_else(|| ProtocolToolError::new("private Agent approval ordinals are missing"))?;
+    require_exact_object_keys(
+        ordinals,
+        &[
+            "event_kinds",
+            "runtimes",
+            "payload_kinds",
+            "action_kinds",
+            "decisions",
+        ],
+        "private Agent approval ordinals",
+    )?;
+    require_exact_u64_object(
+        ordinals.get("event_kinds").ok_or_else(|| {
+            ProtocolToolError::new("private Agent approval event kind ordinals are missing")
+        })?,
+        &[("request", 6), ("decision", 7)],
+        "private Agent approval event kind ordinals",
+    )?;
+    require_exact_u64_object(
+        ordinals.get("runtimes").ok_or_else(|| {
+            ProtocolToolError::new("private Agent approval runtime ordinals are missing")
+        })?,
+        &[("codex", 1), ("openclaw", 2), ("hermes", 3)],
+        "private Agent approval runtime ordinals",
+    )?;
+    require_exact_u64_object(
+        ordinals.get("payload_kinds").ok_or_else(|| {
+            ProtocolToolError::new("private Agent approval payload ordinals are missing")
+        })?,
+        &[("request", 1), ("decision", 2)],
+        "private Agent approval payload ordinals",
+    )?;
+    require_exact_u64_object(
+        ordinals.get("action_kinds").ok_or_else(|| {
+            ProtocolToolError::new("private Agent approval action ordinals are missing")
+        })?,
+        &[
+            ("command", 1),
+            ("file_change", 2),
+            ("mcp_tool_call", 3),
+            ("other", 4),
+        ],
+        "private Agent approval action ordinals",
+    )?;
+    require_exact_u64_object(
+        ordinals.get("decisions").ok_or_else(|| {
+            ProtocolToolError::new("private Agent approval decision ordinals are missing")
+        })?,
+        &[("allow_once", 1), ("deny", 2)],
+        "private Agent approval decision ordinals",
+    )?;
+
+    let events = vector
+        .get("events")
+        .and_then(Value::as_array)
+        .filter(|events| events.len() == 4)
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "private Agent approval V6/V7 vector must contain exactly four valid events",
+            )
+        })?;
+    let mut labels = BTreeSet::new();
+    for event in events {
+        let label = json_string(event, "label")?;
+        if !labels.insert(label) {
+            return Err(ProtocolToolError::new(
+                "private Agent approval valid event labels must be unique",
+            ));
+        }
+        validate_private_agent_approval_vector_entry(event, &cddl)?;
+    }
+    if labels
+        != BTreeSet::from([
+            "v6_codex_command",
+            "v6_openclaw_file_change",
+            "v6_allow_once_decision_for_hermes",
+            "v7_hermes_other",
+        ])
+    {
+        return Err(ProtocolToolError::new(
+            "private Agent approval valid event labels drifted",
+        ));
+    }
+    validate_private_agent_approval_hermes_decision_linkage(events)?;
+
+    let invalid_events = vector
+        .get("invalid_events")
+        .and_then(Value::as_array)
+        .filter(|events| events.len() == 4)
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "private Agent approval V6/V7 vector must contain exactly four invalid relabelings",
+            )
+        })?;
+    let mut invalid_labels = BTreeSet::new();
+    for event in invalid_events {
+        require_exact_object_keys(
+            event,
+            &["label", "canonical_cbor_hex"],
+            "private Agent approval invalid event",
+        )?;
+        let label = json_string(event, "label")?;
+        if !invalid_labels.insert(label) {
+            return Err(ProtocolToolError::new(
+                "private Agent approval invalid event labels must be unique",
+            ));
+        }
+        validate_private_agent_approval_invalid_event(event, &cddl)?;
+    }
+    if invalid_labels
+        != BTreeSet::from([
+            "v6_hermes_request",
+            "v7_codex_request",
+            "v7_openclaw_request",
+            "v7_decision",
+        ])
+    {
+        return Err(ProtocolToolError::new(
+            "private Agent approval invalid event labels drifted",
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_u64_object(
+    value: &Value,
+    expected: &[(&str, u64)],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    let expected_keys = expected.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+    require_exact_object_keys(value, &expected_keys, label)?;
+    if expected.iter().all(|(key, expected_value)| {
+        value.get(*key).and_then(Value::as_u64) == Some(*expected_value)
+    }) {
+        Ok(())
+    } else {
+        Err(ProtocolToolError::new(format!(
+            "{label} values do not match the frozen contract"
+        )))
+    }
+}
+
+fn validate_private_agent_approval_hermes_decision_linkage(
+    events: &[Value],
+) -> Result<(), ProtocolToolError> {
+    let request = events
+        .iter()
+        .find(|event| event.get("label").and_then(Value::as_str) == Some("v7_hermes_other"))
+        .ok_or_else(|| {
+            ProtocolToolError::new("private Agent approval Hermes request is missing")
+        })?;
+    let decision = events
+        .iter()
+        .find(|event| {
+            event.get("label").and_then(Value::as_str) == Some("v6_allow_once_decision_for_hermes")
+        })
+        .ok_or_else(|| {
+            ProtocolToolError::new("private Agent approval Hermes decision is missing")
+        })?;
+    for field in ["conversation_id", "run_id"] {
+        if json_string(decision, field)? != json_string(request, field)? {
+            return Err(ProtocolToolError::new(format!(
+                "private Agent approval Hermes decision {field} must match its request"
+            )));
+        }
+    }
+    if json_string(decision, "parent_event_id")? != json_string(request, "event_id")? {
+        return Err(ProtocolToolError::new(
+            "private Agent approval Hermes decision must parent its V7 request",
+        ));
+    }
+    let request_payload = request.get("payload").ok_or_else(|| {
+        ProtocolToolError::new("private Agent approval Hermes payload is missing")
+    })?;
+    let decision_payload = decision.get("payload").ok_or_else(|| {
+        ProtocolToolError::new("private Agent approval Hermes decision payload is missing")
+    })?;
+    if json_string(decision_payload, "request_digest_hex")?
+        != json_string(request_payload, "request_digest_hex")?
+    {
+        return Err(ProtocolToolError::new(
+            "private Agent approval Hermes decision digest must match its request",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // JSON semantics and the exact eleven-field CBOR are one vector boundary.
+fn validate_private_agent_approval_vector_entry(
+    event: &Value,
+    cddl: &str,
+) -> Result<(), ProtocolToolError> {
+    require_exact_object_keys(
+        event,
+        &[
+            "label",
+            "version",
+            "event_id",
+            "conversation_id",
+            "author_identity_id",
+            "author_device_id",
+            "created_at_ms",
+            "kind",
+            "parent_event_id",
+            "run_id",
+            "payload",
+            "canonical_cbor_hex",
+        ],
+        "private Agent approval valid event",
+    )?;
+    let label = json_string(event, "label")?;
+    let version = private_agent_approval_json_u64(event, "version", label)?;
+    if !matches!(version, 6 | 7) {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} version must be 6 or 7"
+        )));
+    }
+    let event_id = json_string(event, "event_id")?;
+    let conversation_id = json_string(event, "conversation_id")?;
+    let author_identity_id = json_string(event, "author_identity_id")?;
+    let author_device_id = json_string(event, "author_device_id")?;
+    let parent_event_id = json_string(event, "parent_event_id")?;
+    let run_id = json_string(event, "run_id")?;
+    for (value, field) in [
+        (event_id, "event_id"),
+        (conversation_id, "conversation_id"),
+        (author_device_id, "author_device_id"),
+        (parent_event_id, "parent_event_id"),
+        (run_id, "run_id"),
+    ] {
+        validate_uuid_v7(value).map_err(|error| {
+            ProtocolToolError::new(format!(
+                "private Agent approval {label} {field} is invalid: {error}"
+            ))
+        })?;
+    }
+    if parent_event_id == event_id {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} parent cannot equal event_id"
+        )));
+    }
+    validate_identity_id(
+        author_identity_id,
+        &format!("private Agent approval {label} author_identity_id"),
+    )?;
+    let created_at_ms = json_i64(event, "created_at_ms")?;
+    let created_at = UtcMillis::new(created_at_ms).map_err(|_| {
+        ProtocolToolError::new(format!(
+            "private Agent approval {label} created_at_ms must be valid UTC milliseconds"
+        ))
+    })?;
+    let kind = private_agent_approval_json_u64(event, "kind", label)?;
+    if !matches!(kind, 6 | 7) {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} kind must be request=6 or decision=7"
+        )));
+    }
+    let payload = event.get("payload").ok_or_else(|| {
+        ProtocolToolError::new(format!("private Agent approval {label} payload is missing"))
+    })?;
+    let (payload, shape) =
+        build_private_agent_approval_payload(payload, version, kind, created_at_ms, label)?;
+    if !private_agent_approval_shape_is_allowed(shape) {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} version/runtime combination is forbidden"
+        )));
+    }
+    if private_agent_approval_expected_valid_shape(label) != Some(shape) {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} no longer proves its frozen ordinal combination"
+        )));
+    }
+
+    let canonical = CanonicalValue::Map(vec![
+        (
+            CanonicalValue::Unsigned(1),
+            CanonicalValue::Unsigned(version),
+        ),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(event_id.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(conversation_id.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(author_identity_id.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(author_device_id.to_owned()),
+        ),
+        (CanonicalValue::Unsigned(6), created_at.to_canonical_value()),
+        (CanonicalValue::Unsigned(7), CanonicalValue::Unsigned(kind)),
+        (
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Array(vec![CanonicalValue::Text(parent_event_id.to_owned())]),
+        ),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Text(String::new()),
+        ),
+        (
+            CanonicalValue::Unsigned(10),
+            CanonicalValue::Text(run_id.to_owned()),
+        ),
+        (CanonicalValue::Unsigned(11), payload),
+    ]);
+    let rebuilt = encode_deterministic_cbor(&canonical).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "encode private Agent approval {label} canonical CBOR: {error}"
+        ))
+    })?;
+    if rebuilt.len() > PRIVATE_EVENT_MAX_ENCODED_BYTES {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} exceeds 66383 canonical CBOR bytes"
+        )));
+    }
+    let golden = decode_hex(json_string(event, "canonical_cbor_hex")?)?;
+    if rebuilt != golden {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} canonical CBOR drift: actual {}",
+            lowercase_hex(&rebuilt)
+        )));
+    }
+    let decoded = decode_strict_private_agent_approval_cbor(&golden, label)?;
+    if decoded != canonical || validate_relaxed_private_agent_approval_event(&decoded)? != shape {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} canonical field linkage drifted"
+        )));
+    }
+    cddl_cat::validate_cbor_bytes("private-agent-approval-event-v6-v7", cddl, &golden).map_err(
+        |error| {
+            ProtocolToolError::new(format!(
+                "private Agent approval {label} CDDL union rejected: {error}"
+            ))
+        },
+    )
+}
+
+fn private_agent_approval_json_u64(
+    value: &Value,
+    key: &str,
+    label: &str,
+) -> Result<u64, ProtocolToolError> {
+    value.get(key).and_then(Value::as_u64).ok_or_else(|| {
+        ProtocolToolError::new(format!(
+            "private Agent approval {label} {key} must be an unsigned integer"
+        ))
+    })
+}
+
+fn build_private_agent_approval_payload(
+    payload: &Value,
+    version: u64,
+    kind: u64,
+    created_at_ms: i64,
+    label: &str,
+) -> Result<(CanonicalValue, PrivateAgentApprovalShape), ProtocolToolError> {
+    match kind {
+        6 => build_private_agent_approval_request_payload(payload, version, created_at_ms, label),
+        7 => build_private_agent_approval_decision_payload(payload, version, label),
+        _ => Err(ProtocolToolError::new(
+            "private Agent approval event kind must be 6 or 7",
+        )),
+    }
+}
+
+fn build_private_agent_approval_request_payload(
+    payload: &Value,
+    version: u64,
+    created_at_ms: i64,
+    label: &str,
+) -> Result<(CanonicalValue, PrivateAgentApprovalShape), ProtocolToolError> {
+    require_exact_object_keys(
+        payload,
+        &[
+            "payload_kind",
+            "runtime",
+            "action_kind",
+            "title_utf8_hex",
+            "detail_utf8_hex",
+            "request_digest_hex",
+            "expires_at_ms",
+        ],
+        &format!("private Agent approval {label} request payload"),
+    )?;
+    if private_agent_approval_json_u64(payload, "payload_kind", label)? != 1 {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} request payload kind must be 1"
+        )));
+    }
+    let runtime = private_agent_approval_json_u64(payload, "runtime", label)?;
+    if !(1..=3).contains(&runtime) {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} runtime must be 1, 2, or 3"
+        )));
+    }
+    let action = private_agent_approval_json_u64(payload, "action_kind", label)?;
+    if !(1..=4).contains(&action) {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} action kind must be 1 through 4"
+        )));
+    }
+    let title = decode_private_agent_approval_utf8_hex(payload, "title_utf8_hex", label)?;
+    validate_private_agent_approval_title(&title)?;
+    let detail = decode_private_agent_approval_utf8_hex(payload, "detail_utf8_hex", label)?;
+    validate_private_agent_approval_detail(&detail)?;
+    let digest = decode_lower_hex_fixed::<32>(json_string(payload, "request_digest_hex")?)?;
+    validate_private_agent_approval_digest(&digest)?;
+    let expires_at_ms = json_i64(payload, "expires_at_ms")?;
+    let expires_at = UtcMillis::new(expires_at_ms).map_err(|_| {
+        ProtocolToolError::new(format!(
+            "private Agent approval {label} expires_at_ms must be valid UTC milliseconds"
+        ))
+    })?;
+    validate_private_agent_approval_ttl(created_at_ms, expires_at_ms)?;
+    Ok((
+        CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Unsigned(runtime),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Unsigned(action),
+            ),
+            (CanonicalValue::Unsigned(4), CanonicalValue::Text(title)),
+            (CanonicalValue::Unsigned(5), CanonicalValue::Text(detail)),
+            (
+                CanonicalValue::Unsigned(6),
+                CanonicalValue::Bytes(digest.to_vec()),
+            ),
+            (CanonicalValue::Unsigned(7), expires_at.to_canonical_value()),
+        ]),
+        PrivateAgentApprovalShape::Request {
+            version,
+            runtime,
+            action,
+        },
+    ))
+}
+
+fn build_private_agent_approval_decision_payload(
+    payload: &Value,
+    version: u64,
+    label: &str,
+) -> Result<(CanonicalValue, PrivateAgentApprovalShape), ProtocolToolError> {
+    require_exact_object_keys(
+        payload,
+        &["payload_kind", "request_digest_hex", "decision"],
+        &format!("private Agent approval {label} decision payload"),
+    )?;
+    if private_agent_approval_json_u64(payload, "payload_kind", label)? != 2 {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} decision payload kind must be 2"
+        )));
+    }
+    let digest = decode_lower_hex_fixed::<32>(json_string(payload, "request_digest_hex")?)?;
+    validate_private_agent_approval_digest(&digest)?;
+    let decision = private_agent_approval_json_u64(payload, "decision", label)?;
+    if !(1..=2).contains(&decision) {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} decision must be 1 or 2"
+        )));
+    }
+    Ok((
+        CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Bytes(digest.to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Unsigned(decision),
+            ),
+        ]),
+        PrivateAgentApprovalShape::Decision { version, decision },
+    ))
+}
+
+fn decode_private_agent_approval_utf8_hex(
+    value: &Value,
+    field: &str,
+    label: &str,
+) -> Result<String, ProtocolToolError> {
+    String::from_utf8(decode_hex(json_string(value, field)?)?).map_err(|_| {
+        ProtocolToolError::new(format!(
+            "private Agent approval {label} {field} must contain valid UTF-8"
+        ))
+    })
+}
+
+fn private_agent_approval_expected_valid_shape(label: &str) -> Option<PrivateAgentApprovalShape> {
+    match label {
+        "v6_codex_command" => Some(PrivateAgentApprovalShape::Request {
+            version: 6,
+            runtime: 1,
+            action: 1,
+        }),
+        "v6_openclaw_file_change" => Some(PrivateAgentApprovalShape::Request {
+            version: 6,
+            runtime: 2,
+            action: 2,
+        }),
+        "v6_allow_once_decision_for_hermes" => Some(PrivateAgentApprovalShape::Decision {
+            version: 6,
+            decision: 1,
+        }),
+        "v7_hermes_other" => Some(PrivateAgentApprovalShape::Request {
+            version: 7,
+            runtime: 3,
+            action: 4,
+        }),
+        _ => None,
+    }
+}
+
+const fn private_agent_approval_shape_is_allowed(shape: PrivateAgentApprovalShape) -> bool {
+    matches!(
+        shape,
+        PrivateAgentApprovalShape::Request {
+            version: 6,
+            runtime: 1 | 2,
+            ..
+        } | PrivateAgentApprovalShape::Request {
+            version: 7,
+            runtime: 3,
+            ..
+        } | PrivateAgentApprovalShape::Decision { version: 6, .. }
+    )
+}
+
+fn validate_private_agent_approval_invalid_event(
+    event: &Value,
+    cddl: &str,
+) -> Result<(), ProtocolToolError> {
+    let label = json_string(event, "label")?;
+    let bytes = decode_hex(json_string(event, "canonical_cbor_hex")?)?;
+    let decoded = decode_strict_private_agent_approval_cbor(&bytes, label)?;
+    let shape = validate_relaxed_private_agent_approval_event(&decoded)?;
+    if private_agent_approval_shape_is_allowed(shape) {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval invalid vector {label} is an allowed version combination"
+        )));
+    }
+    if private_agent_approval_expected_invalid_shape(label) != Some(shape) {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval invalid vector {label} is not its exact forbidden relabeling"
+        )));
+    }
+    if cddl_cat::validate_cbor_bytes("private-agent-approval-event-v6-v7", cddl, &bytes).is_ok() {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval CDDL union accepted forbidden relabeling {label}"
+        )));
+    }
+    Ok(())
+}
+
+fn private_agent_approval_expected_invalid_shape(label: &str) -> Option<PrivateAgentApprovalShape> {
+    match label {
+        "v6_hermes_request" => Some(PrivateAgentApprovalShape::Request {
+            version: 6,
+            runtime: 3,
+            action: 1,
+        }),
+        "v7_codex_request" => Some(PrivateAgentApprovalShape::Request {
+            version: 7,
+            runtime: 1,
+            action: 1,
+        }),
+        "v7_openclaw_request" => Some(PrivateAgentApprovalShape::Request {
+            version: 7,
+            runtime: 2,
+            action: 1,
+        }),
+        "v7_decision" => Some(PrivateAgentApprovalShape::Decision {
+            version: 7,
+            decision: 1,
+        }),
+        _ => None,
+    }
+}
+
+fn decode_strict_private_agent_approval_cbor(
+    bytes: &[u8],
+    label: &str,
+) -> Result<CanonicalValue, ProtocolToolError> {
+    if bytes.len() > PRIVATE_EVENT_MAX_ENCODED_BYTES {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} exceeds 66383 canonical CBOR bytes"
+        )));
+    }
+    let decoded = decode_deterministic_cbor(bytes).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "private Agent approval {label} is not strict canonical CBOR: {error}"
+        ))
+    })?;
+    let reencoded = encode_deterministic_cbor(&decoded).map_err(|error| {
+        ProtocolToolError::new(format!("re-encode private Agent approval {label}: {error}"))
+    })?;
+    if reencoded != bytes {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval {label} changed under canonical re-encoding"
+        )));
+    }
+    Ok(decoded)
+}
+
+#[allow(clippy::too_many_lines)] // The relaxed decoder proves forbidden vectors differ only by version/runtime pairing.
+fn validate_relaxed_private_agent_approval_event(
+    value: &CanonicalValue,
+) -> Result<PrivateAgentApprovalShape, ProtocolToolError> {
+    let fields = private_agent_approval_map_fields(value, 11, "event")?;
+    let version = private_agent_approval_unsigned(fields[0], "event version")?;
+    if !matches!(version, 6 | 7) {
+        return Err(ProtocolToolError::new(
+            "private Agent approval event version must be 6 or 7",
+        ));
+    }
+    let event_id = private_agent_approval_text(fields[1], "event_id")?;
+    let conversation_id = private_agent_approval_text(fields[2], "conversation_id")?;
+    let author_identity_id = private_agent_approval_text(fields[3], "author_identity_id")?;
+    let author_device_id = private_agent_approval_text(fields[4], "author_device_id")?;
+    for (value, field) in [
+        (event_id, "event_id"),
+        (conversation_id, "conversation_id"),
+        (author_device_id, "author_device_id"),
+    ] {
+        validate_uuid_v7(value).map_err(|error| {
+            ProtocolToolError::new(format!(
+                "private Agent approval decoded {field} is invalid: {error}"
+            ))
+        })?;
+    }
+    validate_identity_id(
+        author_identity_id,
+        "private Agent approval decoded author_identity_id",
+    )?;
+    let created_at_ms = private_agent_approval_utc(fields[5], "created_at_ms")?.get();
+    let kind = private_agent_approval_unsigned(fields[6], "event kind")?;
+    if !matches!(kind, 6 | 7) {
+        return Err(ProtocolToolError::new(
+            "private Agent approval decoded kind must be 6 or 7",
+        ));
+    }
+    let CanonicalValue::Array(parents) = fields[7] else {
+        return Err(ProtocolToolError::new(
+            "private Agent approval decoded parents must be an array",
+        ));
+    };
+    if parents.len() != 1 {
+        return Err(ProtocolToolError::new(
+            "private Agent approval decoded event must have exactly one parent",
+        ));
+    }
+    let parent = private_agent_approval_text(&parents[0], "parent_event_id")?;
+    validate_uuid_v7(parent)?;
+    if parent == event_id {
+        return Err(ProtocolToolError::new(
+            "private Agent approval decoded parent cannot equal event_id",
+        ));
+    }
+    if fields[8] != &CanonicalValue::Text(String::new()) {
+        return Err(ProtocolToolError::new(
+            "private Agent approval decoded body must be empty text",
+        ));
+    }
+    let run_id = private_agent_approval_text(fields[9], "run_id")?;
+    validate_uuid_v7(run_id)?;
+
+    match kind {
+        6 => {
+            let payload = private_agent_approval_map_fields(fields[10], 7, "request payload")?;
+            if private_agent_approval_unsigned(payload[0], "request payload kind")? != 1 {
+                return Err(ProtocolToolError::new(
+                    "private Agent approval decoded request payload kind must be 1",
+                ));
+            }
+            let runtime = private_agent_approval_unsigned(payload[1], "runtime")?;
+            if !(1..=3).contains(&runtime) {
+                return Err(ProtocolToolError::new(
+                    "private Agent approval decoded runtime must be 1, 2, or 3",
+                ));
+            }
+            let action = private_agent_approval_unsigned(payload[2], "action kind")?;
+            if !(1..=4).contains(&action) {
+                return Err(ProtocolToolError::new(
+                    "private Agent approval decoded action kind must be 1 through 4",
+                ));
+            }
+            validate_private_agent_approval_title(private_agent_approval_text(
+                payload[3],
+                "request title",
+            )?)?;
+            validate_private_agent_approval_detail(private_agent_approval_text(
+                payload[4],
+                "request detail",
+            )?)?;
+            validate_private_agent_approval_digest(private_agent_approval_bytes(
+                payload[5],
+                "request digest",
+            )?)?;
+            let expires_at_ms = private_agent_approval_utc(payload[6], "expires_at_ms")?.get();
+            validate_private_agent_approval_ttl(created_at_ms, expires_at_ms)?;
+            Ok(PrivateAgentApprovalShape::Request {
+                version,
+                runtime,
+                action,
+            })
+        }
+        7 => {
+            let payload = private_agent_approval_map_fields(fields[10], 3, "decision payload")?;
+            if private_agent_approval_unsigned(payload[0], "decision payload kind")? != 2 {
+                return Err(ProtocolToolError::new(
+                    "private Agent approval decoded decision payload kind must be 2",
+                ));
+            }
+            validate_private_agent_approval_digest(private_agent_approval_bytes(
+                payload[1],
+                "request digest",
+            )?)?;
+            let decision = private_agent_approval_unsigned(payload[2], "decision")?;
+            if !(1..=2).contains(&decision) {
+                return Err(ProtocolToolError::new(
+                    "private Agent approval decoded decision must be 1 or 2",
+                ));
+            }
+            Ok(PrivateAgentApprovalShape::Decision { version, decision })
+        }
+        _ => unreachable!("approval kind was constrained above"),
+    }
+}
+
+fn private_agent_approval_map_fields<'a>(
+    value: &'a CanonicalValue,
+    expected_len: usize,
+    label: &str,
+) -> Result<Vec<&'a CanonicalValue>, ProtocolToolError> {
+    let CanonicalValue::Map(entries) = value else {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval decoded {label} must be a map"
+        )));
+    };
+    if entries.len() != expected_len {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval decoded {label} field set drifted"
+        )));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, (key, value))| {
+            let expected = u64::try_from(index + 1).expect("approval field count is bounded");
+            if key == &CanonicalValue::Unsigned(expected) {
+                Ok(value)
+            } else {
+                Err(ProtocolToolError::new(format!(
+                    "private Agent approval decoded {label} has an unknown or missing field"
+                )))
+            }
+        })
+        .collect()
+}
+
+fn private_agent_approval_unsigned(
+    value: &CanonicalValue,
+    label: &str,
+) -> Result<u64, ProtocolToolError> {
+    let CanonicalValue::Unsigned(value) = value else {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval decoded {label} must be unsigned"
+        )));
+    };
+    Ok(*value)
+}
+
+fn private_agent_approval_text<'a>(
+    value: &'a CanonicalValue,
+    label: &str,
+) -> Result<&'a str, ProtocolToolError> {
+    let CanonicalValue::Text(value) = value else {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval decoded {label} must be text"
+        )));
+    };
+    Ok(value)
+}
+
+fn private_agent_approval_bytes<'a>(
+    value: &'a CanonicalValue,
+    label: &str,
+) -> Result<&'a [u8], ProtocolToolError> {
+    let CanonicalValue::Bytes(value) = value else {
+        return Err(ProtocolToolError::new(format!(
+            "private Agent approval decoded {label} must be bytes"
+        )));
+    };
+    Ok(value)
+}
+
+fn private_agent_approval_utc(
+    value: &CanonicalValue,
+    label: &str,
+) -> Result<UtcMillis, ProtocolToolError> {
+    let raw = match value {
+        CanonicalValue::Unsigned(value) => i64::try_from(*value).map_err(|_| {
+            ProtocolToolError::new(format!(
+                "private Agent approval decoded {label} exceeds i64"
+            ))
+        })?,
+        CanonicalValue::Negative(value) => *value,
+        _ => {
+            return Err(ProtocolToolError::new(format!(
+                "private Agent approval decoded {label} must be an integer"
+            )));
+        }
+    };
+    UtcMillis::new(raw).map_err(|_| {
+        ProtocolToolError::new(format!(
+            "private Agent approval decoded {label} must be valid UTC milliseconds"
+        ))
+    })
+}
+
+fn validate_private_agent_approval_title(value: &str) -> Result<(), ProtocolToolError> {
+    let scalar_count = value.chars().count();
+    if !(1..=PRIVATE_AGENT_APPROVAL_MAX_TITLE_SCALARS).contains(&scalar_count)
+        || value
+            .chars()
+            .any(|character| character.is_control() || is_bidi_control(character))
+    {
+        return Err(ProtocolToolError::new(
+            "private Agent approval title must contain 1..120 safe Unicode scalars",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_private_agent_approval_detail(value: &str) -> Result<(), ProtocolToolError> {
+    if value.len() > PRIVATE_AGENT_APPROVAL_MAX_DETAIL_BYTES
+        || value.chars().any(|character| {
+            (character.is_control() && !matches!(character, '\n' | '\t'))
+                || is_bidi_control(character)
+        })
+    {
+        return Err(ProtocolToolError::new(
+            "private Agent approval detail must be at most 4096 safe UTF-8 bytes",
+        ));
+    }
+    Ok(())
+}
+
+const fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn validate_private_agent_approval_digest(value: &[u8]) -> Result<(), ProtocolToolError> {
+    if value.len() != 32 || value.iter().all(|byte| *byte == 0) {
+        return Err(ProtocolToolError::new(
+            "private Agent approval request digest must be 32 nonzero bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_private_agent_approval_ttl(
+    created_at_ms: i64,
+    expires_at_ms: i64,
+) -> Result<(), ProtocolToolError> {
+    let ttl = expires_at_ms
+        .checked_sub(created_at_ms)
+        .ok_or_else(|| ProtocolToolError::new("private Agent approval request TTL overflowed"))?;
+    if (1..=PRIVATE_AGENT_APPROVAL_MAX_REQUEST_TTL_MS).contains(&ttl) {
+        Ok(())
+    } else {
+        Err(ProtocolToolError::new(
+            "private Agent approval request TTL must be 1..=300000 milliseconds",
+        ))
+    }
 }
 
 fn validate_mls_sequencer_v2(root: &Path) -> Result<(), ProtocolToolError> {
@@ -4968,6 +5938,23 @@ mod tests {
             cddl,
             decode_hex(event["canonical_cbor_hex"].as_str().unwrap()).unwrap(),
         )
+    }
+
+    #[test]
+    fn private_agent_approval_text_semantics_reject_layout_and_bidi_spoofing() {
+        assert!(validate_private_agent_approval_title(&"𐀀".repeat(120)).is_ok());
+        assert!(validate_private_agent_approval_title(&"𐀀".repeat(121)).is_err());
+        assert!(validate_private_agent_approval_detail("line one\n\tline two").is_ok());
+        for unsafe_character in ['\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}'] {
+            assert!(
+                validate_private_agent_approval_title(&format!("unsafe{unsafe_character}"))
+                    .is_err()
+            );
+            assert!(
+                validate_private_agent_approval_detail(&format!("unsafe{unsafe_character}"))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

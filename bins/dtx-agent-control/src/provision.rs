@@ -425,7 +425,7 @@ impl AcceptanceArguments {
             }
         }
         if (phase == AcceptancePhase::Prepare && !dry_run && handoff_file.is_none())
-            || (phase == AcceptancePhase::Finalize && facts_files.len() != 2)
+            || (phase == AcceptancePhase::Finalize && facts_files.is_empty())
             || (phase == AcceptancePhase::Prepare && !facts_files.is_empty())
             || (phase == AcceptancePhase::Finalize && handoff_file.is_some())
         {
@@ -892,7 +892,10 @@ fn validate_and_sort_acceptance_plan(
     plan: &mut AcceptancePlan,
     now_millis: i64,
 ) -> Result<(), AcceptanceError> {
-    if plan.schema != ACCEPTANCE_PLAN_SCHEMA || plan.version != 1 || plan.agents.len() != 2 {
+    if plan.schema != ACCEPTANCE_PLAN_SCHEMA
+        || plan.version != 1
+        || !(1..=2).contains(&plan.agents.len())
+    {
         return Err(AcceptanceError::Plan);
     }
     plan.agents.sort_by_key(|agent| agent.connector_id);
@@ -916,7 +919,7 @@ fn validate_and_sort_acceptance_plan(
             || !is_canonical_https_origin(&agent.server_origin)
             || !matches!(
                 agent.adapter_kind,
-                AdapterCode::Codex | AdapterCode::OpenClawAcp
+                AdapterCode::Codex | AdapterCode::OpenClawAcp | AdapterCode::HermesAcp
             )
             || !adapters.insert(agent.adapter_kind)
             || !connector_ids.insert(agent.connector_id)
@@ -929,7 +932,10 @@ fn validate_and_sort_acceptance_plan(
             return Err(AcceptanceError::Plan);
         }
     }
-    if adapters != BTreeSet::from([AdapterCode::Codex, AdapterCode::OpenClawAcp]) {
+    let codex = BTreeSet::from([AdapterCode::Codex]);
+    let codex_openclaw = BTreeSet::from([AdapterCode::Codex, AdapterCode::OpenClawAcp]);
+    let codex_hermes = BTreeSet::from([AdapterCode::Codex, AdapterCode::HermesAcp]);
+    if adapters != codex && adapters != codex_openclaw && adapters != codex_hermes {
         return Err(AcceptanceError::Plan);
     }
     Ok(())
@@ -2540,6 +2546,12 @@ mod tests {
         }
     }
 
+    fn hermes_acceptance_plan() -> AcceptancePlan {
+        let mut plan = acceptance_plan();
+        plan.agents[1].adapter_kind = AdapterCode::HermesAcp;
+        plan
+    }
+
     fn acceptance_facts(plan: &AcceptancePlan) -> Vec<AcceptanceFacts> {
         let keys = [
             Ed25519PublicKey::try_from([
@@ -2663,10 +2675,105 @@ mod tests {
             parse_acceptance_plan(unknown.as_bytes()).err(),
             Some(AcceptanceError::Plan)
         );
-        decoded.agents[1].adapter_kind = AdapterCode::Codex;
+    }
+
+    #[test]
+    fn hermes_acceptance_handoff_and_authority_facts_round_trip() {
+        let mut plan = hermes_acceptance_plan();
+        validate_and_sort_acceptance_plan(&mut plan, 1_800_000_000_000).unwrap();
+        let encoded = serde_json::to_vec(&plan).unwrap();
+        let digest = domain_digest(ACCEPTANCE_PLAN_DIGEST_DOMAIN, &encoded);
+        let handoff = generate_acceptance_handoff(&plan, digest).unwrap();
+        validate_acceptance_handoff(&handoff, &plan, digest, 1_800_000_000_001).unwrap();
+        let mut facts = acceptance_facts(&plan);
+        validate_and_sort_acceptance_facts(&mut facts, &plan).unwrap();
+    }
+
+    #[test]
+    fn acceptance_plan_allows_only_exact_host_local_adapter_sets() {
+        let mut codex_only = acceptance_plan();
+        codex_only
+            .agents
+            .retain(|agent| agent.adapter_kind == AdapterCode::Codex);
+        validate_and_sort_acceptance_plan(&mut codex_only, 1_800_000_000_000)
+            .expect("a fresh Windows Codex-only Host is supported");
+
+        let mut codex_openclaw = acceptance_plan();
+        validate_and_sort_acceptance_plan(&mut codex_openclaw, 1_800_000_000_000)
+            .expect("the existing Codex plus OpenClaw Host remains supported");
+
+        let mut codex_hermes = hermes_acceptance_plan();
+        validate_and_sort_acceptance_plan(&mut codex_hermes, 1_800_000_000_000)
+            .expect("the future Codex plus Hermes Host is supported");
+
+        let mut openclaw_only = acceptance_plan();
+        openclaw_only.agents.remove(0);
         assert_eq!(
-            validate_and_sort_acceptance_plan(&mut decoded, 1_800_000_000_000),
+            validate_and_sort_acceptance_plan(&mut openclaw_only, 1_800_000_000_000),
             Err(AcceptanceError::Plan)
+        );
+
+        let mut hermes_only = hermes_acceptance_plan();
+        hermes_only.agents.remove(0);
+        assert_eq!(
+            validate_and_sort_acceptance_plan(&mut hermes_only, 1_800_000_000_000),
+            Err(AcceptanceError::Plan)
+        );
+
+        let mut duplicate = acceptance_plan();
+        duplicate.agents[1].adapter_kind = AdapterCode::Codex;
+        assert_eq!(
+            validate_and_sort_acceptance_plan(&mut duplicate, 1_800_000_000_000),
+            Err(AcceptanceError::Plan)
+        );
+
+        let mut triplet = acceptance_plan();
+        let third = serde_json::from_slice(
+            &serde_json::to_vec(&triplet.agents[0]).expect("serialize third plan entry"),
+        )
+        .expect("deserialize third plan entry");
+        triplet.agents.push(third);
+        assert_eq!(
+            validate_and_sort_acceptance_plan(&mut triplet, 1_800_000_000_000),
+            Err(AcceptanceError::Plan)
+        );
+
+        for (exact, approximate) in [("openclaw_acp", "openclaw"), ("hermes_acp", "hermes")] {
+            let encoded = String::from_utf8(serde_json::to_vec(&codex_hermes).unwrap())
+                .unwrap()
+                .replace("hermes_acp", exact)
+                .replacen(exact, approximate, 1);
+            assert_eq!(
+                parse_acceptance_plan(encoded.as_bytes()).err(),
+                Some(AcceptanceError::Plan)
+            );
+        }
+    }
+
+    #[test]
+    fn acceptance_facts_match_the_selected_plan_count_and_installations() {
+        let mut pair = hermes_acceptance_plan();
+        validate_and_sort_acceptance_plan(&mut pair, 1_800_000_000_000).unwrap();
+        let pair_facts = acceptance_facts(&pair);
+
+        let mut codex_only = acceptance_plan();
+        codex_only
+            .agents
+            .retain(|agent| agent.adapter_kind == AdapterCode::Codex);
+        validate_and_sort_acceptance_plan(&mut codex_only, 1_800_000_000_000).unwrap();
+        let mut codex_facts = acceptance_facts(&codex_only);
+        validate_and_sort_acceptance_facts(&mut codex_facts, &codex_only)
+            .expect("one exact Codex fact matches the Codex-only plan");
+
+        let mut excess_facts = pair_facts;
+        assert_eq!(
+            validate_and_sort_acceptance_facts(&mut excess_facts, &codex_only),
+            Err(AcceptanceError::FactsConflict)
+        );
+        let mut wrong_runtime_fact = vec![excess_facts.remove(1)];
+        assert_eq!(
+            validate_and_sort_acceptance_facts(&mut wrong_runtime_fact, &codex_only),
+            Err(AcceptanceError::FactsConflict)
         );
     }
 
@@ -2708,7 +2815,23 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_finalize_requires_exactly_two_facts_files() {
+    fn acceptance_finalize_accepts_one_or_two_facts_files() {
+        let one = AcceptanceArguments::parse([
+            OsString::from("dtx-agent-provision"),
+            OsString::from("acceptance-finalize"),
+            OsString::from("--config-file"),
+            OsString::from("agent-control.json"),
+            OsString::from("--database-url-file"),
+            OsString::from("database-url"),
+            OsString::from("--plan-file"),
+            OsString::from("plan.json"),
+            OsString::from("--facts-file"),
+            OsString::from("codex-facts.json"),
+            OsString::from("--dry-run"),
+        ])
+        .unwrap();
+        assert_eq!(one.facts_files.len(), 1);
+
         let parsed = AcceptanceArguments::parse([
             OsString::from("dtx-agent-provision"),
             OsString::from("acceptance-finalize"),

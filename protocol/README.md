@@ -94,6 +94,15 @@ Layout:
   join, and approval digests are bound end to end; the server treats admission
   capsules and MLS payloads as opaque, and response-loss retries converge on
   the original durable receipt or confirmation leaf.
+  `baseline/v34/manifest.json` disjointly freezes the already-deployed private
+  Agent approval V6 contract and the Hermes-only V7 request without changing
+  the private-event V1/V20 artifacts. V6 requests admit only Codex=1 and
+  OpenClaw=2, and all approval decisions remain V6; V7 admits only Hermes=3
+  requests. Relabeling a V6 Hermes request, a V7 Codex/OpenClaw request, or a V7
+  decision is invalid. These artifacts exist for native consumer conformance:
+  operational servers, relays, Agent Control, and storage still treat the MLS
+  plaintext as opaque and never decode or persist approval title, detail, or
+  payload bytes.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

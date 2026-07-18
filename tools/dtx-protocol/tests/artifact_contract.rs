@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -6,6 +7,8 @@ use std::{
 };
 
 use dtx_protocol::{check_breaking, freeze_baseline, validate_artifacts};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -34,6 +37,42 @@ fn private_application_event_v1_is_part_of_the_validated_frozen_contract() {
             .is_file()
     );
     validate_artifacts(&root).expect("private application event vectors must be byte exact");
+}
+
+#[test]
+fn private_agent_approval_v6_v7_is_a_disjoint_validated_v34_contract() {
+    let root = repository_root();
+    let artifact_paths = [
+        "protocol/cddl/private-event/v6_v7/private-agent-approval-v6-v7.cddl",
+        "protocol/test-vectors/private-event/v6_v7/private-agent-approval-v6-v7.json",
+    ];
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(root.join("protocol/baseline/v34/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["version"].as_u64(), Some(34));
+    assert_eq!(manifest["events"].as_object().unwrap().len(), 0);
+    assert_eq!(manifest["errors"].as_object().unwrap().len(), 0);
+    let artifacts = manifest["artifacts"].as_object().unwrap();
+    assert_eq!(artifacts.len(), artifact_paths.len());
+    for path in artifact_paths {
+        let mut digest = String::from("sha256:");
+        for byte in Sha256::digest(fs::read(root.join(path)).unwrap()) {
+            write!(&mut digest, "{byte:02x}").unwrap();
+        }
+        assert_eq!(
+            artifacts.get(path).and_then(Value::as_str),
+            Some(digest.as_str())
+        );
+    }
+
+    let v20 = fs::read(root.join("protocol/baseline/v20/manifest.json")).unwrap();
+    validate_artifacts(&root).expect("private approval V6/V7 vectors must be byte exact");
+    assert_eq!(
+        fs::read(root.join("protocol/baseline/v20/manifest.json")).unwrap(),
+        v20,
+        "validating approvals must not mutate the private-event V1/V20 baseline",
+    );
 }
 
 #[test]

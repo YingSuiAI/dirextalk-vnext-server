@@ -1,0 +1,99 @@
+; Dirextalk private Agent approval V6/V7 delta (baseline V34).
+;
+; These bytes exist only inside MLS application ciphertext. Servers, relays,
+; Agent Control, and storage MUST treat them as opaque MLS plaintext and MUST
+; NOT decode, persist, or log fields 9 or 11.
+;
+; V6 is the already-deployed approval contract: requests admit only Codex=1 or
+; OpenClaw=2, and every approval decision is encoded as V6. V7 is request-only
+; and admits only Hermes=3. A V6 Hermes request, V7 Codex/OpenClaw request, or
+; V7 decision is invalid rather than an additive interpretation of V6.
+
+private-agent-approval-uuid-v7-v6-v7 = tstr .size 36
+private-agent-approval-author-identity-v6-v7 = tstr .size 57
+private-agent-approval-utc-millis-v6-v7 = -62135596800000..253402300799999
+private-agent-approval-digest-v6-v7 = bstr .size 32
+
+; Title is additionally limited to 120 Unicode scalar values. The 480-byte
+; CDDL ceiling permits 120 four-byte scalars; semantic validation rejects
+; controls and bidi formatting characters. Detail is at most 4096 UTF-8 bytes,
+; permits only LF/TAB controls, and rejects the same bidi characters.
+private-agent-approval-title-v6-v7 = tstr .size (1..480)
+private-agent-approval-detail-v6-v7 = tstr .size (0..4096)
+
+private-agent-approval-action-v6-v7 = 1 / 2 / 3 / 4
+private-agent-approval-decision-v6 = 1 / 2
+private-agent-approval-runtime-v6 = 1 / 2
+
+private-agent-approval-request-payload-v6 = {
+  1: 1, ; request payload
+  2: private-agent-approval-runtime-v6,
+  3: private-agent-approval-action-v6-v7,
+  4: private-agent-approval-title-v6-v7,
+  5: private-agent-approval-detail-v6-v7,
+  6: private-agent-approval-digest-v6-v7,
+  7: private-agent-approval-utc-millis-v6-v7
+}
+
+private-agent-approval-decision-payload-v6 = {
+  1: 2, ; decision payload
+  2: private-agent-approval-digest-v6-v7,
+  3: private-agent-approval-decision-v6
+}
+
+private-agent-approval-request-payload-v7 = {
+  1: 1, ; request payload
+  2: 3, ; Hermes
+  3: private-agent-approval-action-v6-v7,
+  4: private-agent-approval-title-v6-v7,
+  5: private-agent-approval-detail-v6-v7,
+  6: private-agent-approval-digest-v6-v7,
+  7: private-agent-approval-utc-millis-v6-v7
+}
+
+private-agent-approval-request-event-v6 = {
+  1: 6,
+  2: private-agent-approval-uuid-v7-v6-v7,
+  3: private-agent-approval-uuid-v7-v6-v7,
+  4: private-agent-approval-author-identity-v6-v7,
+  5: private-agent-approval-uuid-v7-v6-v7,
+  6: private-agent-approval-utc-millis-v6-v7,
+  7: 6, ; Agent approval request event kind
+  8: [private-agent-approval-uuid-v7-v6-v7],
+  9: "",
+  10: private-agent-approval-uuid-v7-v6-v7,
+  11: private-agent-approval-request-payload-v6
+}
+
+private-agent-approval-decision-event-v6 = {
+  1: 6,
+  2: private-agent-approval-uuid-v7-v6-v7,
+  3: private-agent-approval-uuid-v7-v6-v7,
+  4: private-agent-approval-author-identity-v6-v7,
+  5: private-agent-approval-uuid-v7-v6-v7,
+  6: private-agent-approval-utc-millis-v6-v7,
+  7: 7, ; Agent approval decision event kind
+  8: [private-agent-approval-uuid-v7-v6-v7],
+  9: "",
+  10: private-agent-approval-uuid-v7-v6-v7,
+  11: private-agent-approval-decision-payload-v6
+}
+
+private-agent-approval-request-event-v7 = {
+  1: 7,
+  2: private-agent-approval-uuid-v7-v6-v7,
+  3: private-agent-approval-uuid-v7-v6-v7,
+  4: private-agent-approval-author-identity-v6-v7,
+  5: private-agent-approval-uuid-v7-v6-v7,
+  6: private-agent-approval-utc-millis-v6-v7,
+  7: 6, ; Agent approval request event kind
+  8: [private-agent-approval-uuid-v7-v6-v7],
+  9: "",
+  10: private-agent-approval-uuid-v7-v6-v7,
+  11: private-agent-approval-request-payload-v7
+}
+
+private-agent-approval-event-v6-v7 =
+  private-agent-approval-request-event-v6 /
+  private-agent-approval-decision-event-v6 /
+  private-agent-approval-request-event-v7

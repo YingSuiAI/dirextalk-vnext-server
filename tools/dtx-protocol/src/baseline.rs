@@ -163,6 +163,10 @@ const V33_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/public-search-pagination/v1",
     "protocol/test-vectors/public-search-pagination/v1",
 ];
+const V34_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/private-event/v6_v7",
+    "protocol/test-vectors/private-event/v6_v7",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -376,6 +380,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v33/manifest.json",
         includes_registries: false,
         artifact_paths: V33_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 34,
+        path: "protocol/baseline/v34/manifest.json",
+        includes_registries: false,
+        artifact_paths: V34_ARTIFACT_PATHS,
     },
 ];
 
@@ -882,5 +892,21 @@ mod tests {
             assert!(prior.is_disjoint(&v14));
         }
         assert!(!V1_ARTIFACT_PATHS.contains(&"protocol/proto"));
+    }
+
+    #[test]
+    fn v34_selects_only_the_private_agent_approval_contract() {
+        let v34 = BASELINE_SPECS.last().expect("v34 baseline spec");
+        assert_eq!(v34.version, 34);
+        assert_eq!(v34.path, "protocol/baseline/v34/manifest.json");
+        assert_eq!(v34.artifact_paths, V34_ARTIFACT_PATHS);
+        assert_eq!(
+            V34_ARTIFACT_PATHS,
+            [
+                "protocol/cddl/private-event/v6_v7",
+                "protocol/test-vectors/private-event/v6_v7",
+            ]
+        );
+        assert!(!v34.includes_registries);
     }
 }

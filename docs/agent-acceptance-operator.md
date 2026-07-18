@@ -5,11 +5,15 @@ acceptance boundary. It creates no public HTTP API and starts no runtime or
 cloud process. The split keeps Connector enrollment independent from the real
 Agent identities that the client authority flow creates later.
 
-The non-secret plan contains one Host, exactly one `codex` and one
-`openclaw_acp` Connector, and the future Agent/Installation/Agent Device/Binding
-IDs. Each Agent entry also contains its canonical HTTPS `server_origin`.
-Immutable IDs, capacities, descriptor digests, and request IDs are replay
-checked; changed durable facts fail closed.
+The non-secret plan contains one Host and one or two Connectors. The supported
+adapter sets are exactly `{codex}` for a fresh Windows Codex Host,
+`{codex, openclaw_acp}` for the existing Alpha path, or
+`{codex, hermes_acp}` for future native Hermes acceptance. OpenClaw-only,
+Hermes-only, duplicate, and three-adapter plans are invalid; so are approximate
+values such as `openclaw` or `hermes`. The plan also contains the future
+Agent/Installation/Agent Device/Binding IDs and each Agent's canonical HTTPS
+`server_origin`. Immutable IDs, capacities, descriptor digests, and request IDs
+are replay checked; changed durable facts fail closed.
 
 ## Prepare
 
@@ -23,7 +27,7 @@ dtx-agent-provision acceptance-prepare \
   --dry-run
 ```
 
-Create/reuse the Host and two Connectors, then issue/recover one exact
+Create/reuse the Host and selected Connector(s), then issue/recover one exact
 enrollment intent per Connector:
 
 ```text
@@ -72,7 +76,8 @@ fixtures and random placeholder fingerprints are unsupported.
 
 ## Finalize
 
-Validate both facts files without touching PostgreSQL:
+Validate the facts files without touching PostgreSQL. This existing
+Codex-plus-OpenClaw example requires two:
 
 ```text
 dtx-agent-provision acceptance-finalize \
@@ -88,10 +93,21 @@ Run the same command without `--dry-run` to create/reuse each verified Agent
 Definition, owner-approval-pending Installation, active Agent Device, and
 enabled exclusive Binding. The client's signed Owner approval remains the
 only operation allowed to bind the Agent identity to its Installation.
-Finalize requires the exact prepared Host and Connectors;
-it never silently creates a missing foundation. Repeating the exact command is
-idempotent, while changed identity, certificate, descriptor, or routing facts
-fail closed.
+Finalize requires exactly one facts file per selected plan entry, matched by
+the exact Installation ID and canonical origin. A `{codex}` plan therefore
+requires only its Codex facts file; it must not fabricate an OpenClaw or Hermes
+fact from another Host. Finalize also requires the exact prepared Host and
+Connectors; it never silently creates a missing foundation. Repeating the exact
+command is idempotent, while changed identity, certificate, descriptor, or
+routing facts fail closed.
+
+For a `{codex, hermes_acp}` plan, keep the command shape identical and replace
+only the second facts path with the independent native Hermes facts file, for
+example `/root/dtx-acceptance/hermes-agent-facts.json`. The facts file does not
+carry an adapter label: its exact Installation ID and origin bind it to the
+corresponding `hermes_acp` plan entry. This support is future-ready operator
+code and does not imply that Hermes is deployed or accepted on a particular
+host.
 
 The database URL is read only from the explicit owner-controlled `0400`,
 `0440`, `0600`, or `0640` service secret. The Connector issuer is loaded from
