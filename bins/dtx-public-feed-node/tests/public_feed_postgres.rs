@@ -153,6 +153,30 @@ fn map_field(map: &[(CanonicalValue, CanonicalValue)], key: u64) -> &CanonicalVa
 }
 
 #[tokio::test]
+async fn standalone_router_does_not_advertise_discussion_mutations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy_with(
+        "postgres://localhost/dirextalk".parse::<sqlx::postgres::PgConnectOptions>()?,
+    );
+    let store = PublicFeedPgStore::from_prevalidated_pool(pool);
+    let subject = descriptor(now_ms()).subject_id();
+    let app = public_feed_router(store, TenantId::new());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/.well-known/dirextalk/public/v1/{subject}/posts/{}/comments",
+                    "00".repeat(32),
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // One end-to-end acceptance path intentionally keeps all recovery assertions together.
 async fn descriptor_two_posts_pagination_replay_and_tombstone_converge()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -700,6 +724,26 @@ async fn policy_comments_replies_likes_and_exact_replay_are_origin_hosted()
         StatusCode::FORBIDDEN
     );
     active.store(true, Ordering::SeqCst);
+    let missing_parent = make_comment(
+        "0190f2a5-7b45-7abc-8def-0123456789aa",
+        Some(Sha256Digest::from_bytes([0xcd; 32])),
+        "missing parent",
+    )?;
+    assert_eq!(
+        app.clone()
+            .oneshot(write_request_with_key(
+                "POST",
+                &comments_path,
+                "application/vnd.dirextalk.public-comment.v1+cbor",
+                missing_parent.to_deterministic_cbor()?,
+                now,
+                "discussion-comment-missing-parent",
+            ))
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND,
+        "an absent parent digest is a missing resource",
+    );
     let reply = make_comment(
         "0190f2a5-7b44-7abc-8def-0123456789ab",
         Some(first_receipt.thread_entry_hash()),
@@ -737,7 +781,8 @@ async fn policy_comments_replies_likes_and_exact_replay_are_origin_hosted()
             ))
             .await?
             .status(),
-        StatusCode::BAD_REQUEST
+        StatusCode::BAD_REQUEST,
+        "a present reply cannot itself be used as a parent",
     );
 
     let reaction_unsigned = UnsignedReactionEventV1::new(

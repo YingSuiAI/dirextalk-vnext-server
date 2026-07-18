@@ -639,8 +639,20 @@ struct PageQuery {
     cursor: Option<String>,
     limit: Option<u16>,
 }
+/// Builds descriptor and feed routes only.
+///
+/// The standalone `dtx-public-feed-node` intentionally uses this router and
+/// does not advertise Public Discussion V1. The production unified `dtx-node`
+/// supplies current-device authority through [`public_feed_router_with_discussion`].
 pub fn public_feed_router(store: PublicFeedPgStore, tenant: TenantId) -> Router {
-    public_feed_router_with_discussion(store, tenant, PublicDiscussionRouterConfig::rejecting())
+    Router::new()
+        .route(SUBJECT_PATH, get(get_descriptor).put(put_descriptor))
+        .route(FEED_PATH, get(get_page).post(append_event))
+        .with_state(AppState {
+            store,
+            tenant,
+            cache: ResponseCache::new(256, 16 * 1024 * 1024),
+        })
 }
 
 /// Builds the public origin router with an explicit current-device authority
@@ -651,15 +663,7 @@ pub fn public_feed_router_with_discussion(
     discussion: PublicDiscussionRouterConfig,
 ) -> Router {
     let discussion_router = discussion::public_discussion_router(store.clone(), tenant, discussion);
-    Router::new()
-        .route(SUBJECT_PATH, get(get_descriptor).put(put_descriptor))
-        .route(FEED_PATH, get(get_page).post(append_event))
-        .with_state(AppState {
-            store,
-            tenant,
-            cache: ResponseCache::new(256, 16 * 1024 * 1024),
-        })
-        .merge(discussion_router)
+    public_feed_router(store, tenant).merge(discussion_router)
 }
 async fn get_descriptor(
     State(s): State<AppState>,

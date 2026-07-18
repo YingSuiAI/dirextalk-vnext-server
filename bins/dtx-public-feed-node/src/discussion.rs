@@ -85,20 +85,6 @@ impl DeviceAuthority for FederatedDeviceAuthority {
     }
 }
 
-#[derive(Clone, Default)]
-struct RejectingDeviceAuthority;
-impl DeviceAuthority for RejectingDeviceAuthority {
-    fn active_device_signing_key<'a>(
-        &'a self,
-        _origin: &'a str,
-        _identity_id: IdentityId,
-        _device_id: DeviceId,
-    ) -> Pin<Box<dyn Future<Output = Result<SigningPublicKey, FederatedIdentityError>> + Send + 'a>>
-    {
-        Box::pin(async { Err(FederatedIdentityError::DeviceUnavailable) })
-    }
-}
-
 #[derive(Clone)]
 pub struct PublicDiscussionRouterConfig {
     authority: Arc<dyn DeviceAuthority>,
@@ -107,10 +93,6 @@ impl PublicDiscussionRouterConfig {
     #[must_use]
     pub fn new(authority: Arc<dyn DeviceAuthority>) -> Self {
         Self { authority }
-    }
-    #[must_use]
-    pub fn rejecting() -> Self {
-        Self::new(Arc::new(RejectingDeviceAuthority))
     }
 }
 
@@ -486,21 +468,26 @@ impl DiscussionStore {
         )
         .await?;
         if let Some(parent) = event.parent_comment_entry_hash() {
-            let valid_parent: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM directory.feed_comment_entries
-                     WHERE tenant_id=$1 AND subject_id=$2 AND post_id=$3
-                       AND entry_hash=$4 AND parent_entry_hash IS NULL
-                 )",
+            let parent_row = sqlx::query(
+                "SELECT parent_entry_hash FROM directory.feed_comment_entries
+                  WHERE tenant_id=$1 AND subject_id=$2 AND post_id=$3 AND entry_hash=$4",
             )
             .bind(tenant.as_uuid())
             .bind(subject.to_string())
             .bind(post_hash.as_bytes().as_slice())
             .bind(parent.as_bytes().as_slice())
-            .fetch_one(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await?;
-            if !valid_parent {
-                return Err(DiscussionStoreError::Invalid);
+            match parent_row {
+                None => return Err(DiscussionStoreError::NotFound),
+                Some(row)
+                    if row
+                        .try_get::<Option<Vec<u8>>, _>("parent_entry_hash")?
+                        .is_some() =>
+                {
+                    return Err(DiscussionStoreError::Invalid);
+                }
+                Some(_) => {}
             }
         }
         let head = sqlx::query(
