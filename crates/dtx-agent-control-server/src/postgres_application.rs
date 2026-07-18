@@ -55,11 +55,12 @@ use uuid::Uuid;
 use crate::{
     ApplicationFuture, CommandNotificationSubscription, ConnectorCertificateAuthority,
     ConnectorControlApplication, ConnectorControlApplicationError,
-    ConnectorCredentialAuthorizationIndex, CredentialRotationCompletion, EnrollmentCompletion,
-    HeartbeatCompletion, OpenControlCompletion, ParsedAgentProvisioningInstalled,
-    ParsedAgentProvisioningRejected, ParsedAgentRouteBootstrapInstalled,
-    ParsedAgentRouteBootstrapRejected, ParsedAgentRouteRecipientReady, ParsedCapacity,
-    ParsedCommandAcknowledgement, ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat,
+    ConnectorCredentialAuthorizationIndex, CredentialReissueCompletion,
+    CredentialRotationCompletion, EnrollmentCompletion, HeartbeatCompletion, OpenControlCompletion,
+    ParsedAgentProvisioningInstalled, ParsedAgentProvisioningRejected,
+    ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteBootstrapRejected,
+    ParsedAgentRouteRecipientReady, ParsedCapacity, ParsedCommandAcknowledgement,
+    ParsedCredentialReissue, ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat,
     ParsedHello, ParsedLeaseFence, ParsedProvisioningRecipientAnnouncement, ParsedReady,
     ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted, ParsedRunExecutionFence,
     ParsedRunFailed, ParsedRunOutput, ParsedRunRelease, ProtobufDurableCommandEncoder,
@@ -307,6 +308,29 @@ impl fmt::Debug for CreatedConnectorEnrollment {
             .field("expires_at_millis", &self.expires_at_millis)
             .finish()
     }
+}
+
+/// Operator-only certificate recovery preparation. Only the raw SHA-256 token digest is retained.
+#[derive(Debug)]
+pub struct PrepareConnectorCredentialReissueRequest {
+    pub tenant_id: TenantId,
+    pub host_id: HostId,
+    pub connector_id: ConnectorId,
+    pub operation_id: RequestId,
+    pub expected_credential_id: ConnectorCredentialId,
+    pub expected_leaf_fingerprint: Sha256Digest,
+    pub expected_generation: u64,
+    pub expected_spec_revision: Revision,
+    pub plan_digest: Sha256Digest,
+    pub token_digest: Sha256Digest,
+    pub ttl_millis: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreatedConnectorCredentialReissue {
+    pub intent_id: EnrollmentIntentId,
+    pub expires_at_millis: i64,
+    pub replayed: bool,
 }
 
 /// Owner-supplied optimistic fence for one durable Connector command.
@@ -1303,6 +1327,190 @@ impl PostgresConnectorControlApplication {
         Ok(response)
     }
 
+    /// Creates or replays the exact operator-approved offline credential recovery intent.
+    /// The caller is responsible for retaining the raw token in a protected handoff; this method
+    /// can only compare its digest and deliberately never returns secret material.
+    pub async fn prepare_connector_credential_reissue(
+        &self,
+        request: PrepareConnectorCredentialReissueRequest,
+    ) -> Result<CreatedConnectorCredentialReissue, ConnectorControlApplicationError> {
+        if !(1..=dtx_agent_control::MAX_ENROLLMENT_TTL_MILLIS).contains(&request.ttl_millis) {
+            return Err(ConnectorControlApplicationError::InvalidRequest);
+        }
+        let now = self.now()?;
+        let mut session = self
+            .store
+            .begin_tenant(request.tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if let Some(row) = sqlx::query(
+            "SELECT intent_id, host_id, current_credential_id, current_leaf_fingerprint,
+                    connector_generation, spec_revision, plan_digest, token_digest, expires_at_ms
+               FROM agent.connector_credential_reissue_intents
+              WHERE tenant_id=$1 AND operation_id=$2 FOR UPDATE",
+        )
+        .bind(Uuid::from(request.tenant_id))
+        .bind(Uuid::from(request.operation_id))
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?
+        {
+            let exact = HostId::try_from(
+                row.try_get::<Uuid, _>("host_id")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?,
+            )
+            .ok()
+                == Some(request.host_id)
+                && ConnectorCredentialId::try_from(
+                    row.try_get::<Uuid, _>("current_credential_id")
+                        .map_err(|_| ConnectorControlApplicationError::Internal)?,
+                )
+                .ok()
+                    == Some(request.expected_credential_id)
+                && digest_from_row(&row, "current_leaf_fingerprint")?
+                    == request.expected_leaf_fingerprint
+                && positive_u64_from_row(&row, "connector_generation")?
+                    == request.expected_generation
+                && positive_revision(
+                    row.try_get("spec_revision")
+                        .map_err(|_| ConnectorControlApplicationError::Internal)?,
+                )? == request.expected_spec_revision
+                && digest_from_row(&row, "plan_digest")? == request.plan_digest
+                && digest_from_row(&row, "token_digest")? == request.token_digest;
+            if !exact {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+            let intent_id = EnrollmentIntentId::try_from(
+                row.try_get::<Uuid, _>("intent_id")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?,
+            )
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            let expires_at_millis: i64 = row
+                .try_get("expires_at_ms")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            session
+                .commit()
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            return Ok(CreatedConnectorCredentialReissue {
+                intent_id,
+                expires_at_millis,
+                replayed: true,
+            });
+        }
+        let connector = ConnectorRepository::new()
+            .load_control_head_for_update(
+                session.connection(),
+                request.tenant_id,
+                request.connector_id,
+            )
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::NotFound)?;
+        if connector.host_id() != request.host_id
+            || connector.generation() != request.expected_generation
+            || connector.spec_revision() != request.expected_spec_revision
+            || connector.desired_state() == ConnectorDesiredState::Revoked
+        {
+            return Err(ConnectorControlApplicationError::StaleFence);
+        }
+        CommandLogRepository::new()
+            .lock_connector_for_control(
+                session.connection(),
+                request.tenant_id,
+                request.connector_id,
+            )
+            .await
+            .map_err(persistence_error)?;
+        let authorization = ConnectorCredentialAuthorizationRepository::new()
+            .load_head(
+                session.connection(),
+                request.tenant_id,
+                request.connector_id,
+            )
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::NotFound)?;
+        if authorization.authorization().pending().is_some() {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let current = authorization
+            .authorization()
+            .current()
+            .ok_or(ConnectorControlApplicationError::NotFound)?;
+        if current.credential_id() != request.expected_credential_id
+            || current.certificate_fingerprint() != request.expected_leaf_fingerprint
+            || current.generation() != request.expected_generation
+            || current.revision() != request.expected_spec_revision
+            || now < current.not_after_millis()
+            || now < current.not_before_millis()
+        {
+            return Err(ConnectorControlApplicationError::StaleFence);
+        }
+        let intent_id = EnrollmentIntentId::try_from(self.next_uuid()?)
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let expires_at = now
+            .checked_add(request.ttl_millis)
+            .ok_or(ConnectorControlApplicationError::InvalidRequest)?;
+        ConnectorControlOperationRepository::new()
+            .claim(
+                session.connection(),
+                request.tenant_id,
+                request.operation_id,
+                request.connector_id,
+                ConnectorControlOperationKind::CredentialReissue,
+                now,
+            )
+            .await
+            .map_err(persistence_error)?;
+        sqlx::query(
+            "INSERT INTO agent.connector_credential_reissue_intents (
+                tenant_id,intent_id,operation_id,connector_id,host_id,current_credential_id,current_leaf_fingerprint,
+                connector_generation,spec_revision,plan_digest,token_digest,status,created_at_ms,expires_at_ms
+              ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active',$12,$13)",
+        ).bind(Uuid::from(request.tenant_id)).bind(Uuid::from(intent_id)).bind(Uuid::from(request.operation_id))
+            .bind(Uuid::from(request.connector_id)).bind(Uuid::from(request.host_id)).bind(Uuid::from(request.expected_credential_id))
+            .bind(request.expected_leaf_fingerprint.as_bytes().to_vec()).bind(i64::try_from(request.expected_generation).map_err(|_| ConnectorControlApplicationError::InvalidRequest)?)
+            .bind(i64::try_from(request.expected_spec_revision.get()).map_err(|_| ConnectorControlApplicationError::InvalidRequest)?)
+            .bind(request.plan_digest.as_bytes().to_vec()).bind(request.token_digest.as_bytes().to_vec()).bind(now).bind(expires_at)
+            .execute(session.connection()).await.map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        Ok(CreatedConnectorCredentialReissue {
+            intent_id,
+            expires_at_millis: expires_at,
+            replayed: false,
+        })
+    }
+
+    /// Aborts only an unconsumed recovery operation. A promoted/consumed credential is immutable.
+    pub async fn abort_connector_credential_reissue(
+        &self,
+        tenant_id: TenantId,
+        operation_id: RequestId,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        let now = self.now()?;
+        let mut session = self
+            .store
+            .begin_tenant(tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let updated = sqlx::query(
+            "UPDATE agent.connector_credential_reissue_intents SET status='aborted', transitioned_at_ms=$3
+              WHERE tenant_id=$1 AND operation_id=$2 AND status='active'",
+        ).bind(Uuid::from(tenant_id)).bind(Uuid::from(operation_id)).bind(now).execute(session.connection()).await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if updated.rows_affected() != 1 {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)
+    }
+
     /// Loads one durable authorization head into the advisory in-process index.
     ///
     /// Callers may use this during listener startup and after restoring tenant
@@ -2040,6 +2248,195 @@ impl PostgresConnectorControlApplication {
         })
     }
 
+    /// Consumes one operator-prepared recovery intent. The old certificate may be expired only
+    /// for this proof verification; no ordinary control frame is admitted with it.
+    #[allow(clippy::too_many_lines)]
+    async fn reissue_operation(
+        &self,
+        parsed: ParsedCredentialReissue,
+    ) -> Result<CredentialReissueCompletion, ConnectorControlApplicationError> {
+        let ParsedCredentialReissue { token: _, request } = parsed;
+        let now = self.now()?;
+        let tenant_id = request.tenant_id();
+        let mut session = self
+            .store
+            .begin_tenant(tenant_id)
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let row = sqlx::query(
+            "SELECT host_id, connector_id, current_credential_id, current_leaf_fingerprint,
+                    connector_generation, spec_revision, token_digest, status, expires_at_ms,
+                    request_digest, credential_id
+               FROM agent.connector_credential_reissue_intents
+              WHERE tenant_id=$1 AND intent_id=$2 AND operation_id=$3 FOR UPDATE",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(request.intent_id()))
+        .bind(Uuid::from(request.operation_id()))
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?
+        .ok_or(ConnectorControlApplicationError::AuthenticationFailed)?;
+        let stored_host: Uuid = row
+            .try_get("host_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_connector: Uuid = row
+            .try_get("connector_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_current: Uuid = row
+            .try_get("current_credential_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_fp = digest_from_row(&row, "current_leaf_fingerprint")?;
+        let stored_generation = positive_u64_from_row(&row, "connector_generation")?;
+        let stored_revision = positive_revision(
+            row.try_get("spec_revision")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?,
+        )?;
+        let stored_token = digest_from_row(&row, "token_digest")?;
+        if HostId::try_from(stored_host).ok() != Some(request.host_id())
+            || ConnectorId::try_from(stored_connector).ok() != Some(request.connector_id())
+            || ConnectorCredentialId::try_from(stored_current).ok()
+                != Some(request.current_credential_id())
+            || stored_fp != request.current_fingerprint()
+            || stored_generation != request.generation()
+            || stored_revision != request.spec_revision()
+            || stored_token != request.token_digest()
+        {
+            return Err(ConnectorControlApplicationError::AuthenticationFailed);
+        }
+        let status: String = row
+            .try_get("status")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        if status == "consumed" {
+            let persisted = digest_from_row(&row, "request_digest")?;
+            if persisted != request.request_digest() {
+                return Err(ConnectorControlApplicationError::AuthenticationFailed);
+            }
+            let credential_id: Uuid = row
+                .try_get("credential_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            let authorization = ConnectorCredentialAuthorizationRepository::new()
+                .load_head(session.connection(), tenant_id, request.connector_id())
+                .await
+                .map_err(persistence_error)?
+                .ok_or(ConnectorControlApplicationError::Internal)?;
+            let credential = authorization
+                .authorization()
+                .credential(
+                    ConnectorCredentialId::try_from(credential_id)
+                        .map_err(|_| ConnectorControlApplicationError::Internal)?,
+                )
+                .cloned()
+                .ok_or(ConnectorControlApplicationError::Internal)?;
+            session
+                .commit()
+                .await
+                .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+            return Ok(CredentialReissueCompletion {
+                credential,
+                request,
+            });
+        }
+        let expires_at: i64 = row
+            .try_get("expires_at_ms")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        if status != "active" || now >= expires_at {
+            return Err(ConnectorControlApplicationError::AuthenticationFailed);
+        }
+        CommandLogRepository::new()
+            .lock_connector_for_control(session.connection(), tenant_id, request.connector_id())
+            .await
+            .map_err(persistence_error)?;
+        let connector = ConnectorRepository::new()
+            .load_control_head_for_update(session.connection(), tenant_id, request.connector_id())
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::NotFound)?;
+        if connector.host_id() != request.host_id()
+            || connector.generation() != request.generation()
+            || connector.spec_revision() != request.spec_revision()
+            || connector.desired_state() == ConnectorDesiredState::Revoked
+        {
+            return Err(ConnectorControlApplicationError::StaleFence);
+        }
+        let authorization_head = ConnectorCredentialAuthorizationRepository::new()
+            .load_head(session.connection(), tenant_id, request.connector_id())
+            .await
+            .map_err(persistence_error)?
+            .ok_or(ConnectorControlApplicationError::AuthenticationFailed)?;
+        let mut authorization = authorization_head.authorization().clone();
+        if authorization.pending().is_some() {
+            return Err(ConnectorControlApplicationError::StaleFence);
+        }
+        let current = authorization
+            .current()
+            .ok_or(ConnectorControlApplicationError::AuthenticationFailed)?;
+        if current.credential_id() != request.current_credential_id()
+            || current.certificate_fingerprint() != request.current_fingerprint()
+            || current.generation() != request.generation()
+            || current.revision() != request.spec_revision()
+            || now < current.not_before_millis()
+            || now < current.not_after_millis()
+        {
+            return Err(ConnectorControlApplicationError::AuthenticationFailed);
+        }
+        request
+            .verify(current.control_key())
+            .map_err(|_| ConnectorControlApplicationError::AuthenticationFailed)?;
+        let credential = self.issue_credential(
+            tenant_id,
+            request.connector_id(),
+            request.generation(),
+            request.spec_revision(),
+            request.new_control_key(),
+            current.refresh_key(),
+            now,
+        )?;
+        authorization
+            .propose_reissue(credential.clone())
+            .map_err(|_| ConnectorControlApplicationError::AuthenticationFailed)?;
+        // Persist the result receipt before the authorization transition. Both writes are in this
+        // transaction, so an issuance/promotion fault cannot leave a usable dangling credential.
+        let updated = sqlx::query(
+            "UPDATE agent.connector_credential_reissue_intents
+                SET status='consumed', transitioned_at_ms=$4, request_digest=$5,
+                    result_digest=$6, credential_id=$7
+              WHERE tenant_id=$1 AND intent_id=$2 AND operation_id=$3 AND status='active'",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(request.intent_id()))
+        .bind(Uuid::from(request.operation_id()))
+        .bind(now)
+        .bind(request.request_digest().as_bytes().to_vec())
+        .bind(credential.result_digest().as_bytes().to_vec())
+        .bind(Uuid::from(credential.credential_id()))
+        .execute(session.connection())
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if updated.rows_affected() != 1 {
+            return Err(ConnectorControlApplicationError::StaleFence);
+        }
+        ConnectorCredentialAuthorizationRepository::new()
+            .save_head(
+                session.connection(),
+                &authorization,
+                &authorization_head,
+                request.operation_id(),
+                now,
+            )
+            .await
+            .map_err(persistence_error)?;
+        session
+            .commit()
+            .await
+            .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        let _ = self.authorization_index.replace(&authorization.snapshot());
+        Ok(CredentialReissueCompletion {
+            credential,
+            request,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn open_operation(
         &self,
@@ -2115,48 +2512,70 @@ impl PostgresConnectorControlApplication {
                 generation,
                 ..
             } => {
-                let operation_id = expected_authorization
+                if let Some(operation_id) = expected_authorization
                     .rotations
                     .iter()
                     .find(|rotation| rotation.successor_credential_id == credential_id)
                     .map(|rotation| rotation.request_id)
-                    .ok_or(ConnectorControlApplicationError::Internal)?;
-                let expected_generation = connector
-                    .generation()
-                    .checked_add(1)
-                    .ok_or(ConnectorControlApplicationError::StaleFence)?;
-                let expected_revision = connector
-                    .spec_revision()
-                    .checked_next()
-                    .map_err(|_| ConnectorControlApplicationError::StaleFence)?;
-                if generation != expected_generation
-                    || hello.connector_generation != expected_generation
-                    || hello.spec_revision != expected_revision
                 {
-                    return Err(ConnectorControlApplicationError::StaleFence);
-                }
-                connector
-                    .advance_generation(connector.spec_revision(), now)
-                    .map_err(|_| ConnectorControlApplicationError::StaleFence)?;
-                if command_head.acknowledged_sequence() != command_head.last_sequence()
-                    || !replay_commands.is_empty()
-                {
-                    return Err(ConnectorControlApplicationError::StaleFence);
-                }
-                CommandLogRepository::new()
-                    .advance_drained_fence(
-                        session.connection(),
-                        hello.tenant_id,
-                        hello.connector_id,
-                        command_head.generation(),
-                        command_head.spec_revision(),
-                        expected_generation,
-                        expected_revision,
-                        now,
+                    let expected_generation = connector
+                        .generation()
+                        .checked_add(1)
+                        .ok_or(ConnectorControlApplicationError::StaleFence)?;
+                    let expected_revision = connector
+                        .spec_revision()
+                        .checked_next()
+                        .map_err(|_| ConnectorControlApplicationError::StaleFence)?;
+                    if generation != expected_generation
+                        || hello.connector_generation != expected_generation
+                        || hello.spec_revision != expected_revision
+                    {
+                        return Err(ConnectorControlApplicationError::StaleFence);
+                    }
+                    connector
+                        .advance_generation(connector.spec_revision(), now)
+                        .map_err(|_| ConnectorControlApplicationError::StaleFence)?;
+                    if command_head.acknowledged_sequence() != command_head.last_sequence()
+                        || !replay_commands.is_empty()
+                    {
+                        return Err(ConnectorControlApplicationError::StaleFence);
+                    }
+                    CommandLogRepository::new()
+                        .advance_drained_fence(
+                            session.connection(),
+                            hello.tenant_id,
+                            hello.connector_id,
+                            command_head.generation(),
+                            command_head.spec_revision(),
+                            expected_generation,
+                            expected_revision,
+                            now,
+                        )
+                        .await
+                        .map_err(persistence_error)?;
+                    Some(operation_id)
+                } else {
+                    let operation_id: Option<Uuid> = sqlx::query_scalar(
+                        "SELECT operation_id FROM agent.connector_credential_reissue_intents
+                          WHERE tenant_id=$1 AND connector_id=$2 AND credential_id=$3 AND status='consumed'",
                     )
+                    .bind(Uuid::from(hello.tenant_id))
+                    .bind(Uuid::from(hello.connector_id))
+                    .bind(Uuid::from(credential_id))
+                    .fetch_optional(session.connection())
                     .await
-                    .map_err(persistence_error)?;
-                Some(operation_id)
+                    .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+                    let operation_id = operation_id
+                        .and_then(|value| RequestId::try_from(value).ok())
+                        .ok_or(ConnectorControlApplicationError::Internal)?;
+                    if generation != connector.generation()
+                        || hello.connector_generation != connector.generation()
+                        || hello.spec_revision != connector.spec_revision()
+                    {
+                        return Err(ConnectorControlApplicationError::StaleFence);
+                    }
+                    Some(operation_id)
+                }
             }
         };
         if connector.current_boot_id() != Some(hello.boot_id) {
@@ -5121,6 +5540,31 @@ fn optional_digest_vec(
     Ok(Some(Sha256Digest::from_bytes(bytes)))
 }
 
+fn digest_from_row(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<Sha256Digest, ConnectorControlApplicationError> {
+    let bytes: [u8; 32] = row
+        .try_get::<Vec<u8>, _>(field)
+        .map_err(|_| ConnectorControlApplicationError::Internal)?
+        .try_into()
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+    Ok(Sha256Digest::from_bytes(bytes))
+}
+
+fn positive_u64_from_row(
+    row: &sqlx::postgres::PgRow,
+    field: &str,
+) -> Result<u64, ConnectorControlApplicationError> {
+    u64::try_from(
+        row.try_get::<i64, _>(field)
+            .map_err(|_| ConnectorControlApplicationError::Internal)?,
+    )
+    .ok()
+    .filter(|value| (1..=Revision::MAX).contains(value))
+    .ok_or(ConnectorControlApplicationError::Internal)
+}
+
 fn optional_bytes32(
     row: &sqlx::postgres::PgRow,
     field: &str,
@@ -5168,6 +5612,13 @@ impl ConnectorControlApplication for PostgresConnectorControlApplication {
 
     fn enroll(&self, request: ParsedEnrollment) -> ApplicationFuture<'_, EnrollmentCompletion> {
         Box::pin(self.enroll_operation(request))
+    }
+
+    fn reissue_credential(
+        &self,
+        request: ParsedCredentialReissue,
+    ) -> ApplicationFuture<'_, CredentialReissueCompletion> {
+        Box::pin(self.reissue_operation(request))
     }
 
     fn open_control(

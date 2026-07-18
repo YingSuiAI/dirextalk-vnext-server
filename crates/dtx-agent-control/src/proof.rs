@@ -1,7 +1,8 @@
 use std::{error::Error, fmt};
 
 use dtx_domain::{
-    ConnectorCredentialId, ConnectorId, Ed25519PublicKey, HostId, RequestId, Revision, TenantId,
+    ConnectorCredentialId, ConnectorId, Ed25519PublicKey, EnrollmentIntentId, HostId, RequestId,
+    Revision, TenantId,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 
@@ -11,6 +12,185 @@ const ENROLLMENT_PROOF_DOMAIN: &[u8] = b"dirextalk.connector-enrollment-proof.v1
 const ENROLLMENT_REQUEST_DOMAIN: &[u8] = b"dirextalk.connector-enrollment-request.v1";
 const ROTATION_PROOF_DOMAIN: &[u8] = b"dirextalk.connector-credential-rotation-proof.v1";
 const ROTATION_REQUEST_DOMAIN: &[u8] = b"dirextalk.connector-credential-rotation-request.v1";
+const CREDENTIAL_REISSUE_PROOF_DOMAIN: &[u8] = b"dirextalk.connector-credential-reissue.v1\0";
+const CREDENTIAL_REISSUE_REQUEST_DOMAIN: &[u8] =
+    b"dirextalk.connector-credential-reissue-request.v1";
+
+fn encode_parts(domain: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    let capacity = domain
+        .len()
+        .saturating_add(parts.iter().map(|part| part.len()).sum::<usize>())
+        .saturating_add((parts.len() + 1) * 8);
+    let mut bytes = Vec::with_capacity(capacity);
+    for part in std::iter::once(&domain).chain(parts.iter()) {
+        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(part);
+    }
+    bytes
+}
+
+/// Caller-held one-time recovery token. Only its domain-separated digest may persist.
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct CredentialReissueToken([u8; 32]);
+
+impl CredentialReissueToken {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> Sha256Digest {
+        crate::raw_sha256_digest(&self.0)
+    }
+}
+
+impl fmt::Debug for CredentialReissueToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialReissueToken(<redacted>)")
+    }
+}
+
+/// Exact two-control-key proof used to recover one expired certificate without changing runtime
+/// generation or Connector spec revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialReissueRequest {
+    operation_id: RequestId,
+    intent_id: EnrollmentIntentId,
+    token_digest: Sha256Digest,
+    tenant_id: TenantId,
+    host_id: HostId,
+    connector_id: ConnectorId,
+    current_credential_id: ConnectorCredentialId,
+    current_fingerprint: Sha256Digest,
+    generation: u64,
+    spec_revision: Revision,
+    new_control_key: Ed25519PublicKey,
+    current_control_signature: [u8; 64],
+    new_control_signature: [u8; 64],
+}
+
+impl CredentialReissueRequest {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        operation_id: RequestId,
+        intent_id: EnrollmentIntentId,
+        token_digest: Sha256Digest,
+        tenant_id: TenantId,
+        host_id: HostId,
+        connector_id: ConnectorId,
+        current_credential_id: ConnectorCredentialId,
+        current_fingerprint: Sha256Digest,
+        generation: u64,
+        spec_revision: Revision,
+        new_control_key: Ed25519PublicKey,
+        current_control_signature: [u8; 64],
+        new_control_signature: [u8; 64],
+    ) -> Self {
+        Self {
+            operation_id,
+            intent_id,
+            token_digest,
+            tenant_id,
+            host_id,
+            connector_id,
+            current_credential_id,
+            current_fingerprint,
+            generation,
+            spec_revision,
+            new_control_key,
+            current_control_signature,
+            new_control_signature,
+        }
+    }
+
+    #[must_use]
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let generation = self.generation.to_be_bytes();
+        let revision = self.spec_revision.get().to_be_bytes();
+        encode_parts(
+            CREDENTIAL_REISSUE_PROOF_DOMAIN,
+            &[
+                self.operation_id.as_uuid().as_bytes(),
+                self.intent_id.as_uuid().as_bytes(),
+                &self.token_digest.as_bytes(),
+                self.tenant_id.as_uuid().as_bytes(),
+                self.host_id.as_uuid().as_bytes(),
+                self.connector_id.as_uuid().as_bytes(),
+                self.current_credential_id.as_uuid().as_bytes(),
+                &self.current_fingerprint.as_bytes(),
+                &generation,
+                &revision,
+                self.new_control_key.as_bytes(),
+            ],
+        )
+    }
+
+    #[must_use]
+    pub fn request_digest(&self) -> Sha256Digest {
+        let bytes = self.signing_bytes();
+        domain_digest(
+            CREDENTIAL_REISSUE_REQUEST_DOMAIN,
+            &[
+                &bytes,
+                &self.current_control_signature,
+                &self.new_control_signature,
+            ],
+        )
+    }
+
+    pub fn verify(&self, current_control_key: Ed25519PublicKey) -> Result<(), ProofError> {
+        let bytes = self.signing_bytes();
+        verify_signature(current_control_key, &bytes, self.current_control_signature)?;
+        verify_signature(self.new_control_key, &bytes, self.new_control_signature)
+    }
+
+    #[must_use]
+    pub const fn operation_id(&self) -> RequestId {
+        self.operation_id
+    }
+    #[must_use]
+    pub const fn intent_id(&self) -> EnrollmentIntentId {
+        self.intent_id
+    }
+    #[must_use]
+    pub const fn token_digest(&self) -> Sha256Digest {
+        self.token_digest
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> TenantId {
+        self.tenant_id
+    }
+    #[must_use]
+    pub const fn host_id(&self) -> HostId {
+        self.host_id
+    }
+    #[must_use]
+    pub const fn connector_id(&self) -> ConnectorId {
+        self.connector_id
+    }
+    #[must_use]
+    pub const fn current_credential_id(&self) -> ConnectorCredentialId {
+        self.current_credential_id
+    }
+    #[must_use]
+    pub const fn current_fingerprint(&self) -> Sha256Digest {
+        self.current_fingerprint
+    }
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+    #[must_use]
+    pub const fn spec_revision(&self) -> Revision {
+        self.spec_revision
+    }
+    #[must_use]
+    pub const fn new_control_key(&self) -> Ed25519PublicKey {
+        self.new_control_key
+    }
+}
 
 /// Exact enrollment statement signed by both client-owned keys.
 #[derive(Clone, Debug, Eq, PartialEq)]

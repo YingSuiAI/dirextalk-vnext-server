@@ -754,10 +754,13 @@ async fn load_authorization_head_rotation(
     .bind(Uuid::from(connector_id))
     .bind(Uuid::from(pending.credential_id()))
     .fetch_optional(&mut *connection)
-    .await?
-    .ok_or(AgentPersistenceError::CorruptData(
-        "Connector pending credential rotation",
-    ))?;
+    .await?;
+    let Some(row) = row else {
+        // Certificate-only reissue has no live RotateCredential record. Its operation is
+        // independently bound by the reissue intent and its pending status is still fenced by
+        // the authorization head.
+        return Ok((high_water, Vec::new()));
+    };
     let sequence = positive_u64(
         row.try_get("rotation_sequence")?,
         "Connector rotation sequence",
@@ -909,6 +912,12 @@ enum CredentialOrigin {
         request_digest: Sha256Digest,
         result_digest: Sha256Digest,
     },
+    Reissue {
+        predecessor_id: ConnectorCredentialId,
+        operation_id: RequestId,
+        request_digest: Sha256Digest,
+        result_digest: Sha256Digest,
+    },
 }
 
 async fn insert_credential(
@@ -939,6 +948,19 @@ async fn insert_credential(
                 result_digest,
             } => (
                 "rotation",
+                None,
+                Some(Uuid::from(predecessor_id)),
+                operation_id,
+                request_digest,
+                result_digest,
+            ),
+            CredentialOrigin::Reissue {
+                predecessor_id,
+                operation_id,
+                request_digest,
+                result_digest,
+            } => (
+                "reissue",
                 None,
                 Some(Uuid::from(predecessor_id)),
                 operation_id,
@@ -1142,6 +1164,9 @@ enum AuthorizationTransition<'a> {
         rotation: &'a AcceptedRotationSnapshot,
         successor: &'a ConnectorCredential,
     },
+    ReissueStarted {
+        successor: &'a ConnectorCredential,
+    },
     Promoted,
     Revoked,
 }
@@ -1155,43 +1180,96 @@ async fn persist_authorization_transition(
     operation_id: RequestId,
     stored_at_ms: i64,
 ) -> Result<(), AgentPersistenceError> {
-    let cause_kind = match transition {
-        AuthorizationTransition::RotationStarted {
-            rotation,
-            successor,
-        } => {
-            if rotation.request_id != operation_id {
-                return Err(AgentPersistenceError::ImmutableConflict(
-                    "Connector rotation operation",
-                ));
-            }
-            insert_credential(
-                connection,
-                successor,
-                CredentialOrigin::Rotation {
-                    predecessor_id: rotation.current_credential_id,
-                    operation_id,
-                    request_digest: rotation.request_digest,
-                    result_digest: rotation.result_digest,
-                },
-                stored_at_ms,
-            )
-            .await?;
-            insert_rotation(
-                connection,
-                proposed,
-                rotation_sequence.ok_or(AgentPersistenceError::CorruptData(
-                    "Connector rotation sequence",
-                ))?,
+    let cause_kind =
+        match transition {
+            AuthorizationTransition::RotationStarted {
                 rotation,
-                stored_at_ms,
-            )
-            .await?;
-            "rotation_started"
-        }
-        AuthorizationTransition::Promoted => "rotation_promoted",
-        AuthorizationTransition::Revoked => "revoked",
-    };
+                successor,
+            } => {
+                if rotation.request_id != operation_id {
+                    return Err(AgentPersistenceError::ImmutableConflict(
+                        "Connector rotation operation",
+                    ));
+                }
+                insert_credential(
+                    connection,
+                    successor,
+                    CredentialOrigin::Rotation {
+                        predecessor_id: rotation.current_credential_id,
+                        operation_id,
+                        request_digest: rotation.request_digest,
+                        result_digest: rotation.result_digest,
+                    },
+                    stored_at_ms,
+                )
+                .await?;
+                insert_rotation(
+                    connection,
+                    proposed,
+                    rotation_sequence.ok_or(AgentPersistenceError::CorruptData(
+                        "Connector rotation sequence",
+                    ))?,
+                    rotation,
+                    stored_at_ms,
+                )
+                .await?;
+                "rotation_started"
+            }
+            AuthorizationTransition::ReissueStarted { successor } => {
+                let row = sqlx::query(
+                    "SELECT current_credential_id, request_digest, result_digest
+                   FROM agent.connector_credential_reissue_intents
+                  WHERE tenant_id=$1 AND operation_id=$2 AND connector_id=$3 AND status='consumed'",
+                )
+                .bind(Uuid::from(proposed.tenant_id))
+                .bind(Uuid::from(operation_id))
+                .bind(Uuid::from(proposed.connector_id))
+                .fetch_optional(&mut *connection)
+                .await?
+                .ok_or(AgentPersistenceError::ImmutableConflict(
+                    "Connector credential reissue operation",
+                ))?;
+                let predecessor_id = credential_id(row.try_get("current_credential_id")?)?;
+                let request_digest =
+                    digest(row.try_get("request_digest")?, "reissue request digest")?;
+                let result_digest = digest(row.try_get("result_digest")?, "reissue result digest")?;
+                insert_credential(
+                    connection,
+                    successor,
+                    CredentialOrigin::Reissue {
+                        predecessor_id,
+                        operation_id,
+                        request_digest,
+                        result_digest,
+                    },
+                    stored_at_ms,
+                )
+                .await?;
+                "reissue_started"
+            }
+            AuthorizationTransition::Promoted => {
+                let promoted = proposed.current_credential_id.ok_or(
+                    AgentPersistenceError::SnapshotRejected("promoted Connector credential"),
+                )?;
+                let is_reissue: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                    SELECT 1 FROM agent.connector_credential_reissue_intents
+                     WHERE tenant_id=$1 AND connector_id=$2 AND credential_id=$3
+                )",
+                )
+                .bind(Uuid::from(proposed.tenant_id))
+                .bind(Uuid::from(proposed.connector_id))
+                .bind(Uuid::from(promoted))
+                .fetch_one(&mut *connection)
+                .await?;
+                if is_reissue {
+                    "reissue_promoted"
+                } else {
+                    "rotation_promoted"
+                }
+            }
+            AuthorizationTransition::Revoked => "revoked",
+        };
     insert_authorization_revision(
         connection,
         proposed,
@@ -1237,6 +1315,35 @@ fn classify_transition<'a>(
         {
             return Ok(AuthorizationTransition::RotationStarted {
                 rotation,
+                successor: &successor.credential,
+            });
+        }
+    }
+
+    if proposed.history.len() == current.history.len() + 1
+        && proposed.rotations == current.rotations
+        && current.state == ConnectorCredentialAuthorizationState::Active
+        && current.pending_credential_id.is_none()
+        && proposed.state == ConnectorCredentialAuthorizationState::Active
+        && proposed.current_credential_id == current.current_credential_id
+    {
+        let successor = proposed
+            .history
+            .last()
+            .ok_or(AgentPersistenceError::SnapshotRejected("reissue successor"))?;
+        let current_credential = current
+            .history
+            .iter()
+            .find(|entry| entry.status == ConnectorCredentialStatus::Current)
+            .ok_or(AgentPersistenceError::SnapshotRejected(
+                "reissue current credential",
+            ))?;
+        if successor.status == ConnectorCredentialStatus::Pending
+            && proposed.pending_credential_id == Some(successor.credential.credential_id())
+            && successor.credential.generation() == current_credential.credential.generation()
+            && successor.credential.revision() == current_credential.credential.revision()
+        {
+            return Ok(AuthorizationTransition::ReissueStarted {
                 successor: &successor.credential,
             });
         }

@@ -71,6 +71,89 @@ fn credential_for(request: &EnrollmentRequest, id: ConnectorCredentialId) -> Con
 }
 
 #[test]
+fn certificate_only_reissue_keeps_the_connector_fence_and_retires_the_expired_credential() {
+    let token = EnrollmentToken::from_bytes([7; 32]);
+    let mut intent = EnrollmentIntent::new(
+        EnrollmentIntentId::new(),
+        TenantId::new(),
+        HostId::new(),
+        ConnectorId::new(),
+        1,
+        Revision::INITIAL,
+        RequestId::new(),
+        100,
+        300_000,
+        &token,
+    )
+    .unwrap();
+    let (control, _) = keys(21);
+    let (refresh, _) = keys(22);
+    let request = enrollment_request(&intent, &control, &refresh);
+    let current = intent
+        .consume(
+            &token,
+            &request,
+            credential_for(&request, ConnectorCredentialId::new()),
+            200,
+        )
+        .unwrap();
+    let (_, replacement_control) = keys(23);
+    let replacement = ConnectorCredential::new(
+        ConnectorCredentialId::new(),
+        current.tenant_id(),
+        current.connector_id(),
+        current.generation(),
+        current.revision(),
+        replacement_control,
+        current.refresh_key(),
+        raw_sha256_digest(&[0x30, 0x01, 0x03]),
+        vec![vec![0x30, 0x01, 0x03]],
+        10_000,
+        20_000,
+    )
+    .unwrap();
+    let mut authorization = ConnectorCredentialAuthorization::new(current.clone()).unwrap();
+    authorization.propose_reissue(replacement.clone()).unwrap();
+    assert_eq!(
+        authorization.current().unwrap().generation(),
+        replacement.generation()
+    );
+    assert_eq!(
+        authorization.current().unwrap().revision(),
+        replacement.revision()
+    );
+    assert_eq!(
+        authorization.status(current.credential_id()),
+        Some(ConnectorCredentialStatus::Current)
+    );
+    assert_eq!(
+        authorization.status(replacement.credential_id()),
+        Some(ConnectorCredentialStatus::Pending)
+    );
+    let outcome = authorization
+        .accept_hello(
+            ConnectorCredentialPresentation::new(
+                replacement.tenant_id(),
+                replacement.connector_id(),
+                replacement.credential_id(),
+                replacement.generation(),
+                replacement.certificate_fingerprint(),
+            ),
+            11_000,
+        )
+        .unwrap();
+    assert!(matches!(outcome, CredentialHelloOutcome::Promoted { .. }));
+    assert_eq!(
+        authorization.status(current.credential_id()),
+        Some(ConnectorCredentialStatus::Retired)
+    );
+    assert_eq!(
+        authorization.status(replacement.credential_id()),
+        Some(ConnectorCredentialStatus::Current)
+    );
+}
+
+#[test]
 fn enrollment_is_one_time_exactly_replayable_and_changed_replay_conflicts() {
     let token = EnrollmentToken::from_bytes([7; 32]);
     let mut intent = EnrollmentIntent::new(

@@ -1,12 +1,12 @@
-use dtx_agent_control_proto::AGENT_CONTROL_WIRE_PROTOCOL_V1_4;
+use dtx_agent_control_proto::AGENT_CONTROL_WIRE_PROTOCOL_V1_5;
 use prost::Message;
 use prost_types::{
     DescriptorProto, FileDescriptorProto, FileDescriptorSet, field_descriptor_proto::Type,
 };
 
 #[test]
-fn v1_4_descriptor_keeps_the_existing_service_and_closed_additive_surface() {
-    assert_eq!(AGENT_CONTROL_WIRE_PROTOCOL_V1_4, "agent-control/1.4");
+fn v1_5_descriptor_keeps_the_existing_service_and_closed_additive_surface() {
+    assert_eq!(AGENT_CONTROL_WIRE_PROTOCOL_V1_5, "agent-control/1.5");
     let descriptor = FileDescriptorSet::decode(dtx_agent_control_proto::v1::FILE_DESCRIPTOR_SET)
         .expect("generated V1.4 descriptor is valid");
     let file = descriptor
@@ -20,6 +20,38 @@ fn v1_4_descriptor_keeps_the_existing_service_and_closed_additive_surface() {
             .filter_map(|service| service.name.as_deref())
             .collect::<Vec<_>>(),
         ["ConnectorEnrollment", "ConnectorControl"]
+    );
+    let enrollment = file
+        .service
+        .iter()
+        .find(|service| service.name.as_deref() == Some("ConnectorEnrollment"))
+        .expect("ConnectorEnrollment exists");
+    assert_eq!(
+        enrollment
+            .method
+            .iter()
+            .filter_map(|method| method.name.as_deref())
+            .collect::<Vec<_>>(),
+        ["EnrollConnector", "ReissueConnectorCredential"],
+    );
+    assert_fields(
+        file,
+        "ReissueConnectorCredentialRequest",
+        &[
+            ("operation_id", 1, Type::String),
+            ("intent_id", 2, Type::String),
+            ("reissue_token", 3, Type::Bytes),
+            ("tenant_id", 4, Type::String),
+            ("host_id", 5, Type::String),
+            ("connector_id", 6, Type::String),
+            ("current_credential_id", 7, Type::String),
+            ("current_leaf_fingerprint_sha256", 8, Type::Bytes),
+            ("connector_generation", 9, Type::Uint64),
+            ("spec_revision", 10, Type::Uint64),
+            ("new_control_public_key", 11, Type::Bytes),
+            ("current_control_signature", 12, Type::Bytes),
+            ("new_control_signature", 13, Type::Bytes),
+        ],
     );
     assert_eq!(
         oneof_fields(message(file, "ClientFrame"), "kind"),

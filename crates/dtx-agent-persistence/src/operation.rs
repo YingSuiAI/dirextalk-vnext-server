@@ -10,6 +10,7 @@ pub enum ConnectorControlOperationKind {
     Enrollment,
     ApplyConfig,
     RotateCredential,
+    CredentialReissue,
     CloseStream,
 }
 
@@ -19,6 +20,7 @@ impl ConnectorControlOperationKind {
             Self::Enrollment => "enrollment",
             Self::ApplyConfig => "apply_config",
             Self::RotateCredential => "rotate_credential",
+            Self::CredentialReissue => "credential_reissue",
             Self::CloseStream => "close_stream",
         }
     }
@@ -28,6 +30,7 @@ impl ConnectorControlOperationKind {
             "enrollment" => Ok(Self::Enrollment),
             "apply_config" => Ok(Self::ApplyConfig),
             "rotate_credential" => Ok(Self::RotateCredential),
+            "credential_reissue" => Ok(Self::CredentialReissue),
             "close_stream" => Ok(Self::CloseStream),
             _ => Err(AgentPersistenceError::CorruptData(
                 "Connector control operation kind",

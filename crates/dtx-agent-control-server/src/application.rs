@@ -1,7 +1,8 @@
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
 use dtx_agent_control::{
-    ConnectorCredential, CredentialRotationRequest, DurableServerCommand, EnrollmentRequest,
+    ConnectorCredential, CredentialReissueRequest, CredentialRotationRequest, DurableServerCommand,
+    EnrollmentRequest,
 };
 use dtx_connect_registry::{ConnectorFence, ConnectorLease, HeartbeatAck};
 use dtx_domain::{ConnectorId, TenantId};
@@ -10,11 +11,11 @@ use dtx_security::AuthenticatedConnectorPeer;
 use crate::wire::{
     ParsedAgentProvisioningInstalled, ParsedAgentProvisioningRejected,
     ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteBootstrapRejected,
-    ParsedAgentRouteRecipientReady, ParsedCommandAcknowledgement, ParsedCredentialRotationProof,
-    ParsedEnrollment, ParsedHeartbeat, ParsedHello, ParsedProvisioningRecipientAnnouncement,
-    ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted, ParsedRunFailed,
-    ParsedRunOutput, ParsedRunRelease, RunAvailableWire, RunCancelRequestedWire,
-    RunLeaseGrantedWire,
+    ParsedAgentRouteRecipientReady, ParsedCommandAcknowledgement, ParsedCredentialReissue,
+    ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat, ParsedHello,
+    ParsedProvisioningRecipientAnnouncement, ParsedReady, ParsedRunCheckpoint, ParsedRunClaim,
+    ParsedRunCompleted, ParsedRunFailed, ParsedRunOutput, ParsedRunRelease, RunAvailableWire,
+    RunCancelRequestedWire, RunLeaseGrantedWire,
 };
 use crate::{CommandNotificationSubscription, RunOfferNotificationSubscription};
 
@@ -27,6 +28,13 @@ pub type ApplicationFuture<'a, T> =
 pub struct EnrollmentCompletion {
     pub credential: ConnectorCredential,
     pub request: EnrollmentRequest,
+}
+
+/// Certificate-only recovery result committed together with the exact consumed reissue intent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialReissueCompletion {
+    pub credential: ConnectorCredential,
+    pub request: CredentialReissueRequest,
 }
 
 /// Durable lease and exact replay batch returned by the first accepted `Hello`.
@@ -69,6 +77,13 @@ pub trait ConnectorControlApplication: Send + Sync + 'static {
     fn now_utc_millis(&self) -> Result<i64, ConnectorControlApplicationError>;
 
     fn enroll(&self, request: ParsedEnrollment) -> ApplicationFuture<'_, EnrollmentCompletion>;
+
+    fn reissue_credential(
+        &self,
+        _request: ParsedCredentialReissue,
+    ) -> ApplicationFuture<'_, CredentialReissueCompletion> {
+        Box::pin(async { Err(ConnectorControlApplicationError::PermissionDenied) })
+    }
 
     fn open_control(
         &self,

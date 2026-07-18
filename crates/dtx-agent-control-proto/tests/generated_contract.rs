@@ -2,7 +2,8 @@ use std::pin::Pin;
 
 use dtx_agent_control_proto::v1::{
     ClientFrame, ConnectorCredential, CredentialRotationResult, DurableCommand,
-    DurableCommandFrame, EnrollConnectorRequest, EnrollConnectorResponse, Hello, ServerFrame,
+    DurableCommandFrame, EnrollConnectorRequest, EnrollConnectorResponse, Hello,
+    ReissueConnectorCredentialRequest, ReissueConnectorCredentialResponse, ServerFrame,
     client_frame, connector_control_client::ConnectorControlClient,
     connector_control_server::ConnectorControl,
     connector_enrollment_client::ConnectorEnrollmentClient,
@@ -37,7 +38,7 @@ fn descriptor_exposes_unary_enrollment_and_bidirectional_control() {
             .iter()
             .filter_map(|method| method.name.as_deref())
             .collect::<Vec<_>>(),
-        ["EnrollConnector"]
+        ["EnrollConnector", "ReissueConnectorCredential"]
     );
 
     let enroll = enrollment_service
@@ -334,6 +335,13 @@ impl ConnectorEnrollment for StubService {
         &self,
         _request: Request<EnrollConnectorRequest>,
     ) -> Result<Response<EnrollConnectorResponse>, Status> {
+        Err(Status::unimplemented("contract-only stub"))
+    }
+
+    async fn reissue_connector_credential(
+        &self,
+        _request: Request<ReissueConnectorCredentialRequest>,
+    ) -> Result<Response<ReissueConnectorCredentialResponse>, Status> {
         Err(Status::unimplemented("contract-only stub"))
     }
 }

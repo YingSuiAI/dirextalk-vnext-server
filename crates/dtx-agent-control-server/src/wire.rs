@@ -1,10 +1,11 @@
 use std::{collections::BTreeSet, error::Error, fmt, str::FromStr};
 
 use dtx_agent_control::{
-    CommandAck, ConnectorCredential, CredentialRotationRequest, CredentialRotationTranscript,
-    DurableServerCommand, EnrollmentRequest, EnrollmentToken, EnrollmentTranscript,
-    MAX_ACTIVE_RUN_IDS, MAX_RUNTIME_CAPABILITIES, MAX_RUNTIME_QUEUE_DEPTH, RuntimeClaims,
-    Sha256Digest, run_failed_report_digest,
+    CommandAck, ConnectorCredential, CredentialReissueRequest, CredentialReissueToken,
+    CredentialRotationRequest, CredentialRotationTranscript, DurableServerCommand,
+    EnrollmentRequest, EnrollmentToken, EnrollmentTranscript, MAX_ACTIVE_RUN_IDS,
+    MAX_RUNTIME_CAPABILITIES, MAX_RUNTIME_QUEUE_DEPTH, RuntimeClaims, Sha256Digest,
+    run_failed_report_digest,
 };
 use dtx_agent_control_proto::v1;
 use dtx_connect_registry::{
@@ -71,6 +72,14 @@ impl Error for WireError {}
 pub struct ParsedEnrollment {
     pub token: EnrollmentToken,
     pub request: EnrollmentRequest,
+}
+
+/// Validated certificate-only recovery payload. The raw token remains zeroizing and is never
+/// included in Debug/response material.
+#[derive(Debug)]
+pub struct ParsedCredentialReissue {
+    pub token: CredentialReissueToken,
+    pub request: CredentialReissueRequest,
 }
 
 /// Structurally valid protocol range. Negotiation policy remains server-owned.
@@ -523,6 +532,35 @@ pub fn parse_enrollment_request(
         exact_array(value.refresh_signature, "refresh_signature")?,
     );
     Ok(ParsedEnrollment { token, request })
+}
+
+/// Converts the versioned certificate-reissue request into proof-bound domain input.
+pub fn parse_credential_reissue_request(
+    mut value: v1::ReissueConnectorCredentialRequest,
+) -> Result<ParsedCredentialReissue, WireError> {
+    let token = CredentialReissueToken::from_bytes(take_exact_secret_array(
+        &mut value.reissue_token,
+        "reissue_token",
+    )?);
+    let request = CredentialReissueRequest::new(
+        parse_id(&value.operation_id, "operation_id")?,
+        parse_id(&value.intent_id, "intent_id")?,
+        token.digest(),
+        parse_id(&value.tenant_id, "tenant_id")?,
+        parse_id(&value.host_id, "host_id")?,
+        parse_id(&value.connector_id, "connector_id")?,
+        parse_id(&value.current_credential_id, "current_credential_id")?,
+        parse_digest(
+            value.current_leaf_fingerprint_sha256,
+            "current_leaf_fingerprint_sha256",
+        )?,
+        positive_safe(value.connector_generation, "connector_generation")?,
+        parse_revision(value.spec_revision, "spec_revision")?,
+        parse_public_key(&value.new_control_public_key, "new_control_public_key")?,
+        exact_array(value.current_control_signature, "current_control_signature")?,
+        exact_array(value.new_control_signature, "new_control_signature")?,
+    );
+    Ok(ParsedCredentialReissue { token, request })
 }
 
 /// Validates a Hello frame without deriving authorization from its self-reported claims.
@@ -1257,6 +1295,27 @@ pub fn build_enrollment_response(
     credential: &ConnectorCredential,
 ) -> v1::EnrollConnectorResponse {
     v1::EnrollConnectorResponse {
+        credential: Some(build_credential_message(credential)),
+        request_digest: request.request_digest().as_bytes().to_vec(),
+        result_digest: credential.result_digest().as_bytes().to_vec(),
+    }
+}
+
+#[must_use]
+pub fn build_credential_reissue_response(
+    request: &CredentialReissueRequest,
+    credential: &ConnectorCredential,
+) -> v1::ReissueConnectorCredentialResponse {
+    v1::ReissueConnectorCredentialResponse {
+        operation_id: request.operation_id().to_string(),
+        intent_id: request.intent_id().to_string(),
+        tenant_id: request.tenant_id().to_string(),
+        host_id: request.host_id().to_string(),
+        connector_id: request.connector_id().to_string(),
+        current_credential_id: request.current_credential_id().to_string(),
+        current_leaf_fingerprint_sha256: request.current_fingerprint().as_bytes().to_vec(),
+        connector_generation: request.generation(),
+        spec_revision: request.spec_revision().get(),
         credential: Some(build_credential_message(credential)),
         request_digest: request.request_digest().as_bytes().to_vec(),
         result_digest: credential.result_digest().as_bytes().to_vec(),

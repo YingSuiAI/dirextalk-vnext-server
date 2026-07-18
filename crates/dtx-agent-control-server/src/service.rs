@@ -13,11 +13,11 @@ use crate::{
     ConnectorControlApplication, ConnectorControlApplicationError, ConnectorHelloAdmissionPermit,
     ConnectorTransportAdmission, ConnectorTransportAdmissionConfig, ParsedClientFrame,
     SourceTransportAdmission, SourceTransportAdmissionConfig, authenticate_control_request,
-    build_connect_lease, build_credential_rotation_result, build_durable_command_frame,
-    build_enrollment_response, build_heartbeat_acknowledgement, build_run_available,
-    build_run_checkpoint_ack, build_run_completed_ack, build_run_failed_ack,
-    build_run_lease_granted, build_run_output_ack, parse_client_frame, parse_enrollment_request,
-    unix_time_from_millis,
+    build_connect_lease, build_credential_reissue_response, build_credential_rotation_result,
+    build_durable_command_frame, build_enrollment_response, build_heartbeat_acknowledgement,
+    build_run_available, build_run_checkpoint_ack, build_run_completed_ack, build_run_failed_ack,
+    build_run_lease_granted, build_run_output_ack, parse_client_frame,
+    parse_credential_reissue_request, parse_enrollment_request, unix_time_from_millis,
 };
 
 /// Maximum time an authenticated control RPC may remain silent before its first `Hello`.
@@ -172,6 +172,29 @@ impl v1::connector_enrollment_server::ConnectorEnrollment for ConnectorEnrollmen
                 .map_err(|_| Status::deadline_exceeded("ENROLLMENT_TIMEOUT"))?
                 .map_err(application_status)?;
         Ok(Response::new(build_enrollment_response(
+            &completion.request,
+            &completion.credential,
+        )))
+    }
+
+    async fn reissue_connector_credential(
+        &self,
+        request: Request<v1::ReissueConnectorCredentialRequest>,
+    ) -> Result<Response<v1::ReissueConnectorCredentialResponse>, Status> {
+        let _admission_permit = self
+            .transport_admission
+            .try_acquire_request(&request)
+            .map_err(|_| Status::resource_exhausted("RESOURCE_EXHAUSTED"))?;
+        let request =
+            parse_credential_reissue_request(request.into_inner()).map_err(wire_status)?;
+        let completion = tokio::time::timeout(
+            self.operation_timeout,
+            self.application.reissue_credential(request),
+        )
+        .await
+        .map_err(|_| Status::deadline_exceeded("REISSUE_TIMEOUT"))?
+        .map_err(application_status)?;
+        Ok(Response::new(build_credential_reissue_response(
             &completion.request,
             &completion.credential,
         )))

@@ -450,6 +450,47 @@ impl ConnectorCredentialAuthorization {
         Ok(successor)
     }
 
+    /// Adds a pending certificate-only recovery credential. Unlike normal rotation it keeps the
+    /// Connector generation/spec fence and offline refresh key unchanged; the next first Hello
+    /// atomically retires the expired credential.
+    pub fn propose_reissue(
+        &mut self,
+        successor: ConnectorCredential,
+    ) -> Result<(), ConnectorCredentialAuthorizationError> {
+        if self.state == ConnectorCredentialAuthorizationState::Revoked {
+            return Err(ConnectorCredentialAuthorizationError::Revoked);
+        }
+        if self.pending().is_some() {
+            return Err(ConnectorCredentialAuthorizationError::PendingSuccessorExists);
+        }
+        let current = self
+            .current()
+            .ok_or(ConnectorCredentialAuthorizationError::InvalidSnapshot)?;
+        if successor.tenant_id() != self.tenant_id
+            || successor.connector_id() != self.connector_id
+            || successor.generation() != current.generation()
+            || successor.revision() != current.revision()
+            || successor.refresh_key() != current.refresh_key()
+            || successor.credential_id() == current.credential_id()
+            || successor.control_key() == current.control_key()
+            || successor.certificate_fingerprint() == current.certificate_fingerprint()
+        {
+            return Err(ConnectorCredentialAuthorizationError::InvalidSuccessor);
+        }
+        if self.history.iter().any(|entry| {
+            entry.credential.credential_id() == successor.credential_id()
+                || entry.credential.control_key() == successor.control_key()
+                || entry.credential.certificate_fingerprint() == successor.certificate_fingerprint()
+        }) {
+            return Err(ConnectorCredentialAuthorizationError::CredentialReuse);
+        }
+        self.history.push(CredentialEntry {
+            credential: successor,
+            status: ConnectorCredentialStatus::Pending,
+        });
+        Ok(())
+    }
+
     /// Validates identity, two-key proof, idempotency, and the single-pending
     /// rule before an application asks its certificate issuer for a successor.
     ///
@@ -835,9 +876,7 @@ impl Error for ConnectorCredentialAuthorizationError {}
 fn validate_authorization_snapshot(
     snapshot: &ConnectorCredentialAuthorizationSnapshot,
 ) -> Result<(), ConnectorCredentialAuthorizationError> {
-    if snapshot.history.is_empty()
-        || snapshot.rotations.len().checked_add(1) != Some(snapshot.history.len())
-    {
+    if snapshot.history.is_empty() || snapshot.rotations.len() >= snapshot.history.len() {
         return Err(ConnectorCredentialAuthorizationError::InvalidSnapshot);
     }
     let mut ids = BTreeSet::new();
@@ -858,24 +897,37 @@ fn validate_authorization_snapshot(
         if let Some(previous) = index
             .checked_sub(1)
             .and_then(|previous| snapshot.history.get(previous))
-            && (previous
-                .credential
-                .generation()
-                .checked_add(1)
-                .is_none_or(|next| next != credential.generation())
-                || previous.credential.revision() >= credential.revision())
+            && !((previous.credential.generation().checked_add(1) == Some(credential.generation())
+                && previous.credential.revision() < credential.revision())
+                || (previous.credential.generation() == credential.generation()
+                    && previous.credential.revision() == credential.revision()))
         {
             return Err(ConnectorCredentialAuthorizationError::InvalidSnapshot);
         }
     }
 
     let mut request_ids = BTreeSet::new();
-    for (index, rotation) in snapshot.rotations.iter().enumerate() {
-        let current = &snapshot.history[index].credential;
-        let successor = &snapshot.history[index + 1].credential;
-        if rotation.current_credential_id != current.credential_id()
-            || rotation.successor_credential_id != successor.credential_id()
-            || !rotation.result_digest.ct_eq(successor.result_digest())
+    for rotation in &snapshot.rotations {
+        let current = snapshot
+            .history
+            .iter()
+            .find(|entry| entry.credential.credential_id() == rotation.current_credential_id)
+            .ok_or(ConnectorCredentialAuthorizationError::InvalidSnapshot)?;
+        let successor = snapshot
+            .history
+            .iter()
+            .find(|entry| entry.credential.credential_id() == rotation.successor_credential_id)
+            .ok_or(ConnectorCredentialAuthorizationError::InvalidSnapshot)?;
+        if successor.credential.generation()
+            != current
+                .credential
+                .generation()
+                .checked_add(1)
+                .ok_or(ConnectorCredentialAuthorizationError::InvalidSnapshot)?
+            || successor.credential.revision() <= current.credential.revision()
+            || !rotation
+                .result_digest
+                .ct_eq(successor.credential.result_digest())
             || rotation.command_sequence == 0
             || rotation.command_sequence > Revision::MAX
             || !request_ids.insert(rotation.request_id)
@@ -925,7 +977,7 @@ fn validate_authorization_status(
                 || snapshot.history.iter().any(|entry| {
                     entry.status == ConnectorCredentialStatus::Revoked
                         || (entry.status == ConnectorCredentialStatus::Retired
-                            && entry.credential.generation() >= current[0].credential.generation())
+                            && entry.credential.generation() > current[0].credential.generation())
                 })
             {
                 return Err(ConnectorCredentialAuthorizationError::InvalidSnapshot);

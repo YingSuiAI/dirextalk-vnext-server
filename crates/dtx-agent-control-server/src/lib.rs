@@ -34,7 +34,8 @@ pub use agent_identity_provisioning::*;
 pub use agent_route_bootstrap::*;
 pub use application::{
     ApplicationFuture, ConnectorControlApplication, ConnectorControlApplicationError,
-    CredentialRotationCompletion, EnrollmentCompletion, HeartbeatCompletion, OpenControlCompletion,
+    CredentialReissueCompletion, CredentialRotationCompletion, EnrollmentCompletion,
+    HeartbeatCompletion, OpenControlCompletion,
 };
 pub use authentication::{
     ControlRequestAuthenticationError, authenticate_control_request, unix_time_from_millis,
@@ -81,8 +82,9 @@ pub use postgres_application::{
     AgentRunReconcileBatch, ApplyConnectorConfigurationRequest, CancelAgentRunRequest,
     CloseConnectorStreamRequest, ConnectorCommandFence, ConnectorControlPolicy,
     ConnectorLifecycleAction, ConnectorLifecycleCommandWrite, CreateAgentRunRequest,
-    CreateConnectorEnrollmentRequest, CreatedAgentRun, CreatedConnectorEnrollment,
-    PostgresConnectorControlApplication, RotateConnectorCredentialRequest,
+    CreateConnectorEnrollmentRequest, CreatedAgentRun, CreatedConnectorCredentialReissue,
+    CreatedConnectorEnrollment, PostgresConnectorControlApplication,
+    PrepareConnectorCredentialReissueRequest, RotateConnectorCredentialRequest,
 };
 pub use provisioning::*;
 pub use run_notifications::RunOfferNotificationSubscription;
