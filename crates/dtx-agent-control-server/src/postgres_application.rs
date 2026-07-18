@@ -69,7 +69,8 @@ use crate::{
 };
 
 const PROTOCOL_MAJOR: u32 = 1;
-const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 4;
+const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 5;
+const EXPIRED_AGENT_ROUTE_PREPARE_ACK_PROTOCOL_MINOR: u32 = 5;
 const DEFAULT_HEARTBEAT_INTERVAL_MILLIS: u32 = 10_000;
 const DEFAULT_HEARTBEAT_TTL_MILLIS: u32 = 30_000;
 const CERTIFICATE_NOT_BEFORE_SKEW_MILLIS: i64 = 30_000;
@@ -2393,6 +2394,7 @@ impl PostgresConnectorControlApplication {
         &self,
         peer: AuthenticatedConnectorPeer,
         acknowledgement: ParsedCommandAcknowledgement,
+        protocol_minor: u32,
     ) -> Result<(), ConnectorControlApplicationError> {
         ensure_peer_fence(peer, acknowledgement.fence)?;
         let now = self.now()?;
@@ -2423,6 +2425,9 @@ impl PostgresConnectorControlApplication {
         let target_command = self.decode_persisted_command(&target_frame)?;
         match target_command.payload() {
             ServerCommandPayload::PrepareAgentRouteRecipient(prepare) => {
+                if protocol_minor < EXPIRED_AGENT_ROUTE_PREPARE_ACK_PROTOCOL_MINOR {
+                    return Err(ConnectorControlApplicationError::Conflict);
+                }
                 self.acknowledge_expired_agent_route_prepare(
                     session.connection(),
                     acknowledgement,
@@ -5194,7 +5199,17 @@ impl ConnectorControlApplication for PostgresConnectorControlApplication {
         peer: AuthenticatedConnectorPeer,
         acknowledgement: ParsedCommandAcknowledgement,
     ) -> ApplicationFuture<'_, ()> {
-        Box::pin(self.acknowledge_operation(peer, acknowledgement))
+        // Calls outside a negotiated control session may ACK legacy command kinds only.
+        Box::pin(self.acknowledge_operation(peer, acknowledgement, 0))
+    }
+
+    fn acknowledge_command_on_session(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        acknowledgement: ParsedCommandAcknowledgement,
+        protocol_minor: u32,
+    ) -> ApplicationFuture<'_, ()> {
+        Box::pin(self.acknowledge_operation(peer, acknowledgement, protocol_minor))
     }
 
     fn rotate_credential(

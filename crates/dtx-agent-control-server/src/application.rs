@@ -94,6 +94,20 @@ pub trait ConnectorControlApplication: Send + Sync + 'static {
         acknowledgement: ParsedCommandAcknowledgement,
     ) -> ApplicationFuture<'_, ()>;
 
+    /// Acknowledges a command on the live control session that negotiated `protocol_minor`.
+    ///
+    /// The default preserves implementations whose acknowledgement semantics do not vary by
+    /// protocol minor. Applications with minor-gated transitions must override this method and
+    /// fail closed when the session did not negotiate the required contract.
+    fn acknowledge_command_on_session(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        acknowledgement: ParsedCommandAcknowledgement,
+        _protocol_minor: u32,
+    ) -> ApplicationFuture<'_, ()> {
+        self.acknowledge_command(peer, acknowledgement)
+    }
+
     fn rotate_credential(
         &self,
         peer: AuthenticatedConnectorPeer,

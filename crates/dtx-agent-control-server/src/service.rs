@@ -533,7 +533,11 @@ async fn drive_control(
                     }
                     ParsedClientFrame::CommandAcknowledgement(acknowledgement) => {
                         application
-                            .acknowledge_command(peer, acknowledgement)
+                            .acknowledge_command_on_session(
+                                peer,
+                                acknowledgement,
+                                protocol_minor,
+                            )
                             .await
                     }
                     ParsedClientFrame::CredentialRotationProof(proof) => {

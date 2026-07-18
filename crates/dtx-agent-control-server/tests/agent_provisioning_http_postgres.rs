@@ -2050,9 +2050,9 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
                 spec_revision: completion.credential.revision(),
                 protocol: ParsedProtocolRange {
                     minimum_major: 1,
-                    minimum_minor: 4,
+                    minimum_minor: 5,
                     maximum_major: 1,
-                    maximum_minor: 4,
+                    maximum_minor: 5,
                 },
                 runtime_claims: claims()?,
                 capacity: capacity(),
@@ -2061,7 +2061,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
             },
         )
         .await?;
-    assert_eq!(opened.protocol_minor, 4);
+    assert_eq!(opened.protocol_minor, 5);
     let fence = opened.lease.fence();
     let router = agent_provisioning_owner_router(Arc::new(
         PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app.clone()),
@@ -2123,7 +2123,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         encoded_command_digest: expired_prepare.encoded_command_digest(),
     };
     assert_eq!(
-        app.acknowledge_command(
+        app.acknowledge_command_on_session(
             authenticate_at(
                 index.clone(),
                 &ca_der,
@@ -2131,6 +2131,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
                 route_auth_time_ms,
             )?,
             expired_ack,
+            5,
         )
         .await,
         Err(ConnectorControlApplicationError::Conflict),
@@ -2142,7 +2143,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         ..expired_ack
     };
     assert_eq!(
-        app.acknowledge_command(
+        app.acknowledge_command_on_session(
             authenticate_at(
                 index.clone(),
                 &ca_der,
@@ -2150,6 +2151,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
                 route_auth_time_ms,
             )?,
             wrong_sequence,
+            5,
         )
         .await,
         Err(ConnectorControlApplicationError::StaleFence),
@@ -2160,7 +2162,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         ..expired_ack
     };
     assert_eq!(
-        app.acknowledge_command(
+        app.acknowledge_command_on_session(
             authenticate_at(
                 index.clone(),
                 &ca_der,
@@ -2168,6 +2170,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
                 route_auth_time_ms,
             )?,
             wrong_digest,
+            5,
         )
         .await,
         Err(ConnectorControlApplicationError::Conflict),
@@ -2198,19 +2201,8 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         .max(0)
         .saturating_add(2);
     tokio::time::sleep(Duration::from_millis(u64::try_from(wait_until_expired)?)).await;
-    app.acknowledge_command(
-        authenticate_at(
-            index.clone(),
-            &ca_der,
-            &completion.credential,
-            route_auth_time_ms,
-        )?,
-        expired_ack,
-    )
-    .await
-    .expect("the exact expired Prepare ACK must close its command, bootstrap, and outbox");
     assert_eq!(
-        app.acknowledge_command(
+        app.acknowledge_command_on_session(
             authenticate_at(
                 index.clone(),
                 &ca_der,
@@ -2218,6 +2210,58 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
                 route_auth_time_ms,
             )?,
             expired_ack,
+            4,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict),
+        "an Agent Control 1.4 session cannot invoke the 1.5 expired-Prepare transition",
+    );
+    let mut before_minor_five_ack = store.begin_tenant(tenant_id).await?;
+    let (before_minor_five_state, before_minor_five_outbox, before_minor_five_cursor): (
+        String,
+        String,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT b.state, o.state, h.acknowledged_command_sequence
+           FROM agent.agent_route_bootstraps AS b
+           JOIN agent.agent_route_bootstrap_outbox AS o
+             ON o.tenant_id=b.tenant_id AND o.bootstrap_id=b.bootstrap_id
+           JOIN agent.connector_control_stream_heads AS h
+             ON h.tenant_id=b.tenant_id AND h.connector_id=b.connector_id
+          WHERE b.tenant_id=$1 AND b.bootstrap_id=$2
+            AND o.command_kind='prepare_recipient'",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(expired_bootstrap_id))
+    .fetch_one(before_minor_five_ack.connection())
+    .await?;
+    assert_eq!(before_minor_five_state, "pending_recipient");
+    assert_eq!(before_minor_five_outbox, "dispatched");
+    assert_eq!(before_minor_five_cursor, 0);
+    before_minor_five_ack.rollback().await?;
+
+    app.acknowledge_command_on_session(
+        authenticate_at(
+            index.clone(),
+            &ca_der,
+            &completion.credential,
+            route_auth_time_ms,
+        )?,
+        expired_ack,
+        5,
+    )
+    .await
+    .expect("the exact expired Prepare ACK must close its command, bootstrap, and outbox");
+    assert_eq!(
+        app.acknowledge_command_on_session(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            expired_ack,
+            5,
         )
         .await,
         Ok(()),

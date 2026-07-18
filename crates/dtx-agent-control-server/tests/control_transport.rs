@@ -78,6 +78,7 @@ struct FakeApplication {
     run_claim_calls: AtomicUsize,
     run_reconcile_calls: AtomicUsize,
     execution_report_calls: AtomicUsize,
+    acknowledged_protocol_minor: AtomicUsize,
     reject_execution_reports: AtomicBool,
     command_page_size: usize,
     protocol_minor: u32,
@@ -155,6 +156,7 @@ impl FakeApplication {
             run_claim_calls: AtomicUsize::new(0),
             run_reconcile_calls: AtomicUsize::new(0),
             execution_report_calls: AtomicUsize::new(0),
+            acknowledged_protocol_minor: AtomicUsize::new(usize::MAX),
             reject_execution_reports: AtomicBool::new(false),
             command_page_size: 64,
             protocol_minor: 0,
@@ -171,6 +173,11 @@ impl FakeApplication {
 
     fn with_execution_reporting(mut self) -> Self {
         self.protocol_minor = 2;
+        self
+    }
+
+    fn with_protocol_minor(mut self, protocol_minor: u32) -> Self {
+        self.protocol_minor = protocol_minor;
         self
     }
 
@@ -261,12 +268,15 @@ impl ConnectorControlApplication for FakeApplication {
     ) -> ApplicationFuture<'_, OpenControlCompletion> {
         let result = (|| {
             self.validate_peer(peer)?;
+            let negotiated_protocol_minor = (0..=self.protocol_minor)
+                .rev()
+                .find(|minor| hello.protocol.supports(1, *minor))
+                .ok_or(ConnectorControlApplicationError::PermissionDenied)?;
             if hello.tenant_id != self.identity.tenant_id()
                 || hello.connector_id != self.identity.connector_id()
                 || hello.host_id != self.host_id
                 || hello.connector_generation != 1
                 || hello.spec_revision != Revision::INITIAL
-                || !hello.protocol.supports(1, self.protocol_minor)
                 || hello.capacity.maximum_concurrent_runs != 2
             {
                 return Err(ConnectorControlApplicationError::InvalidRequest);
@@ -308,7 +318,7 @@ impl ConnectorControlApplication for FakeApplication {
                 .collect();
             Ok(OpenControlCompletion {
                 lease,
-                protocol_minor: self.protocol_minor,
+                protocol_minor: negotiated_protocol_minor,
                 heartbeat_interval_millis: HEARTBEAT_INTERVAL_MILLIS,
                 heartbeat_ttl_millis: HEARTBEAT_TTL_MILLIS,
                 acknowledged_command_sequence: state.command_log.acknowledged_sequence(),
@@ -384,6 +394,19 @@ impl ConnectorControlApplication for FakeApplication {
                 .map_err(|_| ConnectorControlApplicationError::Conflict)
         })();
         application_result(result)
+    }
+
+    fn acknowledge_command_on_session(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        acknowledgement: ParsedCommandAcknowledgement,
+        protocol_minor: u32,
+    ) -> ApplicationFuture<'_, ()> {
+        self.acknowledged_protocol_minor.store(
+            usize::try_from(protocol_minor).expect("protocol minor fits usize"),
+            Ordering::SeqCst,
+        );
+        self.acknowledge_command(peer, acknowledgement)
     }
 
     fn rotate_credential(
@@ -706,15 +729,18 @@ async fn real_mtls_control_uses_application_authority_not_the_local_tls_index() 
 
     let (operation_id, expected_command, expected_payload_digest, expected_encoded_digest) =
         exact_command();
-    let application = Arc::new(FakeApplication::new(
-        now_millis,
-        identity,
-        host_id,
-        client_certificate.certificate_fingerprint(),
-        operation_id,
-        expected_command.clone(),
-        expected_payload_digest,
-    ));
+    let application = Arc::new(
+        FakeApplication::new(
+            now_millis,
+            identity,
+            host_id,
+            client_certificate.certificate_fingerprint(),
+            operation_id,
+            expected_command.clone(),
+            expected_payload_digest,
+        )
+        .with_protocol_minor(5),
+    );
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("loopback listener binds");
@@ -737,13 +763,13 @@ async fn real_mtls_control_uses_application_authority_not_the_local_tls_index() 
     let (first_sender, mut first_responses) = open_control(
         address,
         client_tls.clone(),
-        hello(identity, host_id, first_boot, 0),
+        hello_through_minor(identity, host_id, first_boot, 4),
     )
     .await;
     let first_connect_lease = expect_connect_lease(&mut first_responses).await;
     assert_eq!(
-        first_connect_lease.protocol_minor, 0,
-        "an agent-control/1.0 client stays on minor zero on the shared stream",
+        first_connect_lease.protocol_minor, 4,
+        "an older Connector range remains negotiated on Agent Control 1.4",
     );
     let first_lease = first_connect_lease.fence.expect("lease includes a fence");
     let first_command = expect_command(&mut first_responses).await;
@@ -767,10 +793,15 @@ async fn real_mtls_control_uses_application_authority_not_the_local_tls_index() 
     let (second_sender, mut second_responses) = open_control(
         address,
         client_tls.clone(),
-        hello(identity, host_id, second_boot, 0),
+        hello_through_minor(identity, host_id, second_boot, 5),
     )
     .await;
-    let second_lease = expect_lease(&mut second_responses).await;
+    let second_connect_lease = expect_connect_lease(&mut second_responses).await;
+    assert_eq!(
+        second_connect_lease.protocol_minor, 5,
+        "the server advertises the expired-Prepare ordinary-ACK contract as Agent Control 1.5",
+    );
+    let second_lease = second_connect_lease.fence.expect("lease includes a fence");
     let replayed_command = expect_command(&mut second_responses).await;
     assert_eq!(
         replayed_command, first_command,
@@ -792,6 +823,13 @@ async fn real_mtls_control_uses_application_authority_not_the_local_tls_index() 
     send_heartbeat(&second_sender, second_lease, 1).await;
     expect_heartbeat_ack(&mut second_responses, 1).await;
     assert_eq!(application.acknowledged_sequence(), 1);
+    assert_eq!(
+        application
+            .acknowledged_protocol_minor
+            .load(Ordering::SeqCst),
+        5,
+        "the acknowledgement boundary receives the minor negotiated for its live session",
+    );
     drop(second_sender);
     drop(second_responses);
 
