@@ -22,11 +22,12 @@ use dtx_agent_control::{
 };
 use dtx_agent_control_server::{
     AgentProvisioningInstalledReceiptFacts, ConnectorCertificateAuthority,
-    ConnectorControlApplication, ConnectorControlPolicy, ConnectorCredentialAuthorizationIndex,
-    CreateConnectorEnrollmentRequest, MAX_CONNECTOR_PROJECTION_BINDINGS,
-    ParsedAgentProvisioningInstalled, ParsedAgentRouteBootstrapInstalled,
-    ParsedAgentRouteRecipientReady, ParsedCapacity, ParsedEnrollment, ParsedHello,
-    ParsedLeaseFence, ParsedProtocolRange, ParsedProvisioningRecipientAnnouncement,
+    ConnectorControlApplication, ConnectorControlApplicationError, ConnectorControlPolicy,
+    ConnectorCredentialAuthorizationIndex, CreateConnectorEnrollmentRequest,
+    MAX_CONNECTOR_PROJECTION_BINDINGS, ParsedAgentProvisioningInstalled,
+    ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteRecipientReady, ParsedCapacity,
+    ParsedCommandAcknowledgement, ParsedEnrollment, ParsedHello, ParsedLeaseFence,
+    ParsedProtocolRange, ParsedProvisioningRecipientAnnouncement,
     PostgresAgentProvisioningOwnerBackend, PostgresConnectorControlApplication,
     ProtobufDurableCommandDecoder, agent_provisioning_installed_receipt_digest,
     agent_provisioning_owner_router,
@@ -87,6 +88,7 @@ use uuid::Uuid;
 static TEST_NOW: OnceLock<i64> = OnceLock::new();
 static BINDING_FIXTURE_CLOCK_OFFSET: AtomicI64 = AtomicI64::new(0);
 const AGENT_ID: &str = "dtxa17sv7zwzpr7aduy467sdm3pkmxe6if34eoarhaxdnau44fjwfseda";
+const PRIVATE_CONVERSATION_TOOLS_PROFILE_V1: &[u8] = b"dirextalk/private-conversation-agent-profile/v1\nmention-only\nfuture-messages\nsend-messages\nexclude-history\nexclude-attachments\ninclude-tools\nexclude-cloud\nexclude-egress";
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -1936,6 +1938,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
 #[allow(clippy::too_many_lines)]
 async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed()
 -> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
     TEST_NOW.get_or_init(|| {
         i64::try_from(
             SystemTime::now()
@@ -1945,7 +1948,6 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         )
         .expect("current time fits i64")
     });
-    let harness = PostgresHarness::start().await?;
     grant_agent_route_run_runtime_access(&harness).await?;
     let store = harness.runtime_store(12).await?;
     let tenant_id = TenantId::new();
@@ -2023,11 +2025,22 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
             request: enrollment_request,
         })
         .await?;
+    let route_auth_time_ms = current_store_timestamp()?;
+    assert!(
+        completion.credential.not_before_millis() <= route_auth_time_ms
+            && route_auth_time_ms < completion.credential.not_after_millis(),
+        "route connector authentication time must be inside the issued credential validity",
+    );
     app.hydrate_connector_authorization(tenant_id, connector.connector_id())
         .await?;
     let opened = app
         .open_control(
-            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
             ParsedHello {
                 tenant_id,
                 connector_id: connector.connector_id(),
@@ -2054,65 +2067,201 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app.clone()),
     ));
 
-    let grant_operation = RequestId::new();
-    let grant_uri =
-        format!("/v1/conversations/{source_conversation_id}/agent-grants/{installation_id}");
-    let grant = owner_conversation_grant_mutation(
+    // An ordinary ACK is reserved for closing one exact Prepare command only
+    // after its bootstrap expires. It must atomically retire the command and
+    // outbox so a successor Begin for the same live target can make progress.
+    let expired_bootstrap_id = AgentRouteBootstrapId::new();
+    let expired_at = current_store_timestamp()? + 5_000;
+    let expired_begin = owner_post(
         router.clone(),
-        Method::PUT,
-        &grant_uri,
+        "/v1/agent-route-bootstraps",
         &owner_authorization,
-        grant_operation,
-        "\"g0\"",
-        conversation_grant_body(
-            1,
-            grant_operation,
+        "route_bootstrap_expired_prepare",
+        "application/vnd.dirextalk.agent-route-bootstrap.v1+cbor",
+        agent_route_bootstrap_begin_body(
+            expired_bootstrap_id,
             tenant_id,
-            source_conversation_id,
-            installation_id,
-            None,
-            owner_id,
-            owner_device_id,
-            &owner_device_key,
-            Some(now() + 600_000),
-            Some([0x73; 32]),
-            now() + 300_000,
-        )?,
-    )
-    .await?;
-    assert_eq!(grant.0, StatusCode::CREATED);
-
-    let route_id = ConversationId::new();
-    let route_fence = [0x74; 32];
-    let before_install_operation = RequestId::new();
-    let before_install_event = EventId::try_from(*before_install_operation.as_uuid())?;
-    let run_uri =
-        format!("/v1/conversations/{source_conversation_id}/agent-routes/{route_id}/runs");
-    let before_install = owner_agent_route_run(
-        router.clone(),
-        &run_uri,
-        &owner_authorization,
-        before_install_operation,
-        "\"g1\"",
-        agent_route_run_body(
-            tenant_id,
-            source_conversation_id,
-            route_id,
             installation_id,
             binding_id,
             agent_control_device_id,
-            route_fence,
-            before_install_event,
-            before_install_operation,
-            Revision::INITIAL,
             owner_id,
             owner_device_id,
+            expired_at,
+            vec![0x70; 128],
             &owner_device_key,
-            now() + 300_000,
         )?,
     )
     .await?;
-    assert_eq!(before_install.0, StatusCode::CONFLICT);
+    assert_eq!(expired_begin.0, StatusCode::CREATED);
+    let expired_commands = app
+        .poll_commands(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            fence,
+            0,
+        )
+        .await
+        .expect("polling the new expired-case Prepare command must remain available");
+    let expired_prepare = expired_commands
+        .iter()
+        .find(|command| {
+            matches!(
+                command.payload(),
+                ServerCommandPayload::PrepareAgentRouteRecipient(prepare)
+                    if prepare.bootstrap_id == expired_bootstrap_id
+            )
+        })
+        .expect("expired bootstrap has one durable Prepare command");
+    let expired_ack = ParsedCommandAcknowledgement {
+        fence: parsed_fence(fence),
+        command_sequence: expired_prepare.sequence(),
+        payload_digest: expired_prepare.payload_digest(),
+        encoded_command_digest: expired_prepare.encoded_command_digest(),
+    };
+    assert_eq!(
+        app.acknowledge_command(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            expired_ack,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict),
+        "a nonexpired Prepare must not be retired by an ordinary ACK",
+    );
+
+    let wrong_sequence = ParsedCommandAcknowledgement {
+        command_sequence: expired_ack.command_sequence + 1,
+        ..expired_ack
+    };
+    assert_eq!(
+        app.acknowledge_command(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            wrong_sequence,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::StaleFence),
+        "an ACK for a different sequence must not retire the expired Prepare",
+    );
+    let wrong_digest = ParsedCommandAcknowledgement {
+        encoded_command_digest: ControlDigest::from_bytes([0x6f; 32]),
+        ..expired_ack
+    };
+    assert_eq!(
+        app.acknowledge_command(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            wrong_digest,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict),
+        "an inexact digest must not retire the expired Prepare",
+    );
+    let mut before_expired_ack = store.begin_tenant(tenant_id).await?;
+    let (before_state, before_outbox_state, before_cursor): (String, String, i64) = sqlx::query_as(
+        "SELECT b.state, o.state, h.acknowledged_command_sequence
+               FROM agent.agent_route_bootstraps AS b
+               JOIN agent.agent_route_bootstrap_outbox AS o
+                 ON o.tenant_id=b.tenant_id AND o.bootstrap_id=b.bootstrap_id
+               JOIN agent.connector_control_stream_heads AS h
+                 ON h.tenant_id=b.tenant_id AND h.connector_id=b.connector_id
+              WHERE b.tenant_id=$1 AND b.bootstrap_id=$2
+                AND o.command_kind='prepare_recipient'",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(expired_bootstrap_id))
+    .fetch_one(before_expired_ack.connection())
+    .await?;
+    assert_eq!(before_state, "pending_recipient");
+    assert_eq!(before_outbox_state, "dispatched");
+    assert_eq!(before_cursor, 0);
+    before_expired_ack.rollback().await?;
+
+    let wait_until_expired = expired_at
+        .saturating_sub(current_store_timestamp()?)
+        .max(0)
+        .saturating_add(2);
+    tokio::time::sleep(Duration::from_millis(u64::try_from(wait_until_expired)?)).await;
+    app.acknowledge_command(
+        authenticate_at(
+            index.clone(),
+            &ca_der,
+            &completion.credential,
+            route_auth_time_ms,
+        )?,
+        expired_ack,
+    )
+    .await
+    .expect("the exact expired Prepare ACK must close its command, bootstrap, and outbox");
+    assert_eq!(
+        app.acknowledge_command(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            expired_ack,
+        )
+        .await,
+        Ok(()),
+        "the exact completed expiry transition must replay idempotently",
+    );
+
+    let expired_uri = format!("/v1/agent-route-bootstraps/{expired_bootstrap_id}");
+    let expired_status = owner_get(router.clone(), &expired_uri, &owner_authorization).await?;
+    assert_eq!(expired_status.0, StatusCode::OK);
+    let CanonicalValue::Map(expired_receipt) = decode_deterministic_cbor(&expired_status.1)? else {
+        panic!("expired RouteBootstrap receipt must be a canonical map");
+    };
+    assert_eq!(expired_receipt.len(), 11);
+    assert_eq!(expired_receipt[2].1, text(expired_bootstrap_id));
+    assert_eq!(expired_receipt[3].1, u(6));
+    assert_eq!(expired_receipt[4].1, CanonicalValue::Null);
+    assert_eq!(expired_receipt[5].1, CanonicalValue::Null);
+    assert_eq!(expired_receipt[6].1, CanonicalValue::Null);
+    assert_eq!(expired_receipt[7].1, CanonicalValue::Null);
+    assert_eq!(expired_receipt[10].1, CanonicalValue::Null);
+
+    let mut expired_session = store.begin_tenant(tenant_id).await?;
+    let (expired_state, cancelled_state, acknowledged_cursor): (String, String, i64) =
+        sqlx::query_as(
+            "SELECT b.state, o.state, h.acknowledged_command_sequence
+               FROM agent.agent_route_bootstraps AS b
+               JOIN agent.agent_route_bootstrap_outbox AS o
+                 ON o.tenant_id=b.tenant_id AND o.bootstrap_id=b.bootstrap_id
+               JOIN agent.connector_control_stream_heads AS h
+                 ON h.tenant_id=b.tenant_id AND h.connector_id=b.connector_id
+              WHERE b.tenant_id=$1 AND b.bootstrap_id=$2
+                AND o.command_kind='prepare_recipient'",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(expired_bootstrap_id))
+        .fetch_one(expired_session.connection())
+        .await?;
+    assert_eq!(expired_state, "expired");
+    assert_eq!(cancelled_state, "cancelled");
+    assert_eq!(
+        acknowledged_cursor,
+        i64::try_from(expired_prepare.sequence())?
+    );
+    expired_session.rollback().await?;
 
     let bootstrap_id = AgentRouteBootstrapId::new();
     let bootstrap_expires_at = now() + 300_000;
@@ -2151,13 +2300,79 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     assert_eq!(begin_replay.0, StatusCode::OK);
     assert_eq!(begin_replay.1, begin.1);
 
+    let grant_operation = RequestId::new();
+    let grant_uri =
+        format!("/v1/conversations/{source_conversation_id}/agent-grants/{installation_id}");
+    let grant = owner_conversation_grant_mutation(
+        router.clone(),
+        Method::PUT,
+        &grant_uri,
+        &owner_authorization,
+        grant_operation,
+        "\"g0\"",
+        conversation_grant_body(
+            1,
+            grant_operation,
+            tenant_id,
+            source_conversation_id,
+            installation_id,
+            None,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            Some(now() + 600_000),
+            Some(private_conversation_tools_profile_v1_digest()),
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(grant.0, StatusCode::CREATED);
+
+    let route_id = ConversationId::new();
+    let route_fence = [0x74; 32];
+    let before_install_operation = RequestId::new();
+    let before_install_event = EventId::try_from(*before_install_operation.as_uuid())?;
+    let run_uri =
+        format!("/v1/conversations/{source_conversation_id}/agent-routes/{route_id}/runs");
+    let before_install = owner_agent_route_run(
+        router.clone(),
+        &run_uri,
+        &owner_authorization,
+        before_install_operation,
+        "\"g1\"",
+        agent_route_run_body(
+            tenant_id,
+            source_conversation_id,
+            route_id,
+            installation_id,
+            binding_id,
+            agent_control_device_id,
+            route_fence,
+            before_install_event,
+            before_install_operation,
+            Revision::INITIAL,
+            owner_id,
+            owner_device_id,
+            &owner_device_key,
+            now() + 300_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(before_install.0, StatusCode::CONFLICT);
+
     let commands = app
         .poll_commands(
-            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
             fence,
-            0,
+            expired_prepare.sequence(),
         )
-        .await?;
+        .await
+        .expect("polling the successor Prepare must continue from the expired ACK cursor");
     let prepare_commands = commands
         .iter()
         .filter(|command| {
@@ -2220,14 +2435,24 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     changed_ready.result_digest = ControlDigest::from_bytes([0x77; 32]);
     assert!(
         app.record_agent_route_recipient_ready(
-            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
             changed_ready,
         )
         .await
         .is_err()
     );
     app.record_agent_route_recipient_ready(
-        authenticate(index.clone(), &ca_der, &completion.credential)?,
+        authenticate_at(
+            index.clone(),
+            &ca_der,
+            &completion.credential,
+            route_auth_time_ms,
+        )?,
         ready,
     )
     .await?;
@@ -2296,7 +2521,12 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     assert_eq!(delivery.0, StatusCode::CREATED);
     let delivery_commands = app
         .poll_commands(
-            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
             fence,
             prepare_command.sequence(),
         )
@@ -2312,6 +2542,26 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         .collect::<Vec<_>>();
     assert_eq!(delivery_commands.len(), 1);
     let delivery_command = delivery_commands[0];
+
+    assert_eq!(
+        app.acknowledge_command(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            ParsedCommandAcknowledgement {
+                fence: parsed_fence(fence),
+                command_sequence: delivery_command.sequence(),
+                payload_digest: delivery_command.payload_digest(),
+                encoded_command_digest: delivery_command.encoded_command_digest(),
+            },
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict),
+        "a delivery command requires its typed terminal result, never an ordinary ACK",
+    );
 
     let mut delivery_session = store.begin_tenant(tenant_id).await?;
     let delivery_outbox_count: i64 = sqlx::query_scalar(
@@ -2357,7 +2607,12 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         ),
     };
     app.complete_agent_route_bootstrap(
-        authenticate(index.clone(), &ca_der, &completion.credential)?,
+        authenticate_at(
+            index.clone(),
+            &ca_der,
+            &completion.credential,
+            route_auth_time_ms,
+        )?,
         installed,
     )
     .await?;
@@ -3485,6 +3740,10 @@ fn conversation_grant_body(
     )
 }
 
+fn private_conversation_tools_profile_v1_digest() -> [u8; 32] {
+    *Sha256Digest::hash_domain(&[], PRIVATE_CONVERSATION_TOOLS_PROFILE_V1).as_bytes()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn connector_binding_state_body(
     action: u64,
@@ -4098,6 +4357,15 @@ fn authenticate(
     ca_der: &[u8],
     credential: &dtx_agent_control::ConnectorCredential,
 ) -> Result<dtx_security::AuthenticatedConnectorPeer, Box<dyn Error>> {
+    authenticate_at(index, ca_der, credential, now())
+}
+
+fn authenticate_at(
+    index: Arc<ConnectorCredentialAuthorizationIndex>,
+    ca_der: &[u8],
+    credential: &dtx_agent_control::ConnectorCredential,
+    auth_time_ms: i64,
+) -> Result<dtx_security::AuthenticatedConnectorPeer, Box<dyn Error>> {
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(ca_der.to_vec()))?;
     let verifier = ConnectorMtlsClientVerifier::new(Arc::new(roots), index)?;
@@ -4109,7 +4377,7 @@ fn authenticate(
             .cloned()
             .map(CertificateDer::from)
             .collect::<Vec<_>>(),
-        UnixTime::since_unix_epoch(Duration::from_millis(u64::try_from(now())?)),
+        UnixTime::since_unix_epoch(Duration::from_millis(u64::try_from(auth_time_ms)?)),
     )?)
 }
 

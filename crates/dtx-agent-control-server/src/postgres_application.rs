@@ -8,7 +8,7 @@ use dtx_agent_control::{
     DEFAULT_ENROLLMENT_TTL_MILLIS, DurableServerCommand, DurableServerCommandSnapshot,
     EnrollmentError, EnrollmentIntent, EnrollmentRequestDisposition, EnrollmentToken,
     ExactCommandBytes, MAX_CONFIG_ENTRIES_PER_SCOPE, MAX_CONNECTOR_CREDENTIAL_VALIDITY_MILLIS,
-    RotateCredentialCommand, ServerCommandPayload, Sha256Digest,
+    PrepareAgentRouteRecipient, RotateCredentialCommand, ServerCommandPayload, Sha256Digest,
 };
 use dtx_agent_control_proto::v1;
 use dtx_agent_persistence::{
@@ -2421,11 +2421,28 @@ impl PostgresConnectorControlApplication {
             .map_err(persistence_error)?
             .ok_or(ConnectorControlApplicationError::StaleFence)?;
         let target_command = self.decode_persisted_command(&target_frame)?;
-        if matches!(
-            target_command.payload(),
+        match target_command.payload() {
+            ServerCommandPayload::PrepareAgentRouteRecipient(prepare) => {
+                self.acknowledge_expired_agent_route_prepare(
+                    session.connection(),
+                    acknowledgement,
+                    prepare,
+                    now,
+                )
+                .await?;
+                return session
+                    .commit()
+                    .await
+                    .map_err(|_| ConnectorControlApplicationError::Unavailable);
+            }
             ServerCommandPayload::RotateCredential(_)
-        ) {
-            return Err(ConnectorControlApplicationError::Conflict);
+            | ServerCommandPayload::DeliverAgentRouteBootstrap(_) => {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+            ServerCommandPayload::ApplyConfig(_)
+            | ServerCommandPayload::CloseStream(_)
+            | ServerCommandPayload::DeliverAgentProvisioning(_)
+            | ServerCommandPayload::RevokeAgentProvisioning(_) => {}
         }
         let acknowledgement_write = command_repository
             .acknowledge_command(
@@ -2506,6 +2523,180 @@ impl PostgresConnectorControlApplication {
             .commit()
             .await
             .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)] // Exact route, command, and outbox facts close atomically.
+    async fn acknowledge_expired_agent_route_prepare(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        acknowledgement: ParsedCommandAcknowledgement,
+        prepare: &PrepareAgentRouteRecipient,
+        now: i64,
+    ) -> Result<(), ConnectorControlApplicationError> {
+        let row = sqlx::query(
+            "SELECT b.bootstrap_id, b.owner_identity_id, b.owner_device_id,
+                    b.installation_id, b.binding_id, b.agent_control_device_id,
+                    b.owner_signed_intent, b.expires_at_ms, b.state AS bootstrap_state,
+                    (b.route_fence IS NOT NULL OR b.recipient_id IS NOT NULL
+                     OR b.recipient_capsule_digest IS NOT NULL
+                     OR b.opaque_recipient_capsule IS NOT NULL OR b.route_id IS NOT NULL
+                     OR b.delivery_id IS NOT NULL OR b.bootstrap_capsule_digest IS NOT NULL
+                     OR b.opaque_sealed_bootstrap IS NOT NULL
+                     OR b.delivery_request_digest IS NOT NULL
+                     OR b.delivery_receipt_bytes IS NOT NULL
+                     OR b.delivery_receipt_digest IS NOT NULL
+                     OR b.rejection_code IS NOT NULL) AS side_effectful,
+                    o.operation_id, o.command_payload_digest, o.encoded_command_digest,
+                    o.state AS outbox_state
+               FROM agent.agent_route_bootstraps AS b
+               JOIN agent.agent_route_bootstrap_outbox AS o
+                 ON o.tenant_id=b.tenant_id AND o.bootstrap_id=b.bootstrap_id
+              WHERE b.tenant_id=$1 AND b.connector_id=$2
+                AND o.connector_id=b.connector_id AND o.command_kind='prepare_recipient'
+                AND o.command_sequence=$3
+              FOR UPDATE OF b, o",
+        )
+        .bind(Uuid::from(acknowledgement.fence.tenant_id))
+        .bind(Uuid::from(acknowledgement.fence.connector_id))
+        .bind(
+            i64::try_from(acknowledgement.command_sequence)
+                .map_err(|_| ConnectorControlApplicationError::Conflict)?,
+        )
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?
+        .ok_or(ConnectorControlApplicationError::Conflict)?;
+
+        let bootstrap_id: Uuid = row
+            .try_get("bootstrap_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let operation_id: Uuid = row
+            .try_get("operation_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let bootstrap_state: String = row
+            .try_get("bootstrap_state")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let outbox_state: String = row
+            .try_get("outbox_state")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let expires_at: i64 = row
+            .try_get("expires_at_ms")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_payload = digest_vec(&row, "command_payload_digest")?;
+        let stored_encoded = digest_vec(&row, "encoded_command_digest")?;
+        let owner_signed_intent: Vec<u8> = row
+            .try_get("owner_signed_intent")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let side_effectful: bool = row
+            .try_get("side_effectful")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let pending_transition =
+            matches!(bootstrap_state.as_str(), "pending_recipient" | "expired")
+                && matches!(outbox_state.as_str(), "pending" | "dispatched");
+        let exact_replay = bootstrap_state == "expired" && outbox_state == "cancelled";
+        if bootstrap_id != Uuid::from(prepare.bootstrap_id)
+            || operation_id != bootstrap_id
+            || prepare.tenant_id != acknowledgement.fence.tenant_id
+            || prepare.installation_id.as_uuid()
+                != &row
+                    .try_get::<Uuid, _>("installation_id")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?
+            || prepare.binding_id.as_uuid()
+                != &row
+                    .try_get::<Uuid, _>("binding_id")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?
+            || prepare.agent_control_device_id.as_uuid()
+                != &row
+                    .try_get::<Uuid, _>("agent_control_device_id")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?
+            || prepare.owner_identity_id.to_string()
+                != row
+                    .try_get::<String, _>("owner_identity_id")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?
+            || prepare.owner_device_id.as_uuid()
+                != &row
+                    .try_get::<Uuid, _>("owner_device_id")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?
+            || prepare.owner_signed_intent.as_slice() != owner_signed_intent.as_slice()
+            || prepare.expires_at_millis != expires_at
+            || expires_at > now
+            || !(pending_transition || exact_replay)
+            || stored_payload != acknowledgement.payload_digest
+            || stored_encoded != acknowledgement.encoded_command_digest
+            || side_effectful
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+
+        let acknowledgement_write = CommandLogRepository::new()
+            .acknowledge_command(
+                connection,
+                acknowledgement.fence.tenant_id,
+                acknowledgement.fence.connector_id,
+                acknowledgement.fence.connector_generation,
+                acknowledgement.command_sequence,
+                acknowledgement.payload_digest,
+                acknowledgement.encoded_command_digest,
+                now,
+            )
+            .await
+            .map_err(persistence_error)?;
+        if exact_replay {
+            return if acknowledgement_write.advanced() {
+                Err(ConnectorControlApplicationError::Conflict)
+            } else {
+                Ok(())
+            };
+        }
+        if !acknowledgement_write.advanced() {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let expired = sqlx::query(
+            "UPDATE agent.agent_route_bootstraps
+                SET state='expired', updated_at_ms=GREATEST(updated_at_ms,$3)
+              WHERE tenant_id=$1 AND bootstrap_id=$2
+                AND state IN ('pending_recipient','expired') AND expires_at_ms <= $3
+                AND route_fence IS NULL AND recipient_id IS NULL
+                AND recipient_capsule_digest IS NULL AND opaque_recipient_capsule IS NULL
+                AND route_id IS NULL AND delivery_id IS NULL
+                AND bootstrap_capsule_digest IS NULL AND opaque_sealed_bootstrap IS NULL
+                AND delivery_request_digest IS NULL AND delivery_receipt_bytes IS NULL
+                AND delivery_receipt_digest IS NULL AND rejection_code IS NULL",
+        )
+        .bind(Uuid::from(acknowledgement.fence.tenant_id))
+        .bind(bootstrap_id)
+        .bind(now)
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if expired.rows_affected() != 1 {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
+        let cancelled = sqlx::query(
+            "UPDATE agent.agent_route_bootstrap_outbox
+                SET state='cancelled', result_digest=NULL, resolved_at_ms=NULL,
+                    rejection_code=NULL
+              WHERE tenant_id=$1 AND bootstrap_id=$2 AND connector_id=$3
+                AND operation_id=$2 AND command_kind='prepare_recipient'
+                AND command_sequence=$4 AND command_payload_digest=$5
+                AND encoded_command_digest=$6 AND state IN ('pending','dispatched')",
+        )
+        .bind(Uuid::from(acknowledgement.fence.tenant_id))
+        .bind(bootstrap_id)
+        .bind(Uuid::from(acknowledgement.fence.connector_id))
+        .bind(
+            i64::try_from(acknowledgement.command_sequence)
+                .map_err(|_| ConnectorControlApplicationError::Conflict)?,
+        )
+        .bind(acknowledgement.payload_digest.as_bytes().as_slice())
+        .bind(acknowledgement.encoded_command_digest.as_bytes().as_slice())
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
+        if cancelled.rows_affected() != 1 {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
         Ok(())
     }
 
