@@ -127,6 +127,37 @@ impl ConnectorCredentialAuthorizationRepository {
         }))
     }
 
+    /// Loads one exact credential from durable history for an idempotent result replay.
+    ///
+    /// This indexed lookup does not materialize the authorization audit and remains valid after
+    /// the credential has been retired by a later rotation or reissue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected credential is corrupt or unavailable.
+    pub async fn load_credential(
+        self,
+        connection: &mut PgConnection,
+        tenant_id: TenantId,
+        connector_id: ConnectorId,
+        credential_id: ConnectorCredentialId,
+    ) -> Result<Option<ConnectorCredential>, AgentPersistenceError> {
+        sqlx::query(
+            "SELECT credential_id, connector_generation, credential_revision,
+                    online_public_key, refresh_public_key, certificate_fingerprint,
+                    certificate_chain_der, not_before_ms, not_after_ms
+               FROM agent.connector_control_credentials
+              WHERE tenant_id=$1 AND connector_id=$2 AND credential_id=$3",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(connector_id))
+        .bind(Uuid::from(credential_id))
+        .fetch_optional(&mut *connection)
+        .await?
+        .map(|row| load_credential_row(tenant_id, connector_id, &row))
+        .transpose()
+    }
+
     /// Checks whether this Connector has already used an online control key.
     ///
     /// This indexed, single-result lookup preserves historical key-reuse rejection without
@@ -510,10 +541,10 @@ impl ConnectorCredentialAuthorizationRepository {
         let credential_rows = sqlx::query(
             "SELECT credential_id, connector_generation, credential_revision,
                     online_public_key, refresh_public_key, certificate_fingerprint,
-                    certificate_chain_der, not_before_ms, not_after_ms
+                    certificate_chain_der, not_before_ms, not_after_ms,
+                    origin_kind, predecessor_credential_id, origin_operation_id
                FROM agent.connector_control_credentials
               WHERE tenant_id=$1 AND connector_id=$2
-              ORDER BY connector_generation
               LIMIT $3",
         )
         .bind(Uuid::from(tenant_id))
@@ -524,13 +555,14 @@ impl ConnectorCredentialAuthorizationRepository {
         reject_oversized_audit_rows(credential_rows.len())?;
         let mut credentials = Vec::with_capacity(credential_rows.len());
         for row in credential_rows {
-            credentials.push(load_credential_row(tenant_id, connector_id, &row)?);
+            credentials.push(load_credential_audit_row(tenant_id, connector_id, &row)?);
         }
         if credentials.is_empty() {
             return Err(AgentPersistenceError::CorruptData(
                 "Connector credential history",
             ));
         }
+        let credentials = order_credential_audit_rows(credentials)?;
 
         let rotation_rows = sqlx::query(
             "SELECT rotation_sequence, request_id, request_digest, result_digest,
@@ -566,7 +598,8 @@ impl ConnectorCredentialAuthorizationRepository {
         let state = parse_authorization_state(&latest.lifecycle)?;
         let history = credentials
             .into_iter()
-            .map(|credential| {
+            .map(|record| {
+                let credential = record.credential;
                 let id = credential.credential_id();
                 let status = match state {
                     ConnectorCredentialAuthorizationState::Active => {
@@ -1377,6 +1410,13 @@ struct AuthorizationRevisionRow {
     cause_operation_id: RequestId,
 }
 
+struct CredentialAuditRow {
+    credential: ConnectorCredential,
+    origin_kind: String,
+    predecessor_credential_id: Option<ConnectorCredentialId>,
+    origin_operation_id: RequestId,
+}
+
 fn parse_revision_history(
     rows: Vec<sqlx::postgres::PgRow>,
 ) -> Result<Vec<AuthorizationRevisionRow>, AgentPersistenceError> {
@@ -1435,7 +1475,7 @@ fn validate_revision_history(
             ));
         }
         let valid = match revision.cause_kind.as_str() {
-            "rotation_started" => {
+            "rotation_started" | "reissue_started" => {
                 revision.lifecycle == "active"
                     && revision.generation == previous.generation
                     && revision.current_credential_id == previous.current_credential_id
@@ -1445,6 +1485,12 @@ fn validate_revision_history(
             "rotation_promoted" => {
                 revision.lifecycle == "active"
                     && revision.generation == previous.generation + 1
+                    && Some(revision.current_credential_id) == previous.pending_credential_id
+                    && revision.pending_credential_id.is_none()
+            }
+            "reissue_promoted" => {
+                revision.lifecycle == "active"
+                    && revision.generation == previous.generation
                     && Some(revision.current_credential_id) == previous.pending_credential_id
                     && revision.pending_credential_id.is_none()
             }
@@ -1467,47 +1513,142 @@ fn validate_revision_history(
 
 fn validate_revision_credentials(
     revisions: &[AuthorizationRevisionRow],
-    credentials: &[ConnectorCredential],
+    credentials: &[CredentialAuditRow],
     rotations: &[AcceptedRotationSnapshot],
 ) -> Result<(), AgentPersistenceError> {
-    if rotations.len() + 1 != credentials.len() {
+    let reissue_count = credentials
+        .iter()
+        .filter(|record| record.origin_kind == "reissue")
+        .count();
+    if rotations.len() + reissue_count + 1 != credentials.len()
+        || credentials[0].origin_kind != "enrollment"
+        || credentials[0].predecessor_credential_id.is_some()
+        || credentials[0].origin_operation_id != revisions[0].cause_operation_id
+        || credentials[0].credential.credential_id() != revisions[0].current_credential_id
+    {
         return Err(AgentPersistenceError::CorruptData(
-            "Connector credential rotation count",
+            "Connector credential transition count",
         ));
     }
-    for (index, credential) in credentials.iter().enumerate() {
-        if index > 0 {
-            let previous = &credentials[index - 1];
-            if credential.generation() != previous.generation() + 1
-                || credential.revision() <= previous.revision()
-            {
-                return Err(AgentPersistenceError::CorruptData(
-                    "Connector credential sequence",
-                ));
-            }
-        }
-    }
-    for (index, rotation) in rotations.iter().enumerate() {
-        if rotation.current_credential_id != credentials[index].credential_id()
-            || rotation.successor_credential_id != credentials[index + 1].credential_id()
-        {
+    for transition in credentials.windows(2) {
+        let previous = &transition[0].credential;
+        let successor = &transition[1];
+        if successor.predecessor_credential_id != Some(previous.credential_id()) {
             return Err(AgentPersistenceError::CorruptData(
-                "Connector credential rotation chain",
+                "Connector credential predecessor chain",
             ));
         }
-        let matching_revision = revisions.iter().any(|revision| {
-            revision.cause_kind == "rotation_started"
-                && revision.cause_operation_id == rotation.request_id
-                && revision.current_credential_id == rotation.current_credential_id
-                && revision.pending_credential_id == Some(rotation.successor_credential_id)
-        });
-        if !matching_revision {
+        let valid = match successor.origin_kind.as_str() {
+            "rotation" => {
+                let matching_rotations = rotations
+                    .iter()
+                    .filter(|rotation| {
+                        rotation.request_id == successor.origin_operation_id
+                            && rotation.current_credential_id == previous.credential_id()
+                            && rotation.successor_credential_id
+                                == successor.credential.credential_id()
+                    })
+                    .count();
+                successor.credential.generation() == previous.generation() + 1
+                    && successor.credential.revision() > previous.revision()
+                    && matching_rotations == 1
+                    && revisions.iter().any(|revision| {
+                        revision.cause_kind == "rotation_started"
+                            && revision.cause_operation_id == successor.origin_operation_id
+                            && revision.current_credential_id == previous.credential_id()
+                            && revision.pending_credential_id
+                                == Some(successor.credential.credential_id())
+                    })
+                    && promotion_matches_origin(
+                        revisions,
+                        successor.credential.credential_id(),
+                        "rotation_promoted",
+                        successor.origin_operation_id,
+                    )
+            }
+            "reissue" => {
+                successor.credential.generation() == previous.generation()
+                    && successor.credential.revision() == previous.revision()
+                    && revisions.iter().any(|revision| {
+                        revision.cause_kind == "reissue_started"
+                            && revision.cause_operation_id == successor.origin_operation_id
+                            && revision.current_credential_id == previous.credential_id()
+                            && revision.pending_credential_id
+                                == Some(successor.credential.credential_id())
+                    })
+                    && promotion_matches_origin(
+                        revisions,
+                        successor.credential.credential_id(),
+                        "reissue_promoted",
+                        successor.origin_operation_id,
+                    )
+            }
+            _ => false,
+        };
+        if !valid {
             return Err(AgentPersistenceError::CorruptData(
-                "Connector credential rotation authorization",
+                "Connector credential transition chain",
             ));
         }
     }
     Ok(())
+}
+
+fn promotion_matches_origin(
+    revisions: &[AuthorizationRevisionRow],
+    credential_id: ConnectorCredentialId,
+    expected_cause: &str,
+    operation_id: RequestId,
+) -> bool {
+    revisions.iter().all(|revision| {
+        revision.current_credential_id != credential_id
+            || !matches!(
+                revision.cause_kind.as_str(),
+                "rotation_promoted" | "reissue_promoted"
+            )
+            || (revision.cause_kind == expected_cause
+                && revision.cause_operation_id == operation_id)
+    })
+}
+
+fn order_credential_audit_rows(
+    mut rows: Vec<CredentialAuditRow>,
+) -> Result<Vec<CredentialAuditRow>, AgentPersistenceError> {
+    let initial = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            row.origin_kind == "enrollment" && row.predecessor_credential_id.is_none()
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if initial.len() != 1 {
+        return Err(AgentPersistenceError::CorruptData(
+            "Connector credential enrollment root",
+        ));
+    }
+    let mut ordered = Vec::with_capacity(rows.len());
+    ordered.push(rows.swap_remove(initial[0]));
+    while !rows.is_empty() {
+        let predecessor = ordered
+            .last()
+            .expect("the enrollment root was inserted")
+            .credential
+            .credential_id();
+        let successors = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.predecessor_credential_id == Some(predecessor))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if successors.len() != 1 {
+            return Err(AgentPersistenceError::CorruptData(
+                "Connector credential predecessor chain",
+            ));
+        }
+        ordered.push(rows.swap_remove(successors[0]));
+    }
+    Ok(ordered)
 }
 
 fn reject_oversized_audit_rows(row_count: usize) -> Result<(), AgentPersistenceError> {
@@ -1576,6 +1717,26 @@ fn load_credential_row(
         row.try_get("not_after_ms")?,
     )
     .map_err(|_| AgentPersistenceError::SnapshotRejected("Connector credential"))
+}
+
+fn load_credential_audit_row(
+    tenant_id: TenantId,
+    connector_id: ConnectorId,
+    row: &sqlx::postgres::PgRow,
+) -> Result<CredentialAuditRow, AgentPersistenceError> {
+    let predecessor: Option<Uuid> = row.try_get("predecessor_credential_id")?;
+    let origin_kind: String = row.try_get("origin_kind")?;
+    if !matches!(origin_kind.as_str(), "enrollment" | "rotation" | "reissue") {
+        return Err(AgentPersistenceError::CorruptData(
+            "Connector credential origin",
+        ));
+    }
+    Ok(CredentialAuditRow {
+        credential: load_credential_row(tenant_id, connector_id, row)?,
+        origin_kind,
+        predecessor_credential_id: predecessor.map(credential_id).transpose()?,
+        origin_operation_id: request_id(row.try_get("origin_operation_id")?)?,
+    })
 }
 
 fn authorization_state_code(state: ConnectorCredentialAuthorizationState) -> &'static str {

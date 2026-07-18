@@ -150,6 +150,8 @@ const PUBLIC_DISCUSSION_V1_DOWN: &str =
     include_str!("../../../migrations/202607190043_public_discussion_v1.down.sql");
 const CONNECTOR_CREDENTIAL_REISSUE_V1_DOWN: &str =
     include_str!("../../../migrations/202607190044_connector_credential_reissue_v1.down.sql");
+const CONNECTOR_CREDENTIAL_REISSUE_V1_UP: &str =
+    include_str!("../../../migrations/202607190044_connector_credential_reissue_v1.up.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -166,6 +168,155 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(applied, EXPECTED_MIGRATION_COUNT);
     assert_eq!(visible, applied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn connector_credential_reissue_empty_down_restores_the_v43_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(CONNECTOR_CREDENTIAL_REISSUE_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+
+    let intent_table_exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass('agent.connector_credential_reissue_intents') IS NOT NULL",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!intent_table_exists);
+
+    let operation_constraint: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid)
+           FROM pg_constraint
+          WHERE conrelid='agent.connector_control_operations'::regclass
+            AND conname='connector_control_operations_kind_valid'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    for preserved_kind in [
+        "deliver_agent_provisioning",
+        "revoke_agent_provisioning",
+        "prepare_agent_route_recipient",
+        "deliver_agent_route_bootstrap",
+    ] {
+        assert!(operation_constraint.contains(preserved_kind));
+    }
+    assert!(!operation_constraint.contains("credential_reissue"));
+
+    let restored_constraints: Vec<(String, String)> = sqlx::query_as(
+        "SELECT conname, pg_get_constraintdef(oid)
+           FROM pg_constraint
+          WHERE (conrelid='agent.connector_control_credentials'::regclass
+                 AND conname IN (
+                    'connector_control_credentials_origin_valid',
+                    'connector_control_credentials_generation_unique',
+                    'connector_control_credentials_revision_unique'
+                 ))
+             OR (conrelid='agent.connector_control_credential_revisions'::regclass
+                 AND conname='connector_credential_revisions_cause_valid')
+          ORDER BY conname",
+    )
+    .fetch_all(harness.admin_pool())
+    .await?;
+    assert_eq!(restored_constraints.len(), 4);
+    assert!(
+        restored_constraints
+            .iter()
+            .all(|(_, definition)| !definition.contains("reissue"))
+    );
+
+    let operation_function: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef(
+             'agent.enforce_connector_control_operation_published()'::regprocedure
+         )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    let credential_function: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef(
+             'agent.enforce_connector_control_credential_insert()'::regprocedure
+         )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    let consumed_function: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef(
+             'agent.enforce_connector_enrollment_consumed()'::regprocedure
+         )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    let revision_function: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef(
+             'agent.enforce_connector_credential_revision_insert()'::regprocedure
+         )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!operation_function.contains("credential_reissue"));
+    assert!(!credential_function.contains("reissue"));
+    assert!(!consumed_function.contains("reissue"));
+    assert!(!revision_function.contains("reissue"));
+    assert!(
+        revision_function.contains("selected_credential_origin"),
+        "the complete V43 initial-authorization validation must be restored",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn connector_credential_reissue_forward_upgrade_preserves_v43_operations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    let mut connection = harness.admin_pool().acquire().await?;
+    sqlx::raw_sql(CONNECTOR_CREDENTIAL_REISSUE_V1_DOWN)
+        .execute(&mut *connection)
+        .await?;
+
+    let tenant_id = Uuid::now_v7();
+    let connector_id = Uuid::now_v7();
+    sqlx::query("SET session_replication_role='replica'")
+        .execute(&mut *connection)
+        .await?;
+    for operation_kind in [
+        "deliver_agent_provisioning",
+        "revoke_agent_provisioning",
+        "prepare_agent_route_recipient",
+        "deliver_agent_route_bootstrap",
+    ] {
+        sqlx::query(
+            "INSERT INTO agent.connector_control_operations (
+                tenant_id, operation_id, connector_id, operation_kind, created_at_ms
+             ) VALUES ($1,$2,$3,$4,1)",
+        )
+        .bind(tenant_id)
+        .bind(Uuid::now_v7())
+        .bind(connector_id)
+        .bind(operation_kind)
+        .execute(&mut *connection)
+        .await?;
+    }
+    sqlx::query("SET session_replication_role='origin'")
+        .execute(&mut *connection)
+        .await?;
+
+    sqlx::raw_sql(CONNECTOR_CREDENTIAL_REISSUE_V1_UP)
+        .execute(&mut *connection)
+        .await?;
+    let preserved: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM agent.connector_control_operations
+          WHERE tenant_id=$1
+            AND operation_kind IN (
+                'deliver_agent_provisioning', 'revoke_agent_provisioning',
+                'prepare_agent_route_recipient', 'deliver_agent_route_bootstrap'
+            )",
+    )
+    .bind(tenant_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    assert_eq!(preserved, 4);
     Ok(())
 }
 

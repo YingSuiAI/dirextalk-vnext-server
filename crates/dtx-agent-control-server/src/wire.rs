@@ -1318,7 +1318,10 @@ pub fn build_credential_reissue_response(
         spec_revision: request.spec_revision().get(),
         credential: Some(build_credential_message(credential)),
         request_digest: request.request_digest().as_bytes().to_vec(),
-        result_digest: credential.result_digest().as_bytes().to_vec(),
+        result_digest: credential
+            .reissue_result_digest(request)
+            .as_bytes()
+            .to_vec(),
     }
 }
 

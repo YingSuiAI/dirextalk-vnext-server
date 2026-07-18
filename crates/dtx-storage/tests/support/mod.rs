@@ -343,6 +343,7 @@ impl PostgresHarness {
              GRANT SELECT, INSERT, UPDATE ON agent.host_credential_authorization_heads TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.connector_control_operations TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.connector_enrollment_intents TO dtx_runtime_test;
+             GRANT SELECT, INSERT, UPDATE ON agent.connector_credential_reissue_intents TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.connector_control_credentials TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.connector_control_credential_revisions TO dtx_runtime_test;
              GRANT SELECT, INSERT ON agent.connector_control_credential_rotations TO dtx_runtime_test;

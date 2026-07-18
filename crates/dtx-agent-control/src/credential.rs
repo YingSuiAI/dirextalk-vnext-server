@@ -5,11 +5,12 @@ use dtx_domain::{
 };
 
 use crate::{
-    CredentialRotationRequest, EnrollmentTranscript, Sha256Digest,
+    CredentialReissueRequest, CredentialRotationRequest, EnrollmentTranscript, Sha256Digest,
     digest::{domain_digest, raw_sha256_digest},
 };
 
 const CREDENTIAL_RESULT_DOMAIN: &[u8] = b"dirextalk.connector-credential-result.v1";
+const CREDENTIAL_REISSUE_RESULT_DOMAIN: &[u8] = b"dirextalk.connector-credential-reissue-result.v1";
 
 /// Maximum number of leaf-first DER certificates retained for one credential.
 pub const MAX_CONNECTOR_CERTIFICATE_CHAIN_ENTRIES: usize = 4;
@@ -126,6 +127,53 @@ impl ConnectorCredential {
         parts.extend(self.certificate_chain.iter().map(Vec::as_slice));
         parts.extend([not_before.as_slice(), not_after.as_slice()]);
         domain_digest(CREDENTIAL_RESULT_DOMAIN, &parts)
+    }
+
+    /// Commits the complete public certificate-reissue response without exposing the retained
+    /// refresh key. Every part is length-prefixed by [`domain_digest`]; UUIDs use network bytes,
+    /// counters and timestamps use unsigned big-endian bytes, and certificates remain leaf-first.
+    #[must_use]
+    pub fn reissue_result_digest(&self, request: &CredentialReissueRequest) -> Sha256Digest {
+        let connector_generation = request.generation().to_be_bytes();
+        let spec_revision = request.spec_revision().get().to_be_bytes();
+        let credential_generation = self.generation.to_be_bytes();
+        let credential_revision = self.revision.get().to_be_bytes();
+        let certificate_count = (self.certificate_chain.len() as u64).to_be_bytes();
+        let not_before = (self.not_before_millis as u64).to_be_bytes();
+        let not_after = (self.not_after_millis as u64).to_be_bytes();
+        let operation_id = request.operation_id();
+        let intent_id = request.intent_id();
+        let tenant_id = request.tenant_id();
+        let host_id = request.host_id();
+        let connector_id = request.connector_id();
+        let current_credential_id = request.current_credential_id();
+        let current_fingerprint = request.current_fingerprint().as_bytes();
+        let fingerprint = self.certificate_fingerprint.as_bytes();
+        let request_digest = request.request_digest().as_bytes();
+        let mut parts: Vec<&[u8]> = vec![
+            operation_id.as_uuid().as_bytes(),
+            intent_id.as_uuid().as_bytes(),
+            tenant_id.as_uuid().as_bytes(),
+            host_id.as_uuid().as_bytes(),
+            connector_id.as_uuid().as_bytes(),
+            current_credential_id.as_uuid().as_bytes(),
+            &current_fingerprint,
+            &connector_generation,
+            &spec_revision,
+            self.credential_id.as_uuid().as_bytes(),
+            &credential_generation,
+            &credential_revision,
+            self.control_key.as_bytes(),
+            &certificate_count,
+        ];
+        parts.extend(self.certificate_chain.iter().map(Vec::as_slice));
+        parts.extend([
+            fingerprint.as_slice(),
+            not_before.as_slice(),
+            not_after.as_slice(),
+            request_digest.as_slice(),
+        ]);
+        domain_digest(CREDENTIAL_REISSUE_RESULT_DOMAIN, &parts)
     }
 
     pub(crate) fn validate_enrollment_result(

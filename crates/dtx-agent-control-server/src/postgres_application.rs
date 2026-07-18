@@ -1344,8 +1344,9 @@ impl PostgresConnectorControlApplication {
             .await
             .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
         if let Some(row) = sqlx::query(
-            "SELECT intent_id, host_id, current_credential_id, current_leaf_fingerprint,
-                    connector_generation, spec_revision, plan_digest, token_digest, expires_at_ms
+            "SELECT intent_id, connector_id, host_id, current_credential_id, current_leaf_fingerprint,
+                    connector_generation, spec_revision, plan_digest, token_digest, status,
+                    created_at_ms, expires_at_ms
                FROM agent.connector_credential_reissue_intents
               WHERE tenant_id=$1 AND operation_id=$2 FOR UPDATE",
         )
@@ -1355,7 +1356,19 @@ impl PostgresConnectorControlApplication {
         .await
         .map_err(|_| ConnectorControlApplicationError::Unavailable)?
         {
-            let exact = HostId::try_from(
+            let created_at_millis: i64 = row
+                .try_get("created_at_ms")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            let expires_at_millis: i64 = row
+                .try_get("expires_at_ms")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            let exact = ConnectorId::try_from(
+                row.try_get::<Uuid, _>("connector_id")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?,
+            )
+            .ok()
+                == Some(request.connector_id)
+                && HostId::try_from(
                 row.try_get::<Uuid, _>("host_id")
                     .map_err(|_| ConnectorControlApplicationError::Internal)?,
             )
@@ -1376,18 +1389,25 @@ impl PostgresConnectorControlApplication {
                         .map_err(|_| ConnectorControlApplicationError::Internal)?,
                 )? == request.expected_spec_revision
                 && digest_from_row(&row, "plan_digest")? == request.plan_digest
-                && digest_from_row(&row, "token_digest")? == request.token_digest;
+                && digest_from_row(&row, "token_digest")? == request.token_digest
+                && expires_at_millis.checked_sub(created_at_millis) == Some(request.ttl_millis);
             if !exact {
                 return Err(ConnectorControlApplicationError::Conflict);
+            }
+            let status: String = row
+                .try_get("status")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            if status == "aborted" {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+            if status != "active" && status != "consumed" {
+                return Err(ConnectorControlApplicationError::Internal);
             }
             let intent_id = EnrollmentIntentId::try_from(
                 row.try_get::<Uuid, _>("intent_id")
                     .map_err(|_| ConnectorControlApplicationError::Internal)?,
             )
             .map_err(|_| ConnectorControlApplicationError::Internal)?;
-            let expires_at_millis: i64 = row
-                .try_get("expires_at_ms")
-                .map_err(|_| ConnectorControlApplicationError::Internal)?;
             session
                 .commit()
                 .await
@@ -2266,7 +2286,7 @@ impl PostgresConnectorControlApplication {
         let row = sqlx::query(
             "SELECT host_id, connector_id, current_credential_id, current_leaf_fingerprint,
                     connector_generation, spec_revision, token_digest, status, expires_at_ms,
-                    request_digest, credential_id
+                    request_digest, result_digest, credential_id
                FROM agent.connector_credential_reissue_intents
               WHERE tenant_id=$1 AND intent_id=$2 AND operation_id=$3 FOR UPDATE",
         )
@@ -2310,24 +2330,27 @@ impl PostgresConnectorControlApplication {
         if status == "consumed" {
             let persisted = digest_from_row(&row, "request_digest")?;
             if persisted != request.request_digest() {
-                return Err(ConnectorControlApplicationError::AuthenticationFailed);
+                return Err(ConnectorControlApplicationError::Conflict);
             }
             let credential_id: Uuid = row
                 .try_get("credential_id")
                 .map_err(|_| ConnectorControlApplicationError::Internal)?;
-            let authorization = ConnectorCredentialAuthorizationRepository::new()
-                .load_head(session.connection(), tenant_id, request.connector_id())
+            let credential_id = ConnectorCredentialId::try_from(credential_id)
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            let credential = ConnectorCredentialAuthorizationRepository::new()
+                .load_credential(
+                    session.connection(),
+                    tenant_id,
+                    request.connector_id(),
+                    credential_id,
+                )
                 .await
                 .map_err(persistence_error)?
                 .ok_or(ConnectorControlApplicationError::Internal)?;
-            let credential = authorization
-                .authorization()
-                .credential(
-                    ConnectorCredentialId::try_from(credential_id)
-                        .map_err(|_| ConnectorControlApplicationError::Internal)?,
-                )
-                .cloned()
-                .ok_or(ConnectorControlApplicationError::Internal)?;
+            let persisted_result = digest_from_row(&row, "result_digest")?;
+            if persisted_result != credential.reissue_result_digest(&request) {
+                return Err(ConnectorControlApplicationError::Internal);
+            }
             session
                 .commit()
                 .await
@@ -2408,7 +2431,12 @@ impl PostgresConnectorControlApplication {
         .bind(Uuid::from(request.operation_id()))
         .bind(now)
         .bind(request.request_digest().as_bytes().to_vec())
-        .bind(credential.result_digest().as_bytes().to_vec())
+        .bind(
+            credential
+                .reissue_result_digest(&request)
+                .as_bytes()
+                .to_vec(),
+        )
         .bind(Uuid::from(credential.credential_id()))
         .execute(session.connection())
         .await
