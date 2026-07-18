@@ -107,6 +107,8 @@ const CONVERSATION_GRANT_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.conversation-agent-grant.v1+cbor";
 const CONVERSATION_GRANT_RECEIPT_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.conversation-agent-grant-receipt.v1+cbor";
+const PRIVATE_CONVERSATION_PROFILE_V1: &[u8] = b"dirextalk/private-conversation-agent-profile/v1\nmention-only\nfuture-messages\nsend-messages\nexclude-history\nexclude-attachments\nexclude-tools\nexclude-cloud\nexclude-egress";
+const PRIVATE_CONVERSATION_TOOLS_PROFILE_V1: &[u8] = b"dirextalk/private-conversation-agent-profile/v1\nmention-only\nfuture-messages\nsend-messages\nexclude-history\nexclude-attachments\ninclude-tools\nexclude-cloud\nexclude-egress";
 pub const CONNECTOR_BINDING_STATE_COMMAND_MEDIA_TYPE_V1: &str =
     "application/vnd.dirextalk.connector-binding-state-command.v1+cbor";
 pub const CONNECTOR_BINDING_STATE_RECEIPT_MEDIA_TYPE_V1: &str =
@@ -2271,7 +2273,11 @@ fn new_private_conversation_grant(
         installation,
         GrantId::new(),
         command.conversation_id,
-        private_conversation_permissions(),
+        private_conversation_permissions(
+            command
+                .privacy_policy_hash
+                .ok_or(AgentProvisioningOwnerError::InvalidRequest)?,
+        )?,
         TriggerPolicy::MentionOnly,
         command
             .privacy_policy_hash
@@ -2295,7 +2301,11 @@ fn new_private_conversation_grant_update(
     now: UtcMillis,
 ) -> Result<ConversationGrantUpdate, AgentProvisioningOwnerError> {
     Ok(ConversationGrantUpdate::new(
-        private_conversation_permissions(),
+        private_conversation_permissions(
+            command
+                .privacy_policy_hash
+                .ok_or(AgentProvisioningOwnerError::InvalidRequest)?,
+        )?,
         TriggerPolicy::MentionOnly,
         command
             .privacy_policy_hash
@@ -2311,10 +2321,22 @@ fn new_private_conversation_grant_update(
     ))
 }
 
-fn private_conversation_permissions() -> AgentConversationPermissions {
-    AgentConversationPermissions::none()
+fn private_conversation_permissions(
+    privacy_policy_hash: PrivacyPolicyDigest,
+) -> Result<AgentConversationPermissions, AgentProvisioningOwnerError> {
+    let permissions = AgentConversationPermissions::none()
         .with(AgentConversationPermission::ReadFutureMessages)
-        .with(AgentConversationPermission::SendMessages)
+        .with(AgentConversationPermission::SendMessages);
+    let profile_digest = |profile: &[u8]| {
+        PrivacyPolicyDigest::from_bytes(*Sha256Digest::hash_domain(&[], profile).as_bytes())
+    };
+    if privacy_policy_hash == profile_digest(PRIVATE_CONVERSATION_PROFILE_V1) {
+        Ok(permissions)
+    } else if privacy_policy_hash == profile_digest(PRIVATE_CONVERSATION_TOOLS_PROFILE_V1) {
+        Ok(permissions.with(AgentConversationPermission::InvokeTools))
+    } else {
+        Err(AgentProvisioningOwnerError::InvalidRequest)
+    }
 }
 
 async fn installation_has_enabled_active_agent_device(
@@ -4263,12 +4285,13 @@ mod tests {
 
     use super::{
         AgentProvisioningDeliveryReceipt, AgentProvisioningOwnerError,
-        ConversationGrantOwnerAction, REVOCATION_BINDING_DOMAIN, approval_status,
+        ConversationGrantOwnerAction, PRIVATE_CONVERSATION_PROFILE_V1,
+        PRIVATE_CONVERSATION_TOOLS_PROFILE_V1, REVOCATION_BINDING_DOMAIN, approval_status,
         conversation_grant_receipt_cbor, delivery_receipt_cbor, delivery_status, parse_approval,
         parse_connector_projection_query, parse_connector_projection_representation,
         parse_conversation_grant, parse_conversation_grant_fence,
         parse_conversation_grant_operation, parse_delivery, parse_device_session,
-        parse_idempotency, parse_revocation,
+        parse_idempotency, parse_revocation, private_conversation_permissions,
     };
 
     const VECTORS: &str = include_str!(
@@ -4376,6 +4399,33 @@ mod tests {
         let changed = encode_deterministic_cbor(&changed).unwrap();
         assert_eq!(
             parse_conversation_grant(&changed, ConversationGrantOwnerAction::Revoke),
+            Err(AgentProvisioningOwnerError::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn signed_private_conversation_profile_controls_tool_authority_exactly() {
+        use dtx_agent_registry::AgentConversationPermission;
+
+        let digest = |profile: &[u8]| {
+            PrivacyPolicyDigest::from_bytes(*Sha256Digest::hash_domain(&[], profile).as_bytes())
+        };
+        let chat = private_conversation_permissions(digest(PRIVATE_CONVERSATION_PROFILE_V1))
+            .expect("the fixed no-tools profile is supported");
+        assert!(!chat.contains(AgentConversationPermission::InvokeTools));
+
+        let tools = private_conversation_permissions(digest(PRIVATE_CONVERSATION_TOOLS_PROFILE_V1))
+            .expect("the fixed tools profile is supported");
+        assert!(tools.contains(AgentConversationPermission::InvokeTools));
+        assert_eq!(
+            digest(PRIVATE_CONVERSATION_TOOLS_PROFILE_V1)
+                .as_bytes()
+                .as_slice(),
+            hex("a2b7854914565e4716ce65af4f7d8844293c78131545cb467f7922fca4491476")
+        );
+
+        assert_eq!(
+            private_conversation_permissions(PrivacyPolicyDigest::from_bytes([9; 32])),
             Err(AgentProvisioningOwnerError::InvalidRequest)
         );
     }
