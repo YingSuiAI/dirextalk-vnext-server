@@ -11,10 +11,9 @@ use dtx_connect_registry::{
     AdapterKind, ConnectorFence, ConnectorLease, HeartbeatAck, LeaseStatus,
 };
 use dtx_domain::{
-    AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId,
-    ArtifactId, BindingId, BootId, ConnectorCredentialId, ConnectorId, ConversationId,
-    Ed25519PublicKey, EventId, HostId, InstallationId, LeaseId, RequestId, Revision, RunId,
-    RunLeaseId, TenantId,
+    AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId, ArtifactId,
+    BindingId, BootId, ConnectorCredentialId, ConnectorId, ConversationId, Ed25519PublicKey,
+    EventId, HostId, InstallationId, LeaseId, RequestId, Revision, RunId, RunLeaseId, TenantId,
 };
 use zeroize::Zeroize as _;
 
@@ -1039,9 +1038,8 @@ pub fn parse_client_frame(value: v1::ClientFrame) -> Result<ParsedClientFrame, W
         Kind::AgentProvisioningRejected(frame) => {
             parse_provisioning_rejected(frame).map(ParsedClientFrame::AgentProvisioningRejected)
         }
-        Kind::AgentRouteRecipientReady(frame) => {
-            parse_agent_route_recipient_ready(frame).map(ParsedClientFrame::AgentRouteRecipientReady)
-        }
+        Kind::AgentRouteRecipientReady(frame) => parse_agent_route_recipient_ready(frame)
+            .map(ParsedClientFrame::AgentRouteRecipientReady),
         Kind::AgentRouteBootstrapInstalled(frame) => parse_agent_route_bootstrap_installed(frame)
             .map(ParsedClientFrame::AgentRouteBootstrapInstalled),
         Kind::AgentRouteBootstrapRejected(frame) => parse_agent_route_bootstrap_rejected(frame)
@@ -1197,7 +1195,10 @@ fn parse_agent_route_bootstrap_installed(
         recipient_id: parse_id(&value.recipient_id, "recipient_id")?,
         capsule_digest: parse_digest(value.capsule_digest, "capsule_digest")?,
         route_fence,
-        installed_at_millis: parse_wire_timestamp(value.installed_at_millis, "installed_at_millis")?,
+        installed_at_millis: parse_wire_timestamp(
+            value.installed_at_millis,
+            "installed_at_millis",
+        )?,
         result_digest: parse_digest(value.result_digest, "result_digest")?,
     })
 }

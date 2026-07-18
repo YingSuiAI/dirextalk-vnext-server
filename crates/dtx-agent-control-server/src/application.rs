@@ -8,13 +8,13 @@ use dtx_domain::{ConnectorId, TenantId};
 use dtx_security::AuthenticatedConnectorPeer;
 
 use crate::wire::{
-    ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteBootstrapRejected,
-    ParsedAgentRouteRecipientReady,
     ParsedAgentProvisioningInstalled, ParsedAgentProvisioningRejected,
-    ParsedCommandAcknowledgement, ParsedCredentialRotationProof, ParsedEnrollment, ParsedHeartbeat,
-    ParsedHello, ParsedProvisioningRecipientAnnouncement, ParsedReady, ParsedRunCheckpoint,
-    ParsedRunClaim, ParsedRunCompleted, ParsedRunFailed, ParsedRunOutput, ParsedRunRelease,
-    RunAvailableWire, RunCancelRequestedWire, RunLeaseGrantedWire,
+    ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteBootstrapRejected,
+    ParsedAgentRouteRecipientReady, ParsedCommandAcknowledgement, ParsedCredentialRotationProof,
+    ParsedEnrollment, ParsedHeartbeat, ParsedHello, ParsedProvisioningRecipientAnnouncement,
+    ParsedReady, ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted, ParsedRunFailed,
+    ParsedRunOutput, ParsedRunRelease, RunAvailableWire, RunCancelRequestedWire,
+    RunLeaseGrantedWire,
 };
 use crate::{CommandNotificationSubscription, RunOfferNotificationSubscription};
 

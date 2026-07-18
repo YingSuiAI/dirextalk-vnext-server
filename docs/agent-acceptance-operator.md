@@ -45,6 +45,21 @@ tokens exist only in that file: never in arguments, environment, stdout,
 errors, or logs. Stdout is a redacted prepare manifest containing the exact
 Installation IDs and origins needed by the client authority tool.
 
+For the future fresh-Windows Codex path, preserve that redacted stdout as a
+bounded regular prepare-manifest file and stream the secret handoff directly
+into `dirextalk-agent-connector acceptance-install` stdin through the
+operator-controlled channel. Do not copy the handoff onto the Windows host or
+place it in an argument, environment variable, transcript, or log. The
+Connector pairs the two documents on the exact operation, plan digest,
+tenant, Owner device, Host, singleton `codex` Connector, enrollment intent,
+and expiry before any RPC. It persists the generated keys and exact signed
+request in a protected resumable transaction without the raw token, publishes
+the credential with atomic no-replace semantics, reloads it, and converges the
+exact current-user task. Only after that complete boundary succeeds does it
+retire the transaction and emit the existing five-field public pin; conflicts
+and incomplete outcomes emit no success manifest. This support does not by
+itself assert that a Windows Connector was deployed or accepted.
+
 ## Real Agent authority facts
 
 Run the controlled client `provision_agent_authority` flow once per

@@ -2230,6 +2230,20 @@ fn report_acceptance_prepare_success(
     topology_changed: bool,
     handoff_created: bool,
 ) -> Result<(), AcceptanceError> {
+    write_acceptance_report(&acceptance_prepare_report(
+        plan,
+        handoff,
+        topology_changed,
+        handoff_created,
+    ))
+}
+
+fn acceptance_prepare_report(
+    plan: &AcceptancePlan,
+    handoff: &AcceptanceHandoff,
+    topology_changed: bool,
+    handoff_created: bool,
+) -> AcceptanceReport {
     let agents = plan
         .agents
         .iter()
@@ -2245,7 +2259,7 @@ fn report_acceptance_prepare_success(
             expires_at_millis: handoff.expires_at_millis,
         })
         .collect();
-    write_acceptance_report(&AcceptanceReport {
+    AcceptanceReport {
         schema: ACCEPTANCE_RESULT_SCHEMA,
         version: 1,
         phase: "prepare",
@@ -2259,7 +2273,7 @@ fn report_acceptance_prepare_success(
         topology_changed: Some(topology_changed),
         handoff_created: Some(handoff_created),
         agents,
-    })
+    }
 }
 
 fn report_acceptance_finalize_success(
@@ -2675,6 +2689,68 @@ mod tests {
             parse_acceptance_plan(unknown.as_bytes()).err(),
             Some(AcceptanceError::Plan)
         );
+    }
+
+    #[test]
+    fn codex_prepare_report_correlates_the_secret_handoff_without_exposing_its_token() {
+        let mut plan = acceptance_plan();
+        plan.agents
+            .retain(|agent| agent.adapter_kind == AdapterCode::Codex);
+        validate_and_sort_acceptance_plan(&mut plan, 1_800_000_000_000).unwrap();
+        let encoded_plan = serde_json::to_vec(&plan).unwrap();
+        let plan_digest = domain_digest(ACCEPTANCE_PLAN_DIGEST_DOMAIN, &encoded_plan);
+        let mut handoff = generate_acceptance_handoff(&plan, plan_digest).unwrap();
+        handoff.state = HandoffState::Ready;
+        handoff.agents[0].intent_id =
+            Some(EnrollmentIntentId::from_str("01890f47-5fd4-7cc2-8f8f-5f9476f4f027").unwrap());
+        handoff.agents[0].generation = Some(1);
+        handoff.agents[0].spec_revision = Some(1);
+        handoff.agents[0].expires_at_millis = Some(1_800_000_300_000);
+        validate_acceptance_handoff(&handoff, &plan, plan_digest, 1_800_000_000_001).unwrap();
+
+        let report = acceptance_prepare_report(&plan, &handoff, true, true);
+        let handoff_json = serde_json::to_value(&handoff).unwrap();
+        let report_json = serde_json::to_value(&report).unwrap();
+        let secret = handoff_json["agents"][0]["enrollment_token"]
+            .as_str()
+            .expect("secret handoff contains the raw enrollment token");
+        let encoded_report = serde_json::to_string(&report_json).unwrap();
+
+        assert_eq!(report_json["schema"], ACCEPTANCE_RESULT_SCHEMA);
+        assert_eq!(report_json["version"], 1);
+        assert_eq!(report_json["phase"], "prepare");
+        assert_eq!(report_json["state"], "ready");
+        assert_eq!(report_json["operation_id"], handoff_json["operation_id"]);
+        assert_eq!(report_json["plan_digest"], handoff_json["plan_digest"]);
+        assert_eq!(report_json["tenant_id"], handoff_json["tenant_id"]);
+        assert_eq!(
+            report_json["owner_identity_id"],
+            handoff_json["owner_identity_id"]
+        );
+        assert_eq!(
+            report_json["owner_identity_device_id"],
+            handoff_json["owner_identity_device_id"]
+        );
+        assert_eq!(report_json["host_id"], handoff_json["host_id"]);
+        assert_eq!(report_json["agents"].as_array().unwrap().len(), 1);
+        assert_eq!(report_json["agents"][0]["adapter_kind"], "codex");
+        assert_eq!(
+            report_json["agents"][0]["connector_id"],
+            handoff_json["agents"][0]["connector_id"]
+        );
+        assert_eq!(
+            report_json["agents"][0]["intent_id"],
+            handoff_json["agents"][0]["intent_id"]
+        );
+        assert_eq!(
+            report_json["agents"][0]["expires_at_millis"],
+            handoff_json["agents"][0]["expires_at_millis"]
+        );
+        assert!(!encoded_report.contains(secret));
+        assert!(!encoded_report.contains("enrollment_token"));
+        assert!(!encoded_report.contains("enrollment_request_id"));
+        assert!(!encoded_report.contains("generation"));
+        assert!(!encoded_report.contains("spec_revision"));
     }
 
     #[test]
