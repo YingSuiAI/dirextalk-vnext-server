@@ -8,6 +8,7 @@ use std::{
 use axum::{http::StatusCode, routing::get};
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use dtx_domain::{Clock, IndexerId, SystemClock, TenantId};
+use dtx_federated_identity::FederatedIdentityVerifier;
 use dtx_group_node::{GroupNodeState, group_router_with_state, load_mls_sequencer_signing_key};
 use dtx_group_persistence::GroupPgStore;
 use dtx_identity_node::{IdentityBootstrapState, identity_bootstrap_router_with_state};
@@ -15,7 +16,10 @@ use dtx_identity_persistence::IdentityPgStore;
 use dtx_indexer_node::{IndexerPgStore, PinnedHttpsBundleFetcher, indexer_router};
 use dtx_mailbox::MailboxPgStore;
 use dtx_mailbox_node::{MailboxNodeState, mailbox_router_with_state};
-use dtx_public_feed_node::{PublicFeedPgStore, public_feed_router};
+use dtx_public_feed_node::{
+    FederatedDeviceAuthority, PublicDiscussionRouterConfig, PublicFeedPgStore,
+    public_feed_router_with_discussion,
+};
 use ed25519_dalek::SigningKey;
 use sqlx::postgres::PgConnectOptions;
 use tokio::net::TcpListener;
@@ -105,15 +109,28 @@ async fn run() -> Result<(), NodeError> {
         clock.clone(),
         sequencer_signing_key,
         &public_origin,
-        allowed_http_identity_origins,
+        allowed_http_identity_origins.clone(),
         additional_federated_identity_trust_root_pem.as_deref(),
     )?;
+    let (discussion_identity, _) =
+        FederatedIdentityVerifier::new_with_public_origin_and_additional_trust_root_pem(
+            &public_origin,
+            allowed_http_identity_origins,
+            additional_federated_identity_trust_root_pem.as_deref(),
+        )
+        .map_err(|_| NodeError::Configuration)?;
     let mailbox_state = MailboxNodeState::with_clock(mailbox_store, clock);
 
     let router = identity_bootstrap_router_with_state(identity_state)
         .merge(group_router_with_state(group_state))
         .merge(mailbox_router_with_state(mailbox_state))
-        .merge(public_feed_router(public_feed_store, tenant_id))
+        .merge(public_feed_router_with_discussion(
+            public_feed_store,
+            tenant_id,
+            PublicDiscussionRouterConfig::new(Arc::new(FederatedDeviceAuthority::new(
+                discussion_identity,
+            ))),
+        ))
         .merge(indexer_router(
             indexer_store,
             tenant_id,
@@ -346,11 +363,11 @@ fn load_database_options(name: &str) -> Result<PgConnectOptions, NodeError> {
 
 #[cfg(unix)]
 async fn shutdown_signal() {
-    let mut termination =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(_) => return,
-        };
+    let Ok(mut termination) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        return;
+    };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = termination.recv() => {},

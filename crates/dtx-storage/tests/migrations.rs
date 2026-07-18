@@ -46,7 +46,8 @@ const AGENT_ACCEPTANCE_FINALIZE_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_170_
 const AGENT_ACCEPTANCE_PREPARE_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_180_040;
 const AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_MIGRATION_VERSION: i64 = 202_607_180_041;
 const AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_MIGRATION_VERSION: i64 = 202_607_180_042;
-const EXPECTED_MIGRATION_COUNT: i64 = 42;
+const PUBLIC_DISCUSSION_V1_MIGRATION_VERSION: i64 = 202_607_190_043;
+const EXPECTED_MIGRATION_COUNT: i64 = 43;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -144,6 +145,8 @@ const AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_DOWN: &str =
     include_str!("../../../migrations/202607180042_agent_acceptance_tenant_stream_select.down.sql");
 const AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_UP: &str =
     include_str!("../../../migrations/202607180042_agent_acceptance_tenant_stream_select.up.sql");
+const PUBLIC_DISCUSSION_V1_DOWN: &str =
+    include_str!("../../../migrations/202607190043_public_discussion_v1.down.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -160,6 +163,73 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(applied, EXPECTED_MIGRATION_COUNT);
     assert_eq!(visible, applied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn public_discussion_tables_force_tenant_rls_and_keep_histories_append_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(
+        "CREATE ROLE dtx_public_feed_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS
+            NOCREATEDB NOCREATEROLE NOREPLICATION",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    MigrationRunner::new().run(harness.admin_pool()).await?;
+
+    let protected: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM pg_class relation
+           JOIN pg_namespace namespace ON namespace.oid=relation.relnamespace
+           JOIN (VALUES
+             ('feed_idempotency_receipts'), ('discussion_policy_heads'),
+             ('discussion_policy_versions'), ('discussion_idempotency_receipts'),
+             ('discussion_event_ids'), ('feed_comment_threads'),
+             ('feed_comment_entries'), ('feed_reaction_entries'),
+             ('feed_reaction_projections'), ('discussion_rate_limits')
+           ) AS expected(name) ON expected.name=relation.relname
+          WHERE namespace.nspname='directory'
+            AND relation.relrowsecurity AND relation.relforcerowsecurity",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(protected, 10);
+
+    let delete_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM (VALUES
+             ('directory.feed_idempotency_receipts'),
+             ('directory.discussion_policy_heads'),
+             ('directory.discussion_policy_versions'),
+             ('directory.discussion_idempotency_receipts'),
+             ('directory.discussion_event_ids'),
+             ('directory.feed_comment_threads'),
+             ('directory.feed_comment_entries'),
+             ('directory.feed_reaction_entries'),
+             ('directory.feed_reaction_projections'),
+             ('directory.discussion_rate_limits')
+           ) AS relation(name)
+          WHERE has_table_privilege('dtx_public_feed_runtime', relation.name, 'DELETE')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(delete_grants, 0);
+
+    let append_only_triggers: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger
+          WHERE tgname IN (
+            'feed_idempotency_receipts_append_only',
+            'discussion_policy_versions_append_only',
+            'discussion_idempotency_receipts_append_only',
+            'discussion_event_ids_append_only',
+            'feed_comment_entries_append_only',
+            'feed_reaction_entries_append_only'
+          ) AND NOT tgisinternal",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(append_only_triggers, 6);
     Ok(())
 }
 
@@ -1093,7 +1163,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -1137,8 +1207,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(AGENT_ACCEPTANCE_PREPARE_PRIVILEGES_MIGRATION_VERSION)
     .bind(AGENT_ACCEPTANCE_TENANT_STREAM_PRIVILEGES_MIGRATION_VERSION)
     .bind(AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_MIGRATION_VERSION)
+    .bind(PUBLIC_DISCUSSION_V1_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(PUBLIC_DISCUSSION_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_DOWN)
         .execute(harness.admin_pool())
         .await?;

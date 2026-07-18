@@ -168,6 +168,16 @@ const V34_ARTIFACT_PATHS: &[&str] = &[
     "protocol/test-vectors/private-event/v6_v7",
 ];
 const V35_ARTIFACT_PATHS: &[&str] = &["protocol/proto/dirextalk/agent_control/v1_4"];
+const V36_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/public-discussion/v1",
+    "protocol/openapi/public-discussion/v1",
+    "protocol/test-vectors/public-discussion/v1",
+    "protocol/cddl/private-event/v8",
+    "protocol/test-vectors/private-event/v8",
+    "protocol/cddl/group-query-proof/v1",
+    "protocol/openapi/group-query-proof/v1",
+    "protocol/test-vectors/group-query-proof/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -393,6 +403,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v35/manifest.json",
         includes_registries: false,
         artifact_paths: V35_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 36,
+        path: "protocol/baseline/v36/manifest.json",
+        includes_registries: false,
+        artifact_paths: V36_ARTIFACT_PATHS,
     },
 ];
 
@@ -922,7 +938,10 @@ mod tests {
 
     #[test]
     fn v35_selects_only_the_agent_control_v1_4_contract() {
-        let v35 = BASELINE_SPECS.last().expect("v35 baseline spec");
+        let v35 = BASELINE_SPECS
+            .iter()
+            .find(|spec| spec.version == 35)
+            .expect("v35 baseline spec");
         assert_eq!(v35.version, 35);
         assert_eq!(v35.path, "protocol/baseline/v35/manifest.json");
         assert_eq!(v35.artifact_paths, V35_ARTIFACT_PATHS);
@@ -931,5 +950,15 @@ mod tests {
             ["protocol/proto/dirextalk/agent_control/v1_4"]
         );
         assert!(!v35.includes_registries);
+    }
+
+    #[test]
+    fn v36_selects_only_additive_public_discussion_private_v8_and_query_overlay() {
+        let v36 = BASELINE_SPECS.last().expect("v36 baseline spec");
+        assert_eq!(v36.version, 36);
+        assert_eq!(v36.path, "protocol/baseline/v36/manifest.json");
+        assert_eq!(v36.artifact_paths, V36_ARTIFACT_PATHS);
+        assert_eq!(V36_ARTIFACT_PATHS.len(), 8);
+        assert!(!v36.includes_registries);
     }
 }

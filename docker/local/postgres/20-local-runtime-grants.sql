@@ -77,6 +77,13 @@ GRANT EXECUTE ON FUNCTION directory.current_tenant_id()
 GRANT SELECT, INSERT, UPDATE ON directory.public_subjects TO dtx_public_feed_node;
 GRANT SELECT, INSERT ON directory.descriptor_versions, directory.feed_entries,
     directory.moderation_labels TO dtx_public_feed_node;
+GRANT SELECT, INSERT ON directory.feed_idempotency_receipts,
+    directory.discussion_policy_versions, directory.discussion_idempotency_receipts,
+    directory.discussion_event_ids, directory.feed_comment_entries,
+    directory.feed_reaction_entries TO dtx_public_feed_node;
+GRANT SELECT, INSERT, UPDATE ON directory.discussion_policy_heads,
+    directory.feed_comment_threads, directory.feed_reaction_projections,
+    directory.discussion_rate_limits TO dtx_public_feed_node;
 GRANT SELECT, INSERT, UPDATE ON directory.index_registrations,
     directory.index_rate_limits, directory.index_registration_attempts
     TO dtx_indexer_node;

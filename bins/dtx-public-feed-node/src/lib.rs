@@ -2,6 +2,10 @@
 
 //! `PostgreSQL` CAS storage and strict HTTP boundary for PD2 public feeds.
 
+mod discussion;
+
+pub use discussion::{DeviceAuthority, FederatedDeviceAuthority, PublicDiscussionRouterConfig};
+
 use std::{
     fmt,
     str::FromStr,
@@ -40,6 +44,8 @@ const MAX_DEADLINE_AHEAD_MS: i64 = 30_000;
 const CACHE_NAMESPACE: &str = "public-conditional-cache-v1";
 const PUBLIC_NOT_FOUND_TTL: Duration = Duration::from_secs(2);
 const PUBLIC_NOT_FOUND_CACHE_CONTROL: &str = "public, max-age=2, must-revalidate";
+const FEED_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] = b"dirextalk.public-feed-http-idempotency-key.v1\0";
+const FEED_REQUEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.public-feed-http-request.v1\0";
 
 #[derive(Clone)]
 pub struct PublicFeedPgStore {
@@ -79,6 +85,16 @@ impl PublicFeedPgStore {
                     AND has_table_privilege(current_user, 'directory.public_subjects', 'SELECT,INSERT,UPDATE')
                     AND has_table_privilege(current_user, 'directory.descriptor_versions', 'SELECT,INSERT')
                     AND has_table_privilege(current_user, 'directory.feed_entries', 'SELECT,INSERT')
+                    AND has_table_privilege(current_user, 'directory.feed_idempotency_receipts', 'SELECT,INSERT')
+                    AND has_table_privilege(current_user, 'directory.discussion_policy_heads', 'SELECT,INSERT,UPDATE')
+                    AND has_table_privilege(current_user, 'directory.discussion_policy_versions', 'SELECT,INSERT')
+                    AND has_table_privilege(current_user, 'directory.discussion_idempotency_receipts', 'SELECT,INSERT')
+                    AND has_table_privilege(current_user, 'directory.discussion_event_ids', 'SELECT,INSERT')
+                    AND has_table_privilege(current_user, 'directory.feed_comment_threads', 'SELECT,INSERT,UPDATE')
+                    AND has_table_privilege(current_user, 'directory.feed_comment_entries', 'SELECT,INSERT')
+                    AND has_table_privilege(current_user, 'directory.feed_reaction_entries', 'SELECT,INSERT')
+                    AND has_table_privilege(current_user, 'directory.feed_reaction_projections', 'SELECT,INSERT,UPDATE')
+                    AND has_table_privilege(current_user, 'directory.discussion_rate_limits', 'SELECT,INSERT,UPDATE')
                FROM pg_roles r
                JOIN pg_namespace n ON n.nspname = 'directory'
               WHERE r.rolname = current_user",
@@ -356,6 +372,42 @@ impl PublicFeedPgStore {
         exact: &[u8],
         now_ms: i64,
     ) -> Result<AppendOutcome, StoreError> {
+        self.append_inner(tenant, subject, exact, now_ms, None)
+            .await
+    }
+
+    /// Appends a continued V24 event with a durable HTTP idempotency receipt.
+    /// Receipt lookup occurs before current-head validation.
+    ///
+    /// # Errors
+    /// Returns a validation, replay conflict, feed conflict, tombstone, or database error.
+    pub async fn append_idempotent(
+        &self,
+        tenant: TenantId,
+        subject: &PublicSubjectId,
+        exact: &[u8],
+        now_ms: i64,
+        idempotency_key_hash: Sha256Digest,
+        request_digest: Sha256Digest,
+    ) -> Result<AppendOutcome, StoreError> {
+        self.append_inner(
+            tenant,
+            subject,
+            exact,
+            now_ms,
+            Some((idempotency_key_hash, request_digest)),
+        )
+        .await
+    }
+
+    async fn append_inner(
+        &self,
+        tenant: TenantId,
+        subject: &PublicSubjectId,
+        exact: &[u8],
+        now_ms: i64,
+        idempotency: Option<(Sha256Digest, Sha256Digest)>,
+    ) -> Result<AppendOutcome, StoreError> {
         let event = SignedPublicFeedEventV1::decode_and_verify(exact)?;
         if &event.subject_id() != subject {
             return Err(StoreError::InvalidEvent(PublicFeedError::InvalidSubject));
@@ -365,6 +417,28 @@ impl PublicFeedPgStore {
         let mut tx = self.begin(tenant).await?;
         let subject_row=sqlx::query("SELECT publisher_identity_id,publisher_signing_key,descriptor_expires_at_ms,descriptor_tombstoned,feed_head_sequence,feed_head_hash,feed_tombstoned FROM directory.public_subjects WHERE tenant_id=$1 AND subject_id=$2 FOR UPDATE")
             .bind(tenant.as_uuid()).bind(subject.to_string()).fetch_optional(&mut *tx).await?.ok_or(StoreError::NotFound)?;
+        if let Some((key_hash, request_digest)) = idempotency {
+            let prior = sqlx::query(
+                "SELECT request_digest,exact_response
+                   FROM directory.feed_idempotency_receipts
+                  WHERE tenant_id=$1 AND subject_id=$2 AND idempotency_key_hash=$3",
+            )
+            .bind(tenant.as_uuid())
+            .bind(subject.to_string())
+            .bind(key_hash.as_bytes().as_slice())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(row) = prior {
+                let prior_digest: Vec<u8> = row.try_get("request_digest")?;
+                let prior_response: Vec<u8> = row.try_get("exact_response")?;
+                tx.commit().await?;
+                return if prior_digest == request_digest.as_bytes() && prior_response == exact {
+                    Ok(AppendOutcome::Replayed)
+                } else {
+                    Err(StoreError::Conflict)
+                };
+            }
+        }
         if subject_row.try_get::<String, _>("publisher_identity_id")?
             != event.publisher_identity_id().to_string()
             || subject_row.try_get::<Vec<u8>, _>("publisher_signing_key")?
@@ -372,7 +446,16 @@ impl PublicFeedPgStore {
         {
             return Err(StoreError::InvalidEvent(PublicFeedError::InvalidPublisher));
         }
-        if let Some(row)=sqlx::query("SELECT exact_cbor FROM directory.feed_entries WHERE tenant_id=$1 AND subject_id=$2 AND sequence=$3").bind(tenant.as_uuid()).bind(subject.to_string()).bind(sequence).fetch_optional(&mut *tx).await? { let prior:Vec<u8>=row.try_get("exact_cbor")?; tx.commit().await?; return if prior==exact{Ok(AppendOutcome::Replayed)}else{Err(StoreError::Conflict)}; }
+        if let Some(row)=sqlx::query("SELECT exact_cbor FROM directory.feed_entries WHERE tenant_id=$1 AND subject_id=$2 AND sequence=$3").bind(tenant.as_uuid()).bind(subject.to_string()).bind(sequence).fetch_optional(&mut *tx).await? {
+            let prior:Vec<u8>=row.try_get("exact_cbor")?;
+            if prior!=exact { return Err(StoreError::Conflict); }
+            if let Some((key_hash, request_digest))=idempotency {
+                sqlx::query("INSERT INTO directory.feed_idempotency_receipts(tenant_id,subject_id,idempotency_key_hash,request_digest,exact_response,created_at_ms) VALUES($1,$2,$3,$4,$5,$6)")
+                    .bind(tenant.as_uuid()).bind(subject.to_string()).bind(key_hash.as_bytes().as_slice()).bind(request_digest.as_bytes().as_slice()).bind(exact).bind(now_ms).execute(&mut *tx).await?;
+            }
+            tx.commit().await?;
+            return Ok(AppendOutcome::Replayed);
+        }
         if subject_row.try_get::<bool, _>("descriptor_tombstoned")? {
             return Err(StoreError::Tombstoned);
         }
@@ -395,6 +478,10 @@ impl PublicFeedPgStore {
             .bind(tenant.as_uuid()).bind(subject.to_string()).bind(sequence).bind(hash.as_bytes().as_slice()).bind(event.payload().is_tombstone()).bind(old_seq).bind(old_hash).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             return Err(StoreError::Conflict);
+        }
+        if let Some((key_hash, request_digest)) = idempotency {
+            sqlx::query("INSERT INTO directory.feed_idempotency_receipts(tenant_id,subject_id,idempotency_key_hash,request_digest,exact_response,created_at_ms) VALUES($1,$2,$3,$4,$5,$6)")
+                .bind(tenant.as_uuid()).bind(subject.to_string()).bind(key_hash.as_bytes().as_slice()).bind(request_digest.as_bytes().as_slice()).bind(exact).bind(now_ms).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(AppendOutcome::Created)
@@ -553,6 +640,17 @@ struct PageQuery {
     limit: Option<u16>,
 }
 pub fn public_feed_router(store: PublicFeedPgStore, tenant: TenantId) -> Router {
+    public_feed_router_with_discussion(store, tenant, PublicDiscussionRouterConfig::rejecting())
+}
+
+/// Builds the public origin router with an explicit current-device authority
+/// resolver for Public Discussion V1 mutations.
+pub fn public_feed_router_with_discussion(
+    store: PublicFeedPgStore,
+    tenant: TenantId,
+    discussion: PublicDiscussionRouterConfig,
+) -> Router {
+    let discussion_router = discussion::public_discussion_router(store.clone(), tenant, discussion);
     Router::new()
         .route(SUBJECT_PATH, get(get_descriptor).put(put_descriptor))
         .route(FEED_PATH, get(get_page).post(append_event))
@@ -561,6 +659,7 @@ pub fn public_feed_router(store: PublicFeedPgStore, tenant: TenantId) -> Router 
             tenant,
             cache: ResponseCache::new(256, 16 * 1024 * 1024),
         })
+        .merge(discussion_router)
 }
 async fn get_descriptor(
     State(s): State<AppState>,
@@ -816,10 +915,34 @@ async fn append_event(
     let Ok(bytes) = to_bytes(body, MAX_EVENT_BODY).await else {
         return failure(StatusCode::PAYLOAD_TOO_LARGE);
     };
+    let Ok(event) = SignedPublicFeedEventV1::decode_and_verify(&bytes) else {
+        return failure(StatusCode::BAD_REQUEST);
+    };
+    let idempotency = if event.sequence().get() > 1 || parts.headers.contains_key("idempotency-key")
+    {
+        let Ok(key_hash) = idempotency_key_hash(&parts.headers, FEED_IDEMPOTENCY_KEY_HASH_DOMAIN)
+        else {
+            return failure(StatusCode::BAD_REQUEST);
+        };
+        Some((
+            key_hash,
+            Sha256Digest::hash_domain(FEED_REQUEST_DIGEST_DOMAIN, &bytes),
+        ))
+    } else {
+        None
+    };
     let Ok(now) = unix_millis() else {
         return failure(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let response = match s.store.append(s.tenant, &subject, &bytes, now).await {
+    let append = match idempotency {
+        Some((key_hash, request_digest)) => {
+            s.store
+                .append_idempotent(s.tenant, &subject, &bytes, now, key_hash, request_digest)
+                .await
+        }
+        None => s.store.append(s.tenant, &subject, &bytes, now).await,
+    };
+    let response = match append {
         Ok(AppendOutcome::Created) => success(
             StatusCode::CREATED,
             EVENT_CONTENT_TYPE,
@@ -854,6 +977,18 @@ fn parse_subject(value: &str) -> Result<PublicSubjectId, StoreError> {
 }
 fn exact_content_type(h: &HeaderMap, expected: &str) -> bool {
     h.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) == Some(expected)
+}
+fn idempotency_key_hash(headers: &HeaderMap, domain: &[u8]) -> Result<Sha256Digest, ()> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let value = values.next().ok_or(())?;
+    if values.next().is_some() {
+        return Err(());
+    }
+    let bytes = value.as_bytes();
+    if !(16..=128).contains(&bytes.len()) || !bytes.iter().all(u8::is_ascii_graphic) {
+        return Err(());
+    }
+    Ok(Sha256Digest::hash_domain(domain, bytes))
 }
 fn valid_deadline(h: &HeaderMap) -> bool {
     let Some(value) = h

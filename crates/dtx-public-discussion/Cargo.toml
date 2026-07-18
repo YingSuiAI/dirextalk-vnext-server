@@ -1,22 +1,18 @@
 [package]
-name = "dtx-federated-identity"
+name = "dtx-public-discussion"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
+base64ct.workspace = true
 dtx-domain = { path = "../dtx-domain" }
-dtx-identity-log = { path = "../dtx-identity-log" }
 dtx-wire = { path = "../dtx-wire" }
-reqwest.workspace = true
-rustls.workspace = true
-tokio.workspace = true
-x509-parser.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
-base64ct.workspace = true
-rcgen.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

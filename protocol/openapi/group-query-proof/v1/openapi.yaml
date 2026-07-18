@@ -1,0 +1,55 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Group Query Proof V1 Documentation Overlay
+  version: 1.0.0
+  description: >-
+    Additive baseline V36 overlay for the deployed V32 query proof. It does not
+    modify V32 bytes. Both pending-join discovery and MLS commit-feed reads use
+    DTX-Group-Query-Proof. Action 1 authorizes only list_join_requests; action 2
+    authorizes only list_mls_commits. A valid proof for one action cannot be
+    replayed at the other route.
+paths:
+  /v1/groups/{scope_kind}/{scope_id}/join-requests:
+    get:
+      operationId: listJoinRequestsWithGroupQueryProofV1
+      parameters:
+        - $ref: '#/components/parameters/GroupQueryProof'
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - $ref: '#/components/parameters/IdentityOrigin'
+        - {name: after, in: query, required: false, schema: {type: string}}
+        - {name: limit, in: query, required: true, schema: {type: integer, minimum: 1, maximum: 64}}
+      responses:
+        '200': {description: Exact pending join-request page; requires action 1.}
+        '401': {description: Device authority or action-fenced proof rejected.}
+        '422': {description: Noncanonical route, query, proof, or scope.}
+  /v1/groups/{scope_kind}/{scope_id}/mls-commits:
+    get:
+      operationId: listMlsCommitsWithGroupQueryProofV1
+      parameters:
+        - $ref: '#/components/parameters/GroupQueryProof'
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - $ref: '#/components/parameters/IdentityOrigin'
+        - {name: after_epoch, in: query, required: true, schema: {type: integer, minimum: 0, maximum: 9007199254740991}}
+        - {name: limit, in: query, required: true, schema: {type: integer, minimum: 1, maximum: 64}}
+      responses:
+        '200': {description: Exact consecutive MLS commit page; requires action 2.}
+        '401': {description: Device authority, membership, or action-fenced proof rejected.}
+        '422': {description: Noncanonical route, query, proof, or scope.}
+components:
+  parameters:
+    GroupQueryProof:
+      name: DTX-Group-Query-Proof
+      in: header
+      required: true
+      description: Unpadded base64url of exact canonical group-query-proof-v1 CBOR.
+      schema: {type: string, minLength: 1, maxLength: 2048, pattern: '^[A-Za-z0-9_-]+$'}
+    DeviceSessionAuthorization:
+      name: Authorization
+      in: header
+      required: false
+      schema: {type: string}
+    IdentityOrigin:
+      name: DTX-Identity-Origin
+      in: header
+      required: false
+      schema: {type: string, pattern: '^https?://[^/?#]+$'}

@@ -2,7 +2,12 @@
 
 //! Hardened remote identity-log resolution shared by federated services.
 
-use std::{collections::BTreeSet, fmt, time::Duration};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 
 use dtx_domain::{DeviceId, IdentityId};
 use dtx_identity_log::{
@@ -22,6 +27,7 @@ const MAX_IDENTITY_LOG_PAGES: usize = 256;
 pub struct FederatedIdentityVerifier {
     client: Client,
     allowed_http_origins: BTreeSet<String>,
+    additional_trust_root: Option<Certificate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,10 +72,11 @@ impl FederatedIdentityVerifier {
             }
             canonical_http_origins.insert(canonical.origin().ascii_serialization());
         }
-        let client = build_client(None)?;
+        let client = build_client(None, None)?;
         Ok(Self {
             client,
             allowed_http_origins: canonical_http_origins,
+            additional_trust_root: None,
         })
     }
 
@@ -112,7 +119,9 @@ impl FederatedIdentityVerifier {
         mut self,
         trust_root_pem: &[u8],
     ) -> Result<Self, FederatedIdentityError> {
-        self.client = build_client(Some(parse_additional_trust_root_pem(trust_root_pem)?))?;
+        let trust_root = parse_additional_trust_root_pem(trust_root_pem)?;
+        self.client = build_client(Some(trust_root.clone()), None)?;
+        self.additional_trust_root = Some(trust_root);
         Ok(self)
     }
 
@@ -131,6 +140,7 @@ impl FederatedIdentityVerifier {
         device_id: DeviceId,
     ) -> Result<SigningPublicKey, FederatedIdentityError> {
         let origin = self.parse_allowed_origin(origin)?;
+        let client = self.client_for_origin(&origin).await?;
         let mut after = 0_u64;
         let mut advertised_head = None;
         let mut projection = None;
@@ -138,8 +148,7 @@ impl FederatedIdentityVerifier {
 
         for _ in 0..MAX_IDENTITY_LOG_PAGES {
             let page_url = identity_log_page_url(&origin, identity_id, after)?;
-            let response = self
-                .client
+            let response = client
                 .get(page_url)
                 .header(header::ACCEPT, IDENTITY_LOG_PAGE_CONTENT_TYPE)
                 .header(header::CACHE_CONTROL, "no-store")
@@ -239,10 +248,44 @@ impl FederatedIdentityVerifier {
             Err(FederatedIdentityError::InvalidOrigin)
         }
     }
+
+    async fn client_for_origin(&self, origin: &Url) -> Result<Client, FederatedIdentityError> {
+        if origin.scheme() == "http" {
+            return Ok(self.client.clone());
+        }
+        let host = origin
+            .host_str()
+            .ok_or(FederatedIdentityError::InvalidOrigin)?;
+        if host.parse::<IpAddr>().is_ok() {
+            return Err(FederatedIdentityError::InvalidOrigin);
+        }
+        let port = origin
+            .port_or_known_default()
+            .ok_or(FederatedIdentityError::InvalidOrigin)?;
+        let addresses = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|_| FederatedIdentityError::TemporarilyUnavailable)?
+            .map(|socket| socket.ip())
+            .collect::<BTreeSet<_>>();
+        if addresses.is_empty()
+            || addresses.len() > 16
+            || addresses.iter().any(|address| !is_public_address(*address))
+        {
+            return Err(FederatedIdentityError::InvalidOrigin);
+        }
+        let pinned = SocketAddr::new(
+            *addresses
+                .first()
+                .ok_or(FederatedIdentityError::InvalidOrigin)?,
+            port,
+        );
+        build_client(self.additional_trust_root.clone(), Some((host, pinned)))
+    }
 }
 
 fn build_client(
     additional_trust_root: Option<Certificate>,
+    pinned_origin: Option<(&str, SocketAddr)>,
 ) -> Result<Client, FederatedIdentityError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let builder = Client::builder()
@@ -255,13 +298,62 @@ fn build_client(
     // `tls_certs_merge` retains the platform/WebPKI verifier and only appends this
     // explicitly configured root. In particular, it does not disable hostname or
     // certificate-chain validation.
-    let builder = match additional_trust_root {
+    let mut builder = match additional_trust_root {
         Some(trust_root) => builder.tls_certs_merge([trust_root]),
         None => builder,
     };
+    if let Some((host, socket)) = pinned_origin {
+        builder = builder.resolve(host, socket);
+    }
     builder
         .build()
         .map_err(|_| FederatedIdentityError::TemporarilyUnavailable)
+}
+
+fn is_public_address(value: IpAddr) -> bool {
+    match value {
+        IpAddr::V4(value) => public_v4(value),
+        IpAddr::V6(value) => public_v6(value),
+    }
+}
+
+fn public_v4(value: Ipv4Addr) -> bool {
+    let numeric = u32::from(value);
+    ![
+        (0x0000_0000, 8),
+        (0x0a00_0000, 8),
+        (0x6440_0000, 10),
+        (0x7f00_0000, 8),
+        (0xa9fe_0000, 16),
+        (0xac10_0000, 12),
+        (0xc000_0000, 24),
+        (0xc000_0200, 24),
+        (0xc058_6300, 24),
+        (0xc0a8_0000, 16),
+        (0xc612_0000, 15),
+        (0xc633_6400, 24),
+        (0xcb00_7100, 24),
+        (0xe000_0000, 4),
+        (0xf000_0000, 4),
+    ]
+    .iter()
+    .any(|(network, prefix)| numeric >> (32 - prefix) == network >> (32 - prefix))
+}
+
+fn public_v6(value: Ipv6Addr) -> bool {
+    let numeric = u128::from(value);
+    if value.to_ipv4_mapped().is_some() {
+        return false;
+    }
+    numeric >> 125 == 0b001
+        && ![
+            (0x2001_u128 << 112, 23),
+            (0x2001_0db8_u128 << 96, 32),
+            (0x2002_u128 << 112, 16),
+            (0x3fff_u128 << 112, 20),
+        ]
+        .iter()
+        .any(|(network, prefix)| numeric >> (128 - prefix) == network >> (128 - prefix))
 }
 
 fn parse_additional_trust_root_pem(
@@ -344,14 +436,46 @@ fn require_single_header(
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{error::Error, net::IpAddr};
 
     use base64ct::{Base64, Encoding as _};
     use rcgen::{
         BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519,
     };
 
-    use super::{FederatedIdentityError, FederatedIdentityVerifier};
+    use super::{FederatedIdentityError, FederatedIdentityVerifier, is_public_address};
+
+    #[test]
+    fn pinned_https_accepts_only_public_dns_answers() -> Result<(), Box<dyn Error>> {
+        for value in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(is_public_address(value.parse::<IpAddr>()?), "{value}");
+        }
+        for value in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.0.2.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "2001:db8::1",
+            "3fff::1",
+            "fe80::1",
+            "fc00::1",
+            "ff02::1",
+        ] {
+            assert!(!is_public_address(value.parse::<IpAddr>()?), "{value}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn additional_trust_root_requires_one_ca_pem() -> Result<(), Box<dyn Error>> {

@@ -513,6 +513,23 @@ async fn owner_admin_discovery_is_bound_paged_cached_and_restart_safe() -> Resul
     );
 
     let first_target = format!("{scope_path}/join-requests?after=&limit=1");
+    let wrong_join_action = send_group_query(
+        app.clone(),
+        &first_target,
+        &remote_admin,
+        &remote_origin,
+        true,
+        group_query_proof_for_action(
+            &remote_admin,
+            &remote_origin,
+            scope,
+            &first_target,
+            2,
+            1_000,
+        )?,
+    )
+    .await?;
+    assert_eq!(wrong_join_action.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let first = send_group_query(
         app.clone(),
         &first_target,
@@ -789,6 +806,14 @@ async fn active_member_fetches_consecutive_v30_v32_feed_and_removed_member_conve
     assert_eq!(mls_receipt_epoch(&peer_receipt)?, 3);
 
     let target = format!("{scope_path}/mls-commits?after_epoch=2&limit=64");
+    let wrong_feed_action = send_local_commit_feed(
+        app.clone(),
+        &target,
+        &member,
+        group_query_proof_for_action(&member, AUDIENCE, scope, &target, 1, 1_100)?,
+    )
+    .await?;
+    assert_eq!(wrong_feed_action.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let feed = send_local_commit_feed(
         app.clone(),
         &target,

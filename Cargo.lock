@@ -988,6 +988,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "tokio",
  "x509-parser",
 ]
 
@@ -1205,6 +1206,7 @@ dependencies = [
  "axum",
  "axum-server",
  "dtx-domain",
+ "dtx-federated-identity",
  "dtx-group-node",
  "dtx-group-persistence",
  "dtx-identity-node",
@@ -1253,6 +1255,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-public-discussion"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "dtx-domain",
+ "dtx-wire",
+ "ed25519-dalek",
+ "serde_json",
+]
+
+[[package]]
 name = "dtx-public-feed"
 version = "0.1.0"
 dependencies = [
@@ -1271,8 +1284,10 @@ dependencies = [
  "axum",
  "base64ct",
  "dtx-domain",
+ "dtx-federated-identity",
  "dtx-http-cache",
  "dtx-public-descriptor",
+ "dtx-public-discussion",
  "dtx-public-feed",
  "dtx-storage",
  "dtx-wire",

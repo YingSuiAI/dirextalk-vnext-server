@@ -117,6 +117,61 @@ fn restored_v23_and_additive_v35_are_disjoint_and_frozen() {
 }
 
 #[test]
+fn additive_v36_is_disjoint_and_preserves_v24_and_every_older_manifest_byte_exact() {
+    let root = repository_root();
+    let older = (1..=35)
+        .map(|version| {
+            let path = root.join(format!("protocol/baseline/v{version}/manifest.json"));
+            let bytes = fs::read(&path).unwrap_or_else(|error| {
+                panic!(
+                    "read published V{version} manifest {}: {error}",
+                    path.display()
+                )
+            });
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    let v24_before = older
+        .iter()
+        .find(|(path, _)| path.ends_with("protocol/baseline/v24/manifest.json"))
+        .map(|(_, bytes)| bytes.clone())
+        .expect("V24 manifest snapshot");
+    let v36_path = root.join("protocol/baseline/v36/manifest.json");
+    let v36_before = fs::read(&v36_path).expect("V36 manifest is present");
+    let v36: Value = serde_json::from_slice(&v36_before).expect("V36 manifest is valid JSON");
+    assert_eq!(v36["version"].as_u64(), Some(36));
+    assert_eq!(v36["events"].as_object().unwrap().len(), 0);
+    assert_eq!(v36["errors"].as_object().unwrap().len(), 0);
+    let artifacts = v36["artifacts"].as_object().expect("V36 artifacts");
+    assert_eq!(artifacts.len(), 8);
+    assert_eq!(
+        artifacts
+            .get("protocol/test-vectors/private-event/v8/private-group-reaction-v8.json")
+            .and_then(Value::as_str),
+        Some("sha256:519f24a89a91d7ee7098a1d0881c9f035e587e7d96d0649bd76123edb5ba5420"),
+    );
+    let v24: Value = serde_json::from_slice(&v24_before).expect("V24 manifest JSON");
+    assert!(
+        v24["artifacts"]
+            .as_object()
+            .expect("V24 artifacts")
+            .keys()
+            .all(|path| !artifacts.contains_key(path)),
+    );
+
+    freeze_baseline(&root).expect("V36 and every published baseline remain byte exact");
+    for (path, expected) in older {
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            expected,
+            "{} changed",
+            path.display()
+        );
+    }
+    assert_eq!(fs::read(v36_path).unwrap(), v36_before);
+}
+
+#[test]
 fn freezing_a_new_version_preserves_the_published_v1_manifest() {
     let root = isolated_protocol_tree();
     let v1 = root.join("protocol/baseline/v1/manifest.json");

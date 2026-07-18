@@ -1,0 +1,31 @@
+; Baseline V36 documentation overlay for the already-deployed V32 group query
+; proof. V32 named the MLS feed header DTX-MLS-Commit-Proof in OpenAPI, but the
+; implementation and native client have always used the canonical
+; DTX-Group-Query-Proof header and this exact action-fenced proof.
+
+group-query-proof-identity-id-v1 = tstr .size 57
+group-query-proof-uuid-v7-v1 = tstr .size 36
+group-query-proof-channel-id-v1 = tstr .size 57
+group-query-proof-time-v1 = -62135596800000..253402300799999
+group-query-proof-signature-v1 = bstr .size 64
+group-query-proof-scope-v1 =
+  { 1: 1, 2: group-query-proof-uuid-v7-v1 } /
+  { 1: 2, 2: group-query-proof-channel-id-v1 }
+
+group-query-proof-binding-v1 = {
+  1: 1,
+  2: 1 / 2, ; list_join_requests / list_mls_commits
+  3: tstr .size (1..768), ; exact canonical path plus query
+  4: group-query-proof-scope-v1,
+  5: group-query-proof-identity-id-v1,
+  6: group-query-proof-uuid-v7-v1,
+  7: group-query-proof-time-v1,
+  8: group-query-proof-time-v1,
+  9: tstr .size (10..512)
+}
+
+group-query-proof-v1 = {
+  1: 1,
+  2: group-query-proof-binding-v1,
+  3: group-query-proof-signature-v1
+}

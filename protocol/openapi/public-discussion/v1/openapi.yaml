@@ -1,0 +1,239 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Public Channel Continued Posting and Discussion V1
+  version: 1.0.0
+  description: >-
+    Additive baseline V36. Public Feed V1 post bytes remain unchanged. A
+    sequence-2-or-later feed append and every discussion mutation use one
+    visible ASCII Idempotency-Key; only its domain-separated hash is persisted.
+    Exact replay returns the original persisted response before current device
+    authority is rechecked. Comments and reactions are accepted only from a
+    currently active device in the complete signed identity log at the exact
+    HTTPS origin carried in the signed event.
+paths:
+  /.well-known/dirextalk/public/v1/{channel_id}/feed:
+    post:
+      operationId: appendContinuedPublicFeedPostV1
+      summary: Append an exact Public Feed V1 event after the first post
+      description: >-
+        Sequence 1 retains the frozen V24 behavior and may omit Idempotency-Key.
+        Sequence 2 and later require it. The key is neither signed nor echoed;
+        one scoped key with different exact request bytes returns 409.
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - $ref: '#/components/parameters/Deadline'
+        - $ref: '#/components/parameters/IdempotencyKeyOptionalForSequenceOne'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.public-feed-event.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCbor'}
+      responses:
+        '200': {description: Exact durable replay converged.}
+        '201': {description: Event appended.}
+        '400': {description: Invalid headers, media type, or canonical event.}
+        '409': {description: Idempotency, sequence, head, equivocation, or tombstone conflict.}
+  /.well-known/dirextalk/public/v1/{channel_id}/discussion-policy:
+    get:
+      operationId: getPublicDiscussionPolicyV1
+      summary: Read the exact current owner-signed discussion policy
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: Exact current policy with a strong representation ETag.
+          headers:
+            ETag: {$ref: '#/components/headers/ETag'}
+            Cache-Control: {$ref: '#/components/headers/PublicReadCacheControl'}
+          content:
+            application/vnd.dirextalk.public-discussion-policy.v1+cbor:
+              schema: {$ref: '#/components/schemas/ExactCbor'}
+        '304':
+          description: The exact cached policy remains current.
+          headers:
+            ETag: {$ref: '#/components/headers/ETag'}
+            Cache-Control: {$ref: '#/components/headers/PublicReadCacheControl'}
+        '404': {description: Unknown Channel or no discussion policy.}
+    put:
+      operationId: putPublicDiscussionPolicyV1
+      summary: Create or CAS-advance the exact owner-root-signed policy
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - $ref: '#/components/parameters/Deadline'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.public-discussion-policy.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/PolicyMutation'}
+        '201': {$ref: '#/components/responses/PolicyMutation'}
+        '409': {description: Revision, prior digest, event, or idempotency conflict.}
+  /.well-known/dirextalk/public/v1/{channel_id}/posts/{post_hash}/comments:
+    get:
+      operationId: listPublicCommentsV1
+      summary: Read one immutable snapshot page of exact comment receipts
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - $ref: '#/components/parameters/PostHash'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - {name: cursor, in: query, required: false, schema: {type: string, minLength: 1, maxLength: 512, pattern: '^[A-Za-z0-9_-]+$'}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+      responses:
+        '200':
+          description: Canonical page; roots revalidate after 10 seconds and immutable continuations after 300 seconds.
+          headers:
+            ETag: {$ref: '#/components/headers/ETag'}
+            Cache-Control: {$ref: '#/components/headers/PublicReadCacheControl'}
+          content:
+            application/vnd.dirextalk.public-comment-page.v1+cbor:
+              schema: {$ref: '#/components/schemas/ExactCbor'}
+        '304': {description: The exact snapshot representation remains current.}
+        '400': {description: Invalid lower-case post hash, cursor, limit, or conditional header.}
+        '404': {description: Unknown post or no comment thread.}
+    post:
+      operationId: appendPublicCommentV1
+      summary: Append one device-signed root comment or one-level reply
+      description: >-
+        The body is at most 4096 UTF-8 bytes. A parent binds one existing root
+        comment entry; replying to a reply is rejected. The actor's signed
+        identity origin is authoritative and is not accepted from an unsigned
+        request header.
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - $ref: '#/components/parameters/PostHash'
+        - $ref: '#/components/parameters/Deadline'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.public-comment.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/CommentMutation'}
+        '201': {$ref: '#/components/responses/CommentMutation'}
+        '403': {description: Device signature or current complete identity-log authority rejected.}
+        '404': {description: Policy, post, or parent comment not found.}
+        '409': {description: Event, thread head, policy fence, or idempotency conflict.}
+        '429': {description: Per-origin-host actor mutation limit exceeded.}
+  /.well-known/dirextalk/public/v1/{channel_id}/posts/{post_hash}/reactions:
+    get:
+      operationId: getPublicReactionProjectionV1
+      summary: Read the deterministic current actor-state reaction projection
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - $ref: '#/components/parameters/PostHash'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - {name: target_kind, in: query, required: true, schema: {type: string, enum: [post, comment]}}
+        - {name: target_hash, in: query, required: true, schema: {$ref: '#/components/schemas/LowerHexDigest'}}
+        - {name: kind, in: query, required: true, schema: {type: string, enum: [like]}}
+      responses:
+        '200':
+          description: Exact latest signed event per actor, identity-sorted; inactive unlike states remain.
+          headers:
+            ETag: {$ref: '#/components/headers/ETag'}
+            Cache-Control: {$ref: '#/components/headers/PublicReadCacheControl'}
+          content:
+            application/vnd.dirextalk.public-reaction-projection.v1+cbor:
+              schema: {$ref: '#/components/schemas/ExactCbor'}
+        '304': {description: The exact projection remains current.}
+        '404': {description: Unknown post or target.}
+    post:
+      operationId: advancePublicReactionStateV1
+      summary: CAS-advance one actor's device-signed like/unlike state
+      description: >-
+        Revision 1 has a null previous digest. Later revisions bind the exact
+        previous event digest. Event IDs are globally unique within the Channel.
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - $ref: '#/components/parameters/PostHash'
+        - $ref: '#/components/parameters/Deadline'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.public-reaction.v1+cbor:
+            schema: {$ref: '#/components/schemas/ExactCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/ReactionMutation'}
+        '201': {$ref: '#/components/responses/ReactionMutation'}
+        '403': {description: Device signature or current complete identity-log authority rejected.}
+        '404': {description: Policy, post, or target not found.}
+        '409': {description: Actor revision, prior digest, event, policy fence, or idempotency conflict.}
+        '429': {description: Per-origin-host actor mutation limit exceeded.}
+components:
+  parameters:
+    ChannelId:
+      name: channel_id
+      in: path
+      required: true
+      schema: {type: string, minLength: 57, maxLength: 57, pattern: '^dtxc1[a-z2-7]{52}$'}
+    PostHash:
+      name: post_hash
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/LowerHexDigest'}
+    Deadline:
+      name: x-dtx-deadline-ms
+      in: header
+      required: true
+      schema: {type: integer}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: One visible ASCII value, 16..128 bytes; UUIDv7 is recommended.
+      schema: {type: string, minLength: 16, maxLength: 128, pattern: '^[!-~]+$'}
+    IdempotencyKeyOptionalForSequenceOne:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Required for feed sequence 2 and later; sequence 1 remains V24-compatible.
+      schema: {type: string, minLength: 16, maxLength: 128, pattern: '^[!-~]+$'}
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      schema: {type: string, pattern: '^"dtx-[0-9a-f]{64}"$'}
+  schemas:
+    ExactCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+    LowerHexDigest:
+      type: string
+      minLength: 64
+      maxLength: 64
+      pattern: '^[0-9a-f]{64}$'
+  headers:
+    ETag:
+      required: true
+      schema: {type: string, pattern: '^"dtx-[0-9a-f]{64}"$'}
+    PublicReadCacheControl:
+      required: true
+      description: Public reads use the route-specific max-age and must-revalidate; requests carrying credentials use no-store.
+      schema: {type: string}
+  responses:
+    PolicyMutation:
+      description: Exact persisted policy; mutation responses are no-store.
+      headers:
+        Cache-Control: {schema: {type: string, const: no-store}}
+      content:
+        application/vnd.dirextalk.public-discussion-policy.v1+cbor:
+          schema: {$ref: '#/components/schemas/ExactCbor'}
+    CommentMutation:
+      description: Exact persisted comment receipt; mutation responses are no-store.
+      headers:
+        Cache-Control: {schema: {type: string, const: no-store}}
+      content:
+        application/vnd.dirextalk.public-comment-receipt.v1+cbor:
+          schema: {$ref: '#/components/schemas/ExactCbor'}
+    ReactionMutation:
+      description: Exact persisted reaction receipt; mutation responses are no-store.
+      headers:
+        Cache-Control: {schema: {type: string, const: no-store}}
+      content:
+        application/vnd.dirextalk.public-reaction-receipt.v1+cbor:
+          schema: {$ref: '#/components/schemas/ExactCbor'}

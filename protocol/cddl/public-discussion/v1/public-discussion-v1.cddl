@@ -1,0 +1,119 @@
+; Dirextalk Public Channel continued posting and Public Discussion V1 (baseline V36).
+; Public posts remain exact publisher-signed Public Feed V1 events. Comments and
+; actor-state reactions are separate device-signed facts bound to one immutable
+; lower-case feed entry hash. Servers never infer follower/subscriber state.
+
+public-discussion-version-v1 = { 1: 1, 2: 0 }
+public-discussion-wire-v1 = {
+  1: public-discussion-version-v1,
+  2: public-discussion-version-v1
+}
+public-discussion-channel-id-v1 = tstr .size 57
+public-discussion-identity-id-v1 = tstr .size 57
+public-discussion-uuid-v7-v1 = tstr .size 36
+public-discussion-origin-v1 = tstr .size (10..512)
+public-discussion-digest-v1 = bstr .size 32
+public-discussion-key-v1 = bstr .size 32
+public-discussion-signature-v1 = bstr .size 64
+public-discussion-safe-uint-v1 = 0..9007199254740991
+public-discussion-positive-safe-uint-v1 = 1..9007199254740991
+public-discussion-time-v1 = -62135596800000..253402300799999
+
+; Signature input is
+; signature-domain || SHA-256(event-digest-domain || exact unsigned CBOR).
+public-discussion-policy-v1 = {
+  1: public-discussion-wire-v1,
+  2: public-discussion-channel-id-v1,
+  3: public-discussion-identity-id-v1,
+  4: public-discussion-key-v1,
+  5: public-discussion-positive-safe-uint-v1,
+  6: public-discussion-digest-v1 / null,
+  7: 1, ; verified_identity
+  8: public-discussion-time-v1,
+  9: public-discussion-signature-v1
+}
+
+public-comment-v1 = {
+  1: public-discussion-wire-v1,
+  2: public-discussion-uuid-v7-v1,
+  3: public-discussion-channel-id-v1,
+  4: public-discussion-digest-v1, ; immutable post/feed-entry hash
+  5: public-discussion-digest-v1 / null, ; one-level parent comment entry hash
+  6: tstr .size (1..4096),
+  7: public-discussion-identity-id-v1,
+  8: public-discussion-uuid-v7-v1,
+  9: public-discussion-origin-v1,
+  10: public-discussion-positive-safe-uint-v1,
+  11: public-discussion-digest-v1,
+  12: public-discussion-time-v1,
+  13: public-discussion-signature-v1
+}
+
+public-comment-receipt-v1 = {
+  1: public-discussion-wire-v1,
+  2: public-discussion-positive-safe-uint-v1,
+  3: public-discussion-digest-v1 / null,
+  4: public-discussion-digest-v1,
+  5: bstr .size (1..65536) ; exact signed public-comment-v1
+}
+
+; Cursor is canonical CBOR encoded as unpadded base64url. It is snapshot-bound
+; and intentionally has no wire-version map so the route/media type owns V1.
+public-comment-cursor-v1 = {
+  1: public-discussion-channel-id-v1,
+  2: public-discussion-digest-v1,
+  3: public-discussion-safe-uint-v1,
+  4: public-discussion-positive-safe-uint-v1,
+  5: public-discussion-digest-v1
+}
+
+public-comment-page-v1 = {
+  1: public-discussion-wire-v1,
+  2: public-discussion-channel-id-v1,
+  3: public-discussion-digest-v1,
+  4: [1*100 bstr .size (1..65536)],
+  5: tstr .size (1..512) / null,
+  6: public-discussion-positive-safe-uint-v1,
+  7: public-discussion-digest-v1
+}
+
+public-reaction-v1 = {
+  1: public-discussion-wire-v1,
+  2: public-discussion-uuid-v7-v1,
+  3: public-discussion-channel-id-v1,
+  4: public-discussion-digest-v1, ; immutable post/feed-entry hash
+  5: 1 / 2, ; post / comment
+  6: public-discussion-digest-v1, ; exact post or comment-entry target
+  7: 1, ; like
+  8: bool,
+  9: public-discussion-positive-safe-uint-v1,
+  10: public-discussion-digest-v1 / null,
+  11: public-discussion-identity-id-v1,
+  12: public-discussion-uuid-v7-v1,
+  13: public-discussion-origin-v1,
+  14: public-discussion-positive-safe-uint-v1,
+  15: public-discussion-digest-v1,
+  16: public-discussion-time-v1,
+  17: public-discussion-signature-v1
+}
+
+public-reaction-receipt-v1 = {
+  1: public-discussion-wire-v1,
+  2: public-discussion-uuid-v7-v1,
+  3: public-discussion-digest-v1,
+  4: public-discussion-positive-safe-uint-v1,
+  5: public-discussion-time-v1
+}
+
+; Field 7 contains one exact latest signed event per actor, sorted by actor
+; identity. Inactive states remain present so unlike/replay converges.
+public-reaction-projection-v1 = {
+  1: public-discussion-wire-v1,
+  2: public-discussion-channel-id-v1,
+  3: public-discussion-digest-v1,
+  4: 1 / 2,
+  5: public-discussion-digest-v1,
+  6: 1,
+  7: [* bstr .size (1..65536)],
+  8: public-discussion-digest-v1
+}

@@ -31,6 +31,7 @@ members = [
     "crates/dtx-membership-command",
     "crates/dtx-mailbox",
     "crates/dtx-public-descriptor",
+    "crates/dtx-public-discussion",
     "crates/dtx-public-feed",
     "crates/dtx-security",
     "crates/dtx-storage",

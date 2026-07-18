@@ -9,6 +9,7 @@ publish = false
 axum.workspace = true
 axum-server.workspace = true
 dtx-domain = { path = "../../crates/dtx-domain" }
+dtx-federated-identity = { path = "../../crates/dtx-federated-identity" }
 dtx-group-node = { path = "../dtx-group-node" }
 dtx-group-persistence = { path = "../../crates/dtx-group-persistence" }
 dtx-identity-node = { path = "../dtx-identity-node" }

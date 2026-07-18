@@ -1,0 +1,15 @@
+{
+  "version": 36,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/group-query-proof/v1/group-query-proof-overlay-v1.cddl": "sha256:9c834231b94180d72e79ef58a7b111098a8617ef0eb6936ae3891d91557574ff",
+    "protocol/cddl/private-event/v8/private-group-reaction-v8.cddl": "sha256:27d3b779c7c7200b07f5975aadce93f9f6438d638f1e56bb5e0c606b1a44c44c",
+    "protocol/cddl/public-discussion/v1/public-discussion-v1.cddl": "sha256:9c886fd6bfdb253da4d6507450f35c92ae31dd9871d1382b4cb223e0bdd7704f",
+    "protocol/openapi/group-query-proof/v1/openapi.yaml": "sha256:a14c20030c3c5574a7701fbf5c195e2493d84168b0f96fc384068c72b2005a2c",
+    "protocol/openapi/public-discussion/v1/openapi.yaml": "sha256:47a1ea1566b74d230354c8afb0943c48b7e8732c3307628c4ec7e2cfc082f4ce",
+    "protocol/test-vectors/group-query-proof/v1/group-query-proof-overlay-v1.json": "sha256:216437e347edca40b7f70cce2a81ee381160fc03b282c0d788016554584d6ac2",
+    "protocol/test-vectors/private-event/v8/private-group-reaction-v8.json": "sha256:519f24a89a91d7ee7098a1d0881c9f035e587e7d96d0649bd76123edb5ba5420",
+    "protocol/test-vectors/public-discussion/v1/public-discussion-v1.json": "sha256:0c1adb63b3d316d393e982d847c16f333e858d5bb24b4080760eda34efbc6c4a"
+  }
+}

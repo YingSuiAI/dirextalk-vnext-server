@@ -155,11 +155,265 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_v30_peer_admission(root)?;
     validate_mls_sequencer_v4(root)?;
     validate_conversation_agent_grant_v1(root)?;
+    validate_v36_additive_contracts(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one V36 gate keeps the public discussion, private V8, and group-query overlay byte exact"
+)]
+fn validate_v36_additive_contracts(root: &Path) -> Result<(), ProtocolToolError> {
+    let discussion_cddl_path =
+        root.join("protocol/cddl/public-discussion/v1/public-discussion-v1.cddl");
+    let discussion_cddl = read(&discussion_cddl_path)?;
+    cddl_cat::parse_cddl(&discussion_cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse Public Discussion V1 CDDL {}: {error}",
+            discussion_cddl_path.display()
+        ))
+    })?;
+    let discussion_openapi_path = root.join("protocol/openapi/public-discussion/v1/openapi.yaml");
+    let discussion_openapi = read(&discussion_openapi_path)?;
+    let discussion_spec = oas3::from_yaml(&discussion_openapi).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse Public Discussion V1 OpenAPI {}: {error}",
+            discussion_openapi_path.display()
+        ))
+    })?;
+    if discussion_spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "Public Discussion V1 OpenAPI must declare 3.1.0",
+        ));
+    }
+    for required in [
+        "sequence-2-or-later",
+        "Idempotency-Key",
+        "application/vnd.dirextalk.public-discussion-policy.v1+cbor",
+        "application/vnd.dirextalk.public-comment.v1+cbor",
+        "application/vnd.dirextalk.public-reaction.v1+cbor",
+        "currently active device",
+        "no-store",
+    ] {
+        if !discussion_openapi.contains(required) {
+            return Err(ProtocolToolError::new(format!(
+                "Public Discussion V1 OpenAPI is missing {required}"
+            )));
+        }
+    }
+
+    let discussion_vector = read_json(
+        &root.join("protocol/test-vectors/public-discussion/v1/public-discussion-v1.json"),
+    )?;
+    validate_vector_version(&discussion_vector, "public-discussion-v1")?;
+    if discussion_vector.get("baseline").and_then(Value::as_u64) != Some(36) {
+        return Err(ProtocolToolError::new(
+            "Public Discussion V1 vector baseline must be 36",
+        ));
+    }
+    for (rule, pointer) in [
+        ("public-discussion-policy-v1", "/policy/canonical_cbor_hex"),
+        ("public-comment-v1", "/comment/canonical_cbor_hex"),
+        (
+            "public-comment-receipt-v1",
+            "/comment_receipt/canonical_cbor_hex",
+        ),
+        ("public-comment-page-v1", "/comment_page_canonical_cbor_hex"),
+        ("public-reaction-v1", "/reaction/canonical_cbor_hex"),
+        (
+            "public-reaction-receipt-v1",
+            "/reaction_receipt_canonical_cbor_hex",
+        ),
+        (
+            "public-reaction-projection-v1",
+            "/reaction_projection_canonical_cbor_hex",
+        ),
+    ] {
+        let encoded = discussion_vector
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProtocolToolError::new(format!(
+                    "Public Discussion V1 vector field {pointer} must be a string"
+                ))
+            })?;
+        validate_cddl_hex(rule, &discussion_cddl, encoded)?;
+    }
+    let cursor = discussion_vector
+        .pointer("/comment_cursor/base64url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProtocolToolError::new("Public Discussion V1 cursor is missing"))?;
+    let cursor_bytes = Base64UrlUnpadded::decode_vec(cursor)
+        .map_err(|_| ProtocolToolError::new("Public Discussion V1 cursor is not base64url"))?;
+    if Base64UrlUnpadded::encode_string(&cursor_bytes) != cursor {
+        return Err(ProtocolToolError::new(
+            "Public Discussion V1 cursor must use unpadded canonical base64url",
+        ));
+    }
+    cddl_cat::validate_cbor_bytes("public-comment-cursor-v1", &discussion_cddl, &cursor_bytes)
+        .map_err(|error| {
+            ProtocolToolError::new(format!(
+                "CDDL rejected Public Discussion V1 cursor: {error}"
+            ))
+        })?;
+    for (domain, exact_pointer, digest_pointer, label) in [
+        (
+            b"dirextalk.public-discussion-policy-entry.v1\0".as_slice(),
+            "/policy/canonical_cbor_hex",
+            "/policy/policy_digest_hex",
+            "Public Discussion V1 policy",
+        ),
+        (
+            b"dirextalk.public-comment-event-entry.v1\0".as_slice(),
+            "/comment/canonical_cbor_hex",
+            "/comment/event_hash_hex",
+            "Public Discussion V1 comment",
+        ),
+        (
+            b"dirextalk.public-reaction-event-entry.v1\0".as_slice(),
+            "/reaction/canonical_cbor_hex",
+            "/reaction/event_digest_hex",
+            "Public Discussion V1 reaction",
+        ),
+    ] {
+        let exact = discussion_vector
+            .pointer(exact_pointer)
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProtocolToolError::new(format!("missing {exact_pointer}")))?;
+        let digest = discussion_vector
+            .pointer(digest_pointer)
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProtocolToolError::new(format!("missing {digest_pointer}")))?;
+        ensure_domain_digest(domain, exact, digest, label)?;
+    }
+
+    let private_cddl_path =
+        root.join("protocol/cddl/private-event/v8/private-group-reaction-v8.cddl");
+    let private_cddl = read(&private_cddl_path)?;
+    cddl_cat::parse_cddl(&private_cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse private group reaction V8 CDDL {}: {error}",
+            private_cddl_path.display()
+        ))
+    })?;
+    let private_vector = read_json(
+        &root.join("protocol/test-vectors/private-event/v8/private-group-reaction-v8.json"),
+    )?;
+    if private_vector.get("baseline").and_then(Value::as_u64) != Some(36)
+        || private_vector.get("version").and_then(Value::as_u64) != Some(8)
+        || private_vector.get("kind").and_then(Value::as_u64) != Some(8)
+    {
+        return Err(ProtocolToolError::new(
+            "private group reaction V8 vector baseline/version/kind drift",
+        ));
+    }
+    let private_hex = json_string(&private_vector, "canonical_cbor_hex")?;
+    validate_cddl_hex("private-group-reaction-v8", &private_cddl, private_hex)?;
+    let private_bytes = decode_hex(private_hex)?;
+    if lowercase_hex(&Sha256::digest(&private_bytes))
+        != json_string(&private_vector, "canonical_cbor_sha256")?
+    {
+        return Err(ProtocolToolError::new(
+            "private group reaction V8 canonical CBOR digest drift",
+        ));
+    }
+    let bound_head =
+        decode_lower_hex_fixed::<32>(json_string(&private_vector, "bound_mls_head_hex")?)?;
+    if bound_head.iter().all(|byte| *byte == 0) {
+        return Err(ProtocolToolError::new(
+            "private group reaction V8 MLS head must be non-zero",
+        ));
+    }
+
+    let query_cddl_path =
+        root.join("protocol/cddl/group-query-proof/v1/group-query-proof-overlay-v1.cddl");
+    let query_cddl = read(&query_cddl_path)?;
+    cddl_cat::parse_cddl(&query_cddl).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse Group Query Proof V1 overlay CDDL {}: {error}",
+            query_cddl_path.display()
+        ))
+    })?;
+    let query_openapi_path = root.join("protocol/openapi/group-query-proof/v1/openapi.yaml");
+    let query_openapi = read(&query_openapi_path)?;
+    let query_spec = oas3::from_yaml(&query_openapi).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse Group Query Proof V1 overlay OpenAPI {}: {error}",
+            query_openapi_path.display()
+        ))
+    })?;
+    if query_spec.openapi != "3.1.0"
+        || !query_openapi.contains("DTX-Group-Query-Proof")
+        || !query_openapi.contains("Action 1")
+        || !query_openapi.contains("action 2")
+    {
+        return Err(ProtocolToolError::new(
+            "Group Query Proof V1 overlay header/action fence drift",
+        ));
+    }
+    let query_vector = read_json(
+        &root.join("protocol/test-vectors/group-query-proof/v1/group-query-proof-overlay-v1.json"),
+    )?;
+    if query_vector.get("baseline").and_then(Value::as_u64) != Some(36)
+        || query_vector.get("version").and_then(Value::as_u64) != Some(1)
+        || json_string(&query_vector, "canonical_header")? != "DTX-Group-Query-Proof"
+    {
+        return Err(ProtocolToolError::new(
+            "Group Query Proof V1 overlay vector header/baseline drift",
+        ));
+    }
+    let proofs = query_vector
+        .get("proofs")
+        .and_then(Value::as_array)
+        .filter(|proofs| proofs.len() == 2)
+        .ok_or_else(|| {
+            ProtocolToolError::new("Group Query Proof V1 vector must contain two actions")
+        })?;
+    for (index, proof) in proofs.iter().enumerate() {
+        let expected_action = (index + 1) as u64;
+        if proof.get("action").and_then(Value::as_u64) != Some(expected_action) {
+            return Err(ProtocolToolError::new(
+                "Group Query Proof V1 actions must be exactly 1 then 2",
+            ));
+        }
+        let encoded = json_string(proof, "canonical_cbor_hex")?;
+        validate_cddl_hex("group-query-proof-v1", &query_cddl, encoded)?;
+        let exact = decode_hex(encoded)?;
+        let header = json_string(proof, "header_base64url")?;
+        if Base64UrlUnpadded::encode_string(&exact) != header {
+            return Err(ProtocolToolError::new(
+                "Group Query Proof V1 header does not encode exact proof bytes",
+            ));
+        }
+        let decoded = decode_deterministic_cbor(&exact).map_err(|error| {
+            ProtocolToolError::new(format!("decode Group Query Proof V1: {error}"))
+        })?;
+        let CanonicalValue::Map(fields) = decoded else {
+            return Err(ProtocolToolError::new("Group Query Proof V1 must be a map"));
+        };
+        let binding = fields
+            .iter()
+            .find_map(|(key, value)| (key == &CanonicalValue::Unsigned(2)).then_some(value))
+            .ok_or_else(|| ProtocolToolError::new("Group Query Proof V1 binding is missing"))?;
+        let CanonicalValue::Map(binding_fields) = binding else {
+            return Err(ProtocolToolError::new(
+                "Group Query Proof V1 binding must be a map",
+            ));
+        };
+        if !binding_fields.iter().any(|(key, value)| {
+            key == &CanonicalValue::Unsigned(2)
+                && value == &CanonicalValue::Unsigned(expected_action)
+        }) {
+            return Err(ProtocolToolError::new(
+                "Group Query Proof V1 encoded action does not match its label",
+            ));
+        }
+    }
     Ok(())
 }
 

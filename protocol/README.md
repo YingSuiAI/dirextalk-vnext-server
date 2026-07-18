@@ -110,6 +110,20 @@ Layout:
   and durable command byte. Negotiated minor 1.5 reuses this exact codec and
   changes only the ordinary-ACK rule after an expired recipient has been
   durably retired; runtime peers continue to negotiate supported minors 2–5.
+  `baseline/v36/manifest.json` is disjoint and additive. It freezes Public
+  Channel continued-feed idempotency plus Public Discussion V1 policy,
+  comment, reply, like/unlike, cursor, receipt, projection, HTTP, and golden
+  bytes without changing the V24 Public Feed event. Sequence 1 retains the V24
+  HTTP compatibility path; sequence 2 and later require one scoped, durable
+  Idempotency-Key receipt. It also mirrors the native private group-reaction V8
+  vector byte-for-byte. V8 remains MLS plaintext that the server never decodes;
+  clients gate it on an exact roster-wide epoch/head capability beacon carried
+  as benign reserved V1 text. Finally, V36 publishes a documentation overlay
+  for the already-deployed group-query proof: pending join-request reads use
+  action 1, MLS commit-feed reads use action 2, and both use the canonical
+  `DTX-Group-Query-Proof` header. The inaccurate V32 OpenAPI component name is
+  preserved byte-for-byte as historical input and is not an alternate runtime
+  header.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

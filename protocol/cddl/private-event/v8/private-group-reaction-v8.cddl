@@ -1,0 +1,41 @@
+; Dirextalk MLS-private group reaction V8 (baseline V36).
+;
+; This plaintext exists only inside MLS application ciphertext. Servers,
+; relays, storage, and Agent Control MUST treat it as opaque bytes and MUST NOT
+; decode or log any field. V8 is enabled only after every active roster device
+; authenticated the exact same current MLS epoch/head through a reserved V1
+; Text event body with this exact canonical form:
+;   dirextalk.private-event-capability.v1;kind=8;version=8;epoch=
+;   <positive canonical decimal>;head=<64 lower-case hex, non-zero>
+; A roster, epoch, or head change invalidates every prior beacon. Upgraded
+; clients suppress this line; an older client may render it as benign text.
+
+private-reaction-uuid-v7-v8 = tstr .size 36
+private-reaction-identity-id-v8 = tstr .size 57
+private-reaction-time-v8 = -62135596800000..253402300799999
+private-reaction-safe-revision-v8 = 1..9007199254740991
+private-reaction-epoch-v8 = 1..18446744073709551615
+private-reaction-digest-v8 = bstr .size 32
+
+private-reaction-payload-v8 = {
+  1: private-reaction-uuid-v7-v8, ; target event id
+  2: 1,                           ; like
+  3: bool,                        ; active / unlike
+  4: private-reaction-safe-revision-v8,
+  5: private-reaction-epoch-v8,
+  6: private-reaction-digest-v8   ; non-zero exact MLS head
+}
+
+private-group-reaction-v8 = {
+  1: 8,
+  2: private-reaction-uuid-v7-v8,
+  3: private-reaction-uuid-v7-v8,
+  4: private-reaction-identity-id-v8,
+  5: private-reaction-uuid-v7-v8,
+  6: private-reaction-time-v8,
+  7: 8,
+  8: [private-reaction-uuid-v7-v8],
+  9: "",
+  10: null,
+  11: private-reaction-payload-v8
+}
