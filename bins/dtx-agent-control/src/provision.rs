@@ -17,19 +17,20 @@ use std::{
 
 use base64ct::{Base64UrlUnpadded, Encoding};
 use config::BootstrapConfig;
-use dtx_agent_control::{EnrollmentToken, Sha256Digest};
+use dtx_agent_control::{CredentialReissueToken, EnrollmentToken, Sha256Digest};
 use dtx_agent_control_server::{
     ConnectorCertificateAuthority, ConnectorCredentialAuthorizationIndex,
     CreateConnectorEnrollmentRequest, CreatedConnectorEnrollment, HostProvisioningConnectorRequest,
     HostProvisioningRequest, HostProvisioningResult, MAX_PROVISIONING_CONNECTORS,
     MIN_PROVISIONING_ENROLLMENT_TTL_MILLIS, PostgresConnectorControlApplication,
-    ProtobufDurableCommandDecoder, ensure_host_provisioning,
+    PrepareConnectorCredentialReissueRequest, ProtobufDurableCommandDecoder,
+    ensure_host_provisioning,
 };
 use dtx_agent_host::{AgentHost, HostLifecycle};
 use dtx_agent_persistence::{
     AgentDefinitionRepository, AgentDeviceRepository, AgentHostRepository,
-    AgentInstallationRepository, BindingSetRepository, ConnectorRepository, CurrentWrite,
-    DefinitionInsert,
+    AgentInstallationRepository, BindingSetRepository, ConnectorCredentialAuthorizationRepository,
+    ConnectorRepository, CurrentWrite, DefinitionInsert,
 };
 use dtx_agent_registry::{
     AgentDevice, AgentDeviceCommand, AgentDeviceState, AgentInstallation, DescriptorDigest,
@@ -40,8 +41,9 @@ use dtx_connect_registry::{
     RoutingPolicy, TenantRef,
 };
 use dtx_domain::{
-    AgentDeviceId, AgentId, BindingId, ConnectorId, DeviceId, EnrollmentIntentId, HostCredentialId,
-    HostId, IdentityId, InstallationId, RequestId, Revision, TenantId,
+    AgentDeviceId, AgentId, BindingId, ConnectorCredentialId, ConnectorId, DeviceId,
+    EnrollmentIntentId, HostCredentialId, HostId, IdentityId, InstallationId, RequestId, Revision,
+    TenantId,
 };
 use dtx_security::SecretBytes;
 use dtx_storage::PgStore;
@@ -59,6 +61,11 @@ const ACCEPTANCE_PLAN_SCHEMA: &str = "dirextalk.agent-acceptance-plan";
 const ACCEPTANCE_HANDOFF_SCHEMA: &str = "dirextalk.agent-acceptance-handoff";
 const ACCEPTANCE_RESULT_SCHEMA: &str = "dirextalk.agent-acceptance-result";
 const ACCEPTANCE_PLAN_DIGEST_DOMAIN: &[u8] = b"dirextalk.agent-acceptance-plan.v1";
+const CREDENTIAL_REISSUE_PLAN_SCHEMA: &str = "dirextalk.connector-credential-reissue-plan";
+const CREDENTIAL_REISSUE_HANDOFF_SCHEMA: &str = "dirextalk.connector-credential-reissue-handoff";
+const CREDENTIAL_REISSUE_RESULT_SCHEMA: &str = "dirextalk.connector-credential-reissue-result";
+const CREDENTIAL_REISSUE_PLAN_DIGEST_DOMAIN: &[u8] =
+    b"dirextalk.connector-credential-reissue-plan.v1";
 const MAX_JSON_BYTES: u64 = 65_536;
 const MAX_DATABASE_URL_BYTES: u64 = 4_096;
 const MAX_PEM_BUNDLE_BYTES: u64 = 1_048_576;
@@ -88,6 +95,7 @@ const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.connector_control_credentials", "SELECT"),
     ("agent.connector_control_credential_revisions", "SELECT"),
     ("agent.connector_control_credential_heads", "SELECT"),
+    ("agent.connector_control_credential_rotations", "SELECT"),
 ];
 const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[("system.current_tenant_id()", "EXECUTE")];
 const ACCEPTANCE_PREPARE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
@@ -137,6 +145,19 @@ const ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.connector_bindings", "INSERT"),
     ("agent.connector_bindings", "UPDATE"),
 ];
+const CREDENTIAL_REISSUE_PREPARE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
+    ("agent.connector_instances", "SELECT"),
+    ("agent.connector_revisions", "SELECT"),
+    ("agent.connector_control_operations", "SELECT"),
+    ("agent.connector_control_operations", "INSERT"),
+    ("agent.connector_control_credentials", "SELECT"),
+    ("agent.connector_control_credential_revisions", "SELECT"),
+    ("agent.connector_control_credential_heads", "SELECT"),
+    ("agent.connector_credential_reissue_intents", "SELECT"),
+    ("agent.connector_credential_reissue_intents", "INSERT"),
+];
+const CREDENTIAL_REISSUE_ABORT_TABLE_PRIVILEGES: &[(&str, &str)] =
+    &[("agent.connector_credential_reissue_intents", "UPDATE")];
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -147,6 +168,20 @@ async fn main() -> ExitCode {
                 || command == std::ffi::OsStr::new("acceptance-finalize")
     ) {
         return match run_acceptance().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("dtx-agent-provision: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if matches!(
+        env::args_os().nth(1).as_deref(),
+        Some(command)
+            if command == std::ffi::OsStr::new("credential-reissue-prepare")
+                || command == std::ffi::OsStr::new("credential-reissue-abort")
+    ) {
+        return match run_credential_reissue().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("dtx-agent-provision: {error}");
@@ -311,6 +346,186 @@ async fn run_acceptance() -> Result<(), AcceptanceError> {
     }
 }
 
+async fn run_credential_reissue() -> Result<(), CredentialReissueError> {
+    let arguments = CredentialReissueArguments::parse(env::args_os())?;
+    let config = BootstrapConfig::load(&arguments.config_file)
+        .map_err(|_| CredentialReissueError::Config)?;
+    let mut plan = parse_credential_reissue_plan(&read_regular_bounded(
+        &arguments.plan_file,
+        MAX_JSON_BYTES,
+        false,
+    )?)?;
+    validate_credential_reissue_plan(&mut plan)?;
+    if plan.tenant_id != config.owner_api.tenant_id {
+        return Err(CredentialReissueError::TenantMismatch);
+    }
+    let normalized_plan = serde_json::to_vec(&plan).map_err(|_| CredentialReissueError::Plan)?;
+    let plan_digest = domain_digest(CREDENTIAL_REISSUE_PLAN_DIGEST_DOMAIN, &normalized_plan);
+    let database_url = Zeroizing::new(read_service_secret_bounded(
+        &arguments.database_url_file,
+        MAX_DATABASE_URL_BYTES,
+    )?);
+    let database_options = std::str::from_utf8(&database_url)
+        .map_err(|_| CredentialReissueError::DatabaseConfig)?
+        .trim()
+        .parse::<PgConnectOptions>()
+        .map_err(|_| CredentialReissueError::DatabaseConfig)?;
+    let store = PgStore::connect(database_options, 2)
+        .await
+        .map_err(|_| CredentialReissueError::Database)?;
+    let required_table_privileges = match arguments.phase {
+        CredentialReissuePhase::Prepare => CREDENTIAL_REISSUE_PREPARE_TABLE_PRIVILEGES,
+        CredentialReissuePhase::Abort => CREDENTIAL_REISSUE_ABORT_TABLE_PRIVILEGES,
+    };
+    if !store
+        .readiness_check(required_table_privileges, REQUIRED_FUNCTION_PRIVILEGES)
+        .await
+        .map_err(|_| CredentialReissueError::Database)?
+    {
+        return Err(CredentialReissueError::Database);
+    }
+
+    let issuer = load_connector_issuer(&config).map_err(CredentialReissueError::from)?;
+    let application = PostgresConnectorControlApplication::new(
+        store.clone(),
+        issuer,
+        Arc::new(ConnectorCredentialAuthorizationIndex::new()),
+        Arc::new(ProtobufDurableCommandDecoder),
+    );
+    match arguments.phase {
+        CredentialReissuePhase::Prepare => {
+            let handoff_path = arguments
+                .handoff_file
+                .as_deref()
+                .ok_or(CredentialReissueError::Usage)?;
+            if reissue_handoff_is_missing(handoff_path)?
+                && durable_reissue_intent_exists(&store, plan.tenant_id, plan.operation_id).await?
+            {
+                return Err(CredentialReissueError::HandoffLost);
+            }
+            let expected_credential_id = load_reissue_current_credential_id(&store, &plan).await?;
+            let mut handoff = LockedCredentialReissueHandoff::acquire(
+                &plan,
+                plan_digest,
+                expected_credential_id,
+                handoff_path,
+            )?;
+            let created = application
+                .prepare_connector_credential_reissue(PrepareConnectorCredentialReissueRequest {
+                    tenant_id: plan.tenant_id,
+                    host_id: plan.host_id,
+                    connector_id: plan.connector_id,
+                    operation_id: plan.operation_id,
+                    expected_credential_id: handoff.handoff.current_credential_id,
+                    expected_leaf_fingerprint: Sha256Digest::from_bytes(
+                        plan.expected_leaf_fingerprint_sha256.bytes(),
+                    ),
+                    expected_generation: plan.expected_generation,
+                    expected_spec_revision: Revision::new(plan.expected_spec_revision)
+                        .map_err(|_| CredentialReissueError::Plan)?,
+                    plan_digest,
+                    token_digest: handoff
+                        .handoff
+                        .reissue_token
+                        .domain_reissue_token()
+                        .digest(),
+                    ttl_millis: plan.handoff_ttl_millis,
+                })
+                .await
+                .map_err(|_| CredentialReissueError::Prepare)?;
+            handoff.mark_ready(created.intent_id, created.expires_at_millis)?;
+            report_credential_reissue_success(
+                CredentialReissuePhase::Prepare,
+                &plan,
+                plan_digest,
+                Some(created.intent_id),
+                Some(created.expires_at_millis),
+                Some(created.replayed),
+            )
+        }
+        CredentialReissuePhase::Abort => {
+            application
+                .abort_connector_credential_reissue(plan.tenant_id, plan.operation_id)
+                .await
+                .map_err(|_| CredentialReissueError::Abort)?;
+            report_credential_reissue_success(
+                CredentialReissuePhase::Abort,
+                &plan,
+                plan_digest,
+                None,
+                None,
+                None,
+            )
+        }
+    }
+}
+
+fn reissue_handoff_is_missing(path: &Path) -> Result<bool, CredentialReissueError> {
+    let parent = path.parent().ok_or(CredentialReissueError::Handoff)?;
+    validate_handoff_parent(parent).map_err(CredentialReissueError::from)?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Err(CredentialReissueError::Handoff),
+    }
+}
+
+async fn durable_reissue_intent_exists(
+    store: &PgStore,
+    tenant_id: TenantId,
+    operation_id: RequestId,
+) -> Result<bool, CredentialReissueError> {
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| CredentialReissueError::Database)?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM agent.connector_credential_reissue_intents WHERE tenant_id=$1 AND operation_id=$2)",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(operation_id.as_uuid())
+    .fetch_one(session.connection())
+    .await
+    .map_err(|_| CredentialReissueError::Database)?;
+    session
+        .commit()
+        .await
+        .map_err(|_| CredentialReissueError::Database)?;
+    Ok(exists)
+}
+
+async fn load_reissue_current_credential_id(
+    store: &PgStore,
+    plan: &CredentialReissuePlan,
+) -> Result<ConnectorCredentialId, CredentialReissueError> {
+    let mut session = store
+        .begin_tenant(plan.tenant_id)
+        .await
+        .map_err(|_| CredentialReissueError::Database)?;
+    let authorization = ConnectorCredentialAuthorizationRepository::new()
+        .load_head(session.connection(), plan.tenant_id, plan.connector_id)
+        .await
+        .map_err(|_| CredentialReissueError::Database)?
+        .ok_or(CredentialReissueError::Prepare)?;
+    let current = authorization
+        .authorization()
+        .current()
+        .ok_or(CredentialReissueError::Prepare)?;
+    if current.certificate_fingerprint()
+        != Sha256Digest::from_bytes(plan.expected_leaf_fingerprint_sha256.bytes())
+        || current.generation() != plan.expected_generation
+        || current.revision().get() != plan.expected_spec_revision
+    {
+        return Err(CredentialReissueError::Prepare);
+    }
+    let credential_id = current.credential_id();
+    session
+        .commit()
+        .await
+        .map_err(|_| CredentialReissueError::Database)?;
+    Ok(credential_id)
+}
+
 #[allow(
     clippy::struct_field_names,
     reason = "CLI flag names intentionally retain the explicit file suffix"
@@ -443,6 +658,76 @@ impl AcceptanceArguments {
     }
 }
 
+#[allow(
+    clippy::struct_field_names,
+    reason = "CLI flag names intentionally retain the explicit file suffix"
+)]
+struct CredentialReissueArguments {
+    phase: CredentialReissuePhase,
+    config_file: PathBuf,
+    database_url_file: PathBuf,
+    plan_file: PathBuf,
+    handoff_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialReissuePhase {
+    Prepare,
+    Abort,
+}
+
+impl CredentialReissueArguments {
+    fn parse(
+        arguments: impl IntoIterator<Item = OsString>,
+    ) -> Result<Self, CredentialReissueError> {
+        let mut arguments = arguments.into_iter();
+        let _program = arguments.next();
+        let phase = match arguments.next().as_deref() {
+            Some(command) if command == std::ffi::OsStr::new("credential-reissue-prepare") => {
+                CredentialReissuePhase::Prepare
+            }
+            Some(command) if command == std::ffi::OsStr::new("credential-reissue-abort") => {
+                CredentialReissuePhase::Abort
+            }
+            _ => return Err(CredentialReissueError::Usage),
+        };
+        let mut config_file = None;
+        let mut database_url_file = None;
+        let mut plan_file = None;
+        let mut handoff_file = None;
+        while let Some(flag) = arguments.next() {
+            let value = arguments.next().ok_or(CredentialReissueError::Usage)?;
+            match flag.to_str() {
+                Some("--config-file") if config_file.is_none() => {
+                    config_file = Some(PathBuf::from(value))
+                }
+                Some("--database-url-file") if database_url_file.is_none() => {
+                    database_url_file = Some(PathBuf::from(value));
+                }
+                Some("--plan-file") if plan_file.is_none() => {
+                    plan_file = Some(PathBuf::from(value))
+                }
+                Some("--handoff-file") if handoff_file.is_none() => {
+                    handoff_file = Some(PathBuf::from(value));
+                }
+                _ => return Err(CredentialReissueError::Usage),
+            }
+        }
+        if (phase == CredentialReissuePhase::Prepare && handoff_file.is_none())
+            || (phase == CredentialReissuePhase::Abort && handoff_file.is_some())
+        {
+            return Err(CredentialReissueError::Usage);
+        }
+        Ok(Self {
+            phase,
+            config_file: config_file.ok_or(CredentialReissueError::Usage)?,
+            database_url_file: database_url_file.ok_or(CredentialReissueError::Usage)?,
+            plan_file: plan_file.ok_or(CredentialReissueError::Usage)?,
+            handoff_file,
+        })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProvisioningPlan {
@@ -520,6 +805,31 @@ struct AcceptanceFacts {
     identity_head_sequence: u64,
     identity_head_hash: Base64Digest32,
     credential_fingerprint: Base64Digest32,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialReissuePlan {
+    schema: String,
+    schema_version: u8,
+    operation_id: RequestId,
+    tenant_id: TenantId,
+    host_id: HostId,
+    connector_id: ConnectorId,
+    expected_leaf_fingerprint_sha256: Digest32,
+    expected_generation: u64,
+    expected_spec_revision: u64,
+    reason: CredentialReissueReason,
+    handoff_ttl_millis: i64,
+    enrollment_url: String,
+    enrollment_server_name: String,
+    enrollment_root_ca_sha256: Digest32,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CredentialReissueReason {
+    ExpiredControlCredential,
 }
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -696,6 +1006,95 @@ struct AcceptanceHandoffAgent {
     expires_at_millis: Option<i64>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialReissueHandoff {
+    schema: String,
+    schema_version: u8,
+    state: CredentialReissueHandoffState,
+    operation_id: RequestId,
+    intent_id: Option<EnrollmentIntentId>,
+    plan_digest: Digest32,
+    tenant_id: TenantId,
+    host_id: HostId,
+    connector_id: ConnectorId,
+    current_credential_id: ConnectorCredentialId,
+    current_leaf_fingerprint_sha256: Digest32,
+    generation: u64,
+    spec_revision: u64,
+    expires_at_millis: Option<i64>,
+    reissue_token: SecretToken,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CredentialReissueHandoffState {
+    Pending,
+    Ready,
+}
+
+struct LockedCredentialReissueHandoff {
+    _lock: HandoffParentLock,
+    path: PathBuf,
+    handoff: CredentialReissueHandoff,
+}
+
+impl LockedCredentialReissueHandoff {
+    fn acquire(
+        plan: &CredentialReissuePlan,
+        plan_digest: Sha256Digest,
+        current_credential_id: ConnectorCredentialId,
+        path: &Path,
+    ) -> Result<Self, CredentialReissueError> {
+        let lock = HandoffParentLock::acquire(path).map_err(CredentialReissueError::from)?;
+        let handoff = match fs::symlink_metadata(path) {
+            Ok(_) => {
+                let bytes = Zeroizing::new(
+                    read_regular_bounded(path, MAX_JSON_BYTES, true)
+                        .map_err(CredentialReissueError::from)?,
+                );
+                serde_json::from_slice(&bytes).map_err(|_| CredentialReissueError::Handoff)?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let handoff =
+                    generate_credential_reissue_handoff(plan, plan_digest, current_credential_id)?;
+                atomic_create_handoff(path, &handoff).map_err(CredentialReissueError::from)?;
+                handoff
+            }
+            Err(_) => return Err(CredentialReissueError::Handoff),
+        };
+        validate_credential_reissue_handoff(&handoff, plan, plan_digest)?;
+        Ok(Self {
+            _lock: lock,
+            path: path.to_path_buf(),
+            handoff,
+        })
+    }
+
+    fn mark_ready(
+        &mut self,
+        intent_id: EnrollmentIntentId,
+        expires_at_millis: i64,
+    ) -> Result<(), CredentialReissueError> {
+        match self.handoff.state {
+            CredentialReissueHandoffState::Pending => {
+                self.handoff.state = CredentialReissueHandoffState::Ready;
+                self.handoff.intent_id = Some(intent_id);
+                self.handoff.expires_at_millis = Some(expires_at_millis);
+                atomic_replace_handoff(&self.path, &self.handoff)
+                    .map_err(CredentialReissueError::from)
+            }
+            CredentialReissueHandoffState::Ready
+                if self.handoff.intent_id == Some(intent_id)
+                    && self.handoff.expires_at_millis == Some(expires_at_millis) =>
+            {
+                Ok(())
+            }
+            CredentialReissueHandoffState::Ready => Err(CredentialReissueError::HandoffConflict),
+        }
+    }
+}
+
 struct LockedAcceptanceHandoff {
     _lock: HandoffParentLock,
     path: PathBuf,
@@ -838,6 +1237,10 @@ impl SecretToken {
     fn domain_token(&self) -> EnrollmentToken {
         EnrollmentToken::from_bytes(self.0)
     }
+
+    fn domain_reissue_token(&self) -> CredentialReissueToken {
+        CredentialReissueToken::from_bytes(self.0)
+    }
 }
 
 impl Drop for SecretToken {
@@ -863,10 +1266,14 @@ impl<'de> Deserialize<'de> for SecretToken {
         let encoded = Zeroizing::new(String::deserialize(deserializer)?);
         let mut decoded = Base64UrlUnpadded::decode_vec(&encoded)
             .map_err(|_| de::Error::custom("invalid enrollment token"))?;
-        let bytes = decoded
+        let bytes: [u8; 32] = decoded
             .as_slice()
             .try_into()
             .map_err(|_| de::Error::custom("invalid enrollment token length"))?;
+        if Base64UrlUnpadded::encode_string(&bytes) != *encoded {
+            decoded.zeroize();
+            return Err(de::Error::custom("invalid enrollment token encoding"));
+        }
         decoded.zeroize();
         Ok(Self(bytes))
     }
@@ -886,6 +1293,54 @@ fn parse_acceptance_plan(bytes: &[u8]) -> Result<AcceptancePlan, AcceptanceError
 
 fn parse_acceptance_facts(bytes: &[u8]) -> Result<AcceptanceFacts, AcceptanceError> {
     serde_json::from_slice(bytes).map_err(|_| AcceptanceError::Facts)
+}
+
+fn parse_credential_reissue_plan(
+    bytes: &[u8],
+) -> Result<CredentialReissuePlan, CredentialReissueError> {
+    serde_json::from_slice(bytes).map_err(|_| CredentialReissueError::Plan)
+}
+
+fn validate_credential_reissue_plan(
+    plan: &mut CredentialReissuePlan,
+) -> Result<(), CredentialReissueError> {
+    if plan.schema != CREDENTIAL_REISSUE_PLAN_SCHEMA
+        || plan.schema_version != 1
+        || plan.reason != CredentialReissueReason::ExpiredControlCredential
+        || plan.expected_leaf_fingerprint_sha256.bytes() == [0; 32]
+        || plan.enrollment_root_ca_sha256.bytes() == [0; 32]
+        || plan.expected_generation == 0
+        || Revision::new(plan.expected_spec_revision).is_err()
+        || !(1..=MAX_ENROLLMENT_TTL_MILLIS).contains(&plan.handoff_ttl_millis)
+        || !is_canonical_https_origin(&plan.enrollment_url)
+        || !is_canonical_server_name(&plan.enrollment_server_name)
+        || enrollment_url_host(&plan.enrollment_url) != Some(plan.enrollment_server_name.as_str())
+    {
+        return Err(CredentialReissueError::Plan);
+    }
+    Ok(())
+}
+
+fn is_canonical_server_name(value: &str) -> bool {
+    value.len() <= 253
+        && !value.is_empty()
+        && value == value.to_ascii_lowercase()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn enrollment_url_host(value: &str) -> Option<&str> {
+    let authority = value.strip_prefix("https://")?;
+    let (host, _) = authority
+        .rsplit_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    Some(host)
 }
 
 fn validate_and_sort_acceptance_plan(
@@ -1097,6 +1552,60 @@ fn validate_acceptance_handoff(
         {
             return Err(AcceptanceError::HandoffConflict);
         }
+    }
+    Ok(())
+}
+
+fn generate_credential_reissue_handoff(
+    plan: &CredentialReissuePlan,
+    plan_digest: Sha256Digest,
+    current_credential_id: ConnectorCredentialId,
+) -> Result<CredentialReissueHandoff, CredentialReissueError> {
+    Ok(CredentialReissueHandoff {
+        schema: CREDENTIAL_REISSUE_HANDOFF_SCHEMA.to_owned(),
+        schema_version: 1,
+        state: CredentialReissueHandoffState::Pending,
+        operation_id: plan.operation_id,
+        intent_id: None,
+        plan_digest: Digest32(plan_digest.as_bytes()),
+        tenant_id: plan.tenant_id,
+        host_id: plan.host_id,
+        connector_id: plan.connector_id,
+        current_credential_id,
+        current_leaf_fingerprint_sha256: plan.expected_leaf_fingerprint_sha256,
+        generation: plan.expected_generation,
+        spec_revision: plan.expected_spec_revision,
+        expires_at_millis: None,
+        reissue_token: SecretToken::generate().map_err(CredentialReissueError::from)?,
+    })
+}
+
+fn validate_credential_reissue_handoff(
+    handoff: &CredentialReissueHandoff,
+    plan: &CredentialReissuePlan,
+    plan_digest: Sha256Digest,
+) -> Result<(), CredentialReissueError> {
+    let metadata_valid = match handoff.state {
+        CredentialReissueHandoffState::Pending => {
+            handoff.intent_id.is_none() && handoff.expires_at_millis.is_none()
+        }
+        CredentialReissueHandoffState::Ready => {
+            handoff.intent_id.is_some() && handoff.expires_at_millis.is_some_and(|value| value > 0)
+        }
+    };
+    if handoff.schema != CREDENTIAL_REISSUE_HANDOFF_SCHEMA
+        || handoff.schema_version != 1
+        || handoff.operation_id != plan.operation_id
+        || handoff.plan_digest != Digest32(plan_digest.as_bytes())
+        || handoff.tenant_id != plan.tenant_id
+        || handoff.host_id != plan.host_id
+        || handoff.connector_id != plan.connector_id
+        || handoff.current_leaf_fingerprint_sha256 != plan.expected_leaf_fingerprint_sha256
+        || handoff.generation != plan.expected_generation
+        || handoff.spec_revision != plan.expected_spec_revision
+        || !metadata_valid
+    {
+        return Err(CredentialReissueError::HandoffConflict);
     }
     Ok(())
 }
@@ -2321,6 +2830,138 @@ fn write_acceptance_report(report: &AcceptanceReport) -> Result<(), AcceptanceEr
     output.flush().map_err(|_| AcceptanceError::Output)
 }
 
+#[derive(Serialize)]
+struct CredentialReissueReport {
+    schema: &'static str,
+    schema_version: u8,
+    phase: &'static str,
+    state: &'static str,
+    operation_id: RequestId,
+    plan_digest: Digest32,
+    tenant_id: TenantId,
+    host_id: HostId,
+    connector_id: ConnectorId,
+    intent_id: Option<EnrollmentIntentId>,
+    expires_at_millis: Option<i64>,
+    replayed: Option<bool>,
+}
+
+fn report_credential_reissue_success(
+    phase: CredentialReissuePhase,
+    plan: &CredentialReissuePlan,
+    plan_digest: Sha256Digest,
+    intent_id: Option<EnrollmentIntentId>,
+    expires_at_millis: Option<i64>,
+    replayed: Option<bool>,
+) -> Result<(), CredentialReissueError> {
+    let report = CredentialReissueReport {
+        schema: CREDENTIAL_REISSUE_RESULT_SCHEMA,
+        schema_version: 1,
+        phase: match phase {
+            CredentialReissuePhase::Prepare => "prepare",
+            CredentialReissuePhase::Abort => "abort",
+        },
+        state: match phase {
+            CredentialReissuePhase::Prepare => "ready",
+            CredentialReissuePhase::Abort => "aborted",
+        },
+        operation_id: plan.operation_id,
+        plan_digest: Digest32(plan_digest.as_bytes()),
+        tenant_id: plan.tenant_id,
+        host_id: plan.host_id,
+        connector_id: plan.connector_id,
+        intent_id,
+        expires_at_millis,
+        replayed,
+    };
+    let mut output = io::stdout().lock();
+    serde_json::to_writer(&mut output, &report).map_err(|_| CredentialReissueError::Output)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| CredentialReissueError::Output)?;
+    output.flush().map_err(|_| CredentialReissueError::Output)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialReissueError {
+    Usage,
+    Config,
+    Plan,
+    TenantMismatch,
+    Handoff,
+    HandoffConflict,
+    HandoffLost,
+    File,
+    FilePermissions,
+    DatabaseConfig,
+    Database,
+    Prepare,
+    Abort,
+    Issuer,
+    Random,
+    Output,
+}
+
+impl From<ProvisionError> for CredentialReissueError {
+    fn from(error: ProvisionError) -> Self {
+        match error {
+            ProvisionError::Handoff | ProvisionError::HandoffExpired => Self::Handoff,
+            ProvisionError::HandoffConflict => Self::HandoffConflict,
+            ProvisionError::File => Self::File,
+            ProvisionError::FilePermissions => Self::FilePermissions,
+            ProvisionError::Random => Self::Random,
+            ProvisionError::Output => Self::Output,
+            ProvisionError::Usage
+            | ProvisionError::Plan
+            | ProvisionError::DatabaseConfig
+            | ProvisionError::Database
+            | ProvisionError::Provisioning
+            | ProvisionError::Time => Self::File,
+        }
+    }
+}
+
+impl From<AcceptanceError> for CredentialReissueError {
+    fn from(error: AcceptanceError) -> Self {
+        match error {
+            AcceptanceError::File => Self::File,
+            AcceptanceError::FilePermissions => Self::FilePermissions,
+            AcceptanceError::Issuer => Self::Issuer,
+            AcceptanceError::Random => Self::Random,
+            AcceptanceError::DatabaseConfig => Self::DatabaseConfig,
+            AcceptanceError::Database => Self::Database,
+            _ => Self::Config,
+        }
+    }
+}
+
+impl fmt::Display for CredentialReissueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Usage => {
+                "usage: dtx-agent-provision credential-reissue-prepare --config-file <service-config> --database-url-file <0400|0440|0600|0640-file> --plan-file <json> --handoff-file <new-0600-json> | dtx-agent-provision credential-reissue-abort --config-file <service-config> --database-url-file <0400|0440|0600|0640-file> --plan-file <json>"
+            }
+            Self::Config => "Agent Control service configuration is invalid",
+            Self::Plan => "credential reissue plan is invalid",
+            Self::TenantMismatch => "credential reissue plan tenant does not match Agent Control",
+            Self::Handoff => "secret credential reissue handoff is invalid",
+            Self::HandoffConflict => "secret credential reissue handoff conflicts with the plan",
+            Self::HandoffLost => "the exact credential reissue handoff is missing; refusing to mint a replacement token",
+            Self::File => "a required file could not be read or written safely",
+            Self::FilePermissions => "secret file ownership or permissions are unsafe",
+            Self::DatabaseConfig => "database connection configuration is invalid",
+            Self::Database => "database runtime boundary is unavailable",
+            Self::Prepare => "credential reissue could not be prepared or replayed",
+            Self::Abort => "credential reissue cannot be aborted after promotion or consumption",
+            Self::Issuer => "Connector issuer configuration is invalid",
+            Self::Random => "secure random generation failed",
+            Self::Output => "redacted credential reissue receipt could not be written",
+        })
+    }
+}
+
+impl std::error::Error for CredentialReissueError {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AcceptanceError {
     Usage,
@@ -2471,6 +3112,29 @@ mod tests {
         "ttl_millis":300000
       }]
     }"#;
+
+    const CREDENTIAL_REISSUE_PLAN: &str = r#"{
+      "schema":"dirextalk.connector-credential-reissue-plan",
+      "schema_version":1,
+      "operation_id":"01890f47-5fd4-7cc2-8f8f-5f9476f4f030",
+      "tenant_id":"01890f47-5fd4-7cc2-8f8f-5f9476f4f031",
+      "host_id":"01890f47-5fd4-7cc2-8f8f-5f9476f4f032",
+      "connector_id":"01890f47-5fd4-7cc2-8f8f-5f9476f4f033",
+      "expected_leaf_fingerprint_sha256":"1111111111111111111111111111111111111111111111111111111111111111",
+      "expected_generation":1,
+      "expected_spec_revision":1,
+      "reason":"expired_control_credential",
+      "handoff_ttl_millis":300000,
+      "enrollment_url":"https://enroll.dirextalk.ai",
+      "enrollment_server_name":"enroll.dirextalk.ai",
+      "enrollment_root_ca_sha256":"2222222222222222222222222222222222222222222222222222222222222222"
+    }"#;
+
+    fn credential_reissue_plan() -> CredentialReissuePlan {
+        let mut plan = parse_credential_reissue_plan(CREDENTIAL_REISSUE_PLAN.as_bytes()).unwrap();
+        validate_credential_reissue_plan(&mut plan).unwrap();
+        plan
+    }
 
     fn acceptance_plan() -> AcceptancePlan {
         let owner_identity_id =
@@ -2637,6 +3301,94 @@ mod tests {
             hermes.connectors[0].adapter_kind.domain(),
             AdapterKind::HermesAcp,
         );
+    }
+
+    #[test]
+    fn credential_reissue_plan_and_handoff_are_strict_and_replayable_without_leaking_token() {
+        let plan = credential_reissue_plan();
+        let digest = domain_digest(
+            CREDENTIAL_REISSUE_PLAN_DIGEST_DOMAIN,
+            &serde_json::to_vec(&plan).unwrap(),
+        );
+        let current_credential_id =
+            ConnectorCredentialId::from_str("01890f47-5fd4-7cc2-8f8f-5f9476f4f034").unwrap();
+        let mut handoff =
+            generate_credential_reissue_handoff(&plan, digest, current_credential_id).unwrap();
+        validate_credential_reissue_handoff(&handoff, &plan, digest).unwrap();
+        let encoded = serde_json::to_value(&handoff).unwrap();
+        let token = encoded["reissue_token"].as_str().unwrap().to_owned();
+        assert_eq!(token.len(), 43);
+        assert!(
+            token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        );
+        handoff.state = CredentialReissueHandoffState::Ready;
+        handoff.intent_id =
+            Some(EnrollmentIntentId::from_str("01890f47-5fd4-7cc2-8f8f-5f9476f4f035").unwrap());
+        handoff.expires_at_millis = Some(1_800_000_300_000);
+        validate_credential_reissue_handoff(&handoff, &plan, digest).unwrap();
+
+        let report = CredentialReissueReport {
+            schema: CREDENTIAL_REISSUE_RESULT_SCHEMA,
+            schema_version: 1,
+            phase: "prepare",
+            state: "ready",
+            operation_id: plan.operation_id,
+            plan_digest: Digest32(digest.as_bytes()),
+            tenant_id: plan.tenant_id,
+            host_id: plan.host_id,
+            connector_id: plan.connector_id,
+            intent_id: handoff.intent_id,
+            expires_at_millis: handoff.expires_at_millis,
+            replayed: Some(true),
+        };
+        let report_json = serde_json::to_string(&report).unwrap();
+        assert!(!report_json.contains(&token));
+        assert!(!report_json.contains("reissue_token"));
+        assert!(!report_json.contains("current_credential_id"));
+        assert!(!report_json.contains("current_leaf_fingerprint"));
+
+        let mut changed = credential_reissue_plan();
+        changed.expected_generation = 2;
+        assert_eq!(
+            validate_credential_reissue_handoff(&handoff, &changed, digest),
+            Err(CredentialReissueError::HandoffConflict)
+        );
+    }
+
+    #[test]
+    fn credential_reissue_parser_requires_the_new_handoff_only_for_prepare() {
+        let prepare = CredentialReissueArguments::parse([
+            OsString::from("dtx-agent-provision"),
+            OsString::from("credential-reissue-prepare"),
+            OsString::from("--config-file"),
+            OsString::from("agent-control.json"),
+            OsString::from("--database-url-file"),
+            OsString::from("database-url"),
+            OsString::from("--plan-file"),
+            OsString::from("plan.json"),
+            OsString::from("--handoff-file"),
+            OsString::from("handoff.json"),
+        ])
+        .unwrap();
+        assert_eq!(prepare.phase, CredentialReissuePhase::Prepare);
+        assert!(prepare.handoff_file.is_some());
+        assert!(matches!(
+            CredentialReissueArguments::parse([
+                OsString::from("dtx-agent-provision"),
+                OsString::from("credential-reissue-abort"),
+                OsString::from("--config-file"),
+                OsString::from("agent-control.json"),
+                OsString::from("--database-url-file"),
+                OsString::from("database-url"),
+                OsString::from("--plan-file"),
+                OsString::from("plan.json"),
+                OsString::from("--handoff-file"),
+                OsString::from("handoff.json"),
+            ]),
+            Err(CredentialReissueError::Usage)
+        ));
     }
 
     #[test]
@@ -3006,6 +3758,32 @@ mod tests {
             Some(ProvisionError::File)
         );
         assert_eq!(fs::read(&handoff_path).unwrap(), b"already exists");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_reissue_handoff_refuses_an_unsafe_parent_before_token_creation() {
+        let directory = TemporaryDirectory::new(0o755);
+        let handoff_path = directory.path.join("handoff.json");
+        let plan = credential_reissue_plan();
+        let digest = domain_digest(
+            CREDENTIAL_REISSUE_PLAN_DIGEST_DOMAIN,
+            &serde_json::to_vec(&plan).unwrap(),
+        );
+        let current_credential_id =
+            ConnectorCredentialId::from_str("01890f47-5fd4-7cc2-8f8f-5f9476f4f034").unwrap();
+
+        assert_eq!(
+            LockedCredentialReissueHandoff::acquire(
+                &plan,
+                digest,
+                current_credential_id,
+                &handoff_path,
+            )
+            .err(),
+            Some(CredentialReissueError::FilePermissions)
+        );
+        assert!(!handoff_path.exists());
     }
 
     #[cfg(unix)]
