@@ -13,6 +13,9 @@ truth; WSS never becomes a business-write or authentication authority.
 - Migration 047 adds exact identity-head, device-revocation, and key-authorization
   invalidations plus contiguous-prefix-only compaction. Migrations 045 and 046
   remain frozen.
+- Migration 049 adds the V39 retention safety repair: one-way expired
+  ciphertext tombstones, a compacted identity-delivery prefix, and head-locked
+  realtime/delivery compaction. It has no dependency on migration 048.
 - WSS uses binary canonical CBOR. The Gateway prefers the additive
   `dirextalk.realtime-sync.v2` subprotocol and retains
   `dirextalk.realtime-sync.v1` compatibility. Protocol baselines 37 and 38
@@ -30,6 +33,9 @@ domain-separated key digests; public or private authority key bytes are not
 copied into the grant table. Every request reauthenticates its device session,
 rehydrates the current identity projection, and rejects stale heads, rotated
 authorities, revoked devices/grants, or mismatched PoP.
+Every later granted-device Pull or ACK also revalidates the stored grant against
+the current active grantor device or current root/recovery key. A previously
+created delivery cursor is never accepted as a second authorization source.
 
 ## Post-commit publication
 
@@ -47,6 +53,11 @@ marks the claim published.
   starts at the current journal floor. An expired interior row cannot advance
   the floor past a live row. Replay validates every adjacent cursor; a cursor
   behind the floor or any retained gap receives `CatchUpRequired`.
+- Expired mailbox ciphertext is replaced by a one-way tombstone before quota is
+  released. Compaction never consults device ACKs: it removes only the globally
+  expired contiguous identity-delivery prefix, retains exact envelope/receipt
+  metadata, and records the removed prefix as one scalar floor. Appends, Pull
+  snapshots, and compaction serialize on the identity head.
 - Claim, mark, and compaction timestamps must remain within 60 seconds of the
   PostgreSQL clock, so the privileged functions cannot be used to forge future
   expiry even if the dedicated runtime login is compromised.
@@ -73,6 +84,9 @@ recover retained identity history before joining WSS deltas. Durable Mailbox
 Pull/ACK and the account-level encrypted conversation read cursor remain the
 only offline/unread truth; terminal ranges only make an otherwise permanent
 expired-sequence gap resumable.
+Pull V3 holds the captured delivery head through its page read, filters every
+row to that highwater, and materializes a compacted prefix as a terminal range;
+it cannot return a concurrently appended row above the receipt highwater.
 
 ## Ephemeral routing
 
@@ -84,6 +98,11 @@ signal. Presence additionally requires both sides to opt in. The registry is
 bounded, process-local, and removed at disconnect—active scope is never written
 to PostgreSQL or included in durable replay. V1 remains wire compatible but can
 only establish an implicit scope by sending a signal.
+
+Scope subscription, ephemeral publication, and each matching peer delivery
+reauthenticate the device session and require the exact current lease ID/fence.
+A replacement Hello or device/session revocation therefore fences the old
+socket before it can subscribe, send, or receive another ephemeral signal.
 
 The scope digest is a possession capability: clients must derive it from the
 current private conversation authorization/epoch, never from a public or stable

@@ -707,6 +707,16 @@ async fn load_mailbox_for_update(
     mailbox_id: MailboxId,
     now: UtcMillis,
 ) -> Result<MailboxRow, MailboxPersistenceError> {
+    let identity_id: String =
+        sqlx::query_scalar("SELECT owner_identity_id FROM messaging.mailboxes WHERE mailbox_id=$1")
+            .bind(*mailbox_id.as_uuid())
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or(MailboxPersistenceError::MailboxUnavailable)?;
+    // Mailbox writers and the retention compactor take this identity lock
+    // before row/head locks, preventing lock inversion across an identity's
+    // multiple mailboxes.
+    advisory_lock(connection, "mailbox-identity", &identity_id).await?;
     let row = sqlx::query(
         "SELECT owner_identity_id, owner_device_id, write_capability_hash,
                 expires_at_ms, next_delivery_sequence, active_envelope_count,
@@ -779,10 +789,18 @@ async fn expire_available(
     now: UtcMillis,
 ) -> Result<(i64, i64), MailboxPersistenceError> {
     let sizes: Vec<i32> = sqlx::query_scalar(
-        "UPDATE messaging.mailbox_envelopes
-            SET state='expired'
-          WHERE mailbox_id=$1 AND state='available' AND expires_at_ms <= $2
-        RETURNING octet_length(opaque_ciphertext)",
+        "WITH expiring AS MATERIALIZED (
+             SELECT envelope_id,octet_length(opaque_ciphertext) AS ciphertext_bytes
+               FROM messaging.mailbox_envelopes
+              WHERE mailbox_id=$1 AND state='available' AND expires_at_ms<=$2
+              FOR UPDATE
+         ), tombstoned AS (
+             UPDATE messaging.mailbox_envelopes AS envelope
+                SET state='expired',opaque_ciphertext=NULL
+               FROM expiring
+              WHERE envelope.mailbox_id=$1 AND envelope.envelope_id=expiring.envelope_id
+             RETURNING expiring.ciphertext_bytes
+         ) SELECT ciphertext_bytes FROM tombstoned",
     )
     .bind(*mailbox_id.as_uuid())
     .bind(now.get())

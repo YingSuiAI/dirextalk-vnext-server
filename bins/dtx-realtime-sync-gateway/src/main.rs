@@ -461,11 +461,17 @@ async fn serve_socket(
             }
             signal = ephemeral_rx.recv() => {
                 let Ok(current_now) = now(&state) else { break };
-                if let Ok(signal) = signal
-                    && state.scopes.is_visible(signal, connection_id, lease.identity_id, current_now)
-                    && send_binary(&mut socket, encode_ephemeral(signal, wire)).await.is_err()
-                {
-                    return;
+                let signal = match signal {
+                    Ok(signal) => signal,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                if state.scopes.is_visible(signal, connection_id, lease.identity_id, current_now) {
+                    if state.store.validate_lease(&credential, lease, current_now).await.is_err() {
+                        close(&mut socket, 1008, "lease or session rejected").await;
+                        return;
+                    }
+                    if send_binary(&mut socket, encode_ephemeral(signal, wire)).await.is_err() { return; }
                 }
             }
             incoming = socket.next() => {
@@ -498,6 +504,10 @@ async fn serve_socket(
                         if send_binary(&mut socket, encode_ack_ok(cursor, wire)).await.is_err() { return; }
                     }
                     ClientFrame::Ephemeral { kind, scope_digest, ttl_ms, presence_opt_in } => {
+                        if state.store.validate_lease(&credential, lease, current_now).await.is_err() {
+                            close(&mut socket, 1008, "lease or session rejected").await;
+                            return;
+                        }
                         if kind == 3 && !presence_opt_in {
                             close(&mut socket, 1008, "presence requires opt in").await;
                             return;
@@ -539,6 +549,10 @@ async fn serve_socket(
                     }
                     ClientFrame::ScopeSubscribe { scope_digest, ttl_ms, presence_opt_in }
                         if wire == WireLine::V2 => {
+                        if state.store.validate_lease(&credential, lease, current_now).await.is_err() {
+                            close(&mut socket, 1008, "lease or session rejected").await;
+                            return;
+                        }
                         let expires_at_ms = current_now.get().saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX));
                         if !state.scopes.subscribe(
                             connection_id,

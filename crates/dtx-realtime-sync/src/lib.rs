@@ -267,6 +267,31 @@ impl RealtimeSyncStore {
         })
     }
 
+    /// Revalidates the authenticated session and exact latest lease fence for
+    /// a non-durable gateway edge such as scope or ephemeral routing.
+    ///
+    /// # Errors
+    ///
+    /// Rejects revoked/replaced sessions, mismatched actors, expired leases,
+    /// stale fences, and storage failures.
+    pub async fn validate_lease(
+        &self,
+        credential: &DeviceSessionCredential,
+        lease: Lease,
+        now: UtcMillis,
+    ) -> Result<(), RealtimeSyncError> {
+        let mut transaction = self.pool.begin().await?;
+        let authenticated = authenticate(&mut transaction, credential, now).await?;
+        require_actor(
+            authenticated.identity_id(),
+            authenticated.device_id(),
+            lease,
+        )?;
+        require_current_lease(&mut transaction, lease, now).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Replays one ordered page after an exclusive durable cursor.
     ///
     /// # Errors

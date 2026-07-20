@@ -15,10 +15,11 @@ use axum::{
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{Clock, ClockError, DeviceId, DeviceSessionId, EnvelopeId, IdentityId, MailboxId};
 use dtx_identity_log::{
-    DeviceCertificateV1, DeviceEncryptionPublicKey, IdentityLogEventPayloadV1, IdentityLogEventV1,
-    KeyAcceptancePurposeV1, UnsignedDeviceCertificateV1, UnsignedIdentityLogEventV1,
-    device_certificate_signature_input, genesis_recovery_acceptance_input,
-    identity_log_signature_input, key_rotation_acceptance_input,
+    DeviceCertificateV1, DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION,
+    IdentityLogEventPayloadV1, IdentityLogEventV1, KeyAcceptancePurposeV1,
+    UnsignedDeviceCertificateV1, UnsignedIdentityLogEventV1, device_certificate_signature_input,
+    genesis_recovery_acceptance_input, identity_log_signature_input, key_rotation_acceptance_input,
+    recovery_rotation_authorization_input,
 };
 use dtx_identity_persistence::{
     DEVICE_SESSION_SECRET_HASH_DOMAIN, DeviceSessionCompletionCommand, DeviceSessionCredential,
@@ -575,15 +576,7 @@ async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(
         "SELECT opaque_ciphertext FROM messaging.mailbox_envelopes WHERE mailbox_id=$1 AND envelope_id=$2",
     ).bind(*mailbox_id.as_uuid()).bind(*envelope_id.as_uuid()).fetch_one(harness.admin_pool()).await?;
     assert_eq!(retained, b"opaque-for-both-devices");
-    sqlx::query(
-        "UPDATE messaging.device_history_grants SET revoked_at_ms=$3 \
-         WHERE identity_id=$1 AND new_device_id=$2",
-    )
-    .bind(owner.identity_id.to_string())
-    .bind(*second.device_id.as_uuid())
-    .bind(NOW + 1)
-    .execute(harness.admin_pool())
-    .await?;
+    revoke_active_device(&identity_store, &owner).await?;
     assert_eq!(
         send_v2(
             app,
@@ -665,6 +658,42 @@ async fn identity_mailbox_v3_advances_two_devices_across_expired_delivery_gaps()
             StatusCode::CREATED,
         );
     }
+    // A Pull V3 page must never observe a journal row above the head captured
+    // for its receipt, even if a writer becomes visible between those reads.
+    sqlx::query(
+        "UPDATE messaging.identity_delivery_heads SET next_sequence=3 WHERE identity_id=$1",
+    )
+    .bind(owner.identity_id.to_string())
+    .execute(harness.admin_pool())
+    .await?;
+    let captured = send_v2(
+        write_app.clone(),
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        owner.session_id,
+        owner.session_secret,
+        encode_deterministic_cbor(&CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+            (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
+            (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
+        ]))?,
+    )
+    .await?;
+    assert_eq!(captured.status(), StatusCode::OK);
+    let CanonicalValue::Map(captured_fields) =
+        decode_deterministic_cbor(&response_bytes(captured).await?)?
+    else {
+        return Err("captured V3 pull receipt not a map".into());
+    };
+    assert_eq!(captured_fields[3].1, CanonicalValue::Unsigned(3));
+    assert!(matches!(&captured_fields[5].1, CanonicalValue::Array(segments) if segments.len()==3));
+    sqlx::query(
+        "UPDATE messaging.identity_delivery_heads SET next_sequence=4 WHERE identity_id=$1",
+    )
+    .bind(owner.identity_id.to_string())
+    .execute(harness.admin_pool())
+    .await?;
     let head = Sha256Digest::from_bytes(
         sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT head_hash FROM identity.log_heads WHERE identity_id=$1",
@@ -782,6 +811,315 @@ async fn identity_mailbox_v3_advances_two_devices_across_expired_delivery_gaps()
     .fetch_all(harness.admin_pool())
     .await?;
     assert_eq!(states, vec![4, 4]);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one PostgreSQL boundary test keeps bounded expiry refill, ACK independence, and append/compaction serialization coherent"
+)]
+async fn expired_delivery_compaction_is_bounded_and_concurrent_append_safe()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let mailbox_store = MailboxPgStore::connect(harness.mailbox_runtime_options(), 6).await?;
+    let realtime_store =
+        RealtimeSyncStore::connect(harness.realtime_sync_runtime_options(), 4).await?;
+    let base = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let owner = enroll_active_device_at(&identity_store, 211, 212, 213, [214; 32], base).await?;
+    let mailbox_id = MailboxId::new();
+    let capability = [215; 32];
+    let register_app = mailbox_router_with_state(MailboxNodeState::with_clock(
+        mailbox_store.clone(),
+        Arc::new(FixedClock(base)),
+    ));
+    assert_eq!(
+        send_registration(
+            register_app,
+            "retention-register-0001",
+            owner.session_id,
+            owner.session_secret,
+            mailbox_id,
+            mailbox_registration_body(
+                mailbox_id,
+                owner.identity_id,
+                owner.device_id,
+                capability,
+                UtcMillis::new(base + 600_000)?,
+            )?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+
+    // Repeated short-TTL refill releases quota only after the old ciphertext
+    // is irreversibly tombstoned and its contiguous delivery row is removed.
+    for index in 0_i64..4 {
+        let now = base + index * 3;
+        let envelope_id = EnvelopeId::new();
+        let app = mailbox_router_with_state(MailboxNodeState::with_clock(
+            mailbox_store.clone(),
+            Arc::new(FixedClock(now)),
+        ));
+        assert_eq!(
+            send_envelope(
+                app,
+                &format!("retention-refill-{index:04}"),
+                capability,
+                mailbox_id,
+                envelope_id,
+                mailbox_envelope_body(envelope_id, &[0x70; 4096], UtcMillis::new(now + 1)?)?,
+            )
+            .await?
+            .status(),
+            StatusCode::CREATED,
+        );
+        realtime_store
+            .compact_expired(UtcMillis::new(now + 2)?)
+            .await?;
+        let bounded: (i64, i64, i64, i64, i32, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT count(*) FROM messaging.mailbox_envelopes
+                  WHERE mailbox_id=$1 AND opaque_ciphertext IS NOT NULL),
+                (SELECT count(*) FROM messaging.identity_delivery_journal WHERE identity_id=$2),
+                (SELECT compacted_through FROM messaging.identity_delivery_heads WHERE identity_id=$2),
+                (SELECT count(*) FROM messaging.mailbox_enqueue_claims WHERE mailbox_id=$1),
+                active_envelope_count,active_envelope_bytes
+               FROM messaging.mailboxes WHERE mailbox_id=$1",
+        )
+        .bind(*mailbox_id.as_uuid())
+        .bind(owner.identity_id.to_string())
+        .fetch_one(harness.admin_pool())
+        .await?;
+        assert_eq!(bounded, (0, 0, index + 1, index + 1, 0, 0));
+    }
+
+    let expired_id = EnvelopeId::new();
+    let race_now = base + 20;
+    let race_app = mailbox_router_with_state(MailboxNodeState::with_clock(
+        mailbox_store.clone(),
+        Arc::new(FixedClock(race_now)),
+    ));
+    assert_eq!(
+        send_envelope(
+            race_app.clone(),
+            "retention-race-expired",
+            capability,
+            mailbox_id,
+            expired_id,
+            mailbox_envelope_body(expired_id, b"expired-race", UtcMillis::new(race_now + 1)?)?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+
+    let mut barrier_transaction = harness.admin_pool().begin().await?;
+    sqlx::query("SELECT 1 FROM messaging.identity_delivery_heads WHERE identity_id=$1 FOR UPDATE")
+        .bind(owner.identity_id.to_string())
+        .execute(&mut *barrier_transaction)
+        .await?;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let compact_barrier = barrier.clone();
+    let compact_store = realtime_store.clone();
+    let compact_task = tokio::spawn(async move {
+        compact_barrier.wait().await;
+        compact_store
+            .compact_expired(UtcMillis::new(race_now + 2).expect("valid compaction time"))
+            .await
+    });
+    let append_barrier = barrier.clone();
+    let live_id = EnvelopeId::new();
+    let append_task = tokio::spawn(async move {
+        append_barrier.wait().await;
+        send_envelope(
+            race_app,
+            "retention-race-live",
+            capability,
+            mailbox_id,
+            live_id,
+            mailbox_envelope_body(
+                live_id,
+                b"live-after-race",
+                UtcMillis::new(race_now + 60_000).expect("valid live expiry"),
+            )
+            .expect("valid live body"),
+        )
+        .await
+        .expect("concurrent append response")
+        .status()
+    });
+    barrier.wait().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    barrier_transaction.commit().await?;
+    compact_task.await??;
+    assert_eq!(append_task.await?, StatusCode::CREATED);
+
+    let serialized: (i64, i64, i64) = sqlx::query_as(
+        "SELECT next_sequence,compacted_through,
+                (SELECT count(*) FROM messaging.identity_delivery_journal WHERE identity_id=$1)
+           FROM messaging.identity_delivery_heads WHERE identity_id=$1",
+    )
+    .bind(owner.identity_id.to_string())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(serialized, (6, 5, 1));
+
+    // A device ACK is only a device-local cursor fact. Before global expiry it
+    // cannot tombstone ciphertext or remove the shared delivery row.
+    assert_eq!(
+        send_acknowledgement(
+            mailbox_router_with_state(MailboxNodeState::with_clock(
+                mailbox_store.clone(),
+                Arc::new(FixedClock(race_now + 3)),
+            )),
+            "retention-race-ack",
+            owner.session_id,
+            owner.session_secret,
+            mailbox_id,
+            mailbox_ack_body(&[live_id])?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    realtime_store
+        .compact_expired(UtcMillis::new(race_now + 4)?)
+        .await?;
+    let retained: (String, bool, i64, i64) = sqlx::query_as(
+        "SELECT state,opaque_ciphertext IS NOT NULL,
+                (SELECT count(*) FROM messaging.identity_delivery_journal WHERE identity_id=$3),
+                (SELECT count(*) FROM messaging.mailbox_envelopes
+                  WHERE mailbox_id=$1 AND opaque_ciphertext IS NULL
+                    AND octet_length(receipt_bytes)>0 AND octet_length(request_digest)=32)
+           FROM messaging.mailbox_envelopes WHERE mailbox_id=$1 AND envelope_id=$2",
+    )
+    .bind(*mailbox_id.as_uuid())
+    .bind(*live_id.as_uuid())
+    .bind(owner.identity_id.to_string())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(retained, ("acked".to_owned(), true, 1, 5));
+    let recovered = send_v2(
+        mailbox_router_with_state(MailboxNodeState::with_clock(
+            mailbox_store,
+            Arc::new(FixedClock(race_now + 4)),
+        )),
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        owner.session_id,
+        owner.session_secret,
+        encode_deterministic_cbor(&CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+            (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
+            (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
+        ]))?,
+    )
+    .await?;
+    assert_eq!(recovered.status(), StatusCode::OK);
+    let CanonicalValue::Map(recovered_fields) =
+        decode_deterministic_cbor(&response_bytes(recovered).await?)?
+    else {
+        return Err("compacted V3 pull receipt not a map".into());
+    };
+    assert_eq!(recovered_fields[3].1, CanonicalValue::Unsigned(6));
+    let CanonicalValue::Array(recovered_segments) = &recovered_fields[5].1 else {
+        return Err("compacted V3 pull segments missing".into());
+    };
+    assert_eq!(recovered_segments.len(), 2);
+    assert!(matches!(
+        &recovered_segments[0],
+        CanonicalValue::Map(fields)
+            if fields[0].1 == CanonicalValue::Unsigned(2)
+                && fields[1].1 == CanonicalValue::Unsigned(1)
+                && fields[2].1 == CanonicalValue::Unsigned(5)
+    ));
+
+    // Realtime append uses the same head-row barrier. A compactor racing a
+    // committed append may remove only the expired prefix it actually saw;
+    // it cannot advance the floor past the new live cursor.
+    sqlx::query(
+        "UPDATE realtime.journal SET created_at_ms=$2,expires_at_ms=$3 WHERE identity_id=$1",
+    )
+    .bind(owner.identity_id.to_string())
+    .bind(race_now)
+    .bind(race_now + 5)
+    .execute(harness.admin_pool())
+    .await?;
+    let before_realtime: i64 =
+        sqlx::query_scalar("SELECT next_cursor FROM realtime.identity_heads WHERE identity_id=$1")
+            .bind(owner.identity_id.to_string())
+            .fetch_one(harness.admin_pool())
+            .await?;
+    let mut realtime_barrier_transaction = harness.admin_pool().begin().await?;
+    sqlx::query("SELECT 1 FROM realtime.identity_heads WHERE identity_id=$1 FOR UPDATE")
+        .bind(owner.identity_id.to_string())
+        .execute(&mut *realtime_barrier_transaction)
+        .await?;
+    let realtime_barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let compact_barrier = realtime_barrier.clone();
+    let compact_store = realtime_store.clone();
+    let realtime_compact_task = tokio::spawn(async move {
+        compact_barrier.wait().await;
+        compact_store
+            .compact_expired(UtcMillis::new(race_now + 6).expect("valid realtime compaction time"))
+            .await
+    });
+    let append_barrier = realtime_barrier.clone();
+    let append_pool = harness.admin_pool().clone();
+    let append_identity = owner.identity_id.to_string();
+    let realtime_append_task = tokio::spawn(async move {
+        append_barrier.wait().await;
+        let mut transaction = append_pool.begin().await?;
+        let cursor: i64 = sqlx::query_scalar(
+            "UPDATE realtime.identity_heads SET next_cursor=next_cursor+1
+              WHERE identity_id=$1 RETURNING next_cursor",
+        )
+        .bind(&append_identity)
+        .fetch_one(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO realtime.journal(
+                 identity_id,cursor,event_kind,subject_digest,created_at_ms,expires_at_ms
+             ) VALUES($1,$2,'durable_invalidation',$3,$4,$5)",
+        )
+        .bind(&append_identity)
+        .bind(cursor)
+        .bind(vec![0x72_u8; 32])
+        .bind(race_now + 6)
+        .bind(race_now + 60_000)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("INSERT INTO realtime.outbox(identity_id,cursor) VALUES($1,$2)")
+            .bind(&append_identity)
+            .bind(cursor)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok::<i64, sqlx::Error>(cursor)
+    });
+    realtime_barrier.wait().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    realtime_barrier_transaction.commit().await?;
+    realtime_compact_task.await??;
+    let appended_cursor = realtime_append_task.await??;
+    assert_eq!(appended_cursor, before_realtime + 1);
+    let realtime_serialized: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT next_cursor,journal_floor,
+                (SELECT min(cursor) FROM realtime.journal WHERE identity_id=$1),
+                (SELECT count(*) FROM realtime.journal WHERE identity_id=$1)
+           FROM realtime.identity_heads WHERE identity_id=$1",
+    )
+    .bind(owner.identity_id.to_string())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(
+        realtime_serialized,
+        (appended_cursor, appended_cursor, appended_cursor, 1)
+    );
     Ok(())
 }
 
@@ -981,6 +1319,103 @@ async fn history_grants_accept_current_root_or_recovery_and_reject_stale_or_wron
         .await?
         .ok_or("identity missing after root rotation")?
         .head();
+    let root_after_rotation = send_v2(
+        app.clone(),
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        root_target.session_id,
+        root_target.session_secret,
+        encode_deterministic_cbor(&CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+            (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
+            (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
+        ]))?,
+    )
+    .await?;
+    assert_eq!(root_after_rotation.status(), StatusCode::NOT_FOUND);
+    let recovery_still_current = send_v2(
+        app.clone(),
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        recovery_target.session_id,
+        recovery_target.session_secret,
+        encode_deterministic_cbor(&CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+            (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
+            (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
+        ]))?,
+    )
+    .await?;
+    assert_ne!(recovery_still_current.status(), StatusCode::NOT_FOUND);
+
+    let successor_recovery = SigningKey::from_bytes(&[141; 32]);
+    let successor_recovery_public = public_key(&successor_recovery)?;
+    let recovery_sequence = SafeUint::new(after_rotation.sequence().get() + 1)?;
+    let recovery_acceptance = signature(
+        &successor_recovery,
+        &key_rotation_acceptance_input(
+            owner.identity_id,
+            recovery_sequence,
+            Some(after_rotation.hash()),
+            KeyAcceptancePurposeV1::RecoveryRotate,
+            successor_recovery_public,
+        )?,
+    );
+    let recovery_rotation = signed_event(
+        &successor_root,
+        owner.identity_id,
+        recovery_sequence.get(),
+        Some(after_rotation.hash()),
+        NOW,
+        IdentityLogEventPayloadV1::RecoveryRotate {
+            new_recovery_signing_key: successor_recovery_public,
+            acceptance_signature: recovery_acceptance,
+            recovery_authorization_signature: Some(signature(
+                &owner.recovery,
+                &recovery_rotation_authorization_input(
+                    IDENTITY_LOG_WIRE_VERSION,
+                    owner.identity_id,
+                    recovery_sequence,
+                    Some(after_rotation.hash()),
+                    UtcMillis::new(NOW)?,
+                    successor_public,
+                    successor_recovery_public,
+                    recovery_acceptance,
+                )?,
+            )),
+        },
+    )?;
+    assert!(matches!(
+        repository
+            .append(
+                &identity_store,
+                &IdentityAppendCommand::new(
+                    Sha256Digest::hash_domain(b"test-mailbox-recovery-rotation\0", &[141]),
+                    Some(after_rotation),
+                    recovery_rotation.to_deterministic_cbor()?,
+                )?,
+                UtcMillis::new(NOW)?,
+            )
+            .await?,
+        IdentityAppendOutcome::Committed(_)
+    ));
+    let recovery_after_rotation = send_v2(
+        app.clone(),
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        recovery_target.session_id,
+        recovery_target.session_secret,
+        encode_deterministic_cbor(&CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+            (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
+            (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
+        ]))?,
+    )
+    .await?;
+    assert_eq!(recovery_after_rotation.status(), StatusCode::NOT_FOUND);
     let revoked_old_root = device_history_grant_body(
         owner.identity_id,
         rejected_target.device_id,
@@ -1579,6 +2014,96 @@ async fn realtime_sync_fences_old_leases_and_requires_catch_up_after_a_gap()
             .collect::<Vec<_>>(),
         vec![3, 4]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_ephemeral_edges_reject_replaced_socket_and_revoked_session()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let realtime_store =
+        RealtimeSyncStore::connect(harness.realtime_sync_runtime_options(), 4).await?;
+    let realtime_now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    let owner =
+        enroll_active_device_at(&identity_store, 221, 222, 223, [224; 32], realtime_now).await?;
+    let credential = DeviceSessionCredential::new(owner.session_id, owner.session_secret)?;
+
+    // These leases model two simultaneously open sockets for one device. The
+    // second Hello replaces the first fence before either socket's next scope,
+    // send, or peer-delivery edge.
+    let replaced_socket = realtime_store
+        .acquire(
+            &credential,
+            SafeUint::new(0)?,
+            UtcMillis::new(realtime_now)?,
+        )
+        .await?;
+    let latest_socket = realtime_store
+        .acquire(
+            &credential,
+            SafeUint::new(0)?,
+            UtcMillis::new(realtime_now + 1)?,
+        )
+        .await?;
+    assert!(matches!(
+        realtime_store
+            .validate_lease(
+                &credential,
+                replaced_socket,
+                UtcMillis::new(realtime_now + 2)?,
+            )
+            .await,
+        Err(RealtimeSyncError::StaleLease)
+    ));
+    realtime_store
+        .validate_lease(
+            &credential,
+            latest_socket,
+            UtcMillis::new(realtime_now + 2)?,
+        )
+        .await?;
+
+    let repository = IdentityLogRepository::new();
+    let head = repository
+        .load(&identity_store, owner.identity_id)
+        .await?
+        .ok_or("identity missing before realtime revoke")?
+        .head();
+    let revoke = signed_event(
+        &owner.root,
+        owner.identity_id,
+        head.sequence().get() + 1,
+        Some(head.hash()),
+        realtime_now + 3,
+        IdentityLogEventPayloadV1::DeviceRevoke {
+            device_id: owner.device_id,
+        },
+    )?;
+    assert!(matches!(
+        repository
+            .append(
+                &identity_store,
+                &IdentityAppendCommand::new(
+                    Sha256Digest::hash_domain(b"test-realtime-edge-revoke\0", &[225]),
+                    Some(head),
+                    revoke.to_deterministic_cbor()?,
+                )?,
+                UtcMillis::new(realtime_now + 3)?,
+            )
+            .await?,
+        IdentityAppendOutcome::Committed(_)
+    ));
+    assert!(matches!(
+        realtime_store
+            .validate_lease(
+                &credential,
+                latest_socket,
+                UtcMillis::new(realtime_now + 4)?,
+            )
+            .await,
+        Err(RealtimeSyncError::Unauthorized)
+    ));
     Ok(())
 }
 

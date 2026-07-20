@@ -1,5 +1,8 @@
 use dtx_domain::{DeviceId, EnvelopeId, IdentityId};
-use dtx_identity_persistence::{AuthenticatedDeviceSession, DeviceSessionCredential};
+use dtx_identity_persistence::{
+    AuthenticatedDeviceSession, DeviceSessionCredential, DeviceSessionRepository,
+    IdentityPersistenceError, lock_and_load_active_snapshot,
+};
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, SafeUint, Sha256Digest, UtcMillis, encode_deterministic_cbor,
 };
@@ -14,6 +17,7 @@ use crate::{
 /// Maximum identity-owned delivery entries returned by one V2 pull.
 pub const MAX_IDENTITY_PULL_ENTRIES: u16 = 100;
 const V2_ACK_REQUEST_HASH_DOMAIN: &[u8] = b"dirextalk.identity-mailbox-ack.v2\0";
+const HISTORY_AUTHORITY_ID_DOMAIN: &[u8] = b"dirextalk.device-history-authority-id.v1\0";
 
 /// One identity-owned opaque envelope. The sequence is account-wide, not mailbox-local.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -120,6 +124,10 @@ impl crate::MailboxRepository {
     ///
     /// Rejects invalid/revoked sessions, unauthorized history, non-contiguous
     /// durable state, corrupt live ciphertext, and storage failures.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "captured head, compacted terminal prefix, and surviving rows form one transactional Pull V3 snapshot"
+    )]
     pub async fn pull_identity_v3(
         self,
         store: &MailboxPgStore,
@@ -136,17 +144,36 @@ impl crate::MailboxRepository {
                 .map_err(|_| MailboxPersistenceError::InvalidCommand("identity pull cursor"))?;
             let resumable_floor = earliest.saturating_sub(1);
             let lower_bound = requested_after.max(resumable_floor);
-            let highwater: i64 = sqlx::query_scalar(
-                "SELECT next_sequence FROM messaging.identity_delivery_heads WHERE identity_id=$1",
+            // Hold a shared lock through the row read so the captured head and
+            // page are one coherent delivery snapshot. Appends and future
+            // compaction both update this same serialization row.
+            let head = sqlx::query(
+                "SELECT next_sequence,compacted_through FROM messaging.identity_delivery_heads
+                  WHERE identity_id=$1 FOR SHARE",
             )
             .bind(authenticated.identity_id().to_string())
             .fetch_one(&mut *session.connection())
             .await?;
+            let highwater: i64 = head.try_get("next_sequence")?;
+            let compacted_through: i64 = head.try_get("compacted_through")?;
             if lower_bound > highwater {
                 return Err(MailboxPersistenceError::InvalidCommand(
                     "identity pull beyond highwater",
                 ));
             }
+            let mut segments = Vec::new();
+            let row_lower_bound = lower_bound.max(compacted_through);
+            if lower_bound < compacted_through {
+                segments.push(IdentityDeliverySegment::TerminalRange {
+                    first: safe_sequence(lower_bound.saturating_add(1))?,
+                    last: safe_sequence(compacted_through.min(highwater))?,
+                });
+            }
+            let remaining_limit = i64::from(request.limit()).saturating_sub(
+                i64::try_from(segments.len()).map_err(|_| {
+                    MailboxPersistenceError::CorruptData("identity delivery segment count")
+                })?,
+            );
             let rows = sqlx::query(
                 "SELECT journal.delivery_sequence,journal.envelope_id,journal.expires_at_ms,
                         CASE WHEN journal.expires_at_ms>$3 THEN envelope.opaque_ciphertext END AS opaque_ciphertext
@@ -155,16 +182,18 @@ impl crate::MailboxRepository {
                      ON envelope.mailbox_id=journal.mailbox_id
                     AND envelope.envelope_id=journal.envelope_id
                   WHERE journal.identity_id=$1 AND journal.delivery_sequence>$2
+                    AND journal.delivery_sequence<=$5
                   ORDER BY journal.delivery_sequence LIMIT $4",
             )
             .bind(authenticated.identity_id().to_string())
-            .bind(lower_bound)
+            .bind(row_lower_bound)
             .bind(now.get())
-            .bind(i64::from(request.limit()))
+            .bind(remaining_limit)
+            .bind(highwater)
             .fetch_all(&mut *session.connection())
             .await?;
-            let mut segments = Vec::with_capacity(rows.len());
-            let mut expected = lower_bound.saturating_add(1);
+            segments.reserve(rows.len());
+            let mut expected = row_lower_bound.saturating_add(1);
             for row in rows {
                 let sequence: i64 = row.try_get("delivery_sequence")?;
                 if sequence != expected {
@@ -495,23 +524,20 @@ async fn authorize_identity_device(
     .bind(*authenticated.device_id().as_uuid())
     .fetch_one(&mut *connection)
     .await?;
-    let grant_earliest = sqlx::query_scalar::<_, i64>(
-        "SELECT earliest_sequence FROM messaging.device_history_grants
-          WHERE identity_id=$1 AND new_device_id=$2 AND revoked_at_ms IS NULL",
-    )
-    .bind(authenticated.identity_id().to_string())
-    .bind(*authenticated.device_id().as_uuid())
-    .fetch_optional(&mut *connection)
-    .await?;
     let authorized_earliest = if owns_mailbox {
         1
     } else {
-        grant_earliest.ok_or(MailboxPersistenceError::MailboxUnavailable)?
+        current_history_grant_earliest(connection, authenticated).await?
     };
     if let Some(earliest) = existing_earliest {
         // Delivery state is only a cursor. It must never become a second
         // authorization truth after a history grant or device is revoked.
-        return Ok(earliest);
+        if earliest != authorized_earliest {
+            return Err(MailboxPersistenceError::CorruptData(
+                "history grant delivery floor",
+            ));
+        }
+        return Ok(authorized_earliest);
     }
     let earliest = authorized_earliest;
     sqlx::query(
@@ -527,6 +553,75 @@ async fn authorize_identity_device(
     .execute(&mut *connection)
     .await?;
     Ok(earliest)
+}
+
+async fn current_history_grant_earliest(
+    connection: &mut PgConnection,
+    authenticated: AuthenticatedDeviceSession,
+) -> Result<i64, MailboxPersistenceError> {
+    let row = sqlx::query(
+        "SELECT earliest_sequence,authorization_kind,authorizer_id
+           FROM messaging.device_history_grants
+          WHERE identity_id=$1 AND new_device_id=$2 AND revoked_at_ms IS NULL
+          FOR UPDATE",
+    )
+    .bind(authenticated.identity_id().to_string())
+    .bind(*authenticated.device_id().as_uuid())
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or(MailboxPersistenceError::MailboxUnavailable)?;
+    let earliest: i64 = row.try_get("earliest_sequence")?;
+    let authorization_kind: String = row.try_get("authorization_kind")?;
+    let authorizer_id: String = row.try_get("authorizer_id")?;
+    let current = match authorization_kind.as_str() {
+        "grantor_device" => authorizer_id.parse::<DeviceId>().is_ok(),
+        "root" | "recovery" => {
+            let snapshot = lock_and_load_active_snapshot(connection, authenticated.identity_id())
+                .await
+                .map_err(map_identity_authorization_error)?;
+            let key = if authorization_kind == "root" {
+                snapshot.projection().current_root_key()
+            } else {
+                snapshot.projection().current_recovery_key()
+            };
+            authorizer_id
+                == Sha256Digest::hash_domain(HISTORY_AUTHORITY_ID_DOMAIN, key.as_bytes())
+                    .to_string()
+        }
+        _ => false,
+    };
+    let current = if authorization_kind == "grantor_device" && current {
+        let authorizer = authorizer_id
+            .parse::<DeviceId>()
+            .map_err(|_| MailboxPersistenceError::CorruptData("history grant authorizer"))?;
+        match DeviceSessionRepository::active_device_signing_key_in_transaction(
+            connection,
+            authenticated.identity_id(),
+            authorizer,
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(IdentityPersistenceError::DeviceAuthenticationRejected) => false,
+            Err(error) => return Err(map_identity_authorization_error(error)),
+        }
+    } else {
+        current
+    };
+    if !current {
+        return Err(MailboxPersistenceError::MailboxUnavailable);
+    }
+    Ok(earliest)
+}
+
+fn map_identity_authorization_error(error: IdentityPersistenceError) -> MailboxPersistenceError {
+    match error {
+        IdentityPersistenceError::Database(error) => MailboxPersistenceError::Database(error),
+        IdentityPersistenceError::DeviceAuthenticationRejected => {
+            MailboxPersistenceError::MailboxUnavailable
+        }
+        _ => MailboxPersistenceError::IdentityAuthorizationUnavailable,
+    }
 }
 
 fn encode_pull_receipt(
