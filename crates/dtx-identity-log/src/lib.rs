@@ -1525,6 +1525,7 @@ pub struct IdentityLogV1 {
     identity_id: IdentityId,
     current_root_key: SigningPublicKey,
     current_recovery_key: SigningPublicKey,
+    initial_device_id: Option<DeviceId>,
     devices: BTreeMap<DeviceId, DeviceRecordV1>,
     relay_descriptor: Option<RelayDescriptorV1>,
     head_sequence: SafeUint,
@@ -1563,6 +1564,7 @@ impl IdentityLogV1 {
             identity_id: genesis.identity_id(),
             current_root_key: *root_signing_key,
             current_recovery_key: *recovery_signing_key,
+            initial_device_id: None,
             devices: BTreeMap::new(),
             relay_descriptor: None,
             head_sequence: genesis.sequence(),
@@ -1642,6 +1644,16 @@ impl IdentityLogV1 {
     #[must_use]
     pub const fn current_recovery_key(&self) -> SigningPublicKey {
         self.current_recovery_key
+    }
+
+    /// Returns the immutable first device enrolled directly after genesis.
+    ///
+    /// Later devices cannot acquire bootstrap authority by owning service
+    /// resources. A projection without an exact sequence-two device has no
+    /// bootstrap device.
+    #[must_use]
+    pub const fn initial_device_id(&self) -> Option<DeviceId> {
+        self.initial_device_id
     }
 
     /// Returns the contiguous log head sequence.
@@ -1773,6 +1785,9 @@ impl IdentityLogV1 {
             })
         {
             return Err(IdentityLogError::DeviceAlreadyExists);
+        }
+        if self.head_sequence.get() == 1 {
+            self.initial_device_id = Some(certificate.device_id());
         }
         self.devices.insert(
             certificate.device_id(),

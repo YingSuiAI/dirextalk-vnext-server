@@ -29,6 +29,10 @@ pub const MAX_ACTIVE_ENVELOPES: usize = 1_000;
 pub const MAX_ACTIVE_ENVELOPE_BYTES: usize = 67_108_864;
 /// Maximum envelope lifetime from the server's transaction clock.
 pub const MAX_ENVELOPE_TTL_MILLIS: i64 = 604_800_000;
+/// Minimum exact mailbox-operation replay retention after durable expiry.
+pub const MAILBOX_OPERATION_REPLAY_RETENTION_MILLIS: i64 = 15 * 60 * 1_000;
+/// Backward-compatible name for the enqueue portion of the replay horizon.
+pub const MAILBOX_ENQUEUE_REPLAY_RETENTION_MILLIS: i64 = MAILBOX_OPERATION_REPLAY_RETENTION_MILLIS;
 /// Maximum entries in a pull page or acknowledgement command.
 pub const MAX_PAGE_ENTRIES: usize = 100;
 

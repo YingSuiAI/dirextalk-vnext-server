@@ -25,8 +25,8 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{Clock, DeviceSessionId, IdentityId, SystemClock};
 use dtx_identity_persistence::DeviceSessionCredential;
 use dtx_realtime_sync::{
-    HEARTBEAT_INTERVAL_MILLIS, Invalidation, InvalidationKind, Lease, OutboxNotification,
-    RealtimeSyncStore, ReplayPage,
+    HEARTBEAT_INTERVAL_MILLIS, Invalidation, InvalidationKind, Lease, LeaseOperation,
+    OutboxNotification, RealtimeSyncStore, ReplayPage,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, SafeUint, Sha256Digest, UtcMillis, decode_deterministic_cbor,
@@ -46,6 +46,8 @@ const SAFETY_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FRAME_BYTES: usize = 16_384;
 const MAX_EPHEMERAL_TTL_MILLIS: u64 = 10_000;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const LEASE_OPERATION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
+const SOCKET_SIDE_EFFECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GLOBAL_CONNECTIONS: usize = 4_096;
 const MAX_CONNECTIONS_PER_SOURCE: usize = 32;
 const MAX_SCOPES_PER_CONNECTION: usize = 32;
@@ -430,9 +432,15 @@ async fn serve_socket(
         close(&mut socket, 1008, "authentication rejected").await;
         return;
     };
-    if send_binary(&mut socket, encode_hello_ack(lease, wire))
-        .await
-        .is_err()
+    if !send_binary_fenced(
+        &state,
+        &credential,
+        lease,
+        initial_now,
+        &mut socket,
+        encode_hello_ack(lease, wire),
+    )
+    .await
     {
         return;
     }
@@ -467,11 +475,31 @@ async fn serve_socket(
                     Err(broadcast::error::RecvError::Closed) => return,
                 };
                 if state.scopes.is_visible(signal, connection_id, lease.identity_id, current_now) {
-                    if state.store.validate_lease(&credential, lease, current_now).await.is_err() {
+                    let Ok(operation) = begin_gateway_operation(
+                        &state, &credential, lease, current_now,
+                    ).await else {
                         close(&mut socket, 1008, "lease or session rejected").await;
                         return;
+                    };
+                    let Some(edge_now) = operation_side_effect_now(&state, lease) else {
+                        drop(operation);
+                        return;
+                    };
+                    if !state.scopes.is_visible(
+                        signal, connection_id, lease.identity_id, edge_now,
+                    ) {
+                        if !finish_gateway_operation(operation).await {
+                            return;
+                        }
+                        continue;
                     }
-                    if send_binary(&mut socket, encode_ephemeral(signal, wire)).await.is_err() { return; }
+                    if !send_binary_in_operation(
+                        &state,
+                        operation,
+                        lease,
+                        &mut socket,
+                        encode_ephemeral(signal, wire),
+                    ).await { return; }
                 }
             }
             incoming = socket.next() => {
@@ -490,7 +518,14 @@ async fn serve_socket(
                     ClientFrame::Heartbeat { lease_id, fence } if matches_lease(lease, lease_id, fence) => {
                         if let Ok(updated) = state.store.heartbeat(&credential, lease, current_now).await {
                             lease = updated;
-                            if send_binary(&mut socket, encode_heartbeat_ack(lease, wire)).await.is_err() { return; }
+                            if !send_binary_fenced(
+                                &state,
+                                &credential,
+                                lease,
+                                current_now,
+                                &mut socket,
+                                encode_heartbeat_ack(lease, wire),
+                            ).await { return; }
                         } else {
                             close(&mut socket, 1008, "stale lease").await;
                             return;
@@ -501,14 +536,28 @@ async fn serve_socket(
                             close(&mut socket, 1008, "ack rejected").await;
                             return;
                         }
-                        if send_binary(&mut socket, encode_ack_ok(cursor, wire)).await.is_err() { return; }
+                        if !send_binary_fenced(
+                            &state,
+                            &credential,
+                            lease,
+                            current_now,
+                            &mut socket,
+                            encode_ack_ok(cursor, wire),
+                        ).await { return; }
                     }
                     ClientFrame::Ephemeral { kind, scope_digest, ttl_ms, presence_opt_in } => {
-                        if state.store.validate_lease(&credential, lease, current_now).await.is_err() {
+                        let Ok(operation) = begin_gateway_operation(
+                            &state, &credential, lease, current_now,
+                        ).await else {
                             close(&mut socket, 1008, "lease or session rejected").await;
                             return;
-                        }
+                        };
+                        let Some(edge_now) = operation_side_effect_now(&state, lease) else {
+                            drop(operation);
+                            return;
+                        };
                         if kind == 3 && !presence_opt_in {
+                            let _ = finish_gateway_operation(operation).await;
                             close(&mut socket, 1008, "presence requires opt in").await;
                             return;
                         }
@@ -517,9 +566,9 @@ async fn serve_socket(
                                 connection_id,
                                 lease.identity_id,
                                 scope_digest,
-                                current_now.get().saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX)),
+                                edge_now.get().saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX)),
                                 presence_opt_in,
-                                current_now,
+                                edge_now,
                             )
                         } else {
                             state.scopes.has_subscription(
@@ -527,14 +576,15 @@ async fn serve_socket(
                                 lease.identity_id,
                                 scope_digest,
                                 kind == 3,
-                                current_now,
+                                edge_now,
                             )
                         };
                         if !scope_admitted {
+                            let _ = finish_gateway_operation(operation).await;
                             close(&mut socket, 1008, "scope admission rejected").await;
                             return;
                         }
-                        let expires_at_ms = current_now.get().saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX));
+                        let expires_at_ms = edge_now.get().saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX));
                         let _ = state.ephemeral.send(EphemeralSignal {
                             source_connection_id: connection_id,
                             source_identity_id: lease.identity_id,
@@ -546,23 +596,36 @@ async fn serve_socket(
                             scope_digest,
                             expires_at_ms,
                         });
+                        if !finish_gateway_operation(operation).await {
+                            return;
+                        }
                     }
                     ClientFrame::ScopeSubscribe { scope_digest, ttl_ms, presence_opt_in }
                         if wire == WireLine::V2 => {
-                        if state.store.validate_lease(&credential, lease, current_now).await.is_err() {
+                        let Ok(operation) = begin_gateway_operation(
+                            &state, &credential, lease, current_now,
+                        ).await else {
                             close(&mut socket, 1008, "lease or session rejected").await;
                             return;
-                        }
-                        let expires_at_ms = current_now.get().saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX));
+                        };
+                        let Some(edge_now) = operation_side_effect_now(&state, lease) else {
+                            drop(operation);
+                            return;
+                        };
+                        let expires_at_ms = edge_now.get().saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX));
                         if !state.scopes.subscribe(
                             connection_id,
                             lease.identity_id,
                             scope_digest,
                             expires_at_ms,
                             presence_opt_in,
-                            current_now,
+                            edge_now,
                         ) {
+                            let _ = finish_gateway_operation(operation).await;
                             close(&mut socket, 1008, "scope admission rejected").await;
+                            return;
+                        }
+                        if !finish_gateway_operation(operation).await {
                             return;
                         }
                     }
@@ -622,33 +685,132 @@ async fn push_replay(
     socket: &mut WebSocket,
     wire: WireLine,
 ) -> bool {
-    match state
-        .store
-        .replay(credential, lease, *next_cursor, now)
-        .await
-    {
-        Ok(ReplayPage::Events { events, .. }) => {
-            for event in events {
-                *next_cursor = event.cursor;
-                if send_binary(socket, encode_invalidation(event, wire))
-                    .await
-                    .is_err()
-                {
-                    return false;
+    let Ok(mut operation) = begin_gateway_operation(state, credential, lease, now).await else {
+        close(socket, 1008, "lease or session rejected").await;
+        return false;
+    };
+    let Some(replay_now) = operation_side_effect_now(state, lease) else {
+        drop(operation);
+        return false;
+    };
+    let Ok(page) = operation.replay(*next_cursor, replay_now).await else {
+        drop(operation);
+        close(socket, 1008, "lease or session rejected").await;
+        return false;
+    };
+    match page {
+        ReplayPage::Events { events, .. } => {
+            let Some(edge_now) = operation_side_effect_now(state, lease) else {
+                drop(operation);
+                return false;
+            };
+            let Some(timeout) = socket_side_effect_timeout(lease, edge_now) else {
+                drop(operation);
+                return false;
+            };
+            let sent = tokio::time::timeout(timeout, async {
+                for event in events {
+                    send_binary(socket, encode_invalidation(event, wire))
+                        .await
+                        .map_err(|_| ())?;
+                    *next_cursor = event.cursor;
                 }
-            }
-            true
+                Ok::<(), ()>(())
+            })
+            .await
+            .is_ok_and(|result| result.is_ok());
+            let finished = finish_gateway_operation(operation).await;
+            sent && finished
         }
-        Ok(ReplayPage::CatchUpRequired { highwater }) => {
-            let _ = send_binary(socket, encode_catch_up(highwater, wire)).await;
-            close(socket, 1008, "durable catch-up required").await;
-            false
-        }
-        Err(_) => {
-            close(socket, 1008, "lease or session rejected").await;
+        ReplayPage::CatchUpRequired { highwater } => {
+            let Some(edge_now) = operation_side_effect_now(state, lease) else {
+                drop(operation);
+                return false;
+            };
+            let Some(timeout) = socket_side_effect_timeout(lease, edge_now) else {
+                drop(operation);
+                return false;
+            };
+            let _ = tokio::time::timeout(timeout, async {
+                let _ = send_binary(socket, encode_catch_up(highwater, wire)).await;
+                close(socket, 1008, "durable catch-up required").await;
+            })
+            .await;
+            let _ = finish_gateway_operation(operation).await;
             false
         }
     }
+}
+
+async fn begin_gateway_operation(
+    state: &AppState,
+    credential: &DeviceSessionCredential,
+    lease: Lease,
+    now: UtcMillis,
+) -> Result<LeaseOperation, ()> {
+    tokio::time::timeout(
+        LEASE_OPERATION_ACQUIRE_TIMEOUT,
+        state.store.begin_lease_operation(credential, lease, now),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())
+}
+
+async fn finish_gateway_operation(operation: LeaseOperation) -> bool {
+    tokio::time::timeout(LEASE_OPERATION_ACQUIRE_TIMEOUT, operation.finish())
+        .await
+        .is_ok_and(|result| result.is_ok())
+}
+
+async fn send_binary_fenced(
+    state: &AppState,
+    credential: &DeviceSessionCredential,
+    lease: Lease,
+    now: UtcMillis,
+    socket: &mut WebSocket,
+    bytes: Vec<u8>,
+) -> bool {
+    let Ok(operation) = begin_gateway_operation(state, credential, lease, now).await else {
+        return false;
+    };
+    send_binary_in_operation(state, operation, lease, socket, bytes).await
+}
+
+async fn send_binary_in_operation(
+    state: &AppState,
+    operation: LeaseOperation,
+    lease: Lease,
+    socket: &mut WebSocket,
+    bytes: Vec<u8>,
+) -> bool {
+    let Some(edge_now) = operation_side_effect_now(state, lease) else {
+        drop(operation);
+        return false;
+    };
+    let Some(timeout) = socket_side_effect_timeout(lease, edge_now) else {
+        drop(operation);
+        return false;
+    };
+    let sent = tokio::time::timeout(timeout, send_binary(socket, bytes))
+        .await
+        .is_ok_and(|result| result.is_ok());
+    let finished = finish_gateway_operation(operation).await;
+    sent && finished
+}
+
+fn operation_side_effect_now(state: &AppState, lease: Lease) -> Option<UtcMillis> {
+    let edge_now = now(state).ok()?;
+    (edge_now < lease.expires_at).then_some(edge_now)
+}
+
+fn socket_side_effect_timeout(lease: Lease, now: UtcMillis) -> Option<Duration> {
+    let remaining = lease.expires_at.get().checked_sub(now.get())?;
+    if remaining == 0 {
+        return None;
+    }
+    let remaining = Duration::from_millis(u64::try_from(remaining).ok()?);
+    Some(SOCKET_SIDE_EFFECT_TIMEOUT.min(remaining))
 }
 
 fn decode_client_frame(bytes: &[u8], wire: WireLine) -> Result<ClientFrame, ()> {

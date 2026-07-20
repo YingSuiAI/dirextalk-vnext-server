@@ -15,7 +15,7 @@ use dtx_identity_persistence::{
 };
 use dtx_wire::{SafeUint, Sha256Digest, UtcMillis};
 use sqlx::{
-    PgPool, Row,
+    PgPool, Postgres, Row, Transaction,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use uuid::Uuid;
@@ -89,6 +89,62 @@ pub struct Lease {
     pub expires_at: UtcMillis,
 }
 
+/// One exact lease/session fence held across a gateway edge side effect.
+///
+/// The private transaction owns both the identity advisory lock acquired by
+/// session authentication and a shared lock on the exact lease row. Replacing
+/// the lease or revoking the device therefore cannot commit until the caller
+/// finishes or drops this operation. Callers must keep the guarded side effect
+/// bounded; dropping a cancelled operation rolls the transaction back.
+#[must_use = "a lease operation must remain alive through its guarded side effect"]
+pub struct LeaseOperation {
+    transaction: Option<Transaction<'static, Postgres>>,
+    lease: Lease,
+}
+
+impl fmt::Debug for LeaseOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeaseOperation")
+            .field("lease", &self.lease)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LeaseOperation {
+    /// Reads one durable replay page while the exact lease remains fenced.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid cursor or corrupt durable journal state and preserves
+    /// the operation fence until [`Self::finish`] or drop.
+    pub async fn replay(
+        &mut self,
+        after: SafeUint,
+        now: UtcMillis,
+    ) -> Result<ReplayPage, RealtimeSyncError> {
+        let transaction = self
+            .transaction
+            .as_mut()
+            .ok_or(RealtimeSyncError::StaleLease)?;
+        replay_in_transaction(transaction, self.lease, after, now).await
+    }
+
+    /// Releases this operation fence after its external side effect completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error when the read-only transaction cannot commit.
+    pub async fn finish(mut self) -> Result<(), RealtimeSyncError> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or(RealtimeSyncError::StaleLease)?;
+        transaction.commit().await?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvalidationKind {
     MailboxDelivery,
@@ -154,6 +210,7 @@ impl RealtimeSyncStore {
                 AND has_function_privilege(current_user,'realtime.claim_outbox(uuid,uuid,bigint,bigint,integer)','EXECUTE')
                 AND has_function_privilege(current_user,'realtime.mark_outbox_published(uuid,uuid,bigint)','EXECUTE')
                 AND has_function_privilege(current_user,'realtime.compact_expired(bigint,integer)','EXECUTE')
+                AND has_function_privilege(current_user,'messaging.compact_expired_identity_deliveries(bigint,integer)','EXECUTE')
                 AND NOT has_table_privilege(current_user,'messaging.mailbox_envelopes','SELECT')",
         ).fetch_one(&pool).await?;
         if !authorized {
@@ -267,19 +324,18 @@ impl RealtimeSyncStore {
         })
     }
 
-    /// Revalidates the authenticated session and exact latest lease fence for
-    /// a non-durable gateway edge such as scope or ephemeral routing.
+    /// Begins an exact session/lease fence for one bounded gateway side effect.
     ///
     /// # Errors
     ///
     /// Rejects revoked/replaced sessions, mismatched actors, expired leases,
     /// stale fences, and storage failures.
-    pub async fn validate_lease(
+    pub async fn begin_lease_operation(
         &self,
         credential: &DeviceSessionCredential,
         lease: Lease,
         now: UtcMillis,
-    ) -> Result<(), RealtimeSyncError> {
+    ) -> Result<LeaseOperation, RealtimeSyncError> {
         let mut transaction = self.pool.begin().await?;
         let authenticated = authenticate(&mut transaction, credential, now).await?;
         require_actor(
@@ -287,9 +343,11 @@ impl RealtimeSyncStore {
             authenticated.device_id(),
             lease,
         )?;
-        require_current_lease(&mut transaction, lease, now).await?;
-        transaction.commit().await?;
-        Ok(())
+        lock_current_lease(&mut transaction, lease, now).await?;
+        Ok(LeaseOperation {
+            transaction: Some(transaction),
+            lease,
+        })
     }
 
     /// Replays one ordered page after an exclusive durable cursor.
@@ -305,57 +363,10 @@ impl RealtimeSyncStore {
         after: SafeUint,
         now: UtcMillis,
     ) -> Result<ReplayPage, RealtimeSyncError> {
-        let mut transaction = self.pool.begin().await?;
-        let authenticated = authenticate(&mut transaction, credential, now).await?;
-        require_actor(
-            authenticated.identity_id(),
-            authenticated.device_id(),
-            lease,
-        )?;
-        require_current_lease(&mut transaction, lease, now).await?;
-        let head = sqlx::query(
-            "SELECT next_cursor,journal_floor FROM realtime.identity_heads WHERE identity_id=$1",
-        )
-        .bind(lease.identity_id.to_string())
-        .fetch_one(&mut *transaction)
-        .await?;
-        let highwater = safe(head.try_get("next_cursor")?)?;
-        let floor = safe(head.try_get("journal_floor")?)?;
-        if after.get().saturating_add(1) < floor.get() || after.get() > highwater.get() {
-            transaction.commit().await?;
-            return Ok(ReplayPage::CatchUpRequired { highwater });
-        }
-        let rows = sqlx::query(
-            "SELECT cursor,event_kind,subject_digest FROM realtime.journal
-              WHERE identity_id=$1 AND cursor>$2 AND expires_at_ms>$3 ORDER BY cursor LIMIT $4",
-        )
-        .bind(lease.identity_id.to_string())
-        .bind(i64::try_from(after.get()).map_err(|_| RealtimeSyncError::InvalidCursor)?)
-        .bind(now.get())
-        .bind(MAX_REPLAY_EVENTS)
-        .fetch_all(&mut *transaction)
-        .await?;
-        let mut events = Vec::with_capacity(rows.len());
-        for row in rows {
-            let kind = invalidation_kind(&row.try_get::<String, _>("event_kind")?)?;
-            events.push(Invalidation {
-                cursor: safe(row.try_get("cursor")?)?,
-                kind,
-                subject_digest: digest(row.try_get("subject_digest")?)?,
-            });
-        }
-        let mut expected_next = after.get().saturating_add(1);
-        let contiguous = events.iter().all(|event| {
-            let matches = event.cursor.get() == expected_next;
-            expected_next = expected_next.saturating_add(1);
-            matches
-        });
-        if (events.is_empty() && after.get() < highwater.get()) || !contiguous {
-            transaction.commit().await?;
-            return Ok(ReplayPage::CatchUpRequired { highwater });
-        }
-        transaction.commit().await?;
-        Ok(ReplayPage::Events { highwater, events })
+        let mut operation = self.begin_lease_operation(credential, lease, now).await?;
+        let page = operation.replay(after, now).await?;
+        operation.finish().await?;
+        Ok(page)
     }
 
     /// Persists this device's monotonic realtime acknowledgement.
@@ -378,7 +389,7 @@ impl RealtimeSyncStore {
             authenticated.device_id(),
             lease,
         )?;
-        require_current_lease(&mut transaction, lease, now).await?;
+        lock_current_lease(&mut transaction, lease, now).await?;
         let highwater: i64 = sqlx::query_scalar(
             "SELECT next_cursor FROM realtime.identity_heads WHERE identity_id=$1",
         )
@@ -476,6 +487,16 @@ impl RealtimeSyncStore {
             .bind(MAX_OUTBOX_CLAIM_EVENTS)
             .fetch_one(&self.pool)
             .await?;
+        // Keep the realtime-head phase and mailbox phase in distinct
+        // transactions. Each phase takes the shared identity advisory lock
+        // before its own head lock, so no transaction can hold a realtime head
+        // while waiting for the mailbox writer's advisory lock.
+        let _: i32 =
+            sqlx::query_scalar("SELECT messaging.compact_expired_identity_deliveries($1,$2)")
+                .bind(now.get())
+                .bind(MAX_OUTBOX_CLAIM_EVENTS)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(())
     }
 }
@@ -508,27 +529,80 @@ fn require_actor(
     }
 }
 
-async fn require_current_lease(
+async fn lock_current_lease(
     connection: &mut sqlx::PgConnection,
     lease: Lease,
     now: UtcMillis,
 ) -> Result<(), RealtimeSyncError> {
-    let current: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM realtime.device_leases
-          WHERE identity_id=$1 AND device_id=$2 AND lease_id=$3 AND fence=$4 AND expires_at_ms>$5)",
+    let current = sqlx::query_scalar::<_, i64>(
+        "SELECT fence FROM realtime.device_leases
+          WHERE identity_id=$1 AND device_id=$2 AND lease_id=$3 AND fence=$4
+            AND expires_at_ms>$5
+          FOR SHARE",
     )
     .bind(lease.identity_id.to_string())
     .bind(*lease.device_id.as_uuid())
     .bind(lease.lease_id)
     .bind(i64::try_from(lease.fence.get()).map_err(|_| RealtimeSyncError::CorruptData)?)
     .bind(now.get())
-    .fetch_one(&mut *connection)
+    .fetch_optional(&mut *connection)
     .await?;
-    if current {
+    if current.is_some() {
         Ok(())
     } else {
         Err(RealtimeSyncError::StaleLease)
     }
+}
+
+async fn replay_in_transaction(
+    transaction: &mut Transaction<'static, Postgres>,
+    lease: Lease,
+    after: SafeUint,
+    now: UtcMillis,
+) -> Result<ReplayPage, RealtimeSyncError> {
+    if now >= lease.expires_at {
+        return Err(RealtimeSyncError::StaleLease);
+    }
+    let head = sqlx::query(
+        "SELECT next_cursor,journal_floor FROM realtime.identity_heads WHERE identity_id=$1",
+    )
+    .bind(lease.identity_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await?;
+    let highwater = safe(head.try_get("next_cursor")?)?;
+    let floor = safe(head.try_get("journal_floor")?)?;
+    if after.get().saturating_add(1) < floor.get() || after.get() > highwater.get() {
+        return Ok(ReplayPage::CatchUpRequired { highwater });
+    }
+    let rows = sqlx::query(
+        "SELECT cursor,event_kind,subject_digest FROM realtime.journal
+          WHERE identity_id=$1 AND cursor>$2 AND expires_at_ms>$3 ORDER BY cursor LIMIT $4",
+    )
+    .bind(lease.identity_id.to_string())
+    .bind(i64::try_from(after.get()).map_err(|_| RealtimeSyncError::InvalidCursor)?)
+    .bind(now.get())
+    .bind(MAX_REPLAY_EVENTS)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let kind = invalidation_kind(&row.try_get::<String, _>("event_kind")?)?;
+        events.push(Invalidation {
+            cursor: safe(row.try_get("cursor")?)?,
+            kind,
+            subject_digest: digest(row.try_get("subject_digest")?)?,
+        });
+    }
+    let mut expected_next = after.get().saturating_add(1);
+    let contiguous = events.iter().all(|event| {
+        let matches = event.cursor.get() == expected_next;
+        expected_next = expected_next.saturating_add(1);
+        matches
+    });
+    if (events.is_empty() && after.get() < highwater.get()) || !contiguous {
+        return Ok(ReplayPage::CatchUpRequired { highwater });
+    }
+    Ok(ReplayPage::Events { highwater, events })
 }
 
 fn safe(value: i64) -> Result<SafeUint, RealtimeSyncError> {

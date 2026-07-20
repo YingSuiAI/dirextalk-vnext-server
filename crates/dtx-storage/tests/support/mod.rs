@@ -535,6 +535,8 @@ impl PostgresHarness {
              GRANT EXECUTE ON FUNCTION realtime.mark_outbox_published(uuid,uuid,bigint)
                 TO dtx_realtime_sync_runtime;
              GRANT EXECUTE ON FUNCTION realtime.compact_expired(bigint,integer)
+                TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.compact_expired_identity_deliveries(bigint,integer)
                 TO dtx_realtime_sync_runtime;",
         )
         .execute(&mut *role_transaction)

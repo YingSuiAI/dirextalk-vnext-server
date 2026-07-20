@@ -16,6 +16,10 @@ truth; WSS never becomes a business-write or authentication authority.
 - Migration 049 adds the V39 retention safety repair: one-way expired
   ciphertext tombstones, a compacted identity-delivery prefix, and head-locked
   realtime/delivery compaction. It has no dependency on migration 048.
+- Migration 050 bounds retained mailbox operation receipts after one explicit
+  15-minute replay horizon, adds expiry/receipt GC indexes, and reserves bounded
+  progress for ciphertext tombstones, delivery prefixes, orphan tombstones,
+  legacy ACK claims, and per-device ACK claims.
 - WSS uses binary canonical CBOR. The Gateway prefers the additive
   `dirextalk.realtime-sync.v2` subprotocol and retains
   `dirextalk.realtime-sync.v1` compatibility. Protocol baselines 37 and 38
@@ -36,6 +40,9 @@ authorities, revoked devices/grants, or mismatched PoP.
 Every later granted-device Pull or ACK also revalidates the stored grant against
 the current active grantor device or current root/recovery key. A previously
 created delivery cursor is never accepted as a second authorization source.
+Only the immutable first device enrolled directly after identity genesis has
+sequence-one bootstrap recovery. Owning a mailbox, holding an old delivery
+cursor, or having used the account on this device never grants history access.
 
 ## Post-commit publication
 
@@ -48,24 +55,32 @@ marks the claim published.
 - Crash after broadcast but before mark: the batch is broadcast again, so
   delivery is at-least-once.
 - No connected receiver: later WSS replay reads the durable journal.
-- Expired rows are compacted in pages of at most 256. Compaction removes the
+- Expired rows are compacted in pages of at most 256. Realtime-journal and
+  mailbox-retention phases use separate transactions under one global
+  compactor fence; every phase acquires the mailbox identity advisory lock
+  before its own head row. Compaction removes the
   matching outbox row first, but only for the contiguous expired prefix that
   starts at the current journal floor. An expired interior row cannot advance
   the floor past a live row. Replay validates every adjacent cursor; a cursor
   behind the floor or any retained gap receives `CatchUpRequired`.
-- Expired mailbox ciphertext is replaced by a one-way tombstone before quota is
-  released. Compaction never consults device ACKs: it removes only the globally
-  expired contiguous identity-delivery prefix, retains exact envelope/receipt
-  metadata, and records the removed prefix as one scalar floor. Appends, Pull
-  snapshots, and compaction serialize on the identity head.
+- Every non-null mailbox ciphertext remains quota-charged regardless of ACK or
+  nominal expiry. Expiry compaction replaces it with a one-way tombstone before
+  releasing quota. Exact enqueue, legacy ACK, and per-device ACK receipts remain
+  replayable through 15 minutes after their terminal timestamp; bounded GC may
+  then remove only receipt metadata, never the durable per-device cursor.
+  Compaction never consults device ACKs when deciding global payload expiry: it
+  removes only an old, fully tombstoned contiguous identity-delivery prefix and
+  records that prefix as one scalar floor. Appends, Pull snapshots, and
+  compaction serialize on the mailbox identity advisory lock and relevant head.
 - Claim, mark, and compaction timestamps must remain within 60 seconds of the
-  PostgreSQL clock, so the privileged functions cannot be used to forge future
-  expiry even if the dedicated runtime login is compromised.
+  PostgreSQL clock. Retention eligibility itself uses one captured PostgreSQL
+  clock, so either allowed caller skew extreme produces the same result and the
+  privileged functions cannot be used to forge future expiry.
 
 The Gateway role cannot select mailbox ciphertext or mutate arbitrary realtime
-tables. Its only outbox write/cleanup capabilities are the three bounded
-functions granted by migration 046. Identity writes call the narrow migration
-047 append function inside their business transaction, so their typed
+tables. Its outbox write/cleanup capabilities are the three bounded migration
+046 functions plus the bounded migration 049 mailbox-retention compactor.
+Identity writes call the narrow migration 047 append function inside their business transaction, so their typed
 invalidation and outbox row commit or roll back together. Subjects are only
 domain-separated 32-byte digests.
 
@@ -101,8 +116,12 @@ only establish an implicit scope by sending a signal.
 
 Scope subscription, ephemeral publication, and each matching peer delivery
 reauthenticate the device session and require the exact current lease ID/fence.
-A replacement Hello or device/session revocation therefore fences the old
-socket before it can subscribe, send, or receive another ephemeral signal.
+The authenticated transaction retains the identity mutation fence and a shared
+lock on that exact lease row through the bounded in-memory or socket side
+effect. A replacement Hello or device/session revocation therefore cannot
+commit midway through an authorized edge, and the old socket cannot begin a
+later subscribe, send, or receive edge. Socket effects are capped at two seconds
+and recheck the server clock against lease expiry after acquiring the fence.
 
 The scope digest is a possession capability: clients must derive it from the
 current private conversation authorization/epoch, never from a public or stable

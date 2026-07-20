@@ -1,16 +1,30 @@
-ALTER TABLE messaging.identity_delivery_heads
-    ADD COLUMN compacted_through bigint NOT NULL DEFAULT 0
-        CHECK (compacted_through BETWEEN 0 AND 9007199254740991),
-    ADD CONSTRAINT identity_delivery_compaction_not_ahead
-        CHECK (compacted_through <= next_sequence);
+-- Exact receipts collected after the published replay horizon are intentionally
+-- not reconstructed; V49 durable delivery floors and payload state remain
+-- compatible.
 
-ALTER TABLE messaging.mailbox_envelopes
-    ALTER COLUMN opaque_ciphertext DROP NOT NULL,
-    DROP CONSTRAINT messaging_envelopes_ciphertext_bounded,
-    ADD CONSTRAINT messaging_envelopes_ciphertext_bounded CHECK (
-        (state IN ('available','acked') AND octet_length(opaque_ciphertext) BETWEEN 1 AND 262144)
-        OR (state='expired' AND opaque_ciphertext IS NULL)
-    );
+DROP INDEX messaging.messaging_device_ack_replay_gc_idx;
+DROP INDEX messaging.messaging_mailbox_ack_replay_gc_idx;
+DROP INDEX messaging.messaging_envelope_tombstone_gc_idx;
+DROP INDEX messaging.messaging_mailbox_retained_quota_idx;
+DROP INDEX messaging.messaging_identity_delivery_expiry_gc_idx;
+
+DROP TRIGGER messaging_enqueue_claims_append_only ON messaging.mailbox_enqueue_claims;
+CREATE TRIGGER messaging_enqueue_claims_append_only
+BEFORE UPDATE OR DELETE ON messaging.mailbox_enqueue_claims
+FOR EACH ROW
+EXECUTE FUNCTION messaging.reject_immutable_mutation();
+
+DROP FUNCTION messaging.enforce_enqueue_claim_retention();
+
+DROP TRIGGER messaging_ack_claims_append_only ON messaging.mailbox_ack_claims;
+CREATE TRIGGER messaging_ack_claims_append_only
+BEFORE UPDATE OR DELETE ON messaging.mailbox_ack_claims
+FOR EACH ROW
+EXECUTE FUNCTION messaging.reject_immutable_mutation();
+
+DROP TRIGGER messaging_device_delivery_ack_claims_retention
+    ON messaging.device_delivery_ack_claims;
+DROP FUNCTION messaging.enforce_replay_claim_retention();
 
 CREATE OR REPLACE FUNCTION messaging.enforce_envelope_transition()
 RETURNS trigger
@@ -38,7 +52,7 @@ BEGIN
 END
 $$;
 
-CREATE FUNCTION messaging.compact_expired_identity_deliveries(now_ms bigint, maximum_rows integer)
+CREATE OR REPLACE FUNCTION messaging.compact_expired_identity_deliveries(now_ms bigint, maximum_rows integer)
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -56,9 +70,6 @@ BEGIN
        OR maximum_rows NOT BETWEEN 1 AND 256 THEN
         RAISE EXCEPTION 'identity delivery compaction rejected' USING ERRCODE='42501';
     END IF;
-    -- Serialize every compactor phase before taking any per-identity lock. A
-    -- writer never needs this global lock and always takes its one identity
-    -- advisory lock before either journal head.
     PERFORM pg_advisory_xact_lock(hashtextextended(
         'dirextalk-retention-compactor-v1',0));
     WHILE changed < maximum_rows LOOP
@@ -146,82 +157,3 @@ BEGIN
     RETURN changed;
 END
 $$;
-
-CREATE OR REPLACE FUNCTION realtime.compact_expired(now_ms bigint, maximum_rows integer)
-RETURNS integer
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog, realtime
-AS $$
-DECLARE database_now_ms bigint := floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint;
-DECLARE selected_identity text;
-DECLARE current_floor bigint;
-DECLARE compact_to bigint;
-DECLARE removed integer;
-DECLARE changed integer := 0;
-BEGIN
-    IF NOT realtime.runtime_authorized()
-       OR now_ms NOT BETWEEN database_now_ms-60000 AND database_now_ms+60000
-       OR maximum_rows NOT BETWEEN 1 AND 256 THEN
-        RAISE EXCEPTION 'realtime compaction rejected' USING ERRCODE='42501';
-    END IF;
-    PERFORM pg_advisory_xact_lock(hashtextextended(
-        'dirextalk-retention-compactor-v1',0));
-    WHILE changed < maximum_rows LOOP
-        SELECT head.identity_id INTO selected_identity
-          FROM realtime.identity_heads AS head
-          JOIN realtime.journal AS first_event
-            ON first_event.identity_id=head.identity_id
-           AND first_event.cursor=head.journal_floor
-         WHERE first_event.expires_at_ms<=database_now_ms
-         ORDER BY head.identity_id LIMIT 1;
-        EXIT WHEN selected_identity IS NULL;
-        PERFORM pg_advisory_xact_lock(hashtextextended(
-            'mailbox-identity:' || selected_identity, 0));
-        SELECT journal_floor INTO current_floor
-          FROM realtime.identity_heads
-         WHERE identity_id=selected_identity FOR UPDATE;
-        SELECT max(cursor) INTO compact_to FROM (
-            SELECT cursor FROM realtime.journal
-             WHERE identity_id=selected_identity
-               AND cursor>=current_floor
-               AND expires_at_ms<=database_now_ms
-               AND cursor < COALESCE((
-                    SELECT min(cursor) FROM realtime.journal
-                     WHERE identity_id=selected_identity
-                       AND cursor>=current_floor AND expires_at_ms>database_now_ms
-               ),9007199254740992)
-             ORDER BY cursor LIMIT maximum_rows-changed
-        ) AS expired_prefix;
-        IF compact_to IS NULL THEN
-            selected_identity := NULL;
-            CONTINUE;
-        END IF;
-        DELETE FROM realtime.outbox
-         WHERE identity_id=selected_identity AND cursor BETWEEN current_floor AND compact_to;
-        DELETE FROM realtime.journal
-         WHERE identity_id=selected_identity AND cursor BETWEEN current_floor AND compact_to;
-        GET DIAGNOSTICS removed = ROW_COUNT;
-        IF removed <> compact_to-current_floor+1 THEN
-            RAISE EXCEPTION 'realtime journal prefix is not contiguous' USING ERRCODE='23514';
-        END IF;
-        UPDATE realtime.identity_heads
-           SET journal_floor=LEAST(compact_to+1,9007199254740991)
-         WHERE identity_id=selected_identity;
-        changed := changed+removed;
-        selected_identity := NULL;
-    END LOOP;
-    RETURN changed;
-END
-$$;
-
-REVOKE ALL ON FUNCTION messaging.compact_expired_identity_deliveries(bigint,integer) FROM PUBLIC;
-
-DO $grants$
-BEGIN
-    IF to_regrole('dtx_realtime_sync_runtime') IS NOT NULL THEN
-        GRANT EXECUTE ON FUNCTION messaging.compact_expired_identity_deliveries(bigint,integer)
-            TO dtx_realtime_sync_runtime;
-    END IF;
-END
-$grants$;

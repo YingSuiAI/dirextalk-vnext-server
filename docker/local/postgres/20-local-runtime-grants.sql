@@ -98,6 +98,8 @@ GRANT EXECUTE ON FUNCTION realtime.mark_outbox_published(uuid,uuid,bigint)
     TO dtx_realtime_sync_runtime;
 GRANT EXECUTE ON FUNCTION realtime.compact_expired(bigint,integer)
     TO dtx_realtime_sync_runtime;
+GRANT EXECUTE ON FUNCTION messaging.compact_expired_identity_deliveries(bigint,integer)
+    TO dtx_realtime_sync_runtime;
 
 -- These login roles deliberately use direct grants with NOINHERIT. Membership
 -- in dtx_public_feed_runtime is only the RLS authorization marker and does not

@@ -243,8 +243,9 @@ impl crate::MailboxRepository {
     /// Pulls every eligible identity-owned envelope in account delivery order.
     ///
     /// The current device session selects both identity and device. A secondary
-    /// device must already have a non-revoked history grant; the original mailbox
-    /// device is enrolled lazily at sequence one. Pull never consumes payload.
+    /// device must already have a non-revoked history grant; the immutable first
+    /// identity device is enrolled lazily at sequence one. Pull never consumes
+    /// payload.
     ///
     /// # Errors
     ///
@@ -516,19 +517,15 @@ async fn authorize_identity_device(
     .bind(*authenticated.device_id().as_uuid())
     .fetch_optional(&mut *connection)
     .await?;
-    let owns_mailbox: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM messaging.mailboxes
-          WHERE owner_identity_id=$1 AND owner_device_id=$2)",
-    )
-    .bind(authenticated.identity_id().to_string())
-    .bind(*authenticated.device_id().as_uuid())
-    .fetch_one(&mut *connection)
-    .await?;
-    let authorized_earliest = if owns_mailbox {
-        1
-    } else {
-        current_history_grant_earliest(connection, authenticated).await?
-    };
+    let snapshot = lock_and_load_active_snapshot(connection, authenticated.identity_id())
+        .await
+        .map_err(map_identity_authorization_error)?;
+    let authorized_earliest =
+        if snapshot.projection().initial_device_id() == Some(authenticated.device_id()) {
+            1
+        } else {
+            current_history_grant_earliest(connection, authenticated).await?
+        };
     if let Some(earliest) = existing_earliest {
         // Delivery state is only a cursor. It must never become a second
         // authorization truth after a history grant or device is revoked.

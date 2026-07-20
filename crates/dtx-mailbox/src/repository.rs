@@ -200,17 +200,16 @@ impl MailboxRepository {
                 ))?;
             validate_envelope_expiry(command.expires_at(), mailbox.expires_at, now)?;
 
-            // A legacy owner ACK releases its delivery cursor but ciphertext
-            // remains eligible for other devices until expiry. Capacity must
-            // therefore follow retained live bytes, not the V14 active cursor
-            // counters, or repeated ACK/enqueue cycles could bypass the bound.
+            // A legacy owner ACK releases its delivery cursor but not retained
+            // storage. Capacity follows every non-null ciphertext until a
+            // durable expiry tombstone clears it, independent of delivery
+            // state or a delayed compactor.
             let (retained_count, retained_bytes): (i64, i64) = sqlx::query_as(
                 "SELECT count(*), COALESCE(sum(octet_length(opaque_ciphertext)),0)::bigint
                    FROM messaging.mailbox_envelopes
-                  WHERE mailbox_id=$1 AND expires_at_ms>$2",
+                  WHERE mailbox_id=$1 AND opaque_ciphertext IS NOT NULL",
             )
             .bind(*command.mailbox_id().as_uuid())
-            .bind(now.get())
             .fetch_one(&mut *session.connection())
             .await?;
             let next_retained_count = retained_count

@@ -31,6 +31,7 @@ pub use multi_device::{
 pub use repository::MailboxRepository;
 pub use store::{MailboxPgStore, MailboxSession};
 pub use types::{
+    MAILBOX_ENQUEUE_REPLAY_RETENTION_MILLIS, MAILBOX_OPERATION_REPLAY_RETENTION_MILLIS,
     MAILBOX_WRITE_CAPABILITY_HASH_DOMAIN, MAX_ACTIVE_ENVELOPE_BYTES, MAX_ACTIVE_ENVELOPES,
     MAX_ENVELOPE_TTL_MILLIS, MAX_OPAQUE_CIPHERTEXT_BYTES, MAX_PAGE_ENTRIES,
     MailboxAcknowledgementCommand, MailboxEnvelopeCommand, MailboxOperationOutcome,

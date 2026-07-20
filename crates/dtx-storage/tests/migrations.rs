@@ -52,7 +52,8 @@ const REALTIME_SYNC_MULTIDEVICE_MAILBOX_V1_MIGRATION_VERSION: i64 = 202_607_200_
 const ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_MIGRATION_VERSION: i64 = 202_607_200_046;
 const REALTIME_SYNC_CONTINUITY_V2_MIGRATION_VERSION: i64 = 202_607_200_047;
 const REALTIME_SYNC_RETENTION_SAFETY_V1_MIGRATION_VERSION: i64 = 202_607_200_049;
-const EXPECTED_MIGRATION_COUNT: i64 = 48;
+const MAILBOX_RETAINED_QUOTA_GC_V1_MIGRATION_VERSION: i64 = 202_607_200_050;
+const EXPECTED_MIGRATION_COUNT: i64 = 49;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -170,6 +171,10 @@ const REALTIME_SYNC_CONTINUITY_V2_UP: &str =
     include_str!("../../../migrations/202607200047_realtime_sync_continuity_v2.up.sql");
 const REALTIME_SYNC_RETENTION_SAFETY_V1_DOWN: &str =
     include_str!("../../../migrations/202607200049_realtime_sync_retention_safety_v1.down.sql");
+const MAILBOX_RETAINED_QUOTA_GC_V1_DOWN: &str =
+    include_str!("../../../migrations/202607200050_mailbox_retained_quota_gc_v1.down.sql");
+const MAILBOX_RETAINED_QUOTA_GC_V1_UP: &str =
+    include_str!("../../../migrations/202607200050_mailbox_retained_quota_gc_v1.up.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -1438,6 +1443,140 @@ async fn hermes_adapter_down_migration_refuses_to_orphan_durable_rows()
 }
 
 #[tokio::test]
+async fn mailbox_retention_empty_down_up_preserves_v49_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(MAILBOX_RETAINED_QUOTA_GC_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    let removed: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('messaging.enforce_replay_claim_retention()') IS NULL
+            AND to_regclass('messaging.messaging_identity_delivery_expiry_gc_idx') IS NULL
+            AND to_regclass('messaging.messaging_mailbox_retained_quota_idx') IS NULL
+            AND to_regclass('messaging.messaging_envelope_tombstone_gc_idx') IS NULL
+            AND to_regclass('messaging.messaging_mailbox_ack_replay_gc_idx') IS NULL
+            AND to_regclass('messaging.messaging_device_ack_replay_gc_idx') IS NULL",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(removed);
+
+    sqlx::raw_sql(MAILBOX_RETAINED_QUOTA_GC_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    let restored: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('messaging.enforce_replay_claim_retention()') IS NOT NULL
+            AND to_regclass('messaging.messaging_identity_delivery_expiry_gc_idx') IS NOT NULL
+            AND to_regclass('messaging.messaging_mailbox_retained_quota_idx') IS NOT NULL
+            AND to_regclass('messaging.messaging_envelope_tombstone_gc_idx') IS NOT NULL
+            AND to_regclass('messaging.messaging_mailbox_ack_replay_gc_idx') IS NOT NULL
+            AND to_regclass('messaging.messaging_device_ack_replay_gc_idx') IS NOT NULL",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(restored);
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_retention_down_refuses_to_drop_a_compacted_delivery_floor()
+-> Result<(), Box<dyn std::error::Error>> {
+    const IDENTITY_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(MAILBOX_RETAINED_QUOTA_GC_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    let mut transaction = harness.admin_pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO identity.log_heads(
+             identity_id,protocol_major,protocol_minor,minimum_reader_major,
+             minimum_reader_minor,head_sequence,head_hash,state,created_at_ms,updated_at_ms
+         ) VALUES($1,1,1,1,1,1,$2,'active',0,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![7_u8; 32])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.log_entries(
+             identity_id,sequence,entry_hash,previous_hash,protocol_major,
+             protocol_minor,minimum_reader_major,minimum_reader_minor,event_bytes,recorded_at_ms
+         ) VALUES($1,1,$2,NULL,1,1,1,1,$3,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![7_u8; 32])
+    .bind(vec![1_u8])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO messaging.identity_delivery_heads(
+             identity_id,next_sequence,compacted_through
+         ) VALUES($1,1,1)",
+    )
+    .bind(IDENTITY_ID)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    let error = sqlx::raw_sql(REALTIME_SYNC_RETENTION_SAFETY_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await
+        .expect_err("rollback must preserve a compacted delivery floor");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("55000")),
+    );
+    let floor: i64 = sqlx::query_scalar(
+        "SELECT compacted_through FROM messaging.identity_delivery_heads WHERE identity_id=$1",
+    )
+    .bind(IDENTITY_ID)
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(floor, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_retention_empty_down_restores_v47_ciphertext_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(MAILBOX_RETAINED_QUOTA_GC_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(REALTIME_SYNC_RETENTION_SAFETY_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+
+    let (nullable, compacted_column_exists, constraint): (String, bool, String) = sqlx::query_as(
+        "SELECT column_info.is_nullable,
+                    EXISTS(
+                        SELECT 1 FROM information_schema.columns
+                         WHERE table_schema='messaging'
+                           AND table_name='identity_delivery_heads'
+                           AND column_name='compacted_through'
+                    ),
+                    pg_get_constraintdef(constraint_info.oid)
+               FROM information_schema.columns AS column_info
+               JOIN pg_constraint AS constraint_info
+                 ON constraint_info.conrelid='messaging.mailbox_envelopes'::regclass
+                AND constraint_info.conname='messaging_envelopes_ciphertext_bounded'
+              WHERE column_info.table_schema='messaging'
+                AND column_info.table_name='mailbox_envelopes'
+                AND column_info.column_name='opaque_ciphertext'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(nullable, "NO");
+    assert!(!compacted_column_exists);
+    assert!(constraint.contains("octet_length(opaque_ciphertext)"));
+    assert!(!constraint.contains("IS NULL"));
+    Ok(())
+}
+
+#[tokio::test]
 #[allow(
     clippy::too_many_lines,
     reason = "one reversible migration test keeps the full ordered schema teardown auditable"
@@ -1448,7 +1587,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -1498,8 +1637,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_MIGRATION_VERSION)
     .bind(REALTIME_SYNC_CONTINUITY_V2_MIGRATION_VERSION)
     .bind(REALTIME_SYNC_RETENTION_SAFETY_V1_MIGRATION_VERSION)
+    .bind(MAILBOX_RETAINED_QUOTA_GC_V1_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(MAILBOX_RETAINED_QUOTA_GC_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(REALTIME_SYNC_RETENTION_SAFETY_V1_DOWN)
         .execute(harness.admin_pool())
         .await?;

@@ -1,3 +1,26 @@
+-- V47 cannot represent an irreversibly tombstoned payload or a deleted
+-- account-delivery prefix. Refuse before any DDL so the resumable floor and
+-- current reader remain intact.
+DO $preflight$
+DECLARE compacted_heads bigint;
+DECLARE tombstoned_payloads bigint;
+BEGIN
+    SELECT count(*) INTO compacted_heads
+      FROM messaging.identity_delivery_heads WHERE compacted_through>0;
+    SELECT count(*) INTO tombstoned_payloads
+      FROM messaging.mailbox_envelopes WHERE opaque_ciphertext IS NULL;
+    IF compacted_heads<>0 OR tombstoned_payloads<>0 THEN
+        RAISE EXCEPTION 'cannot downgrade realtime retention safety after compaction'
+            USING ERRCODE='55000',
+                  DETAIL=format(
+                      'compacted identity heads=%s tombstoned payloads=%s',
+                      compacted_heads,tombstoned_payloads
+                  ),
+                  HINT='Keep schema version 49 or later and use the retained delivery floor.';
+    END IF;
+END
+$preflight$;
+
 CREATE OR REPLACE FUNCTION messaging.enforce_envelope_transition()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -20,12 +43,12 @@ BEGIN
 END
 $$;
 
--- Tombstoned bytes are intentionally not reconstructed on rollback.
 ALTER TABLE messaging.mailbox_envelopes
     DROP CONSTRAINT messaging_envelopes_ciphertext_bounded,
     ADD CONSTRAINT messaging_envelopes_ciphertext_bounded CHECK (
-        opaque_ciphertext IS NULL OR octet_length(opaque_ciphertext) BETWEEN 1 AND 262144
-    );
+        octet_length(opaque_ciphertext) BETWEEN 1 AND 262144
+    ),
+    ALTER COLUMN opaque_ciphertext SET NOT NULL;
 ALTER TABLE messaging.identity_delivery_heads
     DROP CONSTRAINT identity_delivery_compaction_not_ahead,
     DROP COLUMN compacted_through;
