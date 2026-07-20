@@ -25,6 +25,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 dtx-identity-log = { path = "../../crates/dtx-identity-log" }
+dtx-realtime-sync = { path = "../../crates/dtx-realtime-sync" }
 dtx-storage = { path = "../../crates/dtx-storage" }
 ed25519-dalek.workspace = true
 reqwest.workspace = true

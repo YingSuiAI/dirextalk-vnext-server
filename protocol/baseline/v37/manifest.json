@@ -1,0 +1,10 @@
+{
+  "version": 37,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/realtime-sync/v1/realtime-sync-v1.cddl": "sha256:2299b3f2eb2009aac09bcc5009136f13a35c3ea6cac2a71cd13a7ef1fcd75b8f",
+    "protocol/proto/dirextalk/agent_control/v1_5/agent_control.proto": "sha256:da8366acc9c8e7bb4f34d6540286e337b2af53db9efc90624a20b067158b73ad",
+    "protocol/test-vectors/realtime-sync/v1/realtime-sync-v1.json": "sha256:96abc89b5701db109ddd6f1962d67a5ac5a3a4e3615de42b48bb45d04677b024"
+  }
+}

@@ -10,6 +10,8 @@
 
 mod attachment;
 mod error;
+mod history;
+mod multi_device;
 mod repository;
 mod store;
 mod types;
@@ -19,6 +21,11 @@ pub use attachment::{
     AttachmentError, AttachmentManifest, AttachmentRepository, AttachmentStatus,
 };
 pub use error::MailboxPersistenceError;
+pub use history::DeviceHistoryGrantCommand;
+pub use multi_device::{
+    IdentityMailboxAckCommand, IdentityMailboxPullRequest, IdentityPulledEnvelope,
+    MAX_IDENTITY_PULL_ENTRIES,
+};
 pub use repository::MailboxRepository;
 pub use store::{MailboxPgStore, MailboxSession};
 pub use types::{

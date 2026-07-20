@@ -9,6 +9,7 @@ members = [
     "bins/dtx-indexer-node",
     "bins/dtx-mailbox-node",
     "bins/dtx-public-feed-node",
+    "bins/dtx-realtime-sync-gateway",
     "bins/dtx-node",
     "crates/dtx-agent-control",
     "crates/dtx-agent-control-proto",
@@ -33,6 +34,7 @@ members = [
     "crates/dtx-public-descriptor",
     "crates/dtx-public-discussion",
     "crates/dtx-public-feed",
+    "crates/dtx-realtime-sync",
     "crates/dtx-security",
     "crates/dtx-storage",
     "crates/dtx-testkit",
@@ -47,7 +49,7 @@ edition = "2024"
 rust-version = "1.97.0"
 
 [workspace.dependencies]
-axum = { version = "0.8.9", default-features = false, features = ["http1", "query", "tokio"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "query", "tokio", "ws"] }
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 base64ct = { version = "1.8.3", features = ["alloc"] }
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }

@@ -23,6 +23,7 @@ const RUNTIME_USER: &str = "dtx_runtime_test";
 const IDENTITY_RUNTIME_USER: &str = "dtx_identity_only_test";
 const GROUP_RUNTIME_USER: &str = "dtx_group_only_test";
 const MAILBOX_RUNTIME_USER: &str = "dtx_mailbox_only_test";
+const REALTIME_SYNC_RUNTIME_USER: &str = "dtx_realtime_sync_only_test";
 const POSTGRES_TAG: &str = "18.4-alpine3.24";
 const LOCAL_POSTGRES_MODE_ENV: &str = "DTX_TEST_LOCAL_POSTGRES";
 const LOCAL_POSTGRES_HOST_ENV: &str = "DTX_TEST_LOCAL_POSTGRES_HOST";
@@ -142,6 +143,8 @@ pub struct PostgresHarness {
     group_runtime_options: PgConnectOptions,
     mailbox_runtime_pool: PgPool,
     mailbox_runtime_options: PgConnectOptions,
+    realtime_sync_runtime_pool: PgPool,
+    realtime_sync_runtime_options: PgConnectOptions,
     _container: Option<ContainerAsync<Postgres>>,
     local_database: Option<LocalPostgresDatabase>,
 }
@@ -153,6 +156,7 @@ impl PostgresHarness {
         let identity_runtime_password = random_password("identity-runtime");
         let group_runtime_password = random_password("group-runtime");
         let mailbox_runtime_password = random_password("mailbox-runtime");
+        let realtime_sync_runtime_password = random_password("realtime-sync-runtime");
         let local_config = local_postgres_config_from_env()?;
         let mut local_database = match local_config.as_ref() {
             Some(config) => Some(LocalPostgresDatabase::create(config).await?),
@@ -217,12 +221,14 @@ impl PostgresHarness {
             "SELECT set_config('dtx.test_runtime_password', $1, true), \
                     set_config('dtx.test_identity_runtime_password', $2, true), \
                     set_config('dtx.test_group_runtime_password', $3, true), \
-                    set_config('dtx.test_mailbox_runtime_password', $4, true)",
+                    set_config('dtx.test_mailbox_runtime_password', $4, true), \
+                    set_config('dtx.test_realtime_sync_runtime_password', $5, true)",
         )
         .bind(&runtime_password)
         .bind(&identity_runtime_password)
         .bind(&group_runtime_password)
         .bind(&mailbox_runtime_password)
+        .bind(&realtime_sync_runtime_password)
         .execute(&mut *role_transaction)
         .await?;
         sqlx::raw_sql(
@@ -272,6 +278,17 @@ impl PostgresHarness {
                           current_setting('dtx.test_mailbox_runtime_password')
                       );
                   END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_realtime_sync_only_test') THEN
+                      EXECUTE format(
+                          'CREATE ROLE dtx_realtime_sync_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_realtime_sync_runtime_password')
+                      );
+                  ELSE
+                      EXECUTE format(
+                          'ALTER ROLE dtx_realtime_sync_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_realtime_sync_runtime_password')
+                      );
+                  END IF;
                   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_identity_runtime') THEN
                       CREATE ROLE dtx_identity_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
                   ELSE
@@ -287,11 +304,21 @@ impl PostgresHarness {
                   ELSE
                       ALTER ROLE dtx_mailbox_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
                   END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_realtime_sync_runtime') THEN
+                      CREATE ROLE dtx_realtime_sync_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  ELSE
+                      ALTER ROLE dtx_realtime_sync_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  END IF;
                   REVOKE dtx_identity_runtime FROM dtx_runtime_test;
                   REVOKE dtx_identity_runtime FROM dtx_identity_only_test;
                   REVOKE dtx_group_runtime FROM dtx_group_only_test;
                   REVOKE dtx_identity_runtime FROM dtx_mailbox_runtime;
                   REVOKE dtx_group_runtime FROM dtx_mailbox_runtime;
+                  REVOKE dtx_realtime_sync_runtime FROM dtx_mailbox_runtime;
+                  REVOKE dtx_identity_runtime FROM dtx_realtime_sync_only_test;
+                  REVOKE dtx_group_runtime FROM dtx_realtime_sync_only_test;
+                  REVOKE dtx_mailbox_runtime FROM dtx_realtime_sync_only_test;
+                  REVOKE dtx_realtime_sync_runtime FROM dtx_realtime_sync_only_test;
                   REVOKE dtx_mailbox_runtime FROM dtx_runtime_test;
                   REVOKE dtx_mailbox_runtime FROM dtx_identity_only_test;
                   REVOKE dtx_mailbox_runtime FROM dtx_group_only_test;
@@ -301,6 +328,7 @@ impl PostgresHarness {
                   GRANT dtx_identity_runtime TO dtx_identity_only_test;
                   GRANT dtx_group_runtime TO dtx_group_only_test;
                   GRANT dtx_mailbox_runtime TO dtx_mailbox_only_test;
+                  GRANT dtx_realtime_sync_runtime TO dtx_realtime_sync_only_test;
              END
              $role$;
              GRANT USAGE ON SCHEMA system TO dtx_runtime_test;
@@ -454,17 +482,47 @@ impl PostgresHarness {
                 TO dtx_mailbox_runtime;
              GRANT EXECUTE ON FUNCTION identity.identity_mailbox_reader_authorized()
                 TO dtx_mailbox_runtime;
+             GRANT EXECUTE ON FUNCTION identity.identity_realtime_reader_authorized()
+                TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT, UPDATE ON messaging.mailboxes TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON messaging.mailbox_registration_claims TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT, UPDATE ON messaging.mailbox_envelopes TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON messaging.mailbox_enqueue_claims TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON messaging.mailbox_ack_claims TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT, UPDATE ON messaging.identity_delivery_heads,
+                messaging.device_delivery_state, messaging.device_history_grants
+                TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT ON messaging.identity_delivery_journal,
+                messaging.device_delivery_ack_claims TO dtx_mailbox_runtime;
+             GRANT USAGE ON SCHEMA realtime TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT, UPDATE ON realtime.identity_heads TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT ON realtime.journal, realtime.outbox TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT, UPDATE ON messaging.attachment_objects TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON messaging.attachment_chunks TO dtx_mailbox_runtime;
              GRANT EXECUTE ON FUNCTION messaging.expire_attachment_objects(integer)
                 TO dtx_mailbox_runtime;
              GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
-                TO dtx_mailbox_runtime;",
+                TO dtx_mailbox_runtime;
+
+             GRANT USAGE ON SCHEMA realtime, identity, messaging TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION realtime.runtime_authorized()
+                TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.is_uuid_v7(uuid)
+                TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION identity.identity_runtime_authorized()
+                TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION identity.identity_owner_authorized()
+                TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION identity.identity_realtime_reader_authorized()
+                TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION identity.identity_mailbox_reader_authorized()
+                TO dtx_realtime_sync_runtime;
+             GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
+                TO dtx_realtime_sync_runtime;
+             GRANT SELECT ON realtime.identity_heads, realtime.journal
+                TO dtx_realtime_sync_runtime;
+             GRANT SELECT, INSERT, UPDATE ON realtime.device_sync_acks, realtime.device_leases
+                TO dtx_realtime_sync_runtime;",
         )
         .execute(&mut *role_transaction)
         .await?;
@@ -514,6 +572,17 @@ impl PostgresHarness {
                 .max_connections(4)
                 .connect_with(mailbox_runtime_options.clone())
                 .await?;
+            let realtime_sync_runtime_options = connect_options(
+                &host,
+                port,
+                REALTIME_SYNC_RUNTIME_USER,
+                &realtime_sync_runtime_password,
+                &database,
+            );
+            let realtime_sync_runtime_pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect_with(realtime_sync_runtime_options.clone())
+                .await?;
 
             Ok::<Self, Box<dyn Error>>(Self {
                 admin_pool,
@@ -525,6 +594,8 @@ impl PostgresHarness {
                 group_runtime_options,
                 mailbox_runtime_pool,
                 mailbox_runtime_options,
+                realtime_sync_runtime_pool,
+                realtime_sync_runtime_options,
                 _container: container,
                 local_database: local_database.take(),
             })
@@ -576,6 +647,14 @@ impl PostgresHarness {
 
     pub fn mailbox_runtime_options(&self) -> PgConnectOptions {
         self.mailbox_runtime_options.clone()
+    }
+
+    pub fn realtime_sync_runtime_pool(&self) -> &PgPool {
+        &self.realtime_sync_runtime_pool
+    }
+
+    pub fn realtime_sync_runtime_options(&self) -> PgConnectOptions {
+        self.realtime_sync_runtime_options.clone()
     }
 
     pub async fn runtime_store(

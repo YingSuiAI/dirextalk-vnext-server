@@ -27,16 +27,22 @@ use dtx_identity_persistence::{
 use dtx_mailbox::{
     AttachmentCapability, AttachmentCreate, AttachmentError, AttachmentManifest,
     AttachmentRepository, AttachmentStatus, MAILBOX_WRITE_CAPABILITY_HASH_DOMAIN,
-    MailboxPersistenceError, MailboxPgStore,
+    MailboxPersistenceError, MailboxPgStore, MailboxRegistrationCommand, MailboxRepository,
 };
 use dtx_mailbox_node::{
-    DEVICE_SESSION_AUTHORIZATION_SCHEME, MAILBOX_ACK_CONTENT_TYPE, MAILBOX_ACK_PATH_TEMPLATE,
+    DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V1_PATH,
+    DEVICE_SESSION_AUTHORIZATION_SCHEME, IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
+    IDENTITY_MAILBOX_ACK_V2_PATH, IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
+    IDENTITY_MAILBOX_PULL_V2_PATH, MAILBOX_ACK_CONTENT_TYPE, MAILBOX_ACK_PATH_TEMPLATE,
     MAILBOX_ACK_RECEIPT_CONTENT_TYPE, MAILBOX_CAPABILITY_AUTHORIZATION_SCHEME,
     MAILBOX_ENQUEUE_PATH_TEMPLATE, MAILBOX_ENVELOPE_CONTENT_TYPE,
     MAILBOX_ENVELOPE_RECEIPT_CONTENT_TYPE, MAILBOX_PULL_CONTENT_TYPE, MAILBOX_PULL_PATH_TEMPLATE,
     MAILBOX_PULL_RECEIPT_CONTENT_TYPE, MAILBOX_REGISTER_CONTENT_TYPE,
     MAILBOX_REGISTER_PATH_TEMPLATE, MAILBOX_REGISTER_RECEIPT_CONTENT_TYPE, MailboxNodeState,
     mailbox_router_with_state,
+};
+use dtx_realtime_sync::{
+    HEARTBEAT_INTERVAL_MILLIS, LEASE_TTL_MILLIS, RealtimeSyncError, RealtimeSyncStore, ReplayPage,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -77,7 +83,7 @@ async fn opaque_mailbox_is_replay_safe_non_consuming_and_owner_revocation_safe()
     let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
     let mailbox_store = MailboxPgStore::connect(harness.mailbox_runtime_options(), 4).await?;
     let app = mailbox_router_with_state(MailboxNodeState::with_clock(
-        mailbox_store,
+        mailbox_store.clone(),
         Arc::new(FixedClock(NOW)),
     ));
     let owner = enroll_active_device(&identity_store, 81, 82, 83, [84; 32]).await?;
@@ -343,6 +349,405 @@ async fn opaque_mailbox_is_replay_safe_non_consuming_and_owner_revocation_safe()
         "DEVICE_AUTHENTICATION_FAILED",
     )
     .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one boundary test keeps signed history authorization, two-device pull/ACK isolation, revocation, and ciphertext retention coherent"
+)]
+async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let mailbox_store = MailboxPgStore::connect(harness.mailbox_runtime_options(), 4).await?;
+    let app = mailbox_router_with_state(MailboxNodeState::with_clock(
+        mailbox_store.clone(),
+        Arc::new(FixedClock(NOW)),
+    ));
+    let owner = enroll_active_device(&identity_store, 101, 102, 103, [104; 32]).await?;
+    let second = add_active_device(&identity_store, &owner, 105, [106; 32]).await?;
+
+    let mailbox_id = MailboxId::new();
+    let capability = [107; 32];
+    let register_body = mailbox_registration_body(
+        mailbox_id,
+        owner.identity_id,
+        owner.device_id,
+        capability,
+        UtcMillis::new(EXPIRY)?,
+    )?;
+    let register_command = MailboxRegistrationCommand::new(
+        Sha256Digest::hash_domain(b"test-identity-mailbox-register-v2\0", b"register"),
+        mailbox_id,
+        owner.identity_id,
+        owner.device_id,
+        Sha256Digest::hash_domain(MAILBOX_WRITE_CAPABILITY_HASH_DOMAIN, &capability),
+        UtcMillis::new(EXPIRY)?,
+        register_body,
+    )?;
+    assert!(
+        !MailboxRepository
+            .register(
+                &mailbox_store,
+                &DeviceSessionCredential::new(owner.session_id, owner.session_secret)?,
+                &register_command,
+                UtcMillis::new(NOW)?,
+            )
+            .await?
+            .replayed()
+    );
+    let envelope_id = EnvelopeId::new();
+    assert_eq!(
+        send_envelope(
+            app.clone(),
+            "identity-mailbox-envelope-v2",
+            capability,
+            mailbox_id,
+            envelope_id,
+            mailbox_envelope_body(
+                envelope_id,
+                b"opaque-for-both-devices",
+                UtcMillis::new(EXPIRY)?
+            )?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+
+    let head_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT head_hash FROM identity.log_heads WHERE identity_id=$1")
+            .bind(owner.identity_id.to_string())
+            .fetch_one(harness.admin_pool())
+            .await?;
+    let unsigned_grant = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(owner.identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(second.device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Bytes(head_hash),
+        ),
+        (CanonicalValue::Unsigned(5), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Bytes(vec![108; 32]),
+        ),
+        (CanonicalValue::Unsigned(7), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Text(owner.device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Bytes(vec![109; 32]),
+        ),
+        (
+            CanonicalValue::Unsigned(10),
+            UtcMillis::new(NOW)?.to_canonical_value(),
+        ),
+    ]);
+    let unsigned_bytes = encode_deterministic_cbor(&unsigned_grant)?;
+    let mut grant_input = b"dirextalk.device-history-grant.v1\0".to_vec();
+    grant_input.extend_from_slice(&unsigned_bytes);
+    let mut pop_input = b"dirextalk.device-history-grant-pop.v1\0".to_vec();
+    pop_input.extend_from_slice(&unsigned_bytes);
+    let CanonicalValue::Map(mut grant_fields) = unsigned_grant else {
+        unreachable!()
+    };
+    grant_fields.push((
+        CanonicalValue::Unsigned(11),
+        signature(&SigningKey::from_bytes(&[103; 32]), &grant_input).to_canonical_value(),
+    ));
+    grant_fields.push((
+        CanonicalValue::Unsigned(12),
+        signature(&SigningKey::from_bytes(&[105; 32]), &pop_input).to_canonical_value(),
+    ));
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V1_PATH,
+            DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE,
+            None,
+            owner.session_id,
+            owner.session_secret,
+            encode_deterministic_cbor(&CanonicalValue::Map(grant_fields))?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+
+    let pull_body = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
+        (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
+    ]))?;
+    for device in [&owner, &second] {
+        let pulled = send_v2(
+            app.clone(),
+            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
+            None,
+            device.session_id,
+            device.session_secret,
+            pull_body.clone(),
+        )
+        .await?;
+        assert_eq!(pulled.status(), StatusCode::OK);
+        let decoded = decode_deterministic_cbor(&response_bytes(pulled).await?)?;
+        let CanonicalValue::Map(fields) = decoded else {
+            return Err("V2 pull receipt not a map".into());
+        };
+        assert!(matches!(&fields[4].1, CanonicalValue::Array(entries) if entries.len()==1));
+    }
+
+    let ack_body = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(1)),
+    ]))?;
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            IDENTITY_MAILBOX_ACK_V2_PATH,
+            IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
+            Some("identity-mailbox-owner-ack"),
+            owner.session_id,
+            owner.session_secret,
+            ack_body.clone(),
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED
+    );
+    let second_after_owner_ack = send_v2(
+        app.clone(),
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
+        None,
+        second.session_id,
+        second.session_secret,
+        pull_body,
+    )
+    .await?;
+    let CanonicalValue::Map(fields) =
+        decode_deterministic_cbor(&response_bytes(second_after_owner_ack).await?)?
+    else {
+        return Err("second V2 pull receipt not a map".into());
+    };
+    assert!(matches!(&fields[4].1, CanonicalValue::Array(entries) if entries.len()==1));
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            IDENTITY_MAILBOX_ACK_V2_PATH,
+            IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
+            Some("identity-mailbox-second-ack"),
+            second.session_id,
+            second.session_secret,
+            ack_body,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED
+    );
+    let states: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT device_id,contiguous_ack_sequence FROM messaging.device_delivery_state
+          WHERE identity_id=$1 ORDER BY device_id",
+    )
+    .bind(owner.identity_id.to_string())
+    .fetch_all(harness.admin_pool())
+    .await?;
+    assert_eq!(states.len(), 2);
+    assert!(states.iter().all(|(_, cursor)| *cursor == 1));
+    let retained: Vec<u8> = sqlx::query_scalar(
+        "SELECT opaque_ciphertext FROM messaging.mailbox_envelopes WHERE mailbox_id=$1 AND envelope_id=$2",
+    ).bind(*mailbox_id.as_uuid()).bind(*envelope_id.as_uuid()).fetch_one(harness.admin_pool()).await?;
+    assert_eq!(retained, b"opaque-for-both-devices");
+    sqlx::query(
+        "UPDATE messaging.device_history_grants SET revoked_at_ms=$3 \
+         WHERE identity_id=$1 AND new_device_id=$2",
+    )
+    .bind(owner.identity_id.to_string())
+    .bind(*second.device_id.as_uuid())
+    .bind(NOW + 1)
+    .execute(harness.admin_pool())
+    .await?;
+    assert_eq!(
+        send_v2(
+            app,
+            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
+            None,
+            second.session_id,
+            second.session_secret,
+            encode_deterministic_cbor(&CanonicalValue::Map(vec![
+                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+                (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
+                (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
+            ]))?,
+        )
+        .await?
+        .status(),
+        StatusCode::NOT_FOUND,
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one boundary test keeps fenced acquire, replay, ACK, heartbeat, expiry, and durable gap recovery coherent"
+)]
+async fn realtime_sync_fences_old_leases_and_requires_catch_up_after_a_gap()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let mailbox_store = MailboxPgStore::connect(harness.mailbox_runtime_options(), 4).await?;
+    let realtime_store =
+        RealtimeSyncStore::connect(harness.realtime_sync_runtime_options(), 4).await?;
+    let app = mailbox_router_with_state(MailboxNodeState::with_clock(
+        mailbox_store.clone(),
+        Arc::new(FixedClock(NOW)),
+    ));
+    let owner = enroll_active_device(&identity_store, 121, 122, 123, [124; 32]).await?;
+    let credential = DeviceSessionCredential::new(owner.session_id, owner.session_secret)?;
+
+    let mailbox_id = MailboxId::new();
+    let capability = [125; 32];
+    let registration_body = mailbox_registration_body(
+        mailbox_id,
+        owner.identity_id,
+        owner.device_id,
+        capability,
+        UtcMillis::new(EXPIRY)?,
+    )?;
+    let registration = MailboxRegistrationCommand::new(
+        Sha256Digest::hash_domain(b"test-realtime-register\0", b"register"),
+        mailbox_id,
+        owner.identity_id,
+        owner.device_id,
+        Sha256Digest::hash_domain(MAILBOX_WRITE_CAPABILITY_HASH_DOMAIN, &capability),
+        UtcMillis::new(EXPIRY)?,
+        registration_body,
+    )?;
+    MailboxRepository
+        .register(
+            &mailbox_store,
+            &credential,
+            &registration,
+            UtcMillis::new(NOW)?,
+        )
+        .await?;
+    let envelope_id = EnvelopeId::new();
+    assert_eq!(
+        send_envelope(
+            app,
+            "realtime-envelope-0001",
+            capability,
+            mailbox_id,
+            envelope_id,
+            mailbox_envelope_body(envelope_id, b"opaque", UtcMillis::new(EXPIRY)?)?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+
+    let first = realtime_store
+        .acquire(&credential, SafeUint::new(0)?, UtcMillis::new(NOW)?)
+        .await?;
+    let current = realtime_store
+        .acquire(&credential, SafeUint::new(0)?, UtcMillis::new(NOW + 1)?)
+        .await?;
+    assert_eq!(current.fence.get(), first.fence.get() + 1);
+    assert!(matches!(
+        realtime_store
+            .replay(
+                &credential,
+                first,
+                SafeUint::new(0)?,
+                UtcMillis::new(NOW + 2)?
+            )
+            .await,
+        Err(RealtimeSyncError::StaleLease)
+    ));
+
+    let ReplayPage::Events { highwater, events } = realtime_store
+        .replay(
+            &credential,
+            current,
+            SafeUint::new(0)?,
+            UtcMillis::new(NOW + 2)?,
+        )
+        .await?
+    else {
+        panic!("durable event must replay before expiry");
+    };
+    assert_eq!(highwater.get(), 1);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cursor.get(), 1);
+    realtime_store
+        .acknowledge(
+            &credential,
+            current,
+            SafeUint::new(1)?,
+            UtcMillis::new(NOW + 3)?,
+        )
+        .await?;
+
+    let renewed = realtime_store
+        .heartbeat(
+            &credential,
+            current,
+            UtcMillis::new(NOW + HEARTBEAT_INTERVAL_MILLIS)?,
+        )
+        .await?;
+    assert_eq!(
+        renewed.expires_at.get(),
+        NOW + HEARTBEAT_INTERVAL_MILLIS + LEASE_TTL_MILLIS
+    );
+    assert!(matches!(
+        realtime_store
+            .replay(
+                &credential,
+                renewed,
+                SafeUint::new(1)?,
+                UtcMillis::new(renewed.expires_at.get())?,
+            )
+            .await,
+        Err(RealtimeSyncError::StaleLease)
+    ));
+
+    sqlx::query(
+        "UPDATE realtime.journal SET created_at_ms=$2,expires_at_ms=$3 \
+         WHERE identity_id=$1 AND cursor=1",
+    )
+    .bind(owner.identity_id.to_string())
+    .bind(NOW - 2)
+    .bind(NOW - 1)
+    .execute(harness.admin_pool())
+    .await?;
+    let catch_up_lease = realtime_store
+        .acquire(&credential, SafeUint::new(0)?, UtcMillis::new(NOW + 4)?)
+        .await?;
+    assert!(matches!(
+        realtime_store
+            .replay(
+                &credential,
+                catch_up_lease,
+                SafeUint::new(0)?,
+                UtcMillis::new(NOW + 4)?,
+            )
+            .await?,
+        ReplayPage::CatchUpRequired { highwater } if highwater.get() == 1
+    ));
     Ok(())
 }
 
@@ -940,6 +1345,7 @@ async fn enroll_active_device_at(
         &device,
         identity_id,
         device_id,
+        device_seed.wrapping_add(1),
         genesis.entry_hash()?,
         2,
         now - 700,
@@ -1001,6 +1407,92 @@ async fn enroll_active_device_at(
     Ok(ActiveDevice {
         root,
         identity_id,
+        device_id,
+        session_id,
+        session_secret,
+    })
+}
+
+async fn add_active_device(
+    store: &IdentityPgStore,
+    owner: &ActiveDevice,
+    device_seed: u8,
+    session_secret: [u8; 32],
+) -> Result<ActiveDevice, Box<dyn Error>> {
+    let repository = IdentityLogRepository::new();
+    let head = repository
+        .load(store, owner.identity_id)
+        .await?
+        .ok_or("identity missing before second device add")?
+        .head();
+    let device = SigningKey::from_bytes(&[device_seed; 32]);
+    let device_id = DeviceId::new();
+    let event = device_add(
+        &owner.root,
+        &device,
+        owner.identity_id,
+        device_id,
+        device_seed.wrapping_add(1),
+        head.hash(),
+        head.sequence().get() + 1,
+        NOW - 100,
+    )?;
+    let command = IdentityAppendCommand::new(
+        Sha256Digest::hash_domain(b"test-mailbox-additional-device\0", &[device_seed]),
+        Some(head),
+        event.to_deterministic_cbor()?,
+    )?;
+    assert!(matches!(
+        repository
+            .append(store, &command, UtcMillis::new(NOW - 50)?)
+            .await?,
+        IdentityAppendOutcome::Committed(_)
+    ));
+    let challenge = DeviceSessionRepository
+        .issue_challenge(
+            store,
+            owner.identity_id,
+            device_id,
+            [device_seed; 32],
+            AUDIENCE,
+            UtcMillis::new(NOW)?,
+        )
+        .await?;
+    let session_id = DeviceSessionId::new();
+    let session_secret_hash =
+        Sha256Digest::hash_domain(DEVICE_SESSION_SECRET_HASH_DOMAIN, &session_secret);
+    let proof = signature(
+        &device,
+        &device_session_proof_input(
+            owner.identity_id,
+            device_id,
+            challenge.challenge_id(),
+            challenge.nonce(),
+            AUDIENCE,
+            session_id,
+            session_secret_hash,
+            challenge.session_expires_at(),
+        )?,
+    );
+    let completion = DeviceSessionCompletionCommand::new(
+        Sha256Digest::hash_domain(b"test-mailbox-additional-session\0", &[device_seed]),
+        owner.identity_id,
+        device_id,
+        challenge.challenge_id(),
+        session_id,
+        *challenge.nonce(),
+        session_secret,
+        proof,
+    )?;
+    assert!(matches!(
+        DeviceSessionRepository
+            .complete(store, &completion, UtcMillis::new(NOW)?)
+            .await?,
+        DeviceSessionOutcome::Issued(_)
+    ));
+    Ok(ActiveDevice {
+        root: SigningKey::from_bytes(&owner.root.to_bytes()),
+        identity_id: owner.identity_id,
         device_id,
         session_id,
         session_secret,
@@ -1221,6 +1713,32 @@ async fn send_acknowledgement(
     .map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn send_v2(
+    app: axum::Router,
+    path: &str,
+    content_type: &str,
+    idempotency_key: Option<&str>,
+    session_id: DeviceSessionId,
+    session_secret: [u8; 32],
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::AUTHORIZATION,
+            device_session_authorization(session_id, session_secret),
+        );
+    if let Some(key) = idempotency_key {
+        request = request.header("idempotency-key", key);
+    }
+    app.oneshot(request.body(Body::from(body))?)
+        .await
+        .map_err(Into::into)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the test helper mirrors the complete public mailbox HTTP request boundary"
@@ -1414,6 +1932,7 @@ fn device_add(
     device: &SigningKey,
     identity_id: IdentityId,
     device_id: DeviceId,
+    encryption_seed: u8,
     previous_hash: Sha256Digest,
     sequence: u64,
     occurred_at: i64,
@@ -1425,7 +1944,7 @@ fn device_add(
         identity_id,
         device_id,
         device_key,
-        DeviceEncryptionPublicKey::try_from([7_u8; 32])?,
+        DeviceEncryptionPublicKey::try_from([encryption_seed; 32])?,
         root_key,
         UtcMillis::new(occurred_at - 1)?,
     )?;

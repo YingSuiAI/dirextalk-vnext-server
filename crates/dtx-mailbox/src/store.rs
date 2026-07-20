@@ -108,6 +108,15 @@ async fn validate_mailbox_runtime_role(pool: &PgPool) -> Result<(), MailboxPersi
              AND has_table_privilege(current_user, 'messaging.mailbox_enqueue_claims', 'INSERT')
              AND has_table_privilege(current_user, 'messaging.mailbox_ack_claims', 'SELECT')
              AND has_table_privilege(current_user, 'messaging.mailbox_ack_claims', 'INSERT')
+             AND has_table_privilege(current_user, 'messaging.identity_delivery_heads', 'SELECT,INSERT,UPDATE')
+             AND has_table_privilege(current_user, 'messaging.identity_delivery_journal', 'SELECT,INSERT')
+             AND has_table_privilege(current_user, 'messaging.device_delivery_state', 'SELECT,INSERT,UPDATE')
+             AND has_table_privilege(current_user, 'messaging.device_delivery_ack_claims', 'SELECT,INSERT')
+             AND has_table_privilege(current_user, 'messaging.device_history_grants', 'SELECT,INSERT,UPDATE')
+             AND has_schema_privilege(current_user, 'realtime', 'USAGE')
+             AND has_table_privilege(current_user, 'realtime.identity_heads', 'SELECT,INSERT,UPDATE')
+             AND has_table_privilege(current_user, 'realtime.journal', 'SELECT,INSERT')
+             AND has_table_privilege(current_user, 'realtime.outbox', 'SELECT,INSERT')
              AND has_table_privilege(current_user, 'messaging.attachment_objects', 'SELECT')
              AND has_table_privilege(current_user, 'messaging.attachment_objects', 'INSERT')
              AND has_table_privilege(current_user, 'messaging.attachment_objects', 'UPDATE')
@@ -120,6 +129,11 @@ async fn validate_mailbox_runtime_role(pool: &PgPool) -> Result<(), MailboxPersi
              AND has_function_privilege(
                  current_user,
                  'identity.identity_mailbox_reader_authorized()'::regprocedure,
+                 'EXECUTE'
+             )
+             AND has_function_privilege(
+                 current_user,
+                 'identity.identity_realtime_reader_authorized()'::regprocedure,
                  'EXECUTE'
              )
              AND has_function_privilege(
@@ -239,7 +253,8 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, MailboxPersi
                     AND procedure.oid NOT IN (
                         'identity.identity_runtime_authorized()'::regprocedure,
                         'identity.identity_owner_authorized()'::regprocedure,
-                        'identity.identity_mailbox_reader_authorized()'::regprocedure
+                        'identity.identity_mailbox_reader_authorized()'::regprocedure,
+                        'identity.identity_realtime_reader_authorized()'::regprocedure
                     )
              )
              OR EXISTS (

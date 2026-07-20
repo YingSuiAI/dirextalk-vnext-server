@@ -24,11 +24,14 @@ use dtx_domain::{
 };
 use dtx_identity_persistence::DeviceSessionCredential;
 use dtx_mailbox::{
+    DeviceHistoryGrantCommand, IdentityMailboxAckCommand, IdentityMailboxPullRequest,
     MailboxAcknowledgementCommand, MailboxEnvelopeCommand, MailboxOperationOutcome,
     MailboxPersistenceError, MailboxPgStore, MailboxPullRequest, MailboxRegistrationCommand,
     MailboxRepository, MailboxWriteCapability,
 };
-use dtx_wire::{CanonicalValue, SafeUint, Sha256Digest, UtcMillis, decode_deterministic_cbor};
+use dtx_wire::{
+    CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, UtcMillis, decode_deterministic_cbor,
+};
 use serde::Serialize;
 
 mod attachment;
@@ -42,6 +45,11 @@ pub const MAILBOX_ENQUEUE_PATH_TEMPLATE: &str =
 pub const MAILBOX_PULL_PATH_TEMPLATE: &str = "/v1/mailboxes/{mailbox_id}/pull";
 /// Owner acknowledgement route template.
 pub const MAILBOX_ACK_PATH_TEMPLATE: &str = "/v1/mailboxes/{mailbox_id}/acks";
+/// Identity-owned multi-device pull route.
+pub const IDENTITY_MAILBOX_PULL_V2_PATH: &str = "/v2/mailbox/pull";
+/// Per-device contiguous identity delivery acknowledgement route.
+pub const IDENTITY_MAILBOX_ACK_V2_PATH: &str = "/v2/mailbox/acks";
+pub const DEVICE_HISTORY_GRANT_V1_PATH: &str = "/v2/devices/history-grants";
 
 /// Exact registration request media type.
 pub const MAILBOX_REGISTER_CONTENT_TYPE: &str =
@@ -65,6 +73,18 @@ pub const MAILBOX_ACK_CONTENT_TYPE: &str = "application/vnd.dirextalk.mailbox-ac
 /// Exact acknowledgement receipt media type.
 pub const MAILBOX_ACK_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mailbox-acks-receipt.v1+cbor";
+pub const IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.identity-mailbox-pull.v2+cbor";
+pub const IDENTITY_MAILBOX_PULL_RECEIPT_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.identity-mailbox-pull-receipt.v2+cbor";
+pub const IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.identity-mailbox-ack.v2+cbor";
+pub const IDENTITY_MAILBOX_ACK_RECEIPT_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.identity-mailbox-ack-receipt.v2+cbor";
+pub const DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.device-history-grant.v1+cbor";
+pub const DEVICE_HISTORY_GRANT_RECEIPT_V1_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.device-history-grant-receipt.v1+cbor";
 /// Exact authorization scheme for owner device sessions.
 pub const DEVICE_SESSION_AUTHORIZATION_SCHEME: &str = "DTX-Device-Session";
 /// Exact authorization scheme for write-only mailbox capabilities.
@@ -83,6 +103,8 @@ const HTTP_REGISTER_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
 const HTTP_ENQUEUE_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
     b"dirextalk.mailbox-http-enqueue-idempotency-key.v1\0";
 const HTTP_ACK_IDEMPOTENCY_HASH_DOMAIN: &[u8] = b"dirextalk.mailbox-http-ack-idempotency-key.v1\0";
+const HTTP_IDENTITY_ACK_V2_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.identity-mailbox-http-ack-idempotency-key.v2\0";
 
 /// Shared state for the isolated public mailbox router.
 #[derive(Clone)]
@@ -261,6 +283,83 @@ impl MailboxNodeState {
             MAILBOX_ACK_RECEIPT_CONTENT_TYPE,
         ))
     }
+
+    async fn pull_identity_v2(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<MailboxSuccess, MailboxFailure> {
+        if !has_exact_content_type(headers, IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+        {
+            return Err(MailboxFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)?;
+        let bytes = read_exact_body(body, MAX_PULL_BODY_BYTES).await?;
+        let request = parse_identity_pull_v2_request(&bytes)?;
+        let outcome = self
+            .repository
+            .pull_identity_v2(&self.store, &credential, request, self.now()?)
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        Ok(MailboxSuccess {
+            status: StatusCode::OK,
+            exact_receipt_bytes: outcome.receipt_bytes().to_vec(),
+            content_type: IDENTITY_MAILBOX_PULL_RECEIPT_V2_CONTENT_TYPE,
+        })
+    }
+
+    async fn acknowledge_identity_v2(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<MailboxSuccess, MailboxFailure> {
+        if !has_exact_content_type(headers, IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+        {
+            return Err(MailboxFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)?;
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_IDENTITY_ACK_V2_IDEMPOTENCY_HASH_DOMAIN)?;
+        let bytes = read_exact_body(body, MAX_ACK_BODY_BYTES).await?;
+        let sequence = parse_identity_ack_v2_request(&bytes)?;
+        let command = IdentityMailboxAckCommand::new(idempotency_key_hash, sequence, bytes)
+            .map_err(|error| map_persistence_error(&error))?;
+        let outcome = self
+            .repository
+            .acknowledge_identity_v2(&self.store, &credential, &command, self.now()?)
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        Ok(MailboxSuccess::write(
+            &outcome,
+            IDENTITY_MAILBOX_ACK_RECEIPT_V2_CONTENT_TYPE,
+        ))
+    }
+
+    async fn grant_device_history(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<MailboxSuccess, MailboxFailure> {
+        if !has_exact_content_type(headers, DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+        {
+            return Err(MailboxFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)?;
+        let bytes = read_exact_body(body, MAX_REGISTER_BODY_BYTES).await?;
+        let command = parse_device_history_grant(&bytes)?;
+        let outcome = self
+            .repository
+            .grant_device_history(&self.store, &credential, &command, self.now()?)
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        Ok(MailboxSuccess::write(
+            &outcome,
+            DEVICE_HISTORY_GRANT_RECEIPT_V1_CONTENT_TYPE,
+        ))
+    }
 }
 
 /// Builds the public isolated mailbox router using the system UTC clock.
@@ -275,6 +374,15 @@ pub fn mailbox_router_with_state(state: MailboxNodeState) -> Router {
         .route(MAILBOX_ENQUEUE_PATH_TEMPLATE, put(enqueue_mailbox_envelope))
         .route(MAILBOX_PULL_PATH_TEMPLATE, post(pull_mailbox))
         .route(MAILBOX_ACK_PATH_TEMPLATE, post(acknowledge_mailbox))
+        .route(
+            IDENTITY_MAILBOX_PULL_V2_PATH,
+            post(pull_identity_mailbox_v2),
+        )
+        .route(
+            IDENTITY_MAILBOX_ACK_V2_PATH,
+            post(acknowledge_identity_mailbox_v2),
+        )
+        .route(DEVICE_HISTORY_GRANT_V1_PATH, post(grant_device_history))
         .merge(attachment::attachment_router())
         .with_state(state)
 }
@@ -329,6 +437,39 @@ async fn acknowledge_mailbox(
     let request_id = RequestId::new();
     let (parts, body) = request.into_parts();
     match state.acknowledge(&mailbox_id, &parts.headers, body).await {
+        Ok(success) => mailbox_success_response(success, request_id),
+        Err(failure) => mailbox_failure_response(failure, request_id),
+    }
+}
+
+async fn pull_identity_mailbox_v2(
+    State(state): State<MailboxNodeState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.pull_identity_v2(&parts.headers, body).await {
+        Ok(success) => mailbox_success_response(success, request_id),
+        Err(failure) => mailbox_failure_response(failure, request_id),
+    }
+}
+
+async fn acknowledge_identity_mailbox_v2(
+    State(state): State<MailboxNodeState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.acknowledge_identity_v2(&parts.headers, body).await {
+        Ok(success) => mailbox_success_response(success, request_id),
+        Err(failure) => mailbox_failure_response(failure, request_id),
+    }
+}
+
+async fn grant_device_history(State(state): State<MailboxNodeState>, request: Request) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.grant_device_history(&parts.headers, body).await {
         Ok(success) => mailbox_success_response(success, request_id),
         Err(failure) => mailbox_failure_response(failure, request_id),
     }
@@ -411,6 +552,57 @@ fn parse_acknowledgement_request(bytes: &[u8]) -> Result<AcknowledgementRequest,
     Ok(AcknowledgementRequest { envelope_ids })
 }
 
+fn parse_identity_pull_v2_request(
+    bytes: &[u8],
+) -> Result<IdentityMailboxPullRequest, MailboxFailure> {
+    let value = decode_deterministic_cbor(bytes).map_err(|_| MailboxFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 3)?;
+    require_cbor_version_v2(cbor_field(fields, 1)?)?;
+    let after_sequence = parse_cbor_safe_uint(cbor_field(fields, 2)?)?;
+    let CanonicalValue::Unsigned(limit) = cbor_field(fields, 3)? else {
+        return Err(MailboxFailure::InvalidRequest);
+    };
+    IdentityMailboxPullRequest::new(
+        after_sequence,
+        u16::try_from(*limit).map_err(|_| MailboxFailure::InvalidRequest)?,
+    )
+    .map_err(|error| map_persistence_error(&error))
+}
+
+fn parse_identity_ack_v2_request(bytes: &[u8]) -> Result<SafeUint, MailboxFailure> {
+    let value = decode_deterministic_cbor(bytes).map_err(|_| MailboxFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 2)?;
+    require_cbor_version_v2(cbor_field(fields, 1)?)?;
+    parse_cbor_safe_uint(cbor_field(fields, 2)?)
+}
+
+fn parse_device_history_grant(bytes: &[u8]) -> Result<DeviceHistoryGrantCommand, MailboxFailure> {
+    let value = decode_deterministic_cbor(bytes).map_err(|_| MailboxFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 12)?;
+    require_cbor_version(cbor_field(fields, 1)?)?;
+    if cbor_field(fields, 7)? != &CanonicalValue::Unsigned(1) {
+        return Err(MailboxFailure::InvalidRequest);
+    }
+    let CanonicalValue::Text(authorizer_id) = cbor_field(fields, 8)? else {
+        return Err(MailboxFailure::InvalidRequest);
+    };
+    let earliest = parse_cbor_safe_uint(cbor_field(fields, 5)?)?;
+    DeviceHistoryGrantCommand::new(
+        parse_cbor_identity_id(cbor_field(fields, 2)?)?,
+        parse_cbor_device_id(cbor_field(fields, 3)?)?,
+        Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 4)?)?),
+        earliest.get(),
+        Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 6)?)?),
+        authorizer_id.clone(),
+        Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 9)?)?),
+        parse_cbor_utc_millis(cbor_field(fields, 10)?)?,
+        Ed25519Signature::from_bytes(parse_cbor_bytes(cbor_field(fields, 11)?)?),
+        Ed25519Signature::from_bytes(parse_cbor_bytes(cbor_field(fields, 12)?)?),
+        bytes.to_vec(),
+    )
+    .map_err(|error| map_persistence_error(&error))
+}
+
 fn exact_cbor_fields(
     value: &CanonicalValue,
     expected_count: usize,
@@ -441,6 +633,14 @@ fn cbor_field(
 
 fn require_cbor_version(value: &CanonicalValue) -> Result<(), MailboxFailure> {
     if value == &CanonicalValue::Unsigned(1) {
+        Ok(())
+    } else {
+        Err(MailboxFailure::InvalidRequest)
+    }
+}
+
+fn require_cbor_version_v2(value: &CanonicalValue) -> Result<(), MailboxFailure> {
+    if value == &CanonicalValue::Unsigned(2) {
         Ok(())
     } else {
         Err(MailboxFailure::InvalidRequest)

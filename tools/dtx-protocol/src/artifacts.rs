@@ -156,11 +156,74 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_mls_sequencer_v4(root)?;
     validate_conversation_agent_grant_v1(root)?;
     validate_v36_additive_contracts(root)?;
+    validate_realtime_sync_v1(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_realtime_sync_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/realtime-sync/v1/realtime-sync-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse Realtime Sync V1 CDDL: {error}")))?;
+    let vector =
+        read_json(&root.join("protocol/test-vectors/realtime-sync/v1/realtime-sync-v1.json"))?;
+    if vector.get("version").and_then(Value::as_u64) != Some(1)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(37)
+        || vector.get("subprotocol").and_then(Value::as_str) != Some("dirextalk.realtime-sync.v1")
+    {
+        return Err(ProtocolToolError::new(
+            "Realtime Sync V1 vector version/baseline/subprotocol drift",
+        ));
+    }
+    for (rule, field) in [
+        ("hello-v1", "hello_canonical_cbor_hex"),
+        (
+            "catch-up-required-v1",
+            "catch_up_required_canonical_cbor_hex",
+        ),
+        ("invalidation-v1", "invalidation_canonical_cbor_hex"),
+        (
+            "identity-mailbox-pull-v2",
+            "identity_pull_v2_canonical_cbor_hex",
+        ),
+        (
+            "identity-mailbox-ack-v2",
+            "identity_ack_v2_canonical_cbor_hex",
+        ),
+    ] {
+        validate_cddl_hex(rule, &cddl, json_string(&vector, field)?)?;
+    }
+    for pointer in [
+        "/privacy/invalidation_subject_is_digest_only",
+        "/privacy/mailbox_ciphertext_not_available_to_gateway",
+        "/privacy/wake_hint_contains_no_plaintext",
+    ] {
+        if vector.pointer(pointer).and_then(Value::as_bool) != Some(true) {
+            return Err(ProtocolToolError::new(format!(
+                "Realtime Sync V1 privacy invariant {pointer} is not frozen true"
+            )));
+        }
+    }
+    let invalidation = decode_hex(json_string(&vector, "invalidation_canonical_cbor_hex")?)?;
+    let decoded = decode_deterministic_cbor(&invalidation)
+        .map_err(|_| ProtocolToolError::new("Realtime Sync V1 invalidation is not canonical"))?;
+    let CanonicalValue::Map(fields) = decoded else {
+        return Err(ProtocolToolError::new(
+            "Realtime Sync V1 invalidation is not a map",
+        ));
+    };
+    if fields
+        .iter()
+        .any(|(_, value)| matches!(value, CanonicalValue::Text(_)))
+    {
+        return Err(ProtocolToolError::new(
+            "Realtime Sync V1 invalidation must not contain plaintext text fields",
+        ));
+    }
     Ok(())
 }
 

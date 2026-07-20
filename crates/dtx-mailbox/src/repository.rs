@@ -108,6 +108,7 @@ impl MailboxRepository {
             .bind(now.get())
             .execute(&mut *session.connection())
             .await?;
+            initialize_delivery_heads(session.connection(), command.owner_identity_id()).await?;
             sqlx::query(
                 "INSERT INTO messaging.mailbox_registration_claims (
                      owner_identity_id, owner_device_id, idempotency_key_hash,
@@ -199,13 +200,42 @@ impl MailboxRepository {
                 ))?;
             validate_envelope_expiry(command.expires_at(), mailbox.expires_at, now)?;
 
-            let next_count = mailbox
-                .active_envelope_count
+            // A legacy owner ACK releases its delivery cursor but ciphertext
+            // remains eligible for other devices until expiry. Capacity must
+            // therefore follow retained live bytes, not the V14 active cursor
+            // counters, or repeated ACK/enqueue cycles could bypass the bound.
+            let (retained_count, retained_bytes): (i64, i64) = sqlx::query_as(
+                "SELECT count(*), COALESCE(sum(octet_length(opaque_ciphertext)),0)::bigint
+                   FROM messaging.mailbox_envelopes
+                  WHERE mailbox_id=$1 AND expires_at_ms>$2",
+            )
+            .bind(*command.mailbox_id().as_uuid())
+            .bind(now.get())
+            .fetch_one(&mut *session.connection())
+            .await?;
+            let next_retained_count = retained_count
                 .checked_add(1)
                 .ok_or(MailboxPersistenceError::CapacityExceeded)?;
             let opaque_bytes = i64::try_from(command.opaque_ciphertext().len()).map_err(|_| {
                 MailboxPersistenceError::InvalidCommand("mailbox opaque ciphertext byte length")
             })?;
+            let next_retained_bytes = retained_bytes
+                .checked_add(opaque_bytes)
+                .ok_or(MailboxPersistenceError::CapacityExceeded)?;
+            if usize::try_from(next_retained_count)
+                .ok()
+                .is_none_or(|value| value > MAX_ACTIVE_ENVELOPES)
+                || usize::try_from(next_retained_bytes)
+                    .ok()
+                    .is_none_or(|value| value > MAX_ACTIVE_ENVELOPE_BYTES)
+            {
+                return Err(MailboxPersistenceError::CapacityExceeded);
+            }
+
+            let next_count = mailbox
+                .active_envelope_count
+                .checked_add(1)
+                .ok_or(MailboxPersistenceError::CapacityExceeded)?;
             let next_bytes = mailbox
                 .active_envelope_bytes
                 .checked_add(opaque_bytes)
@@ -275,6 +305,13 @@ impl MailboxRepository {
             .bind(command.expires_at().get())
             .bind(now.get())
             .execute(&mut *session.connection())
+            .await?;
+            append_identity_delivery_and_realtime(
+                session.connection(),
+                mailbox.owner_identity_id,
+                command,
+                now,
+            )
             .await?;
             sqlx::query(
                 "INSERT INTO messaging.mailbox_enqueue_claims (
@@ -375,7 +412,7 @@ impl MailboxRepository {
         finish_transaction(session, result).await
     }
 
-    /// Acknowledges a bounded page of delivered envelopes for its owner.
+    /// Acknowledges a bounded page of delivered envelopes for its owner device.
     ///
     /// Authentication precedes idempotent replay; an owner session revoked
     /// after a response loss cannot resurrect its old acknowledgement receipt.
@@ -385,7 +422,7 @@ impl MailboxRepository {
     /// Returns a durable replay, authorization, conflict, or storage result.
     #[allow(
         clippy::too_many_lines,
-        reason = "the owner authorization, terminal state transition, and replay claim share one transaction boundary"
+        reason = "owner authorization, device-local acknowledgement, and replay claim share one transaction boundary"
     )]
     pub async fn acknowledge(
         self,
@@ -495,7 +532,6 @@ impl MailboxRepository {
             .bind(next_bytes)
             .execute(&mut *session.connection())
             .await?;
-
             let receipt =
                 encode_acknowledgement_receipt(command.mailbox_id(), command.envelope_ids())?;
             let stored_receipt_hash = receipt_hash(&receipt);
@@ -522,6 +558,90 @@ impl MailboxRepository {
     }
 }
 
+async fn append_identity_delivery_and_realtime(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+    command: &MailboxEnvelopeCommand,
+    now: UtcMillis,
+) -> Result<(), MailboxPersistenceError> {
+    initialize_delivery_heads(connection, identity_id).await?;
+    let delivery_sequence: i64 = sqlx::query_scalar(
+        "UPDATE messaging.identity_delivery_heads
+            SET next_sequence=next_sequence+1
+          WHERE identity_id=$1
+      RETURNING next_sequence",
+    )
+    .bind(identity_id.to_string())
+    .fetch_one(&mut *connection)
+    .await?;
+    sqlx::query(
+        "INSERT INTO messaging.identity_delivery_journal(
+             identity_id, delivery_sequence, mailbox_id, envelope_id, expires_at_ms, created_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(identity_id.to_string())
+    .bind(delivery_sequence)
+    .bind(*command.mailbox_id().as_uuid())
+    .bind(*command.envelope_id().as_uuid())
+    .bind(command.expires_at().get())
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await?;
+
+    let realtime_cursor: i64 = sqlx::query_scalar(
+        "UPDATE realtime.identity_heads
+            SET next_cursor=next_cursor+1
+          WHERE identity_id=$1
+      RETURNING next_cursor",
+    )
+    .bind(identity_id.to_string())
+    .fetch_one(&mut *connection)
+    .await?;
+    let subject_digest = Sha256Digest::hash_domain(
+        b"dirextalk.realtime-mailbox-subject.v1\0",
+        command.envelope_id().as_uuid().as_bytes(),
+    );
+    sqlx::query(
+        "INSERT INTO realtime.journal(
+             identity_id, cursor, event_kind, subject_digest, created_at_ms, expires_at_ms
+         ) VALUES ($1,$2,'mailbox_delivery',$3,$4,$5)",
+    )
+    .bind(identity_id.to_string())
+    .bind(realtime_cursor)
+    .bind(subject_digest.as_bytes().as_slice())
+    .bind(now.get())
+    .bind(command.expires_at().get())
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query("INSERT INTO realtime.outbox(identity_id, cursor) VALUES ($1,$2)")
+        .bind(identity_id.to_string())
+        .bind(realtime_cursor)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
+async fn initialize_delivery_heads(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+) -> Result<(), MailboxPersistenceError> {
+    sqlx::query(
+        "INSERT INTO messaging.identity_delivery_heads(identity_id, next_sequence)
+         VALUES ($1, 0) ON CONFLICT (identity_id) DO NOTHING",
+    )
+    .bind(identity_id.to_string())
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(
+        "INSERT INTO realtime.identity_heads(identity_id, next_cursor, journal_floor)
+         VALUES ($1, 0, 1) ON CONFLICT (identity_id) DO NOTHING",
+    )
+    .bind(identity_id.to_string())
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
 struct MailboxRow {
     owner_identity_id: IdentityId,
     owner_device_id: DeviceId,
@@ -539,7 +659,7 @@ struct PulledEnvelope {
     expires_at: UtcMillis,
 }
 
-async fn authenticate(
+pub(crate) async fn authenticate(
     connection: &mut PgConnection,
     credential: &DeviceSessionCredential,
     now: UtcMillis,
@@ -554,7 +674,7 @@ async fn authenticate(
         })
 }
 
-async fn finish_transaction<T>(
+pub(crate) async fn finish_transaction<T>(
     session: crate::MailboxSession<'_>,
     result: Result<T, MailboxPersistenceError>,
 ) -> Result<T, MailboxPersistenceError> {

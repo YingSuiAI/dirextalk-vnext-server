@@ -12,6 +12,9 @@ BEGIN
     IF to_regrole('dtx_mailbox_runtime') IS NULL THEN
         CREATE ROLE dtx_mailbox_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF to_regrole('dtx_realtime_sync_runtime') IS NULL THEN
+        CREATE ROLE dtx_realtime_sync_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     IF to_regrole('dtx_public_feed_runtime') IS NULL THEN
         CREATE ROLE dtx_public_feed_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
@@ -23,6 +26,9 @@ BEGIN
     END IF;
     IF to_regrole('dtx_mailbox_node') IS NULL THEN
         CREATE ROLE dtx_mailbox_node LOGIN IN ROLE dtx_mailbox_runtime NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF to_regrole('dtx_realtime_sync_gateway') IS NULL THEN
+        CREATE ROLE dtx_realtime_sync_gateway LOGIN IN ROLE dtx_realtime_sync_runtime NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
     IF to_regrole('dtx_public_feed_node') IS NULL THEN
         CREATE ROLE dtx_public_feed_node LOGIN NOINHERIT IN ROLE dtx_public_feed_runtime NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;

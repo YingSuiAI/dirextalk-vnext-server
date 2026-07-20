@@ -1,0 +1,23 @@
+[package]
+name = "dtx-realtime-sync-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+axum-server.workspace = true
+base64ct.workspace = true
+dtx-domain = { path = "../../crates/dtx-domain" }
+dtx-identity-persistence = { path = "../../crates/dtx-identity-persistence" }
+dtx-realtime-sync = { path = "../../crates/dtx-realtime-sync" }
+dtx-wire = { path = "../../crates/dtx-wire" }
+futures-util.workspace = true
+rustls.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
