@@ -191,6 +191,14 @@ const V39_ARTIFACT_PATHS: &[&str] = &[
     "protocol/cddl/realtime-sync/v2",
     "protocol/test-vectors/realtime-sync/v2",
 ];
+const V40_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/history-recovery/v1",
+    "protocol/openapi/history-recovery/v1",
+    "protocol/test-vectors/history-recovery/v1",
+    "protocol/cddl/mls-sequencer/v5",
+    "protocol/openapi/mls-sequencer/v5",
+    "protocol/test-vectors/mls-sequencer/v5",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -440,6 +448,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v39/manifest.json",
         includes_registries: false,
         artifact_paths: V39_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 40,
+        path: "protocol/baseline/v40/manifest.json",
+        includes_registries: false,
+        artifact_paths: V40_ARTIFACT_PATHS,
     },
 ];
 
@@ -1024,11 +1038,37 @@ mod tests {
 
     #[test]
     fn v39_selects_only_realtime_continuity_v2_contracts() {
-        let v39 = BASELINE_SPECS.last().expect("v39 baseline spec");
+        let v39 = BASELINE_SPECS
+            .iter()
+            .find(|spec| spec.version == 39)
+            .expect("v39 baseline spec");
         assert_eq!(v39.version, 39);
         assert_eq!(v39.path, "protocol/baseline/v39/manifest.json");
         assert_eq!(v39.artifact_paths, V39_ARTIFACT_PATHS);
         assert_eq!(V39_ARTIFACT_PATHS.len(), 2);
         assert!(!v39.includes_registries);
+    }
+
+    #[test]
+    fn v40_selects_exact_history_recovery_and_mls_v5_artifacts() {
+        let v40 = BASELINE_SPECS
+            .iter()
+            .find(|spec| spec.version == 40)
+            .expect("v40 baseline spec");
+        assert_eq!(v40.version, 40);
+        assert_eq!(v40.path, "protocol/baseline/v40/manifest.json");
+        assert_eq!(v40.artifact_paths, V40_ARTIFACT_PATHS);
+        assert_eq!(
+            V40_ARTIFACT_PATHS,
+            [
+                "protocol/cddl/history-recovery/v1",
+                "protocol/openapi/history-recovery/v1",
+                "protocol/test-vectors/history-recovery/v1",
+                "protocol/cddl/mls-sequencer/v5",
+                "protocol/openapi/mls-sequencer/v5",
+                "protocol/test-vectors/mls-sequencer/v5",
+            ]
+        );
+        assert!(!v40.includes_registries);
     }
 }

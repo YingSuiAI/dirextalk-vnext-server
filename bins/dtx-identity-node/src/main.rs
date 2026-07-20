@@ -88,11 +88,11 @@ fn load_database_options() -> Result<PgConnectOptions, NodeError> {
 
 #[cfg(unix)]
 async fn shutdown_signal() {
-    let mut termination =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(signal) => signal,
-            Err(_) => return,
-        };
+    let Ok(mut termination) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        return;
+    };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = termination.recv() => {},

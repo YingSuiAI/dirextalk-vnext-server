@@ -9,12 +9,15 @@ use std::{
     time::Duration,
 };
 
-use dtx_domain::{DeviceId, IdentityId};
+use dtx_domain::{DeviceEnrollmentChallengeId, DeviceId, IdentityId};
 use dtx_identity_log::{
-    DeviceStatusV1, IdentityLogEventV1, IdentityLogPageV1, IdentityLogV1,
-    MAX_IDENTITY_LOG_PAGE_BYTES, MAX_IDENTITY_LOG_PAGE_EVENTS,
+    DeviceStatusV1, IdentityLogEventPayloadV1, IdentityLogEventV1, IdentityLogPageV1,
+    IdentityLogV1, MAX_IDENTITY_LOG_PAGE_BYTES, MAX_IDENTITY_LOG_PAGE_EVENTS,
 };
-use dtx_wire::SigningPublicKey;
+use dtx_wire::{
+    CanonicalEncode, CanonicalValue, SafeUint, Sha256Digest, SigningPublicKey, UtcMillis,
+    decode_deterministic_cbor, encode_deterministic_cbor,
+};
 use reqwest::{Certificate, Client, StatusCode, Url, header};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use x509_parser::parse_x509_certificate;
@@ -22,6 +25,338 @@ use x509_parser::parse_x509_certificate;
 const IDENTITY_LOG_PAGE_CONTENT_TYPE: &str = "application/vnd.dirextalk.identity-log-page.v1+cbor";
 const MAX_IDENTITY_LOG_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IDENTITY_LOG_PAGES: usize = 256;
+/// Exact origin-authenticated recovery authorization projection media type.
+pub const MLS_V5_RECOVERY_AUTHORIZATION_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.mls-v5-recovery-authorization.v1+cbor";
+/// Maximum accepted redacted recovery authorization projection size.
+pub const MAX_MLS_V5_RECOVERY_AUTHORIZATION_BYTES: usize = 4_096;
+/// Stable authority identifier domain shared with the history-grant contract.
+pub const HISTORY_RECOVERY_AUTHORITY_ID_DOMAIN: &[u8] =
+    b"dirextalk.device-history-authority-id.v1\0";
+
+/// Exact facts sent to an identity origin for one MLS V5 recovery admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MlsV5RecoveryAuthorizationQuery {
+    identity_id: IdentityId,
+    request_id: DeviceEnrollmentChallengeId,
+    candidate_device_id: DeviceId,
+    controller_device_id: DeviceId,
+    identity_head_digest: Sha256Digest,
+    key_package_digest: Sha256Digest,
+    recovery_request_digest: Sha256Digest,
+    recovery_scope_digest: Sha256Digest,
+}
+
+impl MlsV5RecoveryAuthorizationQuery {
+    /// Builds the exact transport query for one recovery admission.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        identity_id: IdentityId,
+        request_id: DeviceEnrollmentChallengeId,
+        candidate_device_id: DeviceId,
+        controller_device_id: DeviceId,
+        identity_head_digest: Sha256Digest,
+        key_package_digest: Sha256Digest,
+        recovery_request_digest: Sha256Digest,
+        recovery_scope_digest: Sha256Digest,
+    ) -> Self {
+        Self {
+            identity_id,
+            request_id,
+            candidate_device_id,
+            controller_device_id,
+            identity_head_digest,
+            key_package_digest,
+            recovery_request_digest,
+            recovery_scope_digest,
+        }
+    }
+
+    #[must_use]
+    pub const fn identity_id(self) -> IdentityId {
+        self.identity_id
+    }
+
+    #[must_use]
+    pub const fn request_id(self) -> DeviceEnrollmentChallengeId {
+        self.request_id
+    }
+
+    #[must_use]
+    pub const fn candidate_device_id(self) -> DeviceId {
+        self.candidate_device_id
+    }
+
+    #[must_use]
+    pub const fn controller_device_id(self) -> DeviceId {
+        self.controller_device_id
+    }
+
+    #[must_use]
+    pub const fn identity_head_digest(self) -> Sha256Digest {
+        self.identity_head_digest
+    }
+
+    #[must_use]
+    pub const fn key_package_digest(self) -> Sha256Digest {
+        self.key_package_digest
+    }
+
+    #[must_use]
+    pub const fn recovery_request_digest(self) -> Sha256Digest {
+        self.recovery_request_digest
+    }
+
+    #[must_use]
+    pub const fn recovery_scope_digest(self) -> Sha256Digest {
+        self.recovery_scope_digest
+    }
+
+    #[must_use]
+    pub fn canonical_query(self) -> String {
+        format!(
+            "candidate_device_id={}&controller_device_id={}&identity_head_digest={}&key_package_digest={}&recovery_request_digest={}&recovery_scope_digest={}",
+            self.candidate_device_id,
+            self.controller_device_id,
+            self.identity_head_digest,
+            self.key_package_digest,
+            self.recovery_request_digest,
+            self.recovery_scope_digest,
+        )
+    }
+}
+
+/// Current authority kind retained in the redacted origin projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MlsV5RecoveryAuthorityKind {
+    ActiveDevice,
+    Root,
+    Recovery,
+}
+
+impl MlsV5RecoveryAuthorityKind {
+    const fn code(self) -> u64 {
+        match self {
+            Self::ActiveDevice => 1,
+            Self::Root => 2,
+            Self::Recovery => 3,
+        }
+    }
+
+    fn from_code(value: u64) -> Result<Self, FederatedIdentityError> {
+        match value {
+            1 => Ok(Self::ActiveDevice),
+            2 => Ok(Self::Root),
+            3 => Ok(Self::Recovery),
+            _ => Err(FederatedIdentityError::InvalidRecoveryAuthorization),
+        }
+    }
+}
+
+/// Bounded redacted fact projection returned only by the authoritative origin.
+///
+/// This value is not a portable proof. Callers must obtain it through
+/// [`FederatedIdentityVerifier::mls_v5_recovery_authorization`] for every
+/// submission or replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MlsV5RecoveryAuthorizationProjection {
+    query: MlsV5RecoveryAuthorizationQuery,
+    provider_device_id: DeviceId,
+    authority_kind: MlsV5RecoveryAuthorityKind,
+    authority_id: String,
+    history_grant_digest: Sha256Digest,
+    attachment_digest: Sha256Digest,
+    claim_receipt_digest: Sha256Digest,
+    expires_at: UtcMillis,
+}
+
+impl MlsV5RecoveryAuthorizationProjection {
+    /// Constructs the exact redacted origin response.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an invalid authority identifier or an encoding that exceeds the
+    /// public projection bound.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        query: MlsV5RecoveryAuthorizationQuery,
+        provider_device_id: DeviceId,
+        authority_kind: MlsV5RecoveryAuthorityKind,
+        authority_id: String,
+        history_grant_digest: Sha256Digest,
+        attachment_digest: Sha256Digest,
+        claim_receipt_digest: Sha256Digest,
+        expires_at: UtcMillis,
+    ) -> Result<Self, FederatedIdentityError> {
+        if !(8..=128).contains(&authority_id.len()) || !authority_id.is_ascii() {
+            return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+        }
+        let projection = Self {
+            query,
+            provider_device_id,
+            authority_kind,
+            authority_id,
+            history_grant_digest,
+            attachment_digest,
+            claim_receipt_digest,
+            expires_at,
+        };
+        if projection.exact_bytes()?.len() > MAX_MLS_V5_RECOVERY_AUTHORIZATION_BYTES {
+            return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+        }
+        Ok(projection)
+    }
+
+    #[must_use]
+    pub const fn query(&self) -> MlsV5RecoveryAuthorizationQuery {
+        self.query
+    }
+
+    #[must_use]
+    pub const fn provider_device_id(&self) -> DeviceId {
+        self.provider_device_id
+    }
+
+    #[must_use]
+    pub const fn authority_kind(&self) -> MlsV5RecoveryAuthorityKind {
+        self.authority_kind
+    }
+
+    #[must_use]
+    pub fn authority_id(&self) -> &str {
+        &self.authority_id
+    }
+
+    #[must_use]
+    pub const fn history_grant_digest(&self) -> Sha256Digest {
+        self.history_grant_digest
+    }
+
+    #[must_use]
+    pub const fn attachment_digest(&self) -> Sha256Digest {
+        self.attachment_digest
+    }
+
+    #[must_use]
+    pub const fn claim_receipt_digest(&self) -> Sha256Digest {
+        self.claim_receipt_digest
+    }
+
+    #[must_use]
+    pub const fn expires_at(&self) -> UtcMillis {
+        self.expires_at
+    }
+
+    /// Encodes the exact deterministic-CBOR origin projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if deterministic encoding fails.
+    pub fn exact_bytes(&self) -> Result<Vec<u8>, FederatedIdentityError> {
+        encode_deterministic_cbor(&CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(self.query.identity_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Text(self.query.request_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                CanonicalValue::Text(self.query.candidate_device_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(5),
+                CanonicalValue::Text(self.query.controller_device_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(6),
+                self.query.identity_head_digest.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(7),
+                self.query.key_package_digest.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(8),
+                self.query.recovery_request_digest.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(9),
+                self.query.recovery_scope_digest.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(10),
+                CanonicalValue::Text(self.provider_device_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(11),
+                CanonicalValue::Unsigned(self.authority_kind.code()),
+            ),
+            (
+                CanonicalValue::Unsigned(12),
+                CanonicalValue::Text(self.authority_id.clone()),
+            ),
+            (
+                CanonicalValue::Unsigned(13),
+                self.history_grant_digest.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(14),
+                self.attachment_digest.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(15),
+                self.claim_receipt_digest.to_canonical_value(),
+            ),
+            (
+                CanonicalValue::Unsigned(16),
+                self.expires_at.to_canonical_value(),
+            ),
+        ]))
+        .map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)
+    }
+}
+
+/// Freshly reduced current device and identity-head facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedActiveDevice {
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    signing_key: SigningPublicKey,
+    head_sequence: SafeUint,
+    head_digest: Sha256Digest,
+}
+
+impl VerifiedActiveDevice {
+    #[must_use]
+    pub const fn identity_id(self) -> IdentityId {
+        self.identity_id
+    }
+
+    #[must_use]
+    pub const fn device_id(self) -> DeviceId {
+        self.device_id
+    }
+
+    #[must_use]
+    pub const fn signing_key(self) -> SigningPublicKey {
+        self.signing_key
+    }
+
+    #[must_use]
+    pub const fn head_sequence(self) -> SafeUint {
+        self.head_sequence
+    }
+
+    #[must_use]
+    pub const fn head_digest(self) -> Sha256Digest {
+        self.head_digest
+    }
+}
 
 #[derive(Clone)]
 pub struct FederatedIdentityVerifier {
@@ -35,6 +370,8 @@ pub enum FederatedIdentityError {
     InvalidOrigin,
     InvalidTrustRoot,
     InvalidIdentityLog,
+    InvalidRecoveryAuthorization,
+    RecoveryAuthorizationUnavailable,
     DeviceUnavailable,
     TemporarilyUnavailable,
 }
@@ -45,6 +382,12 @@ impl fmt::Display for FederatedIdentityError {
             Self::InvalidOrigin => "federated identity origin is invalid",
             Self::InvalidTrustRoot => "federated identity trust root is invalid",
             Self::InvalidIdentityLog => "federated identity log is invalid",
+            Self::InvalidRecoveryAuthorization => {
+                "federated MLS V5 recovery authorization is invalid"
+            }
+            Self::RecoveryAuthorizationUnavailable => {
+                "federated MLS V5 recovery authorization is unavailable"
+            }
             Self::DeviceUnavailable => "federated identity device is unavailable",
             Self::TemporarilyUnavailable => "federated identity service is unavailable",
         })
@@ -139,12 +482,91 @@ impl FederatedIdentityVerifier {
         identity_id: IdentityId,
         device_id: DeviceId,
     ) -> Result<SigningPublicKey, FederatedIdentityError> {
+        Ok(self
+            .active_device(origin, identity_id, device_id)
+            .await?
+            .signing_key())
+    }
+
+    /// Reduces the authoritative identity log and returns one active device
+    /// together with the exact current head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the origin or log is invalid, the service is
+    /// unavailable, or the requested device is not active at the current head.
+    pub async fn active_device(
+        &self,
+        origin: &str,
+        identity_id: IdentityId,
+        device_id: DeviceId,
+    ) -> Result<VerifiedActiveDevice, FederatedIdentityError> {
+        let (log, _) = self
+            .identity_log_with_terminal_event(origin, identity_id)
+            .await?;
+        Ok(VerifiedActiveDevice {
+            identity_id,
+            device_id,
+            signing_key: active_signing_key(&log, device_id)?,
+            head_sequence: log.head_sequence(),
+            head_digest: log.head_hash(),
+        })
+    }
+
+    /// Reduces one authoritative identity log and proves that its exact current
+    /// terminal event revokes the requested leaf while the controller remains active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid origin/log facts, a stale head, a non-active
+    /// controller, or any terminal event other than the exact target revoke.
+    pub async fn active_device_with_terminal_revoke(
+        &self,
+        origin: &str,
+        identity_id: IdentityId,
+        controller_device_id: DeviceId,
+        revoked_device_id: DeviceId,
+        expected_head_digest: Sha256Digest,
+    ) -> Result<VerifiedActiveDevice, FederatedIdentityError> {
+        let (log, terminal) = self
+            .identity_log_with_terminal_event(origin, identity_id)
+            .await?;
+        if log.head_hash() != expected_head_digest
+            || log.device_status(revoked_device_id) != Some(DeviceStatusV1::Revoked)
+            || terminal.identity_id() != identity_id
+            || terminal.sequence() != log.head_sequence()
+            || terminal
+                .entry_hash()
+                .map_err(|_| FederatedIdentityError::InvalidIdentityLog)?
+                != log.head_hash()
+            || !matches!(
+                terminal.payload(),
+                IdentityLogEventPayloadV1::DeviceRevoke { device_id }
+                    if *device_id == revoked_device_id
+            )
+        {
+            return Err(FederatedIdentityError::DeviceUnavailable);
+        }
+        Ok(VerifiedActiveDevice {
+            identity_id,
+            device_id: controller_device_id,
+            signing_key: active_signing_key(&log, controller_device_id)?,
+            head_sequence: log.head_sequence(),
+            head_digest: log.head_hash(),
+        })
+    }
+
+    async fn identity_log_with_terminal_event(
+        &self,
+        origin: &str,
+        identity_id: IdentityId,
+    ) -> Result<(IdentityLogV1, IdentityLogEventV1), FederatedIdentityError> {
         let origin = self.parse_allowed_origin(origin)?;
         let client = self.client_for_origin(&origin).await?;
-        let mut after = 0_u64;
+        let (mut after, mut total_bytes) = (0_u64, 0_usize);
         let mut advertised_head = None;
         let mut projection = None;
-        let mut total_bytes = 0_usize;
+        let mut terminal_event = None;
 
         for _ in 0..MAX_IDENTITY_LOG_PAGES {
             let page_url = identity_log_page_url(&origin, identity_id, after)?;
@@ -220,6 +642,7 @@ impl FederatedIdentityVerifier {
                         .append(&event)
                         .map_err(|_| FederatedIdentityError::InvalidIdentityLog)?,
                 }
+                terminal_event = Some(event);
             }
             after = page.next_after_sequence();
             if !page.has_more() {
@@ -227,13 +650,85 @@ impl FederatedIdentityVerifier {
                 if advertised_head != Some((log.head_sequence(), log.head_hash())) {
                     return Err(FederatedIdentityError::InvalidIdentityLog);
                 }
-                return active_signing_key(&log, device_id);
+                return Ok((
+                    log,
+                    terminal_event.ok_or(FederatedIdentityError::InvalidIdentityLog)?,
+                ));
             }
             if page.exact_events().len() != MAX_IDENTITY_LOG_PAGE_EVENTS {
                 return Err(FederatedIdentityError::InvalidIdentityLog);
             }
         }
         Err(FederatedIdentityError::InvalidIdentityLog)
+    }
+
+    /// Fetches one fresh origin-authenticated MLS V5 recovery authorization.
+    ///
+    /// The returned projection is deliberately unsigned and non-portable: TLS
+    /// origin authentication, DNS pinning, and response validation are repeated
+    /// for every submission or replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe origin, unavailable or malformed remote
+    /// facts, a non-canonical response, or an already expired authorization.
+    pub async fn mls_v5_recovery_authorization(
+        &self,
+        origin: &str,
+        query: MlsV5RecoveryAuthorizationQuery,
+        now: UtcMillis,
+    ) -> Result<MlsV5RecoveryAuthorizationProjection, FederatedIdentityError> {
+        let origin = self.parse_allowed_origin(origin)?;
+        let client = self.client_for_origin(&origin).await?;
+        let url = mls_v5_recovery_authorization_url(&origin, query)?;
+        let response = client
+            .get(url)
+            .header(header::ACCEPT, MLS_V5_RECOVERY_AUTHORIZATION_CONTENT_TYPE)
+            .header(header::CACHE_CONTROL, "no-store")
+            .send()
+            .await
+            .map_err(|_| FederatedIdentityError::TemporarilyUnavailable)?;
+        if response.status() != StatusCode::OK {
+            return Err(if response.status().is_server_error() {
+                FederatedIdentityError::TemporarilyUnavailable
+            } else {
+                FederatedIdentityError::RecoveryAuthorizationUnavailable
+            });
+        }
+        require_recovery_authorization_header(
+            response.headers(),
+            header::CONTENT_TYPE,
+            MLS_V5_RECOVERY_AUTHORIZATION_CONTENT_TYPE,
+        )?;
+        require_recovery_authorization_header(
+            response.headers(),
+            header::CACHE_CONTROL,
+            "no-store",
+        )?;
+        require_recovery_authorization_header(
+            response.headers(),
+            header::X_CONTENT_TYPE_OPTIONS,
+            "nosniff",
+        )?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_MLS_V5_RECOVERY_AUTHORIZATION_BYTES as u64)
+        {
+            return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+        }
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| FederatedIdentityError::TemporarilyUnavailable)?
+        {
+            if bytes.len() + chunk.len() > MAX_MLS_V5_RECOVERY_AUTHORIZATION_BYTES {
+                return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        decode_mls_v5_recovery_authorization(&bytes, query, now)
     }
 
     fn parse_allowed_origin(&self, origin: &str) -> Result<Url, FederatedIdentityError> {
@@ -418,6 +913,131 @@ fn identity_log_page_url(
         .map_err(|_| FederatedIdentityError::InvalidOrigin)
 }
 
+fn mls_v5_recovery_authorization_url(
+    origin: &Url,
+    query: MlsV5RecoveryAuthorizationQuery,
+) -> Result<Url, FederatedIdentityError> {
+    origin
+        .join(&format!(
+            "v1/identities/{}/history-recovery-requests/{}/mls-v5-authorization?{}",
+            query.identity_id,
+            query.request_id,
+            query.canonical_query(),
+        ))
+        .map_err(|_| FederatedIdentityError::InvalidOrigin)
+}
+
+fn decode_mls_v5_recovery_authorization(
+    bytes: &[u8],
+    expected_query: MlsV5RecoveryAuthorizationQuery,
+    now: UtcMillis,
+) -> Result<MlsV5RecoveryAuthorizationProjection, FederatedIdentityError> {
+    if bytes.is_empty() || bytes.len() > MAX_MLS_V5_RECOVERY_AUTHORIZATION_BYTES {
+        return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+    }
+    let value = decode_deterministic_cbor(bytes)
+        .map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)?;
+    let CanonicalValue::Map(fields) = &value else {
+        return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+    };
+    if fields.len() != 16
+        || fields.iter().enumerate().any(|(index, (key, _))| {
+            key != &CanonicalValue::Unsigned(u64::try_from(index + 1).unwrap_or(u64::MAX))
+        })
+    {
+        return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+    }
+    let field = |index: usize| -> &CanonicalValue { &fields[index - 1].1 };
+    if field(1) != &CanonicalValue::Unsigned(1) {
+        return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+    }
+    let query = MlsV5RecoveryAuthorizationQuery::new(
+        parse_recovery_text(field(2))?
+            .parse::<IdentityId>()
+            .map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)?,
+        parse_recovery_text(field(3))?
+            .parse::<DeviceEnrollmentChallengeId>()
+            .map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)?,
+        parse_recovery_text(field(4))?
+            .parse::<DeviceId>()
+            .map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)?,
+        parse_recovery_text(field(5))?
+            .parse::<DeviceId>()
+            .map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)?,
+        parse_recovery_digest(field(6))?,
+        parse_recovery_digest(field(7))?,
+        parse_recovery_digest(field(8))?,
+        parse_recovery_digest(field(9))?,
+    );
+    let provider_device_id = parse_recovery_text(field(10))?
+        .parse::<DeviceId>()
+        .map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)?;
+    let CanonicalValue::Unsigned(authority_kind) = field(11) else {
+        return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+    };
+    let projection = MlsV5RecoveryAuthorizationProjection::new(
+        query,
+        provider_device_id,
+        MlsV5RecoveryAuthorityKind::from_code(*authority_kind)?,
+        parse_recovery_text(field(12))?.to_owned(),
+        parse_recovery_digest(field(13))?,
+        parse_recovery_digest(field(14))?,
+        parse_recovery_digest(field(15))?,
+        parse_recovery_utc_millis(field(16))?,
+    )?;
+    if query != expected_query
+        || projection.expires_at() <= now
+        || projection.exact_bytes()?.as_slice() != bytes
+    {
+        return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+    }
+    Ok(projection)
+}
+
+fn parse_recovery_text(value: &CanonicalValue) -> Result<&str, FederatedIdentityError> {
+    match value {
+        CanonicalValue::Text(value) => Ok(value),
+        _ => Err(FederatedIdentityError::InvalidRecoveryAuthorization),
+    }
+}
+
+fn parse_recovery_digest(value: &CanonicalValue) -> Result<Sha256Digest, FederatedIdentityError> {
+    let CanonicalValue::Bytes(bytes) = value else {
+        return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+    };
+    let bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)?;
+    Ok(Sha256Digest::from_bytes(bytes))
+}
+
+fn parse_recovery_utc_millis(value: &CanonicalValue) -> Result<UtcMillis, FederatedIdentityError> {
+    let value = match value {
+        CanonicalValue::Unsigned(value) => i64::try_from(*value)
+            .map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)?,
+        CanonicalValue::Negative(value) => *value,
+        _ => return Err(FederatedIdentityError::InvalidRecoveryAuthorization),
+    };
+    UtcMillis::new(value).map_err(|_| FederatedIdentityError::InvalidRecoveryAuthorization)
+}
+
+fn require_recovery_authorization_header(
+    headers: &header::HeaderMap,
+    name: header::HeaderName,
+    expected: &'static str,
+) -> Result<(), FederatedIdentityError> {
+    let mut values = headers.get_all(name).iter();
+    let first = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or(FederatedIdentityError::InvalidRecoveryAuthorization)?;
+    if first != expected || values.next().is_some() {
+        return Err(FederatedIdentityError::InvalidRecoveryAuthorization);
+    }
+    Ok(())
+}
+
 fn require_single_header(
     headers: &header::HeaderMap,
     name: header::HeaderName,
@@ -436,14 +1056,126 @@ fn require_single_header(
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, net::IpAddr};
+    use std::{error::Error, net::IpAddr, str::FromStr};
 
     use base64ct::{Base64, Encoding as _};
+    use dtx_domain::{DeviceEnrollmentChallengeId, DeviceId, IdentityId};
+    use dtx_wire::{Sha256Digest, UtcMillis};
     use rcgen::{
         BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519,
     };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    use super::{FederatedIdentityError, FederatedIdentityVerifier, is_public_address};
+    use super::{
+        FederatedIdentityError, FederatedIdentityVerifier, MlsV5RecoveryAuthorityKind,
+        MlsV5RecoveryAuthorizationProjection, MlsV5RecoveryAuthorizationQuery,
+        decode_mls_v5_recovery_authorization, is_public_address,
+    };
+
+    #[test]
+    fn recovery_authorization_projection_is_canonical_echo_bound_and_expiring()
+    -> Result<(), Box<dyn Error>> {
+        let identity_id =
+            IdentityId::from_str("dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la")?;
+        let request_id = DeviceEnrollmentChallengeId::new();
+        let candidate_device_id = DeviceId::new();
+        let controller_device_id = DeviceId::new();
+        let query = MlsV5RecoveryAuthorizationQuery::new(
+            identity_id,
+            request_id,
+            candidate_device_id,
+            controller_device_id,
+            Sha256Digest::from_bytes([1; 32]),
+            Sha256Digest::from_bytes([2; 32]),
+            Sha256Digest::from_bytes([3; 32]),
+            Sha256Digest::from_bytes([4; 32]),
+        );
+        assert_eq!(
+            query.canonical_query(),
+            format!(
+                "candidate_device_id={candidate_device_id}&controller_device_id={controller_device_id}&identity_head_digest={}&key_package_digest={}&recovery_request_digest={}&recovery_scope_digest={}",
+                Sha256Digest::from_bytes([1; 32]),
+                Sha256Digest::from_bytes([2; 32]),
+                Sha256Digest::from_bytes([3; 32]),
+                Sha256Digest::from_bytes([4; 32]),
+            )
+        );
+        let projection = MlsV5RecoveryAuthorizationProjection::new(
+            query,
+            DeviceId::new(),
+            MlsV5RecoveryAuthorityKind::Root,
+            "authority-current-root".to_owned(),
+            Sha256Digest::from_bytes([5; 32]),
+            Sha256Digest::from_bytes([6; 32]),
+            Sha256Digest::from_bytes([7; 32]),
+            UtcMillis::new(2_000)?,
+        )?;
+        let bytes = projection.exact_bytes()?;
+        assert_eq!(
+            decode_mls_v5_recovery_authorization(&bytes, query, UtcMillis::new(1_999)?)?,
+            projection
+        );
+        assert_eq!(
+            decode_mls_v5_recovery_authorization(&bytes, query, UtcMillis::new(2_000)?),
+            Err(FederatedIdentityError::InvalidRecoveryAuthorization)
+        );
+        let mismatched = MlsV5RecoveryAuthorizationQuery::new(
+            identity_id,
+            request_id,
+            candidate_device_id,
+            controller_device_id,
+            Sha256Digest::from_bytes([8; 32]),
+            Sha256Digest::from_bytes([2; 32]),
+            Sha256Digest::from_bytes([3; 32]),
+            Sha256Digest::from_bytes([4; 32]),
+        );
+        assert_eq!(
+            decode_mls_v5_recovery_authorization(&bytes, mismatched, UtcMillis::new(1_999)?),
+            Err(FederatedIdentityError::InvalidRecoveryAuthorization)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_authorization_fetch_does_not_follow_redirects() -> Result<(), Box<dyn Error>>
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let redirect_origin = origin.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("redirect request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await.expect("request bytes");
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {redirect_origin}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("redirect response");
+        });
+        let verifier = FederatedIdentityVerifier::new([origin.clone()])?;
+        let identity_id =
+            IdentityId::from_str("dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la")?;
+        let query = MlsV5RecoveryAuthorizationQuery::new(
+            identity_id,
+            DeviceEnrollmentChallengeId::new(),
+            DeviceId::new(),
+            DeviceId::new(),
+            Sha256Digest::from_bytes([1; 32]),
+            Sha256Digest::from_bytes([2; 32]),
+            Sha256Digest::from_bytes([3; 32]),
+            Sha256Digest::from_bytes([4; 32]),
+        );
+        assert_eq!(
+            verifier
+                .mls_v5_recovery_authorization(&origin, query, UtcMillis::new(1_000)?)
+                .await,
+            Err(FederatedIdentityError::RecoveryAuthorizationUnavailable)
+        );
+        server.await?;
+        Ok(())
+    }
 
     #[test]
     fn pinned_https_accepts_only_public_dns_answers() -> Result<(), Box<dyn Error>> {

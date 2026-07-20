@@ -15,8 +15,11 @@ use axum::{
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{
-    Clock, ClockError, ConversationId, DeviceId, DeviceSessionId, IdentityId, InviteCapabilityId,
-    JoinRequestId, RequestId, Revision, TenantId,
+    Clock, ClockError, ConversationId, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionId,
+    IdentityId, InviteCapabilityId, JoinRequestId, KeyPackageId, RequestId, Revision, TenantId,
+};
+use dtx_federated_identity::{
+    MLS_V5_RECOVERY_AUTHORIZATION_CONTENT_TYPE, MlsV5RecoveryAuthorizationQuery,
 };
 use dtx_group_node::{
     DEVICE_SESSION_AUTHORIZATION_SCHEME, GROUP_ACTION_RECEIPT_CONTENT_TYPE,
@@ -27,9 +30,10 @@ use dtx_group_node::{
     GROUP_MEMBERSHIP_RECEIPT_PATH_TEMPLATE, GROUP_QUERY_PROOF_HEADER, GROUP_SCOPE_PATH_TEMPLATE,
     GROUP_SERVICE_DESCRIPTOR_CONTENT_TYPE, GROUP_SERVICE_DESCRIPTOR_PATH, GroupNodeState,
     IDENTITY_ORIGIN_HEADER, MEMBERSHIP_RECEIPT_V2_CONTENT_TYPE, MLS_COMMIT_CONTENT_TYPE,
-    MLS_COMMIT_FEED_CONTENT_TYPE, MLS_COMMIT_FEED_V2_CONTENT_TYPE, MLS_COMMIT_PROOF_HEADER,
-    MLS_COMMIT_RECEIPT_CONTENT_TYPE, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE,
-    MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE, MLS_COMMIT_V3_CONTENT_TYPE, MLS_COMMIT_V4_CONTENT_TYPE,
+    MLS_COMMIT_FEED_CONTENT_TYPE, MLS_COMMIT_FEED_V2_CONTENT_TYPE, MLS_COMMIT_FEED_V3_CONTENT_TYPE,
+    MLS_COMMIT_PROOF_HEADER, MLS_COMMIT_RECEIPT_CONTENT_TYPE, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE,
+    MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE, MLS_COMMIT_RECEIPT_V5_CONTENT_TYPE,
+    MLS_COMMIT_V3_CONTENT_TYPE, MLS_COMMIT_V4_CONTENT_TYPE, MLS_COMMIT_V5_CONTENT_TYPE,
     MLS_CONFIRMATION_CONTENT_TYPE, MLS_CONFIRMATION_PROOF_HEADER, MLS_CONFIRMATION_V3_CONTENT_TYPE,
     RECEIPT_QUERY_PROOF_HEADER, group_router_with_state,
 };
@@ -38,7 +42,8 @@ use dtx_group_persistence::{
     GroupControlRepository, GroupMembershipRepository, GroupPgStore,
     MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, MlsCommitAuthorization, MlsCommitCommand,
     MlsDeviceJoinConfirmation, mls_candidate_proof_digest, mls_candidate_proof_signature_input,
-    mls_device_confirmation_signature_input, mls_opaque_commit_digest,
+    mls_device_confirmation_signature_input, mls_opaque_commit_digest, mls_recovery_scope_digest,
+    mls_v5_controller_consent_digest, mls_v5_controller_consent_signature_input,
 };
 use dtx_group_policy::GroupScope;
 use dtx_identity_log::{
@@ -46,11 +51,21 @@ use dtx_identity_log::{
     UnsignedDeviceCertificateV1, UnsignedIdentityLogEventV1, device_certificate_signature_input,
     genesis_recovery_acceptance_input, identity_log_signature_input,
 };
-use dtx_identity_node::identity_bootstrap_router;
+use dtx_identity_node::{
+    DEVICE_ENROLLMENT_CHALLENGE_PATH, DEVICE_ENROLLMENT_CONTENT_TYPE, DEVICE_ENROLLMENT_PATH,
+    DEVICE_REVOKE_PATH_TEMPLATE, HISTORY_RECOVERY_REQUEST_CONTENT_TYPE,
+    IDENTITY_LOG_EVENT_CONTENT_TYPE, IdentityBootstrapState, KEY_PACKAGE_CLAIM_PATH,
+    KEY_PACKAGE_CLAIM_V2_CONTENT_TYPE, KEY_PACKAGE_PUBLISH_PATH_TEMPLATE,
+    KEY_PACKAGE_PUBLISH_V2_CONTENT_TYPE, MLS_V5_RECOVERY_AUTHORIZATION_PATH_TEMPLATE,
+    identity_bootstrap_router, identity_bootstrap_router_with_state,
+};
 use dtx_identity_persistence::{
     DEVICE_SESSION_SECRET_HASH_DOMAIN, DeviceSessionCompletionCommand, DeviceSessionOutcome,
-    DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogRepository,
-    IdentityPgStore, device_session_proof_input,
+    DeviceSessionRepository, HISTORY_RECOVERY_REQUEST_HASH_DOMAIN, IdentityAppendCommand,
+    IdentityAppendOutcome, IdentityLogHead, IdentityLogRepository, IdentityPgStore,
+    KEY_PACKAGE_BYTES_HASH_DOMAIN, device_session_proof_input,
+    history_recovery_request_signature_input, history_recovery_request_unsigned_canonical_bytes,
+    key_package_publish_signature_input,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, Sha256Digest, SigningPublicKey, UtcMillis,
@@ -1016,6 +1031,1226 @@ async fn active_member_fetches_consecutive_v30_v32_feed_and_removed_member_conve
     )
     .await?;
     assert_eq!(removed_access.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one V40 boundary test keeps identity-head freshness, scoped package consumption, confirmation, revocation, replay, and feed order coherent"
+)]
+async fn v5_recovery_add_and_revoked_leaf_removal_are_http_replay_safe()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 8).await?;
+    let group_store = GroupPgStore::connect(harness.group_runtime_options(), 4).await?;
+    let owner = enroll_active_device(&identity_store, 131, 132, 133, [134; 32]).await?;
+    let identity_app = identity_bootstrap_router_with_state(
+        IdentityBootstrapState::with_clock_and_device_session_audience(
+            identity_store.clone(),
+            Arc::new(FixedClock(NOW)),
+            AUDIENCE,
+        ),
+    );
+    let tenant_id = TenantId::new();
+    let group_app = group_router_with_state(
+        GroupNodeState::with_clock(group_store.clone(), tenant_id, Arc::new(FixedClock(NOW)))
+            .with_mls_sequencer_signing_key(SigningKey::from_bytes(&[135; 32]))
+            .with_public_origin_and_allowed_http_identity_origins(
+                AUDIENCE,
+                std::iter::empty::<String>(),
+            )?,
+    );
+    let scope = GroupScope::PrivateConversation(ConversationId::new());
+    let scope_path = scope_path(scope);
+
+    let create_key = "v5-recovery-group-create-0001";
+    let create = send_mutation(
+        group_app.clone(),
+        "PUT",
+        &scope_path,
+        GROUP_CREATE_CONTENT_TYPE,
+        create_key,
+        &owner,
+        create_body(&owner, scope, &scope_path, create_key, 1_000)?,
+    )
+    .await?;
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let bootstrap_submission = RequestId::new();
+    let bootstrap_path = format!("{scope_path}/mls-commits/{bootstrap_submission}");
+    let bootstrap_key = "v5-recovery-bootstrap-0001";
+    let bootstrap = send_mutation(
+        group_app.clone(),
+        "POST",
+        &bootstrap_path,
+        MLS_COMMIT_CONTENT_TYPE,
+        bootstrap_key,
+        &owner,
+        mls_commit_body(
+            &owner,
+            &owner,
+            scope,
+            bootstrap_submission,
+            bootstrap_key,
+            0,
+            Sha256Digest::from_bytes([0; 32]),
+            vec![0x41; 48],
+            MlsCommitAuthorization::OwnerBootstrap,
+        )?,
+    )
+    .await?;
+    assert_eq!(bootstrap.status(), StatusCode::CREATED);
+    let bootstrap_receipt = response_bytes(bootstrap).await?;
+    let (bootstrap_receipt_digest, bootstrap_head) = mls_receipt_facts(&bootstrap_receipt)?;
+    let bootstrap_confirmation = group_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "{bootstrap_path}/confirmations/{}",
+                    owner.device_id
+                ))
+                .header(header::CONTENT_TYPE, MLS_CONFIRMATION_CONTENT_TYPE)
+                .header(
+                    header::AUTHORIZATION,
+                    device_session_authorization(owner.session_id, owner.session_secret),
+                )
+                .body(Body::from(mls_confirmation_body(
+                    &owner,
+                    bootstrap_submission,
+                    bootstrap_receipt_digest,
+                    bootstrap_head,
+                )?))?,
+        )
+        .await?;
+    assert_eq!(bootstrap_confirmation.status(), StatusCode::NO_CONTENT);
+
+    let recovery_a = prepare_scoped_history_recovery(
+        identity_app.clone(),
+        &identity_store,
+        &owner,
+        scope,
+        136,
+        137,
+        [138; 32],
+        [139; 32],
+        "v5-history-recovery-a",
+        NOW - 200,
+    )
+    .await?;
+    let recovery_b = prepare_scoped_history_recovery(
+        identity_app.clone(),
+        &identity_store,
+        &owner,
+        scope,
+        140,
+        141,
+        [142; 32],
+        [143; 32],
+        "v5-history-recovery-b",
+        NOW - 100,
+    )
+    .await?;
+    let current_identity_head = IdentityLogRepository::new()
+        .load(&identity_store, owner.identity_id)
+        .await?
+        .ok_or("identity missing after recovery approvals")?
+        .head();
+    assert_ne!(recovery_a.approved_head, current_identity_head);
+    assert_eq!(recovery_b.approved_head, current_identity_head);
+
+    // Both packages are deliberately published at B's current identity head.
+    // A can therefore fail only because its approved recovery head is stale.
+    let package_a = publish_scoped_recovery_key_package(
+        identity_app.clone(),
+        &owner,
+        &recovery_a,
+        scope,
+        current_identity_head,
+        vec![0xa1; 64],
+        "v5-scoped-package-a-0001",
+    )
+    .await?;
+    let package_b = publish_scoped_recovery_key_package(
+        identity_app.clone(),
+        &owner,
+        &recovery_b,
+        scope,
+        current_identity_head,
+        vec![0xb1; 64],
+        "v5-scoped-package-b-0001",
+    )
+    .await?;
+
+    let stale_submission = RequestId::new();
+    let stale_path = format!("{scope_path}/mls-commits/{stale_submission}");
+    let stale_key = "v5-stale-recovery-add-0001";
+    let stale = send_mutation(
+        group_app.clone(),
+        "POST",
+        &stale_path,
+        MLS_COMMIT_V5_CONTENT_TYPE,
+        stale_key,
+        &owner,
+        mls_recovery_add_body_v5(
+            &owner,
+            &recovery_a.device,
+            scope,
+            stale_submission,
+            stale_key,
+            1,
+            bootstrap_head,
+            vec![0xa2; 48],
+            package_a,
+            recovery_a.request_id,
+            recovery_a.request_digest,
+        )?,
+    )
+    .await?;
+    assert_eq!(stale.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_safe_group_error(stale, "GROUP_ACTION_PROOF_INVALID").await?;
+    assert_eq!(v5_intent_count(harness.admin_pool(), tenant_id).await?, 0);
+
+    let add_submission = RequestId::new();
+    let add_path = format!("{scope_path}/mls-commits/{add_submission}");
+    let add_key = "v5-current-recovery-add-0001";
+    let add_commit = vec![0xb2; 48];
+    let add_body = mls_recovery_add_body_v5(
+        &owner,
+        &recovery_b.device,
+        scope,
+        add_submission,
+        add_key,
+        1,
+        bootstrap_head,
+        add_commit.clone(),
+        package_b,
+        recovery_b.request_id,
+        recovery_b.request_digest,
+    )?;
+    let added = send_mutation(
+        group_app.clone(),
+        "POST",
+        &add_path,
+        MLS_COMMIT_V5_CONTENT_TYPE,
+        add_key,
+        &owner,
+        add_body.clone(),
+    )
+    .await?;
+    assert_eq!(added.status(), StatusCode::CREATED);
+    assert_content_type(&added, MLS_COMMIT_RECEIPT_V5_CONTENT_TYPE);
+    let add_receipt = response_bytes(added).await?;
+    assert_eq!(mls_receipt_epoch(&add_receipt)?, 2);
+    let (add_receipt_digest, add_head) = mls_receipt_facts(&add_receipt)?;
+
+    let add_replay = send_mutation(
+        group_app.clone(),
+        "POST",
+        &add_path,
+        MLS_COMMIT_V5_CONTENT_TYPE,
+        add_key,
+        &owner,
+        add_body,
+    )
+    .await?;
+    assert_eq!(add_replay.status(), StatusCode::OK);
+    assert_eq!(response_bytes(add_replay).await?, add_receipt);
+    let add_conflict = send_mutation(
+        group_app.clone(),
+        "POST",
+        &add_path,
+        MLS_COMMIT_V5_CONTENT_TYPE,
+        add_key,
+        &owner,
+        mls_recovery_add_body_v5(
+            &owner,
+            &recovery_b.device,
+            scope,
+            add_submission,
+            add_key,
+            1,
+            bootstrap_head,
+            vec![0xb3; 48],
+            package_b,
+            recovery_b.request_id,
+            recovery_b.request_digest,
+        )?,
+    )
+    .await?;
+    assert_eq!(add_conflict.status(), StatusCode::CONFLICT);
+
+    let add_confirmation_path = format!("{add_path}/confirmations/{}", recovery_b.device.device_id);
+    let add_confirmation = group_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&add_confirmation_path)
+                .header(header::CONTENT_TYPE, MLS_CONFIRMATION_V3_CONTENT_TYPE)
+                .header(
+                    header::AUTHORIZATION,
+                    device_session_authorization(
+                        recovery_b.device.session_id,
+                        recovery_b.device.session_secret,
+                    ),
+                )
+                .body(Body::from(mls_confirmation_body(
+                    &recovery_b.device,
+                    add_submission,
+                    add_receipt_digest,
+                    add_head,
+                )?))?,
+        )
+        .await?;
+    assert_eq!(add_confirmation.status(), StatusCode::NO_CONTENT);
+    let scope_id = scope_path.rsplit('/').next().ok_or("scope id")?;
+    let recovered_leaf_state: String = sqlx::query_scalar(
+        "SELECT state FROM groups.mls_device_members
+          WHERE tenant_id=$1 AND scope_kind='private_conversation' AND scope_id=$2
+            AND identity_id=$3 AND device_id=$4",
+    )
+    .bind(uuid::Uuid::from(tenant_id))
+    .bind(scope_id)
+    .bind(owner.identity_id.to_string())
+    .bind(uuid::Uuid::from(recovery_b.device.device_id))
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(recovered_leaf_state, "active");
+
+    let pre_revoke_identity_head = IdentityLogRepository::new()
+        .load(&identity_store, owner.identity_id)
+        .await?
+        .ok_or("identity missing before recovery leaf revoke")?
+        .head();
+    let before_revoke_submission = RequestId::new();
+    let before_revoke_path = format!("{scope_path}/mls-commits/{before_revoke_submission}");
+    let before_revoke_key = "v5-remove-before-revoke-0001";
+    let before_revoke = send_mutation(
+        group_app.clone(),
+        "POST",
+        &before_revoke_path,
+        MLS_COMMIT_V5_CONTENT_TYPE,
+        before_revoke_key,
+        &owner,
+        mls_device_remove_body_v5(
+            &owner,
+            &recovery_b.device,
+            scope,
+            before_revoke_submission,
+            before_revoke_key,
+            2,
+            add_head,
+            vec![0xc1; 48],
+            pre_revoke_identity_head.hash(),
+        )?,
+    )
+    .await?;
+    assert_eq!(before_revoke.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_safe_group_error(before_revoke, "GROUP_ACTION_PROOF_INVALID").await?;
+    assert_eq!(v5_intent_count(harness.admin_pool(), tenant_id).await?, 1);
+
+    let revoke_head = revoke_device_over_http(
+        identity_app,
+        &identity_store,
+        &owner,
+        recovery_b.device.device_id,
+        "v5-revoke-recovered-device-0001",
+        NOW,
+    )
+    .await?;
+
+    let mismatched_submission = RequestId::new();
+    let mismatched_path = format!("{scope_path}/mls-commits/{mismatched_submission}");
+    let mismatched_key = "v5-remove-mismatched-target-0001";
+    let mismatched = send_mutation(
+        group_app.clone(),
+        "POST",
+        &mismatched_path,
+        MLS_COMMIT_V5_CONTENT_TYPE,
+        mismatched_key,
+        &owner,
+        mls_device_remove_body_v5(
+            &owner,
+            &recovery_a.device,
+            scope,
+            mismatched_submission,
+            mismatched_key,
+            2,
+            add_head,
+            vec![0xc2; 48],
+            revoke_head,
+        )?,
+    )
+    .await?;
+    assert_eq!(mismatched.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_safe_group_error(mismatched, "GROUP_ACTION_PROOF_INVALID").await?;
+    assert_eq!(v5_intent_count(harness.admin_pool(), tenant_id).await?, 1);
+
+    let remove_submission = RequestId::new();
+    let remove_path = format!("{scope_path}/mls-commits/{remove_submission}");
+    let remove_key = "v5-remove-current-target-0001";
+    let remove_commit = vec![0xc3; 48];
+    let remove_body = mls_device_remove_body_v5(
+        &owner,
+        &recovery_b.device,
+        scope,
+        remove_submission,
+        remove_key,
+        2,
+        add_head,
+        remove_commit.clone(),
+        revoke_head,
+    )?;
+    let removed = send_mutation(
+        group_app.clone(),
+        "POST",
+        &remove_path,
+        MLS_COMMIT_V5_CONTENT_TYPE,
+        remove_key,
+        &owner,
+        remove_body.clone(),
+    )
+    .await?;
+    assert_eq!(removed.status(), StatusCode::CREATED);
+    assert_content_type(&removed, MLS_COMMIT_RECEIPT_V5_CONTENT_TYPE);
+    let remove_receipt = response_bytes(removed).await?;
+    assert_eq!(mls_receipt_epoch(&remove_receipt)?, 3);
+
+    let remove_replay = send_mutation(
+        group_app.clone(),
+        "POST",
+        &remove_path,
+        MLS_COMMIT_V5_CONTENT_TYPE,
+        remove_key,
+        &owner,
+        remove_body,
+    )
+    .await?;
+    assert_eq!(remove_replay.status(), StatusCode::OK);
+    assert_eq!(response_bytes(remove_replay).await?, remove_receipt);
+    let remove_conflict = send_mutation(
+        group_app.clone(),
+        "POST",
+        &remove_path,
+        MLS_COMMIT_V5_CONTENT_TYPE,
+        remove_key,
+        &owner,
+        mls_device_remove_body_v5(
+            &owner,
+            &recovery_b.device,
+            scope,
+            remove_submission,
+            remove_key,
+            2,
+            add_head,
+            vec![0xc4; 48],
+            revoke_head,
+        )?,
+    )
+    .await?;
+    assert_eq!(remove_conflict.status(), StatusCode::CONFLICT);
+
+    let feed_target = format!("{scope_path}/mls-commits?after_epoch=1&limit=64");
+    let feed = send_local_commit_feed_v3(
+        group_app,
+        &feed_target,
+        &owner,
+        group_query_proof_for_action(&owner, AUDIENCE, scope, &feed_target, 2, 1_900)?,
+    )
+    .await?;
+    assert_eq!(feed.status(), StatusCode::OK);
+    assert_content_type(&feed, MLS_COMMIT_FEED_V3_CONTENT_TYPE);
+    assert_eq!(
+        decode_commit_feed(&response_bytes(feed).await?, 3, 1)?,
+        vec![(add_receipt, add_commit), (remove_receipt, remove_commit)]
+    );
+    assert_eq!(v5_intent_count(harness.admin_pool(), tenant_id).await?, 2);
+    let v5_receipt_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM groups.mls_commit_receipts AS receipt
+           JOIN groups.mls_commit_intents AS intent
+             USING (tenant_id,submission_id)
+          WHERE receipt.tenant_id=$1 AND intent.protocol_version=5",
+    )
+    .bind(uuid::Uuid::from(tenant_id))
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(v5_receipt_rows, 2);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the two-database acceptance keeps the complete externally observable V5 recovery workflow together"
+)]
+async fn federated_v5_recovery_and_removal_use_only_fresh_origin_identity_facts()
+-> Result<(), Box<dyn Error>> {
+    let origin_harness = support::PostgresHarness::start().await?;
+    let group_harness = support::PostgresHarness::start().await?;
+    let origin_store =
+        IdentityPgStore::connect(origin_harness.identity_runtime_options(), 8).await?;
+    let group_identity_store =
+        IdentityPgStore::connect(group_harness.identity_runtime_options(), 4).await?;
+    let group_store = GroupPgStore::connect(group_harness.group_runtime_options(), 4).await?;
+
+    let origin_controller = enroll_active_device(&origin_store, 151, 152, 153, [154; 32]).await?;
+    replicate_initial_identity(&group_identity_store, &origin_controller, 152, NOW).await?;
+    let group_controller = issue_same_identity_device_session(
+        &group_identity_store,
+        &origin_controller,
+        SigningKey::from_bytes(&origin_controller.device.to_bytes()),
+        origin_controller.device_id,
+        [155; 32],
+        "federated-v5-group-controller",
+        156,
+    )
+    .await?;
+    let identity_app = identity_bootstrap_router_with_state(
+        IdentityBootstrapState::with_clock_and_device_session_audience(
+            origin_store.clone(),
+            Arc::new(FixedClock(NOW)),
+            AUDIENCE,
+        ),
+    );
+    let (identity_origin, identity_server) =
+        start_identity_server_at(origin_store.clone(), NOW).await?;
+    let tenant_id = TenantId::new();
+    let group_app = group_router_with_state(
+        GroupNodeState::with_clock(group_store, tenant_id, Arc::new(FixedClock(NOW)))
+            .with_mls_sequencer_signing_key(SigningKey::from_bytes(&[157; 32]))
+            .with_public_origin_and_allowed_http_identity_origins(
+                AUDIENCE,
+                [identity_origin.clone()],
+            )?,
+    );
+    let scope = GroupScope::PrivateConversation(ConversationId::new());
+    let scope_path = scope_path(scope);
+
+    let create_key = "federated-v5-create-0001";
+    let create = send_mutation(
+        group_app.clone(),
+        "PUT",
+        &scope_path,
+        GROUP_CREATE_CONTENT_TYPE,
+        create_key,
+        &group_controller,
+        create_body(&group_controller, scope, &scope_path, create_key, 1_000)?,
+    )
+    .await?;
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let bootstrap_submission = RequestId::new();
+    let bootstrap_path = format!("{scope_path}/mls-commits/{bootstrap_submission}");
+    let bootstrap_key = "federated-v5-bootstrap-0001";
+    let bootstrap = send_mutation(
+        group_app.clone(),
+        "POST",
+        &bootstrap_path,
+        MLS_COMMIT_CONTENT_TYPE,
+        bootstrap_key,
+        &group_controller,
+        mls_commit_body(
+            &group_controller,
+            &group_controller,
+            scope,
+            bootstrap_submission,
+            bootstrap_key,
+            0,
+            Sha256Digest::from_bytes([0; 32]),
+            vec![0xd1; 48],
+            MlsCommitAuthorization::OwnerBootstrap,
+        )?,
+    )
+    .await?;
+    assert_eq!(bootstrap.status(), StatusCode::CREATED);
+    let bootstrap_receipt = response_bytes(bootstrap).await?;
+    let (bootstrap_receipt_digest, bootstrap_head) = mls_receipt_facts(&bootstrap_receipt)?;
+    let bootstrap_confirmation = group_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "{bootstrap_path}/confirmations/{}",
+                    group_controller.device_id
+                ))
+                .header(header::CONTENT_TYPE, MLS_CONFIRMATION_CONTENT_TYPE)
+                .header(
+                    header::AUTHORIZATION,
+                    device_session_authorization(
+                        group_controller.session_id,
+                        group_controller.session_secret,
+                    ),
+                )
+                .body(Body::from(mls_confirmation_body(
+                    &group_controller,
+                    bootstrap_submission,
+                    bootstrap_receipt_digest,
+                    bootstrap_head,
+                )?))?,
+        )
+        .await?;
+    assert_eq!(bootstrap_confirmation.status(), StatusCode::NO_CONTENT);
+
+    let stale_recovery = prepare_scoped_history_recovery(
+        identity_app.clone(),
+        &origin_store,
+        &origin_controller,
+        scope,
+        158,
+        159,
+        [160; 32],
+        [161; 32],
+        "federated-v5-history-recovery",
+        NOW - 200,
+    )
+    .await?;
+    let recovery = prepare_scoped_history_recovery(
+        identity_app.clone(),
+        &origin_store,
+        &origin_controller,
+        scope,
+        162,
+        163,
+        [164; 32],
+        [165; 32],
+        "federated-v5-current-history-recovery",
+        NOW - 100,
+    )
+    .await?;
+    let current_origin_head = IdentityLogRepository::new()
+        .load(&origin_store, origin_controller.identity_id)
+        .await?
+        .ok_or("origin identity missing after recovery approval")?
+        .head();
+    assert_ne!(stale_recovery.approved_head, current_origin_head);
+    assert_eq!(recovery.approved_head, current_origin_head);
+    let stale_package_digest = publish_scoped_recovery_key_package(
+        identity_app.clone(),
+        &origin_controller,
+        &stale_recovery,
+        scope,
+        current_origin_head,
+        vec![0xd0; 64],
+        "federated-v5-stale-package-0001",
+    )
+    .await?;
+    let package_digest = publish_scoped_recovery_key_package(
+        identity_app.clone(),
+        &origin_controller,
+        &recovery,
+        scope,
+        current_origin_head,
+        vec![0xd2; 64],
+        "federated-v5-package-0001",
+    )
+    .await?;
+    seed_recovery_authorization_artifacts(
+        origin_harness.admin_pool(),
+        &origin_controller,
+        &stale_recovery,
+        stale_package_digest,
+    )
+    .await?;
+    seed_recovery_authorization_artifacts(
+        origin_harness.admin_pool(),
+        &origin_controller,
+        &recovery,
+        package_digest,
+    )
+    .await?;
+    let stale_group_identity = IdentityLogRepository::new()
+        .load(&group_identity_store, origin_controller.identity_id)
+        .await?
+        .ok_or("group-side controller identity missing")?;
+    assert_eq!(
+        stale_group_identity
+            .projection()
+            .device_status(recovery.device.device_id),
+        None,
+        "the group database must not receive the recovered identity leaf"
+    );
+
+    let authorization_query = MlsV5RecoveryAuthorizationQuery::new(
+        origin_controller.identity_id,
+        recovery.request_id,
+        recovery.device.device_id,
+        origin_controller.device_id,
+        current_origin_head.hash(),
+        package_digest,
+        recovery.request_digest,
+        recovery.scope_digest,
+    );
+    let authorization_path = format!(
+        "{}?{}",
+        MLS_V5_RECOVERY_AUTHORIZATION_PATH_TEMPLATE
+            .replace("{identity_id}", &origin_controller.identity_id.to_string())
+            .replace("{request_id}", &recovery.request_id.to_string()),
+        authorization_query.canonical_query(),
+    );
+    let wrong_media = identity_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&authorization_path)
+                .header(header::ACCEPT, "application/octet-stream")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(wrong_media.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let invented_proof = identity_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&authorization_path)
+                .header(header::ACCEPT, MLS_V5_RECOVERY_AUTHORIZATION_CONTENT_TYPE)
+                .header(header::AUTHORIZATION, "Bearer invented-portable-proof")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(invented_proof.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    sqlx::query(
+        "UPDATE messaging.history_recovery_offers
+            SET expires_at_ms=$3
+          WHERE identity_id=$1 AND request_id=$2",
+    )
+    .bind(origin_controller.identity_id.to_string())
+    .bind(*recovery.request_id.as_uuid())
+    .bind(NOW)
+    .execute(origin_harness.admin_pool())
+    .await?;
+    let expired = identity_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&authorization_path)
+                .header(header::ACCEPT, MLS_V5_RECOVERY_AUTHORIZATION_CONTENT_TYPE)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+    sqlx::query(
+        "UPDATE messaging.history_recovery_offers
+            SET expires_at_ms=$3
+          WHERE identity_id=$1 AND request_id=$2",
+    )
+    .bind(origin_controller.identity_id.to_string())
+    .bind(*recovery.request_id.as_uuid())
+    .bind(NOW + 60_000)
+    .execute(origin_harness.admin_pool())
+    .await?;
+
+    let stale_submission = RequestId::new();
+    let stale_path = format!("{scope_path}/mls-commits/{stale_submission}");
+    let stale_key = "federated-v5-stale-head-0001";
+    let stale_commit = vec![0xcf; 48];
+    let stale_body = mls_recovery_add_body_v5(
+        &origin_controller,
+        &stale_recovery.device,
+        scope,
+        stale_submission,
+        stale_key,
+        1,
+        bootstrap_head,
+        stale_commit.clone(),
+        stale_package_digest,
+        stale_recovery.request_id,
+        stale_recovery.request_digest,
+    )?;
+    let stale_request_digest = mls_recovery_add_request_digest_v5(
+        &origin_controller,
+        &stale_recovery.device,
+        scope,
+        stale_submission,
+        stale_key,
+        1,
+        bootstrap_head,
+        stale_commit,
+        stale_package_digest,
+        stale_recovery.request_id,
+        stale_recovery.request_digest,
+    )?;
+    let stale = send_federated_mls_commit_v5(
+        group_app.clone(),
+        &stale_path,
+        stale_key,
+        &identity_origin,
+        mls_commit_federated_proof(
+            &origin_controller,
+            &identity_origin,
+            1,
+            scope,
+            &stale_path,
+            stale_submission,
+            stale_request_digest,
+            Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, stale_key.as_bytes()),
+            900,
+        )?,
+        stale_body,
+    )
+    .await?;
+    assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        v5_intent_count(group_harness.admin_pool(), tenant_id).await?,
+        0
+    );
+
+    for (index, (candidate_package, request_digest, scope_digest)) in [
+        (
+            Sha256Digest::from_bytes([0xc1; 32]),
+            recovery.request_digest,
+            recovery.scope_digest,
+        ),
+        (
+            package_digest,
+            Sha256Digest::from_bytes([0xc2; 32]),
+            recovery.scope_digest,
+        ),
+        (
+            package_digest,
+            recovery.request_digest,
+            Sha256Digest::from_bytes([0xc3; 32]),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let submission_id = RequestId::new();
+        let path = format!("{scope_path}/mls-commits/{submission_id}");
+        let key = format!("federated-v5-mismatch-{index:04}");
+        let commit = vec![0xc4_u8.saturating_add(u8::try_from(index)?); 48];
+        let body = mls_recovery_add_body_v5_with_scope_digest(
+            &origin_controller,
+            &recovery.device,
+            scope,
+            submission_id,
+            &key,
+            1,
+            bootstrap_head,
+            commit.clone(),
+            candidate_package,
+            recovery.request_id,
+            request_digest,
+            scope_digest,
+        )?;
+        let request = mls_recovery_add_request_digest_v5_with_scope_digest(
+            &origin_controller,
+            &recovery.device,
+            scope,
+            submission_id,
+            &key,
+            1,
+            bootstrap_head,
+            commit,
+            candidate_package,
+            recovery.request_id,
+            request_digest,
+            scope_digest,
+        )?;
+        let rejected = send_federated_mls_commit_v5(
+            group_app.clone(),
+            &path,
+            &key,
+            &identity_origin,
+            mls_commit_federated_proof(
+                &origin_controller,
+                &identity_origin,
+                1,
+                scope,
+                &path,
+                submission_id,
+                request,
+                Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, key.as_bytes()),
+                950,
+            )?,
+            body,
+        )
+        .await?;
+        assert!(
+            matches!(
+                rejected.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::UNPROCESSABLE_ENTITY
+            ),
+            "mismatch case {index} must fail closed"
+        );
+        assert_eq!(
+            v5_intent_count(group_harness.admin_pool(), tenant_id).await?,
+            0
+        );
+    }
+
+    let add_submission = RequestId::new();
+    let add_path = format!("{scope_path}/mls-commits/{add_submission}");
+    let add_key = "federated-v5-add-0001";
+    let add_commit = vec![0xd3; 48];
+    let add_body = mls_recovery_add_body_v5(
+        &origin_controller,
+        &recovery.device,
+        scope,
+        add_submission,
+        add_key,
+        1,
+        bootstrap_head,
+        add_commit.clone(),
+        package_digest,
+        recovery.request_id,
+        recovery.request_digest,
+    )?;
+    let add_request_digest = mls_recovery_add_request_digest_v5(
+        &origin_controller,
+        &recovery.device,
+        scope,
+        add_submission,
+        add_key,
+        1,
+        bootstrap_head,
+        add_commit,
+        package_digest,
+        recovery.request_id,
+        recovery.request_digest,
+    )?;
+    let add_idempotency_hash =
+        Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, add_key.as_bytes());
+    let added = send_federated_mls_commit_v5(
+        group_app.clone(),
+        &add_path,
+        add_key,
+        &identity_origin,
+        mls_commit_federated_proof(
+            &origin_controller,
+            &identity_origin,
+            1,
+            scope,
+            &add_path,
+            add_submission,
+            add_request_digest,
+            add_idempotency_hash,
+            1_000,
+        )?,
+        add_body.clone(),
+    )
+    .await?;
+    assert_eq!(added.status(), StatusCode::CREATED);
+    assert_content_type(&added, MLS_COMMIT_RECEIPT_V5_CONTENT_TYPE);
+    let add_receipt = response_bytes(added).await?;
+    let (add_receipt_digest, add_head) = mls_receipt_facts(&add_receipt)?;
+
+    let add_replay = send_federated_mls_commit_v5(
+        group_app.clone(),
+        &add_path,
+        add_key,
+        &identity_origin,
+        mls_commit_federated_proof(
+            &origin_controller,
+            &identity_origin,
+            1,
+            scope,
+            &add_path,
+            add_submission,
+            add_request_digest,
+            add_idempotency_hash,
+            1_100,
+        )?,
+        add_body,
+    )
+    .await?;
+    assert_eq!(add_replay.status(), StatusCode::OK);
+    assert_eq!(response_bytes(add_replay).await?, add_receipt);
+    let add_readback = send_federated_mls_receipt_query_v5(
+        group_app.clone(),
+        &add_path,
+        &identity_origin,
+        mls_commit_federated_proof(
+            &origin_controller,
+            &identity_origin,
+            2,
+            scope,
+            &add_path,
+            add_submission,
+            add_request_digest,
+            add_idempotency_hash,
+            1_200,
+        )?,
+    )
+    .await?;
+    assert_eq!(add_readback.status(), StatusCode::OK);
+    assert_eq!(response_bytes(add_readback).await?, add_receipt);
+
+    let confirmation_path = format!("{add_path}/confirmations/{}", recovery.device.device_id);
+    let confirmation_body = mls_confirmation_body(
+        &recovery.device,
+        add_submission,
+        add_receipt_digest,
+        add_head,
+    )?;
+    let confirmation = send_federated_confirmation(
+        group_app.clone(),
+        &confirmation_path,
+        &identity_origin,
+        mls_confirmation_proof(
+            &recovery.device,
+            &identity_origin,
+            scope,
+            &confirmation_path,
+            add_submission,
+            &confirmation_body,
+            1_300,
+        )?,
+        confirmation_body,
+    )
+    .await?;
+    assert_eq!(confirmation.status(), StatusCode::NO_CONTENT);
+
+    let revoke_head = revoke_device_over_http(
+        identity_app,
+        &origin_store,
+        &origin_controller,
+        recovery.device.device_id,
+        "federated-v5-revoke-0001",
+        NOW,
+    )
+    .await?;
+    let wrong_remove_submission = RequestId::new();
+    let wrong_remove_path = format!("{scope_path}/mls-commits/{wrong_remove_submission}");
+    let wrong_remove_key = "federated-v5-wrong-revoke-target-0001";
+    let wrong_remove_commit = vec![0xce; 48];
+    let wrong_remove_body = mls_device_remove_body_v5(
+        &origin_controller,
+        &stale_recovery.device,
+        scope,
+        wrong_remove_submission,
+        wrong_remove_key,
+        2,
+        add_head,
+        wrong_remove_commit.clone(),
+        revoke_head,
+    )?;
+    let wrong_remove_request = mls_device_remove_request_digest_v5(
+        &origin_controller,
+        &stale_recovery.device,
+        scope,
+        wrong_remove_submission,
+        wrong_remove_key,
+        2,
+        add_head,
+        wrong_remove_commit,
+        revoke_head,
+    )?;
+    let wrong_remove = send_federated_mls_commit_v5(
+        group_app.clone(),
+        &wrong_remove_path,
+        wrong_remove_key,
+        &identity_origin,
+        mls_commit_federated_proof(
+            &origin_controller,
+            &identity_origin,
+            1,
+            scope,
+            &wrong_remove_path,
+            wrong_remove_submission,
+            wrong_remove_request,
+            Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, wrong_remove_key.as_bytes()),
+            1_350,
+        )?,
+        wrong_remove_body,
+    )
+    .await?;
+    assert_eq!(wrong_remove.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        v5_intent_count(group_harness.admin_pool(), tenant_id).await?,
+        1
+    );
+    let remove_submission = RequestId::new();
+    let remove_path = format!("{scope_path}/mls-commits/{remove_submission}");
+    let remove_key = "federated-v5-remove-0001";
+    let remove_commit = vec![0xd4; 48];
+    let remove_body = mls_device_remove_body_v5(
+        &origin_controller,
+        &recovery.device,
+        scope,
+        remove_submission,
+        remove_key,
+        2,
+        add_head,
+        remove_commit.clone(),
+        revoke_head,
+    )?;
+    let remove_request_digest = mls_device_remove_request_digest_v5(
+        &origin_controller,
+        &recovery.device,
+        scope,
+        remove_submission,
+        remove_key,
+        2,
+        add_head,
+        remove_commit,
+        revoke_head,
+    )?;
+    let remove_idempotency_hash =
+        Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, remove_key.as_bytes());
+    let removed = send_federated_mls_commit_v5(
+        group_app.clone(),
+        &remove_path,
+        remove_key,
+        &identity_origin,
+        mls_commit_federated_proof(
+            &origin_controller,
+            &identity_origin,
+            1,
+            scope,
+            &remove_path,
+            remove_submission,
+            remove_request_digest,
+            remove_idempotency_hash,
+            1_400,
+        )?,
+        remove_body.clone(),
+    )
+    .await?;
+    assert_eq!(removed.status(), StatusCode::CREATED);
+    assert_content_type(&removed, MLS_COMMIT_RECEIPT_V5_CONTENT_TYPE);
+    let remove_receipt = response_bytes(removed).await?;
+    let remove_replay = send_federated_mls_commit_v5(
+        group_app.clone(),
+        &remove_path,
+        remove_key,
+        &identity_origin,
+        mls_commit_federated_proof(
+            &origin_controller,
+            &identity_origin,
+            1,
+            scope,
+            &remove_path,
+            remove_submission,
+            remove_request_digest,
+            remove_idempotency_hash,
+            1_500,
+        )?,
+        remove_body,
+    )
+    .await?;
+    assert_eq!(remove_replay.status(), StatusCode::OK);
+    assert_eq!(response_bytes(remove_replay).await?, remove_receipt);
+    let remove_readback = send_federated_mls_receipt_query_v5(
+        group_app,
+        &remove_path,
+        &identity_origin,
+        mls_commit_federated_proof(
+            &origin_controller,
+            &identity_origin,
+            2,
+            scope,
+            &remove_path,
+            remove_submission,
+            remove_request_digest,
+            remove_idempotency_hash,
+            1_600,
+        )?,
+    )
+    .await?;
+    assert_eq!(remove_readback.status(), StatusCode::OK);
+    assert_eq!(response_bytes(remove_readback).await?, remove_receipt);
+
+    let group_identity_after = IdentityLogRepository::new()
+        .load(&group_identity_store, origin_controller.identity_id)
+        .await?
+        .ok_or("group-side identity disappeared")?;
+    assert_eq!(group_identity_after.head().sequence().get(), 2);
+    assert_eq!(
+        group_identity_after
+            .projection()
+            .device_status(recovery.device.device_id),
+        None
+    );
+    assert_eq!(
+        v5_intent_count(group_harness.admin_pool(), tenant_id).await?,
+        2
+    );
+    identity_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn v5_parser_rejects_add_remove_nullability_matrix_without_rows() -> Result<(), Box<dyn Error>>
+{
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let group_store = GroupPgStore::connect(harness.group_runtime_options(), 4).await?;
+    let owner = enroll_active_device(&identity_store, 144, 145, 146, [147; 32]).await?;
+    let target = synthetic_same_identity_device(&owner, 148);
+    let tenant_id = TenantId::new();
+    let app = group_router_with_state(
+        GroupNodeState::with_clock(group_store, tenant_id, Arc::new(FixedClock(NOW)))
+            .with_mls_sequencer_signing_key(SigningKey::from_bytes(&[149; 32]))
+            .with_public_origin_and_allowed_http_identity_origins(
+                AUDIENCE,
+                std::iter::empty::<String>(),
+            )?,
+    );
+    let scope = GroupScope::PrivateConversation(ConversationId::new());
+    let scope_path = scope_path(scope);
+    let nonzero = Sha256Digest::from_bytes([0x55; 32]);
+
+    for (index, (recovery_add, field, replacement)) in [
+        (true, 8_u64, CanonicalValue::Null),
+        (true, 14_u64, CanonicalValue::Null),
+        (false, 8_u64, nonzero.to_canonical_value()),
+        (false, 14_u64, nonzero.to_canonical_value()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let submission_id = RequestId::new();
+        let path = format!("{scope_path}/mls-commits/{submission_id}");
+        let idempotency_key = format!("v5-parser-nullability-{index:04}");
+        let valid_body = if recovery_add {
+            mls_recovery_add_body_v5(
+                &owner,
+                &target,
+                scope,
+                submission_id,
+                &idempotency_key,
+                0,
+                Sha256Digest::from_bytes([0; 32]),
+                vec![0xd1; 48],
+                Sha256Digest::from_bytes([0x44; 32]),
+                DeviceEnrollmentChallengeId::new(),
+                Sha256Digest::from_bytes([0x45; 32]),
+            )?
+        } else {
+            mls_device_remove_body_v5(
+                &owner,
+                &target,
+                scope,
+                submission_id,
+                &idempotency_key,
+                0,
+                Sha256Digest::from_bytes([0; 32]),
+                vec![0xd2; 48],
+                Sha256Digest::from_bytes([0x46; 32]),
+            )?
+        };
+        let response = send_mutation(
+            app.clone(),
+            "POST",
+            &path,
+            MLS_COMMIT_V5_CONTENT_TYPE,
+            &idempotency_key,
+            &owner,
+            replace_numbered_map_field(&valid_body, field, replacement)?,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_safe_group_error(response, "GROUP_REQUEST_INVALID").await?;
+        assert_eq!(v5_intent_count(harness.admin_pool(), tenant_id).await?, 0);
+    }
     Ok(())
 }
 
@@ -2152,6 +3387,388 @@ struct ActiveDevice {
     session_secret: [u8; 32],
 }
 
+struct PreparedHistoryRecovery {
+    device: ActiveDevice,
+    request_id: DeviceEnrollmentChallengeId,
+    request_digest: Sha256Digest,
+    approved_head: IdentityLogHead,
+    scope_digest: Sha256Digest,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_scoped_history_recovery(
+    app: axum::Router,
+    store: &IdentityPgStore,
+    controller: &ActiveDevice,
+    scope: GroupScope,
+    device_seed: u8,
+    encryption_seed: u8,
+    capability: [u8; 32],
+    session_secret: [u8; 32],
+    key_prefix: &str,
+    occurred_at: i64,
+) -> Result<PreparedHistoryRecovery, Box<dyn Error>> {
+    let repository = IdentityLogRepository::new();
+    let observed_head = repository
+        .load(store, controller.identity_id)
+        .await?
+        .ok_or("identity missing before history recovery request")?
+        .head();
+    let device = SigningKey::from_bytes(&[device_seed; 32]);
+    let device_id = DeviceId::new();
+    let request_id = DeviceEnrollmentChallengeId::new();
+    let encryption_key = DeviceEncryptionPublicKey::try_from([encryption_seed; 32])?;
+    let (request_body, exact_signed_request) = history_recovery_request_body(
+        &device,
+        request_id,
+        controller.identity_id,
+        device_id,
+        encryption_key,
+        observed_head,
+        UtcMillis::new(NOW - 10)?,
+        UtcMillis::new(NOW + 60_000)?,
+        capability,
+    )?;
+    let request = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(DEVICE_ENROLLMENT_CHALLENGE_PATH)
+                .header(header::CONTENT_TYPE, HISTORY_RECOVERY_REQUEST_CONTENT_TYPE)
+                .header("idempotency-key", format!("{key_prefix}-request-0001"))
+                .body(Body::from(request_body))?,
+        )
+        .await?;
+    assert_eq!(request.status(), StatusCode::CREATED);
+
+    let device_add = device_add_with_encryption(
+        &controller.root,
+        &device,
+        controller.identity_id,
+        device_id,
+        observed_head.hash(),
+        observed_head
+            .sequence()
+            .get()
+            .checked_add(1)
+            .ok_or("identity sequence overflow")?,
+        occurred_at,
+        encryption_key,
+    )?;
+    let approval_body = encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Text(request_id.to_string()),
+        CanonicalValue::Bytes(capability.to_vec()),
+        CanonicalValue::Bytes(device_add.to_deterministic_cbor()?),
+    ]))?;
+    let approval = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(DEVICE_ENROLLMENT_PATH)
+                .header(header::CONTENT_TYPE, DEVICE_ENROLLMENT_CONTENT_TYPE)
+                .header("idempotency-key", format!("{key_prefix}-approval-0001"))
+                .header(header::IF_MATCH, format!("\"{}\"", observed_head.hash()))
+                .header(
+                    header::AUTHORIZATION,
+                    device_session_authorization(controller.session_id, controller.session_secret),
+                )
+                .body(Body::from(approval_body))?,
+        )
+        .await?;
+    assert_eq!(approval.status(), StatusCode::CREATED);
+    let approved_head = repository
+        .load(store, controller.identity_id)
+        .await?
+        .ok_or("identity missing after history recovery approval")?
+        .head();
+    assert_eq!(
+        approved_head.sequence().get(),
+        observed_head.sequence().get() + 1
+    );
+    let active = issue_same_identity_device_session(
+        store,
+        controller,
+        device,
+        device_id,
+        session_secret,
+        key_prefix,
+        device_seed,
+    )
+    .await?;
+    Ok(PreparedHistoryRecovery {
+        device: active,
+        request_id,
+        request_digest: Sha256Digest::hash_domain(
+            HISTORY_RECOVERY_REQUEST_HASH_DOMAIN,
+            &exact_signed_request,
+        ),
+        approved_head,
+        scope_digest: mls_recovery_scope_digest(scope)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn history_recovery_request_body(
+    candidate: &SigningKey,
+    request_id: DeviceEnrollmentChallengeId,
+    identity_id: IdentityId,
+    candidate_device_id: DeviceId,
+    recipient_encryption_key: DeviceEncryptionPublicKey,
+    observed_head: IdentityLogHead,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    capability: [u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+    let unsigned = history_recovery_request_unsigned_canonical_bytes(
+        request_id,
+        identity_id,
+        candidate_device_id,
+        public_key(candidate)?,
+        recipient_encryption_key,
+        observed_head,
+        issued_at,
+        expires_at,
+    )?;
+    let candidate_signature = signature(
+        candidate,
+        &history_recovery_request_signature_input(&unsigned),
+    );
+    let CanonicalValue::Map(mut fields) = decode_deterministic_cbor(&unsigned)? else {
+        return Err("unsigned history recovery request must be a map".into());
+    };
+    fields.push((
+        CanonicalValue::Unsigned(12),
+        candidate_signature.to_canonical_value(),
+    ));
+    let exact_signed_request = encode_deterministic_cbor(&CanonicalValue::Map(fields.clone()))?;
+    fields.push((
+        CanonicalValue::Unsigned(13),
+        CanonicalValue::Bytes(capability.to_vec()),
+    ));
+    Ok((
+        encode_deterministic_cbor(&CanonicalValue::Map(fields))?,
+        exact_signed_request,
+    ))
+}
+
+async fn issue_same_identity_device_session(
+    store: &IdentityPgStore,
+    controller: &ActiveDevice,
+    device: SigningKey,
+    device_id: DeviceId,
+    session_secret: [u8; 32],
+    key_prefix: &str,
+    nonce_seed: u8,
+) -> Result<ActiveDevice, Box<dyn Error>> {
+    let challenge = DeviceSessionRepository
+        .issue_challenge(
+            store,
+            controller.identity_id,
+            device_id,
+            [nonce_seed; 32],
+            AUDIENCE,
+            UtcMillis::new(NOW)?,
+        )
+        .await?;
+    let session_id = DeviceSessionId::new();
+    let session_secret_hash =
+        Sha256Digest::hash_domain(DEVICE_SESSION_SECRET_HASH_DOMAIN, &session_secret);
+    let proof = signature(
+        &device,
+        &device_session_proof_input(
+            controller.identity_id,
+            device_id,
+            challenge.challenge_id(),
+            challenge.nonce(),
+            AUDIENCE,
+            session_id,
+            session_secret_hash,
+            challenge.session_expires_at(),
+        )?,
+    );
+    let completion = DeviceSessionCompletionCommand::new(
+        Sha256Digest::hash_domain(b"test-group-recovery-session\0", key_prefix.as_bytes()),
+        controller.identity_id,
+        device_id,
+        challenge.challenge_id(),
+        session_id,
+        *challenge.nonce(),
+        session_secret,
+        proof,
+    )?;
+    assert!(matches!(
+        DeviceSessionRepository
+            .complete(store, &completion, UtcMillis::new(NOW)?)
+            .await?,
+        DeviceSessionOutcome::Issued(_)
+    ));
+    Ok(ActiveDevice {
+        identity_id: controller.identity_id,
+        device_id,
+        root: SigningKey::from_bytes(&controller.root.to_bytes()),
+        device,
+        session_id,
+        session_secret,
+    })
+}
+
+async fn publish_scoped_recovery_key_package(
+    app: axum::Router,
+    controller: &ActiveDevice,
+    recovery: &PreparedHistoryRecovery,
+    scope: GroupScope,
+    published_head: IdentityLogHead,
+    opaque_key_package: Vec<u8>,
+    idempotency_key: &str,
+) -> Result<Sha256Digest, Box<dyn Error>> {
+    let scope_digest = mls_recovery_scope_digest(scope)?;
+    assert_eq!(scope_digest, recovery.scope_digest);
+    let package_id = KeyPackageId::new();
+    let expires_at = UtcMillis::new(NOW + 60_000)?;
+    let mut signature_input = key_package_publish_signature_input(
+        recovery.device.identity_id,
+        recovery.device.device_id,
+        package_id,
+        published_head.sequence(),
+        published_head.hash(),
+        expires_at,
+        &opaque_key_package,
+    )?;
+    signature_input.extend_from_slice(recovery.request_digest.as_bytes());
+    signature_input.extend_from_slice(scope_digest.as_bytes());
+    signature_input.extend_from_slice(b"history_recovery");
+    let detached_signature = signature(&recovery.device.device, &signature_input);
+    let body = encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        CanonicalValue::Text(recovery.device.identity_id.to_string()),
+        CanonicalValue::Text(recovery.device.device_id.to_string()),
+        CanonicalValue::Text(package_id.to_string()),
+        published_head.sequence().to_canonical_value(),
+        published_head.hash().to_canonical_value(),
+        expires_at.to_canonical_value(),
+        CanonicalValue::Bytes(opaque_key_package.clone()),
+        detached_signature.to_canonical_value(),
+        recovery.request_digest.to_canonical_value(),
+        scope_digest.to_canonical_value(),
+        CanonicalValue::Unsigned(1),
+    ]))?;
+    let path = KEY_PACKAGE_PUBLISH_PATH_TEMPLATE.replace("{package_id}", &package_id.to_string());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header(header::CONTENT_TYPE, KEY_PACKAGE_PUBLISH_V2_CONTENT_TYPE)
+                .header("idempotency-key", idempotency_key)
+                .header(
+                    header::AUTHORIZATION,
+                    device_session_authorization(
+                        recovery.device.session_id,
+                        recovery.device.session_secret,
+                    ),
+                )
+                .body(Body::from(body))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let claim_body = encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(2),
+        CanonicalValue::Text(recovery.device.identity_id.to_string()),
+        CanonicalValue::Text(recovery.device.device_id.to_string()),
+        recovery.request_digest.to_canonical_value(),
+        scope_digest.to_canonical_value(),
+        CanonicalValue::Unsigned(1),
+    ]))?;
+    let claim = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(KEY_PACKAGE_CLAIM_PATH)
+                .header(header::CONTENT_TYPE, KEY_PACKAGE_CLAIM_V2_CONTENT_TYPE)
+                .header("idempotency-key", format!("{idempotency_key}-claim"))
+                .header(
+                    header::AUTHORIZATION,
+                    device_session_authorization(controller.session_id, controller.session_secret),
+                )
+                .body(Body::from(claim_body))?,
+        )
+        .await?;
+    assert_eq!(claim.status(), StatusCode::CREATED);
+    Ok(Sha256Digest::hash_domain(
+        KEY_PACKAGE_BYTES_HASH_DOMAIN,
+        &opaque_key_package,
+    ))
+}
+
+async fn revoke_device_over_http(
+    app: axum::Router,
+    store: &IdentityPgStore,
+    controller: &ActiveDevice,
+    target_device_id: DeviceId,
+    idempotency_key: &str,
+    occurred_at: i64,
+) -> Result<Sha256Digest, Box<dyn Error>> {
+    let repository = IdentityLogRepository::new();
+    let head = repository
+        .load(store, controller.identity_id)
+        .await?
+        .ok_or("identity missing before HTTP device revoke")?
+        .head();
+    let event = signed_event(
+        &controller.root,
+        controller.identity_id,
+        head.sequence()
+            .get()
+            .checked_add(1)
+            .ok_or("identity sequence overflow")?,
+        Some(head.hash()),
+        occurred_at,
+        IdentityLogEventPayloadV1::DeviceRevoke {
+            device_id: target_device_id,
+        },
+    )?;
+    let path = DEVICE_REVOKE_PATH_TEMPLATE
+        .replace("{identity_id}", &controller.identity_id.to_string())
+        .replace("{device_id}", &target_device_id.to_string());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, IDENTITY_LOG_EVENT_CONTENT_TYPE)
+                .header("idempotency-key", idempotency_key)
+                .header(header::IF_MATCH, format!("\"{}\"", head.hash()))
+                .header(
+                    header::AUTHORIZATION,
+                    device_session_authorization(controller.session_id, controller.session_secret),
+                )
+                .body(Body::from(event.to_deterministic_cbor()?))?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let current = repository
+        .load(store, controller.identity_id)
+        .await?
+        .ok_or("identity missing after HTTP device revoke")?
+        .head();
+    assert_eq!(current.hash(), event.entry_hash()?);
+    Ok(current.hash())
+}
+
+fn synthetic_same_identity_device(controller: &ActiveDevice, seed: u8) -> ActiveDevice {
+    ActiveDevice {
+        identity_id: controller.identity_id,
+        device_id: DeviceId::new(),
+        root: SigningKey::from_bytes(&controller.root.to_bytes()),
+        device: SigningKey::from_bytes(&[seed; 32]),
+        session_id: DeviceSessionId::new(),
+        session_secret: [seed; 32],
+    }
+}
+
 async fn enroll_active_device(
     store: &IdentityPgStore,
     root_seed: u8,
@@ -2442,6 +4059,171 @@ async fn start_identity_log_server(
         let _ = axum::serve(listener, identity_bootstrap_router(store)).await;
     });
     Ok((origin, server))
+}
+
+async fn start_identity_server_at(
+    store: IdentityPgStore,
+    now_ms: i64,
+) -> Result<(String, tokio::task::JoinHandle<()>), Box<dyn Error>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = format!("http://{}", listener.local_addr()?);
+    let state = IdentityBootstrapState::with_clock_and_device_session_audience(
+        store,
+        Arc::new(FixedClock(now_ms)),
+        AUDIENCE,
+    );
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, identity_bootstrap_router_with_state(state)).await;
+    });
+    Ok((origin, server))
+}
+
+async fn replicate_initial_identity(
+    store: &IdentityPgStore,
+    active: &ActiveDevice,
+    recovery_seed: u8,
+    now_ms: i64,
+) -> Result<(), Box<dyn Error>> {
+    let recovery = SigningKey::from_bytes(&[recovery_seed; 32]);
+    let genesis = genesis(&active.root, &recovery, now_ms - 1_000)?;
+    if genesis.identity_id() != active.identity_id {
+        return Err("replicated identity ID mismatch".into());
+    }
+    let repository = IdentityLogRepository::new();
+    let bootstrap = IdentityAppendCommand::new(
+        Sha256Digest::hash_domain(b"test-group-cross-db-bootstrap\0", &[recovery_seed]),
+        None,
+        genesis.to_deterministic_cbor()?,
+    )?;
+    assert!(matches!(
+        repository
+            .append_bootstrap(store, &bootstrap, UtcMillis::new(now_ms - 800)?)
+            .await?,
+        IdentityAppendOutcome::Committed(_)
+    ));
+    let initial = device_add(
+        &active.root,
+        &active.device,
+        active.identity_id,
+        active.device_id,
+        genesis.entry_hash()?,
+        2,
+        now_ms - 700,
+    )?;
+    assert!(matches!(
+        repository
+            .append_initial_device(
+                store,
+                Sha256Digest::hash_domain(
+                    b"test-group-cross-db-initial\0",
+                    active.device_id.to_string().as_bytes(),
+                ),
+                genesis.entry_hash()?,
+                initial.to_deterministic_cbor()?,
+                UtcMillis::new(now_ms - 500)?,
+            )
+            .await?,
+        IdentityAppendOutcome::Committed(_)
+    ));
+    Ok(())
+}
+
+async fn seed_recovery_authorization_artifacts(
+    pool: &sqlx::PgPool,
+    controller: &ActiveDevice,
+    recovery: &PreparedHistoryRecovery,
+    package_digest: Sha256Digest,
+) -> Result<(), Box<dyn Error>> {
+    let mailbox_id = uuid::Uuid::now_v7();
+    let envelope_id = uuid::Uuid::now_v7();
+    let object_id = uuid::Uuid::now_v7();
+    let attachment_digest = Sha256Digest::from_bytes([0xa5; 32]);
+    let grant_digest = Sha256Digest::from_bytes([0xa6; 32]);
+    sqlx::query(
+        "INSERT INTO messaging.mailboxes
+             (mailbox_id,owner_identity_id,owner_device_id,write_capability_hash,
+              expires_at_ms,next_delivery_sequence,active_envelope_count,
+              active_envelope_bytes,created_at_ms)
+         VALUES ($1,$2,$3,$4,$5,1,1,32,$6)",
+    )
+    .bind(mailbox_id)
+    .bind(controller.identity_id.to_string())
+    .bind(uuid::Uuid::from(controller.device_id))
+    .bind([0xa1_u8; 32].as_slice())
+    .bind(NOW + 60_000)
+    .bind(NOW - 100)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO messaging.mailbox_envelopes
+             (mailbox_id,envelope_id,delivery_sequence,opaque_ciphertext,
+              request_digest,receipt_bytes,receipt_hash,expires_at_ms,state,created_at_ms)
+         VALUES ($1,$2,1,$3,$4,$5,$6,$7,'available',$8)",
+    )
+    .bind(mailbox_id)
+    .bind(envelope_id)
+    .bind([0xa2_u8; 32].as_slice())
+    .bind([0xa3_u8; 32].as_slice())
+    .bind([0x01_u8].as_slice())
+    .bind([0xa4_u8; 32].as_slice())
+    .bind(NOW + 60_000)
+    .bind(NOW - 100)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO messaging.attachment_objects
+             (object_id,owner_identity_id,owner_device_id,upload_capability_hash,
+              read_capability_hash,expected_manifest_digest,expected_chunk_count,
+              expected_ciphertext_bytes,uploaded_chunk_count,uploaded_ciphertext_bytes,
+              manifest_bytes,state,expires_at_ms,created_at_ms,updated_at_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,1,17,1,17,$7,'ready',$8,$9,$9)",
+    )
+    .bind(object_id)
+    .bind(controller.identity_id.to_string())
+    .bind(uuid::Uuid::from(controller.device_id))
+    .bind([0xb1_u8; 32].as_slice())
+    .bind([0xb2_u8; 32].as_slice())
+    .bind(attachment_digest.as_bytes().as_slice())
+    .bind([0xb3_u8; 17].as_slice())
+    .bind(NOW + 60_000)
+    .bind(NOW - 100)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO messaging.history_recovery_offers
+             (identity_id,request_id,recovery_request_digest,approved_head_hash,
+              candidate_device_id,provider_device_id,authority_kind,authority_id,
+              mailbox_id,envelope_id,provider_highwater,earliest_sequence,
+              recipient_package_digest,attachment_digest,offer_digest,exact_grant,
+              request_digest,idempotency_key_hash,provider_signature,authority_signature,
+              granted_at_ms,expires_at_ms,receipt_bytes,receipt_hash)
+         VALUES ($1,$2,$3,$4,$5,$6,'active_device',$7,$8,$9,0,1,$10,$11,$12,$13,
+                 $14,$15,$16,$17,$18,$19,$20,$21)",
+    )
+    .bind(controller.identity_id.to_string())
+    .bind(*recovery.request_id.as_uuid())
+    .bind(recovery.request_digest.as_bytes().as_slice())
+    .bind(recovery.approved_head.hash().as_bytes().as_slice())
+    .bind(uuid::Uuid::from(recovery.device.device_id))
+    .bind(uuid::Uuid::from(controller.device_id))
+    .bind(recovery.device.device_id.to_string())
+    .bind(mailbox_id)
+    .bind(envelope_id)
+    .bind(package_digest.as_bytes().as_slice())
+    .bind(attachment_digest.as_bytes().as_slice())
+    .bind([0xa7_u8; 32].as_slice())
+    .bind([0x01_u8].as_slice())
+    .bind(grant_digest.as_bytes().as_slice())
+    .bind(recovery.request_digest.as_bytes().as_slice())
+    .bind([0xa9_u8; 64].as_slice())
+    .bind([0xaa_u8; 64].as_slice())
+    .bind(NOW - 50)
+    .bind(NOW + 60_000)
+    .bind([0x01_u8].as_slice())
+    .bind([0xab_u8; 32].as_slice())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn revoke_device(
@@ -3144,6 +4926,28 @@ async fn send_federated_mls_commit(
     .map_err(Into::into)
 }
 
+async fn send_federated_mls_commit_v5(
+    app: axum::Router,
+    path: &str,
+    idempotency_key: &str,
+    identity_origin: &str,
+    proof: String,
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, MLS_COMMIT_V5_CONTENT_TYPE)
+            .header("idempotency-key", idempotency_key)
+            .header(IDENTITY_ORIGIN_HEADER, identity_origin)
+            .header(MLS_COMMIT_PROOF_HEADER, proof)
+            .body(Body::from(body))?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
 async fn send_federated_mls_receipt_query(
     app: axum::Router,
     path: &str,
@@ -3155,6 +4959,25 @@ async fn send_federated_mls_receipt_query(
             .method("GET")
             .uri(path)
             .header(header::ACCEPT, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE)
+            .header(IDENTITY_ORIGIN_HEADER, identity_origin)
+            .header(MLS_COMMIT_PROOF_HEADER, proof)
+            .body(Body::empty())?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn send_federated_mls_receipt_query_v5(
+    app: axum::Router,
+    path: &str,
+    identity_origin: &str,
+    proof: String,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(header::ACCEPT, MLS_COMMIT_RECEIPT_V5_CONTENT_TYPE)
             .header(IDENTITY_ORIGIN_HEADER, identity_origin)
             .header(MLS_COMMIT_PROOF_HEADER, proof)
             .body(Body::empty())?,
@@ -3239,6 +5062,28 @@ async fn send_local_commit_feed_v2(
             .method("GET")
             .uri(target)
             .header(header::ACCEPT, MLS_COMMIT_FEED_V2_CONTENT_TYPE)
+            .header(
+                header::AUTHORIZATION,
+                device_session_authorization(active.session_id, active.session_secret),
+            )
+            .header(GROUP_QUERY_PROOF_HEADER, proof)
+            .body(Body::empty())?,
+    )
+    .await
+    .map_err(Into::into)
+}
+
+async fn send_local_commit_feed_v3(
+    app: axum::Router,
+    target: &str,
+    active: &ActiveDevice,
+    proof: String,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    app.oneshot(
+        Request::builder()
+            .method("GET")
+            .uri(target)
+            .header(header::ACCEPT, MLS_COMMIT_FEED_V3_CONTENT_TYPE)
             .header(
                 header::AUTHORIZATION,
                 device_session_authorization(active.session_id, active.session_secret),
@@ -3459,6 +5304,12 @@ fn mls_commit_body(
         MlsCommitAuthorization::ExistingMemberDeviceAdd { .. } => {
             return Err("device-add helper not needed by this acceptance".into());
         }
+        MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd { .. } => {
+            return Err("V5 recovery-add uses the dedicated helper".into());
+        }
+        MlsCommitAuthorization::ExistingMemberDeviceRemove { .. } => {
+            return Err("V5 device-removal uses the dedicated helper".into());
+        }
         MlsCommitAuthorization::ApprovedIdentityJoinV3 { .. } => {
             return Err("V3 approved-join uses the dedicated helper".into());
         }
@@ -3561,6 +5412,315 @@ fn mls_commit_body_v4(
     ]))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn mls_recovery_add_body_v5(
+    controller: &ActiveDevice,
+    recovery_device: &ActiveDevice,
+    scope: GroupScope,
+    submission_id: RequestId,
+    idempotency_key: &str,
+    expected_epoch: u64,
+    expected_head: Sha256Digest,
+    commit_bytes: Vec<u8>,
+    key_package_digest: Sha256Digest,
+    recovery_request_id: DeviceEnrollmentChallengeId,
+    recovery_request_digest: Sha256Digest,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    mls_recovery_add_body_v5_with_scope_digest(
+        controller,
+        recovery_device,
+        scope,
+        submission_id,
+        idempotency_key,
+        expected_epoch,
+        expected_head,
+        commit_bytes,
+        key_package_digest,
+        recovery_request_id,
+        recovery_request_digest,
+        mls_recovery_scope_digest(scope)?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mls_recovery_add_body_v5_with_scope_digest(
+    controller: &ActiveDevice,
+    recovery_device: &ActiveDevice,
+    scope: GroupScope,
+    submission_id: RequestId,
+    idempotency_key: &str,
+    expected_epoch: u64,
+    expected_head: Sha256Digest,
+    commit_bytes: Vec<u8>,
+    key_package_digest: Sha256Digest,
+    recovery_request_id: DeviceEnrollmentChallengeId,
+    recovery_request_digest: Sha256Digest,
+    scope_digest: Sha256Digest,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    if controller.identity_id != recovery_device.identity_id {
+        return Err("V5 recovery controller and device must share one identity".into());
+    }
+    let idempotency_key_hash =
+        Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, idempotency_key.as_bytes());
+    let commit_digest = mls_opaque_commit_digest(&commit_bytes);
+    let welcome_digest = Sha256Digest::hash_domain(b"test-mls-welcome\0", &commit_bytes);
+    let provisional = MlsCommitCommand::new_v5_existing_member_device_recovery_add(
+        submission_id,
+        scope,
+        controller.identity_id,
+        controller.device_id,
+        recovery_device.device_id,
+        key_package_digest,
+        idempotency_key_hash,
+        expected_epoch,
+        expected_head,
+        commit_bytes.clone(),
+        commit_digest,
+        welcome_digest,
+        recovery_request_id,
+        recovery_request_digest,
+        scope_digest,
+        Sha256Digest::from_bytes([0; 32]),
+    )?;
+    let consent_digest = mls_v5_controller_consent_digest(&provisional)?;
+    let command = MlsCommitCommand::new_v5_existing_member_device_recovery_add(
+        submission_id,
+        scope,
+        controller.identity_id,
+        controller.device_id,
+        recovery_device.device_id,
+        key_package_digest,
+        idempotency_key_hash,
+        expected_epoch,
+        expected_head,
+        commit_bytes.clone(),
+        commit_digest,
+        welcome_digest,
+        recovery_request_id,
+        recovery_request_digest,
+        scope_digest,
+        consent_digest,
+    )?;
+    let consent_signature = signature(
+        &controller.device,
+        &mls_v5_controller_consent_signature_input(&command)?,
+    );
+    encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(5),
+        CanonicalValue::Text(submission_id.to_string()),
+        scope_value(scope),
+        CanonicalValue::Text(controller.identity_id.to_string()),
+        CanonicalValue::Text(controller.device_id.to_string()),
+        CanonicalValue::Text(recovery_device.identity_id.to_string()),
+        CanonicalValue::Text(recovery_device.device_id.to_string()),
+        key_package_digest.to_canonical_value(),
+        CanonicalValue::Null,
+        CanonicalValue::Unsigned(expected_epoch),
+        expected_head.to_canonical_value(),
+        CanonicalValue::Bytes(commit_bytes),
+        commit_digest.to_canonical_value(),
+        welcome_digest.to_canonical_value(),
+        numbered_map(vec![
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Text(controller.device_id.to_string()),
+            consent_digest.to_canonical_value(),
+            CanonicalValue::Text(recovery_request_id.to_string()),
+            recovery_request_digest.to_canonical_value(),
+            scope_digest.to_canonical_value(),
+            numbered_map(vec![
+                CanonicalValue::Unsigned(5),
+                consent_digest.to_canonical_value(),
+                consent_signature.to_canonical_value(),
+            ]),
+        ]),
+    ]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mls_device_remove_body_v5(
+    controller: &ActiveDevice,
+    revoked_device: &ActiveDevice,
+    scope: GroupScope,
+    submission_id: RequestId,
+    idempotency_key: &str,
+    expected_epoch: u64,
+    expected_head: Sha256Digest,
+    commit_bytes: Vec<u8>,
+    identity_revoke_head_digest: Sha256Digest,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    if controller.identity_id != revoked_device.identity_id {
+        return Err("V5 removal controller and device must share one identity".into());
+    }
+    let idempotency_key_hash =
+        Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, idempotency_key.as_bytes());
+    let commit_digest = mls_opaque_commit_digest(&commit_bytes);
+    let provisional = MlsCommitCommand::new_v5_existing_member_device_remove(
+        submission_id,
+        scope,
+        controller.identity_id,
+        controller.device_id,
+        revoked_device.device_id,
+        idempotency_key_hash,
+        expected_epoch,
+        expected_head,
+        commit_bytes.clone(),
+        commit_digest,
+        identity_revoke_head_digest,
+    )?;
+    let consent_digest = mls_v5_controller_consent_digest(&provisional)?;
+    let consent_signature = signature(
+        &controller.device,
+        &mls_v5_controller_consent_signature_input(&provisional)?,
+    );
+    encode(&numbered_map(vec![
+        CanonicalValue::Unsigned(5),
+        CanonicalValue::Text(submission_id.to_string()),
+        scope_value(scope),
+        CanonicalValue::Text(controller.identity_id.to_string()),
+        CanonicalValue::Text(controller.device_id.to_string()),
+        CanonicalValue::Text(revoked_device.identity_id.to_string()),
+        CanonicalValue::Text(revoked_device.device_id.to_string()),
+        CanonicalValue::Null,
+        CanonicalValue::Null,
+        CanonicalValue::Unsigned(expected_epoch),
+        expected_head.to_canonical_value(),
+        CanonicalValue::Bytes(commit_bytes),
+        commit_digest.to_canonical_value(),
+        CanonicalValue::Null,
+        numbered_map(vec![
+            CanonicalValue::Unsigned(6),
+            identity_revoke_head_digest.to_canonical_value(),
+            numbered_map(vec![
+                CanonicalValue::Unsigned(5),
+                consent_digest.to_canonical_value(),
+                consent_signature.to_canonical_value(),
+            ]),
+        ]),
+    ]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mls_recovery_add_request_digest_v5(
+    controller: &ActiveDevice,
+    recovery_device: &ActiveDevice,
+    scope: GroupScope,
+    submission_id: RequestId,
+    idempotency_key: &str,
+    expected_epoch: u64,
+    expected_head: Sha256Digest,
+    commit_bytes: Vec<u8>,
+    key_package_digest: Sha256Digest,
+    recovery_request_id: DeviceEnrollmentChallengeId,
+    recovery_request_digest: Sha256Digest,
+) -> Result<Sha256Digest, Box<dyn Error>> {
+    mls_recovery_add_request_digest_v5_with_scope_digest(
+        controller,
+        recovery_device,
+        scope,
+        submission_id,
+        idempotency_key,
+        expected_epoch,
+        expected_head,
+        commit_bytes,
+        key_package_digest,
+        recovery_request_id,
+        recovery_request_digest,
+        mls_recovery_scope_digest(scope)?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mls_recovery_add_request_digest_v5_with_scope_digest(
+    controller: &ActiveDevice,
+    recovery_device: &ActiveDevice,
+    scope: GroupScope,
+    submission_id: RequestId,
+    idempotency_key: &str,
+    expected_epoch: u64,
+    expected_head: Sha256Digest,
+    commit_bytes: Vec<u8>,
+    key_package_digest: Sha256Digest,
+    recovery_request_id: DeviceEnrollmentChallengeId,
+    recovery_request_digest: Sha256Digest,
+    recovery_scope_digest: Sha256Digest,
+) -> Result<Sha256Digest, Box<dyn Error>> {
+    let idempotency_key_hash =
+        Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, idempotency_key.as_bytes());
+    let commit_digest = mls_opaque_commit_digest(&commit_bytes);
+    let welcome_digest = Sha256Digest::hash_domain(b"test-mls-welcome\0", &commit_bytes);
+    let provisional = MlsCommitCommand::new_v5_existing_member_device_recovery_add(
+        submission_id,
+        scope,
+        controller.identity_id,
+        controller.device_id,
+        recovery_device.device_id,
+        key_package_digest,
+        idempotency_key_hash,
+        expected_epoch,
+        expected_head,
+        commit_bytes.clone(),
+        commit_digest,
+        welcome_digest,
+        recovery_request_id,
+        recovery_request_digest,
+        recovery_scope_digest,
+        Sha256Digest::from_bytes([0; 32]),
+    )?;
+    let controller_consent_digest = mls_v5_controller_consent_digest(&provisional)?;
+    Ok(
+        MlsCommitCommand::new_v5_existing_member_device_recovery_add(
+            submission_id,
+            scope,
+            controller.identity_id,
+            controller.device_id,
+            recovery_device.device_id,
+            key_package_digest,
+            idempotency_key_hash,
+            expected_epoch,
+            expected_head,
+            commit_bytes,
+            commit_digest,
+            welcome_digest,
+            recovery_request_id,
+            recovery_request_digest,
+            recovery_scope_digest,
+            controller_consent_digest,
+        )?
+        .request_digest(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mls_device_remove_request_digest_v5(
+    controller: &ActiveDevice,
+    revoked_device: &ActiveDevice,
+    scope: GroupScope,
+    submission_id: RequestId,
+    idempotency_key: &str,
+    expected_epoch: u64,
+    expected_head: Sha256Digest,
+    commit_bytes: Vec<u8>,
+    identity_revoke_head_digest: Sha256Digest,
+) -> Result<Sha256Digest, Box<dyn Error>> {
+    let idempotency_key_hash =
+        Sha256Digest::hash_domain(MLS_IDEMPOTENCY_KEY_HASH_DOMAIN, idempotency_key.as_bytes());
+    let commit_digest = mls_opaque_commit_digest(&commit_bytes);
+    Ok(MlsCommitCommand::new_v5_existing_member_device_remove(
+        submission_id,
+        scope,
+        controller.identity_id,
+        controller.device_id,
+        revoked_device.device_id,
+        idempotency_key_hash,
+        expected_epoch,
+        expected_head,
+        commit_bytes,
+        commit_digest,
+        identity_revoke_head_digest,
+    )?
+    .request_digest())
+}
+
 fn mls_receipt_head(bytes: &[u8]) -> Result<Sha256Digest, Box<dyn Error>> {
     let CanonicalValue::Map(outer) = decode_deterministic_cbor(bytes)? else {
         return Err("MLS receipt wrapper must be a map".into());
@@ -3584,7 +5744,7 @@ fn mls_receipt_facts(bytes: &[u8]) -> Result<(Sha256Digest, Sha256Digest), Box<d
     };
     if !matches!(
         inner.first().map(|field| &field.1),
-        Some(CanonicalValue::Unsigned(1 | 3 | 4))
+        Some(CanonicalValue::Unsigned(1 | 3 | 4 | 5))
     ) {
         return Err("MLS receipt must use a supported inner version".into());
     }
@@ -3886,6 +6046,80 @@ async fn response_bytes(response: axum::response::Response) -> Result<Vec<u8>, B
     Ok(to_bytes(response.into_body(), 64_000).await?.to_vec())
 }
 
+async fn assert_safe_group_error(
+    response: axum::response::Response,
+    expected_code: &str,
+) -> Result<(), Box<dyn Error>> {
+    assert_content_type(&response, "application/json");
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+    let body = to_bytes(response.into_body(), 16_384).await?;
+    let value: serde_json::Value = serde_json::from_slice(&body)?;
+    let object = value
+        .as_object()
+        .ok_or("Group error must be a JSON object")?;
+    assert_eq!(object.len(), 1);
+    let error = object
+        .get("error")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("Group error must contain one error object")?;
+    assert_eq!(error.len(), 3);
+    assert_eq!(
+        error.get("code").and_then(serde_json::Value::as_str),
+        Some(expected_code)
+    );
+    assert!(
+        error
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+    );
+    assert_eq!(
+        error.get("retryable").and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    Ok(())
+}
+
+fn replace_numbered_map_field(
+    bytes: &[u8],
+    field: u64,
+    replacement: CanonicalValue,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let CanonicalValue::Map(mut fields) = decode_deterministic_cbor(bytes)? else {
+        return Err("canonical request must be a map".into());
+    };
+    let value = fields
+        .iter_mut()
+        .find(|(key, _)| key == &CanonicalValue::Unsigned(field))
+        .map(|(_, value)| value)
+        .ok_or("canonical request field missing")?;
+    *value = replacement;
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
+}
+
+async fn v5_intent_count(pool: &sqlx::PgPool, tenant_id: TenantId) -> Result<i64, Box<dyn Error>> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM groups.mls_commit_intents
+          WHERE tenant_id=$1 AND protocol_version=5",
+    )
+    .bind(uuid::Uuid::from(tenant_id))
+    .fetch_one(pool)
+    .await?)
+}
+
 type DecodedDiscoveryPage = (Vec<(String, String)>, Option<String>);
 
 fn decode_discovery_page(bytes: &[u8]) -> Result<DecodedDiscoveryPage, Box<dyn Error>> {
@@ -4020,6 +6254,29 @@ fn device_add(
     sequence: u64,
     occurred_at: i64,
 ) -> Result<IdentityLogEventV1, Box<dyn Error>> {
+    device_add_with_encryption(
+        root,
+        device,
+        identity_id,
+        device_id,
+        previous_hash,
+        sequence,
+        occurred_at,
+        DeviceEncryptionPublicKey::try_from([7_u8; 32])?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn device_add_with_encryption(
+    root: &SigningKey,
+    device: &SigningKey,
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    previous_hash: Sha256Digest,
+    sequence: u64,
+    occurred_at: i64,
+    encryption_key: DeviceEncryptionPublicKey,
+) -> Result<IdentityLogEventV1, Box<dyn Error>> {
     let root_key = public_key(root)?;
     let device_key = public_key(device)?;
     let certificate_unsigned = UnsignedDeviceCertificateV1::new(
@@ -4027,7 +6284,7 @@ fn device_add(
         identity_id,
         device_id,
         device_key,
-        DeviceEncryptionPublicKey::try_from([7_u8; 32])?,
+        encryption_key,
         root_key,
         UtcMillis::new(occurred_at - 1)?,
     )?;

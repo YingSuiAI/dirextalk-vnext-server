@@ -12,6 +12,7 @@ mod account_cursor;
 mod attachment;
 mod error;
 mod history;
+mod history_v2;
 mod multi_device;
 mod repository;
 mod store;
@@ -24,6 +25,7 @@ pub use attachment::{
 };
 pub use error::MailboxPersistenceError;
 pub use history::{DeviceHistoryAuthorization, DeviceHistoryGrantCommand};
+pub use history_v2::{DeviceHistoryGrantAuthorityV2, DeviceHistoryGrantCommandV2};
 pub use multi_device::{
     IdentityDeliverySegment, IdentityMailboxAckCommand, IdentityMailboxPullRequest,
     IdentityPulledEnvelope, MAX_IDENTITY_PULL_ENTRIES,

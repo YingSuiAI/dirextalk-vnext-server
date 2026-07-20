@@ -38,6 +38,30 @@ impl IdentityLogHead {
         }
     }
 
+    /// Builds an externally observed current head for an exact recovery
+    /// request; persistence still rechecks it against the locked log head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the observed sequence is zero.
+    pub fn observed(
+        identity_id: IdentityId,
+        sequence: SafeUint,
+        hash: Sha256Digest,
+    ) -> Result<Self, IdentityPersistenceError> {
+        if sequence.get() == 0 {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "observed identity head sequence",
+            ));
+        }
+        Ok(Self::new(
+            identity_id,
+            dtx_identity_log::IDENTITY_LOG_WIRE_VERSION,
+            sequence,
+            hash,
+        ))
+    }
+
     /// Returns the permanent self-certifying public ID.
     #[must_use]
     pub const fn identity_id(self) -> IdentityId {

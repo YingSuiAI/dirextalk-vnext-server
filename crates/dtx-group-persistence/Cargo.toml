@@ -9,6 +9,7 @@ publish = false
 dtx-domain = { path = "../dtx-domain" }
 dtx-group-policy = { path = "../dtx-group-policy" }
 dtx-identity-persistence = { path = "../dtx-identity-persistence" }
+dtx-identity-log = { path = "../dtx-identity-log" }
 dtx-membership-command = { path = "../dtx-membership-command" }
 dtx-wire = { path = "../dtx-wire" }
 ed25519-dalek.workspace = true

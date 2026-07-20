@@ -131,6 +131,11 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
                  'realtime.append_identity_invalidation(text,text,bytea)', \
                  'EXECUTE' \
              ) \
+             AND has_function_privilege( \
+                 current_user, \
+                 'identity.mls_v5_recovery_authorization_projection(text,uuid,uuid,uuid,bytea,bytea,bytea,bytea,bigint)', \
+                 'EXECUTE' \
+             ) \
              AND has_table_privilege(current_user, 'identity.fork_evidence', 'SELECT') \
              AND has_table_privilege(current_user, 'identity.fork_evidence', 'INSERT') \
              AND has_table_privilege(current_user, 'identity.log_outbox', 'SELECT') \

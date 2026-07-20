@@ -6,9 +6,10 @@ use dtx_identity_log::{
     IdentityLogEventV1,
 };
 use dtx_wire::{
-    CanonicalEncode, CanonicalValue, SafeUint, Sha256Digest, SigningPublicKey, UtcMillis,
-    encode_deterministic_cbor,
+    CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
+    UtcMillis, encode_deterministic_cbor,
 };
+use ed25519_dalek::{Signature, VerifyingKey};
 use sqlx::{PgConnection, Row};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -40,12 +41,19 @@ pub const DEVICE_ENROLLMENT_APPROVAL_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
     b"dirextalk.device-enrollment-approval-idempotency.v1\0";
 /// Domain separator for the exact root-signed device-add bytes in an approval digest.
 pub const DEVICE_ENROLLMENT_EVENT_HASH_DOMAIN: &[u8] = b"dirextalk.device-enrollment-event.v1\0";
+/// Domain separator for the candidate-signed V40 history-recovery request.
+pub const HISTORY_RECOVERY_REQUEST_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.history-recovery-request-signature.v1\0";
+/// Domain separator for the exact candidate-signed history-recovery request.
+pub const HISTORY_RECOVERY_REQUEST_HASH_DOMAIN: &[u8] =
+    b"dirextalk.history-recovery-request-digest.v1\0";
 
 const OPEN_CHALLENGE_STATE: &str = "open";
 const APPROVED_CHALLENGE_STATE: &str = "approved";
 const CANCELLED_CHALLENGE_STATE: &str = "cancelled";
 const DEVICE_ENROLLMENT_PRUNE_BATCH_SIZE: i32 = 256;
 const MAX_DEVICE_ENROLLMENT_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_HISTORY_RECOVERY_REQUEST_BYTES: usize = 16 * 1024;
 
 /// A 32-byte candidate-held bearer capability for one QR enrollment card.
 ///
@@ -214,6 +222,219 @@ impl CreateDeviceEnrollmentChallengeCommand {
             &canonical,
         ))
     }
+}
+
+/// Candidate-generated signed request authorizing one new device to recover
+/// all of the identity's current memberships after normal `DeviceAdd` approval.
+pub struct CreateHistoryRecoveryRequestCommand {
+    idempotency_key_hash: Sha256Digest,
+    request_id: DeviceEnrollmentChallengeId,
+    identity_id: IdentityId,
+    target_device_id: DeviceId,
+    target_device_signing_key: SigningPublicKey,
+    recipient_encryption_key: DeviceEncryptionPublicKey,
+    observed_head: IdentityLogHead,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    capability: DeviceEnrollmentCapability,
+    candidate_signature: Ed25519Signature,
+    exact_request_bytes: Vec<u8>,
+}
+
+impl fmt::Debug for CreateHistoryRecoveryRequestCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateHistoryRecoveryRequestCommand")
+            .field("idempotency_key_hash", &self.idempotency_key_hash)
+            .field("request_id", &self.request_id)
+            .field("identity_id", &self.identity_id)
+            .field("target_device_id", &self.target_device_id)
+            .field("target_device_signing_key", &self.target_device_signing_key)
+            .field("recipient_encryption_key", &self.recipient_encryption_key)
+            .field("observed_head", &self.observed_head)
+            .field("issued_at", &self.issued_at)
+            .field("expires_at", &self.expires_at)
+            .field("capability", &"[REDACTED]")
+            .field("candidate_signature", &self.candidate_signature)
+            .field("exact_request_bytes_len", &self.exact_request_bytes.len())
+            .finish()
+    }
+}
+
+impl CreateHistoryRecoveryRequestCommand {
+    /// Builds and validates an exact, candidate-signed V2 enrollment request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request shape, candidate signature, or exact
+    /// canonical request bytes are invalid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        idempotency_key_hash: Sha256Digest,
+        request_id: DeviceEnrollmentChallengeId,
+        identity_id: IdentityId,
+        target_device_id: DeviceId,
+        target_device_signing_key: SigningPublicKey,
+        recipient_encryption_key: DeviceEncryptionPublicKey,
+        observed_head: IdentityLogHead,
+        issued_at: UtcMillis,
+        expires_at: UtcMillis,
+        capability: DeviceEnrollmentCapability,
+        candidate_signature: Ed25519Signature,
+        exact_request_bytes: Vec<u8>,
+    ) -> Result<Self, IdentityPersistenceError> {
+        if observed_head.identity_id() != identity_id
+            || target_device_signing_key.as_bytes() == recipient_encryption_key.as_bytes()
+            || issued_at >= expires_at
+            || expires_at.get().saturating_sub(issued_at.get())
+                > DEVICE_ENROLLMENT_CHALLENGE_TTL_MILLIS
+            || exact_request_bytes.is_empty()
+            || exact_request_bytes.len() > MAX_HISTORY_RECOVERY_REQUEST_BYTES
+        {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "history recovery request shape",
+            ));
+        }
+        let unsigned = history_recovery_request_unsigned_canonical_bytes(
+            request_id,
+            identity_id,
+            target_device_id,
+            target_device_signing_key,
+            recipient_encryption_key,
+            observed_head,
+            issued_at,
+            expires_at,
+        )?;
+        verify_candidate_signature(
+            target_device_signing_key,
+            &history_recovery_request_signature_input(&unsigned),
+            candidate_signature,
+        )?;
+        let expected = history_recovery_request_canonical_bytes(&unsigned, candidate_signature)?;
+        if expected != exact_request_bytes {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "history recovery request exact canonical bytes",
+            ));
+        }
+        Ok(Self {
+            idempotency_key_hash,
+            request_id,
+            identity_id,
+            target_device_id,
+            target_device_signing_key,
+            recipient_encryption_key,
+            observed_head,
+            issued_at,
+            expires_at,
+            capability,
+            candidate_signature,
+            exact_request_bytes,
+        })
+    }
+
+    /// Returns the candidate-generated request identifier.
+    #[must_use]
+    pub const fn request_id(&self) -> DeviceEnrollmentChallengeId {
+        self.request_id
+    }
+
+    /// Returns the digest bound into grants and scoped `KeyPackages`.
+    #[must_use]
+    pub fn request_digest(&self) -> Sha256Digest {
+        Sha256Digest::hash_domain(
+            HISTORY_RECOVERY_REQUEST_HASH_DOMAIN,
+            &self.exact_request_bytes,
+        )
+    }
+
+    /// Returns the exact canonical request carried by the QR payload.
+    #[must_use]
+    pub fn exact_request_bytes(&self) -> &[u8] {
+        &self.exact_request_bytes
+    }
+}
+
+/// Returns the exact unsigned canonical request a candidate must sign.
+///
+/// # Errors
+///
+/// Returns an error when the request cannot be encoded as deterministic CBOR.
+#[allow(clippy::too_many_arguments)]
+pub fn history_recovery_request_unsigned_canonical_bytes(
+    request_id: DeviceEnrollmentChallengeId,
+    identity_id: IdentityId,
+    target_device_id: DeviceId,
+    target_device_signing_key: SigningPublicKey,
+    recipient_encryption_key: DeviceEncryptionPublicKey,
+    observed_head: IdentityLogHead,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(request_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Text(target_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            target_device_signing_key.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            recipient_encryption_key.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            observed_head.sequence().to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            observed_head.hash().to_canonical_value(),
+        ),
+        (CanonicalValue::Unsigned(9), CanonicalValue::Unsigned(1)),
+        (CanonicalValue::Unsigned(10), issued_at.to_canonical_value()),
+        (
+            CanonicalValue::Unsigned(11),
+            expires_at.to_canonical_value(),
+        ),
+    ]))
+    .map_err(|_| IdentityPersistenceError::InvalidCommand("history recovery request encoding"))
+}
+
+/// Returns the domain-separated bytes authenticated by the candidate.
+#[must_use]
+pub fn history_recovery_request_signature_input(unsigned: &[u8]) -> Vec<u8> {
+    let mut input =
+        Vec::with_capacity(HISTORY_RECOVERY_REQUEST_SIGNATURE_DOMAIN.len() + unsigned.len());
+    input.extend_from_slice(HISTORY_RECOVERY_REQUEST_SIGNATURE_DOMAIN);
+    input.extend_from_slice(unsigned);
+    input
+}
+
+fn history_recovery_request_canonical_bytes(
+    unsigned: &[u8],
+    signature: Ed25519Signature,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    let unsigned = dtx_wire::decode_deterministic_cbor(unsigned).map_err(|_| {
+        IdentityPersistenceError::InvalidCommand("history recovery request encoding")
+    })?;
+    let CanonicalValue::Map(mut fields) = unsigned else {
+        return Err(IdentityPersistenceError::InvalidCommand(
+            "history recovery request encoding",
+        ));
+    };
+    fields.push((CanonicalValue::Unsigned(12), signature.to_canonical_value()));
+    encode_deterministic_cbor(&CanonicalValue::Map(fields))
+        .map_err(|_| IdentityPersistenceError::InvalidCommand("history recovery request encoding"))
 }
 
 /// A capability-bearing enrollment card returned to its candidate.
@@ -506,6 +727,89 @@ impl DeviceEnrollmentChallengeStatus {
 pub struct DeviceEnrollmentRepository;
 
 impl DeviceEnrollmentRepository {
+    /// Persists one exact candidate-signed V2 history-recovery request.
+    ///
+    /// The candidate chooses the request UUID and observed identity head. The
+    /// server accepts it only while that head is current, preserving the exact
+    /// signed bytes for later DeviceAdd/grant authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request is expired, conflicts with an existing
+    /// idempotency record or current identity head, or cannot be persisted.
+    pub async fn create_history_recovery_request(
+        self,
+        store: &IdentityPgStore,
+        command: CreateHistoryRecoveryRequestCommand,
+        now: UtcMillis,
+    ) -> Result<DeviceEnrollmentChallengeOutcome, IdentityPersistenceError> {
+        if now < command.issued_at || now >= command.expires_at {
+            return Err(IdentityPersistenceError::DeviceEnrollmentChallengeExpired);
+        }
+        let request_digest = command.request_digest();
+        let mut session = store.begin().await?;
+        let result = async {
+            if let Some(existing) = load_challenge_by_creation_key_optional(
+                session.connection(),
+                command.idempotency_key_hash,
+            )
+            .await?
+            {
+                if !existing.matches_history_recovery_creation(&command, request_digest) {
+                    return Err(IdentityPersistenceError::IdempotencyConflict);
+                }
+                return Ok(PersistedChallenge {
+                    challenge_id: existing.challenge_id,
+                    created_at: existing.created_at,
+                    expires_at: existing.expires_at,
+                    disposition: CreateDisposition::Replayed,
+                });
+            }
+            let snapshot =
+                lock_and_load_active_snapshot(session.connection(), command.identity_id).await?;
+            if snapshot.head() != command.observed_head {
+                return Err(IdentityPersistenceError::HeadConflict {
+                    current: Some(snapshot.head()),
+                });
+            }
+            create_or_replay_history_recovery_request(
+                session.connection(),
+                &command,
+                request_digest,
+                now,
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(persisted) => {
+                session.commit().await?;
+                let challenge = DeviceEnrollmentChallenge {
+                    challenge_id: persisted.challenge_id,
+                    identity_id: command.identity_id,
+                    target_device_id: command.target_device_id,
+                    target_device_signing_key: command.target_device_signing_key,
+                    target_device_encryption_key: command.recipient_encryption_key,
+                    capability: command.capability,
+                    created_at: persisted.created_at,
+                    expires_at: persisted.expires_at,
+                };
+                Ok(match persisted.disposition {
+                    CreateDisposition::Created => {
+                        DeviceEnrollmentChallengeOutcome::Created(challenge)
+                    }
+                    CreateDisposition::Replayed => {
+                        DeviceEnrollmentChallengeOutcome::Replayed(challenge)
+                    }
+                })
+            }
+            Err(error) => {
+                let _ = session.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
     /// Creates one short-lived candidate enrollment card or replays the exact card request.
     ///
     /// The server persists only the capability hash. A response-loss retry must
@@ -661,6 +965,10 @@ impl DeviceEnrollmentRepository {
                     let snapshot =
                         lock_and_load_active_snapshot(session.connection(), challenge.identity_id)
                             .await?;
+                    ensure_history_recovery_observed_head(
+                        challenge.observed_head,
+                        snapshot.head(),
+                    )?;
                     if command.expected_head_hash() != snapshot.head().hash() {
                         return Err(IdentityPersistenceError::HeadConflict {
                             current: Some(snapshot.head()),
@@ -871,6 +1179,13 @@ struct StoredEnrollmentChallenge {
     target_device_encryption_key: DeviceEncryptionPublicKey,
     capability_hash: Sha256Digest,
     request_digest: Sha256Digest,
+    protocol_version: i16,
+    recovery_request_bytes: Option<Vec<u8>>,
+    recovery_request_digest: Option<Sha256Digest>,
+    observed_head: Option<IdentityLogHead>,
+    request_issued_at: Option<UtcMillis>,
+    recipient_encryption_key: Option<DeviceEncryptionPublicKey>,
+    candidate_request_signature: Option<Ed25519Signature>,
     state: DurableChallengeState,
     created_at: UtcMillis,
     expires_at: UtcMillis,
@@ -889,12 +1204,38 @@ impl StoredEnrollmentChallenge {
         command: &CreateDeviceEnrollmentChallengeCommand,
         request_digest: Sha256Digest,
     ) -> bool {
-        self.creation_idempotency_key_hash == command.idempotency_key_hash
+        self.protocol_version == 1
+            && self.creation_idempotency_key_hash == command.idempotency_key_hash
             && self.identity_id == command.identity_id
             && self.target_device_id == command.target_device_id
             && self.target_device_signing_key == command.target_device_signing_key
             && self.target_device_encryption_key == command.target_device_encryption_key
             && self.request_digest == request_digest
+            && bool::from(
+                self.capability_hash
+                    .as_bytes()
+                    .ct_eq(command.capability.hash().as_bytes()),
+            )
+    }
+
+    fn matches_history_recovery_creation(
+        &self,
+        command: &CreateHistoryRecoveryRequestCommand,
+        request_digest: Sha256Digest,
+    ) -> bool {
+        self.protocol_version == 2
+            && self.challenge_id == command.request_id
+            && self.creation_idempotency_key_hash == command.idempotency_key_hash
+            && self.identity_id == command.identity_id
+            && self.target_device_id == command.target_device_id
+            && self.target_device_signing_key == command.target_device_signing_key
+            && self.target_device_encryption_key == command.recipient_encryption_key
+            && self.recovery_request_bytes.as_deref() == Some(command.exact_request_bytes())
+            && self.recovery_request_digest == Some(request_digest)
+            && self.observed_head == Some(command.observed_head)
+            && self.request_issued_at == Some(command.issued_at)
+            && self.recipient_encryption_key == Some(command.recipient_encryption_key)
+            && self.candidate_request_signature == Some(command.candidate_signature)
             && bool::from(
                 self.capability_hash
                     .as_bytes()
@@ -923,6 +1264,25 @@ impl StoredEnrollmentChallenge {
     }
 
     fn validate(&self) -> Result<(), IdentityPersistenceError> {
+        match self.protocol_version {
+            1 if self.recovery_request_bytes.is_none()
+                && self.recovery_request_digest.is_none()
+                && self.observed_head.is_none()
+                && self.request_issued_at.is_none()
+                && self.recipient_encryption_key.is_none()
+                && self.candidate_request_signature.is_none() => {}
+            2 if self.recovery_request_bytes.is_some()
+                && self.recovery_request_digest.is_some()
+                && self.observed_head.is_some()
+                && self.request_issued_at.is_some()
+                && self.recipient_encryption_key == Some(self.target_device_encryption_key)
+                && self.candidate_request_signature.is_some() => {}
+            _ => {
+                return Err(IdentityPersistenceError::CorruptData(
+                    "device enrollment protocol fields",
+                ));
+            }
+        }
         let expected_open_retention = self.expires_at;
         match self.state {
             DurableChallengeState::Open
@@ -984,7 +1344,7 @@ async fn create_or_replay_challenge(
              capability_hash, request_digest, state, created_at_ms, expires_at_ms,
              retention_until_ms
          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open',$9,$10,$10)
-         ON CONFLICT (creation_idempotency_key_hash) DO NOTHING",
+         ON CONFLICT DO NOTHING",
     )
     .bind(*challenge_id.as_uuid())
     .bind(command.idempotency_key_hash.as_bytes().as_slice())
@@ -1008,8 +1368,90 @@ async fn create_or_replay_challenge(
         });
     }
 
-    let existing = load_challenge_by_creation_key(connection, command.idempotency_key_hash).await?;
+    let existing =
+        load_challenge_by_creation_key_optional(connection, command.idempotency_key_hash)
+            .await?
+            .ok_or(IdentityPersistenceError::CorruptData(
+                "device enrollment challenge conflict without durable row",
+            ))?;
     if !existing.matches_creation(command, request_digest) {
+        return Err(IdentityPersistenceError::IdempotencyConflict);
+    }
+    Ok(PersistedChallenge {
+        challenge_id: existing.challenge_id,
+        created_at: existing.created_at,
+        expires_at: existing.expires_at,
+        disposition: CreateDisposition::Replayed,
+    })
+}
+
+async fn create_or_replay_history_recovery_request(
+    connection: &mut PgConnection,
+    command: &CreateHistoryRecoveryRequestCommand,
+    request_digest: Sha256Digest,
+    now: UtcMillis,
+) -> Result<PersistedChallenge, IdentityPersistenceError> {
+    let inserted = sqlx::query(
+        "INSERT INTO identity.device_enrollment_challenges (
+             challenge_id, creation_idempotency_key_hash, identity_id,
+             target_device_id, target_device_signing_key, target_device_encryption_key,
+             capability_hash, request_digest, state, created_at_ms, expires_at_ms,
+             retention_until_ms, protocol_version, recovery_request_bytes,
+             recovery_request_digest, observed_head_sequence, observed_head_hash,
+             recovery_mode, request_issued_at_ms, recipient_encryption_key,
+             candidate_request_signature
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open',$9,$10,$10,2,$11,$12,$13,$14,
+                   'all_current_memberships',$15,$6,$16)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(*command.request_id.as_uuid())
+    .bind(command.idempotency_key_hash.as_bytes().as_slice())
+    .bind(command.identity_id.to_string())
+    .bind(*command.target_device_id.as_uuid())
+    .bind(command.target_device_signing_key.as_bytes().as_slice())
+    .bind(command.recipient_encryption_key.as_bytes().as_slice())
+    .bind(command.capability.hash().as_bytes().as_slice())
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(now.get())
+    .bind(command.expires_at.get())
+    .bind(command.exact_request_bytes.as_slice())
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(to_i64(command.observed_head.sequence())?)
+    .bind(command.observed_head.hash().as_bytes().as_slice())
+    .bind(command.issued_at.get())
+    .bind(command.candidate_signature.as_bytes().as_slice())
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    if inserted == 1 {
+        return Ok(PersistedChallenge {
+            challenge_id: command.request_id,
+            created_at: now,
+            expires_at: command.expires_at,
+            disposition: CreateDisposition::Created,
+        });
+    }
+    let existing = if let Some(existing) =
+        load_challenge_by_creation_key_optional(connection, command.idempotency_key_hash).await?
+    {
+        existing
+    } else {
+        lock_challenge(connection, command.request_id)
+            .await
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+                ) {
+                    IdentityPersistenceError::CorruptData(
+                        "history recovery request conflict without durable row",
+                    )
+                } else {
+                    error
+                }
+            })?
+    };
+    if !existing.matches_history_recovery_creation(command, request_digest) {
         return Err(IdentityPersistenceError::IdempotencyConflict);
     }
     Ok(PersistedChallenge {
@@ -1030,7 +1472,10 @@ async fn lock_challenge(
                 capability_hash, request_digest, state, created_at_ms, expires_at_ms,
                 approved_at_ms, cancelled_at_ms, approval_request_digest,
                 approver_device_id, approver_session_id,
-                approved_head_sequence, approved_head_hash, retention_until_ms
+                approved_head_sequence, approved_head_hash, retention_until_ms,
+                protocol_version, recovery_request_bytes, recovery_request_digest,
+                observed_head_sequence, observed_head_hash, request_issued_at_ms,
+                recipient_encryption_key, candidate_request_signature
            FROM identity.device_enrollment_challenges
           WHERE challenge_id=$1
           FOR UPDATE",
@@ -1040,17 +1485,6 @@ async fn lock_challenge(
     .await?
     .ok_or(IdentityPersistenceError::DeviceEnrollmentCapabilityRejected)?;
     decode_stored_challenge(&row)
-}
-
-async fn load_challenge_by_creation_key(
-    connection: &mut PgConnection,
-    creation_idempotency_key_hash: Sha256Digest,
-) -> Result<StoredEnrollmentChallenge, IdentityPersistenceError> {
-    load_challenge_by_creation_key_optional(connection, creation_idempotency_key_hash)
-        .await?
-        .ok_or(IdentityPersistenceError::CorruptData(
-            "device enrollment creation claim",
-        ))
 }
 
 async fn load_challenge_by_creation_key_optional(
@@ -1063,7 +1497,10 @@ async fn load_challenge_by_creation_key_optional(
                 capability_hash, request_digest, state, created_at_ms, expires_at_ms,
                 approved_at_ms, cancelled_at_ms, approval_request_digest,
                 approver_device_id, approver_session_id,
-                approved_head_sequence, approved_head_hash, retention_until_ms
+                approved_head_sequence, approved_head_hash, retention_until_ms,
+                protocol_version, recovery_request_bytes, recovery_request_digest,
+                observed_head_sequence, observed_head_hash, request_issued_at_ms,
+                recipient_encryption_key, candidate_request_signature
            FROM identity.device_enrollment_challenges
           WHERE creation_idempotency_key_hash=$1",
     )
@@ -1077,22 +1514,22 @@ fn decode_stored_challenge(
     row: &sqlx::postgres::PgRow,
 ) -> Result<StoredEnrollmentChallenge, IdentityPersistenceError> {
     let identity_id = parse_identity_id(&row.try_get::<String, _>("identity_id")?)?;
-    let approved_head_sequence: Option<i64> = row.try_get("approved_head_sequence")?;
-    let approved_head_hash: Option<Vec<u8>> = row.try_get("approved_head_hash")?;
-    let approved_head = match (approved_head_sequence, approved_head_hash) {
-        (Some(sequence), Some(hash)) => Some(IdentityLogHead::new(
-            identity_id,
-            IDENTITY_LOG_WIRE_VERSION,
-            safe_uint(sequence, "device enrollment approved head sequence")?,
-            digest(&hash, "device enrollment approved head hash")?,
-        )),
-        (None, None) => None,
-        _ => {
-            return Err(IdentityPersistenceError::CorruptData(
-                "device enrollment approved head fields",
-            ));
-        }
-    };
+    let approved_head = decode_optional_head(
+        identity_id,
+        row.try_get("approved_head_sequence")?,
+        row.try_get("approved_head_hash")?,
+        "device enrollment approved head sequence",
+        "device enrollment approved head hash",
+        "device enrollment approved head fields",
+    )?;
+    let observed_head = decode_optional_head(
+        identity_id,
+        row.try_get("observed_head_sequence")?,
+        row.try_get("observed_head_hash")?,
+        "history recovery observed head sequence",
+        "history recovery observed head hash",
+        "history recovery observed head fields",
+    )?;
     let stored = StoredEnrollmentChallenge {
         challenge_id: parse_challenge_id(row.try_get("challenge_id")?)?,
         creation_idempotency_key_hash: digest(
@@ -1117,6 +1554,28 @@ fn decode_stored_challenge(
             &row.try_get::<Vec<u8>, _>("request_digest")?,
             "device enrollment request digest",
         )?,
+        protocol_version: row.try_get("protocol_version")?,
+        recovery_request_bytes: row.try_get("recovery_request_bytes")?,
+        recovery_request_digest: row
+            .try_get::<Option<Vec<u8>>, _>("recovery_request_digest")?
+            .as_deref()
+            .map(|value| digest(value, "history recovery request digest"))
+            .transpose()?,
+        observed_head,
+        request_issued_at: row
+            .try_get::<Option<i64>, _>("request_issued_at_ms")?
+            .map(|value| utc_millis(value, "history recovery request issue time"))
+            .transpose()?,
+        recipient_encryption_key: row
+            .try_get::<Option<Vec<u8>>, _>("recipient_encryption_key")?
+            .as_deref()
+            .map(|value| parse_encryption_key(value, "history recovery recipient key"))
+            .transpose()?,
+        candidate_request_signature: row
+            .try_get::<Option<Vec<u8>>, _>("candidate_request_signature")?
+            .as_deref()
+            .map(|value| parse_signature(value, "history recovery candidate signature"))
+            .transpose()?,
         state: DurableChallengeState::parse(&row.try_get::<String, _>("state")?)?,
         created_at: utc_millis(
             row.try_get("created_at_ms")?,
@@ -1154,6 +1613,26 @@ fn decode_stored_challenge(
     Ok(stored)
 }
 
+fn decode_optional_head(
+    identity_id: IdentityId,
+    sequence: Option<i64>,
+    hash: Option<Vec<u8>>,
+    sequence_label: &'static str,
+    hash_label: &'static str,
+    fields_label: &'static str,
+) -> Result<Option<IdentityLogHead>, IdentityPersistenceError> {
+    match (sequence, hash) {
+        (Some(sequence), Some(hash)) => Ok(Some(IdentityLogHead::new(
+            identity_id,
+            IDENTITY_LOG_WIRE_VERSION,
+            safe_uint(sequence, sequence_label)?,
+            digest(&hash, hash_label)?,
+        ))),
+        (None, None) => Ok(None),
+        _ => Err(IdentityPersistenceError::CorruptData(fields_label)),
+    }
+}
+
 fn ensure_capability(
     challenge: &StoredEnrollmentChallenge,
     capability: &DeviceEnrollmentCapability,
@@ -1168,6 +1647,37 @@ fn ensure_capability(
     } else {
         Err(IdentityPersistenceError::DeviceEnrollmentCapabilityRejected)
     }
+}
+
+fn ensure_history_recovery_observed_head(
+    observed_head: Option<IdentityLogHead>,
+    current_head: IdentityLogHead,
+) -> Result<(), IdentityPersistenceError> {
+    let Some(observed_head) = observed_head else {
+        return Ok(());
+    };
+    if observed_head == current_head {
+        Ok(())
+    } else {
+        Err(IdentityPersistenceError::HeadConflict {
+            current: Some(current_head),
+        })
+    }
+}
+
+fn verify_candidate_signature(
+    signing_key: SigningPublicKey,
+    input: &[u8],
+    signature: Ed25519Signature,
+) -> Result<(), IdentityPersistenceError> {
+    let verifying_key = VerifyingKey::from_bytes(signing_key.as_bytes()).map_err(|_| {
+        IdentityPersistenceError::InvalidCommand("history recovery candidate signing key")
+    })?;
+    verifying_key
+        .verify_strict(input, &Signature::from_bytes(signature.as_bytes()))
+        .map_err(|_| {
+            IdentityPersistenceError::InvalidCommand("history recovery candidate signature")
+        })
 }
 
 fn ensure_exact_approved_replay(
@@ -1368,6 +1878,16 @@ fn parse_encryption_key(
         .map_err(|_| IdentityPersistenceError::CorruptData(label))
 }
 
+fn parse_signature(
+    value: &[u8],
+    label: &'static str,
+) -> Result<Ed25519Signature, IdentityPersistenceError> {
+    let bytes: [u8; 64] = value
+        .try_into()
+        .map_err(|_| IdentityPersistenceError::CorruptData(label))?;
+    Ok(Ed25519Signature::from_bytes(bytes))
+}
+
 fn digest(value: &[u8], label: &'static str) -> Result<Sha256Digest, IdentityPersistenceError> {
     let bytes: [u8; 32] = value
         .try_into()
@@ -1511,5 +2031,37 @@ mod tests {
             ensure_exact_approved_replay(Some(exact), Sha256Digest::from_bytes([20; 32])),
             Err(IdentityPersistenceError::IdempotencyConflict)
         ));
+    }
+
+    #[test]
+    fn history_recovery_observed_head_must_remain_the_direct_predecessor() {
+        let root = SigningPublicKey::try_from(
+            ed25519_dalek::SigningKey::from_bytes(&[21; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+        .expect("valid root key");
+        let identity = IdentityId::derive(root.as_domain_key());
+        let observed = IdentityLogHead::observed(
+            identity,
+            SafeUint::new(7).expect("safe sequence"),
+            Sha256Digest::from_bytes([22; 32]),
+        )
+        .expect("observed head");
+        let advanced = IdentityLogHead::observed(
+            identity,
+            SafeUint::new(8).expect("safe sequence"),
+            Sha256Digest::from_bytes([23; 32]),
+        )
+        .expect("advanced head");
+
+        assert!(ensure_history_recovery_observed_head(Some(observed), observed).is_ok());
+        assert!(matches!(
+            ensure_history_recovery_observed_head(Some(observed), advanced),
+            Err(IdentityPersistenceError::HeadConflict {
+                current: Some(head)
+            }) if head == advanced
+        ));
+        assert!(ensure_history_recovery_observed_head(None, advanced).is_ok());
     }
 }

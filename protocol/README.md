@@ -124,6 +124,20 @@ Layout:
   `DTX-Group-Query-Proof` header. The inaccurate V32 OpenAPI component name is
   preserved byte-for-byte as historical input and is not an alternate runtime
   header.
+  `baseline/v40/manifest.json` freezes candidate-signed History Recovery V1,
+  request-and-scope-bound KeyPackage V2, provider plus independent-authority
+  opaque snapshot grants, and MLS Sequencer V5 recovery add/device remove. A
+  grant atomically appends the durable mailbox and realtime facts at provider
+  highwater `H + 1`; per-device ACKs remain independent. The server never
+  receives history plaintext, MLS epoch secrets, private keys, or active scope,
+  and a revoked-device commit removes only that device leaf. V40 also freezes
+  the exact identity-origin MLS V5 authorization GET and its bounded redacted
+  canonical projection. That unsigned response is a non-portable current fact:
+  hardened callers re-fetch it for submit, replay, and receipt readback, while
+  Group persistence receives no identity-table access. The projection exposes
+  only exact IDs, digests, authority metadata, and expiry—never an opaque offer,
+  capability, session, snapshot, KeyPackage bytes, private state, or epoch
+  secret.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

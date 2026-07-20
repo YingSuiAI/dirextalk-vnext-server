@@ -17,6 +17,8 @@ pub enum MailboxPersistenceError {
     DeviceAuthenticationRejected,
     /// Identity authorization could not be safely read in this transaction.
     IdentityAuthorizationUnavailable,
+    /// No active provider with the required client-held E2EE material exists.
+    KeyMaterialUnavailable,
     /// The mailbox does not exist, expired, or its write capability is invalid.
     MailboxUnavailable,
     /// An immutable mailbox or envelope identity conflicts with existing state.
@@ -43,6 +45,7 @@ impl fmt::Display for MailboxPersistenceError {
             Self::InvalidCommand(_) => "mailbox command is invalid",
             Self::DeviceAuthenticationRejected => "device session authentication was rejected",
             Self::IdentityAuthorizationUnavailable => "identity authorization is unavailable",
+            Self::KeyMaterialUnavailable => "history recovery key material is unavailable",
             Self::MailboxUnavailable => "mailbox is unavailable",
             Self::MailboxConflict => "mailbox conflicts with immutable state",
             Self::IdempotencyConflict => "mailbox idempotency key conflicts",
@@ -63,6 +66,7 @@ impl Error for MailboxPersistenceError {
             | Self::InvalidCommand(_)
             | Self::DeviceAuthenticationRejected
             | Self::IdentityAuthorizationUnavailable
+            | Self::KeyMaterialUnavailable
             | Self::MailboxUnavailable
             | Self::MailboxConflict
             | Self::IdempotencyConflict

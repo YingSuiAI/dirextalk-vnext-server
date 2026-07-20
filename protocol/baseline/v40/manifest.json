@@ -1,0 +1,13 @@
+{
+  "version": 40,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/history-recovery/v1/history-recovery-v1.cddl": "sha256:9f913f80fdb1eda8faa60c47d529ec7d07052969c90a2899dece311d8db0820c",
+    "protocol/cddl/mls-sequencer/v5/mls-sequencer-v5.cddl": "sha256:0f2f43d20fa964f6d647e31383da67308eba724791d1d343fcf6f90c65312148",
+    "protocol/openapi/history-recovery/v1/openapi.yaml": "sha256:cf1b50ebf080c7c85e44b4f818efe43e0385fadfa1e85d6242b6d7977656d4cd",
+    "protocol/openapi/mls-sequencer/v5/openapi.yaml": "sha256:36b5ecd9ce8984b67a3dcf4846bc839f99e56fcf29d0096a0da3cb3862e8ab15",
+    "protocol/test-vectors/history-recovery/v1/history-recovery-v1.json": "sha256:a9313a8717a8fe5115c6d0f4bb8bd5cfd8dd8e74b58db94a8d01ea3a18f799ba",
+    "protocol/test-vectors/mls-sequencer/v5/mls-sequencer-v5.json": "sha256:c6f395b103d3fcc22cbae7dd8b04ec3b270341833e1374cd07df6eef09570f38"
+  }
+}

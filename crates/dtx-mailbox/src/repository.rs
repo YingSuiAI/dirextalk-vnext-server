@@ -557,7 +557,7 @@ impl MailboxRepository {
     }
 }
 
-async fn append_identity_delivery_and_realtime(
+pub(crate) async fn append_identity_delivery_and_realtime(
     connection: &mut PgConnection,
     identity_id: IdentityId,
     command: &MailboxEnvelopeCommand,
@@ -641,14 +641,14 @@ async fn initialize_delivery_heads(
     Ok(())
 }
 
-struct MailboxRow {
-    owner_identity_id: IdentityId,
+pub(crate) struct MailboxRow {
+    pub(crate) owner_identity_id: IdentityId,
     owner_device_id: DeviceId,
     write_capability_hash: Sha256Digest,
-    expires_at: UtcMillis,
-    next_delivery_sequence: i64,
-    active_envelope_count: i64,
-    active_envelope_bytes: i64,
+    pub(crate) expires_at: UtcMillis,
+    pub(crate) next_delivery_sequence: i64,
+    pub(crate) active_envelope_count: i64,
+    pub(crate) active_envelope_bytes: i64,
 }
 
 struct PulledEnvelope {
@@ -701,7 +701,7 @@ async fn advisory_lock(
     Ok(())
 }
 
-async fn load_mailbox_for_update(
+pub(crate) async fn load_mailbox_for_update(
     connection: &mut PgConnection,
     mailbox_id: MailboxId,
     now: UtcMillis,
@@ -782,7 +782,7 @@ fn authorize_write_capability(
     }
 }
 
-async fn expire_available(
+pub(crate) async fn expire_available(
     connection: &mut PgConnection,
     mailbox_id: MailboxId,
     now: UtcMillis,
@@ -831,7 +831,7 @@ async fn expire_available(
     Ok((count, bytes))
 }
 
-fn validate_envelope_expiry(
+pub(crate) fn validate_envelope_expiry(
     expires_at: UtcMillis,
     mailbox_expires_at: UtcMillis,
     now: UtcMillis,

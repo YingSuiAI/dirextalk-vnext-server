@@ -159,6 +159,16 @@ async fn validate_group_runtime_role(pool: &PgPool) -> Result<(), GroupPersisten
                  'identity.identity_group_reader_authorized()'::regprocedure,
                  'EXECUTE'
              )
+             AND has_function_privilege(
+                 current_user,
+                 'identity.history_recovery_request_authorized(text,uuid,bytea,uuid,bigint)'::regprocedure,
+                 'EXECUTE'
+             )
+             AND has_function_privilege(
+                 current_user,
+                 'identity.scoped_key_package_claim_authorized(text,uuid,bytea,bytea,bytea,uuid)'::regprocedure,
+                 'EXECUTE'
+             )
              AND has_table_privilege(current_user, 'identity.device_sessions', 'SELECT')
              AND has_table_privilege(current_user, 'identity.log_heads', 'SELECT')
              AND has_table_privilege(current_user, 'identity.log_entries', 'SELECT')",
@@ -307,7 +317,11 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, GroupPersist
                    JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
                   WHERE namespace.nspname = 'identity'
                     AND has_function_privilege(current_user, procedure.oid, 'EXECUTE')
-                    AND procedure.oid <> 'identity.identity_group_reader_authorized()'::regprocedure
+                    AND procedure.oid NOT IN (
+                        'identity.identity_group_reader_authorized()'::regprocedure,
+                        'identity.history_recovery_request_authorized(text,uuid,bytea,uuid,bigint)'::regprocedure,
+                        'identity.scoped_key_package_claim_authorized(text,uuid,bytea,bytea,bytea,uuid)'::regprocedure
+                    )
              )
              OR EXISTS (
                  SELECT 1

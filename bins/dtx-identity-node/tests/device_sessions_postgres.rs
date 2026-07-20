@@ -21,19 +21,21 @@ use dtx_identity_node::{
     DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE, DEVICE_ENROLLMENT_CHALLENGE_PATH,
     DEVICE_ENROLLMENT_CONTENT_TYPE, DEVICE_ENROLLMENT_PATH, DEVICE_REVOKE_PATH_TEMPLATE,
     DEVICE_SESSION_AUTHORIZATION_SCHEME, DEVICE_SESSION_CHALLENGE_PATH, DEVICE_SESSION_PATH,
-    DEVICE_SESSION_RECEIPT_CONTENT_TYPE, IDENTITY_APPEND_RECEIPT_CONTENT_TYPE,
-    IDENTITY_BOOTSTRAP_PATH, IDENTITY_LOG_EVENT_CONTENT_TYPE, INITIAL_DEVICE_ENROLL_PATH,
-    IdentityBootstrapState, identity_bootstrap_router_with_state,
+    DEVICE_SESSION_RECEIPT_CONTENT_TYPE, HISTORY_RECOVERY_REQUEST_CONTENT_TYPE,
+    IDENTITY_APPEND_RECEIPT_CONTENT_TYPE, IDENTITY_BOOTSTRAP_PATH, IDENTITY_LOG_EVENT_CONTENT_TYPE,
+    INITIAL_DEVICE_ENROLL_PATH, IdentityBootstrapState, identity_bootstrap_router_with_state,
     parse_device_session_authorization,
 };
 use dtx_identity_persistence::{
-    DEVICE_SESSION_SECRET_HASH_DOMAIN, DeviceSessionCompletionCommand, DeviceSessionCredential,
-    DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogRepository,
-    IdentityPgStore, device_session_proof_input,
+    DEVICE_ENROLLMENT_CAPABILITY_HASH_DOMAIN, DEVICE_SESSION_SECRET_HASH_DOMAIN,
+    DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionRepository,
+    HISTORY_RECOVERY_REQUEST_HASH_DOMAIN, IdentityAppendCommand, IdentityAppendOutcome,
+    IdentityLogHead, IdentityLogRepository, IdentityPgStore, device_session_proof_input,
+    history_recovery_request_signature_input, history_recovery_request_unsigned_canonical_bytes,
 };
 use dtx_wire::{
-    CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey, UtcMillis,
-    decode_deterministic_cbor, encode_deterministic_cbor,
+    CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
+    UtcMillis, decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::json;
@@ -46,6 +48,8 @@ const SESSION_KEY: &str = "device-session-command-0001";
 const SESSION_RETRY_KEY: &str = "device-session-command-0002";
 const EXPIRED_SESSION_KEY: &str = "device-session-command-0003";
 const AUDIENCE: &str = "https://identity.test";
+
+type StoredHistoryRecoveryRequest = (i16, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, i64, Vec<u8>);
 
 #[tokio::test]
 #[allow(
@@ -365,6 +369,208 @@ async fn initial_device_and_short_session_are_self_authenticated_replayable_and_
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
+    reason = "one HTTP/PostgreSQL boundary keeps the V2 recovery request, replay, conflicts, and secret persistence coherent"
+)]
+async fn history_recovery_v2_request_is_exact_replay_safe_and_capability_private()
+-> Result<(), Box<dyn Error>> {
+    const REQUEST_KEY: &str = "history-recovery-request-0001";
+    const DIFFERENT_REQUEST_KEY: &str = "history-recovery-request-0002";
+
+    let harness = support::PostgresHarness::start().await?;
+    let store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let app = identity_bootstrap_router_with_state(
+        IdentityBootstrapState::with_clock_and_device_session_audience(
+            store.clone(),
+            Arc::new(FixedClock(2_000)),
+            AUDIENCE,
+        ),
+    );
+
+    let root = signing_key(31);
+    let recovery = signing_key(32);
+    let genesis = genesis(&root, &recovery, 1_000)?;
+    let identity_id = genesis.identity_id();
+    assert_eq!(
+        send_event(
+            app.clone(),
+            IDENTITY_BOOTSTRAP_PATH,
+            "history-recovery-bootstrap-0001",
+            None,
+            genesis.to_deterministic_cbor()?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+
+    let initial_device = signing_key(33);
+    let initial_device_id = DeviceId::new();
+    assert_eq!(
+        send_event(
+            app.clone(),
+            INITIAL_DEVICE_ENROLL_PATH,
+            "history-recovery-initial-0001",
+            Some(genesis.entry_hash()?),
+            device_add(
+                &root,
+                &initial_device,
+                identity_id,
+                initial_device_id,
+                genesis.entry_hash()?,
+                2,
+                1_100,
+            )?
+            .to_deterministic_cbor()?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    let observed_head = IdentityLogRepository::new()
+        .load(&store, identity_id)
+        .await?
+        .ok_or("identity missing before history recovery request")?
+        .head();
+
+    let candidate = signing_key(34);
+    let recipient_encryption_key = DeviceEncryptionPublicKey::try_from([35_u8; 32])?;
+    let request_id = DeviceEnrollmentChallengeId::new();
+    let candidate_device_id = DeviceId::new();
+    let capability = [36_u8; 32];
+    let issued_at = UtcMillis::new(1_900)?;
+    let expires_at = UtcMillis::new(3_000)?;
+    let (request_body, exact_signed_request) = history_recovery_request_body(
+        &candidate,
+        request_id,
+        identity_id,
+        candidate_device_id,
+        recipient_encryption_key,
+        observed_head,
+        issued_at,
+        expires_at,
+        capability,
+    )?;
+
+    let created = send_device_enrollment_challenge(
+        app.clone(),
+        REQUEST_KEY,
+        HISTORY_RECOVERY_REQUEST_CONTENT_TYPE,
+        request_body.clone(),
+    )
+    .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let exact_receipt = to_bytes(created.into_body(), 16_384).await?.to_vec();
+    assert_eq!(enrollment_challenge_id(&exact_receipt)?, request_id);
+
+    let replay = send_device_enrollment_challenge(
+        app.clone(),
+        REQUEST_KEY,
+        HISTORY_RECOVERY_REQUEST_CONTENT_TYPE,
+        request_body.clone(),
+    )
+    .await?;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(replay.into_body(), 16_384).await?.to_vec(),
+        exact_receipt
+    );
+
+    let changed_candidate = signing_key(37);
+    let (changed_request, _) = history_recovery_request_body(
+        &changed_candidate,
+        DeviceEnrollmentChallengeId::new(),
+        identity_id,
+        DeviceId::new(),
+        DeviceEncryptionPublicKey::try_from([38_u8; 32])?,
+        observed_head,
+        issued_at,
+        expires_at,
+        [39_u8; 32],
+    )?;
+    let changed_same_key = send_device_enrollment_challenge(
+        app.clone(),
+        REQUEST_KEY,
+        HISTORY_RECOVERY_REQUEST_CONTENT_TYPE,
+        changed_request,
+    )
+    .await?;
+    assert_eq!(changed_same_key.status(), StatusCode::CONFLICT);
+    assert_safe_error(changed_same_key, "IDEMPOTENCY_CONFLICT").await?;
+
+    let same_request_different_key = send_device_enrollment_challenge(
+        app,
+        DIFFERENT_REQUEST_KEY,
+        HISTORY_RECOVERY_REQUEST_CONTENT_TYPE,
+        request_body,
+    )
+    .await?;
+    assert_eq!(same_request_different_key.status(), StatusCode::CONFLICT);
+    assert_safe_error(same_request_different_key, "IDEMPOTENCY_CONFLICT").await?;
+
+    let rows: Vec<StoredHistoryRecoveryRequest> = sqlx::query_as(
+        "SELECT protocol_version,recovery_request_bytes,request_digest,
+                    recovery_request_digest,capability_hash,observed_head_sequence,
+                    observed_head_hash
+               FROM identity.device_enrollment_challenges WHERE identity_id=$1",
+    )
+    .bind(identity_id.to_string())
+    .fetch_all(harness.identity_runtime_pool())
+    .await?;
+    assert_eq!(rows.len(), 1);
+    let (
+        protocol_version,
+        stored_request,
+        request_digest,
+        recovery_request_digest,
+        capability_hash,
+        observed_head_sequence,
+        observed_head_hash,
+    ) = &rows[0];
+    assert_eq!(*protocol_version, 2);
+    assert_eq!(stored_request, &exact_signed_request);
+    let CanonicalValue::Map(stored_fields) = decode_deterministic_cbor(stored_request)? else {
+        return Err("stored history recovery request is not a map".into());
+    };
+    assert_eq!(stored_fields.len(), 12);
+    for (index, (key, _)) in stored_fields.iter().enumerate() {
+        assert_eq!(key, &CanonicalValue::Unsigned(u64::try_from(index + 1)?));
+    }
+    let expected_request_digest =
+        Sha256Digest::hash_domain(HISTORY_RECOVERY_REQUEST_HASH_DOMAIN, &exact_signed_request);
+    assert_eq!(
+        request_digest.as_slice(),
+        expected_request_digest.as_bytes()
+    );
+    assert_eq!(
+        recovery_request_digest.as_slice(),
+        expected_request_digest.as_bytes()
+    );
+    let expected_capability_hash =
+        Sha256Digest::hash_domain(DEVICE_ENROLLMENT_CAPABILITY_HASH_DOMAIN, &capability);
+    assert_eq!(
+        capability_hash.as_slice(),
+        expected_capability_hash.as_bytes()
+    );
+    assert_ne!(capability_hash.as_slice(), capability.as_slice());
+    assert!(
+        !stored_request
+            .windows(capability.len())
+            .any(|window| window == capability)
+    );
+    assert_eq!(
+        *observed_head_sequence,
+        i64::try_from(observed_head.sequence().get())?
+    );
+    assert_eq!(
+        observed_head_hash.as_slice(),
+        observed_head.hash().as_bytes()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
     reason = "one HTTP/SQL regression protects an approved QR enrollment when its first success response is lost"
 )]
 async fn approved_device_enrollment_replays_after_approving_session_is_revoked()
@@ -510,9 +716,13 @@ async fn approved_device_enrollment_replays_after_approving_session_is_revoked()
             CanonicalValue::Bytes(enrollment_capability.to_vec()),
         ),
     ]))?;
-    let candidate_response =
-        send_device_enrollment_challenge(app.clone(), ENROLLMENT_CHALLENGE_KEY, candidate_request)
-            .await?;
+    let candidate_response = send_device_enrollment_challenge(
+        app.clone(),
+        ENROLLMENT_CHALLENGE_KEY,
+        DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE,
+        candidate_request,
+    )
+    .await?;
     assert_eq!(candidate_response.status(), StatusCode::CREATED);
     let candidate_response = to_bytes(candidate_response.into_body(), 16_384).await?;
     let enrollment_challenge_id = enrollment_challenge_id(&candidate_response)?;
@@ -985,19 +1195,61 @@ async fn another_device_revoke_is_root_signed_session_gated_and_exactly_replayab
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn history_recovery_request_body(
+    candidate: &SigningKey,
+    request_id: DeviceEnrollmentChallengeId,
+    identity_id: IdentityId,
+    candidate_device_id: DeviceId,
+    recipient_encryption_key: DeviceEncryptionPublicKey,
+    observed_head: IdentityLogHead,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    capability: [u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn Error>> {
+    let unsigned = history_recovery_request_unsigned_canonical_bytes(
+        request_id,
+        identity_id,
+        candidate_device_id,
+        public_key(candidate)?,
+        recipient_encryption_key,
+        observed_head,
+        issued_at,
+        expires_at,
+    )?;
+    let candidate_signature = signature(
+        candidate,
+        &history_recovery_request_signature_input(&unsigned),
+    );
+    let CanonicalValue::Map(mut fields) = decode_deterministic_cbor(&unsigned)? else {
+        return Err("unsigned history recovery request is not a map".into());
+    };
+    fields.push((
+        CanonicalValue::Unsigned(12),
+        candidate_signature.to_canonical_value(),
+    ));
+    let exact_signed_request = encode_deterministic_cbor(&CanonicalValue::Map(fields.clone()))?;
+    fields.push((
+        CanonicalValue::Unsigned(13),
+        CanonicalValue::Bytes(capability.to_vec()),
+    ));
+    Ok((
+        encode_deterministic_cbor(&CanonicalValue::Map(fields))?,
+        exact_signed_request,
+    ))
+}
+
 async fn send_device_enrollment_challenge(
     app: axum::Router,
     idempotency_key: &str,
+    content_type: &str,
     body: Vec<u8>,
 ) -> Result<axum::response::Response, Box<dyn Error>> {
     app.oneshot(
         Request::builder()
             .method("POST")
             .uri(DEVICE_ENROLLMENT_CHALLENGE_PATH)
-            .header(
-                header::CONTENT_TYPE,
-                DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE,
-            )
+            .header(header::CONTENT_TYPE, content_type)
             .header("idempotency-key", idempotency_key)
             .body(Body::from(body))?,
     )

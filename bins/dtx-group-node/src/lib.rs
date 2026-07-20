@@ -20,10 +20,12 @@ use axum::{
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{
-    ChannelId, Clock, ConversationId, DeviceId, DeviceSessionId, IdentityId, InviteCapabilityId,
-    JoinRequestId, RequestId, Revision, SystemClock, TenantId,
+    ChannelId, Clock, ConversationId, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionId,
+    IdentityId, InviteCapabilityId, JoinRequestId, RequestId, Revision, SystemClock, TenantId,
 };
-use dtx_federated_identity::{FederatedIdentityError, FederatedIdentityVerifier};
+use dtx_federated_identity::{
+    FederatedIdentityError, FederatedIdentityVerifier, MlsV5RecoveryAuthorizationQuery,
+};
 use dtx_group_persistence::{
     GroupControlCommand, GroupControlDisposition, GroupControlExecution, GroupControlOperation,
     GroupControlReceipt, GroupControlRejection, GroupControlRepository, GroupMembershipRepository,
@@ -31,7 +33,7 @@ use dtx_group_persistence::{
     MembershipCommandExecution, MlsCommitAuthorization, MlsCommitCommand, MlsCommitExecution,
     MlsCommitFeedPage, MlsCommitReceipt, MlsCommitSequencerRepository, MlsDeviceJoinConfirmation,
     PendingJoinRequestCursor, PendingJoinRequestPage, VerifiedDeviceActor,
-    mls_opaque_commit_digest,
+    mls_opaque_commit_digest, mls_v5_controller_consent_digest,
 };
 use dtx_group_policy::{GroupScope, MAX_ADMINS};
 use dtx_identity_persistence::DeviceSessionCredential;
@@ -150,6 +152,8 @@ pub const MLS_COMMIT_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.
 pub const MLS_COMMIT_V3_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v3+cbor";
 /// V32 Owner-authored single-member removal commit request media type.
 pub const MLS_COMMIT_V4_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v4+cbor";
+/// V40 existing-member device recovery/removal request media type.
+pub const MLS_COMMIT_V5_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit.v5+cbor";
 /// Exact V2 signed receipt media type.
 pub const MLS_COMMIT_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mls-commit-receipt.v2+cbor";
@@ -159,11 +163,16 @@ pub const MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE: &str =
 /// V32 receipt binding the removed leaf and product-policy revision fence.
 pub const MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mls-commit-receipt.v4+cbor";
+pub const MLS_COMMIT_RECEIPT_V5_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.mls-commit-receipt.v5+cbor";
 /// Exact V30 active-member commit catch-up page media type.
 pub const MLS_COMMIT_FEED_CONTENT_TYPE: &str = "application/vnd.dirextalk.mls-commit-feed.v1+cbor";
 /// V32 catch-up feed carrying consecutive V3 admissions and V4 removals.
 pub const MLS_COMMIT_FEED_V2_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mls-commit-feed.v2+cbor";
+/// V40 catch-up feed carrying consecutive V3, V4, and V5 commits.
+pub const MLS_COMMIT_FEED_V3_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.mls-commit-feed.v3+cbor";
 /// Exact V2 candidate confirmation media type.
 pub const MLS_CONFIRMATION_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.mls-device-join-confirmation.v2+cbor";
@@ -1244,18 +1253,38 @@ async fn submit_mls_commit(
                 identity_origin,
                 &expected_path,
                 &parsed.command,
+                parsed.controller_signature,
                 now,
                 signing_public_key,
                 Arc::clone(signing_key),
             )
             .await
-        } else if matches!(parsed.command.protocol_version(), 3 | 4) {
+        } else if matches!(parsed.command.protocol_version(), 3..=5) {
             if parts.headers.contains_key(MLS_COMMIT_PROOF_HEADER) {
                 return Err(GroupFailure::ActionProofInvalid);
             }
             let credential = parse_device_session_authorization(&parts.headers)?;
             let signer = Arc::clone(signing_key);
-            if parsed.command.protocol_version() == 4 {
+            if parsed.command.protocol_version() == 5 {
+                state
+                    .mls_repository
+                    .submit_authenticated_v5(
+                        &state.store,
+                        state.tenant_id,
+                        &credential,
+                        &parsed.command,
+                        parsed
+                            .controller_signature
+                            .ok_or(GroupFailure::InvalidRequest)?,
+                        now.get(),
+                        signing_public_key,
+                        move |input| {
+                            Ok(Ed25519Signature::from_bytes(signer.sign(input).to_bytes()))
+                        },
+                    )
+                    .await
+                    .map_err(|error| map_persistence_error(&error))
+            } else if parsed.command.protocol_version() == 4 {
                 state
                     .mls_repository
                     .submit_authenticated_v4(
@@ -1384,23 +1413,42 @@ async fn get_mls_commit_receipt(
     finish(result, request_id)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the V3/V4/V5 federated proof dispatch stays contiguous at the HTTP boundary"
+)]
 async fn submit_federated_mls_commit(
     state: &GroupNodeState,
     headers: &HeaderMap,
     identity_origin: &str,
     expected_path: &str,
     command: &MlsCommitCommand,
+    controller_signature: Option<Ed25519Signature>,
     now: UtcMillis,
     signing_public_key: SigningPublicKey,
     signing_key: Arc<SigningKey>,
 ) -> Result<MlsCommitExecution, GroupFailure> {
-    if !matches!(command.protocol_version(), 3 | 4) || headers.contains_key(header::AUTHORIZATION) {
+    if !matches!(command.protocol_version(), 3..=5) || headers.contains_key(header::AUTHORIZATION) {
         return Err(GroupFailure::ActionProofInvalid);
     }
     let proof = parse_mls_commit_proof_header(headers)?;
     if proof.identity_origin != identity_origin {
         return Err(GroupFailure::ActionProofInvalid);
+    }
+    if command.protocol_version() == 5 {
+        return submit_federated_mls_v5_commit(
+            state,
+            identity_origin,
+            expected_path,
+            command,
+            controller_signature.ok_or(GroupFailure::InvalidRequest)?,
+            proof,
+            now,
+            signing_public_key,
+            signing_key,
+        )
+        .await;
     }
     let actor_signing_key = state
         .federated_identity
@@ -1492,7 +1540,168 @@ async fn submit_federated_mls_commit(
     result.map_err(|error| map_persistence_error(&error))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "fresh origin facts and controller proof are validated in one fail-closed V5 path"
+)]
+async fn submit_federated_mls_v5_commit(
+    state: &GroupNodeState,
+    identity_origin: &str,
+    expected_path: &str,
+    command: &MlsCommitCommand,
+    controller_signature: Ed25519Signature,
+    proof: MlsCommitProof,
+    now: UtcMillis,
+    signing_public_key: SigningPublicKey,
+    signing_key: Arc<SigningKey>,
+) -> Result<MlsCommitExecution, GroupFailure> {
+    let (active_controller, recovery_authorization) = match command.authorization() {
+        MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+            controller_device_id,
+            recovery_request_id,
+            recovery_request_digest,
+            recovery_scope_digest,
+            ..
+        } => {
+            let active_controller = state
+                .federated_identity
+                .active_device(
+                    identity_origin,
+                    command.candidate_identity_id(),
+                    controller_device_id,
+                )
+                .await
+                .map_err(map_federated_identity_error)?;
+            let query = MlsV5RecoveryAuthorizationQuery::new(
+                command.candidate_identity_id(),
+                recovery_request_id,
+                command.candidate_device_id(),
+                controller_device_id,
+                active_controller.head_digest(),
+                command.candidate_key_package_digest(),
+                recovery_request_digest,
+                recovery_scope_digest,
+            );
+            let projection = state
+                .federated_identity
+                .mls_v5_recovery_authorization(identity_origin, query, now)
+                .await
+                .map_err(map_federated_identity_error)?;
+            (active_controller, Some((query, projection)))
+        }
+        MlsCommitAuthorization::ExistingMemberDeviceRemove {
+            identity_revoke_head_digest,
+        } => (
+            state
+                .federated_identity
+                .active_device_with_terminal_revoke(
+                    identity_origin,
+                    command.candidate_identity_id(),
+                    command.actor_device_id(),
+                    command.candidate_device_id(),
+                    identity_revoke_head_digest,
+                )
+                .await
+                .map_err(map_federated_identity_error)?,
+            None,
+        ),
+        _ => return Err(GroupFailure::ActionProofInvalid),
+    };
+    let actor = VerifiedDeviceActor::new(
+        active_controller.identity_id(),
+        active_controller.device_id(),
+        active_controller.signing_key(),
+    );
+    let expected_path = expected_path.to_owned();
+    let expected_origin = identity_origin.to_owned();
+    let expected_scope = command.scope();
+    let expected_submission_id = command.submission_id();
+    let expected_actor_identity_id = command.actor_identity_id();
+    let expected_actor_device_id = command.actor_device_id();
+    let expected_request_digest = command.request_digest();
+    let expected_idempotency_key_hash = command.idempotency_key_hash();
+    state
+        .mls_repository
+        .submit_verified_v5_with_proof(
+            &state.store,
+            state.tenant_id,
+            actor,
+            command,
+            controller_signature,
+            now.get(),
+            signing_public_key,
+            move |device_signing_key| {
+                proof.verify(
+                    MlsCommitProofAction::Submit,
+                    &expected_path,
+                    expected_scope,
+                    expected_submission_id,
+                    expected_actor_identity_id,
+                    expected_actor_device_id,
+                    expected_request_digest,
+                    expected_idempotency_key_hash,
+                    &expected_origin,
+                    now,
+                    device_signing_key,
+                )
+            },
+            move |verified_command| match (
+                verified_command.authorization(),
+                recovery_authorization.as_ref(),
+            ) {
+                (
+                    MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                        controller_device_id,
+                        recovery_request_id,
+                        recovery_request_digest,
+                        recovery_scope_digest,
+                        ..
+                    },
+                    Some((query, projection)),
+                ) => {
+                    let expected_query = MlsV5RecoveryAuthorizationQuery::new(
+                        verified_command.candidate_identity_id(),
+                        recovery_request_id,
+                        verified_command.candidate_device_id(),
+                        controller_device_id,
+                        active_controller.head_digest(),
+                        verified_command.candidate_key_package_digest(),
+                        recovery_request_digest,
+                        recovery_scope_digest,
+                    );
+                    if *query == expected_query
+                        && projection.query() == expected_query
+                        && projection.expires_at() > now
+                    {
+                        Ok(())
+                    } else {
+                        Err(GroupPersistenceError::MlsAuthorizationRejected)
+                    }
+                }
+                (
+                    MlsCommitAuthorization::ExistingMemberDeviceRemove {
+                        identity_revoke_head_digest,
+                    },
+                    None,
+                ) if identity_revoke_head_digest == active_controller.head_digest() => Ok(()),
+                _ => Err(GroupPersistenceError::MlsAuthorizationRejected),
+            },
+            move |input| {
+                Ok(Ed25519Signature::from_bytes(
+                    signing_key.sign(input).to_bytes(),
+                ))
+            },
+        )
+        .await
+        .map_err(|error| map_persistence_error(&error))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "receipt proof and version-specific origin revalidation stay contiguous"
+)]
 async fn load_federated_mls_commit_receipt(
     state: &GroupNodeState,
     headers: &HeaderMap,
@@ -1506,8 +1715,10 @@ async fn load_federated_mls_commit_receipt(
     if headers.contains_key(header::AUTHORIZATION) {
         return Err(GroupFailure::ActionProofInvalid);
     }
-    let expected_protocol_version = if has_exact_accept(headers, MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE)
+    let expected_protocol_version = if has_exact_accept(headers, MLS_COMMIT_RECEIPT_V5_CONTENT_TYPE)
     {
+        5
+    } else if has_exact_accept(headers, MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE) {
         4
     } else {
         require_exact_accept(headers, MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE)?;
@@ -1517,9 +1728,9 @@ async fn load_federated_mls_commit_receipt(
     if proof.identity_origin != identity_origin {
         return Err(GroupFailure::ActionProofInvalid);
     }
-    let actor_signing_key = state
+    let active_actor = state
         .federated_identity
-        .active_device_signing_key(
+        .active_device(
             identity_origin,
             proof.actor_identity_id,
             proof.actor_device_id,
@@ -1529,12 +1740,91 @@ async fn load_federated_mls_commit_receipt(
     let actor = VerifiedDeviceActor::new(
         proof.actor_identity_id,
         proof.actor_device_id,
-        actor_signing_key,
+        active_actor.signing_key(),
     );
     let proof_request_digest = proof.request_digest;
     let proof_idempotency_key_hash = proof.idempotency_key_hash;
     let expected_path = expected_path.to_owned();
     let expected_origin = identity_origin.to_owned();
+    if expected_protocol_version == 5 {
+        let (receipt, facts) = state
+            .mls_repository
+            .receipt_verified_v5_with_proof(
+                &state.store,
+                state.tenant_id,
+                actor,
+                scope,
+                submission_id,
+                proof_request_digest,
+                proof_idempotency_key_hash,
+                signing_public_key,
+                move |device_signing_key| {
+                    proof.verify(
+                        MlsCommitProofAction::Query,
+                        &expected_path,
+                        scope,
+                        submission_id,
+                        actor.identity_id(),
+                        actor.device_id(),
+                        proof_request_digest,
+                        proof_idempotency_key_hash,
+                        &expected_origin,
+                        now,
+                        device_signing_key,
+                    )
+                },
+            )
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        match facts.authorization() {
+            MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                controller_device_id,
+                recovery_request_id,
+                recovery_request_digest,
+                recovery_scope_digest,
+                ..
+            } => {
+                let query = MlsV5RecoveryAuthorizationQuery::new(
+                    facts.identity_id(),
+                    recovery_request_id,
+                    facts.candidate_device_id(),
+                    controller_device_id,
+                    active_actor.head_digest(),
+                    facts.candidate_key_package_digest(),
+                    recovery_request_digest,
+                    recovery_scope_digest,
+                );
+                let projection = state
+                    .federated_identity
+                    .mls_v5_recovery_authorization(identity_origin, query, now)
+                    .await
+                    .map_err(map_federated_identity_error)?;
+                if projection.query() != query || projection.expires_at() <= now {
+                    return Err(GroupFailure::AuthenticationRejected);
+                }
+            }
+            MlsCommitAuthorization::ExistingMemberDeviceRemove {
+                identity_revoke_head_digest,
+            } => {
+                let current = state
+                    .federated_identity
+                    .active_device_with_terminal_revoke(
+                        identity_origin,
+                        facts.identity_id(),
+                        facts.controller_device_id(),
+                        facts.candidate_device_id(),
+                        identity_revoke_head_digest,
+                    )
+                    .await
+                    .map_err(map_federated_identity_error)?;
+                if current.signing_key() != active_actor.signing_key() {
+                    return Err(GroupFailure::AuthenticationRejected);
+                }
+            }
+            _ => return Err(GroupFailure::AuthenticationRejected),
+        }
+        return Ok(receipt);
+    }
     let receipt = state
         .mls_repository
         .receipt_verified_v3_with_proof(
@@ -1585,11 +1875,13 @@ async fn get_mls_commit_feed(
         let scope = parse_scope(&scope_kind, &scope_id)?;
         let collection_path = format!("{}/mls-commits", canonical_scope_path(scope));
         let query = parse_mls_commit_feed_query(&parts.uri, &collection_path)?;
-        let include_v4 = if has_exact_accept(&parts.headers, MLS_COMMIT_FEED_V2_CONTENT_TYPE) {
-            true
+        let feed_version = if has_exact_accept(&parts.headers, MLS_COMMIT_FEED_V3_CONTENT_TYPE) {
+            3
+        } else if has_exact_accept(&parts.headers, MLS_COMMIT_FEED_V2_CONTENT_TYPE) {
+            2
         } else {
             require_exact_accept(&parts.headers, MLS_COMMIT_FEED_CONTENT_TYPE)?;
-            false
+            1
         };
         require_empty_get(&parts.headers, body).await?;
         let proof = parse_group_query_proof_header(&parts.headers)?;
@@ -1680,11 +1972,11 @@ async fn get_mls_commit_feed(
         .map_err(|error| map_persistence_error(&error))?;
         Ok(cbor_response(
             StatusCode::OK,
-            encode_mls_commit_feed(&page, include_v4)?,
-            if include_v4 {
-                MLS_COMMIT_FEED_V2_CONTENT_TYPE
-            } else {
-                MLS_COMMIT_FEED_CONTENT_TYPE
+            encode_mls_commit_feed(&page, feed_version)?,
+            match feed_version {
+                3 => MLS_COMMIT_FEED_V3_CONTENT_TYPE,
+                2 => MLS_COMMIT_FEED_V2_CONTENT_TYPE,
+                _ => MLS_COMMIT_FEED_CONTENT_TYPE,
             },
         ))
     }
@@ -1825,13 +2117,12 @@ fn encode_mls_commit_receipt(receipt: &MlsCommitReceipt) -> Result<Vec<u8>, Grou
 
 fn encode_mls_commit_feed(
     page: &MlsCommitFeedPage,
-    include_v4: bool,
+    feed_version: u64,
 ) -> Result<Vec<u8>, GroupFailure> {
-    if !include_v4
-        && page
-            .items()
-            .iter()
-            .any(|item| item.receipt().protocol_version() == 4)
+    if !(1..=3).contains(&feed_version)
+        || page.items().iter().any(|item| {
+            u64::from(item.receipt().protocol_version()) > feed_version.saturating_add(2)
+        })
     {
         return Err(GroupFailure::InvalidRequest);
     }
@@ -1846,7 +2137,7 @@ fn encode_mls_commit_feed(
         })
         .collect::<Result<Vec<_>, GroupFailure>>()?;
     encode_deterministic_cbor(&numbered_map(vec![
-        CanonicalValue::Unsigned(if include_v4 { 2 } else { 1 }),
+        CanonicalValue::Unsigned(feed_version),
         CanonicalValue::Unsigned(page.after_epoch()),
         CanonicalValue::Array(items),
     ]))
@@ -1997,7 +2288,9 @@ async fn parse_mls_commit_body(
     expected_submission_id: RequestId,
     idempotency_key_hash: Sha256Digest,
 ) -> Result<MlsCommitBody, GroupFailure> {
-    let protocol_version: u8 = if has_exact_content_type(headers, MLS_COMMIT_V4_CONTENT_TYPE) {
+    let protocol_version: u8 = if has_exact_content_type(headers, MLS_COMMIT_V5_CONTENT_TYPE) {
+        5
+    } else if has_exact_content_type(headers, MLS_COMMIT_V4_CONTENT_TYPE) {
         4
     } else if has_exact_content_type(headers, MLS_COMMIT_V3_CONTENT_TYPE) {
         3
@@ -2013,6 +2306,7 @@ async fn parse_mls_commit_body(
             2 => MLS_COMMIT_CONTENT_TYPE,
             3 => MLS_COMMIT_V3_CONTENT_TYPE,
             4 => MLS_COMMIT_V4_CONTENT_TYPE,
+            5 => MLS_COMMIT_V5_CONTENT_TYPE,
             _ => return Err(GroupFailure::InvalidRequest),
         },
         MAX_MLS_COMMIT_BODY_BYTES,
@@ -2030,10 +2324,13 @@ async fn parse_mls_commit_body(
     let candidate_identity_id = parse_identity_id_value(field(fields, 6)?)?;
     let candidate_device_id = parse_device_id_value(field(fields, 7)?)?;
     let zero = Sha256Digest::from_bytes([0; 32]);
+    let candidate_key_package_is_null = field(fields, 8)? == &CanonicalValue::Null;
     let candidate_key_package_digest = if protocol_version == 4 {
-        if field(fields, 8)? != &CanonicalValue::Null {
+        if !candidate_key_package_is_null {
             return Err(GroupFailure::InvalidRequest);
         }
+        zero
+    } else if protocol_version == 5 && candidate_key_package_is_null {
         zero
     } else {
         parse_digest(field(fields, 8)?)?
@@ -2056,10 +2353,13 @@ async fn parse_mls_commit_body(
     if commit_digest != mls_opaque_commit_digest(&commit_bytes) {
         return Err(GroupFailure::InvalidRequest);
     }
+    let welcome_is_null = field(fields, 14)? == &CanonicalValue::Null;
     let welcome_digest = if protocol_version == 4 {
-        if field(fields, 14)? != &CanonicalValue::Null {
+        if !welcome_is_null {
             return Err(GroupFailure::InvalidRequest);
         }
+        zero
+    } else if protocol_version == 5 && welcome_is_null {
         zero
     } else {
         parse_digest(field(fields, 14)?)?
@@ -2069,60 +2369,114 @@ async fn parse_mls_commit_body(
         _ => return Err(GroupFailure::InvalidRequest),
     };
     let authorization_fields = exact_fields(field(fields, 15)?, authorization_len)?;
-    let (authorization, controller_signature) = match field(authorization_fields, 1)? {
-        CanonicalValue::Unsigned(1) if authorization_fields.len() == 1 => {
-            (MlsCommitAuthorization::OwnerBootstrap, None)
-        }
-        CanonicalValue::Unsigned(2) if protocol_version == 2 && authorization_fields.len() == 3 => {
-            (
-                MlsCommitAuthorization::ApprovedIdentityJoin {
-                    membership_command_id: MembershipCommandId::new(parse_request_id_value(
-                        field(authorization_fields, 2)?,
-                    )?),
-                    authorization_digest: parse_digest(field(authorization_fields, 3)?)?,
-                },
-                None,
-            )
-        }
-        CanonicalValue::Unsigned(2) if protocol_version == 3 && authorization_fields.len() == 5 => {
-            (
-                MlsCommitAuthorization::ApprovedIdentityJoinV3 {
-                    membership_command_id: MembershipCommandId::new(parse_request_id_value(
-                        field(authorization_fields, 2)?,
-                    )?),
-                    authorization_digest: parse_digest(field(authorization_fields, 3)?)?,
-                    join_request_digest: parse_digest(field(authorization_fields, 4)?)?,
-                    approval_request_digest: parse_digest(field(authorization_fields, 5)?)?,
-                },
-                None,
-            )
-        }
-        CanonicalValue::Unsigned(3) if authorization_fields.len() == 4 => {
-            let controller_device_id = parse_device_id_value(field(authorization_fields, 2)?)?;
-            let controller_consent_digest = parse_digest(field(authorization_fields, 3)?)?;
-            let (proof_digest, signature) =
-                parse_mls_device_proof(field(authorization_fields, 4)?)?;
-            if proof_digest != controller_consent_digest {
-                return Err(GroupFailure::InvalidRequest);
+    let (authorization, controller_signature, controller_proof_digest) =
+        match field(authorization_fields, 1)? {
+            CanonicalValue::Unsigned(1) if authorization_fields.len() == 1 => {
+                (MlsCommitAuthorization::OwnerBootstrap, None, None)
             }
-            (
-                MlsCommitAuthorization::ExistingMemberDeviceAdd {
-                    controller_device_id,
-                    controller_consent_digest,
-                },
-                Some(signature),
-            )
-        }
-        CanonicalValue::Unsigned(4) if protocol_version == 4 && authorization_fields.len() == 2 => {
-            (
-                MlsCommitAuthorization::MemberRemovalV4 {
-                    expected_policy_revision: parse_revision(field(authorization_fields, 2)?)?,
-                },
-                None,
-            )
-        }
-        _ => return Err(GroupFailure::InvalidRequest),
-    };
+            CanonicalValue::Unsigned(2)
+                if protocol_version == 2 && authorization_fields.len() == 3 =>
+            {
+                (
+                    MlsCommitAuthorization::ApprovedIdentityJoin {
+                        membership_command_id: MembershipCommandId::new(parse_request_id_value(
+                            field(authorization_fields, 2)?,
+                        )?),
+                        authorization_digest: parse_digest(field(authorization_fields, 3)?)?,
+                    },
+                    None,
+                    None,
+                )
+            }
+            CanonicalValue::Unsigned(2)
+                if protocol_version == 3 && authorization_fields.len() == 5 =>
+            {
+                (
+                    MlsCommitAuthorization::ApprovedIdentityJoinV3 {
+                        membership_command_id: MembershipCommandId::new(parse_request_id_value(
+                            field(authorization_fields, 2)?,
+                        )?),
+                        authorization_digest: parse_digest(field(authorization_fields, 3)?)?,
+                        join_request_digest: parse_digest(field(authorization_fields, 4)?)?,
+                        approval_request_digest: parse_digest(field(authorization_fields, 5)?)?,
+                    },
+                    None,
+                    None,
+                )
+            }
+            CanonicalValue::Unsigned(3)
+                if protocol_version == 2 && authorization_fields.len() == 4 =>
+            {
+                let controller_device_id = parse_device_id_value(field(authorization_fields, 2)?)?;
+                let controller_consent_digest = parse_digest(field(authorization_fields, 3)?)?;
+                let (proof_digest, signature) =
+                    parse_mls_device_proof(field(authorization_fields, 4)?)?;
+                if proof_digest != controller_consent_digest {
+                    return Err(GroupFailure::InvalidRequest);
+                }
+                (
+                    MlsCommitAuthorization::ExistingMemberDeviceAdd {
+                        controller_device_id,
+                        controller_consent_digest,
+                    },
+                    Some(signature),
+                    Some(proof_digest),
+                )
+            }
+            CanonicalValue::Unsigned(4)
+                if protocol_version == 4 && authorization_fields.len() == 2 =>
+            {
+                (
+                    MlsCommitAuthorization::MemberRemovalV4 {
+                        expected_policy_revision: parse_revision(field(authorization_fields, 2)?)?,
+                    },
+                    None,
+                    None,
+                )
+            }
+            CanonicalValue::Unsigned(5)
+                if protocol_version == 5 && authorization_fields.len() == 7 =>
+            {
+                let controller_device_id = parse_device_id_value(field(authorization_fields, 2)?)?;
+                let controller_consent_digest = parse_digest(field(authorization_fields, 3)?)?;
+                let CanonicalValue::Text(recovery_request_id) = field(authorization_fields, 4)?
+                else {
+                    return Err(GroupFailure::InvalidRequest);
+                };
+                let (proof_digest, signature) =
+                    parse_mls_v5_controller_proof(field(authorization_fields, 7)?)?;
+                if proof_digest != controller_consent_digest {
+                    return Err(GroupFailure::InvalidRequest);
+                }
+                (
+                    MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                        controller_device_id,
+                        controller_consent_digest,
+                        recovery_request_id: recovery_request_id
+                            .parse::<DeviceEnrollmentChallengeId>()
+                            .map_err(|_| GroupFailure::InvalidRequest)?,
+                        recovery_request_digest: parse_digest(field(authorization_fields, 5)?)?,
+                        recovery_scope_digest: parse_digest(field(authorization_fields, 6)?)?,
+                    },
+                    Some(signature),
+                    Some(proof_digest),
+                )
+            }
+            CanonicalValue::Unsigned(6)
+                if protocol_version == 5 && authorization_fields.len() == 3 =>
+            {
+                let (proof_digest, signature) =
+                    parse_mls_v5_controller_proof(field(authorization_fields, 3)?)?;
+                (
+                    MlsCommitAuthorization::ExistingMemberDeviceRemove {
+                        identity_revoke_head_digest: parse_digest(field(authorization_fields, 2)?)?,
+                    },
+                    Some(signature),
+                    Some(proof_digest),
+                )
+            }
+            _ => return Err(GroupFailure::InvalidRequest),
+        };
     let command = match (protocol_version, authorization) {
         (2, authorization) => MlsCommitCommand::new(
             submission_id,
@@ -2190,14 +2544,100 @@ async fn parse_mls_commit_body(
             commit_bytes,
             commit_digest,
         ),
+        (
+            5,
+            MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                controller_device_id,
+                controller_consent_digest,
+                recovery_request_id,
+                recovery_request_digest,
+                recovery_scope_digest,
+            },
+        ) => {
+            if actor_identity_id != candidate_identity_id
+                || actor_device_id != controller_device_id
+                || candidate_key_package_is_null
+                || welcome_is_null
+                || candidate_key_package_digest == zero
+                || welcome_digest == zero
+            {
+                return Err(GroupFailure::InvalidRequest);
+            }
+            MlsCommitCommand::new_v5_existing_member_device_recovery_add(
+                submission_id,
+                scope,
+                actor_identity_id,
+                controller_device_id,
+                candidate_device_id,
+                candidate_key_package_digest,
+                idempotency_key_hash,
+                expected_epoch,
+                expected_head,
+                commit_bytes,
+                commit_digest,
+                welcome_digest,
+                recovery_request_id,
+                recovery_request_digest,
+                recovery_scope_digest,
+                controller_consent_digest,
+            )
+        }
+        (
+            5,
+            MlsCommitAuthorization::ExistingMemberDeviceRemove {
+                identity_revoke_head_digest,
+            },
+        ) => {
+            if actor_identity_id != candidate_identity_id
+                || !candidate_key_package_is_null
+                || !welcome_is_null
+            {
+                return Err(GroupFailure::InvalidRequest);
+            }
+            MlsCommitCommand::new_v5_existing_member_device_remove(
+                submission_id,
+                scope,
+                actor_identity_id,
+                actor_device_id,
+                candidate_device_id,
+                idempotency_key_hash,
+                expected_epoch,
+                expected_head,
+                commit_bytes,
+                commit_digest,
+                identity_revoke_head_digest,
+            )
+        }
         _ => return Err(GroupFailure::InvalidRequest),
     }
     .map_err(|_| GroupFailure::InvalidRequest)?;
+    if protocol_version == 5
+        && controller_proof_digest
+            != Some(
+                mls_v5_controller_consent_digest(&command)
+                    .map_err(|_| GroupFailure::InvalidRequest)?,
+            )
+    {
+        return Err(GroupFailure::InvalidRequest);
+    }
     Ok(MlsCommitBody {
         command,
         candidate_signature: candidate_proof.map(|(_, signature)| signature),
         controller_signature,
     })
+}
+
+fn parse_mls_v5_controller_proof(
+    value: &CanonicalValue,
+) -> Result<(Sha256Digest, Ed25519Signature), GroupFailure> {
+    let fields = exact_fields(value, 3)?;
+    if field(fields, 1)? != &CanonicalValue::Unsigned(5) {
+        return Err(GroupFailure::InvalidRequest);
+    }
+    Ok((
+        parse_digest(field(fields, 2)?)?,
+        Ed25519Signature::from_bytes(parse_exact_bytes(field(fields, 3)?)?),
+    ))
 }
 
 fn parse_mls_device_proof(
@@ -3669,6 +4109,7 @@ const fn mls_commit_receipt_content_type(protocol_version: u8) -> &'static str {
     match protocol_version {
         3 => MLS_COMMIT_RECEIPT_V3_CONTENT_TYPE,
         4 => MLS_COMMIT_RECEIPT_V4_CONTENT_TYPE,
+        5 => MLS_COMMIT_RECEIPT_V5_CONTENT_TYPE,
         _ => MLS_COMMIT_RECEIPT_CONTENT_TYPE,
     }
 }
@@ -3847,6 +4288,8 @@ fn map_federated_identity_error(error: FederatedIdentityError) -> GroupFailure {
         FederatedIdentityError::InvalidOrigin
         | FederatedIdentityError::InvalidTrustRoot
         | FederatedIdentityError::InvalidIdentityLog
+        | FederatedIdentityError::InvalidRecoveryAuthorization
+        | FederatedIdentityError::RecoveryAuthorizationUnavailable
         | FederatedIdentityError::DeviceUnavailable => GroupFailure::AuthenticationRejected,
     }
 }

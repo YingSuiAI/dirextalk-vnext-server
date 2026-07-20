@@ -23,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
@@ -30,7 +31,6 @@ dtx-storage = { path = "../../crates/dtx-storage" }
 ed25519-dalek.workspace = true
 testcontainers-modules.workspace = true
 tower.workspace = true
-uuid.workspace = true
 
 [lints]
 workspace = true

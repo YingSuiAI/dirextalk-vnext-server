@@ -113,6 +113,7 @@ async fn validate_mailbox_runtime_role(pool: &PgPool) -> Result<(), MailboxPersi
              AND has_table_privilege(current_user, 'messaging.device_delivery_state', 'SELECT,INSERT,UPDATE')
              AND has_table_privilege(current_user, 'messaging.device_delivery_ack_claims', 'SELECT,INSERT')
              AND has_table_privilege(current_user, 'messaging.device_history_grants', 'SELECT,INSERT,UPDATE')
+             AND has_table_privilege(current_user, 'messaging.history_recovery_offers', 'SELECT,INSERT')
              AND has_schema_privilege(current_user, 'realtime', 'USAGE')
              AND has_table_privilege(current_user, 'realtime.identity_heads', 'SELECT,INSERT,UPDATE')
              AND has_table_privilege(current_user, 'realtime.journal', 'SELECT,INSERT')
@@ -136,6 +137,11 @@ async fn validate_mailbox_runtime_role(pool: &PgPool) -> Result<(), MailboxPersi
              AND has_function_privilege(
                  current_user,
                  'identity.identity_realtime_reader_authorized()'::regprocedure,
+                 'EXECUTE'
+             )
+             AND has_function_privilege(
+                 current_user,
+                 'identity.history_recovery_request_authorized(text,uuid,bytea,uuid,bigint)'::regprocedure,
                  'EXECUTE'
              )
              AND has_function_privilege(
@@ -256,7 +262,8 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, MailboxPersi
                         'identity.identity_runtime_authorized()'::regprocedure,
                         'identity.identity_owner_authorized()'::regprocedure,
                         'identity.identity_mailbox_reader_authorized()'::regprocedure,
-                        'identity.identity_realtime_reader_authorized()'::regprocedure
+                        'identity.identity_realtime_reader_authorized()'::regprocedure,
+                        'identity.history_recovery_request_authorized(text,uuid,bytea,uuid,bigint)'::regprocedure
                     )
              )
              OR EXISTS (

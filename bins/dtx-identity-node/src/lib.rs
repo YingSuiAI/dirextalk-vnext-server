@@ -27,21 +27,28 @@ use dtx_domain::{
     Clock, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionChallengeId, DeviceSessionId,
     IdentityId, InviteCapabilityId, KeyPackageId, RequestId, SystemClock,
 };
-use dtx_federated_identity::{FederatedIdentityError, FederatedIdentityVerifier};
+use dtx_federated_identity::{
+    FederatedIdentityError, FederatedIdentityVerifier, HISTORY_RECOVERY_AUTHORITY_ID_DOMAIN,
+    MLS_V5_RECOVERY_AUTHORIZATION_CONTENT_TYPE, MlsV5RecoveryAuthorityKind,
+    MlsV5RecoveryAuthorizationProjection, MlsV5RecoveryAuthorizationQuery,
+};
 use dtx_identity_log::{
-    DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1,
-    IdentityLogEventV1, IdentityLogPageV1, MAX_IDENTITY_LOG_PAGE_EVENTS,
+    DeviceEncryptionPublicKey, DeviceStatusV1, IDENTITY_LOG_WIRE_VERSION,
+    IdentityLogEventPayloadV1, IdentityLogEventV1, IdentityLogPageV1, IdentityLogV1,
+    MAX_IDENTITY_LOG_PAGE_EVENTS,
 };
 use dtx_identity_persistence::{
-    CreateDeviceEnrollmentChallengeCommand, DeviceEnrollmentApprovalCommand,
-    DeviceEnrollmentCapability, DeviceEnrollmentChallenge, DeviceEnrollmentChallengeOutcome,
-    DeviceEnrollmentChallengeState, DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository,
-    DeviceRevokeCommand, DeviceSessionCompletionCommand, DeviceSessionCredential,
-    DeviceSessionOutcome, DeviceSessionRepository, FEDERATED_KEY_PACKAGE_CLAIM_PATH,
-    FederatedKeyPackageClaimProof, IdentityAppendCommand, IdentityAppendOutcome,
+    CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
+    DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability, DeviceEnrollmentChallenge,
+    DeviceEnrollmentChallengeOutcome, DeviceEnrollmentChallengeState,
+    DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository, DeviceRevokeCommand,
+    DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
+    DeviceSessionRepository, FEDERATED_KEY_PACKAGE_CLAIM_PATH, FederatedKeyPackageClaimProof,
+    HistoryRecoveryKeyPackageScope, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead,
     IdentityLogPageReadOutcome, IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
     KeyPackageClaimCommand, KeyPackageClaimOutcome, KeyPackagePublishCommand,
     KeyPackagePublishOutcome, KeyPackageRepository, MAX_KEY_PACKAGE_PUBLISH_BYTES,
+    lock_and_load_active_snapshot,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -49,6 +56,7 @@ use dtx_wire::{
 };
 use getrandom::fill as fill_random;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sqlx::Row;
 use zeroize::Zeroize;
 
 /// Route for the self-authenticated identity genesis request.
@@ -74,6 +82,9 @@ pub const KEY_PACKAGE_CLAIM_PATH: &str = "/v1/key-packages/claim";
 pub const KEY_PACKAGE_FEDERATED_CLAIM_PATH: &str = FEDERATED_KEY_PACKAGE_CLAIM_PATH;
 /// Public read-only route template for exact signed identity-log pages.
 pub const IDENTITY_LOG_PAGE_PATH_TEMPLATE: &str = "/v1/identities/{identity_id}/log";
+/// Public identity-origin route for one fresh redacted MLS V5 recovery authorization.
+pub const MLS_V5_RECOVERY_AUTHORIZATION_PATH_TEMPLATE: &str =
+    "/v1/identities/{identity_id}/history-recovery-requests/{request_id}/mls-v5-authorization";
 /// Active-device route for one exact root-signed revocation of another device.
 pub const DEVICE_REVOKE_PATH_TEMPLATE: &str =
     "/v1/identities/{identity_id}/devices/{device_id}/revoke";
@@ -97,6 +108,8 @@ pub const DEVICE_SESSION_RECEIPT_CONTENT_TYPE: &str =
 /// Exact candidate challenge request media type.
 pub const DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.device-enrollment-candidate.v1+cbor";
+pub const HISTORY_RECOVERY_REQUEST_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.history-recovery-request.v1+cbor";
 /// Capability-gated enrollment status response media type.
 pub const DEVICE_ENROLLMENT_STATUS_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.device-enrollment-status.v1+cbor";
@@ -106,12 +119,16 @@ pub const DEVICE_ENROLLMENT_CONTENT_TYPE: &str =
 /// Exact signed opaque `KeyPackage` publish request media type.
 pub const KEY_PACKAGE_PUBLISH_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.key-package-publish.v1+cbor";
+pub const KEY_PACKAGE_PUBLISH_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.key-package-publish.v2+cbor";
 /// Immutable `KeyPackage` publish receipt media type.
 pub const KEY_PACKAGE_PUBLISH_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.key-package-publish-receipt.v1+cbor";
 /// Exact `KeyPackage` target claim request media type.
 pub const KEY_PACKAGE_CLAIM_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.key-package-claim.v1+cbor";
+pub const KEY_PACKAGE_CLAIM_V2_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.key-package-claim.v2+cbor";
 /// V1 target body authenticated by a requester-origin V2 device proof.
 pub const KEY_PACKAGE_FEDERATED_CLAIM_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.key-package-claim.v2+cbor";
@@ -283,6 +300,10 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
     Router::new()
         .route(IDENTITY_BOOTSTRAP_PATH, post(bootstrap_identity))
         .route(IDENTITY_LOG_PAGE_PATH_TEMPLATE, get(get_identity_log_page))
+        .route(
+            MLS_V5_RECOVERY_AUTHORIZATION_PATH_TEMPLATE,
+            get(get_mls_v5_recovery_authorization),
+        )
         .route(INITIAL_DEVICE_ENROLL_PATH, post(enroll_initial_device))
         .route(
             DEVICE_SESSION_CHALLENGE_PATH,
@@ -622,6 +643,39 @@ async fn get_identity_log_page(
     }
 }
 
+async fn get_mls_v5_recovery_authorization(
+    State(state): State<IdentityBootstrapState>,
+    Path((route_identity_id, route_request_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .mls_v5_recovery_authorization(
+            &route_identity_id,
+            &route_request_id,
+            parts.uri.query(),
+            &parts.headers,
+            body,
+        )
+        .await
+    {
+        Ok(projection) => match projection.exact_bytes() {
+            Ok(bytes) => exact_cbor_response(
+                StatusCode::OK,
+                bytes,
+                MLS_V5_RECOVERY_AUTHORIZATION_CONTENT_TYPE,
+                request_id,
+            ),
+            Err(_) => mls_v5_recovery_authorization_failure_response(
+                MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable,
+                request_id,
+            ),
+        },
+        Err(failure) => mls_v5_recovery_authorization_failure_response(failure, request_id),
+    }
+}
+
 async fn enroll_initial_device(
     State(state): State<IdentityBootstrapState>,
     request: Request,
@@ -780,6 +834,55 @@ async fn claim_key_package_federated(
 }
 
 impl IdentityBootstrapState {
+    async fn mls_v5_recovery_authorization(
+        &self,
+        route_identity_id: &str,
+        route_request_id: &str,
+        raw_query: Option<&str>,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<MlsV5RecoveryAuthorizationProjection, MlsV5RecoveryAuthorizationFailure> {
+        if !has_exact_header(
+            headers,
+            header::ACCEPT,
+            MLS_V5_RECOVERY_AUTHORIZATION_CONTENT_TYPE,
+        ) || headers.contains_key(header::AUTHORIZATION)
+            || headers.contains_key(header::CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(IDEMPOTENCY_KEY_HEADER)
+            || headers.contains_key(IDENTITY_ORIGIN_HEADER)
+        {
+            return Err(MlsV5RecoveryAuthorizationFailure::InvalidRequest);
+        }
+        let body = to_bytes(body, 1)
+            .await
+            .map_err(|_| MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+        if !body.is_empty() {
+            return Err(MlsV5RecoveryAuthorizationFailure::InvalidRequest);
+        }
+        let query = parse_mls_v5_recovery_authorization_query(
+            route_identity_id,
+            route_request_id,
+            raw_query,
+        )?;
+        let now = self
+            .committed_at()
+            .map_err(|()| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+        let mut session = self
+            .store
+            .begin()
+            .await
+            .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+        let result =
+            load_mls_v5_recovery_authorization_projection(session.connection(), query, now).await;
+        session
+            .rollback()
+            .await
+            .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+        result
+    }
+
     async fn get_identity_log_page(
         &self,
         route_identity_id: &str,
@@ -1002,7 +1105,10 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<DeviceEnrollmentChallengeSuccess, DeviceEnrollmentFailure> {
-        if !has_exact_content_type(headers, DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE)
+        let history_recovery =
+            has_exact_content_type(headers, HISTORY_RECOVERY_REQUEST_CONTENT_TYPE);
+        if (!history_recovery
+            && !has_exact_content_type(headers, DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE))
             || headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(header::AUTHORIZATION)
@@ -1018,25 +1124,51 @@ impl IdentityBootstrapState {
         let bytes = to_bytes(body, MAX_DEVICE_ENROLLMENT_CANDIDATE_BYTES)
             .await
             .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
-        let candidate = parse_device_enrollment_candidate(&bytes)?;
-        let command = CreateDeviceEnrollmentChallengeCommand::new(
-            idempotency_key_hash,
-            candidate.identity_id,
-            candidate.target_device_id,
-            candidate.target_device_signing_key,
-            candidate.target_device_encryption_key,
-            candidate.capability,
-        )
-        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
         let now = self
             .committed_at()
             .map_err(|()| DeviceEnrollmentFailure::TemporarilyUnavailable)?;
-        match self
-            .device_enrollments
-            .create_challenge(&self.store, command, now)
-            .await
-            .map_err(|error| map_device_enrollment_persistence_error(&error))?
-        {
+        let outcome = if history_recovery {
+            let request = parse_history_recovery_request(&bytes)?;
+            let command = CreateHistoryRecoveryRequestCommand::new(
+                idempotency_key_hash,
+                request.request_id,
+                request.identity_id,
+                request.target_device_id,
+                request.target_device_signing_key,
+                request.recipient_encryption_key,
+                IdentityLogHead::observed(
+                    request.identity_id,
+                    request.observed_head_sequence,
+                    request.observed_head_hash,
+                )
+                .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?,
+                request.issued_at,
+                request.expires_at,
+                request.capability,
+                request.candidate_signature,
+                request.exact_signed_request,
+            )
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+            self.device_enrollments
+                .create_history_recovery_request(&self.store, command, now)
+                .await
+        } else {
+            let candidate = parse_device_enrollment_candidate(&bytes)?;
+            let command = CreateDeviceEnrollmentChallengeCommand::new(
+                idempotency_key_hash,
+                candidate.identity_id,
+                candidate.target_device_id,
+                candidate.target_device_signing_key,
+                candidate.target_device_encryption_key,
+                candidate.capability,
+            )
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+            self.device_enrollments
+                .create_challenge(&self.store, command, now)
+                .await
+        }
+        .map_err(|error| map_device_enrollment_persistence_error(&error))?;
+        match outcome {
             DeviceEnrollmentChallengeOutcome::Created(challenge) => {
                 Ok(DeviceEnrollmentChallengeSuccess {
                     status: StatusCode::CREATED,
@@ -1201,7 +1333,8 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<KeyPackagePublishSuccess, KeyPackageFailure> {
-        if !has_exact_content_type(headers, KEY_PACKAGE_PUBLISH_CONTENT_TYPE)
+        let recovery_v2 = has_exact_content_type(headers, KEY_PACKAGE_PUBLISH_V2_CONTENT_TYPE);
+        if (!recovery_v2 && !has_exact_content_type(headers, KEY_PACKAGE_PUBLISH_CONTENT_TYPE))
             || headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
@@ -1225,18 +1358,37 @@ impl IdentityBootstrapState {
         if publish.package_id != route_package_id {
             return Err(KeyPackageFailure::InvalidRequest);
         }
-        let command = KeyPackagePublishCommand::new(
-            idempotency_key_hash,
-            publish.identity_id,
-            publish.device_id,
-            publish.package_id,
-            publish.published_head_sequence,
-            publish.published_head_hash,
-            publish.expires_at,
-            publish.opaque_key_package,
-            publish.detached_signature,
-            bytes.to_vec(),
-        )
+        if recovery_v2 != publish.history_recovery_scope.is_some() {
+            return Err(KeyPackageFailure::InvalidRequest);
+        }
+        let command = if let Some(scope) = publish.history_recovery_scope {
+            KeyPackagePublishCommand::new_history_recovery_v2(
+                idempotency_key_hash,
+                publish.identity_id,
+                publish.device_id,
+                publish.package_id,
+                publish.published_head_sequence,
+                publish.published_head_hash,
+                publish.expires_at,
+                publish.opaque_key_package,
+                scope,
+                publish.detached_signature,
+                bytes.to_vec(),
+            )
+        } else {
+            KeyPackagePublishCommand::new(
+                idempotency_key_hash,
+                publish.identity_id,
+                publish.device_id,
+                publish.package_id,
+                publish.published_head_sequence,
+                publish.published_head_hash,
+                publish.expires_at,
+                publish.opaque_key_package,
+                publish.detached_signature,
+                bytes.to_vec(),
+            )
+        }
         .map_err(|_| KeyPackageFailure::InvalidRequest)?;
         let now = self
             .committed_at()
@@ -1263,7 +1415,8 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<KeyPackageClaimSuccess, KeyPackageFailure> {
-        if !has_exact_content_type(headers, KEY_PACKAGE_CLAIM_CONTENT_TYPE)
+        let recovery_v2 = has_exact_content_type(headers, KEY_PACKAGE_CLAIM_V2_CONTENT_TYPE);
+        if (!recovery_v2 && !has_exact_content_type(headers, KEY_PACKAGE_CLAIM_CONTENT_TYPE))
             || headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
@@ -1279,12 +1432,25 @@ impl IdentityBootstrapState {
             .await
             .map_err(|_| KeyPackageFailure::InvalidRequest)?;
         let claim = parse_key_package_claim(&bytes)?;
-        let command = KeyPackageClaimCommand::new(
-            idempotency_key_hash,
-            claim.target_identity_id,
-            claim.target_device_id,
-            bytes.to_vec(),
-        )
+        if recovery_v2 != claim.history_recovery_scope.is_some() {
+            return Err(KeyPackageFailure::InvalidRequest);
+        }
+        let command = if let Some(scope) = claim.history_recovery_scope {
+            KeyPackageClaimCommand::new_history_recovery_v2(
+                idempotency_key_hash,
+                claim.target_identity_id,
+                claim.target_device_id,
+                scope,
+                bytes.to_vec(),
+            )
+        } else {
+            KeyPackageClaimCommand::new(
+                idempotency_key_hash,
+                claim.target_identity_id,
+                claim.target_device_id,
+                bytes.to_vec(),
+            )
+        }
         .map_err(|_| KeyPackageFailure::InvalidRequest)?;
         let now = self
             .committed_at()
@@ -1523,6 +1689,225 @@ fn parse_identity_log_page_request(
         after_sequence.unwrap_or(0),
         limit.unwrap_or(DEFAULT_IDENTITY_LOG_PAGE_LIMIT),
     ))
+}
+
+fn parse_mls_v5_recovery_authorization_query(
+    route_identity_id: &str,
+    route_request_id: &str,
+    raw_query: Option<&str>,
+) -> Result<MlsV5RecoveryAuthorizationQuery, MlsV5RecoveryAuthorizationFailure> {
+    let identity_id = route_identity_id
+        .parse::<IdentityId>()
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+    let request_id = route_request_id
+        .parse::<DeviceEnrollmentChallengeId>()
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+    let raw_query = raw_query.ok_or(MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+    let mut fields = raw_query.split('&');
+    let candidate_device_id = mls_v5_query_value(fields.next(), "candidate_device_id=")?
+        .parse::<DeviceId>()
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+    let controller_device_id = mls_v5_query_value(fields.next(), "controller_device_id=")?
+        .parse::<DeviceId>()
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+    let identity_head_digest =
+        Sha256Digest::from_str(mls_v5_query_value(fields.next(), "identity_head_digest=")?)
+            .map_err(|_| MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+    let key_package_digest =
+        Sha256Digest::from_str(mls_v5_query_value(fields.next(), "key_package_digest=")?)
+            .map_err(|_| MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+    let recovery_request_digest = Sha256Digest::from_str(mls_v5_query_value(
+        fields.next(),
+        "recovery_request_digest=",
+    )?)
+    .map_err(|_| MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+    let recovery_scope_digest =
+        Sha256Digest::from_str(mls_v5_query_value(fields.next(), "recovery_scope_digest=")?)
+            .map_err(|_| MlsV5RecoveryAuthorizationFailure::InvalidRequest)?;
+    if fields.next().is_some() {
+        return Err(MlsV5RecoveryAuthorizationFailure::InvalidRequest);
+    }
+    let query = MlsV5RecoveryAuthorizationQuery::new(
+        identity_id,
+        request_id,
+        candidate_device_id,
+        controller_device_id,
+        identity_head_digest,
+        key_package_digest,
+        recovery_request_digest,
+        recovery_scope_digest,
+    );
+    if query.canonical_query() != raw_query {
+        return Err(MlsV5RecoveryAuthorizationFailure::InvalidRequest);
+    }
+    Ok(query)
+}
+
+fn mls_v5_query_value<'a>(
+    field: Option<&'a str>,
+    name: &str,
+) -> Result<&'a str, MlsV5RecoveryAuthorizationFailure> {
+    field
+        .and_then(|field| field.strip_prefix(name))
+        .filter(|value| !value.is_empty())
+        .ok_or(MlsV5RecoveryAuthorizationFailure::InvalidRequest)
+}
+
+async fn load_mls_v5_recovery_authorization_projection(
+    connection: &mut sqlx::PgConnection,
+    query: MlsV5RecoveryAuthorizationQuery,
+    now: UtcMillis,
+) -> Result<MlsV5RecoveryAuthorizationProjection, MlsV5RecoveryAuthorizationFailure> {
+    let snapshot = lock_and_load_active_snapshot(connection, query.identity_id())
+        .await
+        .map_err(|error| map_mls_v5_recovery_authorization_persistence_error(&error))?;
+    if snapshot.head().hash() != query.identity_head_digest()
+        || snapshot
+            .projection()
+            .device_status(query.candidate_device_id())
+            != Some(DeviceStatusV1::Active)
+        || snapshot
+            .projection()
+            .device_status(query.controller_device_id())
+            != Some(DeviceStatusV1::Active)
+    {
+        return Err(MlsV5RecoveryAuthorizationFailure::Unavailable);
+    }
+    let row = sqlx::query(
+        "SELECT provider_device_id,authority_kind,authority_id,
+                history_grant_digest,attachment_digest,claim_receipt_digest,
+                authorization_expires_at_ms
+           FROM identity.mls_v5_recovery_authorization_projection(
+               $1,$2,$3,$4,$5,$6,$7,$8,$9
+           )",
+    )
+    .bind(query.identity_id().to_string())
+    .bind(*query.request_id().as_uuid())
+    .bind(*query.candidate_device_id().as_uuid())
+    .bind(*query.controller_device_id().as_uuid())
+    .bind(query.identity_head_digest().as_bytes().as_slice())
+    .bind(query.key_package_digest().as_bytes().as_slice())
+    .bind(query.recovery_request_digest().as_bytes().as_slice())
+    .bind(query.recovery_scope_digest().as_bytes().as_slice())
+    .bind(now.get())
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?
+    .ok_or(MlsV5RecoveryAuthorizationFailure::Unavailable)?;
+    let provider_device_id: DeviceId = row
+        .try_get::<uuid::Uuid, _>("provider_device_id")
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?
+        .try_into()
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+    if snapshot.projection().device_status(provider_device_id) != Some(DeviceStatusV1::Active) {
+        return Err(MlsV5RecoveryAuthorizationFailure::Unavailable);
+    }
+    let authority_kind: String = row
+        .try_get("authority_kind")
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+    let authority_id: String = row
+        .try_get("authority_id")
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+    let authority_kind = verify_mls_v5_recovery_authority(
+        snapshot.projection(),
+        provider_device_id,
+        &authority_kind,
+        &authority_id,
+    )?;
+    let expires_at = UtcMillis::new(
+        row.try_get("authorization_expires_at_ms")
+            .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?,
+    )
+    .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+    if expires_at <= now {
+        return Err(MlsV5RecoveryAuthorizationFailure::Unavailable);
+    }
+    MlsV5RecoveryAuthorizationProjection::new(
+        query,
+        provider_device_id,
+        authority_kind,
+        authority_id,
+        database_digest(&row, "history_grant_digest")?,
+        database_digest(&row, "attachment_digest")?,
+        database_digest(&row, "claim_receipt_digest")?,
+        expires_at,
+    )
+    .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)
+}
+
+fn verify_mls_v5_recovery_authority(
+    projection: &IdentityLogV1,
+    provider_device_id: DeviceId,
+    authority_kind: &str,
+    authority_id: &str,
+) -> Result<MlsV5RecoveryAuthorityKind, MlsV5RecoveryAuthorizationFailure> {
+    match authority_kind {
+        "active_device" => {
+            let authority = authority_id
+                .parse::<DeviceId>()
+                .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+            if authority == provider_device_id
+                || projection.device_status(authority) != Some(DeviceStatusV1::Active)
+            {
+                return Err(MlsV5RecoveryAuthorizationFailure::Unavailable);
+            }
+            Ok(MlsV5RecoveryAuthorityKind::ActiveDevice)
+        }
+        "root" => {
+            verify_mls_v5_recovery_key_authority(
+                authority_id,
+                projection.current_root_key().as_bytes(),
+            )?;
+            Ok(MlsV5RecoveryAuthorityKind::Root)
+        }
+        "recovery" => {
+            verify_mls_v5_recovery_key_authority(
+                authority_id,
+                projection.current_recovery_key().as_bytes(),
+            )?;
+            Ok(MlsV5RecoveryAuthorityKind::Recovery)
+        }
+        _ => Err(MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable),
+    }
+}
+
+fn verify_mls_v5_recovery_key_authority(
+    authority_id: &str,
+    current_key: &[u8],
+) -> Result<(), MlsV5RecoveryAuthorizationFailure> {
+    if authority_id
+        != Sha256Digest::hash_domain(HISTORY_RECOVERY_AUTHORITY_ID_DOMAIN, current_key).to_string()
+    {
+        return Err(MlsV5RecoveryAuthorizationFailure::Unavailable);
+    }
+    Ok(())
+}
+
+fn database_digest(
+    row: &sqlx::postgres::PgRow,
+    column: &'static str,
+) -> Result<Sha256Digest, MlsV5RecoveryAuthorizationFailure> {
+    let bytes: Vec<u8> = row
+        .try_get(column)
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+    let bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable)?;
+    Ok(Sha256Digest::from_bytes(bytes))
+}
+
+fn map_mls_v5_recovery_authorization_persistence_error(
+    error: &IdentityPersistenceError,
+) -> MlsV5RecoveryAuthorizationFailure {
+    match error {
+        IdentityPersistenceError::HeadConflict { .. }
+        | IdentityPersistenceError::IdentityInactive
+        | IdentityPersistenceError::DeviceAuthenticationRejected => {
+            MlsV5RecoveryAuthorizationFailure::Unavailable
+        }
+        _ => MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable,
+    }
 }
 
 fn parse_canonical_safe_uint(value: &str) -> Result<u64, IdentityLogPageFailure> {
@@ -1774,6 +2159,8 @@ fn map_federated_identity_error(error: FederatedIdentityError) -> KeyPackageFail
         FederatedIdentityError::InvalidOrigin
         | FederatedIdentityError::InvalidTrustRoot
         | FederatedIdentityError::InvalidIdentityLog
+        | FederatedIdentityError::InvalidRecoveryAuthorization
+        | FederatedIdentityError::RecoveryAuthorizationUnavailable
         | FederatedIdentityError::DeviceUnavailable => KeyPackageFailure::AuthenticationRejected,
     }
 }
@@ -1814,6 +2201,21 @@ struct DeviceEnrollmentCandidateRequest {
     capability: DeviceEnrollmentCapability,
 }
 
+struct HistoryRecoveryCandidateRequest {
+    request_id: DeviceEnrollmentChallengeId,
+    identity_id: IdentityId,
+    target_device_id: DeviceId,
+    target_device_signing_key: SigningPublicKey,
+    recipient_encryption_key: DeviceEncryptionPublicKey,
+    observed_head_sequence: SafeUint,
+    observed_head_hash: Sha256Digest,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
+    candidate_signature: Ed25519Signature,
+    capability: DeviceEnrollmentCapability,
+    exact_signed_request: Vec<u8>,
+}
+
 struct DeviceEnrollmentCompletionRequest {
     challenge_id: DeviceEnrollmentChallengeId,
     capability: DeviceEnrollmentCapability,
@@ -1847,6 +2249,70 @@ fn parse_device_enrollment_candidate(
         target_device_signing_key,
         target_device_encryption_key,
         capability,
+    })
+}
+
+fn parse_history_recovery_request(
+    bytes: &[u8],
+) -> Result<HistoryRecoveryCandidateRequest, DeviceEnrollmentFailure> {
+    let value =
+        decode_deterministic_cbor(bytes).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 13)?;
+    if cbor_field(fields, 1)? != &CanonicalValue::Unsigned(2) {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    if cbor_field(fields, 9)? != &CanonicalValue::Unsigned(1) {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let exact_signed_request = encode_deterministic_cbor(&CanonicalValue::Map(
+        fields.iter().take(12).cloned().collect(),
+    ))
+    .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    Ok(HistoryRecoveryCandidateRequest {
+        request_id: parse_cbor_challenge_id(cbor_field(fields, 2)?)?,
+        identity_id: parse_cbor_identity_id(cbor_field(fields, 3)?)?,
+        target_device_id: parse_cbor_device_id(cbor_field(fields, 4)?)?,
+        target_device_signing_key: SigningPublicKey::try_from(parse_cbor_bytes::<32>(cbor_field(
+            fields, 5,
+        )?)?)
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?,
+        recipient_encryption_key: DeviceEncryptionPublicKey::try_from(parse_cbor_bytes::<32>(
+            cbor_field(fields, 6)?,
+        )?)
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?,
+        observed_head_sequence: match cbor_field(fields, 7)? {
+            CanonicalValue::Unsigned(value) => {
+                SafeUint::new(*value).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
+            }
+            _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+        },
+        observed_head_hash: Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 8)?)?),
+        issued_at: match cbor_field(fields, 10)? {
+            CanonicalValue::Negative(value) => {
+                UtcMillis::new(*value).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
+            }
+            CanonicalValue::Unsigned(value) => UtcMillis::new(
+                i64::try_from(*value).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?,
+            )
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?,
+            _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+        },
+        expires_at: match cbor_field(fields, 11)? {
+            CanonicalValue::Negative(value) => {
+                UtcMillis::new(*value).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
+            }
+            CanonicalValue::Unsigned(value) => UtcMillis::new(
+                i64::try_from(*value).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?,
+            )
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?,
+            _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+        },
+        candidate_signature: Ed25519Signature::from_bytes(parse_cbor_bytes(cbor_field(
+            fields, 12,
+        )?)?),
+        capability: DeviceEnrollmentCapability::new(parse_cbor_bytes(cbor_field(fields, 13)?)?)
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?,
+        exact_signed_request,
     })
 }
 
@@ -1884,11 +2350,13 @@ struct KeyPackagePublishRequest {
     expires_at: UtcMillis,
     opaque_key_package: Vec<u8>,
     detached_signature: Ed25519Signature,
+    history_recovery_scope: Option<HistoryRecoveryKeyPackageScope>,
 }
 
 struct KeyPackageClaimRequest {
     target_identity_id: IdentityId,
     target_device_id: DeviceId,
+    history_recovery_scope: Option<HistoryRecoveryKeyPackageScope>,
 }
 
 fn parse_key_package_publish(bytes: &[u8]) -> Result<KeyPackagePublishRequest, KeyPackageFailure> {
@@ -1896,8 +2364,18 @@ fn parse_key_package_publish(bytes: &[u8]) -> Result<KeyPackagePublishRequest, K
         return Err(KeyPackageFailure::InvalidRequest);
     }
     let value = decode_deterministic_cbor(bytes).map_err(|_| KeyPackageFailure::InvalidRequest)?;
-    let fields = key_package_cbor_fields(&value, 9)?;
-    key_package_require_version(key_package_cbor_field(fields, 1)?)?;
+    let field_count = match &value {
+        CanonicalValue::Map(fields) => fields.len(),
+        _ => return Err(KeyPackageFailure::InvalidRequest),
+    };
+    if !matches!(field_count, 9 | 12) {
+        return Err(KeyPackageFailure::InvalidRequest);
+    }
+    let fields = key_package_cbor_fields(&value, field_count)?;
+    let version = if field_count == 12 { 2 } else { 1 };
+    if key_package_cbor_field(fields, 1)? != &CanonicalValue::Unsigned(version) {
+        return Err(KeyPackageFailure::InvalidRequest);
+    }
     let identity_id = key_package_parse_identity_id(key_package_cbor_field(fields, 2)?)?;
     let device_id = key_package_parse_device_id(key_package_cbor_field(fields, 3)?)?;
     let package_id = key_package_parse_package_id(key_package_cbor_field(fields, 4)?)?;
@@ -1913,6 +2391,24 @@ fn parse_key_package_publish(bytes: &[u8]) -> Result<KeyPackagePublishRequest, K
     let detached_signature = Ed25519Signature::from_bytes(key_package_parse_bytes::<64>(
         key_package_cbor_field(fields, 9)?,
     )?);
+    let history_recovery_scope = if version == 2 {
+        if key_package_cbor_field(fields, 12)? != &CanonicalValue::Unsigned(1) {
+            return Err(KeyPackageFailure::InvalidRequest);
+        }
+        Some(
+            HistoryRecoveryKeyPackageScope::new(
+                Sha256Digest::from_bytes(key_package_parse_bytes(key_package_cbor_field(
+                    fields, 10,
+                )?)?),
+                Sha256Digest::from_bytes(key_package_parse_bytes(key_package_cbor_field(
+                    fields, 11,
+                )?)?),
+            )
+            .map_err(|_| KeyPackageFailure::InvalidRequest)?,
+        )
+    } else {
+        None
+    };
     Ok(KeyPackagePublishRequest {
         identity_id,
         device_id,
@@ -1922,6 +2418,7 @@ fn parse_key_package_publish(bytes: &[u8]) -> Result<KeyPackagePublishRequest, K
         expires_at,
         opaque_key_package,
         detached_signature,
+        history_recovery_scope,
     })
 }
 
@@ -1930,11 +2427,40 @@ fn parse_key_package_claim(bytes: &[u8]) -> Result<KeyPackageClaimRequest, KeyPa
         return Err(KeyPackageFailure::InvalidRequest);
     }
     let value = decode_deterministic_cbor(bytes).map_err(|_| KeyPackageFailure::InvalidRequest)?;
-    let fields = key_package_cbor_fields(&value, 3)?;
-    key_package_require_version(key_package_cbor_field(fields, 1)?)?;
+    let field_count = match &value {
+        CanonicalValue::Map(fields) => fields.len(),
+        _ => return Err(KeyPackageFailure::InvalidRequest),
+    };
+    if !matches!(field_count, 3 | 6) {
+        return Err(KeyPackageFailure::InvalidRequest);
+    }
+    let fields = key_package_cbor_fields(&value, field_count)?;
+    let version = if field_count == 6 { 2 } else { 1 };
+    if key_package_cbor_field(fields, 1)? != &CanonicalValue::Unsigned(version) {
+        return Err(KeyPackageFailure::InvalidRequest);
+    }
+    let history_recovery_scope = if version == 2 {
+        if key_package_cbor_field(fields, 6)? != &CanonicalValue::Unsigned(1) {
+            return Err(KeyPackageFailure::InvalidRequest);
+        }
+        Some(
+            HistoryRecoveryKeyPackageScope::new(
+                Sha256Digest::from_bytes(key_package_parse_bytes(key_package_cbor_field(
+                    fields, 4,
+                )?)?),
+                Sha256Digest::from_bytes(key_package_parse_bytes(key_package_cbor_field(
+                    fields, 5,
+                )?)?),
+            )
+            .map_err(|_| KeyPackageFailure::InvalidRequest)?,
+        )
+    } else {
+        None
+    };
     Ok(KeyPackageClaimRequest {
         target_identity_id: key_package_parse_identity_id(key_package_cbor_field(fields, 2)?)?,
         target_device_id: key_package_parse_device_id(key_package_cbor_field(fields, 3)?)?,
+        history_recovery_scope,
     })
 }
 
@@ -2069,14 +2595,6 @@ fn key_package_cbor_field(
         )
         .map(|(_, value)| value)
         .ok_or(KeyPackageFailure::InvalidRequest)
-}
-
-fn key_package_require_version(value: &CanonicalValue) -> Result<(), KeyPackageFailure> {
-    if value == &CanonicalValue::Unsigned(1) {
-        Ok(())
-    } else {
-        Err(KeyPackageFailure::InvalidRequest)
-    }
 }
 
 fn key_package_parse_identity_id(value: &CanonicalValue) -> Result<IdentityId, KeyPackageFailure> {
@@ -2365,6 +2883,13 @@ enum IdentityLogPageFailure {
     TemporarilyUnavailable,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MlsV5RecoveryAuthorizationFailure {
+    InvalidRequest,
+    Unavailable,
+    TemporarilyUnavailable,
+}
+
 #[derive(Clone, Copy)]
 enum BootstrapFailure {
     InvalidBootstrap,
@@ -2494,6 +3019,16 @@ enum IdentityLogPageErrorCode {
     CursorAhead,
     #[serde(rename = "IDENTITY_LOG_INACTIVE")]
     Inactive,
+    #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, Serialize)]
+enum MlsV5RecoveryAuthorizationErrorCode {
+    #[serde(rename = "MLS_V5_RECOVERY_AUTHORIZATION_REQUEST_INVALID")]
+    InvalidRequest,
+    #[serde(rename = "MLS_V5_RECOVERY_AUTHORIZATION_UNAVAILABLE")]
+    Unavailable,
     #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
     TemporarilyUnavailable,
 }
@@ -2644,6 +3179,30 @@ fn identity_log_page_failure_response(
         IdentityLogPageFailure::TemporarilyUnavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             IdentityLogPageErrorCode::TemporarilyUnavailable,
+            true,
+        ),
+    };
+    safe_error_response(status, code, retryable, request_id)
+}
+
+fn mls_v5_recovery_authorization_failure_response(
+    failure: MlsV5RecoveryAuthorizationFailure,
+    request_id: RequestId,
+) -> Response {
+    let (status, code, retryable) = match failure {
+        MlsV5RecoveryAuthorizationFailure::InvalidRequest => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            MlsV5RecoveryAuthorizationErrorCode::InvalidRequest,
+            false,
+        ),
+        MlsV5RecoveryAuthorizationFailure::Unavailable => (
+            StatusCode::NOT_FOUND,
+            MlsV5RecoveryAuthorizationErrorCode::Unavailable,
+            false,
+        ),
+        MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            MlsV5RecoveryAuthorizationErrorCode::TemporarilyUnavailable,
             true,
         ),
     };

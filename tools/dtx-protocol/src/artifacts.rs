@@ -159,11 +159,2365 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_realtime_sync_v1(root)?;
     validate_account_read_cursor_v1(root)?;
     validate_realtime_sync_v2(root)?;
+    validate_history_recovery_v1(root)?;
+    validate_mls_sequencer_v5(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V40 protocol gate deliberately proves every cross-artifact history binding"
+)]
+fn validate_history_recovery_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    const REQUEST_SIGNATURE: &[u8] = b"dirextalk.history-recovery-request-signature.v1\0";
+    const REQUEST_DIGEST: &[u8] = b"dirextalk.history-recovery-request-digest.v1\0";
+    const CAPABILITY_DIGEST: &[u8] = b"dirextalk.device-enrollment-capability.v1\0";
+    const PACKAGE_BYTES: &[u8] = b"dirextalk.key-package-bytes.v1\0";
+    const PUBLISH_BINDING: &[u8] = b"dirextalk.key-package-publish-binding.v1\0";
+    const PUBLISH_SIGNATURE: &[u8] = b"dirextalk.key-package-publish-signature.v1\0";
+    const CLAIM_RECEIPT: &[u8] = b"dirextalk.key-package-claim-receipt.v1\0";
+    const RECOVERY_SCOPE: &[u8] = b"dirextalk.mls-recovery-scope-digest.v5\0";
+    const RECIPIENT_PACKAGE: &[u8] = b"dirextalk.history-recovery-recipient-package.v1\0";
+    const PROVIDER_SIGNATURE: &[u8] = b"dirextalk.device-history-grant-provider.v2\0";
+    const AUTHORITY_SIGNATURE: &[u8] = b"dirextalk.device-history-grant-authority.v2\0";
+    const GRANT_DIGEST: &[u8] = b"dirextalk.device-history-grant-digest.v2\0";
+    const OFFER_DIGEST: &[u8] = b"dirextalk.device-history-offer.v2\0";
+    const MAILBOX_RECEIPT: &[u8] = b"dirextalk.mailbox-receipt.v1\0";
+
+    let cddl_path = root.join("protocol/cddl/history-recovery/v1/history-recovery-v1.cddl");
+    let cddl = read(&cddl_path)?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse History Recovery V1 CDDL: {error}"))
+    })?;
+    let vector = read_json(
+        &root.join("protocol/test-vectors/history-recovery/v1/history-recovery-v1.json"),
+    )?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "baseline",
+            "media_types",
+            "domains",
+            "candidate_public_key_hex",
+            "provider_public_key_hex",
+            "authority_public_key_hex",
+            "request",
+            "key_package",
+            "mls_v5_authorization",
+            "grant",
+            "pull_v3",
+            "invalid_cbor",
+        ],
+        "History Recovery V1 vector",
+    )?;
+    if vector.get("version").and_then(Value::as_u64) != Some(1)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(40)
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 vector version/baseline must be 1/40",
+        ));
+    }
+    v40_require_string_map(
+        v40_json_field(&vector, "media_types", "History Recovery V1 vector")?,
+        &[
+            (
+                "enroll_request",
+                "application/vnd.dirextalk.history-recovery-request.v1+cbor",
+            ),
+            (
+                "enroll_status",
+                "application/vnd.dirextalk.device-enrollment-status.v1+cbor",
+            ),
+            (
+                "key_package_publish",
+                "application/vnd.dirextalk.key-package-publish.v2+cbor",
+            ),
+            (
+                "key_package_publish_receipt",
+                "application/vnd.dirextalk.key-package-publish-receipt.v1+cbor",
+            ),
+            (
+                "key_package_claim",
+                "application/vnd.dirextalk.key-package-claim.v2+cbor",
+            ),
+            (
+                "key_package_claim_receipt",
+                "application/vnd.dirextalk.key-package-claim-receipt.v1+cbor",
+            ),
+            (
+                "history_grant",
+                "application/vnd.dirextalk.device-history-grant.v2+cbor",
+            ),
+            (
+                "history_grant_receipt",
+                "application/vnd.dirextalk.device-history-grant-receipt.v2+cbor",
+            ),
+            (
+                "mls_v5_authorization",
+                "application/vnd.dirextalk.mls-v5-recovery-authorization.v1+cbor",
+            ),
+            (
+                "pull",
+                "application/vnd.dirextalk.identity-mailbox-pull.v3+cbor",
+            ),
+            (
+                "pull_receipt",
+                "application/vnd.dirextalk.identity-mailbox-pull-receipt.v3+cbor",
+            ),
+        ],
+        "History Recovery V1 media types",
+    )?;
+    v40_require_string_map(
+        v40_json_field(&vector, "domains", "History Recovery V1 vector")?,
+        &[
+            (
+                "request_signature",
+                std::str::from_utf8(REQUEST_SIGNATURE).expect("ASCII domain"),
+            ),
+            (
+                "request_digest",
+                std::str::from_utf8(REQUEST_DIGEST).expect("ASCII domain"),
+            ),
+            (
+                "capability_digest",
+                std::str::from_utf8(CAPABILITY_DIGEST).expect("ASCII domain"),
+            ),
+            (
+                "key_package_bytes",
+                std::str::from_utf8(PACKAGE_BYTES).expect("ASCII domain"),
+            ),
+            (
+                "key_package_publish_binding",
+                std::str::from_utf8(PUBLISH_BINDING).expect("ASCII domain"),
+            ),
+            (
+                "key_package_publish_signature",
+                std::str::from_utf8(PUBLISH_SIGNATURE).expect("ASCII domain"),
+            ),
+            (
+                "key_package_claim_receipt",
+                std::str::from_utf8(CLAIM_RECEIPT).expect("ASCII domain"),
+            ),
+            (
+                "recovery_scope",
+                std::str::from_utf8(RECOVERY_SCOPE).expect("ASCII domain"),
+            ),
+            (
+                "recipient_package",
+                std::str::from_utf8(RECIPIENT_PACKAGE).expect("ASCII domain"),
+            ),
+            (
+                "grant_provider_signature",
+                std::str::from_utf8(PROVIDER_SIGNATURE).expect("ASCII domain"),
+            ),
+            (
+                "grant_authority_signature",
+                std::str::from_utf8(AUTHORITY_SIGNATURE).expect("ASCII domain"),
+            ),
+            (
+                "grant_digest",
+                std::str::from_utf8(GRANT_DIGEST).expect("ASCII domain"),
+            ),
+            (
+                "offer_digest",
+                std::str::from_utf8(OFFER_DIGEST).expect("ASCII domain"),
+            ),
+            (
+                "mailbox_receipt",
+                std::str::from_utf8(MAILBOX_RECEIPT).expect("ASCII domain"),
+            ),
+        ],
+        "History Recovery V1 domains",
+    )?;
+    validate_history_recovery_openapi(root, &vector)?;
+
+    let candidate_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "candidate_public_key_hex")?)?;
+    let provider_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "provider_public_key_hex")?)?;
+    let authority_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "authority_public_key_hex")?)?;
+    if candidate_key == provider_key
+        || candidate_key == authority_key
+        || provider_key == authority_key
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 candidate, provider, and authority keys must be independent",
+        ));
+    }
+
+    let request = v40_json_field(&vector, "request", "History Recovery V1 vector")?;
+    require_exact_object_keys(
+        request,
+        &[
+            "unsigned_cbor_hex",
+            "signed_cbor_hex",
+            "capability_request_cbor_hex",
+            "request_digest_hex",
+            "capability_digest_hex",
+        ],
+        "History Recovery V1 request",
+    )?;
+    let (unsigned_request_bytes, unsigned_request) = v40_decode_exact_cddl(
+        "history-recovery-unsigned-request-v1",
+        &cddl,
+        json_string(request, "unsigned_cbor_hex")?,
+        "History Recovery V1 unsigned request",
+    )?;
+    let (signed_request_bytes, signed_request) = v40_decode_exact_cddl(
+        "history-recovery-signed-request-v1",
+        &cddl,
+        json_string(request, "signed_cbor_hex")?,
+        "History Recovery V1 signed request",
+    )?;
+    let (_, capability_request) = v40_decode_exact_cddl(
+        "history-recovery-request-v1",
+        &cddl,
+        json_string(request, "capability_request_cbor_hex")?,
+        "History Recovery V1 capability request",
+    )?;
+    let unsigned_fields = v40_numbered_fields(&unsigned_request, 11, "history unsigned request")?;
+    let signed_fields = v40_numbered_fields(&signed_request, 12, "history signed request")?;
+    let capability_fields =
+        v40_numbered_fields(&capability_request, 13, "history capability request")?;
+    if unsigned_fields != signed_fields[..11] || signed_fields != capability_fields[..12] {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 signed/capability request fields do not preserve the exact unsigned request",
+        ));
+    }
+    let identity_id = v40_text(unsigned_fields[2], "history request identity")?;
+    validate_identity_id(identity_id, "History Recovery V1 request identity")?;
+    for (field, label) in [
+        (unsigned_fields[1], "request_id"),
+        (unsigned_fields[3], "candidate_device_id"),
+    ] {
+        validate_uuid_v7(v40_text(field, label)?)?;
+    }
+    if v40_fixed_bytes::<32>(unsigned_fields[4], "history candidate public key")? != candidate_key
+        || v40_fixed_bytes::<32>(unsigned_fields[5], "history recipient key")? == candidate_key
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 candidate key linkage or key separation drift",
+        ));
+    }
+    if v40_unsigned(unsigned_fields[9], "history issued_at")?
+        >= v40_unsigned(unsigned_fields[10], "history expires_at")?
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 request validity window is not increasing",
+        ));
+    }
+    let request_signature =
+        v40_fixed_bytes::<64>(signed_fields[11], "history candidate signature")?;
+    let mut request_signature_input = REQUEST_SIGNATURE.to_vec();
+    request_signature_input.extend_from_slice(&unsigned_request_bytes);
+    v40_verify_signature(
+        candidate_key,
+        &request_signature_input,
+        request_signature,
+        "History Recovery V1 candidate request",
+    )?;
+    let request_digest = v40_digest(REQUEST_DIGEST, &signed_request_bytes);
+    v40_require_json_digest(
+        request,
+        "request_digest_hex",
+        request_digest,
+        "history request",
+    )?;
+    let capability = v40_fixed_bytes::<32>(capability_fields[12], "history capability")?;
+    if capability.iter().all(|byte| *byte == 0) {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 capability must be non-zero",
+        ));
+    }
+    v40_require_json_digest(
+        request,
+        "capability_digest_hex",
+        v40_digest(CAPABILITY_DIGEST, &capability),
+        "history capability",
+    )?;
+
+    let key_package = v40_json_field(&vector, "key_package", "History Recovery V1 vector")?;
+    require_exact_object_keys(
+        key_package,
+        &[
+            "scope_cbor_hex",
+            "scope_digest_hex",
+            "opaque_key_package_hex",
+            "package_digest_hex",
+            "publish_binding_cbor_hex",
+            "publish_binding_digest_hex",
+            "publish_cbor_hex",
+            "claim_cbor_hex",
+        ],
+        "History Recovery V1 key package",
+    )?;
+    let (scope_bytes, scope) = v40_decode_exact_cddl(
+        "recovery-scope",
+        &cddl,
+        json_string(key_package, "scope_cbor_hex")?,
+        "History Recovery V1 recovery scope",
+    )?;
+    let scope_fields = v40_numbered_fields(&scope, 2, "history recovery scope")?;
+    if v40_unsigned(scope_fields[0], "history scope kind")? != 1 {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 golden scope must be a private conversation",
+        ));
+    }
+    validate_uuid_v7(v40_text(scope_fields[1], "history scope id")?)?;
+    let scope_digest = v40_digest(RECOVERY_SCOPE, &scope_bytes);
+    v40_require_json_digest(
+        key_package,
+        "scope_digest_hex",
+        scope_digest,
+        "recovery scope",
+    )?;
+    let opaque_package = decode_hex(json_string(key_package, "opaque_key_package_hex")?)?;
+    if opaque_package.is_empty() || opaque_package.len() > 65_536 {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 opaque KeyPackage is outside its byte bound",
+        ));
+    }
+    let package_digest = v40_digest(PACKAGE_BYTES, &opaque_package);
+    v40_require_json_digest(
+        key_package,
+        "package_digest_hex",
+        package_digest,
+        "key package",
+    )?;
+    let (binding_bytes, binding) = v40_decode_exact_cddl(
+        "key-package-publish-binding-v1",
+        &cddl,
+        json_string(key_package, "publish_binding_cbor_hex")?,
+        "History Recovery V1 key package binding",
+    )?;
+    let (publish_bytes, publish) = v40_decode_exact_cddl(
+        "scoped-key-package-publish-v2",
+        &cddl,
+        json_string(key_package, "publish_cbor_hex")?,
+        "History Recovery V1 scoped package publish",
+    )?;
+    let (_, claim) = v40_decode_exact_cddl(
+        "scoped-key-package-claim-v2",
+        &cddl,
+        json_string(key_package, "claim_cbor_hex")?,
+        "History Recovery V1 scoped package claim",
+    )?;
+    let binding_fields = v40_numbered_fields(&binding, 8, "history key package binding")?;
+    let publish_fields = v40_numbered_fields(&publish, 12, "history key package publish")?;
+    let claim_fields = v40_numbered_fields(&claim, 6, "history key package claim")?;
+    if v40_unsigned(binding_fields[0], "key package binding version")? != 1
+        || v40_unsigned(publish_fields[0], "key package publish version")? != 2
+        || binding_fields[1..7] != publish_fields[1..7]
+        || v40_fixed_bytes::<32>(binding_fields[7], "key package binding digest")? != package_digest
+        || v40_bytes(publish_fields[7], "key package bytes")? != opaque_package
+        || v40_fixed_bytes::<32>(publish_fields[9], "publish recovery request digest")?
+            != request_digest
+        || v40_fixed_bytes::<32>(publish_fields[10], "publish recovery scope digest")?
+            != scope_digest
+        || v40_unsigned(publish_fields[11], "publish purpose")? != 1
+        || v40_unsigned(publish_fields[4], "publish identity head sequence")?
+            != v40_unsigned(unsigned_fields[6], "request observed sequence")? + 1
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 package publish does not bind the request, scope, bytes, and approved sequence",
+        ));
+    }
+    let binding_digest = v40_digest(PUBLISH_BINDING, &binding_bytes);
+    v40_require_json_digest(
+        key_package,
+        "publish_binding_digest_hex",
+        binding_digest,
+        "key package publish binding",
+    )?;
+    let mut publish_signature_input = PUBLISH_SIGNATURE.to_vec();
+    publish_signature_input.extend_from_slice(&binding_digest);
+    publish_signature_input.extend_from_slice(&request_digest);
+    publish_signature_input.extend_from_slice(&scope_digest);
+    publish_signature_input.extend_from_slice(b"history_recovery");
+    v40_verify_signature(
+        candidate_key,
+        &publish_signature_input,
+        v40_fixed_bytes::<64>(publish_fields[8], "key package publish signature")?,
+        "History Recovery V1 key package publish",
+    )?;
+    if claim_fields[1] != publish_fields[1]
+        || claim_fields[2] != publish_fields[2]
+        || v40_fixed_bytes::<32>(claim_fields[3], "claim recovery request digest")?
+            != request_digest
+        || v40_fixed_bytes::<32>(claim_fields[4], "claim recovery scope digest")? != scope_digest
+        || v40_unsigned(claim_fields[5], "claim purpose")? != 1
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 package claim escaped the exact request/scope/purpose",
+        ));
+    }
+
+    let grant = v40_json_field(&vector, "grant", "History Recovery V1 vector")?;
+    require_exact_object_keys(
+        grant,
+        &[
+            "unsigned_cbor_hex",
+            "signed_cbor_hex",
+            "grant_digest_hex",
+            "opaque_offer_hex",
+            "offer_digest_hex",
+            "recipient_key_hex",
+            "recipient_package_digest_hex",
+            "idempotency_key_hash_hex",
+            "receipt_cbor_hex",
+            "receipt_digest_hex",
+        ],
+        "History Recovery V1 grant",
+    )?;
+    let (unsigned_grant_bytes, unsigned_grant) = v40_decode_exact_cddl(
+        "device-history-grant-unsigned-v2",
+        &cddl,
+        json_string(grant, "unsigned_cbor_hex")?,
+        "History Recovery V1 unsigned grant",
+    )?;
+    let (signed_grant_bytes, signed_grant) = v40_decode_exact_cddl(
+        "device-history-grant-v2",
+        &cddl,
+        json_string(grant, "signed_cbor_hex")?,
+        "History Recovery V1 signed grant",
+    )?;
+    let (grant_receipt_bytes, grant_receipt) = v40_decode_exact_cddl(
+        "device-history-grant-receipt-v2",
+        &cddl,
+        json_string(grant, "receipt_cbor_hex")?,
+        "History Recovery V1 grant receipt",
+    )?;
+    let unsigned_grant_fields = v40_numbered_fields(&unsigned_grant, 19, "history unsigned grant")?;
+    let signed_grant_fields = v40_numbered_fields(&signed_grant, 22, "history signed grant")?;
+    let grant_receipt_fields = v40_numbered_fields(&grant_receipt, 5, "history grant receipt")?;
+    if unsigned_grant_fields != signed_grant_fields[..19]
+        || signed_grant_fields[1] != unsigned_fields[2]
+        || signed_grant_fields[2] != unsigned_fields[1]
+        || v40_fixed_bytes::<32>(signed_grant_fields[3], "grant request digest")? != request_digest
+        || signed_grant_fields[4] != publish_fields[5]
+        || signed_grant_fields[5] != unsigned_fields[3]
+        || v40_unsigned(signed_grant_fields[7], "grant authority kind")? != 1
+        || signed_grant_fields[6] == signed_grant_fields[5]
+        || signed_grant_fields[8] == signed_grant_fields[6]
+        || signed_grant_fields[8] == signed_grant_fields[5]
+        || v40_unsigned(signed_grant_fields[12], "grant earliest sequence")?
+            != v40_unsigned(signed_grant_fields[11], "grant highwater")? + 1
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 grant identity, request, head, independence, or H+1 linkage drift",
+        ));
+    }
+    for (field, label) in [
+        (signed_grant_fields[2], "grant request_id"),
+        (signed_grant_fields[5], "grant candidate_device_id"),
+        (signed_grant_fields[6], "grant provider_device_id"),
+        (signed_grant_fields[8], "grant authority_id"),
+        (signed_grant_fields[9], "grant mailbox_id"),
+        (signed_grant_fields[10], "grant envelope_id"),
+    ] {
+        validate_uuid_v7(v40_text(field, label)?)?;
+    }
+    let recipient_key = decode_lower_hex_fixed::<32>(json_string(grant, "recipient_key_hex")?)?;
+    if recipient_key != v40_fixed_bytes::<32>(unsigned_fields[5], "history request recipient key")?
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 grant recipient key is not the candidate request key",
+        ));
+    }
+    let recipient_package_digest = v40_digest(RECIPIENT_PACKAGE, &recipient_key);
+    v40_require_json_digest(
+        grant,
+        "recipient_package_digest_hex",
+        recipient_package_digest,
+        "history recipient package",
+    )?;
+    if v40_fixed_bytes::<32>(signed_grant_fields[13], "grant recipient package digest")?
+        != recipient_package_digest
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 grant recipient-package linkage drift",
+        ));
+    }
+    let offer = decode_hex(json_string(grant, "opaque_offer_hex")?)?;
+    if offer.is_empty()
+        || offer.len() > 262_144
+        || v40_bytes(signed_grant_fields[21], "history opaque offer")? != offer
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 opaque offer byte linkage drift",
+        ));
+    }
+    let offer_digest = v40_digest(OFFER_DIGEST, &offer);
+    v40_require_json_digest(grant, "offer_digest_hex", offer_digest, "history offer")?;
+    if v40_fixed_bytes::<32>(signed_grant_fields[15], "grant offer digest")? != offer_digest
+        || v40_fixed_bytes::<32>(signed_grant_fields[18], "grant idempotency digest")?
+            != decode_lower_hex_fixed::<32>(json_string(grant, "idempotency_key_hash_hex")?)?
+        || v40_unsigned(signed_grant_fields[16], "grant issued_at")?
+            >= v40_unsigned(signed_grant_fields[17], "grant expires_at")?
+        || v40_unsigned(signed_grant_fields[17], "grant expires_at")?
+            > v40_unsigned(unsigned_fields[10], "history request expires_at")?
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 offer, idempotency, or expiry linkage drift",
+        ));
+    }
+    for (key, domain, signature_field, label) in [
+        (
+            provider_key,
+            PROVIDER_SIGNATURE,
+            signed_grant_fields[19],
+            "provider",
+        ),
+        (
+            authority_key,
+            AUTHORITY_SIGNATURE,
+            signed_grant_fields[20],
+            "authority",
+        ),
+    ] {
+        let mut input = domain.to_vec();
+        input.extend_from_slice(&unsigned_grant_bytes);
+        v40_verify_signature(
+            key,
+            &input,
+            v40_fixed_bytes::<64>(signature_field, "history grant signature")?,
+            &format!("History Recovery V1 {label} grant"),
+        )?;
+    }
+    let grant_digest = v40_digest(GRANT_DIGEST, &signed_grant_bytes);
+    v40_require_json_digest(grant, "grant_digest_hex", grant_digest, "history grant")?;
+    if grant_receipt_fields[1] != signed_grant_fields[9]
+        || grant_receipt_fields[2] != signed_grant_fields[10]
+        || v40_unsigned(grant_receipt_fields[3], "grant receipt mailbox sequence")? == 0
+        || grant_receipt_fields[4] != signed_grant_fields[17]
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 grant receipt does not bind mailbox, envelope, sequence, and expiry",
+        ));
+    }
+    v40_require_json_digest(
+        grant,
+        "receipt_digest_hex",
+        v40_digest(MAILBOX_RECEIPT, &grant_receipt_bytes),
+        "history grant receipt",
+    )?;
+
+    let authorization = v40_json_field(
+        &vector,
+        "mls_v5_authorization",
+        "History Recovery V1 vector",
+    )?;
+    require_exact_object_keys(
+        authorization,
+        &[
+            "canonical_query",
+            "response_cbor_hex",
+            "expires_at_ms",
+            "portable",
+        ],
+        "History Recovery V1 MLS V5 authorization",
+    )?;
+    let (_, projection) = v40_decode_exact_cddl(
+        "mls-v5-recovery-authorization-v1",
+        &cddl,
+        json_string(authorization, "response_cbor_hex")?,
+        "History Recovery V1 MLS V5 authorization projection",
+    )?;
+    let projection_fields = v40_numbered_fields(&projection, 16, "MLS V5 recovery authorization")?;
+    let identity_head_digest =
+        v40_fixed_bytes::<32>(signed_grant_fields[4], "authorization identity head")?;
+    let attachment_digest =
+        v40_fixed_bytes::<32>(signed_grant_fields[14], "authorization attachment")?;
+    let claim_receipt_digest = v40_digest(CLAIM_RECEIPT, &publish_bytes);
+    let authorization_expires_at = v40_unsigned(signed_grant_fields[17], "authorization expiry")?;
+    if v40_unsigned(projection_fields[0], "authorization version")? != 1
+        || projection_fields[1] != unsigned_fields[2]
+        || projection_fields[2] != unsigned_fields[1]
+        || projection_fields[3] != unsigned_fields[3]
+        || projection_fields[4] != signed_grant_fields[6]
+        || v40_fixed_bytes::<32>(projection_fields[5], "authorization identity head")?
+            != identity_head_digest
+        || v40_fixed_bytes::<32>(projection_fields[6], "authorization package")? != package_digest
+        || v40_fixed_bytes::<32>(projection_fields[7], "authorization request")? != request_digest
+        || v40_fixed_bytes::<32>(projection_fields[8], "authorization scope")? != scope_digest
+        || projection_fields[9] != signed_grant_fields[6]
+        || projection_fields[10] != signed_grant_fields[7]
+        || projection_fields[11] != signed_grant_fields[8]
+        || v40_fixed_bytes::<32>(projection_fields[12], "authorization grant")? != grant_digest
+        || v40_fixed_bytes::<32>(projection_fields[13], "authorization attachment")?
+            != attachment_digest
+        || v40_fixed_bytes::<32>(projection_fields[14], "authorization claim receipt")?
+            != claim_receipt_digest
+        || v40_unsigned(projection_fields[15], "authorization expiry")? != authorization_expires_at
+        || authorization.get("expires_at_ms").and_then(Value::as_u64)
+            != Some(authorization_expires_at)
+        || authorization.get("portable").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 MLS V5 authorization projection escaped its exact current request/head/package/grant bindings",
+        ));
+    }
+    let expected_query = format!(
+        "candidate_device_id={}&controller_device_id={}&identity_head_digest={}&key_package_digest={}&recovery_request_digest={}&recovery_scope_digest={}",
+        v40_text(unsigned_fields[3], "authorization candidate")?,
+        v40_text(signed_grant_fields[6], "authorization controller")?,
+        lowercase_hex(&identity_head_digest),
+        lowercase_hex(&package_digest),
+        lowercase_hex(&request_digest),
+        lowercase_hex(&scope_digest),
+    );
+    if json_string(authorization, "canonical_query")? != expected_query {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 MLS V5 authorization canonical query order or digest linkage drifted",
+        ));
+    }
+
+    let pull = v40_json_field(&vector, "pull_v3", "History Recovery V1 vector")?;
+    require_exact_object_keys(
+        pull,
+        &["request_cbor_hex", "receipt_cbor_hex"],
+        "History Recovery V1 Pull V3",
+    )?;
+    let (_, pull_request) = v40_decode_exact_cddl(
+        "identity-mailbox-pull-v3",
+        &cddl,
+        json_string(pull, "request_cbor_hex")?,
+        "History Recovery V1 Pull V3 request",
+    )?;
+    let (_, pull_receipt) = v40_decode_exact_cddl(
+        "identity-mailbox-pull-receipt-v3",
+        &cddl,
+        json_string(pull, "receipt_cbor_hex")?,
+        "History Recovery V1 Pull V3 receipt",
+    )?;
+    let pull_request_fields = v40_numbered_fields(&pull_request, 3, "history pull request")?;
+    let pull_receipt_fields = v40_numbered_fields(&pull_receipt, 6, "history pull receipt")?;
+    let highwater = v40_unsigned(signed_grant_fields[11], "grant highwater")?;
+    let earliest = v40_unsigned(signed_grant_fields[12], "grant earliest sequence")?;
+    if v40_unsigned(pull_request_fields[1], "pull after_sequence")? != highwater
+        || pull_receipt_fields[1] != signed_grant_fields[1]
+        || pull_receipt_fields[2] != signed_grant_fields[5]
+        || v40_unsigned(pull_receipt_fields[3], "pull highwater")? != earliest
+        || v40_unsigned(pull_receipt_fields[4], "pull floor")? != highwater
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 Pull V3 request/receipt cursor linkage drift",
+        ));
+    }
+    let segments = v40_array(pull_receipt_fields[5], "history pull segments")?;
+    if segments.len() != 1 {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 Pull V3 golden receipt must contain one live segment",
+        ));
+    }
+    let live = v40_numbered_fields(&segments[0], 5, "history live segment")?;
+    if v40_unsigned(live[0], "history segment kind")? != 1
+        || v40_unsigned(live[1], "history segment sequence")? != earliest
+        || live[2] != signed_grant_fields[10]
+        || v40_bytes(live[3], "history segment envelope")? != offer
+        || live[4] != signed_grant_fields[17]
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 live segment does not bind the exact H+1 offer envelope",
+        ));
+    }
+
+    validate_history_recovery_invalid_vectors(&vector, &cddl)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact V40 history route, operation, request, and response media matrix is explicit"
+)]
+fn validate_history_recovery_openapi(root: &Path, vector: &Value) -> Result<(), ProtocolToolError> {
+    let path = root.join("protocol/openapi/history-recovery/v1/openapi.yaml");
+    let source = read(&path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse History Recovery V1 OpenAPI: {error}"))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 OpenAPI must declare 3.1.0",
+        ));
+    }
+    let document: Value = yaml_serde::from_str(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse History Recovery V1 OpenAPI tree: {error}"))
+    })?;
+    require_exact_object_keys(
+        document.pointer("/paths").ok_or_else(|| {
+            ProtocolToolError::new("History Recovery V1 OpenAPI is missing paths")
+        })?,
+        &[
+            "/v1/devices/enroll/challenges",
+            "/v1/identities/{identity_id}/history-recovery-requests/{request_id}/mls-v5-authorization",
+            "/v1/key-packages/{package_id}",
+            "/v1/key-packages/claim",
+            "/v3/devices/history-grants",
+            "/v2/mailbox/pull",
+        ],
+        "History Recovery V1 OpenAPI paths",
+    )?;
+    for (pointer, methods) in [
+        ("/paths/~1v1~1devices~1enroll~1challenges", &["post"][..]),
+        (
+            "/paths/~1v1~1identities~1{identity_id}~1history-recovery-requests~1{request_id}~1mls-v5-authorization",
+            &["get"][..],
+        ),
+        ("/paths/~1v1~1key-packages~1{package_id}", &["put"][..]),
+        ("/paths/~1v1~1key-packages~1claim", &["post"][..]),
+        ("/paths/~1v3~1devices~1history-grants", &["post"][..]),
+        ("/paths/~1v2~1mailbox~1pull", &["post"][..]),
+    ] {
+        require_exact_object_keys(
+            document.pointer(pointer).ok_or_else(|| {
+                ProtocolToolError::new(format!(
+                    "History Recovery V1 OpenAPI is missing route at {pointer}"
+                ))
+            })?,
+            methods,
+            &format!("History Recovery V1 OpenAPI route at {pointer}"),
+        )?;
+    }
+    for (pointer, operation_id) in [
+        (
+            "/paths/~1v1~1devices~1enroll~1challenges/post/operationId",
+            "createHistoryRecoveryChallengeV1",
+        ),
+        (
+            "/paths/~1v1~1identities~1{identity_id}~1history-recovery-requests~1{request_id}~1mls-v5-authorization/get/operationId",
+            "getMlsV5RecoveryAuthorizationV1",
+        ),
+        (
+            "/paths/~1v1~1key-packages~1{package_id}/put/operationId",
+            "publishHistoryRecoveryKeyPackageV2",
+        ),
+        (
+            "/paths/~1v1~1key-packages~1claim/post/operationId",
+            "claimHistoryRecoveryKeyPackageV2",
+        ),
+        (
+            "/paths/~1v3~1devices~1history-grants/post/operationId",
+            "grantDeviceHistoryV2",
+        ),
+        (
+            "/paths/~1v2~1mailbox~1pull/post/operationId",
+            "pullIdentityMailboxV3",
+        ),
+    ] {
+        if document.pointer(pointer).and_then(Value::as_str) != Some(operation_id) {
+            return Err(ProtocolToolError::new(format!(
+                "History Recovery V1 OpenAPI operation drift at {pointer}"
+            )));
+        }
+    }
+    let media = v40_json_field(vector, "media_types", "History Recovery V1 vector")?;
+    for (pointer, field) in [
+        (
+            "/paths/~1v1~1devices~1enroll~1challenges/post/requestBody/content",
+            "enroll_request",
+        ),
+        (
+            "/components/responses/EnrollmentStatus/content",
+            "enroll_status",
+        ),
+        (
+            "/paths/~1v1~1key-packages~1{package_id}/put/requestBody/content",
+            "key_package_publish",
+        ),
+        (
+            "/components/responses/KeyPackagePublishReceipt/content",
+            "key_package_publish_receipt",
+        ),
+        (
+            "/paths/~1v1~1key-packages~1claim/post/requestBody/content",
+            "key_package_claim",
+        ),
+        (
+            "/components/responses/KeyPackageClaimReceipt/content",
+            "key_package_claim_receipt",
+        ),
+        (
+            "/paths/~1v3~1devices~1history-grants/post/requestBody/content",
+            "history_grant",
+        ),
+        (
+            "/components/responses/HistoryGrantReceiptV2/content",
+            "history_grant_receipt",
+        ),
+        (
+            "/components/responses/MlsV5RecoveryAuthorization/content",
+            "mls_v5_authorization",
+        ),
+        (
+            "/paths/~1v2~1mailbox~1pull/post/requestBody/content",
+            "pull",
+        ),
+        (
+            "/components/responses/IdentityPullReceiptV3/content",
+            "pull_receipt",
+        ),
+    ] {
+        v40_validate_exact_cbor_content(
+            &document,
+            pointer,
+            json_string(media, field)?,
+            "History Recovery V1 OpenAPI",
+        )?;
+    }
+    for (pointer, response) in [
+        (
+            "/paths/~1v1~1devices~1enroll~1challenges/post/responses/201/$ref",
+            "EnrollmentStatus",
+        ),
+        (
+            "/paths/~1v1~1devices~1enroll~1challenges/post/responses/200/$ref",
+            "EnrollmentStatus",
+        ),
+        (
+            "/paths/~1v1~1identities~1{identity_id}~1history-recovery-requests~1{request_id}~1mls-v5-authorization/get/responses/200/$ref",
+            "MlsV5RecoveryAuthorization",
+        ),
+        (
+            "/paths/~1v1~1key-packages~1{package_id}/put/responses/201/$ref",
+            "KeyPackagePublishReceipt",
+        ),
+        (
+            "/paths/~1v1~1key-packages~1{package_id}/put/responses/200/$ref",
+            "KeyPackagePublishReceipt",
+        ),
+        (
+            "/paths/~1v1~1key-packages~1claim/post/responses/201/$ref",
+            "KeyPackageClaimReceipt",
+        ),
+        (
+            "/paths/~1v1~1key-packages~1claim/post/responses/200/$ref",
+            "KeyPackageClaimReceipt",
+        ),
+        (
+            "/paths/~1v3~1devices~1history-grants/post/responses/201/$ref",
+            "HistoryGrantReceiptV2",
+        ),
+        (
+            "/paths/~1v3~1devices~1history-grants/post/responses/200/$ref",
+            "HistoryGrantReceiptV2",
+        ),
+        (
+            "/paths/~1v2~1mailbox~1pull/post/responses/200/$ref",
+            "IdentityPullReceiptV3",
+        ),
+    ] {
+        let expected = format!("#/components/responses/{response}");
+        if document.pointer(pointer).and_then(Value::as_str) != Some(expected.as_str()) {
+            return Err(ProtocolToolError::new(format!(
+                "History Recovery V1 OpenAPI response linkage drift at {pointer}"
+            )));
+        }
+    }
+    let authorization_parameters = document
+        .pointer(
+            "/paths/~1v1~1identities~1{identity_id}~1history-recovery-requests~1{request_id}~1mls-v5-authorization/get/parameters",
+        )
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "History Recovery V1 authorization route is missing exact parameters",
+            )
+        })?;
+    let expected_parameters = [
+        "#/components/parameters/IdentityId",
+        "#/components/parameters/RecoveryRequestId",
+        "#/components/parameters/CandidateDeviceId",
+        "#/components/parameters/ControllerDeviceId",
+        "#/components/parameters/IdentityHeadDigest",
+        "#/components/parameters/KeyPackageDigest",
+        "#/components/parameters/RecoveryRequestDigest",
+        "#/components/parameters/RecoveryScopeDigest",
+        "#/components/parameters/MlsV5AuthorizationAccept",
+    ];
+    if authorization_parameters.len() != expected_parameters.len()
+        || authorization_parameters
+            .iter()
+            .zip(expected_parameters)
+            .any(|(actual, expected)| actual.get("$ref").and_then(Value::as_str) != Some(expected))
+        || document
+            .pointer(
+                "/paths/~1v1~1identities~1{identity_id}~1history-recovery-requests~1{request_id}~1mls-v5-authorization/get/x-dirextalk-non-portable-origin-fact",
+            )
+            .and_then(Value::as_bool)
+            != Some(true)
+        || document
+            .pointer(
+                "/components/responses/MlsV5RecoveryAuthorization/headers/Cache-Control/schema/const",
+            )
+            .and_then(Value::as_str)
+            != Some("no-store")
+        || document
+            .pointer(
+                "/components/responses/MlsV5RecoveryAuthorization/headers/X-Content-Type-Options/schema/const",
+            )
+            .and_then(Value::as_str)
+            != Some("nosniff")
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 authorization route parameters or non-cacheable origin semantics drifted",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_history_recovery_invalid_vectors(
+    vector: &Value,
+    cddl: &str,
+) -> Result<(), ProtocolToolError> {
+    let invalid = v40_json_array_field(vector, "invalid_cbor", "History Recovery V1 vector")?;
+    let expected = [
+        "noncanonical_integer",
+        "missing_signed_request_field",
+        "unknown_claim_field",
+        "grant_h_plus_one_mismatch",
+    ];
+    if invalid.len() != expected.len()
+        || invalid
+            .iter()
+            .filter_map(|item| item.get("label").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>()
+            != expected.into_iter().collect::<BTreeSet<_>>()
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V1 invalid specimen family drift",
+        ));
+    }
+    for item in invalid {
+        require_exact_object_keys(
+            item,
+            &["label", "rule", "cbor_hex"],
+            "History Recovery V1 invalid specimen",
+        )?;
+        let label = json_string(item, "label")?;
+        let rule = json_string(item, "rule")?;
+        let encoded = json_string(item, "cbor_hex")?;
+        let expected_rule = match label {
+            "noncanonical_integer" => "history-recovery-request-v1",
+            "missing_signed_request_field" => "history-recovery-signed-request-v1",
+            "unknown_claim_field" => "scoped-key-package-claim-v2",
+            "grant_h_plus_one_mismatch" => "device-history-grant-v2",
+            _ => unreachable!("invalid labels were checked above"),
+        };
+        if rule != expected_rule {
+            return Err(ProtocolToolError::new(format!(
+                "History Recovery V1 invalid specimen {label} must target {expected_rule}"
+            )));
+        }
+        let bytes = decode_hex(encoded)?;
+        match label {
+            "noncanonical_integer" => {
+                if decode_deterministic_cbor(&bytes).is_ok() {
+                    return Err(ProtocolToolError::new(
+                        "History Recovery V1 noncanonical integer was accepted",
+                    ));
+                }
+            }
+            "missing_signed_request_field" | "unknown_claim_field" => {
+                v40_decode_exact(encoded, label)?;
+                if cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).is_ok() {
+                    return Err(ProtocolToolError::new(format!(
+                        "History Recovery V1 CDDL accepted invalid specimen {label}"
+                    )));
+                }
+            }
+            "grant_h_plus_one_mismatch" => {
+                let value = v40_decode_exact(encoded, label)?.1;
+                cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).map_err(|error| {
+                    ProtocolToolError::new(format!(
+                        "History Recovery V1 structural H+1 specimen must pass CDDL: {error}"
+                    ))
+                })?;
+                let fields = v40_numbered_fields(&value, 22, "invalid history grant")?;
+                if v40_unsigned(fields[12], "invalid earliest sequence")?
+                    == v40_unsigned(fields[11], "invalid highwater")? + 1
+                {
+                    return Err(ProtocolToolError::new(
+                        "History Recovery V1 H+1 specimen is not actually invalid",
+                    ));
+                }
+            }
+            _ => unreachable!("invalid labels were checked above"),
+        }
+    }
+    Ok(())
+}
+
+fn v40_json_field<'a>(
+    value: &'a Value,
+    field: &str,
+    label: &str,
+) -> Result<&'a Value, ProtocolToolError> {
+    value
+        .get(field)
+        .ok_or_else(|| ProtocolToolError::new(format!("{label} is missing {field}")))
+}
+
+fn v40_json_array_field<'a>(
+    value: &'a Value,
+    field: &str,
+    label: &str,
+) -> Result<&'a [Value], ProtocolToolError> {
+    v40_json_field(value, field, label)?
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| ProtocolToolError::new(format!("{label} {field} must be an array")))
+}
+
+fn v40_require_string_map(
+    value: &Value,
+    expected: &[(&str, &str)],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    require_exact_object_keys(
+        value,
+        &expected.iter().map(|(field, _)| *field).collect::<Vec<_>>(),
+        label,
+    )?;
+    for (field, expected_value) in expected {
+        if value.get(*field).and_then(Value::as_str) != Some(*expected_value) {
+            return Err(ProtocolToolError::new(format!("{label} {field} drifted")));
+        }
+    }
+    Ok(())
+}
+
+fn v40_decode_exact_cddl(
+    rule: &str,
+    cddl: &str,
+    encoded: &str,
+    label: &str,
+) -> Result<(Vec<u8>, CanonicalValue), ProtocolToolError> {
+    let (bytes, value) = v40_decode_exact(encoded, label)?;
+    cddl_cat::validate_cbor_bytes(rule, cddl, &bytes)
+        .map_err(|error| ProtocolToolError::new(format!("CDDL rejected {label}: {error}")))?;
+    Ok((bytes, value))
+}
+
+fn v40_decode_exact(
+    encoded: &str,
+    label: &str,
+) -> Result<(Vec<u8>, CanonicalValue), ProtocolToolError> {
+    let bytes = decode_hex(encoded)?;
+    let value = v40_decode_exact_bytes(&bytes, label)?;
+    Ok((bytes, value))
+}
+
+fn v40_decode_exact_bytes(bytes: &[u8], label: &str) -> Result<CanonicalValue, ProtocolToolError> {
+    let value = decode_deterministic_cbor(bytes).map_err(|error| {
+        ProtocolToolError::new(format!("{label} is not deterministic CBOR: {error}"))
+    })?;
+    let reencoded = encode_deterministic_cbor(&value)
+        .map_err(|error| ProtocolToolError::new(format!("re-encode {label}: {error}")))?;
+    if reencoded != bytes {
+        return Err(ProtocolToolError::new(format!(
+            "{label} changed under exact canonical re-encoding"
+        )));
+    }
+    Ok(value)
+}
+
+fn v40_numbered_fields<'a>(
+    value: &'a CanonicalValue,
+    expected_len: usize,
+    label: &str,
+) -> Result<Vec<&'a CanonicalValue>, ProtocolToolError> {
+    let CanonicalValue::Map(entries) = value else {
+        return Err(ProtocolToolError::new(format!(
+            "{label} must be a numbered map"
+        )));
+    };
+    if entries.len() != expected_len {
+        return Err(ProtocolToolError::new(format!(
+            "{label} field count drifted"
+        )));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, (key, value))| {
+            let expected = u64::try_from(index + 1).expect("V40 field count is bounded");
+            if key == &CanonicalValue::Unsigned(expected) {
+                Ok(value)
+            } else {
+                Err(ProtocolToolError::new(format!(
+                    "{label} has an unknown, missing, or out-of-order field"
+                )))
+            }
+        })
+        .collect()
+}
+
+fn v40_unsigned(value: &CanonicalValue, label: &str) -> Result<u64, ProtocolToolError> {
+    let CanonicalValue::Unsigned(value) = value else {
+        return Err(ProtocolToolError::new(format!("{label} must be unsigned")));
+    };
+    Ok(*value)
+}
+
+fn v40_text<'a>(value: &'a CanonicalValue, label: &str) -> Result<&'a str, ProtocolToolError> {
+    let CanonicalValue::Text(value) = value else {
+        return Err(ProtocolToolError::new(format!("{label} must be text")));
+    };
+    Ok(value)
+}
+
+fn v40_bytes<'a>(value: &'a CanonicalValue, label: &str) -> Result<&'a [u8], ProtocolToolError> {
+    let CanonicalValue::Bytes(value) = value else {
+        return Err(ProtocolToolError::new(format!("{label} must be bytes")));
+    };
+    Ok(value)
+}
+
+fn v40_fixed_bytes<const LENGTH: usize>(
+    value: &CanonicalValue,
+    label: &str,
+) -> Result<[u8; LENGTH], ProtocolToolError> {
+    v40_bytes(value, label)?
+        .try_into()
+        .map_err(|_| ProtocolToolError::new(format!("{label} must contain exactly {LENGTH} bytes")))
+}
+
+fn v40_array<'a>(
+    value: &'a CanonicalValue,
+    label: &str,
+) -> Result<&'a [CanonicalValue], ProtocolToolError> {
+    let CanonicalValue::Array(value) = value else {
+        return Err(ProtocolToolError::new(format!("{label} must be an array")));
+    };
+    Ok(value)
+}
+
+fn v40_digest(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn v40_require_json_digest(
+    value: &Value,
+    field: &str,
+    expected: [u8; 32],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    if decode_lower_hex_fixed::<32>(json_string(value, field)?)? == expected {
+        Ok(())
+    } else {
+        Err(ProtocolToolError::new(format!("{label} digest drift")))
+    }
+}
+
+fn v40_verify_signature(
+    public_key: [u8; 32],
+    input: &[u8],
+    signature: [u8; 64],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| ProtocolToolError::new(format!("{label} public key is invalid")))?
+        .verify_strict(input, &Signature::from_bytes(&signature))
+        .map_err(|_| ProtocolToolError::new(format!("{label} signature is invalid")))
+}
+
+fn v40_validate_exact_cbor_content(
+    document: &Value,
+    pointer: &str,
+    media_type: &str,
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    let content = document.pointer(pointer).ok_or_else(|| {
+        ProtocolToolError::new(format!("{label} is missing content at {pointer}"))
+    })?;
+    require_exact_object_keys(
+        content,
+        &[media_type],
+        &format!("{label} content at {pointer}"),
+    )?;
+    let media = content.get(media_type).ok_or_else(|| {
+        ProtocolToolError::new(format!("{label} is missing media type {media_type}"))
+    })?;
+    if media.get("x-dirextalk-exact-cbor").and_then(Value::as_bool) != Some(true)
+        || media.pointer("/schema/$ref").and_then(Value::as_str)
+            != Some("#/components/schemas/ExactCanonicalCbor")
+    {
+        return Err(ProtocolToolError::new(format!(
+            "{label} media type {media_type} must require exact canonical CBOR"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum V40MlsOperation {
+    RecoveryAdd,
+    DeviceRemove,
+}
+
+struct V40MlsOperationFacts {
+    scope: CanonicalValue,
+    actor_identity: String,
+    actor_device: String,
+    candidate_identity: String,
+    candidate_device: String,
+    parent_epoch: u64,
+    admitted_epoch: u64,
+    parent_head: [u8; 32],
+    result_head: [u8; 32],
+    commit_bytes: Vec<u8>,
+    signed_receipt_bytes: Vec<u8>,
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V40 protocol gate proves both V5 operations and the mixed-version feed"
+)]
+fn validate_mls_sequencer_v5(root: &Path) -> Result<(), ProtocolToolError> {
+    const COMMIT: &[u8] = b"dirextalk.mls-opaque-commit.v1\0";
+    const REQUEST: &[u8] = b"dirextalk.mls-commit-request.v5\0";
+    const HEAD: &[u8] = b"dirextalk.mls-sequencer-head.v1\0";
+    const RECEIPT_V3: &[u8] = b"dirextalk.mls-commit-receipt.v3\0";
+    const RECEIPT_V4: &[u8] = b"dirextalk.mls-commit-receipt.v4\0";
+    const RECEIPT_V5: &[u8] = b"dirextalk.mls-commit-receipt.v5\0";
+    const RECEIPT_SIGNATURE_V3: &[u8] = b"dirextalk.mls-commit-receipt-signature.v3\0";
+    const RECEIPT_SIGNATURE_V4: &[u8] = b"dirextalk.mls-commit-receipt-signature.v4\0";
+    const RECEIPT_SIGNATURE_V5: &[u8] = b"dirextalk.mls-commit-receipt-signature.v5\0";
+    const CONTROLLER_CONSENT: &[u8] = b"dirextalk.mls-recovery-controller-consent-digest.v5\0";
+    const CONTROLLER_SIGNATURE: &[u8] = b"dirextalk.mls-recovery-controller-consent-signature.v5\0";
+    const RECOVERY_SCOPE: &[u8] = b"dirextalk.mls-recovery-scope-digest.v5\0";
+
+    let cddl = read(&root.join("protocol/cddl/mls-sequencer/v5/mls-sequencer-v5.cddl"))?;
+    cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse MLS Sequencer V5 CDDL: {error}")))?;
+    let cddl_v3 = read(&root.join("protocol/cddl/mls-sequencer/v3/mls-sequencer-v3.cddl"))?;
+    let cddl_v4 = read(&root.join("protocol/cddl/mls-sequencer/v4/mls-sequencer-v4.cddl"))?;
+    let vector =
+        read_json(&root.join("protocol/test-vectors/mls-sequencer/v5/mls-sequencer-v5.json"))?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "baseline",
+            "media_types",
+            "domains",
+            "controller_public_key_hex",
+            "sequencer_public_key_hex",
+            "recovery_scope_cbor_hex",
+            "recovery_scope_digest_hex",
+            "recovery_request_digest_hex",
+            "key_package_digest_hex",
+            "recovery_add",
+            "device_remove",
+            "feed_v3",
+            "invalid_cbor",
+        ],
+        "MLS Sequencer V5 vector",
+    )?;
+    if vector.get("version").and_then(Value::as_u64) != Some(5)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(40)
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V5 vector version/baseline must be 5/40",
+        ));
+    }
+    v40_require_string_map(
+        v40_json_field(&vector, "media_types", "MLS Sequencer V5 vector")?,
+        &[
+            ("commit", "application/vnd.dirextalk.mls-commit.v5+cbor"),
+            (
+                "receipt",
+                "application/vnd.dirextalk.mls-commit-receipt.v5+cbor",
+            ),
+            ("feed", "application/vnd.dirextalk.mls-commit-feed.v3+cbor"),
+        ],
+        "MLS Sequencer V5 media types",
+    )?;
+    v40_require_string_map(
+        v40_json_field(&vector, "domains", "MLS Sequencer V5 vector")?,
+        &[
+            ("commit", std::str::from_utf8(COMMIT).expect("ASCII domain")),
+            (
+                "request",
+                std::str::from_utf8(REQUEST).expect("ASCII domain"),
+            ),
+            ("head", std::str::from_utf8(HEAD).expect("ASCII domain")),
+            (
+                "receipt_v3",
+                std::str::from_utf8(RECEIPT_V3).expect("ASCII domain"),
+            ),
+            (
+                "receipt_v4",
+                std::str::from_utf8(RECEIPT_V4).expect("ASCII domain"),
+            ),
+            (
+                "receipt_v5",
+                std::str::from_utf8(RECEIPT_V5).expect("ASCII domain"),
+            ),
+            (
+                "receipt_signature_v3",
+                std::str::from_utf8(RECEIPT_SIGNATURE_V3).expect("ASCII domain"),
+            ),
+            (
+                "receipt_signature_v4",
+                std::str::from_utf8(RECEIPT_SIGNATURE_V4).expect("ASCII domain"),
+            ),
+            (
+                "receipt_signature_v5",
+                std::str::from_utf8(RECEIPT_SIGNATURE_V5).expect("ASCII domain"),
+            ),
+            (
+                "controller_consent",
+                std::str::from_utf8(CONTROLLER_CONSENT).expect("ASCII domain"),
+            ),
+            (
+                "controller_signature",
+                std::str::from_utf8(CONTROLLER_SIGNATURE).expect("ASCII domain"),
+            ),
+            (
+                "recovery_scope",
+                std::str::from_utf8(RECOVERY_SCOPE).expect("ASCII domain"),
+            ),
+        ],
+        "MLS Sequencer V5 domains",
+    )?;
+    validate_mls_sequencer_v5_openapi(root, &vector)?;
+
+    let controller_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "controller_public_key_hex")?)?;
+    let sequencer_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "sequencer_public_key_hex")?)?;
+    if controller_key == sequencer_key {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V5 controller and sequencer keys must be independent",
+        ));
+    }
+    let (scope_bytes, scope) = v40_decode_exact_cddl(
+        "scope",
+        &cddl,
+        json_string(&vector, "recovery_scope_cbor_hex")?,
+        "MLS Sequencer V5 recovery scope",
+    )?;
+    let scope_digest = v40_digest(RECOVERY_SCOPE, &scope_bytes);
+    v40_require_json_digest(
+        &vector,
+        "recovery_scope_digest_hex",
+        scope_digest,
+        "MLS recovery scope",
+    )?;
+    let recovery_request_digest =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "recovery_request_digest_hex")?)?;
+    let key_package_digest =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "key_package_digest_hex")?)?;
+    if recovery_request_digest.iter().all(|byte| *byte == 0)
+        || scope_digest.iter().all(|byte| *byte == 0)
+        || key_package_digest.iter().all(|byte| *byte == 0)
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V5 recovery bindings must be non-zero",
+        ));
+    }
+    let history = read_json(
+        &root.join("protocol/test-vectors/history-recovery/v1/history-recovery-v1.json"),
+    )?;
+    let history_request = v40_json_field(&history, "request", "History Recovery V1 vector")?;
+    let history_package = v40_json_field(&history, "key_package", "History Recovery V1 vector")?;
+    if recovery_request_digest
+        != decode_lower_hex_fixed::<32>(json_string(history_request, "request_digest_hex")?)?
+        || scope_digest
+            != decode_lower_hex_fixed::<32>(json_string(history_package, "scope_digest_hex")?)?
+        || key_package_digest
+            != decode_lower_hex_fixed::<32>(json_string(history_package, "package_digest_hex")?)?
+        || json_string(&vector, "recovery_scope_cbor_hex")?
+            != json_string(history_package, "scope_cbor_hex")?
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V5 recovery request/scope/KeyPackage does not exactly cross-link History Recovery V1",
+        ));
+    }
+    let (_, history_signed_request) = v40_decode_exact(
+        json_string(history_request, "signed_cbor_hex")?,
+        "MLS cross-linked history request",
+    )?;
+    let history_request_fields =
+        v40_numbered_fields(&history_signed_request, 12, "cross-linked history request")?;
+    let recovery_request_id = v40_text(history_request_fields[1], "history recovery request id")?;
+
+    let add = validate_mls_v5_operation(
+        v40_json_field(&vector, "recovery_add", "MLS Sequencer V5 vector")?,
+        V40MlsOperation::RecoveryAdd,
+        &cddl,
+        &scope,
+        scope_digest,
+        recovery_request_digest,
+        recovery_request_id,
+        key_package_digest,
+        controller_key,
+        sequencer_key,
+    )?;
+    let remove = validate_mls_v5_operation(
+        v40_json_field(&vector, "device_remove", "MLS Sequencer V5 vector")?,
+        V40MlsOperation::DeviceRemove,
+        &cddl,
+        &scope,
+        scope_digest,
+        recovery_request_digest,
+        recovery_request_id,
+        key_package_digest,
+        controller_key,
+        sequencer_key,
+    )?;
+    if add.scope != remove.scope
+        || add.actor_identity != remove.actor_identity
+        || add.actor_device != remove.actor_device
+        || add.candidate_identity != remove.candidate_identity
+        || add.candidate_device != remove.candidate_device
+        || remove.parent_epoch != add.admitted_epoch
+        || remove.parent_head != add.result_head
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V5 removal must immediately follow the recovery add for the same identity/controller/leaf",
+        ));
+    }
+
+    validate_mls_v5_feed(
+        &vector,
+        &cddl_v3,
+        &cddl_v4,
+        &cddl,
+        &scope,
+        sequencer_key,
+        &add,
+    )?;
+    validate_mls_v5_invalid_vectors(&vector, &cddl_v3, &cddl_v4, &cddl, &scope, sequencer_key)?;
+    Ok(())
+}
+
+fn validate_mls_sequencer_v5_openapi(root: &Path, vector: &Value) -> Result<(), ProtocolToolError> {
+    let path = root.join("protocol/openapi/mls-sequencer/v5/openapi.yaml");
+    let source = read(&path)?;
+    let spec = oas3::from_yaml(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse MLS Sequencer V5 OpenAPI: {error}"))
+    })?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V5 OpenAPI must declare 3.1.0",
+        ));
+    }
+    let document: Value = yaml_serde::from_str(&source).map_err(|error| {
+        ProtocolToolError::new(format!("parse MLS Sequencer V5 OpenAPI tree: {error}"))
+    })?;
+    require_exact_object_keys(
+        document
+            .pointer("/paths")
+            .ok_or_else(|| ProtocolToolError::new("MLS Sequencer V5 OpenAPI is missing paths"))?,
+        &[
+            "/v1/groups/{scope_kind}/{scope_id}/mls-commits/{submission_id}",
+            "/v1/groups/{scope_kind}/{scope_id}/mls-commits",
+        ],
+        "MLS Sequencer V5 OpenAPI paths",
+    )?;
+    require_exact_object_keys(
+        document
+            .pointer("/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits~1{submission_id}")
+            .ok_or_else(|| ProtocolToolError::new("MLS Sequencer V5 item route is missing"))?,
+        &["post", "get"],
+        "MLS Sequencer V5 item route",
+    )?;
+    require_exact_object_keys(
+        document
+            .pointer("/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits")
+            .ok_or_else(|| ProtocolToolError::new("MLS Sequencer V5 feed route is missing"))?,
+        &["get"],
+        "MLS Sequencer V5 feed route",
+    )?;
+    for (pointer, operation_id) in [
+        (
+            "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits~1{submission_id}/post/operationId",
+            "submitMlsCommitV5",
+        ),
+        (
+            "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits~1{submission_id}/get/operationId",
+            "getMlsCommitItemV5",
+        ),
+        (
+            "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits/get/operationId",
+            "listMlsCommitFeedV3",
+        ),
+    ] {
+        if document.pointer(pointer).and_then(Value::as_str) != Some(operation_id) {
+            return Err(ProtocolToolError::new(format!(
+                "MLS Sequencer V5 OpenAPI operation drift at {pointer}"
+            )));
+        }
+    }
+    let media = v40_json_field(vector, "media_types", "MLS Sequencer V5 vector")?;
+    for (pointer, field) in [
+        (
+            "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits~1{submission_id}/post/requestBody/content",
+            "commit",
+        ),
+        (
+            "/components/responses/MlsCommitReceiptV5/content",
+            "receipt",
+        ),
+        (
+            "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits/get/responses/200/content",
+            "feed",
+        ),
+    ] {
+        v40_validate_exact_cbor_content(
+            &document,
+            pointer,
+            json_string(media, field)?,
+            "MLS Sequencer V5 OpenAPI",
+        )?;
+    }
+    for pointer in [
+        "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits~1{submission_id}/post/responses/201/$ref",
+        "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits~1{submission_id}/post/responses/200/$ref",
+        "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-commits~1{submission_id}/get/responses/200/$ref",
+    ] {
+        if document.pointer(pointer).and_then(Value::as_str)
+            != Some("#/components/responses/MlsCommitReceiptV5")
+        {
+            return Err(ProtocolToolError::new(format!(
+                "MLS Sequencer V5 OpenAPI receipt route linkage drift at {pointer}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one operation audit keeps request, controller consent, head, and signed receipt exact"
+)]
+fn validate_mls_v5_operation(
+    operation: &Value,
+    kind: V40MlsOperation,
+    cddl: &str,
+    expected_scope: &CanonicalValue,
+    recovery_scope_digest: [u8; 32],
+    recovery_request_digest: [u8; 32],
+    recovery_request_id: &str,
+    recovery_key_package_digest: [u8; 32],
+    controller_key: [u8; 32],
+    sequencer_key: [u8; 32],
+) -> Result<V40MlsOperationFacts, ProtocolToolError> {
+    const COMMIT_DOMAIN: &[u8] = b"dirextalk.mls-opaque-commit.v1\0";
+    const REQUEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-request.v5\0";
+    const HEAD_DOMAIN: &[u8] = b"dirextalk.mls-sequencer-head.v1\0";
+    const RECEIPT_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt.v5\0";
+    const RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt-signature.v5\0";
+    const CONTROLLER_DOMAIN: &[u8] = b"dirextalk.mls-recovery-controller-consent-digest.v5\0";
+    const CONTROLLER_SIGNATURE_DOMAIN: &[u8] =
+        b"dirextalk.mls-recovery-controller-consent-signature.v5\0";
+    const ZERO: [u8; 32] = [0; 32];
+
+    let (name, request_rule, transcript_rule, controller_rule, receipt_rule) = match kind {
+        V40MlsOperation::RecoveryAdd => (
+            "recovery add",
+            "mls-recovery-add-request-v5",
+            "mls-recovery-add-request-digest-transcript-v5",
+            "mls-recovery-add-controller-transcript-v5",
+            "mls-recovery-add-receipt-v5",
+        ),
+        V40MlsOperation::DeviceRemove => (
+            "device remove",
+            "mls-device-remove-request-v5",
+            "mls-device-remove-request-digest-transcript-v5",
+            "mls-device-remove-controller-transcript-v5",
+            "mls-device-remove-receipt-v5",
+        ),
+    };
+    let expected_keys: &[&str] = match kind {
+        V40MlsOperation::RecoveryAdd => &[
+            "request_cbor_hex",
+            "request_digest_transcript_cbor_hex",
+            "request_digest_hex",
+            "controller_transcript_cbor_hex",
+            "controller_consent_digest_hex",
+            "controller_signature_hex",
+            "idempotency_key_hash_hex",
+            "commit_bytes_hex",
+            "commit_digest_hex",
+            "welcome_digest_hex",
+            "head_transcript_cbor_hex",
+            "result_head_digest_hex",
+            "receipt_inner_cbor_hex",
+            "receipt_digest_hex",
+            "receipt_signature_hex",
+            "signed_receipt_cbor_hex",
+        ],
+        V40MlsOperation::DeviceRemove => &[
+            "request_cbor_hex",
+            "request_digest_transcript_cbor_hex",
+            "request_digest_hex",
+            "controller_transcript_cbor_hex",
+            "controller_consent_digest_hex",
+            "controller_signature_hex",
+            "idempotency_key_hash_hex",
+            "identity_revoke_head_digest_hex",
+            "commit_bytes_hex",
+            "commit_digest_hex",
+            "head_transcript_cbor_hex",
+            "result_head_digest_hex",
+            "receipt_inner_cbor_hex",
+            "receipt_digest_hex",
+            "receipt_signature_hex",
+            "signed_receipt_cbor_hex",
+        ],
+    };
+    require_exact_object_keys(
+        operation,
+        expected_keys,
+        &format!("MLS Sequencer V5 {name}"),
+    )?;
+
+    let (_, request) = v40_decode_exact_cddl(
+        request_rule,
+        cddl,
+        json_string(operation, "request_cbor_hex")?,
+        &format!("MLS Sequencer V5 {name} request"),
+    )?;
+    let (request_transcript_bytes, request_transcript) = v40_decode_exact_cddl(
+        transcript_rule,
+        cddl,
+        json_string(operation, "request_digest_transcript_cbor_hex")?,
+        &format!("MLS Sequencer V5 {name} request transcript"),
+    )?;
+    let (controller_transcript_bytes, controller_transcript) = v40_decode_exact_cddl(
+        controller_rule,
+        cddl,
+        json_string(operation, "controller_transcript_cbor_hex")?,
+        &format!("MLS Sequencer V5 {name} controller transcript"),
+    )?;
+    let (head_transcript_bytes, head_transcript) = v40_decode_exact_cddl(
+        "mls-sequencer-head-transcript-v5",
+        cddl,
+        json_string(operation, "head_transcript_cbor_hex")?,
+        &format!("MLS Sequencer V5 {name} head transcript"),
+    )?;
+    let (receipt_bytes, receipt) = v40_decode_exact_cddl(
+        receipt_rule,
+        cddl,
+        json_string(operation, "receipt_inner_cbor_hex")?,
+        &format!("MLS Sequencer V5 {name} receipt"),
+    )?;
+    let (signed_receipt_bytes, signed_receipt) = v40_decode_exact_cddl(
+        "signed-mls-commit-receipt-v5",
+        cddl,
+        json_string(operation, "signed_receipt_cbor_hex")?,
+        &format!("MLS Sequencer V5 {name} signed receipt"),
+    )?;
+    let request_fields = v40_numbered_fields(&request, 15, &format!("MLS {name} request"))?;
+    let transcript_len = match kind {
+        V40MlsOperation::RecoveryAdd => 21,
+        V40MlsOperation::DeviceRemove => 18,
+    };
+    let transcript_fields = v40_numbered_fields(
+        &request_transcript,
+        transcript_len,
+        &format!("MLS {name} request transcript"),
+    )?;
+    let controller_len = match kind {
+        V40MlsOperation::RecoveryAdd => 21,
+        V40MlsOperation::DeviceRemove => 19,
+    };
+    let controller_fields = v40_numbered_fields(
+        &controller_transcript,
+        controller_len,
+        &format!("MLS {name} controller transcript"),
+    )?;
+    let head_fields =
+        v40_numbered_fields(&head_transcript, 7, &format!("MLS {name} head transcript"))?;
+    let receipt_fields = v40_numbered_fields(&receipt, 11, &format!("MLS {name} receipt"))?;
+    let signed_fields =
+        v40_numbered_fields(&signed_receipt, 4, &format!("MLS {name} signed receipt"))?;
+
+    if request_fields[..11] != transcript_fields[..11]
+        || request_fields[2] != expected_scope
+        || v40_unsigned(request_fields[0], "MLS request version")? != 5
+    {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} request/transcript base linkage drift"
+        )));
+    }
+    // Field 9 is deliberately null for both V40 operations: the active
+    // controller, not the recovering or revoked device, signs the final facts.
+    if request_fields[8] != &CanonicalValue::Null {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} must not carry a candidate final-transcript proof"
+        )));
+    }
+    let actor_identity = v40_text(request_fields[3], "MLS actor identity")?;
+    let actor_device = v40_text(request_fields[4], "MLS actor device")?;
+    let candidate_identity = v40_text(request_fields[5], "MLS candidate identity")?;
+    let candidate_device = v40_text(request_fields[6], "MLS candidate device")?;
+    validate_identity_id(actor_identity, "MLS Sequencer V5 actor identity")?;
+    validate_identity_id(candidate_identity, "MLS Sequencer V5 candidate identity")?;
+    for value in [
+        v40_text(request_fields[1], "MLS submission_id")?,
+        actor_device,
+        candidate_device,
+    ] {
+        validate_uuid_v7(value)?;
+    }
+    if actor_identity != candidate_identity || actor_device == candidate_device {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} must be same-identity and controlled by a different active leaf"
+        )));
+    }
+    let commit_bytes = decode_hex(json_string(operation, "commit_bytes_hex")?)?;
+    if commit_bytes.is_empty()
+        || commit_bytes.len() > 1_048_576
+        || v40_bytes(request_fields[11], "MLS opaque commit")? != commit_bytes
+    {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} opaque commit linkage drift"
+        )));
+    }
+    let commit_digest = v40_digest(COMMIT_DOMAIN, &commit_bytes);
+    v40_require_json_digest(operation, "commit_digest_hex", commit_digest, "MLS commit")?;
+    if v40_fixed_bytes::<32>(request_fields[12], "MLS request commit digest")? != commit_digest
+        || transcript_fields[11] != request_fields[12]
+        || transcript_fields[12] != request_fields[13]
+    {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} request does not bind its exact opaque Commit/Welcome facts"
+        )));
+    }
+    let request_digest = v40_digest(REQUEST_DOMAIN, &request_transcript_bytes);
+    v40_require_json_digest(
+        operation,
+        "request_digest_hex",
+        request_digest,
+        "MLS request",
+    )?;
+
+    let idempotency_digest =
+        decode_lower_hex_fixed::<32>(json_string(operation, "idempotency_key_hash_hex")?)?;
+    if idempotency_digest.iter().all(|byte| *byte == 0)
+        || controller_fields[2] != request_fields[2]
+        || controller_fields[3] != request_fields[1]
+        || v40_fixed_bytes::<32>(controller_fields[4], "MLS idempotency digest")?
+            != idempotency_digest
+        || controller_fields[5..9] != request_fields[3..7]
+        || controller_fields[10] != request_fields[9]
+        || controller_fields[11] != request_fields[10]
+        || v40_unsigned(controller_fields[12], "MLS controller admitted epoch")?
+            != v40_unsigned(request_fields[9], "MLS parent epoch")? + 1
+        || controller_fields[13] != request_fields[12]
+        || controller_fields[17] != request_fields[4]
+    {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} controller transcript base linkage drift"
+        )));
+    }
+    let authorization = match kind {
+        V40MlsOperation::RecoveryAdd => {
+            if v40_fixed_bytes::<32>(request_fields[7], "MLS recovery KeyPackage digest")?
+                != recovery_key_package_digest
+                || request_fields[13] == &CanonicalValue::Null
+                || v40_fixed_bytes::<32>(request_fields[13], "MLS recovery Welcome digest")?
+                    .iter()
+                    .all(|byte| *byte == 0)
+                || controller_fields[9] != request_fields[7]
+                || controller_fields[14] != request_fields[13]
+                || v40_unsigned(transcript_fields[13], "MLS recovery authorization code")? != 4
+                || transcript_fields[14] != &CanonicalValue::Null
+                || transcript_fields[15] != &CanonicalValue::Null
+                || transcript_fields[16] != request_fields[4]
+            {
+                return Err(ProtocolToolError::new(
+                    "MLS Sequencer V5 recovery add package/Welcome/controller linkage drift",
+                ));
+            }
+            let auth =
+                v40_numbered_fields(request_fields[14], 7, "MLS recovery add authorization")?;
+            if v40_unsigned(auth[0], "MLS recovery authorization kind")? != 5
+                || auth[1] != request_fields[4]
+                || v40_text(auth[3], "MLS recovery request id")? != recovery_request_id
+                || v40_fixed_bytes::<32>(auth[4], "MLS recovery request digest")?
+                    != recovery_request_digest
+                || v40_fixed_bytes::<32>(auth[5], "MLS recovery scope digest")?
+                    != recovery_scope_digest
+                || transcript_fields[17] != auth[2]
+                || v40_text(transcript_fields[18], "MLS transcript recovery request id")?
+                    != recovery_request_id
+                || v40_fixed_bytes::<32>(transcript_fields[19], "MLS transcript request digest")?
+                    != recovery_request_digest
+                || v40_fixed_bytes::<32>(transcript_fields[20], "MLS transcript scope digest")?
+                    != recovery_scope_digest
+                || v40_text(controller_fields[18], "MLS controller recovery request id")?
+                    != recovery_request_id
+                || v40_fixed_bytes::<32>(controller_fields[19], "MLS controller request digest")?
+                    != recovery_request_digest
+                || v40_fixed_bytes::<32>(controller_fields[20], "MLS controller scope digest")?
+                    != recovery_scope_digest
+            {
+                return Err(ProtocolToolError::new(
+                    "MLS Sequencer V5 recovery add authorization escaped the exact History Recovery request/scope",
+                ));
+            }
+            auth
+        }
+        V40MlsOperation::DeviceRemove => {
+            if request_fields[7] != &CanonicalValue::Null
+                || request_fields[13] != &CanonicalValue::Null
+                || v40_fixed_bytes::<32>(controller_fields[9], "MLS removal zero package")? != ZERO
+                || v40_fixed_bytes::<32>(controller_fields[14], "MLS removal zero Welcome")? != ZERO
+                || v40_unsigned(transcript_fields[13], "MLS removal authorization code")? != 5
+                || transcript_fields[14] != &CanonicalValue::Null
+                || transcript_fields[16] != &CanonicalValue::Null
+                || transcript_fields[17] != &CanonicalValue::Null
+            {
+                return Err(ProtocolToolError::new(
+                    "MLS Sequencer V5 device remove must carry null package/proof/Welcome fields",
+                ));
+            }
+            let auth =
+                v40_numbered_fields(request_fields[14], 3, "MLS device remove authorization")?;
+            let revoke_digest = decode_lower_hex_fixed::<32>(json_string(
+                operation,
+                "identity_revoke_head_digest_hex",
+            )?)?;
+            if revoke_digest.iter().all(|byte| *byte == 0)
+                || v40_unsigned(auth[0], "MLS removal authorization kind")? != 6
+                || v40_fixed_bytes::<32>(auth[1], "MLS removal revoke head")? != revoke_digest
+                || v40_fixed_bytes::<32>(transcript_fields[15], "MLS transcript revoke head")?
+                    != revoke_digest
+                || v40_fixed_bytes::<32>(controller_fields[18], "MLS controller revoke head")?
+                    != revoke_digest
+            {
+                return Err(ProtocolToolError::new(
+                    "MLS Sequencer V5 device remove does not bind the exact current DeviceRevoke head",
+                ));
+            }
+            auth
+        }
+    };
+
+    let proof_index = match kind {
+        V40MlsOperation::RecoveryAdd => 6,
+        V40MlsOperation::DeviceRemove => 2,
+    };
+    let proof = v40_numbered_fields(
+        authorization[proof_index],
+        3,
+        &format!("MLS {name} controller proof"),
+    )?;
+    let operation_code = match kind {
+        V40MlsOperation::RecoveryAdd => 5,
+        V40MlsOperation::DeviceRemove => 6,
+    };
+    let controller_digest = v40_digest(CONTROLLER_DOMAIN, &controller_transcript_bytes);
+    v40_require_json_digest(
+        operation,
+        "controller_consent_digest_hex",
+        controller_digest,
+        "MLS controller consent",
+    )?;
+    let controller_signature =
+        decode_lower_hex_fixed::<64>(json_string(operation, "controller_signature_hex")?)?;
+    if v40_unsigned(controller_fields[0], "MLS controller transcript version")? != 2
+        || v40_unsigned(controller_fields[1], "MLS controller operation")? != operation_code
+        || v40_unsigned(proof[0], "MLS controller proof version")? != 5
+        || v40_fixed_bytes::<32>(proof[1], "MLS controller proof digest")? != controller_digest
+        || v40_fixed_bytes::<64>(proof[2], "MLS controller proof signature")?
+            != controller_signature
+        || matches!(kind, V40MlsOperation::RecoveryAdd)
+            && v40_fixed_bytes::<32>(authorization[2], "MLS authorization controller digest")?
+                != controller_digest
+    {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} controller proof linkage drift"
+        )));
+    }
+    let mut controller_signature_input = CONTROLLER_SIGNATURE_DOMAIN.to_vec();
+    controller_signature_input.extend_from_slice(&controller_digest);
+    v40_verify_signature(
+        controller_key,
+        &controller_signature_input,
+        controller_signature,
+        &format!("MLS Sequencer V5 {name} controller consent"),
+    )?;
+
+    let parent_epoch = v40_unsigned(request_fields[9], "MLS parent epoch")?;
+    let admitted_epoch = parent_epoch + 1;
+    let parent_head = v40_fixed_bytes::<32>(request_fields[10], "MLS parent head")?;
+    let expected_welcome = match kind {
+        V40MlsOperation::RecoveryAdd => {
+            let welcome = v40_fixed_bytes::<32>(request_fields[13], "MLS recovery Welcome digest")?;
+            v40_require_json_digest(
+                operation,
+                "welcome_digest_hex",
+                welcome,
+                "MLS recovery Welcome",
+            )?;
+            welcome
+        }
+        V40MlsOperation::DeviceRemove => ZERO,
+    };
+    if v40_unsigned(head_fields[0], "MLS head transcript version")? != 1
+        || v40_fixed_bytes::<32>(head_fields[1], "MLS head parent")? != parent_head
+        || v40_unsigned(head_fields[2], "MLS head epoch")? != admitted_epoch
+        || v40_fixed_bytes::<32>(head_fields[3], "MLS head commit")? != commit_digest
+        || v40_fixed_bytes::<32>(head_fields[4], "MLS head Welcome")? != expected_welcome
+        || head_fields[5] != request_fields[5]
+        || head_fields[6] != request_fields[6]
+    {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} head transcript linkage drift"
+        )));
+    }
+    let result_head = v40_digest(HEAD_DOMAIN, &head_transcript_bytes);
+    v40_require_json_digest(operation, "result_head_digest_hex", result_head, "MLS head")?;
+    let expected_package = match kind {
+        V40MlsOperation::RecoveryAdd => Some(recovery_key_package_digest),
+        V40MlsOperation::DeviceRemove => None,
+    };
+    if v40_unsigned(receipt_fields[0], "MLS receipt version")? != 5
+        || receipt_fields[1] != request_fields[1]
+        || receipt_fields[2] != request_fields[2]
+        || v40_fixed_bytes::<32>(receipt_fields[3], "MLS receipt request")? != request_digest
+        || v40_unsigned(receipt_fields[4], "MLS receipt epoch")? != admitted_epoch
+        || v40_fixed_bytes::<32>(receipt_fields[5], "MLS receipt head")? != result_head
+        || v40_fixed_bytes::<32>(receipt_fields[6], "MLS receipt commit")? != commit_digest
+        || receipt_fields[8] != request_fields[5]
+        || receipt_fields[9] != request_fields[6]
+        || match expected_package {
+            Some(package) => {
+                v40_fixed_bytes::<32>(receipt_fields[7], "MLS receipt Welcome")? != expected_welcome
+                    || v40_fixed_bytes::<32>(receipt_fields[10], "MLS receipt package")? != package
+            }
+            None => {
+                receipt_fields[7] != &CanonicalValue::Null
+                    || receipt_fields[10] != &CanonicalValue::Null
+            }
+        }
+    {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} receipt linkage/nullability drift"
+        )));
+    }
+    let receipt_digest = v40_digest(RECEIPT_DOMAIN, &receipt_bytes);
+    v40_require_json_digest(
+        operation,
+        "receipt_digest_hex",
+        receipt_digest,
+        "MLS receipt",
+    )?;
+    let receipt_signature =
+        decode_lower_hex_fixed::<64>(json_string(operation, "receipt_signature_hex")?)?;
+    if signed_fields[0] != &receipt
+        || v40_fixed_bytes::<32>(signed_fields[1], "MLS signed receipt digest")? != receipt_digest
+        || v40_fixed_bytes::<32>(signed_fields[2], "MLS receipt signer")? != sequencer_key
+        || v40_fixed_bytes::<64>(signed_fields[3], "MLS signed receipt signature")?
+            != receipt_signature
+    {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V5 {name} signed receipt wrapper linkage drift"
+        )));
+    }
+    let mut receipt_signature_input = RECEIPT_SIGNATURE_DOMAIN.to_vec();
+    receipt_signature_input.extend_from_slice(&receipt_digest);
+    v40_verify_signature(
+        sequencer_key,
+        &receipt_signature_input,
+        receipt_signature,
+        &format!("MLS Sequencer V5 {name} receipt"),
+    )?;
+
+    Ok(V40MlsOperationFacts {
+        scope: (*request_fields[2]).clone(),
+        actor_identity: actor_identity.to_owned(),
+        actor_device: actor_device.to_owned(),
+        candidate_identity: candidate_identity.to_owned(),
+        candidate_device: candidate_device.to_owned(),
+        parent_epoch,
+        admitted_epoch,
+        parent_head,
+        result_head,
+        commit_bytes,
+        signed_receipt_bytes,
+    })
+}
+
+struct V40MlsFeedItemFacts {
+    version: u64,
+    epoch: u64,
+    signed_receipt: Vec<u8>,
+    commit: Vec<u8>,
+}
+
+fn validate_mls_v5_feed(
+    vector: &Value,
+    cddl_v3: &str,
+    cddl_v4: &str,
+    cddl_v5: &str,
+    expected_scope: &CanonicalValue,
+    sequencer_key: [u8; 32],
+    recovery_add: &V40MlsOperationFacts,
+) -> Result<(), ProtocolToolError> {
+    let feed = v40_json_field(vector, "feed_v3", "MLS Sequencer V5 vector")?;
+    require_exact_object_keys(
+        feed,
+        &["after_epoch", "canonical_cbor_hex", "items"],
+        "MLS Sequencer V5 feed",
+    )?;
+    let bytes = decode_hex(json_string(feed, "canonical_cbor_hex")?)?;
+    let facts = v40_validate_mls_feed_bytes(
+        &bytes,
+        cddl_v3,
+        cddl_v4,
+        cddl_v5,
+        expected_scope,
+        sequencer_key,
+    )?;
+    let after_epoch = feed
+        .get("after_epoch")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("MLS Sequencer V5 after_epoch must be unsigned"))?;
+    let items = v40_json_array_field(feed, "items", "MLS Sequencer V5 feed")?;
+    if facts.len() != 3 || items.len() != 3 {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V5 golden feed must contain exactly V3, V4, and V5 items",
+        ));
+    }
+    for (index, (fact, item)) in facts.iter().zip(items).enumerate() {
+        require_exact_object_keys(
+            item,
+            &["version", "signed_receipt_cbor_hex", "commit_bytes_hex"],
+            "MLS Sequencer V5 feed item",
+        )?;
+        let expected_version = u64::try_from(index + 3).expect("three feed items");
+        let expected_epoch = after_epoch + u64::try_from(index + 1).expect("three feed items");
+        if fact.version != expected_version
+            || item.get("version").and_then(Value::as_u64) != Some(expected_version)
+            || fact.epoch != expected_epoch
+            || fact.signed_receipt != decode_hex(json_string(item, "signed_receipt_cbor_hex")?)?
+            || fact.commit != decode_hex(json_string(item, "commit_bytes_hex")?)?
+        {
+            return Err(ProtocolToolError::new(
+                "MLS Sequencer V5 feed item version/epoch/exact-byte linkage drift",
+            ));
+        }
+    }
+    let last = facts.last().expect("feed length was checked");
+    if last.epoch != recovery_add.admitted_epoch
+        || last.signed_receipt != recovery_add.signed_receipt_bytes
+        || last.commit != recovery_add.commit_bytes
+        || recovery_add.parent_epoch + 1 != recovery_add.admitted_epoch
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V5 feed's V5 item is not the exact recovery-add receipt/Commit pair",
+        ));
+    }
+    Ok(())
+}
+
+fn v40_validate_mls_feed_bytes(
+    bytes: &[u8],
+    cddl_v3: &str,
+    cddl_v4: &str,
+    cddl_v5: &str,
+    expected_scope: &CanonicalValue,
+    sequencer_key: [u8; 32],
+) -> Result<Vec<V40MlsFeedItemFacts>, ProtocolToolError> {
+    let value = v40_decode_exact_bytes(bytes, "MLS Commit Feed V3")?;
+    cddl_cat::validate_cbor_bytes("mls-commit-feed-v3", cddl_v5, bytes).map_err(|error| {
+        ProtocolToolError::new(format!("CDDL rejected MLS Commit Feed V3: {error}"))
+    })?;
+    let fields = v40_numbered_fields(&value, 3, "MLS Commit Feed V3")?;
+    if v40_unsigned(fields[0], "MLS feed version")? != 3 {
+        return Err(ProtocolToolError::new("MLS Commit Feed V3 version drift"));
+    }
+    let after_epoch = v40_unsigned(fields[1], "MLS feed after_epoch")?;
+    let items = v40_array(fields[2], "MLS feed items")?;
+    let mut facts = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let pair = v40_array(item, "MLS feed receipt/Commit pair")?;
+        if pair.len() != 2 {
+            return Err(ProtocolToolError::new(
+                "MLS feed item must be an exact signed receipt/Commit pair",
+            ));
+        }
+        let signed = v40_bytes(&pair[0], "MLS feed signed receipt")?.to_vec();
+        let commit = v40_bytes(&pair[1], "MLS feed opaque Commit")?.to_vec();
+        let signed_value = v40_decode_exact_bytes(&signed, "MLS feed signed receipt")?;
+        let signed_fields = v40_numbered_fields(&signed_value, 4, "MLS feed signed receipt")?;
+        let receipt_fields = v40_numbered_fields(signed_fields[0], 11, "MLS feed receipt prefix")
+            .or_else(|_| v40_numbered_fields(signed_fields[0], 12, "MLS feed receipt prefix"))
+            .or_else(|_| v40_numbered_fields(signed_fields[0], 13, "MLS feed receipt prefix"))?;
+        let version = v40_unsigned(receipt_fields[0], "MLS feed receipt version")?;
+        let (cddl, signed_rule, receipt_rule) = match version {
+            3 => (
+                cddl_v3,
+                "signed-mls-commit-receipt-v3",
+                "mls-commit-receipt-v3",
+            ),
+            4 => (
+                cddl_v4,
+                "signed-mls-commit-receipt-v4",
+                "mls-commit-receipt-v4",
+            ),
+            5 => (
+                cddl_v5,
+                "signed-mls-commit-receipt-v5",
+                "mls-commit-receipt-v5",
+            ),
+            _ => {
+                return Err(ProtocolToolError::new(
+                    "MLS Commit Feed V3 carries an unknown receipt version",
+                ));
+            }
+        };
+        let epoch = v40_validate_mls_signed_receipt(
+            &signed,
+            Some(&commit),
+            version,
+            cddl,
+            signed_rule,
+            receipt_rule,
+            expected_scope,
+            sequencer_key,
+        )?;
+        let expected_epoch = after_epoch
+            .checked_add(u64::try_from(index + 1).expect("feed count fits u64"))
+            .ok_or_else(|| ProtocolToolError::new("MLS feed epoch overflow"))?;
+        if epoch != expected_epoch {
+            return Err(ProtocolToolError::new(
+                "MLS Commit Feed V3 epochs are not consecutive after after_epoch",
+            ));
+        }
+        facts.push(V40MlsFeedItemFacts {
+            version,
+            epoch,
+            signed_receipt: signed,
+            commit,
+        });
+    }
+    Ok(facts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn v40_validate_mls_signed_receipt(
+    signed_bytes: &[u8],
+    commit_bytes: Option<&[u8]>,
+    version: u64,
+    cddl: &str,
+    signed_rule: &str,
+    receipt_rule: &str,
+    expected_scope: &CanonicalValue,
+    sequencer_key: [u8; 32],
+) -> Result<u64, ProtocolToolError> {
+    const COMMIT_DOMAIN: &[u8] = b"dirextalk.mls-opaque-commit.v1\0";
+    let signed = v40_decode_exact_bytes(signed_bytes, "MLS feed signed receipt")?;
+    cddl_cat::validate_cbor_bytes(signed_rule, cddl, signed_bytes)
+        .map_err(|error| ProtocolToolError::new(format!("CDDL rejected {signed_rule}: {error}")))?;
+    let signed_fields = v40_numbered_fields(&signed, 4, "MLS feed signed receipt")?;
+    let receipt_bytes = encode_deterministic_cbor(signed_fields[0])
+        .map_err(|error| ProtocolToolError::new(format!("encode MLS feed receipt: {error}")))?;
+    cddl_cat::validate_cbor_bytes(receipt_rule, cddl, &receipt_bytes).map_err(|error| {
+        ProtocolToolError::new(format!("CDDL rejected {receipt_rule}: {error}"))
+    })?;
+    let receipt_len = match version {
+        3 => 13,
+        4 => 12,
+        5 => 11,
+        _ => return Err(ProtocolToolError::new("unknown MLS receipt version")),
+    };
+    let receipt_fields = v40_numbered_fields(signed_fields[0], receipt_len, "MLS feed receipt")?;
+    if v40_unsigned(receipt_fields[0], "MLS feed receipt version")? != version
+        || receipt_fields[2] != expected_scope
+        || v40_fixed_bytes::<32>(signed_fields[2], "MLS feed sequencer key")? != sequencer_key
+    {
+        return Err(ProtocolToolError::new(
+            "MLS feed receipt scope/signer linkage drift",
+        ));
+    }
+    if let Some(commit_bytes) = commit_bytes
+        && (commit_bytes.is_empty()
+            || commit_bytes.len() > 1_048_576
+            || v40_fixed_bytes::<32>(receipt_fields[6], "MLS feed receipt commit digest")?
+                != v40_digest(COMMIT_DOMAIN, commit_bytes))
+    {
+        return Err(ProtocolToolError::new(
+            "MLS feed receipt/Commit pair linkage drift",
+        ));
+    }
+    let (receipt_domain, signature_domain): (&[u8], &[u8]) = match version {
+        3 => (
+            b"dirextalk.mls-commit-receipt.v3\0",
+            b"dirextalk.mls-commit-receipt-signature.v3\0",
+        ),
+        4 => (
+            b"dirextalk.mls-commit-receipt.v4\0",
+            b"dirextalk.mls-commit-receipt-signature.v4\0",
+        ),
+        5 => (
+            b"dirextalk.mls-commit-receipt.v5\0",
+            b"dirextalk.mls-commit-receipt-signature.v5\0",
+        ),
+        _ => unreachable!("version was constrained above"),
+    };
+    let receipt_digest = v40_digest(receipt_domain, &receipt_bytes);
+    if v40_fixed_bytes::<32>(signed_fields[1], "MLS feed receipt digest")? != receipt_digest {
+        return Err(ProtocolToolError::new(
+            "MLS feed signed receipt digest mismatch",
+        ));
+    }
+    let mut signature_input = signature_domain.to_vec();
+    signature_input.extend_from_slice(&receipt_digest);
+    v40_verify_signature(
+        sequencer_key,
+        &signature_input,
+        v40_fixed_bytes::<64>(signed_fields[3], "MLS feed receipt signature")?,
+        "MLS feed receipt",
+    )?;
+    v40_unsigned(receipt_fields[4], "MLS feed receipt epoch")
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exact V40 invalid family covers canonicality, nullability, receipts, and feeds"
+)]
+fn validate_mls_v5_invalid_vectors(
+    vector: &Value,
+    cddl_v3: &str,
+    cddl_v4: &str,
+    cddl_v5: &str,
+    expected_scope: &CanonicalValue,
+    sequencer_key: [u8; 32],
+) -> Result<(), ProtocolToolError> {
+    let invalid = v40_json_array_field(vector, "invalid_cbor", "MLS Sequencer V5 vector")?;
+    let expected = [
+        "noncanonical_integer",
+        "recovery_add_null_key_package",
+        "device_remove_nonnull_key_package",
+        "device_remove_nonnull_welcome",
+        "receipt_digest_mismatch",
+        "feed_epoch_gap",
+        "feed_commit_pair_mismatch",
+    ];
+    if invalid.len() != expected.len()
+        || invalid
+            .iter()
+            .filter_map(|item| item.get("label").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>()
+            != expected.into_iter().collect::<BTreeSet<_>>()
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V5 invalid specimen family drift",
+        ));
+    }
+    for item in invalid {
+        require_exact_object_keys(
+            item,
+            &["label", "rule", "cbor_hex"],
+            "MLS Sequencer V5 invalid specimen",
+        )?;
+        let label = json_string(item, "label")?;
+        let rule = json_string(item, "rule")?;
+        let encoded = json_string(item, "cbor_hex")?;
+        let expected_rule = match label {
+            "noncanonical_integer" | "recovery_add_null_key_package" => {
+                "mls-recovery-add-request-v5"
+            }
+            "device_remove_nonnull_key_package" | "device_remove_nonnull_welcome" => {
+                "mls-device-remove-request-v5"
+            }
+            "receipt_digest_mismatch" => "signed-mls-commit-receipt-v5",
+            "feed_epoch_gap" | "feed_commit_pair_mismatch" => "mls-commit-feed-v3",
+            _ => unreachable!("invalid labels were checked above"),
+        };
+        if rule != expected_rule {
+            return Err(ProtocolToolError::new(format!(
+                "MLS Sequencer V5 invalid specimen {label} must target {expected_rule}"
+            )));
+        }
+        let bytes = decode_hex(encoded)?;
+        match label {
+            "noncanonical_integer" => {
+                if decode_deterministic_cbor(&bytes).is_ok() {
+                    return Err(ProtocolToolError::new(
+                        "MLS Sequencer V5 noncanonical integer was accepted",
+                    ));
+                }
+            }
+            "recovery_add_null_key_package"
+            | "device_remove_nonnull_key_package"
+            | "device_remove_nonnull_welcome" => {
+                v40_decode_exact(encoded, label)?;
+                if cddl_cat::validate_cbor_bytes(rule, cddl_v5, &bytes).is_ok() {
+                    return Err(ProtocolToolError::new(format!(
+                        "MLS Sequencer V5 CDDL accepted invalid nullability specimen {label}"
+                    )));
+                }
+            }
+            "receipt_digest_mismatch" => {
+                v40_decode_exact(encoded, label)?;
+                cddl_cat::validate_cbor_bytes(rule, cddl_v5, &bytes).map_err(|error| {
+                    ProtocolToolError::new(format!(
+                        "MLS receipt mismatch specimen must pass CDDL: {error}"
+                    ))
+                })?;
+                if v40_validate_mls_signed_receipt(
+                    &bytes,
+                    None,
+                    5,
+                    cddl_v5,
+                    "signed-mls-commit-receipt-v5",
+                    "mls-commit-receipt-v5",
+                    expected_scope,
+                    sequencer_key,
+                )
+                .is_ok()
+                {
+                    return Err(ProtocolToolError::new(
+                        "MLS Sequencer V5 receipt digest mismatch was semantically accepted",
+                    ));
+                }
+            }
+            "feed_epoch_gap" | "feed_commit_pair_mismatch" => {
+                v40_decode_exact(encoded, label)?;
+                cddl_cat::validate_cbor_bytes(rule, cddl_v5, &bytes).map_err(|error| {
+                    ProtocolToolError::new(format!(
+                        "MLS feed semantic specimen must pass CDDL: {error}"
+                    ))
+                })?;
+                if v40_validate_mls_feed_bytes(
+                    &bytes,
+                    cddl_v3,
+                    cddl_v4,
+                    cddl_v5,
+                    expected_scope,
+                    sequencer_key,
+                )
+                .is_ok()
+                {
+                    return Err(ProtocolToolError::new(format!(
+                        "MLS Sequencer V5 semantic feed specimen {label} was accepted"
+                    )));
+                }
+            }
+            _ => unreachable!("invalid labels were checked above"),
+        }
+    }
     Ok(())
 }
 

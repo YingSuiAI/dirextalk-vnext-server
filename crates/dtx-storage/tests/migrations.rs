@@ -51,9 +51,11 @@ const CONNECTOR_CREDENTIAL_REISSUE_V1_MIGRATION_VERSION: i64 = 202_607_190_044;
 const REALTIME_SYNC_MULTIDEVICE_MAILBOX_V1_MIGRATION_VERSION: i64 = 202_607_200_045;
 const ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_MIGRATION_VERSION: i64 = 202_607_200_046;
 const REALTIME_SYNC_CONTINUITY_V2_MIGRATION_VERSION: i64 = 202_607_200_047;
+const HISTORY_RECOVERY_V1_MIGRATION_VERSION: i64 = 202_607_200_048;
 const REALTIME_SYNC_RETENTION_SAFETY_V1_MIGRATION_VERSION: i64 = 202_607_200_049;
 const MAILBOX_RETAINED_QUOTA_GC_V1_MIGRATION_VERSION: i64 = 202_607_200_050;
-const EXPECTED_MIGRATION_COUNT: i64 = 49;
+const FEDERATED_MLS_V5_AUTHORIZATION_V1_MIGRATION_VERSION: i64 = 202_607_200_051;
+const EXPECTED_MIGRATION_COUNT: i64 = 51;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -169,12 +171,20 @@ const REALTIME_SYNC_CONTINUITY_V2_DOWN: &str =
     include_str!("../../../migrations/202607200047_realtime_sync_continuity_v2.down.sql");
 const REALTIME_SYNC_CONTINUITY_V2_UP: &str =
     include_str!("../../../migrations/202607200047_realtime_sync_continuity_v2.up.sql");
+const HISTORY_RECOVERY_V1_DOWN: &str =
+    include_str!("../../../migrations/202607200048_history_recovery_v1.down.sql");
+const HISTORY_RECOVERY_V1_UP: &str =
+    include_str!("../../../migrations/202607200048_history_recovery_v1.up.sql");
 const REALTIME_SYNC_RETENTION_SAFETY_V1_DOWN: &str =
     include_str!("../../../migrations/202607200049_realtime_sync_retention_safety_v1.down.sql");
 const MAILBOX_RETAINED_QUOTA_GC_V1_DOWN: &str =
     include_str!("../../../migrations/202607200050_mailbox_retained_quota_gc_v1.down.sql");
 const MAILBOX_RETAINED_QUOTA_GC_V1_UP: &str =
     include_str!("../../../migrations/202607200050_mailbox_retained_quota_gc_v1.up.sql");
+const FEDERATED_MLS_V5_AUTHORIZATION_V1_DOWN: &str =
+    include_str!("../../../migrations/202607200051_federated_mls_v5_authorization_v1.down.sql");
+const FEDERATED_MLS_V5_AUTHORIZATION_V1_UP: &str =
+    include_str!("../../../migrations/202607200051_federated_mls_v5_authorization_v1.up.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -207,6 +217,12 @@ async fn realtime_sync_multidevice_mailbox_empty_down_up_preserves_v14()
         .await?
     );
 
+    sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(HISTORY_RECOVERY_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(REALTIME_SYNC_CONTINUITY_V2_DOWN)
         .execute(harness.admin_pool())
         .await?;
@@ -233,6 +249,12 @@ async fn realtime_sync_multidevice_mailbox_empty_down_up_preserves_v14()
         .execute(harness.admin_pool())
         .await?;
     sqlx::raw_sql(REALTIME_SYNC_CONTINUITY_V2_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(HISTORY_RECOVERY_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_UP)
         .execute(harness.admin_pool())
         .await?;
     assert!(
@@ -304,6 +326,342 @@ async fn realtime_sync_continuity_empty_down_up_preserves_v46()
         .fetch_one(harness.admin_pool())
         .await?
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_recovery_empty_down_up_preserves_v39() -> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(HISTORY_RECOVERY_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('messaging.history_recovery_offers') IS NULL
+                AND to_regprocedure('identity.history_recovery_request_authorized(text,uuid,bytea,uuid,bigint)') IS NULL
+                AND (SELECT count(*) FROM pg_policy
+                      WHERE polrelid IN (
+                          'identity.log_heads'::regclass,
+                          'identity.log_entries'::regclass,
+                          'identity.device_sessions'::regclass
+                      )
+                        AND polname='identity_runtime_only'
+                        AND position('identity_group_reader_authorized'
+                                     IN pg_get_expr(polqual,polrelid))=0)=3
+                AND EXISTS(SELECT 1 FROM pg_constraint
+                  WHERE conname='groups_mls_commit_intents_protocol_version_valid'
+                    AND position('4' IN pg_get_constraintdef(oid))>0
+                    AND position('5' IN pg_get_constraintdef(oid))=0)",
+        )
+        .fetch_one(harness.admin_pool())
+        .await?
+    );
+    sqlx::raw_sql(HISTORY_RECOVERY_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('messaging.history_recovery_offers') IS NOT NULL
+                AND to_regprocedure('identity.history_recovery_request_authorized(text,uuid,bytea,uuid,bigint)') IS NOT NULL
+                AND to_regprocedure('identity.scoped_key_package_claim_authorized(text,uuid,bytea,bytea,bytea,uuid)') IS NOT NULL
+                AND (SELECT count(*) FROM pg_policy
+                      WHERE polrelid IN (
+                          'identity.log_heads'::regclass,
+                          'identity.log_entries'::regclass,
+                          'identity.device_sessions'::regclass
+                      )
+                        AND polname='identity_runtime_only'
+                        AND position('identity_group_reader_authorized'
+                                     IN pg_get_expr(polqual,polrelid))>0)=3
+                AND EXISTS(
+                    SELECT 1 FROM pg_constraint
+                     WHERE conrelid='messaging.history_recovery_offers'::regclass
+                       AND contype='f' AND confdeltype='c'
+                       AND pg_get_constraintdef(oid) LIKE '%mailbox_envelopes%'
+                )",
+        )
+        .fetch_one(harness.admin_pool())
+        .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn federated_mls_v5_projection_is_identity_runtime_only_and_reversible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    let function = "identity.mls_v5_recovery_authorization_projection(text,uuid,uuid,uuid,bytea,bytea,bytea,bytea,bigint)";
+    let privileges: (bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT to_regprocedure($1) IS NOT NULL,
+                has_function_privilege('dtx_identity_runtime',$1,'EXECUTE'),
+                has_function_privilege('dtx_group_runtime',$1,'EXECUTE'),
+                has_table_privilege('dtx_group_runtime','identity.device_enrollment_challenges','SELECT'),
+                has_table_privilege('dtx_group_runtime','messaging.history_recovery_offers','SELECT')",
+    )
+    .bind(function)
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(privileges, (true, true, false, false, false));
+
+    sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT to_regprocedure($1) IS NULL")
+            .bind(function)
+            .fetch_one(harness.admin_pool())
+            .await?
+    );
+    sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regprocedure($1) IS NOT NULL
+                AND has_function_privilege('dtx_identity_runtime',$1,'EXECUTE')
+                AND NOT has_function_privilege('dtx_group_runtime',$1,'EXECUTE')",
+        )
+        .bind(function)
+        .fetch_one(harness.admin_pool())
+        .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn history_recovery_group_identity_reader_is_narrow() -> Result<(), Box<dyn std::error::Error>>
+{
+    const IDENTITY_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+
+    let harness = PostgresHarness::start().await?;
+    let session_id = insert_group_reader_identity_fixture(&harness, IDENTITY_ID).await?;
+
+    let visible_projection: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM identity.log_heads WHERE identity_id=$1)
+            AND EXISTS(SELECT 1 FROM identity.log_entries WHERE identity_id=$1)
+            AND EXISTS(SELECT 1 FROM identity.device_sessions
+                        WHERE identity_id=$1 AND session_id=$2)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(session_id)
+    .fetch_one(harness.group_runtime_pool())
+    .await?;
+    assert!(visible_projection);
+
+    let exact_acl: bool = sqlx::query_scalar(
+        "SELECT identity.identity_group_reader_authorized()
+            AND NOT has_function_privilege(
+                current_user,'identity.identity_runtime_authorized()'::regprocedure,'EXECUTE')
+            AND NOT has_function_privilege(
+                current_user,'identity.identity_owner_authorized()'::regprocedure,'EXECUTE')
+            AND NOT has_function_privilege(
+                current_user,'identity.identity_mailbox_reader_authorized()'::regprocedure,'EXECUTE')
+            AND NOT has_function_privilege(
+                current_user,'identity.identity_realtime_reader_authorized()'::regprocedure,'EXECUTE')
+            AND NOT has_table_privilege(
+                current_user,'identity.device_enrollment_challenges','SELECT')
+            AND NOT has_table_privilege(current_user,'identity.key_packages','SELECT')",
+    )
+    .fetch_one(harness.group_runtime_pool())
+    .await?;
+    assert!(exact_acl);
+
+    let broader_helper_error =
+        sqlx::query_scalar::<_, bool>("SELECT identity.identity_runtime_authorized()")
+            .fetch_one(harness.group_runtime_pool())
+            .await
+            .expect_err("group runtime must not execute the identity-writer authorizer");
+    assert_eq!(
+        broader_helper_error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("42501")),
+    );
+
+    let unrelated_error =
+        sqlx::query_scalar::<_, bool>("SELECT identity.identity_group_reader_authorized()")
+            .fetch_one(harness.mailbox_runtime_pool())
+            .await
+            .expect_err("unrelated runtime must not execute the group identity reader");
+    assert_eq!(
+        unrelated_error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("42501")),
+    );
+
+    let public_execute: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM pg_proc AS procedure
+               CROSS JOIN LATERAL aclexplode(
+                   COALESCE(procedure.proacl,acldefault('f',procedure.proowner))
+               ) AS privilege
+              WHERE procedure.oid='identity.identity_group_reader_authorized()'::regprocedure
+                AND privilege.grantee=0
+                AND privilege.privilege_type='EXECUTE'
+         )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!public_execute);
+    Ok(())
+}
+
+async fn insert_group_reader_identity_fixture(
+    harness: &PostgresHarness,
+    identity_id: &str,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let device_id = Uuid::now_v7();
+    let challenge_id = Uuid::now_v7();
+    let session_id = Uuid::now_v7();
+    let mut transaction = harness.admin_pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO identity.log_heads(
+             identity_id,protocol_major,protocol_minor,minimum_reader_major,
+             minimum_reader_minor,head_sequence,head_hash,state,created_at_ms,updated_at_ms
+         ) VALUES($1,1,1,1,1,1,$2,'active',0,0)",
+    )
+    .bind(identity_id)
+    .bind(vec![1_u8; 32])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.log_entries(
+             identity_id,sequence,entry_hash,previous_hash,protocol_major,
+             protocol_minor,minimum_reader_major,minimum_reader_minor,event_bytes,recorded_at_ms
+         ) VALUES($1,1,$2,NULL,1,1,1,1,$3,0)",
+    )
+    .bind(identity_id)
+    .bind(vec![1_u8; 32])
+    .bind(vec![1_u8])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.device_session_challenges(
+             challenge_id,identity_id,device_id,nonce_hash,audience,state,
+             created_at_ms,expires_at_ms,session_expires_at_ms
+         ) VALUES($1,$2,$3,$4,'https://group.test','open',0,100,200)",
+    )
+    .bind(challenge_id)
+    .bind(identity_id)
+    .bind(device_id)
+    .bind(vec![2_u8; 32])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.device_sessions(
+             session_id,identity_id,device_id,challenge_id,session_secret_hash,
+             issued_head_sequence,issued_head_hash,issued_at_ms,expires_at_ms
+         ) VALUES($1,$2,$3,$4,$5,1,$6,0,200)",
+    )
+    .bind(session_id)
+    .bind(identity_id)
+    .bind(device_id)
+    .bind(challenge_id)
+    .bind(vec![3_u8; 32])
+    .bind(vec![1_u8; 32])
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(session_id)
+}
+
+#[tokio::test]
+async fn history_recovery_down_refuses_v40_facts_before_ddl()
+-> Result<(), Box<dyn std::error::Error>> {
+    const IDENTITY_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+
+    let harness = PostgresHarness::start().await?;
+    let mut transaction = harness.admin_pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO identity.log_heads(
+             identity_id,protocol_major,protocol_minor,minimum_reader_major,
+             minimum_reader_minor,head_sequence,head_hash,state,created_at_ms,updated_at_ms
+         ) VALUES($1,1,1,1,1,1,$2,'active',0,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![1_u8; 32])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.log_entries(
+             identity_id,sequence,entry_hash,previous_hash,protocol_major,
+             protocol_minor,minimum_reader_major,minimum_reader_minor,event_bytes,recorded_at_ms
+         ) VALUES($1,1,$2,NULL,1,1,1,1,$3,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![1_u8; 32])
+    .bind(vec![1_u8])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.device_enrollment_challenges(
+             challenge_id,creation_idempotency_key_hash,identity_id,target_device_id,
+             target_device_signing_key,target_device_encryption_key,capability_hash,
+             request_digest,state,created_at_ms,expires_at_ms,retention_until_ms,
+             protocol_version,recovery_request_bytes,recovery_request_digest,
+             observed_head_sequence,observed_head_hash,recovery_mode,request_issued_at_ms,
+             recipient_encryption_key,candidate_request_signature
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'open',0,100,100,2,$9,$10,1,$11,
+                  'all_current_memberships',0,$6,$12)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(vec![2_u8; 32])
+    .bind(IDENTITY_ID)
+    .bind(Uuid::now_v7())
+    .bind(vec![3_u8; 32])
+    .bind(vec![4_u8; 32])
+    .bind(vec![5_u8; 32])
+    .bind(vec![6_u8; 32])
+    .bind(vec![7_u8])
+    .bind(vec![8_u8; 32])
+    .bind(vec![9_u8; 32])
+    .bind(vec![10_u8; 64])
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    let error = sqlx::raw_sql(HISTORY_RECOVERY_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await
+        .expect_err("rollback must preserve V40 history recovery facts");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("55000")),
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('messaging.history_recovery_offers') IS NOT NULL
+                AND EXISTS(SELECT 1 FROM identity.device_enrollment_challenges
+                           WHERE protocol_version=2)
+                AND (SELECT count(*) FROM pg_policy
+                      WHERE polrelid IN (
+                          'identity.log_heads'::regclass,
+                          'identity.log_entries'::regclass,
+                          'identity.device_sessions'::regclass
+                      )
+                        AND polname='identity_runtime_only'
+                        AND position('identity_group_reader_authorized'
+                                     IN pg_get_expr(polqual,polrelid))>0)=3",
+        )
+        .fetch_one(harness.admin_pool())
+        .await?
+    );
+    sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
     Ok(())
 }
 
@@ -523,7 +881,13 @@ async fn public_discussion_tables_force_tenant_rls_and_keep_histories_append_onl
     Ok(())
 }
 
+type PublicReferenceFact = (i16, String, Option<i64>, Option<Vec<u8>>);
+
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one migration boundary keeps private-room filtering and public reference projection coherent"
+)]
 async fn mcp_reference_queries_filter_private_rooms_and_return_public_facts()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
@@ -640,7 +1004,7 @@ async fn mcp_reference_queries_filter_private_rooms_and_return_public_facts()
     .fetch_all(&mut *transaction)
     .await?;
     assert!(none.is_empty());
-    let public_facts: Vec<(i16, String, Option<i64>, Option<Vec<u8>>)> = sqlx::query_as(
+    let public_facts: Vec<PublicReferenceFact> = sqlx::query_as(
         "SELECT reference_kind, subject_id, sequence, exact_cbor
            FROM directory.mcp_public_reference_facts($1, 6, 256, 1)",
     )
@@ -659,6 +1023,10 @@ async fn mcp_reference_queries_filter_private_rooms_and_return_public_facts()
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one migration boundary keeps credential quota, authentication, rotation, and revocation coherent"
+)]
 async fn agent_mcp_credentials_are_digest_only_rotatable_and_exactly_scoped()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
@@ -1587,7 +1955,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -1636,14 +2004,22 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(REALTIME_SYNC_MULTIDEVICE_MAILBOX_V1_MIGRATION_VERSION)
     .bind(ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_MIGRATION_VERSION)
     .bind(REALTIME_SYNC_CONTINUITY_V2_MIGRATION_VERSION)
+    .bind(HISTORY_RECOVERY_V1_MIGRATION_VERSION)
     .bind(REALTIME_SYNC_RETENTION_SAFETY_V1_MIGRATION_VERSION)
     .bind(MAILBOX_RETAINED_QUOTA_GC_V1_MIGRATION_VERSION)
+    .bind(FEDERATED_MLS_V5_AUTHORIZATION_V1_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(MAILBOX_RETAINED_QUOTA_GC_V1_DOWN)
         .execute(harness.admin_pool())
         .await?;
     sqlx::raw_sql(REALTIME_SYNC_RETENTION_SAFETY_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(HISTORY_RECOVERY_V1_DOWN)
         .execute(harness.admin_pool())
         .await?;
     sqlx::raw_sql(REALTIME_SYNC_CONTINUITY_V2_DOWN)
@@ -1860,6 +2236,10 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one migration boundary audits the runtime role's complete RLS, capability, and DDL surface"
+)]
 async fn runtime_role_is_non_owner_rls_bound_and_has_no_ddl()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;

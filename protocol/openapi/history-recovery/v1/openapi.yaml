@@ -1,0 +1,254 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk History Recovery V1
+  version: 1.0.0
+  description: >-
+    Candidate-authorized recovery of opaque history and per-scope MLS Welcome
+    material. The service never receives history plaintext, MLS private state,
+    epoch secrets, or an active UI scope. Exact retries return the original
+    immutable receipt; changed bytes conflict.
+paths:
+  /v1/devices/enroll/challenges:
+    post:
+      operationId: createHistoryRecoveryChallengeV1
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.history-recovery-request.v1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 16384
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/EnrollmentStatus'}
+        '200': {$ref: '#/components/responses/EnrollmentStatus'}
+        '409': {description: Idempotency, request, or observed-head conflict.}
+        '422': {description: Candidate signature, validity window, or exact CBOR rejected.}
+  /v1/identities/{identity_id}/history-recovery-requests/{request_id}/mls-v5-authorization:
+    get:
+      operationId: getMlsV5RecoveryAuthorizationV1
+      description: >-
+        Returns a bounded redacted projection of current origin facts for one
+        exact MLS V5 recovery add. The response is unsigned and non-portable:
+        callers must repeat the hardened origin fetch for every submit, replay,
+        or receipt readback. Authorization, capability, snapshot, KeyPackage,
+        private-state, and epoch-secret bytes are never returned.
+      x-dirextalk-non-portable-origin-fact: true
+      parameters:
+        - $ref: '#/components/parameters/IdentityId'
+        - $ref: '#/components/parameters/RecoveryRequestId'
+        - $ref: '#/components/parameters/CandidateDeviceId'
+        - $ref: '#/components/parameters/ControllerDeviceId'
+        - $ref: '#/components/parameters/IdentityHeadDigest'
+        - $ref: '#/components/parameters/KeyPackageDigest'
+        - $ref: '#/components/parameters/RecoveryRequestDigest'
+        - $ref: '#/components/parameters/RecoveryScopeDigest'
+        - $ref: '#/components/parameters/MlsV5AuthorizationAccept'
+      responses:
+        '200': {$ref: '#/components/responses/MlsV5RecoveryAuthorization'}
+        '404': {description: Any requested or current authorization fact is unavailable.}
+        '422': {description: Route, query order, header set, or empty-body contract rejected.}
+        '503': {description: Origin facts cannot be checked safely at this time.}
+  /v1/key-packages/{package_id}:
+    put:
+      operationId: publishHistoryRecoveryKeyPackageV2
+      parameters:
+        - $ref: '#/components/parameters/PackageId'
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.key-package-publish.v2+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 131072
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/KeyPackagePublishReceipt'}
+        '200': {$ref: '#/components/responses/KeyPackagePublishReceipt'}
+        '409': {description: Package or idempotency identity conflicts.}
+        '422': {description: Request/scope binding, signature, expiry, or exact CBOR rejected.}
+  /v1/key-packages/claim:
+    post:
+      operationId: claimHistoryRecoveryKeyPackageV2
+      parameters:
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.key-package-claim.v2+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 16384
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/KeyPackageClaimReceipt'}
+        '200': {$ref: '#/components/responses/KeyPackageClaimReceipt'}
+        '404': {description: No exact request-and-scope-bound package is claimable.}
+        '409': {description: Claim or idempotency identity conflicts.}
+        '422': {description: Request/scope binding or exact CBOR rejected.}
+  /v3/devices/history-grants:
+    post:
+      operationId: grantDeviceHistoryV2
+      description: >-
+        The active provider and an independent current authority sign the same
+        unsigned grant. The provider highwater H and earliest sequence H + 1
+        are committed with the opaque offer and durable delivery facts.
+      parameters:
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.device-history-grant.v2+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 1048576
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/HistoryGrantReceiptV2'}
+        '200': {$ref: '#/components/responses/HistoryGrantReceiptV2'}
+        '409': {description: Request, idempotency, head, highwater, or envelope conflict.}
+        '422': {description: Provider/authority, offer, attachment, or exact CBOR rejected.}
+  /v2/mailbox/pull:
+    post:
+      operationId: pullIdentityMailboxV3
+      description: >-
+        Returns consecutive live envelopes and terminal ranges after the
+        authenticated device cursor. Delivery state is a cursor, never an
+        authorization source, and one device cannot consume another's page.
+      parameters:
+        - $ref: '#/components/parameters/DeviceSessionAuthorization'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.identity-mailbox-pull.v3+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 16384
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/IdentityPullReceiptV3'}
+        '401': {description: The active device session is rejected.}
+        '422': {description: Cursor, page bound, continuity, or exact CBOR rejected.}
+components:
+  parameters:
+    IdentityId:
+      name: identity_id
+      in: path
+      required: true
+      schema: {type: string, minLength: 57, maxLength: 57}
+    RecoveryRequestId:
+      name: request_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    CandidateDeviceId:
+      name: candidate_device_id
+      in: query
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    ControllerDeviceId:
+      name: controller_device_id
+      in: query
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    IdentityHeadDigest:
+      name: identity_head_digest
+      in: query
+      required: true
+      schema: {$ref: '#/components/schemas/Sha256Digest'}
+    KeyPackageDigest:
+      name: key_package_digest
+      in: query
+      required: true
+      schema: {$ref: '#/components/schemas/Sha256Digest'}
+    RecoveryRequestDigest:
+      name: recovery_request_digest
+      in: query
+      required: true
+      schema: {$ref: '#/components/schemas/Sha256Digest'}
+    RecoveryScopeDigest:
+      name: recovery_scope_digest
+      in: query
+      required: true
+      schema: {$ref: '#/components/schemas/Sha256Digest'}
+    MlsV5AuthorizationAccept:
+      name: Accept
+      in: header
+      required: true
+      schema:
+        type: string
+        enum: [application/vnd.dirextalk.mls-v5-recovery-authorization.v1+cbor]
+    PackageId:
+      name: package_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 16, maxLength: 128, pattern: '^[A-Za-z0-9_-]{16,128}$'}
+    DeviceSessionAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      schema: {type: string}
+  schemas:
+    ExactCanonicalCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    Sha256Digest:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+  responses:
+    MlsV5RecoveryAuthorization:
+      description: >-
+        Fresh origin-authenticated authorization facts only; never cache or
+        reuse this response as a portable proof.
+      headers:
+        Cache-Control:
+          required: true
+          schema: {type: string, const: no-store}
+        X-Content-Type-Options:
+          required: true
+          schema: {type: string, const: nosniff}
+      content:
+        application/vnd.dirextalk.mls-v5-recovery-authorization.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          x-dirextalk-max-body-bytes: 4096
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    EnrollmentStatus:
+      description: Non-cacheable capability-gated enrollment status.
+      content:
+        application/vnd.dirextalk.device-enrollment-status.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    KeyPackagePublishReceipt:
+      description: Immutable package digest and expiry receipt.
+      content:
+        application/vnd.dirextalk.key-package-publish-receipt.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    KeyPackageClaimReceipt:
+      description: Exact originally published scoped package envelope.
+      content:
+        application/vnd.dirextalk.key-package-claim-receipt.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    HistoryGrantReceiptV2:
+      description: Immutable mailbox envelope receipt for the V2 opaque offer.
+      content:
+        application/vnd.dirextalk.device-history-grant-receipt.v2+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    IdentityPullReceiptV3:
+      description: Consecutive live-envelope and terminal-range page.
+      content:
+        application/vnd.dirextalk.identity-mailbox-pull-receipt.v3+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}

@@ -5,9 +5,14 @@
 //! workflow or an existing identity's active controller, and requires the new
 //! device to confirm the signed receipt before becoming routable.
 
-use dtx_domain::{DeviceId, IdentityId, RequestId, Revision, TenantId};
+use dtx_domain::{
+    DeviceEnrollmentChallengeId, DeviceId, IdentityId, RequestId, Revision, TenantId,
+};
 use dtx_group_policy::GroupScope;
-use dtx_identity_persistence::{DeviceSessionCredential, DeviceSessionRepository};
+use dtx_identity_log::{DeviceStatusV1, IdentityLogEventPayloadV1, IdentityLogEventV1};
+use dtx_identity_persistence::{
+    DeviceSessionCredential, DeviceSessionRepository, lock_and_load_active_snapshot,
+};
 use dtx_membership_command::MembershipCommandId;
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, Sha256Digest, SigningPublicKey,
@@ -36,6 +41,14 @@ const V3_RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt-signat
 const V4_REQUEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-request.v4\0";
 const V4_RECEIPT_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt.v4\0";
 const V4_RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt-signature.v4\0";
+const V5_REQUEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-request.v5\0";
+const V5_RECEIPT_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt.v5\0";
+const V5_RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-commit-receipt-signature.v5\0";
+const V5_CONTROLLER_CONSENT_DIGEST_DOMAIN: &[u8] =
+    b"dirextalk.mls-recovery-controller-consent-digest.v5\0";
+const V5_CONTROLLER_CONSENT_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.mls-recovery-controller-consent-signature.v5\0";
+const V5_RECOVERY_SCOPE_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-recovery-scope-digest.v5\0";
 const DEVICE_CONFIRMATION_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.mls-device-join-confirmation.v1\0";
 /// V2 candidate possession transcript digest domain.
 pub const MLS_CANDIDATE_PROOF_DIGEST_DOMAIN: &[u8] = b"dirextalk.mls-candidate-proof-digest.v2\0";
@@ -126,12 +139,65 @@ pub enum MlsCommitAuthorization {
         /// Verified consent transcript digest binding scope, new device and `KeyPackage`.
         controller_consent_digest: Sha256Digest,
     },
+    /// V40 recovery admission controlled by an already-active leaf of the same identity.
+    ExistingMemberDeviceRecoveryAdd {
+        controller_device_id: DeviceId,
+        controller_consent_digest: Sha256Digest,
+        recovery_request_id: DeviceEnrollmentChallengeId,
+        recovery_request_digest: Sha256Digest,
+        recovery_scope_digest: Sha256Digest,
+    },
+    /// V40 removal of one identity-log-revoked device leaf only.
+    ExistingMemberDeviceRemove {
+        identity_revoke_head_digest: Sha256Digest,
+    },
     /// Owner-authored removal of one non-owner identity whose exact sole
     /// active MLS leaf is bound by the command target fields.
     MemberRemovalV4 {
         /// Product policy revision observed before preparing the MLS removal.
         expected_policy_revision: Revision,
     },
+}
+
+/// Immutable V40 authorization coordinates retained by the Group runtime.
+///
+/// These are lookup coordinates, not a portable identity authorization proof.
+/// A federated caller must re-fetch the authoritative origin facts before each
+/// receipt is returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MlsV5FederatedAuthorizationFacts {
+    identity_id: IdentityId,
+    controller_device_id: DeviceId,
+    candidate_device_id: DeviceId,
+    candidate_key_package_digest: Sha256Digest,
+    authorization: MlsCommitAuthorization,
+}
+
+impl MlsV5FederatedAuthorizationFacts {
+    #[must_use]
+    pub const fn identity_id(self) -> IdentityId {
+        self.identity_id
+    }
+
+    #[must_use]
+    pub const fn controller_device_id(self) -> DeviceId {
+        self.controller_device_id
+    }
+
+    #[must_use]
+    pub const fn candidate_device_id(self) -> DeviceId {
+        self.candidate_device_id
+    }
+
+    #[must_use]
+    pub const fn candidate_key_package_digest(self) -> Sha256Digest {
+        self.candidate_key_package_digest
+    }
+
+    #[must_use]
+    pub const fn authorization(self) -> MlsCommitAuthorization {
+        self.authorization
+    }
 }
 
 /// Fully proof-verified MLS commit submission.
@@ -314,6 +380,108 @@ impl MlsCommitCommand {
         Ok(command)
     }
 
+    /// Constructs V40 same-identity device recovery without any candidate
+    /// signature over controller-created final transcript bytes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed commit bounds or digests and incomplete recovery-add facts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v5_existing_member_device_recovery_add(
+        submission_id: RequestId,
+        scope: GroupScope,
+        actor_identity_id: IdentityId,
+        controller_device_id: DeviceId,
+        candidate_device_id: DeviceId,
+        candidate_key_package_digest: Sha256Digest,
+        idempotency_key_hash: Sha256Digest,
+        expected_epoch: u64,
+        expected_head: Sha256Digest,
+        commit_bytes: Vec<u8>,
+        commit_digest: Sha256Digest,
+        welcome_digest: Sha256Digest,
+        recovery_request_id: DeviceEnrollmentChallengeId,
+        recovery_request_digest: Sha256Digest,
+        recovery_scope_digest: Sha256Digest,
+        controller_consent_digest: Sha256Digest,
+    ) -> Result<Self, GroupPersistenceError> {
+        let zero = Sha256Digest::from_bytes([0; 32]);
+        if candidate_key_package_digest == zero || welcome_digest == zero {
+            return Err(GroupPersistenceError::MlsAuthorizationRejected);
+        }
+        let mut command = Self::new(
+            submission_id,
+            scope,
+            actor_identity_id,
+            controller_device_id,
+            actor_identity_id,
+            candidate_device_id,
+            candidate_key_package_digest,
+            zero,
+            idempotency_key_hash,
+            expected_epoch,
+            expected_head,
+            commit_bytes,
+            commit_digest,
+            welcome_digest,
+            MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                controller_device_id,
+                controller_consent_digest,
+                recovery_request_id,
+                recovery_request_digest,
+                recovery_scope_digest,
+            },
+        )?;
+        command.protocol_version = 5;
+        command.request_digest = command.compute_request_digest()?;
+        Ok(command)
+    }
+
+    /// Constructs V40 removal of one revoked device leaf while preserving the
+    /// account-level group membership and every other active leaf.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed commit bounds or digests and invalid removal facts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_v5_existing_member_device_remove(
+        submission_id: RequestId,
+        scope: GroupScope,
+        identity_id: IdentityId,
+        controller_device_id: DeviceId,
+        revoked_device_id: DeviceId,
+        idempotency_key_hash: Sha256Digest,
+        expected_epoch: u64,
+        expected_head: Sha256Digest,
+        commit_bytes: Vec<u8>,
+        commit_digest: Sha256Digest,
+        identity_revoke_head_digest: Sha256Digest,
+    ) -> Result<Self, GroupPersistenceError> {
+        let zero = Sha256Digest::from_bytes([0; 32]);
+        let mut command = Self::new(
+            submission_id,
+            scope,
+            identity_id,
+            controller_device_id,
+            identity_id,
+            revoked_device_id,
+            zero,
+            zero,
+            idempotency_key_hash,
+            expected_epoch,
+            expected_head,
+            commit_bytes,
+            commit_digest,
+            zero,
+            MlsCommitAuthorization::ExistingMemberDeviceRemove {
+                identity_revoke_head_digest,
+            },
+        )?;
+        command.protocol_version = 5;
+        command.request_digest = command.compute_request_digest()?;
+        Ok(command)
+    }
+
     #[allow(clippy::too_many_lines)] // Keeping the versioned canonical field order contiguous makes transcript review safer.
     fn compute_request_digest(&self) -> Result<Sha256Digest, GroupPersistenceError> {
         let (authorization_code, command_id, authorization_digest, controller_device, consent) =
@@ -350,12 +518,32 @@ impl MlsCommitCommand {
                     CanonicalValue::Text(controller_device_id.to_string()),
                     controller_consent_digest.to_canonical_value(),
                 ),
+                MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                    controller_device_id,
+                    controller_consent_digest,
+                    ..
+                } => (
+                    4,
+                    CanonicalValue::Null,
+                    CanonicalValue::Null,
+                    CanonicalValue::Text(controller_device_id.to_string()),
+                    controller_consent_digest.to_canonical_value(),
+                ),
                 MlsCommitAuthorization::MemberRemovalV4 {
                     expected_policy_revision,
                 } => (
                     3,
                     CanonicalValue::Null,
                     CanonicalValue::Unsigned(expected_policy_revision.get()),
+                    CanonicalValue::Null,
+                    CanonicalValue::Null,
+                ),
+                MlsCommitAuthorization::ExistingMemberDeviceRemove {
+                    identity_revoke_head_digest,
+                } => (
+                    5,
+                    CanonicalValue::Null,
+                    identity_revoke_head_digest.to_canonical_value(),
                     CanonicalValue::Null,
                     CanonicalValue::Null,
                 ),
@@ -388,7 +576,12 @@ impl MlsCommitCommand {
             ),
             (
                 CanonicalValue::Unsigned(8),
-                if self.protocol_version == 4 {
+                if self.protocol_version == 4
+                    || matches!(
+                        self.authorization,
+                        MlsCommitAuthorization::ExistingMemberDeviceRemove { .. }
+                    )
+                {
                     CanonicalValue::Null
                 } else {
                     self.candidate_key_package_digest.to_canonical_value()
@@ -396,7 +589,12 @@ impl MlsCommitCommand {
             ),
             (
                 CanonicalValue::Unsigned(9),
-                if self.protocol_version == 4 {
+                if self.protocol_version == 4
+                    || matches!(
+                        self.authorization,
+                        MlsCommitAuthorization::ExistingMemberDeviceRemove { .. }
+                    )
+                {
                     CanonicalValue::Null
                 } else {
                     self.candidate_proof_digest.to_canonical_value()
@@ -416,7 +614,12 @@ impl MlsCommitCommand {
             ),
             (
                 CanonicalValue::Unsigned(13),
-                if self.protocol_version == 4 {
+                if self.protocol_version == 4
+                    || matches!(
+                        self.authorization,
+                        MlsCommitAuthorization::ExistingMemberDeviceRemove { .. }
+                    )
+                {
                     CanonicalValue::Null
                 } else {
                     self.welcome_digest.to_canonical_value()
@@ -446,6 +649,26 @@ impl MlsCommitCommand {
                 approval_request_digest.to_canonical_value(),
             ));
         }
+        if let MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+            recovery_request_id,
+            recovery_request_digest,
+            recovery_scope_digest,
+            ..
+        } = self.authorization
+        {
+            fields.push((
+                CanonicalValue::Unsigned(19),
+                CanonicalValue::Text(recovery_request_id.to_string()),
+            ));
+            fields.push((
+                CanonicalValue::Unsigned(20),
+                recovery_request_digest.to_canonical_value(),
+            ));
+            fields.push((
+                CanonicalValue::Unsigned(21),
+                recovery_scope_digest.to_canonical_value(),
+            ));
+        }
         let canonical = CanonicalValue::Map(fields);
         encode_deterministic_cbor(&canonical)
             .map(|bytes| {
@@ -453,6 +676,7 @@ impl MlsCommitCommand {
                     match self.protocol_version {
                         3 => V3_REQUEST_DIGEST_DOMAIN,
                         4 => V4_REQUEST_DIGEST_DOMAIN,
+                        5 => V5_REQUEST_DIGEST_DOMAIN,
                         _ => REQUEST_DIGEST_DOMAIN,
                     },
                     &bytes,
@@ -543,6 +767,10 @@ impl MlsCommitCommand {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeping the canonical numbered transcript fields contiguous makes review safer"
+)]
 fn mls_device_proof_transcript(command: &MlsCommitCommand) -> CanonicalValue {
     let (operation, membership_command, approval_digest, controller_device) =
         match command.authorization {
@@ -575,11 +803,26 @@ fn mls_device_proof_transcript(command: &MlsCommitCommand) -> CanonicalValue {
                 CanonicalValue::Null,
                 CanonicalValue::Text(controller_device_id.to_string()),
             ),
+            MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                controller_device_id,
+                ..
+            } => (
+                5,
+                CanonicalValue::Null,
+                CanonicalValue::Null,
+                CanonicalValue::Text(controller_device_id.to_string()),
+            ),
             MlsCommitAuthorization::MemberRemovalV4 { .. } => (
                 4,
                 CanonicalValue::Null,
                 CanonicalValue::Null,
                 CanonicalValue::Null,
+            ),
+            MlsCommitAuthorization::ExistingMemberDeviceRemove { .. } => (
+                6,
+                CanonicalValue::Null,
+                CanonicalValue::Null,
+                CanonicalValue::Text(command.actor_device_id.to_string()),
             ),
         };
     CanonicalValue::Map(vec![
@@ -719,6 +962,72 @@ pub fn mls_controller_consent_signature_input(
     let mut input =
         Vec::with_capacity(MLS_CONTROLLER_CONSENT_SIGNATURE_DOMAIN.len() + digest.as_bytes().len());
     input.extend_from_slice(MLS_CONTROLLER_CONSENT_SIGNATURE_DOMAIN);
+    input.extend_from_slice(digest.as_bytes());
+    Ok(input)
+}
+
+/// Recomputes the V40 controller transcript. It binds the exact recovery
+/// request/scope/package and final parent/Commit/Welcome coordinates while
+/// deliberately requiring no candidate final-transcript private key.
+///
+/// # Errors
+///
+/// Rejects non-V5 authorization kinds and canonical transcript encoding failures.
+pub fn mls_v5_controller_consent_digest(
+    command: &MlsCommitCommand,
+) -> Result<Sha256Digest, GroupPersistenceError> {
+    let CanonicalValue::Map(mut fields) = mls_device_proof_transcript(command) else {
+        unreachable!()
+    };
+    match command.authorization {
+        MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+            recovery_request_id,
+            recovery_request_digest,
+            recovery_scope_digest,
+            ..
+        } => {
+            fields.push((
+                CanonicalValue::Unsigned(19),
+                CanonicalValue::Text(recovery_request_id.to_string()),
+            ));
+            fields.push((
+                CanonicalValue::Unsigned(20),
+                recovery_request_digest.to_canonical_value(),
+            ));
+            fields.push((
+                CanonicalValue::Unsigned(21),
+                recovery_scope_digest.to_canonical_value(),
+            ));
+        }
+        MlsCommitAuthorization::ExistingMemberDeviceRemove {
+            identity_revoke_head_digest,
+        } => {
+            fields.push((
+                CanonicalValue::Unsigned(19),
+                identity_revoke_head_digest.to_canonical_value(),
+            ));
+        }
+        _ => return Err(GroupPersistenceError::MlsAuthorizationRejected),
+    }
+    let bytes = encode_deterministic_cbor(&CanonicalValue::Map(fields))
+        .map_err(|_| GroupPersistenceError::CorruptData("MLS V5 controller consent encoding"))?;
+    Ok(Sha256Digest::hash_domain(
+        V5_CONTROLLER_CONSENT_DIGEST_DOMAIN,
+        &bytes,
+    ))
+}
+
+/// Exact V40 active-controller signature input.
+///
+/// # Errors
+///
+/// Rejects commands that cannot produce a valid V5 controller-consent digest.
+pub fn mls_v5_controller_consent_signature_input(
+    command: &MlsCommitCommand,
+) -> Result<Vec<u8>, GroupPersistenceError> {
+    let digest = mls_v5_controller_consent_digest(command)?;
+    let mut input = Vec::with_capacity(V5_CONTROLLER_CONSENT_SIGNATURE_DOMAIN.len() + 32);
+    input.extend_from_slice(V5_CONTROLLER_CONSENT_SIGNATURE_DOMAIN);
     input.extend_from_slice(digest.as_bytes());
     Ok(input)
 }
@@ -1306,6 +1615,277 @@ impl MlsCommitSequencerRepository {
         settle(session, result).await
     }
 
+    /// Accepts a federated V40 recovery add or exact revoked-leaf removal.
+    ///
+    /// The caller must resolve the controller from the authoritative identity
+    /// origin and validate the operation-specific fresh origin facts. This
+    /// transaction then verifies the route proof and controller consent before
+    /// replay lookup or persistence. It never reads an `identity.*` table.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_verified_v5_with_proof<FP, FA, FS>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        actor: VerifiedDeviceActor,
+        command: &MlsCommitCommand,
+        controller_signature: Ed25519Signature,
+        now_ms: i64,
+        sequencer_signing_key: SigningPublicKey,
+        verify_proof: FP,
+        verify_origin_authorization: FA,
+        sign_receipt: FS,
+    ) -> Result<MlsCommitExecution, GroupPersistenceError>
+    where
+        FP: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+        FA: FnOnce(&MlsCommitCommand) -> Result<(), GroupPersistenceError>,
+        FS: FnOnce(&[u8]) -> Result<Ed25519Signature, GroupPersistenceError>,
+    {
+        if command.protocol_version != 5
+            || !matches!(
+                command.authorization,
+                MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd { .. }
+                    | MlsCommitAuthorization::ExistingMemberDeviceRemove { .. }
+            )
+        {
+            return Err(GroupPersistenceError::MlsAuthorizationRejected);
+        }
+        let mut session = store.begin(tenant_id).await?;
+        let result = async {
+            if actor.identity_id() != command.actor_identity_id
+                || actor.device_id() != command.actor_device_id
+                || command.actor_identity_id != command.candidate_identity_id
+            {
+                return Err(GroupPersistenceError::DeviceAuthenticationRejected);
+            }
+            verify_proof(actor.signing_key())?;
+            let zero = Sha256Digest::from_bytes([0; 32]);
+            let expected_controller_digest = mls_v5_controller_consent_digest(command)?;
+            match command.authorization {
+                MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                    controller_device_id,
+                    controller_consent_digest,
+                    recovery_scope_digest,
+                    ..
+                } => {
+                    if controller_device_id != command.actor_device_id
+                        || controller_consent_digest != expected_controller_digest
+                        || recovery_scope_digest != mls_recovery_scope_digest(command.scope)?
+                        || command.candidate_key_package_digest == zero
+                        || command.welcome_digest == zero
+                    {
+                        return Err(GroupPersistenceError::MlsAuthorizationRejected);
+                    }
+                }
+                MlsCommitAuthorization::ExistingMemberDeviceRemove { .. } => {
+                    if command.actor_device_id == command.candidate_device_id
+                        || command.candidate_key_package_digest != zero
+                        || command.candidate_proof_digest != zero
+                        || command.welcome_digest != zero
+                    {
+                        return Err(GroupPersistenceError::MlsAuthorizationRejected);
+                    }
+                }
+                _ => return Err(GroupPersistenceError::MlsAuthorizationRejected),
+            }
+            verify_origin_authorization(command)?;
+            verify_signature(
+                actor.signing_key(),
+                &mls_v5_controller_consent_signature_input(command)?,
+                controller_signature,
+            )
+            .map_err(|_| GroupPersistenceError::MlsAuthorizationRejected)?;
+            submit_in_transaction(
+                session.connection(),
+                tenant_id,
+                command,
+                now_ms,
+                sequencer_signing_key,
+                |_| Ok(()),
+                |_| Ok(()),
+                sign_receipt,
+            )
+            .await
+        }
+        .await;
+        settle(session, result).await
+    }
+
+    /// Authenticates an active same-identity controller and accepts a V40
+    /// recovery add or revoked-leaf removal. No candidate final-transcript
+    /// signature is accepted at this boundary.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn submit_authenticated_v5<FS>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        credential: &DeviceSessionCredential,
+        command: &MlsCommitCommand,
+        controller_signature: Ed25519Signature,
+        now_ms: i64,
+        sequencer_signing_key: SigningPublicKey,
+        sign_receipt: FS,
+    ) -> Result<MlsCommitExecution, GroupPersistenceError>
+    where
+        FS: FnOnce(&[u8]) -> Result<Ed25519Signature, GroupPersistenceError>,
+    {
+        if command.protocol_version != 5
+            || !matches!(
+                command.authorization,
+                MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd { .. }
+                    | MlsCommitAuthorization::ExistingMemberDeviceRemove { .. }
+            )
+        {
+            return Err(GroupPersistenceError::MlsAuthorizationRejected);
+        }
+        let (mut session, authenticated) =
+            begin_authenticated_with_signing_key(store, tenant_id, credential, now_ms).await?;
+        if authenticated.session().identity_id() != command.actor_identity_id
+            || authenticated.session().device_id() != command.actor_device_id
+            || command.actor_identity_id != command.candidate_identity_id
+        {
+            return settle(
+                session,
+                Err(GroupPersistenceError::DeviceAuthenticationRejected),
+            )
+            .await;
+        }
+        let expected_controller_digest = mls_v5_controller_consent_digest(command)?;
+        let authorization = async {
+            match command.authorization {
+                MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                    controller_device_id,
+                    controller_consent_digest,
+                    recovery_request_id,
+                    recovery_request_digest,
+                    recovery_scope_digest,
+                } => {
+                    if controller_device_id != command.actor_device_id
+                        || controller_consent_digest != expected_controller_digest
+                        || recovery_scope_digest != mls_recovery_scope_digest(command.scope)?
+                        || command.candidate_key_package_digest == Sha256Digest::from_bytes([0; 32])
+                        || command.welcome_digest == Sha256Digest::from_bytes([0; 32])
+                    {
+                        return Err(GroupPersistenceError::MlsAuthorizationRejected);
+                    }
+                    DeviceSessionRepository::active_device_signing_key_in_transaction(
+                        session.connection(),
+                        command.candidate_identity_id,
+                        command.candidate_device_id,
+                    )
+                    .await
+                    .map_err(|_| GroupPersistenceError::MlsAuthorizationRejected)?;
+                    let approved_head: Option<Vec<u8>> = sqlx::query_scalar(
+                        "SELECT approved_head_hash
+                           FROM identity.history_recovery_request_authorized($1,$2,$3,$4,$5)",
+                    )
+                    .bind(command.candidate_identity_id.to_string())
+                    .bind(*recovery_request_id.as_uuid())
+                    .bind(recovery_request_digest.as_bytes().as_slice())
+                    .bind(*command.candidate_device_id.as_uuid())
+                    .bind(now_ms)
+                    .fetch_optional(&mut *session.connection())
+                    .await?;
+                    let current_snapshot = lock_and_load_active_snapshot(
+                        session.connection(),
+                        command.candidate_identity_id,
+                    )
+                    .await
+                    .map_err(|_| GroupPersistenceError::MlsAuthorizationRejected)?;
+                    let request_ok = approved_head
+                        .map(|head| digest(head, "history recovery approved head"))
+                        .transpose()?
+                        == Some(current_snapshot.head().hash());
+                    let package_ok: bool = sqlx::query_scalar(
+                        "SELECT identity.scoped_key_package_claim_authorized($1,$2,$3,$4,$5,$6)",
+                    )
+                    .bind(command.candidate_identity_id.to_string())
+                    .bind(*command.candidate_device_id.as_uuid())
+                    .bind(command.candidate_key_package_digest.as_bytes().as_slice())
+                    .bind(recovery_request_digest.as_bytes().as_slice())
+                    .bind(recovery_scope_digest.as_bytes().as_slice())
+                    .bind(*controller_device_id.as_uuid())
+                    .fetch_one(&mut *session.connection())
+                    .await?;
+                    if !request_ok || !package_ok {
+                        return Err(GroupPersistenceError::MlsAuthorizationRejected);
+                    }
+                }
+                MlsCommitAuthorization::ExistingMemberDeviceRemove {
+                    identity_revoke_head_digest,
+                } => {
+                    if command.welcome_digest != Sha256Digest::from_bytes([0; 32]) {
+                        return Err(GroupPersistenceError::MlsAuthorizationRejected);
+                    }
+                    let snapshot = lock_and_load_active_snapshot(
+                        session.connection(),
+                        command.candidate_identity_id,
+                    )
+                    .await
+                    .map_err(|_| GroupPersistenceError::MlsAuthorizationRejected)?;
+                    let exact_head_event: Vec<u8> = sqlx::query_scalar(
+                        "SELECT event_bytes FROM identity.log_entries
+                          WHERE identity_id=$1 AND sequence=$2",
+                    )
+                    .bind(command.candidate_identity_id.to_string())
+                    .bind(
+                        i64::try_from(snapshot.head().sequence().get()).map_err(|_| {
+                            GroupPersistenceError::CorruptData("identity revoke head sequence")
+                        })?,
+                    )
+                    .fetch_one(&mut *session.connection())
+                    .await?;
+                    let head_event = IdentityLogEventV1::decode_and_verify(&exact_head_event)
+                        .map_err(|_| {
+                            GroupPersistenceError::CorruptData("identity revoke head event")
+                        })?;
+                    let exact_target_revoke = head_event.identity_id()
+                        == command.candidate_identity_id
+                        && head_event.sequence() == snapshot.head().sequence()
+                        && head_event.entry_hash().map_err(|_| {
+                            GroupPersistenceError::CorruptData("identity revoke head digest")
+                        })? == snapshot.head().hash()
+                        && matches!(
+                            head_event.payload(),
+                            IdentityLogEventPayloadV1::DeviceRevoke { device_id }
+                                if *device_id == command.candidate_device_id
+                        );
+                    if snapshot.head().hash() != identity_revoke_head_digest
+                        || snapshot
+                            .projection()
+                            .device_status(command.candidate_device_id)
+                            != Some(DeviceStatusV1::Revoked)
+                        || !exact_target_revoke
+                    {
+                        return Err(GroupPersistenceError::MlsAuthorizationRejected);
+                    }
+                }
+                _ => return Err(GroupPersistenceError::MlsAuthorizationRejected),
+            }
+            verify_signature(
+                authenticated.signing_key(),
+                &mls_v5_controller_consent_signature_input(command)?,
+                controller_signature,
+            )
+            .map_err(|_| GroupPersistenceError::MlsAuthorizationRejected)
+        }
+        .await;
+        if let Err(error) = authorization {
+            return settle(session, Err(error)).await;
+        }
+        let result = submit_in_transaction(
+            session.connection(),
+            tenant_id,
+            command,
+            now_ms,
+            sequencer_signing_key,
+            |_| Ok(()),
+            |_| Ok(()),
+            sign_receipt,
+        )
+        .await;
+        settle(session, result).await
+    }
+
     /// Authenticates an actor or candidate before returning an immutable receipt.
     pub async fn receipt_authenticated(
         self,
@@ -1352,7 +1932,7 @@ impl MlsCommitSequencerRepository {
         settle(session, result).await
     }
 
-    /// Returns an immutable V30/V32 receipt to the freshly resolved federated
+    /// Returns an immutable V30/V32/V40 receipt to the freshly resolved federated
     /// submission actor. Proof verification and durable actor/request/key
     /// binding are checked in the same transaction as receipt readback.
     #[allow(clippy::too_many_arguments)]
@@ -1404,6 +1984,142 @@ impl MlsCommitSequencerRepository {
             .await?
             .filter(|receipt| matches!(receipt.protocol_version(), 3 | 4))
             .ok_or(GroupPersistenceError::ActionProofRejected)
+        }
+        .await;
+        settle(session, result).await
+    }
+
+    /// Returns a federated V40 receipt together with the exact immutable
+    /// coordinates that the HTTP boundary must revalidate at the identity
+    /// origin before emitting that receipt.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one transactional read validates every persisted V5 replay coordinate"
+    )]
+    pub async fn receipt_verified_v5_with_proof<F>(
+        self,
+        store: &GroupPgStore,
+        tenant_id: TenantId,
+        actor: VerifiedDeviceActor,
+        scope: GroupScope,
+        submission_id: RequestId,
+        expected_request_digest: Sha256Digest,
+        expected_idempotency_key_hash: Sha256Digest,
+        expected_signing_key: SigningPublicKey,
+        verify_proof: F,
+    ) -> Result<(MlsCommitReceipt, MlsV5FederatedAuthorizationFacts), GroupPersistenceError>
+    where
+        F: FnOnce(SigningPublicKey) -> Result<(), GroupPersistenceError>,
+    {
+        let mut session = store.begin(tenant_id).await?;
+        let result = async {
+            verify_proof(actor.signing_key())?;
+            let (kind, id) = scope_columns(scope);
+            let row = sqlx::query(
+                "SELECT authorization_kind,candidate_identity_id,candidate_device_id,
+                        candidate_key_package_digest,controller_device_id,
+                        history_recovery_request_id,recovery_request_digest,
+                        recovery_scope_digest,identity_revoke_head_digest
+                   FROM groups.mls_commit_intents
+                  WHERE tenant_id=$1 AND submission_id=$2 AND scope_kind=$3 AND scope_id=$4
+                    AND protocol_version=5 AND actor_identity_id=$5 AND actor_device_id=$6
+                    AND request_digest=$7 AND idempotency_key_hash=$8",
+            )
+            .bind(Uuid::from(tenant_id))
+            .bind(Uuid::from(submission_id))
+            .bind(kind)
+            .bind(id)
+            .bind(actor.identity_id().to_string())
+            .bind(Uuid::from(actor.device_id()))
+            .bind(expected_request_digest.as_bytes().as_slice())
+            .bind(expected_idempotency_key_hash.as_bytes().as_slice())
+            .fetch_optional(session.connection())
+            .await?
+            .ok_or(GroupPersistenceError::ActionProofRejected)?;
+            let identity_id = row
+                .try_get::<String, _>("candidate_identity_id")?
+                .parse::<IdentityId>()
+                .map_err(|_| GroupPersistenceError::CorruptData("MLS V5 identity"))?;
+            let candidate_device_id =
+                DeviceId::try_from(row.try_get::<Uuid, _>("candidate_device_id")?)
+                    .map_err(|_| GroupPersistenceError::CorruptData("MLS V5 candidate device"))?;
+            let candidate_key_package_digest = digest(
+                row.try_get("candidate_key_package_digest")?,
+                "MLS V5 key package",
+            )?;
+            let authorization_kind: String = row.try_get("authorization_kind")?;
+            let (controller_device_id, authorization) = match authorization_kind.as_str() {
+                "existing_member_device_add" => {
+                    let controller_device_id =
+                        DeviceId::try_from(row.try_get::<Uuid, _>("controller_device_id")?)
+                            .map_err(|_| {
+                                GroupPersistenceError::CorruptData("MLS V5 controller device")
+                            })?;
+                    let recovery_request_id = DeviceEnrollmentChallengeId::try_from(
+                        row.try_get::<Uuid, _>("history_recovery_request_id")?,
+                    )
+                    .map_err(|_| GroupPersistenceError::CorruptData("MLS V5 recovery request"))?;
+                    let recovery_request_digest = digest(
+                        row.try_get("recovery_request_digest")?,
+                        "MLS V5 recovery request",
+                    )?;
+                    let recovery_scope_digest = digest(
+                        row.try_get("recovery_scope_digest")?,
+                        "MLS V5 recovery scope",
+                    )?;
+                    (
+                        controller_device_id,
+                        MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+                            controller_device_id,
+                            controller_consent_digest: Sha256Digest::from_bytes([0; 32]),
+                            recovery_request_id,
+                            recovery_request_digest,
+                            recovery_scope_digest,
+                        },
+                    )
+                }
+                "existing_member_device_remove" => {
+                    let identity_revoke_head_digest = digest(
+                        row.try_get("identity_revoke_head_digest")?,
+                        "MLS V5 identity revoke head",
+                    )?;
+                    (
+                        actor.device_id(),
+                        MlsCommitAuthorization::ExistingMemberDeviceRemove {
+                            identity_revoke_head_digest,
+                        },
+                    )
+                }
+                _ => {
+                    return Err(GroupPersistenceError::CorruptData(
+                        "MLS V5 authorization kind",
+                    ));
+                }
+            };
+            if identity_id != actor.identity_id() || controller_device_id != actor.device_id() {
+                return Err(GroupPersistenceError::ActionProofRejected);
+            }
+            let receipt = load_receipt(
+                session.connection(),
+                tenant_id,
+                scope,
+                submission_id,
+                expected_signing_key,
+            )
+            .await?
+            .filter(|receipt| receipt.protocol_version() == 5)
+            .ok_or(GroupPersistenceError::ActionProofRejected)?;
+            Ok((
+                receipt,
+                MlsV5FederatedAuthorizationFacts {
+                    identity_id,
+                    controller_device_id,
+                    candidate_device_id,
+                    candidate_key_package_digest,
+                    authorization,
+                },
+            ))
         }
         .await;
         settle(session, result).await
@@ -1799,6 +2515,7 @@ where
         match command.protocol_version {
             3 => V3_RECEIPT_DIGEST_DOMAIN,
             4 => V4_RECEIPT_DIGEST_DOMAIN,
+            5 => V5_RECEIPT_DIGEST_DOMAIN,
             _ => RECEIPT_DIGEST_DOMAIN,
         },
         &canonical_cbor,
@@ -1839,6 +2556,7 @@ where
     if matches!(
         command.authorization,
         MlsCommitAuthorization::MemberRemovalV4 { .. }
+            | MlsCommitAuthorization::ExistingMemberDeviceRemove { .. }
     ) {
         let removed = sqlx::query(
             "UPDATE groups.mls_device_members
@@ -1936,6 +2654,7 @@ async fn authorize(
         && !matches!(
             command.authorization,
             MlsCommitAuthorization::MemberRemovalV4 { .. }
+                | MlsCommitAuthorization::ExistingMemberDeviceRemove { .. }
         )
     {
         return Err(GroupPersistenceError::MlsAuthorizationRejected);
@@ -2085,6 +2804,85 @@ async fn authorize(
                 return Err(GroupPersistenceError::MlsAuthorizationRejected);
             }
         }
+        MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+            controller_device_id,
+            ..
+        } => {
+            let identity_is_member: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM groups.members
+                  WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND identity_id=$4)",
+            )
+            .bind(Uuid::from(tenant_id))
+            .bind(kind)
+            .bind(&id)
+            .bind(command.candidate_identity_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            let controller_active: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM groups.mls_device_members
+                  WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND identity_id=$4
+                    AND device_id=$5 AND state='active')",
+            )
+            .bind(Uuid::from(tenant_id))
+            .bind(kind)
+            .bind(&id)
+            .bind(command.candidate_identity_id.to_string())
+            .bind(Uuid::from(controller_device_id))
+            .fetch_one(&mut *connection)
+            .await?;
+            if command.protocol_version != 5
+                || command.actor_identity_id != command.candidate_identity_id
+                || command.actor_device_id != controller_device_id
+                || !identity_is_member
+                || !controller_active
+                || command.candidate_proof_digest != Sha256Digest::from_bytes([0; 32])
+            {
+                return Err(GroupPersistenceError::MlsAuthorizationRejected);
+            }
+        }
+        MlsCommitAuthorization::ExistingMemberDeviceRemove { .. } => {
+            let identity_is_member: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM groups.members
+                  WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND identity_id=$4)",
+            )
+            .bind(Uuid::from(tenant_id))
+            .bind(kind)
+            .bind(&id)
+            .bind(command.candidate_identity_id.to_string())
+            .fetch_one(&mut *connection)
+            .await?;
+            let controller_active: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM groups.mls_device_members
+                  WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND identity_id=$4
+                    AND device_id=$5 AND state='active')",
+            )
+            .bind(Uuid::from(tenant_id))
+            .bind(kind)
+            .bind(&id)
+            .bind(command.actor_identity_id.to_string())
+            .bind(Uuid::from(command.actor_device_id))
+            .fetch_one(&mut *connection)
+            .await?;
+            let target_active = candidate_device_exists && sqlx::query_scalar::<_, bool>(
+                "SELECT state='active' FROM groups.mls_device_members
+                  WHERE tenant_id=$1 AND scope_kind=$2 AND scope_id=$3 AND identity_id=$4 AND device_id=$5",
+            ).bind(Uuid::from(tenant_id)).bind(kind).bind(&id)
+                .bind(command.candidate_identity_id.to_string())
+                .bind(Uuid::from(command.candidate_device_id)).fetch_one(&mut *connection).await?;
+            let zero = Sha256Digest::from_bytes([0; 32]);
+            if command.protocol_version != 5
+                || command.actor_identity_id != command.candidate_identity_id
+                || command.actor_device_id == command.candidate_device_id
+                || !identity_is_member
+                || !controller_active
+                || !target_active
+                || command.candidate_key_package_digest != zero
+                || command.candidate_proof_digest != zero
+                || command.welcome_digest != zero
+            {
+                return Err(GroupPersistenceError::MlsAuthorizationRejected);
+            }
+        }
         MlsCommitAuthorization::MemberRemovalV4 {
             expected_policy_revision,
         } => {
@@ -2168,6 +2966,10 @@ async fn authorize(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the versioned authorization-to-column mapping stays adjacent to its insert"
+)]
 async fn insert_intent(
     connection: &mut PgConnection,
     tenant_id: TenantId,
@@ -2186,10 +2988,24 @@ async fn insert_intent(
         controller_consent_digest,
         join_request_digest,
         approval_request_digest,
+        history_recovery_request_id,
+        recovery_request_digest,
+        recovery_scope_digest,
+        identity_revoke_head_digest,
     ) = match command.authorization {
-        MlsCommitAuthorization::OwnerBootstrap => {
-            ("owner_bootstrap", None, None, None, None, None, None)
-        }
+        MlsCommitAuthorization::OwnerBootstrap => (
+            "owner_bootstrap",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
         MlsCommitAuthorization::ApprovedIdentityJoin {
             membership_command_id,
             authorization_digest,
@@ -2197,6 +3013,10 @@ async fn insert_intent(
             "approved_identity_join",
             Some(Uuid::from(membership_command_id.request_id())),
             Some(authorization_digest.as_bytes().to_vec()),
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -2215,6 +3035,10 @@ async fn insert_intent(
             None,
             Some(join_request_digest.as_bytes().to_vec()),
             Some(approval_request_digest.as_bytes().to_vec()),
+            None,
+            None,
+            None,
+            None,
         ),
         MlsCommitAuthorization::ExistingMemberDeviceAdd {
             controller_device_id,
@@ -2227,10 +3051,58 @@ async fn insert_intent(
             Some(controller_consent_digest.as_bytes().to_vec()),
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         ),
-        MlsCommitAuthorization::MemberRemovalV4 { .. } => {
-            ("member_removal", None, None, None, None, None, None)
-        }
+        MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd {
+            controller_device_id,
+            controller_consent_digest,
+            recovery_request_id,
+            recovery_request_digest,
+            recovery_scope_digest,
+        } => (
+            "existing_member_device_add",
+            None,
+            None,
+            Some(Uuid::from(controller_device_id)),
+            Some(controller_consent_digest.as_bytes().to_vec()),
+            None,
+            None,
+            Some(*recovery_request_id.as_uuid()),
+            Some(recovery_request_digest.as_bytes().to_vec()),
+            Some(recovery_scope_digest.as_bytes().to_vec()),
+            None,
+        ),
+        MlsCommitAuthorization::ExistingMemberDeviceRemove {
+            identity_revoke_head_digest,
+        } => (
+            "existing_member_device_remove",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(identity_revoke_head_digest.as_bytes().to_vec()),
+        ),
+        MlsCommitAuthorization::MemberRemovalV4 { .. } => (
+            "member_removal",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
     };
     let (expected_policy_revision, result_policy_revision) = removal_policy_revisions
         .map(|(expected, result)| {
@@ -2253,8 +3125,9 @@ async fn insert_intent(
            controller_consent_digest,idempotency_key_hash,request_digest,authorization_digest,
            parent_epoch,parent_head_digest,admitted_epoch,result_head_digest,commit_bytes,commit_digest,welcome_digest,created_at_ms,
            protocol_version,join_request_digest,approval_request_digest,
-           expected_policy_revision,result_policy_revision)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)",
+           expected_policy_revision,result_policy_revision,history_recovery_request_id,
+           recovery_request_digest,recovery_scope_digest,identity_revoke_head_digest)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)",
     ).bind(Uuid::from(tenant_id)).bind(Uuid::from(command.submission_id)).bind(membership_command_id)
       .bind(kind).bind(id).bind(authorization_kind).bind(command.actor_identity_id.to_string())
       .bind(Uuid::from(command.actor_device_id)).bind(command.candidate_identity_id.to_string())
@@ -2269,6 +3142,8 @@ async fn insert_intent(
       .bind(command.welcome_digest.as_bytes().as_slice()).bind(now_ms)
       .bind(i16::from(command.protocol_version)).bind(join_request_digest).bind(approval_request_digest)
       .bind(expected_policy_revision).bind(result_policy_revision)
+      .bind(history_recovery_request_id).bind(recovery_request_digest)
+      .bind(recovery_scope_digest).bind(identity_revoke_head_digest)
       .execute(&mut *connection).await?;
     Ok(())
 }
@@ -2484,6 +3359,8 @@ async fn membership_command_was_admitted(
         } => membership_command_id,
         MlsCommitAuthorization::OwnerBootstrap
         | MlsCommitAuthorization::ExistingMemberDeviceAdd { .. }
+        | MlsCommitAuthorization::ExistingMemberDeviceRecoveryAdd { .. }
+        | MlsCommitAuthorization::ExistingMemberDeviceRemove { .. }
         | MlsCommitAuthorization::MemberRemovalV4 { .. } => return Ok(false),
     };
     let (kind, id) = scope_columns(command.scope);
@@ -2592,7 +3469,7 @@ async fn load_commit_feed_in_transaction(
            JOIN groups.mls_commit_receipts receipt USING (tenant_id,submission_id)
           WHERE intent.tenant_id=$1 AND intent.scope_kind=$2 AND intent.scope_id=$3
             AND intent.admitted_epoch>$4 AND intent.admitted_epoch<=$5
-            AND intent.protocol_version IN (3,4)
+            AND intent.protocol_version IN (3,4,5)
           ORDER BY intent.admitted_epoch
           LIMIT $6",
     )
@@ -2616,7 +3493,7 @@ async fn load_commit_feed_in_transaction(
         let submission_id = RequestId::try_from(row.try_get::<Uuid, _>("submission_id")?)
             .map_err(|_| GroupPersistenceError::CorruptData("MLS submission ID"))?;
         let receipt = receipt_from_row(submission_id, scope, expected_signing_key, &row)?;
-        if !matches!(receipt.protocol_version(), 3 | 4)
+        if !matches!(receipt.protocol_version(), 3..=5)
             || receipt.admitted_epoch() != expected_epoch
         {
             return Err(GroupPersistenceError::CorruptData(
@@ -2670,7 +3547,7 @@ fn receipt_from_row(
     }
     let protocol_version = u8::try_from(row.try_get::<i16, _>("protocol_version")?)
         .map_err(|_| GroupPersistenceError::CorruptData("MLS protocol version"))?;
-    if !matches!(protocol_version, 2..=4) {
+    if !matches!(protocol_version, 2..=5) {
         return Err(GroupPersistenceError::CorruptData("MLS protocol version"));
     }
     let request_digest = digest(row.try_get("request_digest")?, "MLS request")?;
@@ -2754,6 +3631,7 @@ fn receipt_from_row(
             match protocol_version {
                 3 => V3_RECEIPT_DIGEST_DOMAIN,
                 4 => V4_RECEIPT_DIGEST_DOMAIN,
+                5 => V5_RECEIPT_DIGEST_DOMAIN,
                 _ => RECEIPT_DIGEST_DOMAIN,
             },
             &canonical_cbor,
@@ -2868,7 +3746,11 @@ fn receipt_cbor(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the versioned canonical receipt field order stays contiguous for review"
+)]
 fn receipt_cbor_facts(
     protocol_version: u8,
     submission_id: RequestId,
@@ -2885,12 +3767,27 @@ fn receipt_cbor_facts(
     approval_request_digest: Option<Sha256Digest>,
     removal_policy_revisions: Option<(Revision, Revision)>,
 ) -> Result<Vec<u8>, GroupPersistenceError> {
+    let zero = Sha256Digest::from_bytes([0; 32]);
+    let v5_removal = if protocol_version == 5 {
+        match (candidate_key_package_digest == zero, welcome_digest == zero) {
+            (true, true) => true,
+            (false, false) => false,
+            _ => {
+                return Err(GroupPersistenceError::CorruptData(
+                    "MLS V5 receipt add/remove bindings",
+                ));
+            }
+        }
+    } else {
+        false
+    };
     let mut fields = vec![
         (
             CanonicalValue::Unsigned(1),
             CanonicalValue::Unsigned(match protocol_version {
                 3 => 3,
                 4 => 4,
+                5 => 5,
                 _ => 1,
             }),
         ),
@@ -2911,7 +3808,7 @@ fn receipt_cbor_facts(
         ),
         (
             CanonicalValue::Unsigned(8),
-            if protocol_version == 4 {
+            if protocol_version == 4 || v5_removal {
                 CanonicalValue::Null
             } else {
                 welcome_digest.to_canonical_value()
@@ -2956,10 +3853,20 @@ fn receipt_cbor_facts(
                 CanonicalValue::Unsigned(result_revision.get()),
             ));
         }
+        (5, None, None, None) => {
+            fields.push((
+                CanonicalValue::Unsigned(11),
+                if v5_removal {
+                    CanonicalValue::Null
+                } else {
+                    candidate_key_package_digest.to_canonical_value()
+                },
+            ));
+        }
         (2, None, None, None) => {}
         _ => {
             return Err(GroupPersistenceError::CorruptData(
-                "MLS receipt V3 bindings",
+                "MLS receipt version bindings",
             ));
         }
     }
@@ -2971,6 +3878,7 @@ fn receipt_signature_input(protocol_version: u8, digest: Sha256Digest) -> Vec<u8
     let domain = match protocol_version {
         3 => V3_RECEIPT_SIGNATURE_DOMAIN,
         4 => V4_RECEIPT_SIGNATURE_DOMAIN,
+        5 => V5_RECEIPT_SIGNATURE_DOMAIN,
         _ => RECEIPT_SIGNATURE_DOMAIN,
     };
     let mut input = Vec::with_capacity(domain.len() + 32);
@@ -2999,6 +3907,20 @@ fn scope_value(scope: GroupScope) -> CanonicalValue {
         ),
         (CanonicalValue::Unsigned(2), CanonicalValue::Text(id)),
     ])
+}
+
+/// Digest used by scoped V2 `KeyPackage` claims and V5 MLS recovery commits.
+///
+/// # Errors
+///
+/// Returns an error when the bounded canonical scope cannot be encoded.
+pub fn mls_recovery_scope_digest(scope: GroupScope) -> Result<Sha256Digest, GroupPersistenceError> {
+    let bytes = encode_deterministic_cbor(&scope_value(scope))
+        .map_err(|_| GroupPersistenceError::CorruptData("MLS recovery scope encoding"))?;
+    Ok(Sha256Digest::hash_domain(
+        V5_RECOVERY_SCOPE_DIGEST_DOMAIN,
+        &bytes,
+    ))
 }
 fn scope_columns(scope: GroupScope) -> (&'static str, String) {
     match scope {

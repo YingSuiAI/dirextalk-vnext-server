@@ -64,6 +64,49 @@ const CLAIMED_STATE: &str = "claimed";
 const LOCAL_CLAIMANT_ORIGIN: &str = "";
 const KEY_PACKAGE_PRUNE_BATCH_SIZE: i32 = 256;
 
+/// Immutable recovery scope preventing a `KeyPackage` from being claimed or
+/// consumed outside one approved history-recovery request and group scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryRecoveryKeyPackageScope {
+    request_digest: Sha256Digest,
+    scope_digest: Sha256Digest,
+}
+
+impl HistoryRecoveryKeyPackageScope {
+    /// Builds one non-zero recovery scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either scope digest is all zeroes.
+    pub fn new(
+        request_digest: Sha256Digest,
+        scope_digest: Sha256Digest,
+    ) -> Result<Self, IdentityPersistenceError> {
+        if request_digest.as_bytes().iter().all(|byte| *byte == 0)
+            || scope_digest.as_bytes().iter().all(|byte| *byte == 0)
+        {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "history recovery key package scope",
+            ));
+        }
+        Ok(Self {
+            request_digest,
+            scope_digest,
+        })
+    }
+
+    /// Returns the exact candidate request digest.
+    #[must_use]
+    pub const fn request_digest(self) -> Sha256Digest {
+        self.request_digest
+    }
+    /// Returns the exact group/conversation recovery scope digest.
+    #[must_use]
+    pub const fn scope_digest(self) -> Sha256Digest {
+        self.scope_digest
+    }
+}
+
 /// One exact, device-signed publish request. MLS bytes stay opaque: the
 /// service authenticates only this outer device binding and never deserializes
 /// the `KeyPackage` itself.
@@ -79,6 +122,7 @@ pub struct KeyPackagePublishCommand {
     opaque_key_package: Vec<u8>,
     detached_signature: Ed25519Signature,
     exact_publish_bytes: Vec<u8>,
+    history_recovery_scope: Option<HistoryRecoveryKeyPackageScope>,
 }
 
 impl fmt::Debug for KeyPackagePublishCommand {
@@ -95,6 +139,7 @@ impl fmt::Debug for KeyPackagePublishCommand {
             .field("opaque_key_package", &"[OPAQUE]")
             .field("detached_signature", &self.detached_signature)
             .field("exact_publish_bytes", &"[OPAQUE]")
+            .field("history_recovery_scope", &self.history_recovery_scope)
             .finish()
     }
 }
@@ -149,6 +194,7 @@ impl KeyPackagePublishCommand {
             opaque_key_package,
             detached_signature,
             exact_publish_bytes,
+            history_recovery_scope: None,
         };
         let expected = encode_deterministic_cbor(&command.to_canonical_value()).map_err(|_| {
             IdentityPersistenceError::InvalidCommand("key package publish encoding")
@@ -159,6 +205,66 @@ impl KeyPackagePublishCommand {
             ));
         }
         Ok(command)
+    }
+
+    /// Builds an exact V2 package restricted to one history-recovery scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bounded field is invalid or the supplied bytes
+    /// are not the exact canonical request representation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_history_recovery_v2(
+        idempotency_key_hash: Sha256Digest,
+        identity_id: IdentityId,
+        device_id: DeviceId,
+        package_id: KeyPackageId,
+        published_head_sequence: SafeUint,
+        published_head_hash: Sha256Digest,
+        expires_at: UtcMillis,
+        opaque_key_package: Vec<u8>,
+        scope: HistoryRecoveryKeyPackageScope,
+        detached_signature: Ed25519Signature,
+        exact_publish_bytes: Vec<u8>,
+    ) -> Result<Self, IdentityPersistenceError> {
+        if published_head_sequence.get() == 0
+            || opaque_key_package.is_empty()
+            || opaque_key_package.len() > MAX_KEY_PACKAGE_BYTES
+            || exact_publish_bytes.is_empty()
+            || exact_publish_bytes.len() > MAX_KEY_PACKAGE_PUBLISH_BYTES
+        {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "history recovery key package publish shape",
+            ));
+        }
+        let command = Self {
+            idempotency_key_hash,
+            identity_id,
+            device_id,
+            package_id,
+            published_head_sequence,
+            published_head_hash,
+            expires_at,
+            opaque_key_package,
+            detached_signature,
+            exact_publish_bytes,
+            history_recovery_scope: Some(scope),
+        };
+        let expected = encode_deterministic_cbor(&command.to_canonical_value()).map_err(|_| {
+            IdentityPersistenceError::InvalidCommand("key package publish encoding")
+        })?;
+        if expected != command.exact_publish_bytes {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "key package publish canonical bytes",
+            ));
+        }
+        Ok(command)
+    }
+
+    /// Returns the optional V40 recovery scope.
+    #[must_use]
+    pub const fn history_recovery_scope(&self) -> Option<HistoryRecoveryKeyPackageScope> {
+        self.history_recovery_scope
     }
 
     /// Returns the authenticated publisher identity declared by the envelope.
@@ -234,7 +340,7 @@ impl KeyPackagePublishCommand {
     }
 
     fn signature_input(&self) -> Result<Vec<u8>, IdentityPersistenceError> {
-        key_package_publish_signature_input(
+        let mut input = key_package_publish_signature_input(
             self.identity_id,
             self.device_id,
             self.package_id,
@@ -242,14 +348,27 @@ impl KeyPackagePublishCommand {
             self.published_head_hash,
             self.expires_at,
             &self.opaque_key_package,
-        )
+        )?;
+        if let Some(scope) = self.history_recovery_scope {
+            input.extend_from_slice(scope.request_digest().as_bytes());
+            input.extend_from_slice(scope.scope_digest().as_bytes());
+            input.extend_from_slice(b"history_recovery");
+        }
+        Ok(input)
     }
 }
 
 impl CanonicalEncode for KeyPackagePublishCommand {
     fn to_canonical_value(&self) -> CanonicalValue {
-        CanonicalValue::Map(vec![
-            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        let mut fields = vec![
+            (
+                CanonicalValue::Unsigned(1),
+                CanonicalValue::Unsigned(if self.history_recovery_scope.is_some() {
+                    2
+                } else {
+                    1
+                }),
+            ),
             (
                 CanonicalValue::Unsigned(2),
                 CanonicalValue::Text(self.identity_id.to_string()),
@@ -282,7 +401,19 @@ impl CanonicalEncode for KeyPackagePublishCommand {
                 CanonicalValue::Unsigned(9),
                 self.detached_signature.to_canonical_value(),
             ),
-        ])
+        ];
+        if let Some(scope) = self.history_recovery_scope {
+            fields.push((
+                CanonicalValue::Unsigned(10),
+                scope.request_digest().to_canonical_value(),
+            ));
+            fields.push((
+                CanonicalValue::Unsigned(11),
+                scope.scope_digest().to_canonical_value(),
+            ));
+            fields.push((CanonicalValue::Unsigned(12), CanonicalValue::Unsigned(1)));
+        }
+        CanonicalValue::Map(fields)
     }
 }
 
@@ -295,6 +426,7 @@ pub struct KeyPackageClaimCommand {
     target_identity_id: IdentityId,
     target_device_id: DeviceId,
     exact_claim_bytes: Vec<u8>,
+    history_recovery_scope: Option<HistoryRecoveryKeyPackageScope>,
 }
 
 impl KeyPackageClaimCommand {
@@ -320,6 +452,7 @@ impl KeyPackageClaimCommand {
             target_identity_id,
             target_device_id,
             exact_claim_bytes,
+            history_recovery_scope: None,
         };
         let expected = encode_deterministic_cbor(&command.to_canonical_value())
             .map_err(|_| IdentityPersistenceError::InvalidCommand("key package claim encoding"))?;
@@ -329,6 +462,47 @@ impl KeyPackageClaimCommand {
             ));
         }
         Ok(command)
+    }
+
+    /// Builds a same-identity claim restricted to one exact recovery scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the exact claim is empty, oversized, or not the
+    /// canonical representation of the supplied public fields.
+    pub fn new_history_recovery_v2(
+        idempotency_key_hash: Sha256Digest,
+        target_identity_id: IdentityId,
+        target_device_id: DeviceId,
+        scope: HistoryRecoveryKeyPackageScope,
+        exact_claim_bytes: Vec<u8>,
+    ) -> Result<Self, IdentityPersistenceError> {
+        if exact_claim_bytes.is_empty() || exact_claim_bytes.len() > 16_384 {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "key package claim byte length",
+            ));
+        }
+        let command = Self {
+            idempotency_key_hash,
+            target_identity_id,
+            target_device_id,
+            exact_claim_bytes,
+            history_recovery_scope: Some(scope),
+        };
+        let expected = encode_deterministic_cbor(&command.to_canonical_value())
+            .map_err(|_| IdentityPersistenceError::InvalidCommand("key package claim encoding"))?;
+        if expected != command.exact_claim_bytes {
+            return Err(IdentityPersistenceError::InvalidCommand(
+                "key package claim canonical bytes",
+            ));
+        }
+        Ok(command)
+    }
+
+    /// Returns the optional exact history-recovery scope.
+    #[must_use]
+    pub const fn history_recovery_scope(&self) -> Option<HistoryRecoveryKeyPackageScope> {
+        self.history_recovery_scope
     }
 
     /// Returns the target self-certifying identity.
@@ -359,8 +533,15 @@ impl KeyPackageClaimCommand {
 
 impl CanonicalEncode for KeyPackageClaimCommand {
     fn to_canonical_value(&self) -> CanonicalValue {
-        CanonicalValue::Map(vec![
-            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        let mut fields = vec![
+            (
+                CanonicalValue::Unsigned(1),
+                CanonicalValue::Unsigned(if self.history_recovery_scope.is_some() {
+                    2
+                } else {
+                    1
+                }),
+            ),
             (
                 CanonicalValue::Unsigned(2),
                 CanonicalValue::Text(self.target_identity_id.to_string()),
@@ -369,7 +550,19 @@ impl CanonicalEncode for KeyPackageClaimCommand {
                 CanonicalValue::Unsigned(3),
                 CanonicalValue::Text(self.target_device_id.to_string()),
             ),
-        ])
+        ];
+        if let Some(scope) = self.history_recovery_scope {
+            fields.push((
+                CanonicalValue::Unsigned(4),
+                scope.request_digest().to_canonical_value(),
+            ));
+            fields.push((
+                CanonicalValue::Unsigned(5),
+                scope.scope_digest().to_canonical_value(),
+            ));
+            fields.push((CanonicalValue::Unsigned(6), CanonicalValue::Unsigned(1)));
+        }
+        CanonicalValue::Map(fields)
     }
 }
 
@@ -963,6 +1156,16 @@ impl KeyPackageRepository {
                 return Err(IdentityPersistenceError::KeyPackageConflict);
             }
             validate_publish_expiry(command.expires_at(), now)?;
+            if let Some(scope) = command.history_recovery_scope() {
+                ensure_history_recovery_request_approved(
+                    session.connection(),
+                    command.identity_id(),
+                    command.device_id(),
+                    scope.request_digest(),
+                    now,
+                )
+                .await?;
+            }
             let signing_key =
                 active_device_signing_key(snapshot.projection(), command.device_id())?;
             verify_device_signature(
@@ -1099,6 +1302,12 @@ async fn claim_for_verified_claimant(
     request_digest: Sha256Digest,
     now: UtcMillis,
 ) -> Result<KeyPackageClaimOutcome, IdentityPersistenceError> {
+    if command.history_recovery_scope().is_some()
+        && (claimant_identity_origin != LOCAL_CLAIMANT_ORIGIN
+            || claimant_identity_id != command.target_identity_id())
+    {
+        return Err(IdentityPersistenceError::KeyPackageUnavailable);
+    }
     prune_expired_key_package_state(connection, now).await?;
     match claim_claim_command(
         connection,
@@ -1205,8 +1414,9 @@ async fn insert_key_package(
         "INSERT INTO identity.key_packages (
              package_id, owner_identity_id, owner_device_id, published_head_sequence,
              published_head_hash, package_digest, exact_publish_bytes, published_at_ms,
-             expires_at_ms, state, claimed_at_ms, retention_until_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,$9)
+             expires_at_ms, state, claimed_at_ms, retention_until_ms,
+             purpose, recovery_request_digest, recovery_scope_digest
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,$9,$11,$12,$13)
          ON CONFLICT DO NOTHING",
     )
     .bind(*command.package_id().as_uuid())
@@ -1219,6 +1429,21 @@ async fn insert_key_package(
     .bind(now.get())
     .bind(command.expires_at().get())
     .bind(AVAILABLE_STATE)
+    .bind(if command.history_recovery_scope().is_some() {
+        "history_recovery"
+    } else {
+        "general"
+    })
+    .bind(
+        command
+            .history_recovery_scope()
+            .map(|scope| scope.request_digest().as_bytes().to_vec()),
+    )
+    .bind(
+        command
+            .history_recovery_scope()
+            .map(|scope| scope.scope_digest().as_bytes().to_vec()),
+    )
     .execute(&mut *connection)
     .await?
     .rows_affected();
@@ -1241,8 +1466,9 @@ async fn claim_claim_command(
     let inserted = sqlx::query(
         "INSERT INTO identity.key_package_claims (
              claimant_identity_origin, claimant_identity_id, claimant_device_id, idempotency_key_hash,
-             target_identity_id, target_device_id, request_digest, created_at_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             target_identity_id, target_device_id, request_digest, created_at_ms,
+             purpose, recovery_request_digest, recovery_scope_digest
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
          ON CONFLICT DO NOTHING",
     )
     .bind(claimant_identity_origin)
@@ -1253,6 +1479,9 @@ async fn claim_claim_command(
     .bind(*command.target_device_id().as_uuid())
     .bind(request_digest.as_bytes().as_slice())
     .bind(now.get())
+    .bind(if command.history_recovery_scope().is_some() { "history_recovery" } else { "general" })
+    .bind(command.history_recovery_scope().map(|scope| scope.request_digest().as_bytes().to_vec()))
+    .bind(command.history_recovery_scope().map(|scope| scope.scope_digest().as_bytes().to_vec()))
     .execute(&mut *connection)
     .await?
     .rows_affected();
@@ -1261,7 +1490,8 @@ async fn claim_claim_command(
     }
 
     let row = sqlx::query(
-        "SELECT target_identity_id, target_device_id, request_digest
+        "SELECT target_identity_id, target_device_id, request_digest,
+                purpose, recovery_request_digest, recovery_scope_digest
            FROM identity.key_package_claims
           WHERE claimant_identity_origin=$1
             AND claimant_identity_id=$2
@@ -1274,13 +1504,33 @@ async fn claim_claim_command(
     .bind(command.idempotency_key_hash().as_bytes().as_slice())
     .fetch_one(&mut *connection)
     .await?;
+    let recovery_request_digest: Option<Vec<u8>> = row.try_get("recovery_request_digest")?;
+    let recovery_scope_digest: Option<Vec<u8>> = row.try_get("recovery_scope_digest")?;
     let matches = row.try_get::<String, _>("target_identity_id")?
         == command.target_identity_id().to_string()
         && parse_device_id(row.try_get("target_device_id")?)? == command.target_device_id()
         && digest(
             &row.try_get::<Vec<u8>, _>("request_digest")?,
             "key package claim request digest",
-        )? == request_digest;
+        )? == request_digest
+        && row.try_get::<String, _>("purpose")?
+            == if command.history_recovery_scope().is_some() {
+                "history_recovery"
+            } else {
+                "general"
+            }
+        && optional_digest(
+            recovery_request_digest.as_deref(),
+            "key package claim recovery request digest",
+        )? == command
+            .history_recovery_scope()
+            .map(HistoryRecoveryKeyPackageScope::request_digest)
+        && optional_digest(
+            recovery_scope_digest.as_deref(),
+            "key package claim recovery scope digest",
+        )? == command
+            .history_recovery_scope()
+            .map(HistoryRecoveryKeyPackageScope::scope_digest);
     if !matches {
         return Err(IdentityPersistenceError::IdempotencyConflict);
     }
@@ -1323,6 +1573,34 @@ async fn ensure_target_active(
     Ok(())
 }
 
+async fn ensure_history_recovery_request_approved(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    request_digest: Sha256Digest,
+    now: UtcMillis,
+) -> Result<(), IdentityPersistenceError> {
+    let authorized: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM identity.device_enrollment_challenges
+              WHERE identity_id=$1 AND target_device_id=$2
+                AND protocol_version=2 AND state='approved'
+                AND recovery_request_digest=$3 AND expires_at_ms>$4
+         )",
+    )
+    .bind(identity_id.to_string())
+    .bind(*device_id.as_uuid())
+    .bind(request_digest.as_bytes().as_slice())
+    .bind(now.get())
+    .fetch_one(&mut *connection)
+    .await?;
+    if authorized {
+        Ok(())
+    } else {
+        Err(IdentityPersistenceError::KeyPackageUnavailable)
+    }
+}
+
 async fn claim_available_package(
     connection: &mut PgConnection,
     claimant_identity_origin: &str,
@@ -1338,6 +1616,9 @@ async fn claim_available_package(
             AND owner_device_id=$2
             AND state='available'
             AND expires_at_ms > $3
+            AND purpose=$4
+            AND recovery_request_digest IS NOT DISTINCT FROM $5
+            AND recovery_scope_digest IS NOT DISTINCT FROM $6
           ORDER BY expires_at_ms, package_id
           LIMIT 1
           FOR UPDATE SKIP LOCKED",
@@ -1345,6 +1626,21 @@ async fn claim_available_package(
     .bind(command.target_identity_id().to_string())
     .bind(*command.target_device_id().as_uuid())
     .bind(now.get())
+    .bind(if command.history_recovery_scope().is_some() {
+        "history_recovery"
+    } else {
+        "general"
+    })
+    .bind(
+        command
+            .history_recovery_scope()
+            .map(|scope| scope.request_digest().as_bytes().to_vec()),
+    )
+    .bind(
+        command
+            .history_recovery_scope()
+            .map(|scope| scope.scope_digest().as_bytes().to_vec()),
+    )
     .fetch_optional(&mut *connection)
     .await?
     .ok_or(IdentityPersistenceError::KeyPackageUnavailable)?;
@@ -1505,6 +1801,13 @@ fn digest(value: &[u8], label: &'static str) -> Result<Sha256Digest, IdentityPer
         .try_into()
         .map_err(|_| IdentityPersistenceError::CorruptData(label))?;
     Ok(Sha256Digest::from_bytes(bytes))
+}
+
+fn optional_digest(
+    value: Option<&[u8]>,
+    label: &'static str,
+) -> Result<Option<Sha256Digest>, IdentityPersistenceError> {
+    value.map(|value| digest(value, label)).transpose()
 }
 
 fn utc_millis(value: i64, label: &'static str) -> Result<UtcMillis, IdentityPersistenceError> {

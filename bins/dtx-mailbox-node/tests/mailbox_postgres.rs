@@ -13,7 +13,10 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
-use dtx_domain::{Clock, ClockError, DeviceId, DeviceSessionId, EnvelopeId, IdentityId, MailboxId};
+use dtx_domain::{
+    Clock, ClockError, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionId, EnvelopeId,
+    IdentityId, MailboxId,
+};
 use dtx_identity_log::{
     DeviceCertificateV1, DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION,
     IdentityLogEventPayloadV1, IdentityLogEventV1, KeyAcceptancePurposeV1,
@@ -22,9 +25,12 @@ use dtx_identity_log::{
     recovery_rotation_authorization_input,
 };
 use dtx_identity_persistence::{
-    DEVICE_SESSION_SECRET_HASH_DOMAIN, DeviceSessionCompletionCommand, DeviceSessionCredential,
-    DeviceSessionOutcome, DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome,
+    CreateHistoryRecoveryRequestCommand, DEVICE_SESSION_SECRET_HASH_DOMAIN,
+    DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability, DeviceEnrollmentRepository,
+    DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
+    DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead,
     IdentityLogRepository, IdentityPgStore, device_session_proof_input,
+    history_recovery_request_signature_input, history_recovery_request_unsigned_canonical_bytes,
 };
 use dtx_mailbox::{
     AttachmentCapability, AttachmentCreate, AttachmentError, AttachmentManifest,
@@ -35,17 +41,18 @@ use dtx_mailbox::{
 use dtx_mailbox_node::{
     ACCOUNT_READ_CURSOR_QUERY_V1_CONTENT_TYPE, ACCOUNT_READ_CURSOR_QUERY_V1_PATH,
     ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE, ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
-    DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V1_PATH,
-    DEVICE_SESSION_AUTHORIZATION_SCHEME, IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
-    IDENTITY_MAILBOX_ACK_V2_PATH, IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE,
-    IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE, IDENTITY_MAILBOX_PULL_V2_PATH,
-    IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE, MAILBOX_ACK_CONTENT_TYPE, MAILBOX_ACK_PATH_TEMPLATE,
-    MAILBOX_ACK_RECEIPT_CONTENT_TYPE, MAILBOX_CAPABILITY_AUTHORIZATION_SCHEME,
-    MAILBOX_ENQUEUE_PATH_TEMPLATE, MAILBOX_ENVELOPE_CONTENT_TYPE,
-    MAILBOX_ENVELOPE_RECEIPT_CONTENT_TYPE, MAILBOX_PULL_CONTENT_TYPE, MAILBOX_PULL_PATH_TEMPLATE,
-    MAILBOX_PULL_RECEIPT_CONTENT_TYPE, MAILBOX_REGISTER_CONTENT_TYPE,
-    MAILBOX_REGISTER_PATH_TEMPLATE, MAILBOX_REGISTER_RECEIPT_CONTENT_TYPE, MailboxNodeState,
-    mailbox_router_with_state,
+    DEVICE_HISTORY_GRANT_RECEIPT_V2_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE,
+    DEVICE_HISTORY_GRANT_V1_PATH, DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+    DEVICE_HISTORY_GRANT_V2_PATH, DEVICE_SESSION_AUTHORIZATION_SCHEME,
+    IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE, IDENTITY_MAILBOX_ACK_V2_PATH,
+    IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE, IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
+    IDENTITY_MAILBOX_PULL_V2_PATH, IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE, MAILBOX_ACK_CONTENT_TYPE,
+    MAILBOX_ACK_PATH_TEMPLATE, MAILBOX_ACK_RECEIPT_CONTENT_TYPE,
+    MAILBOX_CAPABILITY_AUTHORIZATION_SCHEME, MAILBOX_ENQUEUE_PATH_TEMPLATE,
+    MAILBOX_ENVELOPE_CONTENT_TYPE, MAILBOX_ENVELOPE_RECEIPT_CONTENT_TYPE,
+    MAILBOX_PULL_CONTENT_TYPE, MAILBOX_PULL_PATH_TEMPLATE, MAILBOX_PULL_RECEIPT_CONTENT_TYPE,
+    MAILBOX_REGISTER_CONTENT_TYPE, MAILBOX_REGISTER_PATH_TEMPLATE,
+    MAILBOX_REGISTER_RECEIPT_CONTENT_TYPE, MailboxNodeState, mailbox_router_with_state,
 };
 use dtx_realtime_sync::{
     HEARTBEAT_INTERVAL_MILLIS, InvalidationKind, LEASE_TTL_MILLIS, OUTBOX_CLAIM_TTL_MILLIS,
@@ -2241,6 +2248,710 @@ async fn history_grants_accept_current_root_or_recovery_and_reject_stale_or_wron
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
+    reason = "one V40 HTTP/PostgreSQL boundary keeps approved-head, attachment, retained-quota, replay, expiry, and per-device cursor evidence coherent"
+)]
+async fn history_recovery_v2_offer_is_exact_current_and_device_ack_is_independent()
+-> Result<(), Box<dyn Error>> {
+    const PROVIDER_SEED: u8 = 151;
+    const CANDIDATE_SEED: u8 = 155;
+    const CANDIDATE_ENCRYPTION_SEED: u8 = 156;
+    const GRANT_NOW: i64 = NOW + 20;
+    const OFFER_EXPIRY: i64 = NOW + 120_000;
+    const REQUEST_EXPIRY: i64 = NOW + 300_000;
+
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let mailbox_store = MailboxPgStore::connect(harness.mailbox_runtime_options(), 6).await?;
+    let app = mailbox_router_with_state(MailboxNodeState::with_clock(
+        mailbox_store.clone(),
+        Arc::new(FixedClock(GRANT_NOW)),
+    ));
+    let owner = enroll_active_device(&identity_store, 152, 153, PROVIDER_SEED, [154; 32]).await?;
+    let observed_head = IdentityLogRepository::new()
+        .load(&identity_store, owner.identity_id)
+        .await?
+        .ok_or("identity missing before V40 recovery request")?
+        .head();
+    let recovered = enroll_history_recovery_device(
+        &identity_store,
+        &owner,
+        observed_head,
+        CANDIDATE_SEED,
+        CANDIDATE_ENCRYPTION_SEED,
+        [157; 32],
+        [158; 32],
+        REQUEST_EXPIRY,
+    )
+    .await?;
+
+    let mailbox_id = MailboxId::new();
+    let mailbox_capability = [159; 32];
+    assert_eq!(
+        send_registration(
+            app.clone(),
+            "history-v2-register-0001",
+            owner.session_id,
+            owner.session_secret,
+            mailbox_id,
+            mailbox_registration_body(
+                mailbox_id,
+                owner.identity_id,
+                owner.device_id,
+                mailbox_capability,
+                UtcMillis::new(EXPIRY)?,
+            )?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    let pull_request = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+        (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
+        (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
+    ]))?;
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+            None,
+            recovered.active.session_id,
+            recovered.active.session_secret,
+            pull_request.clone(),
+        )
+        .await?
+        .status(),
+        StatusCode::NOT_FOUND,
+    );
+
+    let pre_grant_envelope = EnvelopeId::new();
+    let pre_grant_ciphertext = b"opaque-pre-grant-history".to_vec();
+    assert_eq!(
+        send_envelope(
+            app.clone(),
+            "history-v2-pre-grant-envelope",
+            mailbox_capability,
+            mailbox_id,
+            pre_grant_envelope,
+            mailbox_envelope_body(
+                pre_grant_envelope,
+                &pre_grant_ciphertext,
+                UtcMillis::new(OFFER_EXPIRY)?,
+            )?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    let provider_highwater: i64 = sqlx::query_scalar(
+        "SELECT next_sequence FROM messaging.identity_delivery_heads WHERE identity_id=$1",
+    )
+    .bind(owner.identity_id.to_string())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(provider_highwater, 1);
+
+    let (attachment_object_id, attachment_digest) = create_ready_history_attachment(
+        &mailbox_store,
+        &owner,
+        160,
+        UtcMillis::new(OFFER_EXPIRY)?,
+        UtcMillis::new(GRANT_NOW - 3)?,
+    )
+    .await?;
+
+    let authority_id = Sha256Digest::hash_domain(
+        b"dirextalk.device-history-authority-id.v1\0",
+        SigningPublicKey::try_from(owner.root.verifying_key().to_bytes())?.as_bytes(),
+    )
+    .to_string();
+    let provider = SigningKey::from_bytes(&[PROVIDER_SEED; 32]);
+    let stale_envelope = EnvelopeId::new();
+    let stale_body = device_history_grant_body_v2(
+        "history-v2-stale-head",
+        owner.identity_id,
+        recovered.request_id,
+        recovered.request_digest,
+        observed_head.hash(),
+        recovered.active.device_id,
+        owner.device_id,
+        &authority_id,
+        mailbox_id,
+        stale_envelope,
+        u64::try_from(provider_highwater)?,
+        recovered.recipient_package_digest,
+        attachment_digest,
+        b"opaque-stale-head-offer",
+        UtcMillis::new(GRANT_NOW)?,
+        UtcMillis::new(OFFER_EXPIRY)?,
+        &provider,
+        &owner.root,
+    )?;
+    assert_mailbox_error(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V2_PATH,
+            DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+            Some("history-v2-stale-head"),
+            owner.session_id,
+            owner.session_secret,
+            stale_body,
+        )
+        .await?,
+        StatusCode::UNAUTHORIZED,
+        "DEVICE_AUTHENTICATION_FAILED",
+    )
+    .await?;
+
+    let missing_attachment_envelope = EnvelopeId::new();
+    assert_mailbox_error(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V2_PATH,
+            DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+            Some("history-v2-missing-attachment"),
+            owner.session_id,
+            owner.session_secret,
+            device_history_grant_body_v2(
+                "history-v2-missing-attachment",
+                owner.identity_id,
+                recovered.request_id,
+                recovered.request_digest,
+                recovered.approved_head.hash(),
+                recovered.active.device_id,
+                owner.device_id,
+                &authority_id,
+                mailbox_id,
+                missing_attachment_envelope,
+                u64::try_from(provider_highwater)?,
+                recovered.recipient_package_digest,
+                Sha256Digest::from_bytes([162; 32]),
+                b"opaque-missing-attachment-offer",
+                UtcMillis::new(GRANT_NOW)?,
+                UtcMillis::new(OFFER_EXPIRY)?,
+                &provider,
+                &owner.root,
+            )?,
+        )
+        .await?,
+        StatusCode::NOT_FOUND,
+        "MAILBOX_UNAVAILABLE",
+    )
+    .await?;
+
+    let overlong_envelope = EnvelopeId::new();
+    assert_mailbox_error(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V2_PATH,
+            DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+            Some("history-v2-overlong-offer"),
+            owner.session_id,
+            owner.session_secret,
+            device_history_grant_body_v2(
+                "history-v2-overlong-offer",
+                owner.identity_id,
+                recovered.request_id,
+                recovered.request_digest,
+                recovered.approved_head.hash(),
+                recovered.active.device_id,
+                owner.device_id,
+                &authority_id,
+                mailbox_id,
+                overlong_envelope,
+                u64::try_from(provider_highwater)?,
+                recovered.recipient_package_digest,
+                attachment_digest,
+                b"opaque-overlong-offer",
+                UtcMillis::new(GRANT_NOW)?,
+                UtcMillis::new(REQUEST_EXPIRY + 1)?,
+                &provider,
+                &owner.root,
+            )?,
+        )
+        .await?,
+        StatusCode::UNAUTHORIZED,
+        "DEVICE_AUTHENTICATION_FAILED",
+    )
+    .await?;
+
+    let expired_envelope = EnvelopeId::new();
+    assert_mailbox_error(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V2_PATH,
+            DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+            Some("history-v2-expired-offer"),
+            owner.session_id,
+            owner.session_secret,
+            device_history_grant_body_v2(
+                "history-v2-expired-offer",
+                owner.identity_id,
+                recovered.request_id,
+                recovered.request_digest,
+                recovered.approved_head.hash(),
+                recovered.active.device_id,
+                owner.device_id,
+                &authority_id,
+                mailbox_id,
+                expired_envelope,
+                u64::try_from(provider_highwater)?,
+                recovered.recipient_package_digest,
+                attachment_digest,
+                b"opaque-expired-offer",
+                UtcMillis::new(GRANT_NOW - 1)?,
+                UtcMillis::new(GRANT_NOW)?,
+                &provider,
+                &owner.root,
+            )?,
+        )
+        .await?,
+        StatusCode::UNAUTHORIZED,
+        "DEVICE_AUTHENTICATION_FAILED",
+    )
+    .await?;
+
+    let wrong_provider_envelope = EnvelopeId::new();
+    assert_mailbox_error(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V2_PATH,
+            DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+            Some("history-v2-wrong-provider"),
+            recovered.active.session_id,
+            recovered.active.session_secret,
+            device_history_grant_body_v2(
+                "history-v2-wrong-provider",
+                owner.identity_id,
+                recovered.request_id,
+                recovered.request_digest,
+                recovered.approved_head.hash(),
+                recovered.active.device_id,
+                owner.device_id,
+                &authority_id,
+                mailbox_id,
+                wrong_provider_envelope,
+                u64::try_from(provider_highwater)?,
+                recovered.recipient_package_digest,
+                attachment_digest,
+                b"opaque-wrong-provider-offer",
+                UtcMillis::new(GRANT_NOW)?,
+                UtcMillis::new(OFFER_EXPIRY)?,
+                &provider,
+                &owner.root,
+            )?,
+        )
+        .await?,
+        StatusCode::UNAUTHORIZED,
+        "DEVICE_AUTHENTICATION_FAILED",
+    )
+    .await?;
+
+    // Model 1,000 previously ACKed, still-retained legal ciphertext rows in a
+    // separate registered mailbox. The live aggregate stays at zero, so this
+    // specifically proves that a V40 offer is fenced by retained count rather
+    // than the active counter without advancing the recovery delivery head.
+    let quota_mailbox_id = MailboxId::new();
+    assert_eq!(
+        send_registration(
+            app.clone(),
+            "history-v2-quota-register-0001",
+            owner.session_id,
+            owner.session_secret,
+            quota_mailbox_id,
+            mailbox_registration_body(
+                quota_mailbox_id,
+                owner.identity_id,
+                owner.device_id,
+                [161; 32],
+                UtcMillis::new(EXPIRY)?,
+            )?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    let quota_ids = (0..1_000).map(|_| Uuid::now_v7()).collect::<Vec<Uuid>>();
+    let quota_sequences = (1_i64..=1_000).collect::<Vec<i64>>();
+    sqlx::query(
+        "INSERT INTO messaging.mailbox_envelopes(
+             mailbox_id,envelope_id,delivery_sequence,opaque_ciphertext,request_digest,
+             receipt_bytes,receipt_hash,expires_at_ms,state,created_at_ms)
+         SELECT $1,item.envelope_id,item.delivery_sequence,$4,$5,$6,$7,$8,'acked',$9
+           FROM unnest($2::uuid[],$3::bigint[]) AS item(envelope_id,delivery_sequence)",
+    )
+    .bind(*quota_mailbox_id.as_uuid())
+    .bind(&quota_ids)
+    .bind(&quota_sequences)
+    .bind(vec![0xee_u8])
+    .bind(vec![0xa1_u8; 32])
+    .bind(vec![0xa2_u8])
+    .bind(vec![0xa3_u8; 32])
+    .bind(OFFER_EXPIRY)
+    .bind(GRANT_NOW)
+    .execute(harness.admin_pool())
+    .await?;
+    let retained_before_grant: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM messaging.mailbox_envelopes
+          WHERE mailbox_id=$1 AND opaque_ciphertext IS NOT NULL",
+    )
+    .bind(*quota_mailbox_id.as_uuid())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(retained_before_grant, 1_000);
+    let quota_envelope = EnvelopeId::new();
+    assert_mailbox_error(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V2_PATH,
+            DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+            Some("history-v2-retained-quota"),
+            owner.session_id,
+            owner.session_secret,
+            device_history_grant_body_v2(
+                "history-v2-retained-quota",
+                owner.identity_id,
+                recovered.request_id,
+                recovered.request_digest,
+                recovered.approved_head.hash(),
+                recovered.active.device_id,
+                owner.device_id,
+                &authority_id,
+                quota_mailbox_id,
+                quota_envelope,
+                u64::try_from(provider_highwater)?,
+                recovered.recipient_package_digest,
+                attachment_digest,
+                b"opaque-retained-quota-offer",
+                UtcMillis::new(GRANT_NOW)?,
+                UtcMillis::new(OFFER_EXPIRY)?,
+                &provider,
+                &owner.root,
+            )?,
+        )
+        .await?,
+        StatusCode::TOO_MANY_REQUESTS,
+        "MAILBOX_CAPACITY_EXCEEDED",
+    )
+    .await?;
+    let offer_envelope = EnvelopeId::new();
+    let opaque_offer = b"opaque-candidate-encrypted-history-offer".to_vec();
+    let grant_body = device_history_grant_body_v2(
+        "history-v2-success",
+        owner.identity_id,
+        recovered.request_id,
+        recovered.request_digest,
+        recovered.approved_head.hash(),
+        recovered.active.device_id,
+        owner.device_id,
+        &authority_id,
+        mailbox_id,
+        offer_envelope,
+        u64::try_from(provider_highwater)?,
+        recovered.recipient_package_digest,
+        attachment_digest,
+        &opaque_offer,
+        UtcMillis::new(GRANT_NOW)?,
+        UtcMillis::new(OFFER_EXPIRY)?,
+        &provider,
+        &owner.root,
+    )?;
+    let granted = send_v2(
+        app.clone(),
+        DEVICE_HISTORY_GRANT_V2_PATH,
+        DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+        Some("history-v2-success"),
+        owner.session_id,
+        owner.session_secret,
+        grant_body.clone(),
+    )
+    .await?;
+    assert_eq!(granted.status(), StatusCode::CREATED);
+    assert_content_type(&granted, DEVICE_HISTORY_GRANT_RECEIPT_V2_CONTENT_TYPE);
+    let exact_receipt = response_bytes(granted).await?;
+    let replay = send_v2(
+        app.clone(),
+        DEVICE_HISTORY_GRANT_V2_PATH,
+        DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+        Some("history-v2-success"),
+        owner.session_id,
+        owner.session_secret,
+        grant_body,
+    )
+    .await?;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(response_bytes(replay).await?, exact_receipt);
+    assert_mailbox_error(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V2_PATH,
+            DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+            Some("history-v2-success"),
+            owner.session_id,
+            owner.session_secret,
+            device_history_grant_body_v2(
+                "history-v2-success",
+                owner.identity_id,
+                recovered.request_id,
+                recovered.request_digest,
+                recovered.approved_head.hash(),
+                recovered.active.device_id,
+                owner.device_id,
+                &authority_id,
+                mailbox_id,
+                offer_envelope,
+                u64::try_from(provider_highwater)?,
+                recovered.recipient_package_digest,
+                attachment_digest,
+                b"changed-opaque-offer",
+                UtcMillis::new(GRANT_NOW)?,
+                UtcMillis::new(OFFER_EXPIRY)?,
+                &provider,
+                &owner.root,
+            )?,
+        )
+        .await?,
+        StatusCode::CONFLICT,
+        "IDEMPOTENCY_CONFLICT",
+    )
+    .await?;
+
+    let candidate_pull = send_v2(
+        app.clone(),
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        recovered.active.session_id,
+        recovered.active.session_secret,
+        pull_request.clone(),
+    )
+    .await?;
+    assert_eq!(candidate_pull.status(), StatusCode::OK);
+    assert_content_type(
+        &candidate_pull,
+        IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE,
+    );
+    assert_v3_single_envelope(
+        &response_bytes(candidate_pull).await?,
+        2,
+        1,
+        offer_envelope,
+        &opaque_offer,
+    )?;
+
+    let owner_pull = send_v2(
+        app.clone(),
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        owner.session_id,
+        owner.session_secret,
+        pull_request.clone(),
+    )
+    .await?;
+    assert_eq!(owner_pull.status(), StatusCode::OK);
+    let CanonicalValue::Map(owner_pull_fields) =
+        decode_deterministic_cbor(&response_bytes(owner_pull).await?)?
+    else {
+        return Err("owner V3 pull receipt not a map".into());
+    };
+    assert!(
+        matches!(&owner_pull_fields[5].1, CanonicalValue::Array(segments) if segments.len()==2)
+    );
+    let ack_two = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(2)),
+    ]))?;
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            IDENTITY_MAILBOX_ACK_V2_PATH,
+            IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
+            Some("history-v2-owner-ack"),
+            owner.session_id,
+            owner.session_secret,
+            ack_two.clone(),
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    let candidate_after_owner_ack = send_v2(
+        app.clone(),
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        recovered.active.session_id,
+        recovered.active.session_secret,
+        pull_request.clone(),
+    )
+    .await?;
+    assert_eq!(candidate_after_owner_ack.status(), StatusCode::OK);
+    assert_v3_single_envelope(
+        &response_bytes(candidate_after_owner_ack).await?,
+        2,
+        1,
+        offer_envelope,
+        &opaque_offer,
+    )?;
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            IDENTITY_MAILBOX_ACK_V2_PATH,
+            IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
+            Some("history-v2-candidate-ack"),
+            recovered.active.session_id,
+            recovered.active.session_secret,
+            ack_two,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    let cursors: Vec<(Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT device_id,contiguous_ack_sequence,earliest_authorized_sequence
+           FROM messaging.device_delivery_state WHERE identity_id=$1 ORDER BY device_id",
+    )
+    .bind(owner.identity_id.to_string())
+    .fetch_all(harness.admin_pool())
+    .await?;
+    assert_eq!(cursors.len(), 2);
+    assert!(cursors.iter().all(|(_, ack, _)| *ack == 2));
+    assert!(
+        cursors
+            .iter()
+            .any(|(device, _, floor)| { *device == Uuid::from(owner.device_id) && *floor == 1 })
+    );
+    assert!(cursors.iter().any(|(device, _, floor)| {
+        *device == Uuid::from(recovered.active.device_id) && *floor == 2
+    }));
+    let retained: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+        "SELECT envelope_id,opaque_ciphertext FROM messaging.mailbox_envelopes
+          WHERE mailbox_id=$1 ORDER BY delivery_sequence",
+    )
+    .bind(*mailbox_id.as_uuid())
+    .fetch_all(harness.admin_pool())
+    .await?;
+    assert_eq!(retained.len(), 2);
+    assert_eq!(retained[0].1, pre_grant_ciphertext);
+    assert_eq!(retained[1].1, opaque_offer);
+
+    assert_eq!(
+        AttachmentRepository
+            .cancel(
+                &mailbox_store,
+                &DeviceSessionCredential::new(owner.session_id, owner.session_secret)?,
+                attachment_object_id,
+                UtcMillis::new(GRANT_NOW + 1)?,
+            )
+            .await
+            .unwrap(),
+        AttachmentStatus::Cancelled,
+    );
+    let cancelled_app = mailbox_router_with_state(MailboxNodeState::with_clock(
+        mailbox_store.clone(),
+        Arc::new(FixedClock(GRANT_NOW + 1)),
+    ));
+    assert_eq!(
+        send_v2(
+            cancelled_app,
+            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+            None,
+            recovered.active.session_id,
+            recovered.active.session_secret,
+            pull_request.clone(),
+        )
+        .await?
+        .status(),
+        StatusCode::NOT_FOUND,
+    );
+    let (_, replacement_digest) = create_ready_history_attachment(
+        &mailbox_store,
+        &owner,
+        165,
+        UtcMillis::new(OFFER_EXPIRY)?,
+        UtcMillis::new(GRANT_NOW + 2)?,
+    )
+    .await?;
+    assert_eq!(replacement_digest, attachment_digest);
+    let restored_app = mailbox_router_with_state(MailboxNodeState::with_clock(
+        mailbox_store.clone(),
+        Arc::new(FixedClock(GRANT_NOW + 5)),
+    ));
+    let restored_pull = send_v2(
+        restored_app,
+        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        recovered.active.session_id,
+        recovered.active.session_secret,
+        pull_request.clone(),
+    )
+    .await?;
+    assert_eq!(restored_pull.status(), StatusCode::OK);
+    assert_v3_single_envelope(
+        &response_bytes(restored_pull).await?,
+        2,
+        1,
+        offer_envelope,
+        &opaque_offer,
+    )?;
+
+    let next_device = SigningKey::from_bytes(&[163; 32]);
+    let current_head = IdentityLogRepository::new()
+        .load(&identity_store, owner.identity_id)
+        .await?
+        .ok_or("identity missing before stale-offer fence")?
+        .head();
+    let next_event = device_add(
+        &owner.root,
+        &next_device,
+        owner.identity_id,
+        DeviceId::new(),
+        164,
+        current_head.hash(),
+        current_head.sequence().get() + 1,
+        GRANT_NOW + 10,
+    )?;
+    assert!(matches!(
+        IdentityLogRepository::new()
+            .append(
+                &identity_store,
+                &IdentityAppendCommand::new(
+                    Sha256Digest::hash_domain(b"test-history-v2-advance-head\0", &[164]),
+                    Some(current_head),
+                    next_event.to_deterministic_cbor()?,
+                )?,
+                UtcMillis::new(GRANT_NOW + 10)?,
+            )
+            .await?,
+        IdentityAppendOutcome::Committed(_)
+    ));
+    assert_eq!(
+        send_v2(
+            mailbox_router_with_state(MailboxNodeState::with_clock(
+                mailbox_store,
+                Arc::new(FixedClock(GRANT_NOW + 11)),
+            )),
+            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+            None,
+            recovered.active.session_id,
+            recovered.active.session_secret,
+            pull_request,
+        )
+        .await?
+        .status(),
+        StatusCode::NOT_FOUND,
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
     reason = "one HTTPS boundary test keeps opaque CAS, exact replay, multi-device read, conflict, privacy, and revoke behavior coherent"
 )]
 async fn account_read_cursor_is_opaque_exact_cas_and_rechecks_device_revocation()
@@ -3482,6 +4193,14 @@ async fn opaque_attachment_is_exact_idempotent_and_cancel_revokes_read()
     Ok(())
 }
 
+struct RecoveredDevice {
+    active: ActiveDevice,
+    request_id: DeviceEnrollmentChallengeId,
+    request_digest: Sha256Digest,
+    approved_head: IdentityLogHead,
+    recipient_package_digest: Sha256Digest,
+}
+
 struct ActiveDevice {
     root: SigningKey,
     recovery: SigningKey,
@@ -3489,6 +4208,252 @@ struct ActiveDevice {
     device_id: DeviceId,
     session_id: DeviceSessionId,
     session_secret: [u8; 32],
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn enroll_history_recovery_device(
+    store: &IdentityPgStore,
+    owner: &ActiveDevice,
+    observed_head: IdentityLogHead,
+    candidate_seed: u8,
+    encryption_seed: u8,
+    session_secret: [u8; 32],
+    capability_bytes: [u8; 32],
+    request_expires_at: i64,
+) -> Result<RecoveredDevice, Box<dyn Error>> {
+    let candidate = SigningKey::from_bytes(&[candidate_seed; 32]);
+    let candidate_public = public_key(&candidate)?;
+    let recipient_key = DeviceEncryptionPublicKey::try_from([encryption_seed; 32])?;
+    let candidate_device_id = DeviceId::new();
+    let request_id = DeviceEnrollmentChallengeId::new();
+    let issued_at = UtcMillis::new(NOW + 1)?;
+    let expires_at = UtcMillis::new(request_expires_at)?;
+    let unsigned = history_recovery_request_unsigned_canonical_bytes(
+        request_id,
+        owner.identity_id,
+        candidate_device_id,
+        candidate_public,
+        recipient_key,
+        observed_head,
+        issued_at,
+        expires_at,
+    )?;
+    let candidate_signature = signature(
+        &candidate,
+        &history_recovery_request_signature_input(&unsigned),
+    );
+    let CanonicalValue::Map(mut request_fields) = decode_deterministic_cbor(&unsigned)? else {
+        return Err("history recovery unsigned request is not a map".into());
+    };
+    request_fields.push((
+        CanonicalValue::Unsigned(12),
+        candidate_signature.to_canonical_value(),
+    ));
+    let exact_request = encode_deterministic_cbor(&CanonicalValue::Map(request_fields))?;
+    let request = CreateHistoryRecoveryRequestCommand::new(
+        Sha256Digest::hash_domain(
+            b"test-history-recovery-request\0",
+            request_id.to_string().as_bytes(),
+        ),
+        request_id,
+        owner.identity_id,
+        candidate_device_id,
+        candidate_public,
+        recipient_key,
+        observed_head,
+        issued_at,
+        expires_at,
+        DeviceEnrollmentCapability::new(capability_bytes)?,
+        candidate_signature,
+        exact_request,
+    )?;
+    let request_digest = request.request_digest();
+    let created = DeviceEnrollmentRepository
+        .create_history_recovery_request(store, request, issued_at)
+        .await?;
+    assert_eq!(created.challenge().challenge_id(), request_id);
+
+    let device_add = device_add(
+        &owner.root,
+        &candidate,
+        owner.identity_id,
+        candidate_device_id,
+        encryption_seed,
+        observed_head.hash(),
+        observed_head.sequence().get() + 1,
+        NOW + 2,
+    )?;
+    let approval = DeviceEnrollmentApprovalCommand::new(
+        Sha256Digest::hash_domain(
+            b"test-history-recovery-approval\0",
+            request_id.to_string().as_bytes(),
+        ),
+        request_id,
+        DeviceEnrollmentCapability::new(capability_bytes)?,
+        observed_head.hash(),
+        device_add.to_deterministic_cbor()?,
+    )?;
+    assert!(matches!(
+        DeviceEnrollmentRepository
+            .approve(
+                store,
+                approval,
+                DeviceSessionCredential::new(owner.session_id, owner.session_secret)?,
+                UtcMillis::new(NOW + 2)?,
+            )
+            .await?,
+        IdentityAppendOutcome::Committed(_)
+    ));
+    let approved_head = IdentityLogRepository::new()
+        .load(store, owner.identity_id)
+        .await?
+        .ok_or("identity missing after V40 recovery approval")?
+        .head();
+
+    let challenge = DeviceSessionRepository
+        .issue_challenge(
+            store,
+            owner.identity_id,
+            candidate_device_id,
+            [candidate_seed.wrapping_add(1); 32],
+            AUDIENCE,
+            UtcMillis::new(NOW + 3)?,
+        )
+        .await?;
+    let session_id = DeviceSessionId::new();
+    let session_secret_hash =
+        Sha256Digest::hash_domain(DEVICE_SESSION_SECRET_HASH_DOMAIN, &session_secret);
+    let session_proof = signature(
+        &candidate,
+        &device_session_proof_input(
+            owner.identity_id,
+            candidate_device_id,
+            challenge.challenge_id(),
+            challenge.nonce(),
+            AUDIENCE,
+            session_id,
+            session_secret_hash,
+            challenge.session_expires_at(),
+        )?,
+    );
+    assert!(matches!(
+        DeviceSessionRepository
+            .complete(
+                store,
+                &DeviceSessionCompletionCommand::new(
+                    Sha256Digest::hash_domain(
+                        b"test-history-recovery-session\0",
+                        request_id.to_string().as_bytes(),
+                    ),
+                    owner.identity_id,
+                    candidate_device_id,
+                    challenge.challenge_id(),
+                    session_id,
+                    *challenge.nonce(),
+                    session_secret,
+                    session_proof,
+                )?,
+                UtcMillis::new(NOW + 3)?,
+            )
+            .await?,
+        DeviceSessionOutcome::Issued(_)
+    ));
+    Ok(RecoveredDevice {
+        active: ActiveDevice {
+            root: SigningKey::from_bytes(&owner.root.to_bytes()),
+            recovery: SigningKey::from_bytes(&owner.recovery.to_bytes()),
+            identity_id: owner.identity_id,
+            device_id: candidate_device_id,
+            session_id,
+            session_secret,
+        },
+        request_id,
+        request_digest,
+        approved_head,
+        recipient_package_digest: Sha256Digest::hash_domain(
+            b"dirextalk.history-recovery-recipient-package.v1\0",
+            recipient_key.as_bytes(),
+        ),
+    })
+}
+
+async fn create_ready_history_attachment(
+    store: &MailboxPgStore,
+    owner: &ActiveDevice,
+    seed: u8,
+    expires_at: UtcMillis,
+    now: UtcMillis,
+) -> Result<(Uuid, Sha256Digest), Box<dyn Error>> {
+    let object_id = Uuid::now_v7();
+    let ciphertext = vec![0x7d; 64];
+    let chunk_digest = Sha256Digest::from_bytes(Sha256::digest(&ciphertext).into());
+    let mut manifest_bytes = b"DTXA1".to_vec();
+    manifest_bytes.extend_from_slice(&1_u16.to_be_bytes());
+    manifest_bytes.extend_from_slice(&0_u16.to_be_bytes());
+    manifest_bytes.extend_from_slice(&u32::try_from(ciphertext.len())?.to_be_bytes());
+    manifest_bytes.extend_from_slice(chunk_digest.as_bytes());
+    manifest_bytes.extend_from_slice(&17_u32.to_be_bytes());
+    manifest_bytes.extend_from_slice(&[0x7e; 17]);
+    let manifest = AttachmentManifest::parse(manifest_bytes.clone()).unwrap();
+    let manifest_digest = Sha256Digest::from_bytes(Sha256::digest(&manifest_bytes).into());
+    let upload = AttachmentCapability::new([seed; 32]);
+    let read = AttachmentCapability::new([seed.wrapping_add(1); 32]);
+    let credential = DeviceSessionCredential::new(owner.session_id, owner.session_secret)?;
+    assert_eq!(
+        AttachmentRepository
+            .create(
+                store,
+                &credential,
+                &AttachmentCreate {
+                    object_id,
+                    owner_identity_id: owner.identity_id,
+                    owner_device_id: owner.device_id,
+                    manifest_digest,
+                    chunk_count: 1,
+                    ciphertext_bytes: u64::try_from(ciphertext.len())?,
+                    expires_at,
+                },
+                &upload,
+                &read,
+                now,
+            )
+            .await
+            .unwrap(),
+        AttachmentStatus::Created,
+    );
+    assert_eq!(
+        AttachmentRepository
+            .put_chunk(
+                store,
+                object_id,
+                0,
+                &upload,
+                Sha256Digest::hash_domain(
+                    b"test-history-recovery-attachment-chunk\0",
+                    object_id.as_bytes(),
+                ),
+                chunk_digest,
+                &ciphertext,
+                UtcMillis::new(now.get() + 1)?,
+            )
+            .await
+            .unwrap(),
+        AttachmentStatus::Created,
+    );
+    assert_eq!(
+        AttachmentRepository
+            .finalize(
+                store,
+                object_id,
+                &upload,
+                &manifest,
+                UtcMillis::new(now.get() + 2)?,
+            )
+            .await
+            .unwrap(),
+        AttachmentStatus::Ready,
+    );
+    Ok((object_id, manifest_digest))
 }
 
 async fn enroll_active_device(
@@ -3829,6 +4794,161 @@ fn device_history_grant_body(
         signature(new_device, &pop_input).to_canonical_value(),
     ));
     Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn device_history_grant_body_v2(
+    idempotency_key: &str,
+    identity_id: IdentityId,
+    request_id: DeviceEnrollmentChallengeId,
+    recovery_request_digest: Sha256Digest,
+    approved_head_hash: Sha256Digest,
+    candidate_device_id: DeviceId,
+    provider_device_id: DeviceId,
+    authority_id: &str,
+    mailbox_id: MailboxId,
+    envelope_id: EnvelopeId,
+    provider_highwater: u64,
+    recipient_package_digest: Sha256Digest,
+    attachment_digest: Sha256Digest,
+    opaque_offer: &[u8],
+    granted_at: UtcMillis,
+    expires_at: UtcMillis,
+    provider: &SigningKey,
+    authority: &SigningKey,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let idempotency_key_hash = Sha256Digest::hash_domain(
+        b"dirextalk.mailbox-http-history-grant-idempotency-key.v2\0",
+        idempotency_key.as_bytes(),
+    );
+    let offer_digest =
+        Sha256Digest::hash_domain(b"dirextalk.device-history-offer.v2\0", opaque_offer);
+    let unsigned = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(request_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            recovery_request_digest.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            approved_head_hash.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Text(candidate_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Text(provider_device_id.to_string()),
+        ),
+        (CanonicalValue::Unsigned(8), CanonicalValue::Unsigned(2)),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Text(authority_id.to_owned()),
+        ),
+        (
+            CanonicalValue::Unsigned(10),
+            CanonicalValue::Text(mailbox_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(11),
+            CanonicalValue::Text(envelope_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(12),
+            CanonicalValue::Unsigned(provider_highwater),
+        ),
+        (
+            CanonicalValue::Unsigned(13),
+            CanonicalValue::Unsigned(provider_highwater + 1),
+        ),
+        (
+            CanonicalValue::Unsigned(14),
+            recipient_package_digest.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(15),
+            attachment_digest.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(16),
+            offer_digest.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(17),
+            granted_at.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(18),
+            expires_at.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(19),
+            idempotency_key_hash.to_canonical_value(),
+        ),
+    ]);
+    let unsigned_bytes = encode_deterministic_cbor(&unsigned)?;
+    let mut provider_input = b"dirextalk.device-history-grant-provider.v2\0".to_vec();
+    provider_input.extend_from_slice(&unsigned_bytes);
+    let mut authority_input = b"dirextalk.device-history-grant-authority.v2\0".to_vec();
+    authority_input.extend_from_slice(&unsigned_bytes);
+    let CanonicalValue::Map(mut fields) = unsigned else {
+        unreachable!()
+    };
+    fields.push((
+        CanonicalValue::Unsigned(20),
+        signature(provider, &provider_input).to_canonical_value(),
+    ));
+    fields.push((
+        CanonicalValue::Unsigned(21),
+        signature(authority, &authority_input).to_canonical_value(),
+    ));
+    fields.push((
+        CanonicalValue::Unsigned(22),
+        CanonicalValue::Bytes(opaque_offer.to_vec()),
+    ));
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
+}
+
+fn assert_v3_single_envelope(
+    bytes: &[u8],
+    expected_highwater: u64,
+    expected_floor: u64,
+    expected_envelope: EnvelopeId,
+    expected_ciphertext: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let CanonicalValue::Map(fields) = decode_deterministic_cbor(bytes)? else {
+        return Err("V3 pull receipt not a map".into());
+    };
+    if fields.len() != 6
+        || fields[3].1 != CanonicalValue::Unsigned(expected_highwater)
+        || fields[4].1 != CanonicalValue::Unsigned(expected_floor)
+    {
+        return Err("V3 pull head/floor mismatch".into());
+    }
+    let CanonicalValue::Array(segments) = &fields[5].1 else {
+        return Err("V3 pull segments missing".into());
+    };
+    let [CanonicalValue::Map(segment)] = segments.as_slice() else {
+        return Err("V3 pull must contain one envelope".into());
+    };
+    if segment.len() != 5
+        || segment[0].1 != CanonicalValue::Unsigned(1)
+        || segment[1].1 != CanonicalValue::Unsigned(expected_highwater)
+        || segment[2].1 != CanonicalValue::Text(expected_envelope.to_string())
+        || segment[3].1 != CanonicalValue::Bytes(expected_ciphertext.to_vec())
+    {
+        return Err("V3 pull envelope mismatch".into());
+    }
+    Ok(())
 }
 
 fn account_read_cursor_write_body(

@@ -39,6 +39,10 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA groups TO dtx_group_runtime;
 GRANT USAGE ON SCHEMA identity TO dtx_group_runtime;
 GRANT EXECUTE ON FUNCTION identity.identity_group_reader_authorized()
     TO dtx_group_runtime;
+GRANT EXECUTE ON FUNCTION identity.history_recovery_request_authorized(text,uuid,bytea,uuid,bigint)
+    TO dtx_group_runtime;
+GRANT EXECUTE ON FUNCTION identity.scoped_key_package_claim_authorized(text,uuid,bytea,bytea,bytea,uuid)
+    TO dtx_group_runtime;
 GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
     TO dtx_group_runtime;
 GRANT SELECT, INSERT, UPDATE ON groups.policy_heads TO dtx_group_runtime;
@@ -61,6 +65,8 @@ GRANT EXECUTE ON FUNCTION identity.identity_mailbox_reader_authorized()
     TO dtx_mailbox_runtime;
 GRANT EXECUTE ON FUNCTION identity.identity_realtime_reader_authorized()
     TO dtx_mailbox_runtime;
+GRANT EXECUTE ON FUNCTION identity.history_recovery_request_authorized(text,uuid,bytea,uuid,bigint)
+    TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT, UPDATE ON messaging.mailboxes TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT ON messaging.mailbox_registration_claims TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT, UPDATE ON messaging.mailbox_envelopes TO dtx_mailbox_runtime;
@@ -70,6 +76,7 @@ GRANT SELECT, INSERT, UPDATE ON messaging.identity_delivery_heads,
     messaging.device_delivery_state, messaging.device_history_grants TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT ON messaging.identity_delivery_journal,
     messaging.device_delivery_ack_claims TO dtx_mailbox_runtime;
+GRANT SELECT, INSERT ON messaging.history_recovery_offers TO dtx_mailbox_runtime;
 GRANT USAGE ON SCHEMA realtime TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT, UPDATE ON realtime.identity_heads TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT ON realtime.journal, realtime.outbox TO dtx_mailbox_runtime;

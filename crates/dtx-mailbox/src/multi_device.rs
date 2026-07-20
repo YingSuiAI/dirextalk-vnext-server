@@ -1,7 +1,7 @@
 use dtx_domain::{DeviceId, EnvelopeId, IdentityId};
 use dtx_identity_persistence::{
     AuthenticatedDeviceSession, DeviceSessionCredential, DeviceSessionRepository,
-    IdentityPersistenceError, lock_and_load_active_snapshot,
+    IdentityLogSnapshot, IdentityPersistenceError, lock_and_load_active_snapshot,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, SafeUint, Sha256Digest, UtcMillis, encode_deterministic_cbor,
@@ -509,8 +509,9 @@ async fn authorize_identity_device(
     .bind(authenticated.identity_id().to_string())
     .execute(&mut *connection)
     .await?;
-    let existing_earliest = sqlx::query_scalar::<_, i64>(
-        "SELECT earliest_authorized_sequence FROM messaging.device_delivery_state
+    let existing_state = sqlx::query(
+        "SELECT contiguous_ack_sequence,earliest_authorized_sequence
+           FROM messaging.device_delivery_state
           WHERE identity_id=$1 AND device_id=$2",
     )
     .bind(authenticated.identity_id().to_string())
@@ -524,15 +525,37 @@ async fn authorize_identity_device(
         if snapshot.projection().initial_device_id() == Some(authenticated.device_id()) {
             1
         } else {
-            current_history_grant_earliest(connection, authenticated).await?
+            let legacy = current_history_grant_earliest(connection, authenticated).await?;
+            let recovery =
+                current_history_recovery_offer_earliest(connection, authenticated, &snapshot, now)
+                    .await?;
+            match (legacy, recovery) {
+                (Some(left), Some(right)) => left.min(right),
+                (Some(earliest), None) | (None, Some(earliest)) => earliest,
+                (None, None) => return Err(MailboxPersistenceError::MailboxUnavailable),
+            }
         };
-    if let Some(earliest) = existing_earliest {
-        // Delivery state is only a cursor. It must never become a second
-        // authorization truth after a history grant or device is revoked.
+    if let Some(state) = existing_state {
+        let earliest: i64 = state.try_get("earliest_authorized_sequence")?;
         if earliest != authorized_earliest {
-            return Err(MailboxPersistenceError::CorruptData(
-                "history grant delivery floor",
-            ));
+            // Delivery state remains a cursor, never an authorization fact.
+            // When one expiring recovery offer supersedes another, advance the
+            // resumable floor to the currently authorized snapshot boundary.
+            let current_ack: i64 = state.try_get("contiguous_ack_sequence")?;
+            sqlx::query(
+                "UPDATE messaging.device_delivery_state
+                    SET contiguous_ack_sequence=$3,
+                        earliest_authorized_sequence=$4,
+                        updated_at_ms=$5
+                  WHERE identity_id=$1 AND device_id=$2",
+            )
+            .bind(authenticated.identity_id().to_string())
+            .bind(*authenticated.device_id().as_uuid())
+            .bind(current_ack.max(authorized_earliest.saturating_sub(1)))
+            .bind(authorized_earliest)
+            .bind(now.get())
+            .execute(&mut *connection)
+            .await?;
         }
         return Ok(authorized_earliest);
     }
@@ -555,7 +578,7 @@ async fn authorize_identity_device(
 async fn current_history_grant_earliest(
     connection: &mut PgConnection,
     authenticated: AuthenticatedDeviceSession,
-) -> Result<i64, MailboxPersistenceError> {
+) -> Result<Option<i64>, MailboxPersistenceError> {
     let row = sqlx::query(
         "SELECT earliest_sequence,authorization_kind,authorizer_id
            FROM messaging.device_history_grants
@@ -565,8 +588,10 @@ async fn current_history_grant_earliest(
     .bind(authenticated.identity_id().to_string())
     .bind(*authenticated.device_id().as_uuid())
     .fetch_optional(&mut *connection)
-    .await?
-    .ok_or(MailboxPersistenceError::MailboxUnavailable)?;
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
     let earliest: i64 = row.try_get("earliest_sequence")?;
     let authorization_kind: String = row.try_get("authorization_kind")?;
     let authorizer_id: String = row.try_get("authorizer_id")?;
@@ -606,9 +631,116 @@ async fn current_history_grant_earliest(
         current
     };
     if !current {
-        return Err(MailboxPersistenceError::MailboxUnavailable);
+        return Ok(None);
     }
-    Ok(earliest)
+    Ok(Some(earliest))
+}
+
+async fn current_history_recovery_offer_earliest(
+    connection: &mut PgConnection,
+    authenticated: AuthenticatedDeviceSession,
+    snapshot: &IdentityLogSnapshot,
+    now: UtcMillis,
+) -> Result<Option<i64>, MailboxPersistenceError> {
+    let rows = sqlx::query(
+        "SELECT offer.earliest_sequence,offer.provider_device_id,
+                offer.approved_head_hash,offer.authority_kind,offer.authority_id
+           FROM messaging.history_recovery_offers AS offer
+          WHERE offer.identity_id=$1 AND offer.candidate_device_id=$2
+            AND offer.expires_at_ms>$3
+            AND EXISTS (
+                SELECT 1 FROM messaging.attachment_objects AS attachment
+                 WHERE attachment.owner_identity_id=offer.identity_id
+                   AND attachment.expected_manifest_digest=offer.attachment_digest
+                   AND attachment.state='ready'
+                   AND attachment.expires_at_ms>=offer.expires_at_ms
+                   AND attachment.expires_at_ms>$3
+            )
+            AND EXISTS (
+                SELECT 1
+                  FROM identity.history_recovery_request_authorized(
+                      offer.identity_id,offer.request_id,
+                      offer.recovery_request_digest,offer.candidate_device_id,$3
+                  ) AS authorized
+                 WHERE authorized.approved_head_hash=offer.approved_head_hash
+            )
+          ORDER BY offer.earliest_sequence",
+    )
+    .bind(authenticated.identity_id().to_string())
+    .bind(*authenticated.device_id().as_uuid())
+    .bind(now.get())
+    .fetch_all(&mut *connection)
+    .await?;
+    for row in rows {
+        let approved_head_hash: Vec<u8> = row.try_get("approved_head_hash")?;
+        if digest(approved_head_hash, "history offer approved head")? != snapshot.head().hash() {
+            continue;
+        }
+        let provider_uuid: uuid::Uuid = row.try_get("provider_device_id")?;
+        let provider: DeviceId = provider_uuid
+            .try_into()
+            .map_err(|_| MailboxPersistenceError::CorruptData("history offer provider"))?;
+        if !current_active_device(connection, authenticated.identity_id(), provider).await? {
+            continue;
+        }
+        let authority_kind: String = row.try_get("authority_kind")?;
+        let authority_id: String = row.try_get("authority_id")?;
+        let authority_is_current = match authority_kind.as_str() {
+            "active_device" => {
+                let Ok(authority) = authority_id.parse::<DeviceId>() else {
+                    return Err(MailboxPersistenceError::CorruptData(
+                        "history offer authority",
+                    ));
+                };
+                authority != provider
+                    && current_active_device(connection, authenticated.identity_id(), authority)
+                        .await?
+            }
+            "root" => {
+                authority_id
+                    == Sha256Digest::hash_domain(
+                        HISTORY_AUTHORITY_ID_DOMAIN,
+                        snapshot.projection().current_root_key().as_bytes(),
+                    )
+                    .to_string()
+            }
+            "recovery" => {
+                authority_id
+                    == Sha256Digest::hash_domain(
+                        HISTORY_AUTHORITY_ID_DOMAIN,
+                        snapshot.projection().current_recovery_key().as_bytes(),
+                    )
+                    .to_string()
+            }
+            _ => {
+                return Err(MailboxPersistenceError::CorruptData(
+                    "history offer authority kind",
+                ));
+            }
+        };
+        if authority_is_current {
+            return Ok(Some(row.try_get("earliest_sequence")?));
+        }
+    }
+    Ok(None)
+}
+
+async fn current_active_device(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+    device_id: DeviceId,
+) -> Result<bool, MailboxPersistenceError> {
+    match DeviceSessionRepository::active_device_signing_key_in_transaction(
+        connection,
+        identity_id,
+        device_id,
+    )
+    .await
+    {
+        Ok(_) => Ok(true),
+        Err(IdentityPersistenceError::DeviceAuthenticationRejected) => Ok(false),
+        Err(error) => Err(map_identity_authorization_error(error)),
+    }
 }
 
 fn map_identity_authorization_error(error: IdentityPersistenceError) -> MailboxPersistenceError {

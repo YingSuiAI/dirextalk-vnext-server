@@ -298,6 +298,10 @@ impl MailboxEnvelopeCommand {
         Sha256Digest::hash_domain(MAILBOX_ENQUEUE_REQUEST_HASH_DOMAIN, &self.exact_bytes)
     }
 
+    pub(crate) fn exact_bytes(&self) -> &[u8] {
+        &self.exact_bytes
+    }
+
     fn require_exact_bytes(&self) -> Result<(), MailboxPersistenceError> {
         let expected = encode_deterministic_cbor(&self.to_canonical_value())
             .map_err(|_| MailboxPersistenceError::InvalidCommand("mailbox enqueue encoding"))?;
