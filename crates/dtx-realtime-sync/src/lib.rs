@@ -94,6 +94,9 @@ pub enum InvalidationKind {
     MailboxDelivery,
     ConversationRead,
     DurableInvalidation,
+    IdentityHeadChanged,
+    DeviceRevoked,
+    KeyAuthorizationChanged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,12 +319,13 @@ impl RealtimeSyncStore {
                 subject_digest: digest(row.try_get("subject_digest")?)?,
             });
         }
-        let expected_next = after.get().saturating_add(1);
-        if (events.is_empty() && after.get() < highwater.get())
-            || events
-                .first()
-                .is_some_and(|event| event.cursor.get() != expected_next)
-        {
+        let mut expected_next = after.get().saturating_add(1);
+        let contiguous = events.iter().all(|event| {
+            let matches = event.cursor.get() == expected_next;
+            expected_next = expected_next.saturating_add(1);
+            matches
+        });
+        if (events.is_empty() && after.get() < highwater.get()) || !contiguous {
             transaction.commit().await?;
             return Ok(ReplayPage::CatchUpRequired { highwater });
         }
@@ -520,6 +524,9 @@ fn invalidation_kind(value: &str) -> Result<InvalidationKind, RealtimeSyncError>
         "mailbox_delivery" => Ok(InvalidationKind::MailboxDelivery),
         "conversation_read" => Ok(InvalidationKind::ConversationRead),
         "durable_invalidation" => Ok(InvalidationKind::DurableInvalidation),
+        "identity_head_changed" => Ok(InvalidationKind::IdentityHeadChanged),
+        "device_revoked" => Ok(InvalidationKind::DeviceRevoked),
+        "key_authorization_changed" => Ok(InvalidationKind::KeyAuthorizationChanged),
         _ => Err(RealtimeSyncError::CorruptData),
     }
 }

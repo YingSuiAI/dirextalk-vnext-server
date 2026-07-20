@@ -79,6 +79,10 @@ pub const IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.identity-mailbox-pull.v2+cbor";
 pub const IDENTITY_MAILBOX_PULL_RECEIPT_V2_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.identity-mailbox-pull-receipt.v2+cbor";
+pub const IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.identity-mailbox-pull.v3+cbor";
+pub const IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.identity-mailbox-pull-receipt.v3+cbor";
 pub const IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.identity-mailbox-ack.v2+cbor";
 pub const IDENTITY_MAILBOX_ACK_RECEIPT_V2_CONTENT_TYPE: &str =
@@ -321,6 +325,31 @@ impl MailboxNodeState {
         })
     }
 
+    async fn pull_identity_v3(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<MailboxSuccess, MailboxFailure> {
+        if !has_exact_content_type(headers, IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+        {
+            return Err(MailboxFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)?;
+        let bytes = read_exact_body(body, MAX_PULL_BODY_BYTES).await?;
+        let request = parse_identity_pull_v3_request(&bytes)?;
+        let outcome = self
+            .repository
+            .pull_identity_v3(&self.store, &credential, request, self.now()?)
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        Ok(MailboxSuccess {
+            status: StatusCode::OK,
+            exact_receipt_bytes: outcome.receipt_bytes().to_vec(),
+            content_type: IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE,
+        })
+    }
+
     async fn acknowledge_identity_v2(
         &self,
         headers: &HeaderMap,
@@ -519,7 +548,12 @@ async fn pull_identity_mailbox_v2(
 ) -> Response {
     let request_id = RequestId::new();
     let (parts, body) = request.into_parts();
-    match state.pull_identity_v2(&parts.headers, body).await {
+    let result = if has_exact_content_type(&parts.headers, IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE) {
+        state.pull_identity_v3(&parts.headers, body).await
+    } else {
+        state.pull_identity_v2(&parts.headers, body).await
+    };
+    match result {
         Ok(success) => mailbox_success_response(success, request_id),
         Err(failure) => mailbox_failure_response(failure, request_id),
     }
@@ -653,6 +687,25 @@ fn parse_identity_pull_v2_request(
     let value = decode_deterministic_cbor(bytes).map_err(|_| MailboxFailure::InvalidRequest)?;
     let fields = exact_cbor_fields(&value, 3)?;
     require_cbor_version_v2(cbor_field(fields, 1)?)?;
+    let after_sequence = parse_cbor_safe_uint(cbor_field(fields, 2)?)?;
+    let CanonicalValue::Unsigned(limit) = cbor_field(fields, 3)? else {
+        return Err(MailboxFailure::InvalidRequest);
+    };
+    IdentityMailboxPullRequest::new(
+        after_sequence,
+        u16::try_from(*limit).map_err(|_| MailboxFailure::InvalidRequest)?,
+    )
+    .map_err(|error| map_persistence_error(&error))
+}
+
+fn parse_identity_pull_v3_request(
+    bytes: &[u8],
+) -> Result<IdentityMailboxPullRequest, MailboxFailure> {
+    let value = decode_deterministic_cbor(bytes).map_err(|_| MailboxFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 3)?;
+    if cbor_field(fields, 1)? != &CanonicalValue::Unsigned(3) {
+        return Err(MailboxFailure::InvalidRequest);
+    }
     let after_sequence = parse_cbor_safe_uint(cbor_field(fields, 2)?)?;
     let CanonicalValue::Unsigned(limit) = cbor_field(fields, 3)? else {
         return Err(MailboxFailure::InvalidRequest);

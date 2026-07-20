@@ -1,0 +1,9 @@
+{
+  "version": 39,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/realtime-sync/v2/realtime-sync-v2.cddl": "sha256:71b45d8f5ea9cb392ac63a0415a1a8cd305a2d8748a1727ebaf5b4cb8efb94da",
+    "protocol/test-vectors/realtime-sync/v2/realtime-sync-v2.json": "sha256:3b2e19da84ea9b2397666f08f957d588baacdb9f879d0c3462f96ce8c4eedfcc"
+  }
+}

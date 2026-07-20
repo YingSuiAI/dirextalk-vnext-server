@@ -24,6 +24,14 @@ pub struct IdentityPulledEnvelope {
     pub expires_at: UtcMillis,
 }
 
+/// One contiguous V39 delivery segment. Terminal ranges advance a strict
+/// client cursor without returning expired ciphertext.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentityDeliverySegment {
+    Envelope(IdentityPulledEnvelope),
+    TerminalRange { first: SafeUint, last: SafeUint },
+}
+
 /// Authenticated V2 pull request. A device cannot select another identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IdentityMailboxPullRequest {
@@ -105,6 +113,104 @@ impl IdentityMailboxAckCommand {
 }
 
 impl crate::MailboxRepository {
+    /// Pulls one contiguous identity-delivery page with authenticated terminal
+    /// ranges for expired entries.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid/revoked sessions, unauthorized history, non-contiguous
+    /// durable state, corrupt live ciphertext, and storage failures.
+    pub async fn pull_identity_v3(
+        self,
+        store: &MailboxPgStore,
+        credential: &DeviceSessionCredential,
+        request: IdentityMailboxPullRequest,
+        now: UtcMillis,
+    ) -> Result<MailboxOperationOutcome, MailboxPersistenceError> {
+        let mut session = store.begin().await?;
+        let result = async {
+            let authenticated = authenticate(session.connection(), credential, now).await?;
+            let earliest =
+                authorize_identity_device(session.connection(), authenticated, now).await?;
+            let requested_after = i64::try_from(request.after_sequence().get())
+                .map_err(|_| MailboxPersistenceError::InvalidCommand("identity pull cursor"))?;
+            let resumable_floor = earliest.saturating_sub(1);
+            let lower_bound = requested_after.max(resumable_floor);
+            let highwater: i64 = sqlx::query_scalar(
+                "SELECT next_sequence FROM messaging.identity_delivery_heads WHERE identity_id=$1",
+            )
+            .bind(authenticated.identity_id().to_string())
+            .fetch_one(&mut *session.connection())
+            .await?;
+            if lower_bound > highwater {
+                return Err(MailboxPersistenceError::InvalidCommand(
+                    "identity pull beyond highwater",
+                ));
+            }
+            let rows = sqlx::query(
+                "SELECT journal.delivery_sequence,journal.envelope_id,journal.expires_at_ms,
+                        CASE WHEN journal.expires_at_ms>$3 THEN envelope.opaque_ciphertext END AS opaque_ciphertext
+                   FROM messaging.identity_delivery_journal AS journal
+                   JOIN messaging.mailbox_envelopes AS envelope
+                     ON envelope.mailbox_id=journal.mailbox_id
+                    AND envelope.envelope_id=journal.envelope_id
+                  WHERE journal.identity_id=$1 AND journal.delivery_sequence>$2
+                  ORDER BY journal.delivery_sequence LIMIT $4",
+            )
+            .bind(authenticated.identity_id().to_string())
+            .bind(lower_bound)
+            .bind(now.get())
+            .bind(i64::from(request.limit()))
+            .fetch_all(&mut *session.connection())
+            .await?;
+            let mut segments = Vec::with_capacity(rows.len());
+            let mut expected = lower_bound.saturating_add(1);
+            for row in rows {
+                let sequence: i64 = row.try_get("delivery_sequence")?;
+                if sequence != expected {
+                    return Err(MailboxPersistenceError::CorruptData(
+                        "identity delivery sequence gap",
+                    ));
+                }
+                expected = expected.saturating_add(1);
+                let expires_at = parse_time(row.try_get("expires_at_ms")?)?;
+                let ciphertext: Option<Vec<u8>> = row.try_get("opaque_ciphertext")?;
+                if let Some(ciphertext) = ciphertext {
+                    if ciphertext.is_empty() || ciphertext.len() > MAX_OPAQUE_CIPHERTEXT_BYTES {
+                        return Err(MailboxPersistenceError::CorruptData(
+                            "identity mailbox ciphertext",
+                        ));
+                    }
+                    segments.push(IdentityDeliverySegment::Envelope(
+                        IdentityPulledEnvelope {
+                            delivery_sequence: safe_sequence(sequence)?,
+                            envelope_id: parse_envelope_id(row.try_get("envelope_id")?)?,
+                            opaque_ciphertext: ciphertext,
+                            expires_at,
+                        },
+                    ));
+                } else {
+                    extend_terminal_range(&mut segments, safe_sequence(sequence)?);
+                }
+            }
+            if expected.saturating_sub(1) < highwater && segments.is_empty() {
+                return Err(MailboxPersistenceError::CorruptData(
+                    "identity delivery page unavailable",
+                ));
+            }
+            let receipt = encode_pull_v3_receipt(
+                authenticated.identity_id(),
+                authenticated.device_id(),
+                safe_sequence(highwater)?,
+                safe_sequence(resumable_floor)?,
+                &segments,
+            )?;
+            Ok(MailboxOperationOutcome::new(receipt, false))
+        }
+        .await;
+        finish_transaction(session, result).await
+    }
+
     /// Pulls every eligible identity-owned envelope in account delivery order.
     ///
     /// The current device session selects both identity and device. A secondary
@@ -281,6 +387,84 @@ impl crate::MailboxRepository {
         .await;
         finish_transaction(session, result).await
     }
+}
+
+fn extend_terminal_range(segments: &mut Vec<IdentityDeliverySegment>, sequence: SafeUint) {
+    if let Some(IdentityDeliverySegment::TerminalRange { last, .. }) = segments.last_mut()
+        && last.get().checked_add(1) == Some(sequence.get())
+    {
+        *last = sequence;
+        return;
+    }
+    segments.push(IdentityDeliverySegment::TerminalRange {
+        first: sequence,
+        last: sequence,
+    });
+}
+
+fn encode_pull_v3_receipt(
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    highwater: SafeUint,
+    resumable_floor: SafeUint,
+    segments: &[IdentityDeliverySegment],
+) -> Result<Vec<u8>, MailboxPersistenceError> {
+    let segments = segments
+        .iter()
+        .map(|segment| match segment {
+            IdentityDeliverySegment::Envelope(entry) => CanonicalValue::Map(vec![
+                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+                (
+                    CanonicalValue::Unsigned(2),
+                    CanonicalValue::Unsigned(entry.delivery_sequence.get()),
+                ),
+                (
+                    CanonicalValue::Unsigned(3),
+                    CanonicalValue::Text(entry.envelope_id.to_string()),
+                ),
+                (
+                    CanonicalValue::Unsigned(4),
+                    CanonicalValue::Bytes(entry.opaque_ciphertext.clone()),
+                ),
+                (
+                    CanonicalValue::Unsigned(5),
+                    entry.expires_at.to_canonical_value(),
+                ),
+            ]),
+            IdentityDeliverySegment::TerminalRange { first, last } => CanonicalValue::Map(vec![
+                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+                (
+                    CanonicalValue::Unsigned(2),
+                    CanonicalValue::Unsigned(first.get()),
+                ),
+                (
+                    CanonicalValue::Unsigned(3),
+                    CanonicalValue::Unsigned(last.get()),
+                ),
+            ]),
+        })
+        .collect();
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Unsigned(highwater.get()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Unsigned(resumable_floor.get()),
+        ),
+        (CanonicalValue::Unsigned(6), CanonicalValue::Array(segments)),
+    ]))
+    .map_err(|_| MailboxPersistenceError::CorruptData("identity pull V3 receipt"))
 }
 
 async fn authorize_identity_device(

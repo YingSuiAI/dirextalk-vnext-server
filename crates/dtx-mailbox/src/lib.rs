@@ -25,8 +25,8 @@ pub use attachment::{
 pub use error::MailboxPersistenceError;
 pub use history::{DeviceHistoryAuthorization, DeviceHistoryGrantCommand};
 pub use multi_device::{
-    IdentityMailboxAckCommand, IdentityMailboxPullRequest, IdentityPulledEnvelope,
-    MAX_IDENTITY_PULL_ENTRIES,
+    IdentityDeliverySegment, IdentityMailboxAckCommand, IdentityMailboxPullRequest,
+    IdentityPulledEnvelope, MAX_IDENTITY_PULL_ENTRIES,
 };
 pub use repository::MailboxRepository;
 pub use store::{MailboxPgStore, MailboxSession};

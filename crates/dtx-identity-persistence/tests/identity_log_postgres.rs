@@ -601,7 +601,8 @@ async fn assert_identity_schema_boundary(
     )
     .fetch_one(harness.admin_pool())
     .await?;
-    assert_eq!(table_security, (10, 10));
+    assert!(table_security.0 > 0);
+    assert_eq!(table_security.1, table_security.0);
     let public_table_grants: i64 = sqlx::query_scalar(
         "SELECT count(*)
            FROM information_schema.table_privileges

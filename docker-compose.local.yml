@@ -14,6 +14,13 @@ x-node-environment: &node-environment
   DTX_NODE_LISTEN: 0.0.0.0:8443
   DTX_GROUP_FEDERATED_IDENTITY_TRUST_ROOT_FILE: /run/dtx-local-tls/ca.pem
 
+x-gateway-healthcheck: &gateway-healthcheck
+  test: ["CMD-SHELL", "test \"$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /run/dtx-local-tls/ca.pem https://localhost:9444/v1/realtime-sync)\" = 400"]
+  interval: 2s
+  timeout: 3s
+  retries: 15
+  start_period: 2s
+
 services:
   postgres:
     image: postgres:18.4-alpine3.24
@@ -224,6 +231,63 @@ services:
     volumes:
       - dtx-local-tls:/run/dtx-local-tls:ro
     healthcheck: *node-healthcheck
+
+  realtime-a:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-realtime-sync-gateway"]
+    environment:
+      DTX_REALTIME_SYNC_BIND: 0.0.0.0:9444
+      DTX_REALTIME_SYNC_DATABASE_URL: postgres://dtx_realtime_sync_gateway@postgres:5432/dtx_node_a?sslmode=disable
+      DTX_REALTIME_SYNC_TLS_CERTIFICATE_FILE: /run/dtx-local-tls/node-a-cert.pem
+      DTX_REALTIME_SYNC_TLS_PRIVATE_KEY_FILE: /run/dtx-local-tls/node-a-key.pem
+    depends_on:
+      provision-a:
+        condition: service_completed_successfully
+      tls-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:19443:9444"
+    volumes:
+      - dtx-local-tls:/run/dtx-local-tls:ro
+    healthcheck: *gateway-healthcheck
+
+  realtime-b:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-realtime-sync-gateway"]
+    environment:
+      DTX_REALTIME_SYNC_BIND: 0.0.0.0:9444
+      DTX_REALTIME_SYNC_DATABASE_URL: postgres://dtx_realtime_sync_gateway@postgres:5432/dtx_node_b?sslmode=disable
+      DTX_REALTIME_SYNC_TLS_CERTIFICATE_FILE: /run/dtx-local-tls/node-b-cert.pem
+      DTX_REALTIME_SYNC_TLS_PRIVATE_KEY_FILE: /run/dtx-local-tls/node-b-key.pem
+    depends_on:
+      provision-b:
+        condition: service_completed_successfully
+      tls-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:19444:9444"
+    volumes:
+      - dtx-local-tls:/run/dtx-local-tls:ro
+    healthcheck: *gateway-healthcheck
+
+  realtime-c:
+    <<: *dev-image
+    command: ["/usr/local/bin/dtx-realtime-sync-gateway"]
+    environment:
+      DTX_REALTIME_SYNC_BIND: 0.0.0.0:9444
+      DTX_REALTIME_SYNC_DATABASE_URL: postgres://dtx_realtime_sync_gateway@postgres:5432/dtx_node_c?sslmode=disable
+      DTX_REALTIME_SYNC_TLS_CERTIFICATE_FILE: /run/dtx-local-tls/node-c-cert.pem
+      DTX_REALTIME_SYNC_TLS_PRIVATE_KEY_FILE: /run/dtx-local-tls/node-c-key.pem
+    depends_on:
+      provision-c:
+        condition: service_completed_successfully
+      tls-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:19445:9444"
+    volumes:
+      - dtx-local-tls:/run/dtx-local-tls:ro
+    healthcheck: *gateway-healthcheck
 
 volumes:
   dtx-local-postgres:

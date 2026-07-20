@@ -18,6 +18,7 @@ const TOMBSTONED_LOG_STATE: &str = "tombstoned";
 const FORKED_LOG_STATE: &str = "forked";
 const COMMITTED_RECEIPT_STATE: &str = "committed";
 const FORKED_RECEIPT_STATE: &str = "forked";
+const REALTIME_DEVICE_SUBJECT_DOMAIN: &[u8] = b"dirextalk.realtime-device-subject.v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LogState {
@@ -595,6 +596,8 @@ impl IdentityLogRepository {
             }
         };
 
+        append_realtime_identity_invalidation(connection, event, &decision).await?;
+
         resolve_append_decision(connection, command, request_digest, committed_at, decision).await
     }
 
@@ -623,6 +626,44 @@ impl IdentityLogRepository {
         )
         .await
     }
+}
+
+async fn append_realtime_identity_invalidation(
+    connection: &mut PgConnection,
+    event: &IdentityLogEventV1,
+    decision: &AppendDecision,
+) -> Result<(), IdentityPersistenceError> {
+    let (event_kind, subject_digest) = match decision {
+        AppendDecision::Forked(evidence) => {
+            ("identity_head_changed", evidence.observed_head().hash())
+        }
+        AppendDecision::Appended(head) => match event.payload() {
+            IdentityLogEventPayloadV1::DeviceRevoke { device_id } => (
+                "device_revoked",
+                Sha256Digest::hash_domain(
+                    REALTIME_DEVICE_SUBJECT_DOMAIN,
+                    device_id.as_uuid().as_bytes(),
+                ),
+            ),
+            IdentityLogEventPayloadV1::RootRotate { .. }
+            | IdentityLogEventPayloadV1::RecoveryRotate { .. }
+            | IdentityLogEventPayloadV1::RecoveryRestore { .. } => {
+                ("key_authorization_changed", head.hash())
+            }
+            IdentityLogEventPayloadV1::Genesis { .. }
+            | IdentityLogEventPayloadV1::DeviceAdd { .. }
+            | IdentityLogEventPayloadV1::RelayDescriptor { .. } => {
+                ("identity_head_changed", head.hash())
+            }
+        },
+    };
+    let _: i64 = sqlx::query_scalar("SELECT realtime.append_identity_invalidation($1,$2,$3)")
+        .bind(event.identity_id().to_string())
+        .bind(event_kind)
+        .bind(subject_digest.as_bytes().as_slice())
+        .fetch_one(&mut *connection)
+        .await?;
+    Ok(())
 }
 
 fn validate_device_revoke_shape(

@@ -74,6 +74,7 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
     let authorized: bool = sqlx::query_scalar(
         "SELECT identity.identity_runtime_authorized() \
              AND has_schema_privilege(current_user, 'identity', 'USAGE') \
+             AND has_schema_privilege(current_user, 'realtime', 'USAGE') \
              AND has_table_privilege(current_user, 'identity.log_heads', 'SELECT') \
              AND has_table_privilege(current_user, 'identity.log_heads', 'INSERT') \
              AND has_table_privilege(current_user, 'identity.log_heads', 'UPDATE') \
@@ -123,6 +124,11 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
              AND has_function_privilege( \
                  current_user, \
                  'identity.prune_expired_key_packages(bigint, integer)', \
+                 'EXECUTE' \
+             ) \
+             AND has_function_privilege( \
+                 current_user, \
+                 'realtime.append_identity_invalidation(text,text,bytea)', \
                  'EXECUTE' \
              ) \
              AND has_table_privilege(current_user, 'identity.fork_evidence', 'SELECT') \

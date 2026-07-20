@@ -1,13 +1,18 @@
 # vNext server release image
 
-`docker/release/Dockerfile` builds the production `dtx-node` image used by the
+`docker/release/Dockerfile` builds the production image containing the
+independent `dtx-node` and `dtx-realtime-sync-gateway` artifacts used by the
 new Rust release CLI. The default repository is `dirextalk/vent`, but the
 release manifest may select another repository. Releases use an exact SemVer
 tag and must be read back by digest after publication; no floating `latest` tag
 is produced.
 
-The image contains only the unified Rust node and CA roots. It runs as UID/GID
-`10001`, listens on container port `8443`, and has no shell entrypoint, local
+The default entrypoint remains the unified Rust node. A separately scheduled
+Gateway container must override the entrypoint with
+`/usr/local/bin/dtx-realtime-sync-gateway`; it uses its own listener, runtime
+login, session authentication and resource limits and is never merged into
+`dtx-node` or Agent Control. Both processes run as UID/GID `10001`. The image
+has no shell entrypoint, local
 test CA generator, development database environment adapter, or embedded
 credential. Production must mount separate regular files and configure:
 
@@ -25,6 +30,19 @@ dependency updates require an explicit Dockerfile review.
 - `DTX_INDEXER_DATABASE_URL_FILE`
 - `DTX_NODE_TLS_CERTIFICATE_FILE`
 - `DTX_NODE_TLS_PRIVATE_KEY_FILE`
+
+The independent Gateway container exposes `9444` and requires:
+
+- `DTX_REALTIME_SYNC_DATABASE_URL_FILE` (preferred production credential file;
+  raw `DTX_REALTIME_SYNC_DATABASE_URL` is retained only for bounded local use)
+- `DTX_REALTIME_SYNC_TLS_CERTIFICATE_FILE`
+- `DTX_REALTIME_SYNC_TLS_PRIVATE_KEY_FILE`
+- optional `DTX_REALTIME_SYNC_BIND` (default `0.0.0.0:9444`)
+
+Release orchestration must schedule one Gateway service beside each logical
+node, mount only that node's realtime database credential and TLS files, set
+the fixed Gateway entrypoint above, publish only the WSS listener, and retain
+the image digest and process identity as separate rollout/rollback evidence.
 
 The process fails closed when a public listener has no TLS configuration. Run
 database migrations and least-privilege grants as a separate, explicitly

@@ -1,0 +1,37 @@
+safe-uint = 0..9007199254740991
+uuid-v7 = tstr .size 36
+identity-id = tstr .size (8..128)
+digest = bstr .size 32
+
+realtime-client-frame-v2 = hello-v2 / heartbeat-v2 / sync-ack-v2 / ephemeral-v2 / scope-subscribe-v2
+realtime-server-frame-v2 = hello-ack-v2 / invalidation-v2 / catch-up-required-v2 / heartbeat-ack-v2 / ack-ok-v2 / ephemeral-signal-v2
+
+hello-v2 = { 1: 2, 2: 1, 3: safe-uint }
+heartbeat-v2 = { 1: 2, 2: 2, 3: uuid-v7, 4: 1..9007199254740991 }
+sync-ack-v2 = { 1: 2, 2: 3, 3: uuid-v7, 4: 1..9007199254740991, 5: safe-uint }
+ephemeral-v2 = { 1: 2, 2: 4, 3: 1..3, 4: digest, 5: 1..10000, 6: bool }
+scope-subscribe-v2 = { 1: 2, 2: 5, 3: digest, 4: 1..10000, 5: bool }
+
+hello-ack-v2 = {
+  1: 2, 2: 1, 3: uuid-v7, 4: 1..9007199254740991,
+  5: 1..9007199254740991, 6: safe-uint, 7: 15000, 8: 45000
+}
+invalidation-v2 = { 1: 2, 2: 2, 3: 1..9007199254740991, 4: 1..6, 5: digest }
+catch-up-required-v2 = { 1: 2, 2: 3, 3: safe-uint }
+heartbeat-ack-v2 = { 1: 2, 2: 4, 3: uuid-v7, 4: 1..9007199254740991, 5: int }
+ack-ok-v2 = { 1: 2, 2: 5, 3: safe-uint }
+ephemeral-signal-v2 = { 1: 2, 2: 6, 3: 1..3, 4: digest, 5: int, 6: digest }
+
+identity-mailbox-pull-v3 = { 1: 3, 2: safe-uint, 3: 1..100 }
+identity-mailbox-pull-receipt-v3 = {
+  1: 3, 2: identity-id, 3: uuid-v7, 4: safe-uint, 5: safe-uint,
+  6: [* identity-mailbox-segment-v3]
+}
+identity-mailbox-segment-v3 = identity-mailbox-envelope-v3 / identity-mailbox-terminal-range-v3
+identity-mailbox-envelope-v3 = {
+  1: 1, 2: 1..9007199254740991, 3: uuid-v7,
+  4: bstr .size (1..262144), 5: int
+}
+identity-mailbox-terminal-range-v3 = {
+  1: 2, 2: 1..9007199254740991, 3: 1..9007199254740991
+}

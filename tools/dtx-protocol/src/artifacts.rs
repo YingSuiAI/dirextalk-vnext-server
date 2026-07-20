@@ -158,11 +158,55 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_v36_additive_contracts(root)?;
     validate_realtime_sync_v1(root)?;
     validate_account_read_cursor_v1(root)?;
+    validate_realtime_sync_v2(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_realtime_sync_v2(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl = read(&root.join("protocol/cddl/realtime-sync/v2/realtime-sync-v2.cddl"))?;
+    cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse Realtime Sync V2 CDDL: {error}")))?;
+    let vector =
+        read_json(&root.join("protocol/test-vectors/realtime-sync/v2/realtime-sync-v2.json"))?;
+    if vector.get("version").and_then(Value::as_u64) != Some(2)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(39)
+        || vector.get("subprotocol").and_then(Value::as_str) != Some("dirextalk.realtime-sync.v2")
+    {
+        return Err(ProtocolToolError::new(
+            "Realtime Sync V2 vector version/baseline/subprotocol drift",
+        ));
+    }
+    for (rule, field) in [
+        ("hello-v2", "hello_canonical_cbor_hex"),
+        ("scope-subscribe-v2", "scope_subscribe_canonical_cbor_hex"),
+        (
+            "invalidation-v2",
+            "typed_identity_invalidation_canonical_cbor_hex",
+        ),
+        (
+            "identity-mailbox-pull-v3",
+            "identity_pull_v3_canonical_cbor_hex",
+        ),
+    ] {
+        validate_cddl_hex(rule, &cddl, json_string(&vector, field)?)?;
+    }
+    for pointer in [
+        "/privacy/scope_is_digest_only",
+        "/privacy/scope_membership_is_memory_only",
+        "/privacy/ephemeral_requires_active_subscription",
+        "/privacy/expired_delivery_has_no_ciphertext",
+    ] {
+        if vector.pointer(pointer).and_then(Value::as_bool) != Some(true) {
+            return Err(ProtocolToolError::new(format!(
+                "Realtime Sync V2 privacy invariant {pointer} is not frozen true"
+            )));
+        }
+    }
     Ok(())
 }
 

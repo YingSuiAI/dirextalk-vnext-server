@@ -5,8 +5,9 @@ WORKDIR /workspace
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/workspace/target \
-    cargo build --release --locked --package dtx-node \
-    && install -D -m 0555 /workspace/target/release/dtx-node /artifacts/dtx-node
+    cargo build --release --locked --package dtx-node --package dtx-realtime-sync-gateway \
+    && install -D -m 0555 /workspace/target/release/dtx-node /artifacts/dtx-node \
+    && install -D -m 0555 /workspace/target/release/dtx-realtime-sync-gateway /artifacts/dtx-realtime-sync-gateway
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
@@ -14,9 +15,10 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 RUN useradd --system --uid 10001 --create-home --home-dir /var/lib/dirextalk dtx
 
 COPY --from=build /artifacts/dtx-node /usr/local/bin/dtx-node
+COPY --from=build /artifacts/dtx-realtime-sync-gateway /usr/local/bin/dtx-realtime-sync-gateway
 
 ENV DTX_NODE_LISTEN=0.0.0.0:8443
-EXPOSE 8443
+EXPOSE 8443 9444
 STOPSIGNAL SIGTERM
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/dtx-node"]

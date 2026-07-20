@@ -187,6 +187,10 @@ const V38_ARTIFACT_PATHS: &[&str] = &[
     "protocol/cddl/account-read-cursor/v1",
     "protocol/test-vectors/account-read-cursor/v1",
 ];
+const V39_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/realtime-sync/v2",
+    "protocol/test-vectors/realtime-sync/v2",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -430,6 +434,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v38/manifest.json",
         includes_registries: false,
         artifact_paths: V38_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 39,
+        path: "protocol/baseline/v39/manifest.json",
+        includes_registries: false,
+        artifact_paths: V39_ARTIFACT_PATHS,
     },
 ];
 
@@ -1001,11 +1011,24 @@ mod tests {
 
     #[test]
     fn v38_selects_only_opaque_account_read_cursor_contracts() {
-        let v38 = BASELINE_SPECS.last().expect("v38 baseline spec");
+        let v38 = BASELINE_SPECS
+            .iter()
+            .find(|spec| spec.version == 38)
+            .expect("v38 baseline spec");
         assert_eq!(v38.version, 38);
         assert_eq!(v38.path, "protocol/baseline/v38/manifest.json");
         assert_eq!(v38.artifact_paths, V38_ARTIFACT_PATHS);
         assert_eq!(V38_ARTIFACT_PATHS.len(), 2);
         assert!(!v38.includes_registries);
+    }
+
+    #[test]
+    fn v39_selects_only_realtime_continuity_v2_contracts() {
+        let v39 = BASELINE_SPECS.last().expect("v39 baseline spec");
+        assert_eq!(v39.version, 39);
+        assert_eq!(v39.path, "protocol/baseline/v39/manifest.json");
+        assert_eq!(v39.artifact_paths, V39_ARTIFACT_PATHS);
+        assert_eq!(V39_ARTIFACT_PATHS.len(), 2);
+        assert!(!v39.includes_registries);
     }
 }

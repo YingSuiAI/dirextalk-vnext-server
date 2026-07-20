@@ -109,7 +109,10 @@ function Confirm-LocalClusterEndpoints {
         @{ Name = 'node-c mailbox'; Method = 'Put'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18445/v1/mailboxes/0190f2a5-7b1c-7abc-8def-0123456789c1' },
         @{ Name = 'node-c group'; Method = 'Put'; ExpectedStatus = 422; Uri = 'https://127.0.0.1:18445/v1/groups/controlled-public-channel/0190f2a5-7b1c-7abc-8def-0123456789c0' },
         @{ Name = 'node-c public feed'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:18445/.well-known/dirextalk/public/v1/not-a-stable-id' },
-        @{ Name = 'node-c indexer'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:18445/v1/public-search' }
+        @{ Name = 'node-c indexer'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:18445/v1/public-search' },
+        @{ Name = 'node-a realtime gateway'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:19443/v1/realtime-sync' },
+        @{ Name = 'node-b realtime gateway'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:19444/v1/realtime-sync' },
+        @{ Name = 'node-c realtime gateway'; Method = 'Get'; ExpectedStatus = 400; Uri = 'https://127.0.0.1:19445/v1/realtime-sync' }
     )
 
     foreach ($request in $requests) {
@@ -121,7 +124,7 @@ function Confirm-PlaintextHttpIsRejected {
     if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
         throw 'curl.exe is required to prove plaintext HTTP is unavailable.'
     }
-    foreach ($port in @(18443, 18444, 18445)) {
+    foreach ($port in @(18443, 18444, 18445, 19443, 19444, 19445)) {
         & curl.exe --silent --output NUL --max-time 3 "http://127.0.0.1:$port/local-health"
         if ($LASTEXITCODE -eq 0) {
             throw "Local node on port $port accepted plaintext HTTP."

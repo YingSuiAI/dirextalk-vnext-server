@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "baseline": 39,
+  "subprotocol": "dirextalk.realtime-sync.v2",
+  "hello_canonical_cbor_hex": "a3010202010300",
+  "scope_subscribe_canonical_cbor_hex": "a50102020503582000000000000000000000000000000000000000000000000000000000000000000419271005f4",
+  "typed_identity_invalidation_canonical_cbor_hex": "a501020202030104060558200000000000000000000000000000000000000000000000000000000000000000",
+  "identity_pull_v3_canonical_cbor_hex": "a301030200031864",
+  "privacy": {
+    "scope_is_digest_only": true,
+    "scope_membership_is_memory_only": true,
+    "ephemeral_requires_active_subscription": true,
+    "expired_delivery_has_no_ciphertext": true
+  }
+}
