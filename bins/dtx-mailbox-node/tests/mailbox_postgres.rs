@@ -16,8 +16,9 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{Clock, ClockError, DeviceId, DeviceSessionId, EnvelopeId, IdentityId, MailboxId};
 use dtx_identity_log::{
     DeviceCertificateV1, DeviceEncryptionPublicKey, IdentityLogEventPayloadV1, IdentityLogEventV1,
-    UnsignedDeviceCertificateV1, UnsignedIdentityLogEventV1, device_certificate_signature_input,
-    genesis_recovery_acceptance_input, identity_log_signature_input,
+    KeyAcceptancePurposeV1, UnsignedDeviceCertificateV1, UnsignedIdentityLogEventV1,
+    device_certificate_signature_input, genesis_recovery_acceptance_input,
+    identity_log_signature_input, key_rotation_acceptance_input,
 };
 use dtx_identity_persistence::{
     DEVICE_SESSION_SECRET_HASH_DOMAIN, DeviceSessionCompletionCommand, DeviceSessionCredential,
@@ -30,6 +31,8 @@ use dtx_mailbox::{
     MailboxPersistenceError, MailboxPgStore, MailboxRegistrationCommand, MailboxRepository,
 };
 use dtx_mailbox_node::{
+    ACCOUNT_READ_CURSOR_QUERY_V1_CONTENT_TYPE, ACCOUNT_READ_CURSOR_QUERY_V1_PATH,
+    ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE, ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
     DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V1_PATH,
     DEVICE_SESSION_AUTHORIZATION_SCHEME, IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
     IDENTITY_MAILBOX_ACK_V2_PATH, IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
@@ -42,7 +45,8 @@ use dtx_mailbox_node::{
     mailbox_router_with_state,
 };
 use dtx_realtime_sync::{
-    HEARTBEAT_INTERVAL_MILLIS, LEASE_TTL_MILLIS, RealtimeSyncError, RealtimeSyncStore, ReplayPage,
+    HEARTBEAT_INTERVAL_MILLIS, LEASE_TTL_MILLIS, OUTBOX_CLAIM_TTL_MILLIS, RealtimeSyncError,
+    RealtimeSyncStore, ReplayPage,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -603,6 +607,425 @@ async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
+    reason = "one boundary test binds current root/recovery authority, identity head, new-device PoP, and durable grant kind"
+)]
+async fn history_grants_accept_current_root_or_recovery_and_reject_stale_or_wrong_pop()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let mailbox_store = MailboxPgStore::connect(harness.mailbox_runtime_options(), 4).await?;
+    let app = mailbox_router_with_state(MailboxNodeState::with_clock(
+        mailbox_store,
+        Arc::new(FixedClock(NOW)),
+    ));
+    let owner = enroll_active_device(&identity_store, 121, 122, 123, [124; 32]).await?;
+    let root_target = add_active_device(&identity_store, &owner, 125, [126; 32]).await?;
+    let recovery_target = add_active_device(&identity_store, &owner, 127, [128; 32]).await?;
+    let rejected_target = add_active_device(&identity_store, &owner, 129, [130; 32]).await?;
+    let mailbox_id = MailboxId::new();
+    assert_eq!(
+        send_registration(
+            app.clone(),
+            "history-authority-register",
+            owner.session_id,
+            owner.session_secret,
+            mailbox_id,
+            mailbox_registration_body(
+                mailbox_id,
+                owner.identity_id,
+                owner.device_id,
+                [131; 32],
+                UtcMillis::new(EXPIRY)?,
+            )?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    let head = Sha256Digest::from_bytes(
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT head_hash FROM identity.log_heads WHERE identity_id=$1",
+        )
+        .bind(owner.identity_id.to_string())
+        .fetch_one(harness.admin_pool())
+        .await?
+        .try_into()
+        .map_err(|_| "identity head digest size")?,
+    );
+    let root_id = Sha256Digest::hash_domain(
+        b"dirextalk.device-history-authority-id.v1\0",
+        SigningPublicKey::try_from(owner.root.verifying_key().to_bytes())?.as_bytes(),
+    )
+    .to_string();
+    let recovery_id = Sha256Digest::hash_domain(
+        b"dirextalk.device-history-authority-id.v1\0",
+        SigningPublicKey::try_from(owner.recovery.verifying_key().to_bytes())?.as_bytes(),
+    )
+    .to_string();
+    for (target, kind, id, signer, seed) in [
+        (&root_target, 3, root_id, &owner.root, 132),
+        (&recovery_target, 2, recovery_id, &owner.recovery, 133),
+    ] {
+        assert_eq!(
+            send_v2(
+                app.clone(),
+                DEVICE_HISTORY_GRANT_V1_PATH,
+                DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE,
+                None,
+                owner.session_id,
+                owner.session_secret,
+                device_history_grant_body(
+                    owner.identity_id,
+                    target.device_id,
+                    head,
+                    kind,
+                    id,
+                    signer,
+                    &SigningKey::from_bytes(&[if kind == 3 { 125 } else { 127 }; 32]),
+                    seed,
+                    seed.wrapping_add(1),
+                )?,
+            )
+            .await?
+            .status(),
+            StatusCode::CREATED,
+        );
+    }
+    let authorities: Vec<(String, String)> = sqlx::query_as(
+        "SELECT authorization_kind,authorizer_id FROM messaging.device_history_grants
+          WHERE identity_id=$1 ORDER BY authorization_kind",
+    )
+    .bind(owner.identity_id.to_string())
+    .fetch_all(harness.admin_pool())
+    .await?;
+    assert_eq!(
+        authorities
+            .iter()
+            .map(|(kind, _)| kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["recovery", "root"]
+    );
+    assert!(authorities.iter().all(|(_, id)| id.starts_with("sha256:")));
+    assert!(
+        authorities
+            .iter()
+            .all(|(_, id)| !id.starts_with("ed25519:"))
+    );
+
+    let wrong_pop = device_history_grant_body(
+        owner.identity_id,
+        rejected_target.device_id,
+        head,
+        3,
+        Sha256Digest::hash_domain(
+            b"dirextalk.device-history-authority-id.v1\0",
+            SigningPublicKey::try_from(owner.root.verifying_key().to_bytes())?.as_bytes(),
+        )
+        .to_string(),
+        &owner.root,
+        &owner.root,
+        134,
+        135,
+    )?;
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V1_PATH,
+            DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE,
+            None,
+            owner.session_id,
+            owner.session_secret,
+            wrong_pop,
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    let repository = IdentityLogRepository::new();
+    let before_rotation = repository
+        .load(&identity_store, owner.identity_id)
+        .await?
+        .ok_or("identity missing before root rotation")?
+        .head();
+    let successor_root = SigningKey::from_bytes(&[138; 32]);
+    let successor_public = public_key(&successor_root)?;
+    let rotation = signed_event(
+        &owner.root,
+        owner.identity_id,
+        before_rotation.sequence().get() + 1,
+        Some(before_rotation.hash()),
+        NOW,
+        IdentityLogEventPayloadV1::RootRotate {
+            new_root_signing_key: successor_public,
+            acceptance_signature: signature(
+                &successor_root,
+                &key_rotation_acceptance_input(
+                    owner.identity_id,
+                    SafeUint::new(before_rotation.sequence().get() + 1)?,
+                    Some(before_rotation.hash()),
+                    KeyAcceptancePurposeV1::RootRotate,
+                    successor_public,
+                )?,
+            ),
+        },
+    )?;
+    assert!(matches!(
+        repository
+            .append(
+                &identity_store,
+                &IdentityAppendCommand::new(
+                    Sha256Digest::hash_domain(b"test-mailbox-root-rotation\0", &[138]),
+                    Some(before_rotation),
+                    rotation.to_deterministic_cbor()?,
+                )?,
+                UtcMillis::new(NOW)?,
+            )
+            .await?,
+        IdentityAppendOutcome::Committed(_)
+    ));
+    let after_rotation = repository
+        .load(&identity_store, owner.identity_id)
+        .await?
+        .ok_or("identity missing after root rotation")?
+        .head();
+    let revoked_old_root = device_history_grant_body(
+        owner.identity_id,
+        rejected_target.device_id,
+        after_rotation.hash(),
+        3,
+        Sha256Digest::hash_domain(
+            b"dirextalk.device-history-authority-id.v1\0",
+            SigningPublicKey::try_from(owner.root.verifying_key().to_bytes())?.as_bytes(),
+        )
+        .to_string(),
+        &owner.root,
+        &SigningKey::from_bytes(&[129; 32]),
+        139,
+        140,
+    )?;
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            DEVICE_HISTORY_GRANT_V1_PATH,
+            DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE,
+            None,
+            owner.session_id,
+            owner.session_secret,
+            revoked_old_root,
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    let stale = device_history_grant_body(
+        owner.identity_id,
+        rejected_target.device_id,
+        Sha256Digest::from_bytes([1; 32]),
+        2,
+        Sha256Digest::hash_domain(
+            b"dirextalk.device-history-authority-id.v1\0",
+            SigningPublicKey::try_from(owner.recovery.verifying_key().to_bytes())?.as_bytes(),
+        )
+        .to_string(),
+        &owner.recovery,
+        &SigningKey::from_bytes(&[129; 32]),
+        136,
+        137,
+    )?;
+    assert_eq!(
+        send_v2(
+            app,
+            DEVICE_HISTORY_GRANT_V1_PATH,
+            DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE,
+            None,
+            owner.session_id,
+            owner.session_secret,
+            stale,
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one HTTPS boundary test keeps opaque CAS, exact replay, multi-device read, conflict, privacy, and revoke behavior coherent"
+)]
+async fn account_read_cursor_is_opaque_exact_cas_and_rechecks_device_revocation()
+-> Result<(), Box<dyn Error>> {
+    let harness = support::PostgresHarness::start().await?;
+    let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
+    let mailbox_store = MailboxPgStore::connect(harness.mailbox_runtime_options(), 4).await?;
+    let app = mailbox_router_with_state(MailboxNodeState::with_clock(
+        mailbox_store,
+        Arc::new(FixedClock(NOW)),
+    ));
+    let owner = enroll_active_device(&identity_store, 141, 142, 143, [144; 32]).await?;
+    let second = add_active_device(&identity_store, &owner, 145, [146; 32]).await?;
+    let mailbox_id = MailboxId::new();
+    assert_eq!(
+        send_registration(
+            app.clone(),
+            "account-cursor-register",
+            owner.session_id,
+            owner.session_secret,
+            mailbox_id,
+            mailbox_registration_body(
+                mailbox_id,
+                owner.identity_id,
+                owner.device_id,
+                [147; 32],
+                UtcMillis::new(EXPIRY)?,
+            )?,
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    let head = Sha256Digest::from_bytes(
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT head_hash FROM identity.log_heads WHERE identity_id=$1",
+        )
+        .bind(owner.identity_id.to_string())
+        .fetch_one(harness.admin_pool())
+        .await?
+        .try_into()
+        .map_err(|_| "identity head digest size")?,
+    );
+    let conversation = Sha256Digest::hash_domain(
+        b"test-account-cursor-conversation\0",
+        b"never-store-this-conversation-id",
+    );
+    let first_body = account_read_cursor_write_body(conversation, 0, 1, &[0x91; 48], head)?;
+    let first = send_v2(
+        app.clone(),
+        ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
+        ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE,
+        Some("account-cursor-write-0001"),
+        owner.session_id,
+        owner.session_secret,
+        first_body.clone(),
+    )
+    .await?;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_receipt = response_bytes(first).await?;
+    let replay = send_v2(
+        app.clone(),
+        ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
+        ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE,
+        Some("account-cursor-write-0001"),
+        owner.session_id,
+        owner.session_secret,
+        first_body,
+    )
+    .await?;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(response_bytes(replay).await?, first_receipt);
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
+            ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE,
+            Some("account-cursor-write-0001"),
+            owner.session_id,
+            owner.session_secret,
+            account_read_cursor_write_body(conversation, 0, 1, &[0x90; 48], head)?,
+        )
+        .await?
+        .status(),
+        StatusCode::CONFLICT,
+    );
+
+    let query = send_v2(
+        app.clone(),
+        ACCOUNT_READ_CURSOR_QUERY_V1_PATH,
+        ACCOUNT_READ_CURSOR_QUERY_V1_CONTENT_TYPE,
+        None,
+        second.session_id,
+        second.session_secret,
+        account_read_cursor_query_body(conversation)?,
+    )
+    .await?;
+    assert_eq!(query.status(), StatusCode::OK);
+    let query_bytes = response_bytes(query).await?;
+    let CanonicalValue::Map(query_fields) = decode_deterministic_cbor(&query_bytes)? else {
+        return Err("account cursor query receipt not a map".into());
+    };
+    assert_eq!(query_fields[2].1, CanonicalValue::Unsigned(1));
+    assert_eq!(query_fields[3].1, CanonicalValue::Bytes(vec![0x91; 48]));
+    assert!(
+        !query_bytes
+            .windows(b"never-store-this-conversation-id".len())
+            .any(|window| window == b"never-store-this-conversation-id")
+    );
+
+    let stale = send_v2(
+        app.clone(),
+        ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
+        ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE,
+        Some("account-cursor-stale-0001"),
+        second.session_id,
+        second.session_secret,
+        account_read_cursor_write_body(conversation, 0, 1, &[0x92; 48], head)?,
+    )
+    .await?;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let stale_head = send_v2(
+        app.clone(),
+        ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
+        ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE,
+        Some("account-cursor-head-0001"),
+        second.session_id,
+        second.session_secret,
+        account_read_cursor_write_body(
+            conversation,
+            1,
+            2,
+            &[0x93; 48],
+            Sha256Digest::from_bytes([0x94; 32]),
+        )?,
+    )
+    .await?;
+    assert_eq!(stale_head.status(), StatusCode::CONFLICT);
+    let second_body = account_read_cursor_write_body(conversation, 1, 2, &[0x93; 48], head)?;
+    assert_eq!(
+        send_v2(
+            app.clone(),
+            ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
+            ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE,
+            Some("account-cursor-write-0002"),
+            second.session_id,
+            second.session_secret,
+            second_body.clone(),
+        )
+        .await?
+        .status(),
+        StatusCode::CREATED,
+    );
+    revoke_active_device(&identity_store, &second).await?;
+    assert_eq!(
+        send_v2(
+            app,
+            ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
+            ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE,
+            Some("account-cursor-write-0002"),
+            second.session_id,
+            second.session_secret,
+            second_body,
+        )
+        .await?
+        .status(),
+        StatusCode::UNAUTHORIZED,
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
     reason = "one boundary test keeps fenced acquire, replay, ACK, heartbeat, expiry, and durable gap recovery coherent"
 )]
 async fn realtime_sync_fences_old_leases_and_requires_catch_up_after_a_gap()
@@ -659,6 +1082,69 @@ async fn realtime_sync_fences_old_leases_and_requires_catch_up_after_a_gap()
         .status(),
         StatusCode::CREATED,
     );
+    let realtime_now = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+    sqlx::query(
+        "UPDATE realtime.journal SET created_at_ms=$2,expires_at_ms=$3 \
+         WHERE identity_id=$1",
+    )
+    .bind(owner.identity_id.to_string())
+    .bind(realtime_now - 1)
+    .bind(realtime_now + 60_000)
+    .execute(harness.admin_pool())
+    .await?;
+
+    let worker_id = Uuid::now_v7();
+    assert!(matches!(
+        realtime_store
+            .compact_expired(UtcMillis::new(realtime_now + 120_000)?)
+            .await,
+        Err(RealtimeSyncError::Database(_))
+    ));
+    let abandoned = realtime_store
+        .claim_outbox(worker_id, UtcMillis::new(realtime_now)?)
+        .await?;
+    assert_eq!(abandoned.notifications.len(), 1);
+    assert!(
+        realtime_store
+            .claim_outbox(worker_id, UtcMillis::new(realtime_now + 1)?)
+            .await?
+            .notifications
+            .is_empty()
+    );
+    let reclaimed = realtime_store
+        .claim_outbox(
+            worker_id,
+            UtcMillis::new(realtime_now + OUTBOX_CLAIM_TTL_MILLIS)?,
+        )
+        .await?;
+    assert_eq!(reclaimed.notifications, abandoned.notifications);
+    assert_ne!(reclaimed.claim_id, abandoned.claim_id);
+    realtime_store
+        .mark_outbox_published(
+            &abandoned,
+            UtcMillis::new(realtime_now + OUTBOX_CLAIM_TTL_MILLIS + 1)?,
+        )
+        .await?;
+    realtime_store
+        .mark_outbox_published(
+            &reclaimed,
+            UtcMillis::new(realtime_now + OUTBOX_CLAIM_TTL_MILLIS + 1)?,
+        )
+        .await?;
+    realtime_store
+        .mark_outbox_published(
+            &reclaimed,
+            UtcMillis::new(realtime_now + OUTBOX_CLAIM_TTL_MILLIS + 2)?,
+        )
+        .await?;
+    let publication: (i32, bool) = sqlx::query_as(
+        "SELECT attempts,published_at_ms IS NOT NULL FROM realtime.outbox
+          WHERE identity_id=$1 AND cursor=1",
+    )
+    .bind(owner.identity_id.to_string())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(publication, (2, true));
 
     let first = realtime_store
         .acquire(&credential, SafeUint::new(0)?, UtcMillis::new(NOW)?)
@@ -725,15 +1211,65 @@ async fn realtime_sync_fences_old_leases_and_requires_catch_up_after_a_gap()
         Err(RealtimeSyncError::StaleLease)
     ));
 
+    let mut uncommitted = harness.admin_pool().begin().await?;
+    sqlx::query("UPDATE realtime.identity_heads SET next_cursor=2 WHERE identity_id=$1")
+        .bind(owner.identity_id.to_string())
+        .execute(&mut *uncommitted)
+        .await?;
     sqlx::query(
-        "UPDATE realtime.journal SET created_at_ms=$2,expires_at_ms=$3 \
-         WHERE identity_id=$1 AND cursor=1",
+        "INSERT INTO realtime.journal(
+             identity_id,cursor,event_kind,subject_digest,created_at_ms,expires_at_ms
+         ) VALUES($1,2,'durable_invalidation',$2,$3,$4)",
     )
     .bind(owner.identity_id.to_string())
-    .bind(NOW - 2)
-    .bind(NOW - 1)
+    .bind(vec![0x51_u8; 32])
+    .bind(realtime_now + 20)
+    .bind(realtime_now + 60_000)
+    .execute(&mut *uncommitted)
+    .await?;
+    sqlx::query("INSERT INTO realtime.outbox(identity_id,cursor) VALUES($1,2)")
+        .bind(owner.identity_id.to_string())
+        .execute(&mut *uncommitted)
+        .await?;
+    assert!(
+        realtime_store
+            .claim_outbox(worker_id, UtcMillis::new(realtime_now + 20)?)
+            .await?
+            .notifications
+            .is_empty()
+    );
+    uncommitted.commit().await?;
+    let committed = realtime_store
+        .claim_outbox(worker_id, UtcMillis::new(realtime_now + 20)?)
+        .await?;
+    assert_eq!(committed.notifications.len(), 1);
+    assert_eq!(committed.notifications[0].event.cursor.get(), 2);
+    realtime_store
+        .mark_outbox_published(&committed, UtcMillis::new(realtime_now + 21)?)
+        .await?;
+
+    sqlx::query(
+        "UPDATE realtime.journal SET created_at_ms=$2,expires_at_ms=$3 \
+         WHERE identity_id=$1 AND cursor IN (1,2)",
+    )
+    .bind(owner.identity_id.to_string())
+    .bind(realtime_now - 2)
+    .bind(realtime_now - 1)
     .execute(harness.admin_pool())
     .await?;
+    realtime_store
+        .compact_expired(UtcMillis::new(realtime_now + 4)?)
+        .await?;
+    let retained_realtime: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM realtime.journal WHERE identity_id=$1),
+            (SELECT count(*) FROM realtime.outbox WHERE identity_id=$1),
+            (SELECT journal_floor FROM realtime.identity_heads WHERE identity_id=$1)",
+    )
+    .bind(owner.identity_id.to_string())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(retained_realtime, (0, 0, 3));
     let catch_up_lease = realtime_store
         .acquire(&credential, SafeUint::new(0)?, UtcMillis::new(NOW + 4)?)
         .await?;
@@ -746,7 +1282,7 @@ async fn realtime_sync_fences_old_leases_and_requires_catch_up_after_a_gap()
                 UtcMillis::new(NOW + 4)?,
             )
             .await?,
-        ReplayPage::CatchUpRequired { highwater } if highwater.get() == 1
+        ReplayPage::CatchUpRequired { highwater } if highwater.get() == 2
     ));
     Ok(())
 }
@@ -1290,6 +1826,7 @@ async fn opaque_attachment_is_exact_idempotent_and_cancel_revokes_read()
 
 struct ActiveDevice {
     root: SigningKey,
+    recovery: SigningKey,
     identity_id: IdentityId,
     device_id: DeviceId,
     session_id: DeviceSessionId,
@@ -1406,6 +1943,7 @@ async fn enroll_active_device_at(
     ));
     Ok(ActiveDevice {
         root,
+        recovery,
         identity_id,
         device_id,
         session_id,
@@ -1492,6 +2030,7 @@ async fn add_active_device(
     ));
     Ok(ActiveDevice {
         root: SigningKey::from_bytes(&owner.root.to_bytes()),
+        recovery: SigningKey::from_bytes(&owner.recovery.to_bytes()),
         identity_id: owner.identity_id,
         device_id,
         session_id,
@@ -1564,6 +2103,117 @@ fn mailbox_registration_body(
             capability_hash.to_canonical_value(),
         ),
         (CanonicalValue::Unsigned(6), expires_at.to_canonical_value()),
+    ]))?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn device_history_grant_body(
+    identity_id: IdentityId,
+    new_device_id: DeviceId,
+    identity_head: Sha256Digest,
+    authorization_kind: u64,
+    authorizer_id: String,
+    authorizer: &SigningKey,
+    new_device: &SigningKey,
+    history_seed: u8,
+    pop_seed: u8,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let unsigned = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Text(identity_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Text(new_device_id.to_string()),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            identity_head.to_canonical_value(),
+        ),
+        (CanonicalValue::Unsigned(5), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Bytes(vec![history_seed; 32]),
+        ),
+        (
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Unsigned(authorization_kind),
+        ),
+        (
+            CanonicalValue::Unsigned(8),
+            CanonicalValue::Text(authorizer_id),
+        ),
+        (
+            CanonicalValue::Unsigned(9),
+            CanonicalValue::Bytes(vec![pop_seed; 32]),
+        ),
+        (
+            CanonicalValue::Unsigned(10),
+            UtcMillis::new(NOW)?.to_canonical_value(),
+        ),
+    ]);
+    let unsigned_bytes = encode_deterministic_cbor(&unsigned)?;
+    let mut grant_input = b"dirextalk.device-history-grant.v1\0".to_vec();
+    grant_input.extend_from_slice(&unsigned_bytes);
+    let mut pop_input = b"dirextalk.device-history-grant-pop.v1\0".to_vec();
+    pop_input.extend_from_slice(&unsigned_bytes);
+    let CanonicalValue::Map(mut fields) = unsigned else {
+        unreachable!()
+    };
+    fields.push((
+        CanonicalValue::Unsigned(11),
+        signature(authorizer, &grant_input).to_canonical_value(),
+    ));
+    fields.push((
+        CanonicalValue::Unsigned(12),
+        signature(new_device, &pop_input).to_canonical_value(),
+    ));
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
+}
+
+fn account_read_cursor_write_body(
+    conversation_digest: Sha256Digest,
+    base_revision: u64,
+    revision: u64,
+    encrypted_cursor: &[u8],
+    identity_head: Sha256Digest,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            conversation_digest.to_canonical_value(),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Unsigned(base_revision),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Unsigned(revision),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Bytes(encrypted_cursor.to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            identity_head.to_canonical_value(),
+        ),
+    ]))?)
+}
+
+fn account_read_cursor_query_body(
+    conversation_digest: Sha256Digest,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            conversation_digest.to_canonical_value(),
+        ),
     ]))?)
 }
 

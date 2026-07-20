@@ -183,6 +183,10 @@ const V37_ARTIFACT_PATHS: &[&str] = &[
     "protocol/test-vectors/realtime-sync/v1",
     "protocol/proto/dirextalk/agent_control/v1_5",
 ];
+const V38_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/account-read-cursor/v1",
+    "protocol/test-vectors/account-read-cursor/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -420,6 +424,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v37/manifest.json",
         includes_registries: false,
         artifact_paths: V37_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 38,
+        path: "protocol/baseline/v38/manifest.json",
+        includes_registries: false,
+        artifact_paths: V38_ARTIFACT_PATHS,
     },
 ];
 
@@ -978,11 +988,24 @@ mod tests {
 
     #[test]
     fn v37_selects_realtime_sync_and_the_existing_additive_agent_control_v1_5() {
-        let v37 = BASELINE_SPECS.last().expect("v37 baseline spec");
+        let v37 = BASELINE_SPECS
+            .iter()
+            .find(|spec| spec.version == 37)
+            .expect("v37 baseline spec");
         assert_eq!(v37.version, 37);
         assert_eq!(v37.path, "protocol/baseline/v37/manifest.json");
         assert_eq!(v37.artifact_paths, V37_ARTIFACT_PATHS);
         assert_eq!(V37_ARTIFACT_PATHS.len(), 3);
         assert!(!v37.includes_registries);
+    }
+
+    #[test]
+    fn v38_selects_only_opaque_account_read_cursor_contracts() {
+        let v38 = BASELINE_SPECS.last().expect("v38 baseline spec");
+        assert_eq!(v38.version, 38);
+        assert_eq!(v38.path, "protocol/baseline/v38/manifest.json");
+        assert_eq!(v38.artifact_paths, V38_ARTIFACT_PATHS);
+        assert_eq!(V38_ARTIFACT_PATHS.len(), 2);
+        assert!(!v38.includes_registries);
     }
 }

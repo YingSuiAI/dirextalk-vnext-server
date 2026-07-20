@@ -49,7 +49,8 @@ const AGENT_ACCEPTANCE_TENANT_STREAM_SELECT_MIGRATION_VERSION: i64 = 202_607_180
 const PUBLIC_DISCUSSION_V1_MIGRATION_VERSION: i64 = 202_607_190_043;
 const CONNECTOR_CREDENTIAL_REISSUE_V1_MIGRATION_VERSION: i64 = 202_607_190_044;
 const REALTIME_SYNC_MULTIDEVICE_MAILBOX_V1_MIGRATION_VERSION: i64 = 202_607_200_045;
-const EXPECTED_MIGRATION_COUNT: i64 = 45;
+const ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_MIGRATION_VERSION: i64 = 202_607_200_046;
+const EXPECTED_MIGRATION_COUNT: i64 = 46;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -157,6 +158,10 @@ const REALTIME_SYNC_MULTIDEVICE_MAILBOX_V1_DOWN: &str =
     include_str!("../../../migrations/202607200045_realtime_sync_multidevice_mailbox_v1.down.sql");
 const REALTIME_SYNC_MULTIDEVICE_MAILBOX_V1_UP: &str =
     include_str!("../../../migrations/202607200045_realtime_sync_multidevice_mailbox_v1.up.sql");
+const ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_DOWN: &str =
+    include_str!("../../../migrations/202607200046_account_recovery_realtime_outbox_v1.down.sql");
+const ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_UP: &str =
+    include_str!("../../../migrations/202607200046_account_recovery_realtime_outbox_v1.up.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -210,6 +215,37 @@ async fn realtime_sync_multidevice_mailbox_empty_down_up_preserves_v14()
             "SELECT to_regclass('messaging.mailboxes') IS NOT NULL
             AND to_regclass('realtime.journal') IS NOT NULL
             AND to_regclass('messaging.device_delivery_state') IS NOT NULL",
+        )
+        .fetch_one(harness.admin_pool())
+        .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_recovery_outbox_empty_down_up_preserves_v45()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('realtime.journal') IS NOT NULL
+                AND to_regclass('realtime.account_read_cursor_claims') IS NULL
+                AND to_regprocedure('realtime.claim_outbox(uuid,uuid,bigint,bigint,integer)') IS NULL",
+        )
+        .fetch_one(harness.admin_pool())
+        .await?
+    );
+    sqlx::raw_sql(ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('realtime.journal') IS NOT NULL
+                AND to_regclass('realtime.account_read_cursor_claims') IS NOT NULL
+                AND to_regprocedure('realtime.claim_outbox(uuid,uuid,bigint,bigint,integer)') IS NOT NULL",
         )
         .fetch_one(harness.admin_pool())
         .await?
@@ -1363,7 +1399,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -1410,8 +1446,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(PUBLIC_DISCUSSION_V1_MIGRATION_VERSION)
     .bind(CONNECTOR_CREDENTIAL_REISSUE_V1_MIGRATION_VERSION)
     .bind(REALTIME_SYNC_MULTIDEVICE_MAILBOX_V1_MIGRATION_VERSION)
+    .bind(ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(ACCOUNT_RECOVERY_REALTIME_OUTBOX_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(REALTIME_SYNC_MULTIDEVICE_MAILBOX_V1_DOWN)
         .execute(harness.admin_pool())
         .await?;

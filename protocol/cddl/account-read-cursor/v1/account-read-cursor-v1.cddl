@@ -1,0 +1,16 @@
+safe-uint = 0..9007199254740991
+digest = bstr .size 32
+
+account-read-cursor-write-v1 = {
+  1: 1, 2: digest, 3: safe-uint, 4: 1..9007199254740991,
+  5: bstr .size (1..4096), 6: digest
+}
+account-read-cursor-write-receipt-v1 = {
+  1: 1, 2: digest, 3: 1..9007199254740991, 4: digest,
+  5: 1..9007199254740991
+}
+account-read-cursor-query-v1 = { 1: 1, 2: digest }
+account-read-cursor-query-receipt-v1 = {
+  1: 1, 2: digest, 3: 1..9007199254740991,
+  4: bstr .size (1..4096), 5: digest, 6: digest
+}

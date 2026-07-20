@@ -157,11 +157,48 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_conversation_agent_grant_v1(root)?;
     validate_v36_additive_contracts(root)?;
     validate_realtime_sync_v1(root)?;
+    validate_account_read_cursor_v1(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
     validate_openapi(root, &events, &errors)?;
     validate_protobuf(root)?;
+    Ok(())
+}
+
+fn validate_account_read_cursor_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    let cddl =
+        read(&root.join("protocol/cddl/account-read-cursor/v1/account-read-cursor-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse Account Read Cursor V1 CDDL: {error}"))
+    })?;
+    let vector = read_json(
+        &root.join("protocol/test-vectors/account-read-cursor/v1/account-read-cursor-v1.json"),
+    )?;
+    if vector.get("version").and_then(Value::as_u64) != Some(1)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(38)
+    {
+        return Err(ProtocolToolError::new(
+            "Account Read Cursor V1 vector version/baseline drift",
+        ));
+    }
+    for (rule, field) in [
+        ("account-read-cursor-write-v1", "write_canonical_cbor_hex"),
+        ("account-read-cursor-query-v1", "query_canonical_cbor_hex"),
+    ] {
+        validate_cddl_hex(rule, &cddl, json_string(&vector, field)?)?;
+    }
+    for pointer in [
+        "/privacy/conversation_is_digest_only",
+        "/privacy/cursor_is_opaque_ciphertext",
+        "/privacy/server_has_no_plaintext_unread_graph",
+    ] {
+        if vector.pointer(pointer).and_then(Value::as_bool) != Some(true) {
+            return Err(ProtocolToolError::new(format!(
+                "Account Read Cursor V1 privacy invariant {pointer} is not frozen true"
+            )));
+        }
+    }
     Ok(())
 }
 

@@ -17,7 +17,8 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{Clock, DeviceSessionId, IdentityId, SystemClock};
 use dtx_identity_persistence::DeviceSessionCredential;
 use dtx_realtime_sync::{
-    HEARTBEAT_INTERVAL_MILLIS, Invalidation, InvalidationKind, Lease, RealtimeSyncStore, ReplayPage,
+    HEARTBEAT_INTERVAL_MILLIS, Invalidation, InvalidationKind, Lease, OutboxNotification,
+    RealtimeSyncStore, ReplayPage,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, SafeUint, UtcMillis, decode_deterministic_cbor,
@@ -31,7 +32,8 @@ use uuid::Uuid;
 const SUBPROTOCOL: &str = "dirextalk.realtime-sync.v1";
 const SYNC_PATH: &str = "/v1/realtime-sync";
 const SESSION_SCHEME: &str = "DTX-Device-Session";
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const OUTBOX_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SAFETY_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FRAME_BYTES: usize = 16_384;
 const MAX_EPHEMERAL_TTL_MILLIS: u64 = 10_000;
 
@@ -40,6 +42,7 @@ struct AppState {
     store: RealtimeSyncStore,
     clock: Arc<dyn Clock>,
     ephemeral: broadcast::Sender<EphemeralSignal>,
+    durable: broadcast::Sender<OutboxNotification>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -81,11 +84,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let private_key = PathBuf::from(env::var("DTX_REALTIME_SYNC_TLS_PRIVATE_KEY_FILE")?);
     let store = RealtimeSyncStore::connect(PgConnectOptions::from_str(&database_url)?, 16).await?;
     let (ephemeral, _) = broadcast::channel(256);
+    let (durable, _) = broadcast::channel(1_024);
     let state = AppState {
-        store,
+        store: store.clone(),
         clock: Arc::new(SystemClock),
         ephemeral,
+        durable: durable.clone(),
     };
+    tokio::spawn(publish_outbox(store, durable, Uuid::now_v7()));
     let router = Router::new()
         .route(SYNC_PATH, get(upgrade))
         .with_state(state);
@@ -135,26 +141,25 @@ async fn serve_socket(state: AppState, credential: DeviceSessionCredential, mut 
     }
 
     let mut next_cursor = cursor;
-    let mut poll = tokio::time::interval(POLL_INTERVAL);
+    let mut poll = tokio::time::interval(SAFETY_REPLAY_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut ephemeral_rx = state.ephemeral.subscribe();
+    let mut durable_rx = state.durable.subscribe();
     loop {
         tokio::select! {
             _ = poll.tick() => {
                 let Ok(current_now) = now(&state) else { break };
-                match state.store.replay(&credential, lease, next_cursor, current_now).await {
-                    Ok(ReplayPage::Events { events, .. }) => {
-                        for event in events {
-                            next_cursor = event.cursor;
-                            if send_binary(&mut socket, encode_invalidation(event)).await.is_err() { return; }
-                        }
-                    }
-                    Ok(ReplayPage::CatchUpRequired { highwater }) => {
-                        let _ = send_binary(&mut socket, encode_catch_up(highwater)).await;
-                        close(&mut socket, 1008, "durable catch-up required").await;
-                        return;
-                    }
-                    Err(_) => { close(&mut socket, 1008, "lease or session rejected").await; return; }
+                if !push_replay(&state, &credential, lease, &mut next_cursor, current_now, &mut socket).await { return; }
+            }
+            notification = durable_rx.recv() => {
+                let should_replay = match notification {
+                    Ok(notification) => notification.identity_id == lease.identity_id,
+                    Err(broadcast::error::RecvError::Lagged(_)) => true,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                };
+                if should_replay {
+                    let Ok(current_now) = now(&state) else { break };
+                    if !push_replay(&state, &credential, lease, &mut next_cursor, current_now, &mut socket).await { return; }
                 }
             }
             signal = ephemeral_rx.recv() => {
@@ -206,6 +211,83 @@ async fn serve_socket(state: AppState, credential: DeviceSessionCredential, mut 
                     _ => { close(&mut socket, 1008, "frame fence rejected").await; return; }
                 }
             }
+        }
+    }
+}
+
+async fn publish_outbox(
+    store: RealtimeSyncStore,
+    durable: broadcast::Sender<OutboxNotification>,
+    worker_id: Uuid,
+) {
+    let mut poll = tokio::time::interval(OUTBOX_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let clock = SystemClock;
+    let mut compaction_tick = 0_u16;
+    let mut failures = 0_u8;
+    loop {
+        poll.tick().await;
+        let Ok(now_ms) = clock.now_utc_millis() else {
+            continue;
+        };
+        let Ok(now) = UtcMillis::new(now_ms) else {
+            continue;
+        };
+        let claim = if let Ok(claim) = store.claim_outbox(worker_id, now).await {
+            failures = 0;
+            claim
+        } else {
+            failures = failures.saturating_add(1).min(5);
+            tokio::time::sleep(Duration::from_millis(100_u64 << u32::from(failures))).await;
+            continue;
+        };
+        for notification in &claim.notifications {
+            let _ = durable.send(*notification);
+        }
+        if !claim.notifications.is_empty() {
+            let _ = store.mark_outbox_published(&claim, now).await;
+        }
+        compaction_tick = compaction_tick.wrapping_add(1);
+        if compaction_tick >= 300 {
+            let _ = store.compact_expired(now).await;
+            compaction_tick = 0;
+        }
+    }
+}
+
+async fn push_replay(
+    state: &AppState,
+    credential: &DeviceSessionCredential,
+    lease: Lease,
+    next_cursor: &mut SafeUint,
+    now: UtcMillis,
+    socket: &mut WebSocket,
+) -> bool {
+    match state
+        .store
+        .replay(credential, lease, *next_cursor, now)
+        .await
+    {
+        Ok(ReplayPage::Events { events, .. }) => {
+            for event in events {
+                *next_cursor = event.cursor;
+                if send_binary(socket, encode_invalidation(event))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        Ok(ReplayPage::CatchUpRequired { highwater }) => {
+            let _ = send_binary(socket, encode_catch_up(highwater)).await;
+            close(socket, 1008, "durable catch-up required").await;
+            false
+        }
+        Err(_) => {
+            close(socket, 1008, "lease or session rejected").await;
+            false
         }
     }
 }

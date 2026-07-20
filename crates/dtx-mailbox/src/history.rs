@@ -1,13 +1,13 @@
 use dtx_domain::{DeviceId, IdentityId};
 use dtx_identity_persistence::{
     DeviceSessionCredential, DeviceSessionRepository, IdentityPersistenceError,
+    lock_and_load_active_snapshot,
 };
 use dtx_wire::{
-    CanonicalEncode, CanonicalValue, Ed25519Signature, MAX_SAFE_UINT, Sha256Digest, UtcMillis,
-    encode_deterministic_cbor,
+    CanonicalEncode, CanonicalValue, Ed25519Signature, MAX_SAFE_UINT, Sha256Digest,
+    SigningPublicKey, UtcMillis, encode_deterministic_cbor,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
-use sqlx::Row;
 
 use crate::{
     MailboxOperationOutcome, MailboxPersistenceError, MailboxPgStore,
@@ -17,6 +17,33 @@ use crate::{
 const GRANT_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.device-history-grant.v1\0";
 const NEW_DEVICE_POP_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.device-history-grant-pop.v1\0";
 const GRANT_DIGEST_DOMAIN: &[u8] = b"dirextalk.device-history-grant-digest.v1\0";
+const AUTHORITY_ID_DOMAIN: &[u8] = b"dirextalk.device-history-authority-id.v1\0";
+
+/// Authority that signs a V37 device-history grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceHistoryAuthorization {
+    ActiveDevice,
+    RecoveryKey,
+    RootKey,
+}
+
+impl DeviceHistoryAuthorization {
+    const fn wire_kind(self) -> u64 {
+        match self {
+            Self::ActiveDevice => 1,
+            Self::RecoveryKey => 2,
+            Self::RootKey => 3,
+        }
+    }
+
+    const fn database_kind(self) -> &'static str {
+        match self {
+            Self::ActiveDevice => "grantor_device",
+            Self::RecoveryKey => "recovery",
+            Self::RootKey => "root",
+        }
+    }
+}
 
 /// Exact V37 active-device history authorization.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +53,7 @@ pub struct DeviceHistoryGrantCommand {
     identity_head: Sha256Digest,
     earliest_sequence: u64,
     encrypted_history_digest: Sha256Digest,
+    authorization: DeviceHistoryAuthorization,
     authorizer_id: String,
     new_device_pop_digest: Sha256Digest,
     granted_at: UtcMillis,
@@ -47,6 +75,7 @@ impl DeviceHistoryGrantCommand {
         identity_head: Sha256Digest,
         earliest_sequence: u64,
         encrypted_history_digest: Sha256Digest,
+        authorization: DeviceHistoryAuthorization,
         authorizer_id: String,
         new_device_pop_digest: Sha256Digest,
         granted_at: UtcMillis,
@@ -65,6 +94,7 @@ impl DeviceHistoryGrantCommand {
             identity_head,
             earliest_sequence,
             encrypted_history_digest,
+            authorization,
             authorizer_id,
             new_device_pop_digest,
             granted_at,
@@ -103,7 +133,10 @@ impl DeviceHistoryGrantCommand {
                 CanonicalValue::Unsigned(6),
                 self.encrypted_history_digest.to_canonical_value(),
             ),
-            (CanonicalValue::Unsigned(7), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(7),
+                CanonicalValue::Unsigned(self.authorization.wire_kind()),
+            ),
             (
                 CanonicalValue::Unsigned(8),
                 CanonicalValue::Text(self.authorizer_id.clone()),
@@ -162,25 +195,37 @@ impl crate::MailboxRepository {
                 session.connection(), credential, now,
             ).await.map_err(map_identity_error)?;
             if grantor.session().identity_id() != command.identity_id
-                || command.authorizer_id != grantor.session().device_id().to_string()
                 || command.granted_at > now
                 || now.get().saturating_sub(command.granted_at.get()) > 300_000
             {
                 return Err(MailboxPersistenceError::DeviceAuthenticationRejected);
             }
-            // Session authentication already holds the identity-scoped advisory
-            // transaction lock, so a second row lock would add no concurrency
-            // protection and would incorrectly require identity UPDATE privilege.
-            let row = sqlx::query("SELECT head_hash FROM identity.log_heads WHERE identity_id=$1 AND state='active'")
-                .bind(command.identity_id.to_string()).fetch_one(&mut *session.connection()).await?;
-            if digest(row.try_get("head_hash")?)? != command.identity_head {
+            let snapshot = lock_and_load_active_snapshot(session.connection(), command.identity_id)
+                .await.map_err(map_identity_error)?;
+            if snapshot.head().hash() != command.identity_head {
                 return Err(MailboxPersistenceError::DeviceAuthenticationRejected);
             }
+            let authorizer_key = match command.authorization {
+                DeviceHistoryAuthorization::ActiveDevice => {
+                    if command.authorizer_id != grantor.session().device_id().to_string() {
+                        return Err(MailboxPersistenceError::DeviceAuthenticationRejected);
+                    }
+                    grantor.signing_key()
+                }
+                DeviceHistoryAuthorization::RecoveryKey => require_authority_key(
+                    snapshot.projection().current_recovery_key(),
+                    &command.authorizer_id,
+                )?,
+                DeviceHistoryAuthorization::RootKey => require_authority_key(
+                    snapshot.projection().current_root_key(),
+                    &command.authorizer_id,
+                )?,
+            };
             let new_device_key = DeviceSessionRepository::active_device_signing_key_in_transaction(
                 session.connection(), command.identity_id, command.new_device_id,
             ).await.map_err(map_identity_error)?;
             let unsigned = command.canonical_unsigned()?;
-            verify(grantor.signing_key().as_bytes(), GRANT_SIGNATURE_DOMAIN, &unsigned, command.signature)?;
+            verify(authorizer_key.as_bytes(), GRANT_SIGNATURE_DOMAIN, &unsigned, command.signature)?;
             verify(new_device_key.as_bytes(), NEW_DEVICE_POP_SIGNATURE_DOMAIN, &unsigned, command.new_device_pop_signature)?;
             let grant_digest = Sha256Digest::hash_domain(GRANT_DIGEST_DOMAIN, &command.exact_bytes);
             if let Some(existing) = sqlx::query_scalar::<_, Vec<u8>>(
@@ -198,11 +243,12 @@ impl crate::MailboxRepository {
                     identity_id,new_device_id,identity_head,earliest_sequence,encrypted_history_digest,
                     authorization_kind,authorizer_id,new_device_pop_digest,canonical_grant,grant_digest,
                     signature,new_device_pop_signature,granted_at_ms
-                 ) VALUES($1,$2,$3,$4,$5,'grantor_device',$6,$7,$8,$9,$10,$11,$12)",
+                 ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
             ).bind(command.identity_id.to_string()).bind(*command.new_device_id.as_uuid())
                 .bind(command.identity_head.as_bytes().as_slice())
                 .bind(i64::try_from(command.earliest_sequence).map_err(|_| MailboxPersistenceError::InvalidCommand("history grant sequence"))?)
-                .bind(command.encrypted_history_digest.as_bytes().as_slice()).bind(&command.authorizer_id)
+                .bind(command.encrypted_history_digest.as_bytes().as_slice())
+                .bind(command.authorization.database_kind()).bind(&command.authorizer_id)
                 .bind(command.new_device_pop_digest.as_bytes().as_slice()).bind(&command.exact_bytes)
                 .bind(grant_digest.as_bytes().as_slice()).bind(command.signature.as_bytes().as_slice())
                 .bind(command.new_device_pop_signature.as_bytes().as_slice()).bind(command.granted_at.get())
@@ -210,6 +256,18 @@ impl crate::MailboxRepository {
             Ok(MailboxOperationOutcome::new(encode_receipt(command, grant_digest)?, false))
         }.await;
         finish_transaction(session, result).await
+    }
+}
+
+fn require_authority_key(
+    key: SigningPublicKey,
+    authorizer_id: &str,
+) -> Result<SigningPublicKey, MailboxPersistenceError> {
+    let expected = Sha256Digest::hash_domain(AUTHORITY_ID_DOMAIN, key.as_bytes()).to_string();
+    if authorizer_id == expected {
+        Ok(key)
+    } else {
+        Err(MailboxPersistenceError::DeviceAuthenticationRejected)
     }
 }
 

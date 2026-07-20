@@ -8,6 +8,7 @@
 //! transaction as owner mutations, so a revoked session cannot replay an old
 //! receipt.
 
+mod account_cursor;
 mod attachment;
 mod error;
 mod history;
@@ -16,12 +17,13 @@ mod repository;
 mod store;
 mod types;
 
+pub use account_cursor::AccountReadCursorWriteCommand;
 pub use attachment::{
     AttachmentCapability, AttachmentChunk, AttachmentChunkReference, AttachmentCreate,
     AttachmentError, AttachmentManifest, AttachmentRepository, AttachmentStatus,
 };
 pub use error::MailboxPersistenceError;
-pub use history::DeviceHistoryGrantCommand;
+pub use history::{DeviceHistoryAuthorization, DeviceHistoryGrantCommand};
 pub use multi_device::{
     IdentityMailboxAckCommand, IdentityMailboxPullRequest, IdentityPulledEnvelope,
     MAX_IDENTITY_PULL_ENTRIES,

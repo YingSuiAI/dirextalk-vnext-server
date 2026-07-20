@@ -497,6 +497,10 @@ impl PostgresHarness {
              GRANT USAGE ON SCHEMA realtime TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT, UPDATE ON realtime.identity_heads TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON realtime.journal, realtime.outbox TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT, UPDATE ON realtime.encrypted_account_read_cursors
+                TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT ON realtime.account_read_cursor_claims
+                TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT, UPDATE ON messaging.attachment_objects TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON messaging.attachment_chunks TO dtx_mailbox_runtime;
              GRANT EXECUTE ON FUNCTION messaging.expire_attachment_objects(integer)
@@ -522,6 +526,12 @@ impl PostgresHarness {
              GRANT SELECT ON realtime.identity_heads, realtime.journal
                 TO dtx_realtime_sync_runtime;
              GRANT SELECT, INSERT, UPDATE ON realtime.device_sync_acks, realtime.device_leases
+                TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION realtime.claim_outbox(uuid,uuid,bigint,bigint,integer)
+                TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION realtime.mark_outbox_published(uuid,uuid,bigint)
+                TO dtx_realtime_sync_runtime;
+             GRANT EXECUTE ON FUNCTION realtime.compact_expired(bigint,integer)
                 TO dtx_realtime_sync_runtime;",
         )
         .execute(&mut *role_transaction)

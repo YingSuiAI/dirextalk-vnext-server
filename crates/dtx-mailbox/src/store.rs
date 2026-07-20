@@ -117,6 +117,8 @@ async fn validate_mailbox_runtime_role(pool: &PgPool) -> Result<(), MailboxPersi
              AND has_table_privilege(current_user, 'realtime.identity_heads', 'SELECT,INSERT,UPDATE')
              AND has_table_privilege(current_user, 'realtime.journal', 'SELECT,INSERT')
              AND has_table_privilege(current_user, 'realtime.outbox', 'SELECT,INSERT')
+             AND has_table_privilege(current_user, 'realtime.encrypted_account_read_cursors', 'SELECT,INSERT,UPDATE')
+             AND has_table_privilege(current_user, 'realtime.account_read_cursor_claims', 'SELECT,INSERT')
              AND has_table_privilege(current_user, 'messaging.attachment_objects', 'SELECT')
              AND has_table_privilege(current_user, 'messaging.attachment_objects', 'INSERT')
              AND has_table_privilege(current_user, 'messaging.attachment_objects', 'UPDATE')

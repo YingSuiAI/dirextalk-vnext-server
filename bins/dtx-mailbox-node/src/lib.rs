@@ -24,10 +24,10 @@ use dtx_domain::{
 };
 use dtx_identity_persistence::DeviceSessionCredential;
 use dtx_mailbox::{
-    DeviceHistoryGrantCommand, IdentityMailboxAckCommand, IdentityMailboxPullRequest,
-    MailboxAcknowledgementCommand, MailboxEnvelopeCommand, MailboxOperationOutcome,
-    MailboxPersistenceError, MailboxPgStore, MailboxPullRequest, MailboxRegistrationCommand,
-    MailboxRepository, MailboxWriteCapability,
+    AccountReadCursorWriteCommand, DeviceHistoryAuthorization, DeviceHistoryGrantCommand,
+    IdentityMailboxAckCommand, IdentityMailboxPullRequest, MailboxAcknowledgementCommand,
+    MailboxEnvelopeCommand, MailboxOperationOutcome, MailboxPersistenceError, MailboxPgStore,
+    MailboxPullRequest, MailboxRegistrationCommand, MailboxRepository, MailboxWriteCapability,
 };
 use dtx_wire::{
     CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, UtcMillis, decode_deterministic_cbor,
@@ -50,6 +50,8 @@ pub const IDENTITY_MAILBOX_PULL_V2_PATH: &str = "/v2/mailbox/pull";
 /// Per-device contiguous identity delivery acknowledgement route.
 pub const IDENTITY_MAILBOX_ACK_V2_PATH: &str = "/v2/mailbox/acks";
 pub const DEVICE_HISTORY_GRANT_V1_PATH: &str = "/v2/devices/history-grants";
+pub const ACCOUNT_READ_CURSOR_WRITE_V1_PATH: &str = "/v1/account/read-cursors";
+pub const ACCOUNT_READ_CURSOR_QUERY_V1_PATH: &str = "/v1/account/read-cursors/query";
 
 /// Exact registration request media type.
 pub const MAILBOX_REGISTER_CONTENT_TYPE: &str =
@@ -85,6 +87,14 @@ pub const DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.device-history-grant.v1+cbor";
 pub const DEVICE_HISTORY_GRANT_RECEIPT_V1_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.device-history-grant-receipt.v1+cbor";
+pub const ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.account-read-cursor-write.v1+cbor";
+pub const ACCOUNT_READ_CURSOR_WRITE_RECEIPT_V1_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.account-read-cursor-write-receipt.v1+cbor";
+pub const ACCOUNT_READ_CURSOR_QUERY_V1_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.account-read-cursor-query.v1+cbor";
+pub const ACCOUNT_READ_CURSOR_QUERY_RECEIPT_V1_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.account-read-cursor-query-receipt.v1+cbor";
 /// Exact authorization scheme for owner device sessions.
 pub const DEVICE_SESSION_AUTHORIZATION_SCHEME: &str = "DTX-Device-Session";
 /// Exact authorization scheme for write-only mailbox capabilities.
@@ -105,6 +115,8 @@ const HTTP_ENQUEUE_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
 const HTTP_ACK_IDEMPOTENCY_HASH_DOMAIN: &[u8] = b"dirextalk.mailbox-http-ack-idempotency-key.v1\0";
 const HTTP_IDENTITY_ACK_V2_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
     b"dirextalk.identity-mailbox-http-ack-idempotency-key.v2\0";
+const HTTP_ACCOUNT_READ_CURSOR_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.account-read-cursor-http-idempotency-key.v1\0";
 
 /// Shared state for the isolated public mailbox router.
 #[derive(Clone)]
@@ -360,6 +372,57 @@ impl MailboxNodeState {
             DEVICE_HISTORY_GRANT_RECEIPT_V1_CONTENT_TYPE,
         ))
     }
+
+    async fn write_account_read_cursor(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<MailboxSuccess, MailboxFailure> {
+        if !has_exact_content_type(headers, ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+        {
+            return Err(MailboxFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)?;
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_ACCOUNT_READ_CURSOR_IDEMPOTENCY_HASH_DOMAIN)?;
+        let bytes = read_exact_body(body, MAX_REGISTER_BODY_BYTES).await?;
+        let command = parse_account_read_cursor_write(&bytes, idempotency_key_hash)?;
+        let outcome = self
+            .repository
+            .write_account_read_cursor(&self.store, &credential, &command, self.now()?)
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        Ok(MailboxSuccess::write(
+            &outcome,
+            ACCOUNT_READ_CURSOR_WRITE_RECEIPT_V1_CONTENT_TYPE,
+        ))
+    }
+
+    async fn query_account_read_cursor(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<MailboxSuccess, MailboxFailure> {
+        if !has_exact_content_type(headers, ACCOUNT_READ_CURSOR_QUERY_V1_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+        {
+            return Err(MailboxFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)?;
+        let bytes = read_exact_body(body, MAX_PULL_BODY_BYTES).await?;
+        let conversation_digest = parse_account_read_cursor_query(&bytes)?;
+        let outcome = self
+            .repository
+            .read_account_read_cursor(&self.store, &credential, conversation_digest, self.now()?)
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        Ok(MailboxSuccess {
+            status: StatusCode::OK,
+            exact_receipt_bytes: outcome.receipt_bytes().to_vec(),
+            content_type: ACCOUNT_READ_CURSOR_QUERY_RECEIPT_V1_CONTENT_TYPE,
+        })
+    }
 }
 
 /// Builds the public isolated mailbox router using the system UTC clock.
@@ -383,6 +446,14 @@ pub fn mailbox_router_with_state(state: MailboxNodeState) -> Router {
             post(acknowledge_identity_mailbox_v2),
         )
         .route(DEVICE_HISTORY_GRANT_V1_PATH, post(grant_device_history))
+        .route(
+            ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
+            post(write_account_read_cursor),
+        )
+        .route(
+            ACCOUNT_READ_CURSOR_QUERY_V1_PATH,
+            post(query_account_read_cursor),
+        )
         .merge(attachment::attachment_router())
         .with_state(state)
 }
@@ -470,6 +541,30 @@ async fn grant_device_history(State(state): State<MailboxNodeState>, request: Re
     let request_id = RequestId::new();
     let (parts, body) = request.into_parts();
     match state.grant_device_history(&parts.headers, body).await {
+        Ok(success) => mailbox_success_response(success, request_id),
+        Err(failure) => mailbox_failure_response(failure, request_id),
+    }
+}
+
+async fn write_account_read_cursor(
+    State(state): State<MailboxNodeState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.write_account_read_cursor(&parts.headers, body).await {
+        Ok(success) => mailbox_success_response(success, request_id),
+        Err(failure) => mailbox_failure_response(failure, request_id),
+    }
+}
+
+async fn query_account_read_cursor(
+    State(state): State<MailboxNodeState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.query_account_read_cursor(&parts.headers, body).await {
         Ok(success) => mailbox_success_response(success, request_id),
         Err(failure) => mailbox_failure_response(failure, request_id),
     }
@@ -580,9 +675,12 @@ fn parse_device_history_grant(bytes: &[u8]) -> Result<DeviceHistoryGrantCommand,
     let value = decode_deterministic_cbor(bytes).map_err(|_| MailboxFailure::InvalidRequest)?;
     let fields = exact_cbor_fields(&value, 12)?;
     require_cbor_version(cbor_field(fields, 1)?)?;
-    if cbor_field(fields, 7)? != &CanonicalValue::Unsigned(1) {
-        return Err(MailboxFailure::InvalidRequest);
-    }
+    let authorization = match cbor_field(fields, 7)? {
+        CanonicalValue::Unsigned(1) => DeviceHistoryAuthorization::ActiveDevice,
+        CanonicalValue::Unsigned(2) => DeviceHistoryAuthorization::RecoveryKey,
+        CanonicalValue::Unsigned(3) => DeviceHistoryAuthorization::RootKey,
+        _ => return Err(MailboxFailure::InvalidRequest),
+    };
     let CanonicalValue::Text(authorizer_id) = cbor_field(fields, 8)? else {
         return Err(MailboxFailure::InvalidRequest);
     };
@@ -593,6 +691,7 @@ fn parse_device_history_grant(bytes: &[u8]) -> Result<DeviceHistoryGrantCommand,
         Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 4)?)?),
         earliest.get(),
         Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 6)?)?),
+        authorization,
         authorizer_id.clone(),
         Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 9)?)?),
         parse_cbor_utc_millis(cbor_field(fields, 10)?)?,
@@ -601,6 +700,37 @@ fn parse_device_history_grant(bytes: &[u8]) -> Result<DeviceHistoryGrantCommand,
         bytes.to_vec(),
     )
     .map_err(|error| map_persistence_error(&error))
+}
+
+fn parse_account_read_cursor_write(
+    bytes: &[u8],
+    idempotency_key_hash: Sha256Digest,
+) -> Result<AccountReadCursorWriteCommand, MailboxFailure> {
+    let value = decode_deterministic_cbor(bytes).map_err(|_| MailboxFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 6)?;
+    require_cbor_version(cbor_field(fields, 1)?)?;
+    AccountReadCursorWriteCommand::new(
+        idempotency_key_hash,
+        Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 2)?)?),
+        parse_cbor_safe_uint(cbor_field(fields, 3)?)?,
+        parse_cbor_safe_uint(cbor_field(fields, 4)?)?,
+        match cbor_field(fields, 5)? {
+            CanonicalValue::Bytes(bytes) => bytes.clone(),
+            _ => return Err(MailboxFailure::InvalidRequest),
+        },
+        Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 6)?)?),
+        bytes.to_vec(),
+    )
+    .map_err(|error| map_persistence_error(&error))
+}
+
+fn parse_account_read_cursor_query(bytes: &[u8]) -> Result<Sha256Digest, MailboxFailure> {
+    let value = decode_deterministic_cbor(bytes).map_err(|_| MailboxFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 2)?;
+    require_cbor_version(cbor_field(fields, 1)?)?;
+    Ok(Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(
+        fields, 2,
+    )?)?))
 }
 
 fn exact_cbor_fields(

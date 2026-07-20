@@ -23,6 +23,8 @@ use uuid::Uuid;
 pub const HEARTBEAT_INTERVAL_MILLIS: i64 = 15_000;
 pub const LEASE_TTL_MILLIS: i64 = 45_000;
 pub const MAX_REPLAY_EVENTS: i64 = 128;
+pub const OUTBOX_CLAIM_TTL_MILLIS: i64 = 15_000;
+pub const MAX_OUTBOX_CLAIM_EVENTS: i32 = 256;
 
 #[derive(Debug)]
 pub enum RealtimeSyncError {
@@ -112,6 +114,21 @@ pub enum ReplayPage {
     },
 }
 
+/// One post-commit digest-only notification claimed from the durable outbox.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutboxNotification {
+    pub identity_id: IdentityId,
+    pub event: Invalidation,
+}
+
+/// A fenced batch whose publication may be retried after claim expiry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxClaim {
+    pub claim_id: Uuid,
+    pub worker_id: Uuid,
+    pub notifications: Vec<OutboxNotification>,
+}
+
 impl RealtimeSyncStore {
     /// Opens the dedicated least-privilege realtime database pool.
     ///
@@ -131,6 +148,9 @@ impl RealtimeSyncStore {
             "SELECT realtime.runtime_authorized()
                 AND has_table_privilege(current_user,'realtime.journal','SELECT')
                 AND has_table_privilege(current_user,'realtime.device_leases','SELECT,INSERT,UPDATE')
+                AND has_function_privilege(current_user,'realtime.claim_outbox(uuid,uuid,bigint,bigint,integer)','EXECUTE')
+                AND has_function_privilege(current_user,'realtime.mark_outbox_published(uuid,uuid,bigint)','EXECUTE')
+                AND has_function_privilege(current_user,'realtime.compact_expired(bigint,integer)','EXECUTE')
                 AND NOT has_table_privilege(current_user,'messaging.mailbox_envelopes','SELECT')",
         ).fetch_one(&pool).await?;
         if !authorized {
@@ -289,12 +309,7 @@ impl RealtimeSyncStore {
         .await?;
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            let kind = match row.try_get::<String, _>("event_kind")?.as_str() {
-                "mailbox_delivery" => InvalidationKind::MailboxDelivery,
-                "conversation_read" => InvalidationKind::ConversationRead,
-                "durable_invalidation" => InvalidationKind::DurableInvalidation,
-                _ => return Err(RealtimeSyncError::CorruptData),
-            };
+            let kind = invalidation_kind(&row.try_get::<String, _>("event_kind")?)?;
             events.push(Invalidation {
                 cursor: safe(row.try_get("cursor")?)?,
                 kind,
@@ -352,6 +367,86 @@ impl RealtimeSyncStore {
         ).bind(lease.identity_id.to_string()).bind(*lease.device_id.as_uuid()).bind(value).bind(now.get())
             .execute(&mut *transaction).await?;
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Claims one bounded post-commit outbox batch for publication.
+    ///
+    /// # Errors
+    ///
+    /// Rejects corrupt durable events and database/authorization failures.
+    pub async fn claim_outbox(
+        &self,
+        worker_id: Uuid,
+        now: UtcMillis,
+    ) -> Result<OutboxClaim, RealtimeSyncError> {
+        if worker_id.get_version_num() != 7 {
+            return Err(RealtimeSyncError::Unauthorized);
+        }
+        let claim_id = Uuid::now_v7();
+        let rows = sqlx::query(
+            "SELECT identity_id,cursor,event_kind,subject_digest
+               FROM realtime.claim_outbox($1,$2,$3,$4,$5)",
+        )
+        .bind(claim_id)
+        .bind(worker_id)
+        .bind(now.get())
+        .bind(OUTBOX_CLAIM_TTL_MILLIS)
+        .bind(MAX_OUTBOX_CLAIM_EVENTS)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut notifications = Vec::with_capacity(rows.len());
+        for row in rows {
+            notifications.push(OutboxNotification {
+                identity_id: row
+                    .try_get::<String, _>("identity_id")?
+                    .parse()
+                    .map_err(|_| RealtimeSyncError::CorruptData)?,
+                event: Invalidation {
+                    cursor: safe(row.try_get("cursor")?)?,
+                    kind: invalidation_kind(&row.try_get::<String, _>("event_kind")?)?,
+                    subject_digest: digest(row.try_get("subject_digest")?)?,
+                },
+            });
+        }
+        Ok(OutboxClaim {
+            claim_id,
+            worker_id,
+            notifications,
+        })
+    }
+
+    /// Marks a claimed batch published after its notifications enter the
+    /// in-process fanout channel. Exact retries remain idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns database/authorization failures.
+    pub async fn mark_outbox_published(
+        &self,
+        claim: &OutboxClaim,
+        now: UtcMillis,
+    ) -> Result<(), RealtimeSyncError> {
+        let _: i32 = sqlx::query_scalar("SELECT realtime.mark_outbox_published($1,$2,$3)")
+            .bind(claim.claim_id)
+            .bind(claim.worker_id)
+            .bind(now.get())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Removes one bounded expired journal/outbox page and advances floors.
+    ///
+    /// # Errors
+    ///
+    /// Returns database/authorization failures.
+    pub async fn compact_expired(&self, now: UtcMillis) -> Result<(), RealtimeSyncError> {
+        let _: i32 = sqlx::query_scalar("SELECT realtime.compact_expired($1,$2)")
+            .bind(now.get())
+            .bind(MAX_OUTBOX_CLAIM_EVENTS)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -418,6 +513,15 @@ fn digest(value: Vec<u8>) -> Result<Sha256Digest, RealtimeSyncError> {
             .try_into()
             .map_err(|_| RealtimeSyncError::CorruptData)?,
     ))
+}
+
+fn invalidation_kind(value: &str) -> Result<InvalidationKind, RealtimeSyncError> {
+    match value {
+        "mailbox_delivery" => Ok(InvalidationKind::MailboxDelivery),
+        "conversation_read" => Ok(InvalidationKind::ConversationRead),
+        "durable_invalidation" => Ok(InvalidationKind::DurableInvalidation),
+        _ => Err(RealtimeSyncError::CorruptData),
+    }
 }
 
 #[cfg(test)]
