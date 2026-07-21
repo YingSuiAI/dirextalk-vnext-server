@@ -1065,6 +1065,26 @@ pub async fn lock_and_load_active_snapshot(
     load_snapshot_for_head(connection, stored).await
 }
 
+/// Rehydrates one active identity log from the caller's already-established
+/// read-only snapshot. Unlike [`lock_and_load_active_snapshot`], this never
+/// acquires an advisory or row lock.
+///
+/// # Errors
+///
+/// Returns a persistence error for a missing, inactive, or corrupt identity log.
+pub async fn load_active_snapshot_readonly(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+) -> Result<IdentityLogSnapshot, IdentityPersistenceError> {
+    let stored = load_stored_head(connection, identity_id)
+        .await?
+        .ok_or(IdentityPersistenceError::IdentityInactive)?;
+    if stored.state != LogState::Active {
+        return Err(IdentityPersistenceError::IdentityInactive);
+    }
+    load_snapshot_for_head(connection, stored).await
+}
+
 async fn claim_bootstrap_command(
     connection: &mut PgConnection,
     identity_id: IdentityId,

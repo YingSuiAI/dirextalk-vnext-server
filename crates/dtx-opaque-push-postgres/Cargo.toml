@@ -1,5 +1,5 @@
 [package]
-name = "dtx-mailbox"
+name = "dtx-opaque-push-postgres"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,17 +8,17 @@ publish = false
 [dependencies]
 dtx-domain = { path = "../dtx-domain" }
 dtx-identity-persistence = { path = "../dtx-identity-persistence" }
+dtx-opaque-push = { path = "../dtx-opaque-push" }
+dtx-security = { path = "../dtx-security" }
 dtx-wire = { path = "../dtx-wire" }
-ed25519-dalek.workspace = true
 sqlx.workspace = true
-sha2.workspace = true
-subtle.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 dtx-identity-log = { path = "../dtx-identity-log" }
 dtx-storage = { path = "../dtx-storage" }
+ed25519-dalek.workspace = true
 testcontainers-modules.workspace = true
 tokio.workspace = true
 

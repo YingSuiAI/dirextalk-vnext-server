@@ -12,7 +12,7 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use crate::repository::lock_and_load_active_snapshot;
+use crate::repository::{load_active_snapshot_readonly, lock_and_load_active_snapshot};
 use crate::{IdentityLogHead, IdentityPersistenceError, IdentityPgStore};
 
 /// The short lifetime of an unconsumed device-signature challenge.
@@ -36,6 +36,26 @@ pub const DEVICE_SESSION_RECEIPT_HASH_DOMAIN: &[u8] = b"dirextalk.device-session
 
 const OPEN_CHALLENGE_STATE: &str = "open";
 const DEVICE_SESSION_PRUNE_BATCH_SIZE: i32 = 256;
+
+/// Opaque fixed-width digest used only when binding a device-session
+/// credential to a database authentication call. It intentionally has no
+/// serialization or formatting implementation.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct DeviceSessionSecretHash([u8; 32]);
+
+impl fmt::Debug for DeviceSessionSecretHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeviceSessionSecretHash([REDACTED])")
+    }
+}
+
+impl DeviceSessionSecretHash {
+    /// Returns the exact fixed-width bytes expected by the database binding.
+    #[must_use]
+    pub const fn for_database_binding(self) -> [u8; 32] {
+        self.0
+    }
+}
 
 /// A public one-time challenge returned to a device that wants to authenticate.
 ///
@@ -323,6 +343,13 @@ impl DeviceSessionCredential {
         self.session_id
     }
 
+    /// Computes the existing domain-separated digest for a database
+    /// authentication binding without exposing the raw session secret.
+    #[must_use]
+    pub fn database_secret_hash(&self) -> DeviceSessionSecretHash {
+        DeviceSessionSecretHash(*self.secret_hash().as_bytes())
+    }
+
     fn secret_hash(&self) -> Sha256Digest {
         Sha256Digest::hash_domain(DEVICE_SESSION_SECRET_HASH_DOMAIN, &self.session_secret)
     }
@@ -533,6 +560,43 @@ pub struct AuthenticatedDeviceSigningSession {
     signing_key: SigningPublicKey,
 }
 
+/// A coherent, read-only authorization observation for opaque push
+/// registration. Its identity fence is the exact fully reduced log head that
+/// authenticated the active device and signing key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PushIdentityAuthObservation {
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    signing_key: SigningPublicKey,
+    head: IdentityLogHead,
+}
+
+impl PushIdentityAuthObservation {
+    /// Returns the authenticated self-certifying identity.
+    #[must_use]
+    pub const fn identity_id(self) -> IdentityId {
+        self.identity_id
+    }
+
+    /// Returns the authenticated active device.
+    #[must_use]
+    pub const fn device_id(self) -> DeviceId {
+        self.device_id
+    }
+
+    /// Returns the active device signing key from the verified projection.
+    #[must_use]
+    pub const fn signing_key(self) -> SigningPublicKey {
+        self.signing_key
+    }
+
+    /// Returns the full current identity-log fence.
+    #[must_use]
+    pub const fn head(self) -> IdentityLogHead {
+        self.head
+    }
+}
+
 impl AuthenticatedDeviceSigningSession {
     /// Returns the authenticated session facts.
     #[must_use]
@@ -552,6 +616,115 @@ impl AuthenticatedDeviceSigningSession {
 pub struct DeviceSessionRepository;
 
 impl DeviceSessionRepository {
+    /// Authenticates an opaque-push registration against one read-only,
+    /// repeatable snapshot. This deliberately takes no identity advisory or
+    /// row lock: a concurrent append may therefore safely cause a later fence
+    /// conflict, but this observation never blocks the writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityPersistenceError::DeviceSessionRevoked`] only after
+    /// the exact session secret has been verified in constant time, the
+    /// session is fresh, and the authoritative active projection marks that
+    /// session-bound device revoked. Every other unauthenticated or invalid
+    /// durable state is normalized to `DeviceAuthenticationRejected`.
+    pub async fn authenticate_push_registration_readonly(
+        self,
+        store: &IdentityPgStore,
+        credential: &DeviceSessionCredential,
+        now: UtcMillis,
+    ) -> Result<PushIdentityAuthObservation, IdentityPersistenceError> {
+        let mut session = store.begin_readonly_repeatable().await?;
+        let result = Self::authenticate_push_registration_readonly_in_transaction(
+            session.connection(),
+            credential,
+            now,
+        )
+        .await;
+        match result {
+            Ok(observation) => {
+                session.commit().await?;
+                Ok(observation)
+            }
+            Err(error) => {
+                let _ = session.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Authenticates one opaque-push registration in a caller-owned,
+    /// read-only repeatable-read transaction without taking identity locks.
+    /// Callers that use this variant own establishing that transaction mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DeviceSessionRevoked` only for a verified, fresh credential
+    /// whose exact session-bound device is revoked. Every other
+    /// unauthenticated or invalid durable state is normalized to
+    /// `DeviceAuthenticationRejected`.
+    pub async fn authenticate_push_registration_readonly_in_transaction(
+        connection: &mut PgConnection,
+        credential: &DeviceSessionCredential,
+        now: UtcMillis,
+    ) -> Result<PushIdentityAuthObservation, IdentityPersistenceError> {
+        let row = sqlx::query(
+            "SELECT identity_id, device_id, session_secret_hash, expires_at_ms
+               FROM identity.device_sessions
+              WHERE session_id=$1",
+        )
+        .bind(*credential.session_id().as_uuid())
+        .fetch_optional(&mut *connection)
+        .await?
+        .ok_or(IdentityPersistenceError::DeviceAuthenticationRejected)?;
+        let stored_secret = digest(
+            &row.try_get::<Vec<u8>, _>("session_secret_hash")
+                .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?,
+            "device session secret hash",
+        )
+        .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?;
+        if !bool::from(
+            stored_secret
+                .as_bytes()
+                .ct_eq(credential.secret_hash().as_bytes()),
+        ) {
+            return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+        }
+        let expires_at = utc_millis(
+            row.try_get("expires_at_ms")
+                .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?,
+            "device session expiry",
+        )
+        .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?;
+        if now >= expires_at {
+            return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+        }
+        let identity_id = parse_identity_id(
+            &row.try_get::<String, _>("identity_id")
+                .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?,
+        )
+        .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?;
+        let device_id = parse_device_id(
+            row.try_get::<Uuid, _>("device_id")
+                .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?,
+        )
+        .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)?;
+        let snapshot = match load_active_snapshot_readonly(connection, identity_id).await {
+            Ok(snapshot) => snapshot,
+            Err(IdentityPersistenceError::Database(error)) => {
+                return Err(IdentityPersistenceError::Database(error));
+            }
+            Err(_) => return Err(IdentityPersistenceError::DeviceAuthenticationRejected),
+        };
+        let signing_key = push_registration_device_signing_key(snapshot.projection(), device_id)?;
+        Ok(PushIdentityAuthObservation {
+            identity_id,
+            device_id,
+            signing_key,
+            head: snapshot.head(),
+        })
+    }
+
     /// Resolves the current active signing key for an exact identity/device on
     /// a caller-owned transaction.
     ///
@@ -1260,6 +1433,20 @@ fn active_device_signing_key(
         ))
 }
 
+fn push_registration_device_signing_key(
+    projection: &IdentityLogV1,
+    device_id: DeviceId,
+) -> Result<SigningPublicKey, IdentityPersistenceError> {
+    match projection.device_status(device_id) {
+        Some(DeviceStatusV1::Revoked) => Err(IdentityPersistenceError::DeviceSessionRevoked),
+        Some(DeviceStatusV1::Active) => projection
+            .device_certificate(device_id)
+            .map(dtx_identity_log::DeviceCertificateV1::device_signing_key)
+            .ok_or(IdentityPersistenceError::DeviceAuthenticationRejected),
+        None => Err(IdentityPersistenceError::DeviceAuthenticationRejected),
+    }
+}
+
 fn verify_device_proof(
     signing_key: SigningPublicKey,
     proof_input: &[u8],
@@ -1334,4 +1521,21 @@ fn utc_millis(value: i64, label: &'static str) -> Result<UtcMillis, IdentityPers
 fn to_i64(value: SafeUint) -> Result<i64, IdentityPersistenceError> {
     i64::try_from(value.get())
         .map_err(|_| IdentityPersistenceError::CorruptData("device session safe integer"))
+}
+
+#[cfg(test)]
+mod secret_hash_tests {
+    use super::*;
+
+    #[test]
+    fn database_secret_hash_is_fixed_and_redacted() {
+        let credential = DeviceSessionCredential::new(DeviceSessionId::new(), [7; 32]).unwrap();
+        let first = credential.database_secret_hash();
+        let second = credential.database_secret_hash();
+        assert_eq!(first, second);
+        assert_eq!(first.for_database_binding(), second.for_database_binding());
+        let debug = format!("{first:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains('7'));
+    }
 }

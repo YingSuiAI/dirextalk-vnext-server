@@ -14,8 +14,8 @@ use crate::{
     MAX_ACTIVE_ENVELOPE_BYTES, MAX_ACTIVE_ENVELOPES, MAX_OPAQUE_CIPHERTEXT_BYTES,
     MailboxEnvelopeCommand, MailboxOperationOutcome, MailboxPersistenceError, MailboxPgStore,
     repository::{
-        append_identity_delivery_and_realtime, expire_available, finish_transaction,
-        load_mailbox_for_update, validate_envelope_expiry,
+        append_identity_delivery_and_realtime, enqueue_opaque_push_intent, expire_available,
+        finish_transaction, load_mailbox_for_update, validate_envelope_expiry,
     },
 };
 
@@ -580,6 +580,12 @@ impl crate::MailboxRepository {
                 .bind(Sha256Digest::hash_domain(MAILBOX_REQUEST_DOMAIN, envelope.exact_bytes()).as_bytes().as_slice())
                 .bind(&receipt).bind(receipt_hash.as_bytes().as_slice()).bind(command.expires_at.get())
                 .bind(now.get()).execute(&mut *session.connection()).await?;
+            enqueue_opaque_push_intent(
+                session.connection(),
+                command.mailbox_id,
+                command.envelope_id,
+            )
+            .await?;
             append_identity_delivery_and_realtime(session.connection(), command.identity_id, &envelope, now).await?;
             sqlx::query("INSERT INTO messaging.history_recovery_offers(identity_id,request_id,
                 recovery_request_digest,approved_head_hash,candidate_device_id,provider_device_id,

@@ -1,25 +1,23 @@
 [package]
-name = "dtx-mailbox"
+name = "dtx-opaque-push"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
 
 [dependencies]
+chacha20poly1305.workspace = true
 dtx-domain = { path = "../dtx-domain" }
-dtx-identity-persistence = { path = "../dtx-identity-persistence" }
+dtx-security = { path = "../dtx-security" }
 dtx-wire = { path = "../dtx-wire" }
-ed25519-dalek.workspace = true
-sqlx.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
-subtle.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-dtx-identity-log = { path = "../dtx-identity-log" }
-dtx-storage = { path = "../dtx-storage" }
-testcontainers-modules.workspace = true
 tokio.workspace = true
 
 [lints]

@@ -305,6 +305,12 @@ impl MailboxRepository {
             .bind(now.get())
             .execute(&mut *session.connection())
             .await?;
+            enqueue_opaque_push_intent(
+                session.connection(),
+                command.mailbox_id(),
+                command.envelope_id(),
+            )
+            .await?;
             append_identity_delivery_and_realtime(
                 session.connection(),
                 mailbox.owner_identity_id,
@@ -617,6 +623,30 @@ pub(crate) async fn append_identity_delivery_and_realtime(
         .bind(realtime_cursor)
         .execute(&mut *connection)
         .await?;
+    Ok(())
+}
+
+/// Creates the best-effort opaque-push wake hint for one newly persisted
+/// mailbox envelope. The migration-owned function performs registration
+/// selection and idempotent insertion under its provider lock; this call only
+/// supplies a fresh `UUIDv7` intent identifier and the durable mailbox facts.
+pub(crate) async fn enqueue_opaque_push_intent(
+    connection: &mut PgConnection,
+    mailbox_id: MailboxId,
+    envelope_id: EnvelopeId,
+) -> Result<(), MailboxPersistenceError> {
+    let wake_delivery_id = Uuid::now_v7();
+    let inserted: i64 = sqlx::query_scalar("SELECT messaging.enqueue_opaque_push_intent($1,$2,$3)")
+        .bind(wake_delivery_id)
+        .bind(*mailbox_id.as_uuid())
+        .bind(*envelope_id.as_uuid())
+        .fetch_one(&mut *connection)
+        .await?;
+    if !(0..=1).contains(&inserted) {
+        return Err(MailboxPersistenceError::CorruptData(
+            "opaque push wake intent cardinality",
+        ));
+    }
     Ok(())
 }
 

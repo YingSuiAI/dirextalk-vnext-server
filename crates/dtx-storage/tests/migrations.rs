@@ -56,7 +56,8 @@ const REALTIME_SYNC_RETENTION_SAFETY_V1_MIGRATION_VERSION: i64 = 202_607_200_049
 const MAILBOX_RETAINED_QUOTA_GC_V1_MIGRATION_VERSION: i64 = 202_607_200_050;
 const FEDERATED_MLS_V5_AUTHORIZATION_V1_MIGRATION_VERSION: i64 = 202_607_200_051;
 const RECOVERY_SCOPE_CATALOG_V1_MIGRATION_VERSION: i64 = 202_607_210_052;
-const EXPECTED_MIGRATION_COUNT: i64 = 52;
+const OPAQUE_PUSH_V1_MIGRATION_VERSION: i64 = 202_607_220_053;
+const EXPECTED_MIGRATION_COUNT: i64 = 53;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -190,6 +191,119 @@ const RECOVERY_SCOPE_CATALOG_V1_DOWN: &str =
     include_str!("../../../migrations/202607210052_recovery_scope_catalog_v1.down.sql");
 const RECOVERY_SCOPE_CATALOG_V1_UP: &str =
     include_str!("../../../migrations/202607210052_recovery_scope_catalog_v1.up.sql");
+const OPAQUE_PUSH_V1_DOWN: &str =
+    include_str!("../../../migrations/202607220053_opaque_push_v1.down.sql");
+const OPAQUE_PUSH_V1_UP: &str =
+    include_str!("../../../migrations/202607220053_opaque_push_v1.up.sql");
+const LOCAL_RUNTIME_GRANTS: &str =
+    include_str!("../../../docker/local/postgres/20-local-runtime-grants.sql");
+
+#[tokio::test]
+async fn opaque_push_v43_schema_and_least_privilege_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    let contract: (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT to_regclass('messaging.opaque_push_registrations') IS NOT NULL,
+           to_regclass('messaging.opaque_push_idempotency_claims') IS NOT NULL,
+           to_regclass('messaging.opaque_push_deliveries') IS NOT NULL,
+           to_regprocedure('messaging.opaque_push_prepare_mutation(uuid,bytea,text,text,bytea,bigint,bytea,uuid)') IS NOT NULL,
+           to_regprocedure('messaging.claim_opaque_push_deliveries(uuid,integer)') IS NOT NULL,
+           NOT has_table_privilege('dtx_mailbox_runtime','messaging.opaque_push_registrations','SELECT'),
+           NOT has_table_privilege('dtx_realtime_sync_runtime','messaging.opaque_push_deliveries','SELECT'),
+           NOT has_table_privilege('dtx_push_broker_runtime','messaging.mailbox_envelopes','SELECT'),
+           NOT has_table_privilege('dtx_push_broker_runtime','messaging.opaque_push_registrations','SELECT'),
+           has_function_privilege('dtx_push_broker_runtime','messaging.claim_opaque_push_deliveries(uuid,integer)','EXECUTE')",
+    ).fetch_one(harness.admin_pool()).await?;
+    assert_eq!(
+        contract,
+        (true, true, true, true, true, true, true, true, true, true)
+    );
+    let broker_registration_read =
+        sqlx::query("SELECT 1 FROM messaging.opaque_push_registrations LIMIT 1")
+            .fetch_one(harness.push_broker_pool())
+            .await
+            .expect_err("broker must not read registration table");
+    assert_eq!(
+        sqlstate(&broker_registration_read).as_deref(),
+        Some("42501")
+    );
+    let broker_envelope_read = sqlx::query("SELECT 1 FROM messaging.mailbox_envelopes LIMIT 1")
+        .fetch_one(harness.push_broker_pool())
+        .await
+        .expect_err("broker must not read mailbox envelopes");
+    assert_eq!(sqlstate(&broker_envelope_read).as_deref(), Some("42501"));
+    assert!(OPAQUE_PUSH_V1_UP.contains("expires_at_ms=created_at_ms+60000"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_empty_down_up_preserves_contract() -> Result<(), Box<dyn std::error::Error>>
+{
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(OPAQUE_PUSH_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('messaging.opaque_push_deliveries') IS NULL"
+        )
+        .fetch_one(harness.admin_pool())
+        .await?
+    );
+    sqlx::raw_sql(OPAQUE_PUSH_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(sqlx::query_scalar::<_, bool>("SELECT to_regprocedure('messaging.claim_opaque_push_deliveries(uuid,integer)') IS NOT NULL")
+        .fetch_one(harness.admin_pool()).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_down_refuses_authoritative_facts() -> Result<(), Box<dyn std::error::Error>>
+{
+    let harness = PostgresHarness::start().await?;
+    let migration: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public._sqlx_migrations WHERE version=$1 AND success",
+    )
+    .bind(OPAQUE_PUSH_V1_MIGRATION_VERSION)
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(migration, 1);
+    sqlx::query("INSERT INTO messaging.opaque_push_idempotency_claims(device_id,method,path,idempotency_key,if_match_revision,request_digest,receipt_bytes,created_at_ms) VALUES('0197f2e0-0000-7000-8000-000000000001','PUT','/v43/push',decode('01','hex'),0,decode(repeat('00',32),'hex'),decode('01','hex'),0)")
+        .execute(harness.admin_pool()).await?;
+    let error = sqlx::raw_sql(OPAQUE_PUSH_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await
+        .expect_err("facts must block rollback");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot downgrade opaque push V1")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_down_lock_fences_inflight_writer() -> Result<(), Box<dyn std::error::Error>>
+{
+    let harness = PostgresHarness::start().await?;
+    let mut writer = harness.admin_pool().begin().await?;
+    sqlx::query("INSERT INTO messaging.opaque_push_idempotency_claims(device_id,method,path,idempotency_key,if_match_revision,request_digest,receipt_bytes,created_at_ms) VALUES('0197f2e0-0000-7000-8000-000000000001','PUT','/v43/push',decode('02','hex'),0,decode(repeat('00',32),'hex'),decode('01','hex'),0)")
+        .execute(&mut *writer).await?;
+    let down = sqlx::raw_sql(OPAQUE_PUSH_V1_DOWN).execute(harness.admin_pool());
+    tokio::pin!(down);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut down)
+            .await
+            .is_err()
+    );
+    writer.commit().await?;
+    let error = down
+        .await
+        .expect_err("downgrade must observe committed fact");
+    assert_eq!(sqlstate(&error).as_deref(), Some("55000"));
+    Ok(())
+}
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -444,27 +558,12 @@ async fn recovery_scope_catalog_acl_is_identity_runtime_only_and_reversible()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;
     let acl: (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
-        "SELECT has_table_privilege('dtx_identity_runtime','identity.recovery_scope_catalogs','SELECT,INSERT'),
-                has_table_privilege('dtx_identity_runtime','identity.recovery_scope_catalog_preparations','SELECT,INSERT'),
-                NOT has_table_privilege('dtx_identity_runtime','identity.recovery_scope_catalog_preparations','UPDATE'),
-                has_column_privilege('dtx_identity_runtime','identity.recovery_scope_catalog_preparations','provider_response_bytes','UPDATE'),
-                has_function_privilege('dtx_identity_runtime','messaging.is_uuid_v7(uuid)','EXECUTE'),
-                has_table_privilege('dtx_group_runtime','identity.recovery_scope_catalogs','SELECT'),
-                has_table_privilege('dtx_mailbox_runtime','identity.recovery_scope_catalogs','SELECT'),
-                (SELECT relrowsecurity AND relforcerowsecurity FROM pg_class WHERE oid='identity.recovery_scope_catalogs'::regclass),
-                (SELECT relrowsecurity AND relforcerowsecurity FROM pg_class WHERE oid='identity.recovery_scope_catalog_preparations'::regclass),
-                (SELECT count(*)=2 AND bool_and(position('identity_runtime_authorized' IN pg_get_expr(polqual,polrelid))>0)
-                   FROM pg_policy
-                  WHERE polrelid IN ('identity.recovery_scope_catalogs'::regclass,
-                                     'identity.recovery_scope_catalog_preparations'::regclass))",
-    )
-    .fetch_one(harness.admin_pool())
-    .await?;
+        "SELECT has_table_privilege('dtx_identity_runtime','identity.recovery_scope_catalogs','SELECT,INSERT'), has_table_privilege('dtx_identity_runtime','identity.recovery_scope_catalog_preparations','SELECT,INSERT'), NOT has_table_privilege('dtx_identity_runtime','identity.recovery_scope_catalog_preparations','UPDATE'), has_column_privilege('dtx_identity_runtime','identity.recovery_scope_catalog_preparations','provider_response_bytes','UPDATE'), has_function_privilege('dtx_identity_runtime','messaging.is_uuid_v7(uuid)','EXECUTE'), has_table_privilege('dtx_group_runtime','identity.recovery_scope_catalogs','SELECT'), has_table_privilege('dtx_mailbox_runtime','identity.recovery_scope_catalogs','SELECT'), (SELECT relrowsecurity AND relforcerowsecurity FROM pg_class WHERE oid='identity.recovery_scope_catalogs'::regclass), (SELECT relrowsecurity AND relforcerowsecurity FROM pg_class WHERE oid='identity.recovery_scope_catalog_preparations'::regclass), (SELECT count(*)=2 AND bool_and(position('identity_runtime_authorized' IN pg_get_expr(polqual,polrelid))>0) FROM pg_policy WHERE polrelid IN ('identity.recovery_scope_catalogs'::regclass,'identity.recovery_scope_catalog_preparations'::regclass))",
+    ).fetch_one(harness.admin_pool()).await?;
     assert_eq!(
         acl,
         (true, true, true, true, true, false, false, true, true, true)
     );
-
     let trigger_rejected = sqlx::query(
         "UPDATE identity.recovery_scope_catalog_preparations SET candidate_nonce=$1 WHERE false",
     )
@@ -476,23 +575,424 @@ async fn recovery_scope_catalog_acl_is_identity_runtime_only_and_reversible()
         trigger_rejected
             .as_database_error()
             .and_then(sqlx::error::DatabaseError::code),
-        Some(std::borrow::Cow::Borrowed("42501")),
+        Some(std::borrow::Cow::Borrowed("42501"))
     );
-
     sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_DOWN)
         .execute(harness.admin_pool())
         .await?;
-    assert!(
-        sqlx::query_scalar::<_, bool>(
-            "SELECT to_regclass('identity.recovery_scope_catalogs') IS NULL
-                AND to_regclass('identity.recovery_scope_catalog_preparations') IS NULL",
-        )
-        .fetch_one(harness.admin_pool())
-        .await?
-    );
+    assert!(sqlx::query_scalar::<_, bool>("SELECT to_regclass('identity.recovery_scope_catalogs') IS NULL AND to_regclass('identity.recovery_scope_catalog_preparations') IS NULL").fetch_one(harness.admin_pool()).await?);
     sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_UP)
         .execute(harness.admin_pool())
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_authorize_and_finish_ports_fence_claims()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    register_push(&h, &f, Uuid::now_v7(), 0, 1).await?;
+    let delivery = Uuid::now_v7();
+    enqueue_push(&h, &f, delivery, 0).await?;
+    let claim = Uuid::now_v7();
+    sqlx::query("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,1)")
+        .bind(claim)
+        .fetch_one(h.push_broker_pool())
+        .await?;
+    let permit: (i64, i64) = sqlx::query_as("SELECT registration_revision,expires_at_ms FROM messaging.authorize_opaque_push_send($1,$2)").bind(delivery).bind(claim).fetch_one(h.push_broker_pool()).await?;
+    assert_eq!(permit.0, 1);
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT messaging.finish_opaque_push_accepted($1,$2)")
+            .bind(delivery)
+            .bind(claim)
+            .fetch_one(h.push_broker_pool())
+            .await?
+    );
+    let replay: Option<(i64, i64)> = sqlx::query_as("SELECT registration_revision,expires_at_ms FROM messaging.authorize_opaque_push_send($1,$2)").bind(delivery).bind(claim).fetch_optional(h.push_broker_pool()).await?;
+    assert!(replay.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_broker_functions_recheck_runtime_membership()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    sqlx::query("GRANT EXECUTE ON FUNCTION messaging.finish_opaque_push_accepted(uuid,uuid) TO dtx_realtime_sync_runtime").execute(h.admin_pool()).await?;
+    let error =
+        sqlx::query_scalar::<_, bool>("SELECT messaging.finish_opaque_push_accepted($1,$2)")
+            .bind(Uuid::now_v7())
+            .bind(Uuid::now_v7())
+            .fetch_one(h.realtime_sync_runtime_pool())
+            .await
+            .expect_err("non-broker call must be denied");
+    assert_eq!(sqlstate(&error).as_deref(), Some("42501"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_invalid_token_requires_live_exact_claim_and_reserved_class()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let reg = Uuid::now_v7();
+    register_push(&h, &f, reg, 0, 2).await?;
+    let delivery = Uuid::now_v7();
+    enqueue_push(&h, &f, delivery, 0).await?;
+    let claim = Uuid::now_v7();
+    sqlx::query("UPDATE messaging.opaque_push_deliveries SET state='claimed',claim_token=$2,claim_expires_at_ms=0 WHERE delivery_id=$1").bind(delivery).bind(claim).execute(h.admin_pool()).await?;
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT messaging.finish_opaque_push_invalid_token($1,$2,1)"
+        )
+        .bind(delivery)
+        .bind(claim)
+        .fetch_one(h.push_broker_pool())
+        .await?
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM messaging.opaque_push_registrations WHERE registration_id=$1"
+        )
+        .bind(reg)
+        .fetch_one(h.admin_pool())
+        .await?,
+        "active"
+    );
+    let error = sqlx::query_scalar::<_, bool>(
+        "SELECT messaging.finish_opaque_push_permanent_failure($1,$2,'invalid_token')",
+    )
+    .bind(delivery)
+    .bind(claim)
+    .fetch_one(h.push_broker_pool())
+    .await
+    .expect_err("invalid_token is reserved");
+    assert!(matches!(
+        sqlstate(&error).as_deref(),
+        Some("42501") | Some("22023")
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_authorize_post_lock_clock_rejects_expired_claims()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let reg = Uuid::now_v7();
+    register_push(&h, &f, reg, 0, 3).await?;
+    let delivery = Uuid::now_v7();
+    enqueue_push(&h, &f, delivery, 0).await?;
+    let claim = Uuid::now_v7();
+    sqlx::query("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,1)")
+        .bind(claim)
+        .fetch_one(h.push_broker_pool())
+        .await?;
+    sqlx::query("UPDATE messaging.opaque_push_deliveries SET created_at_ms=-60000,expires_at_ms=0 WHERE delivery_id=$1")
+        .bind(delivery)
+        .execute(h.admin_pool())
+        .await?;
+    let permit: Option<(i64,i64)> = sqlx::query_as("SELECT registration_revision,expires_at_ms FROM messaging.authorize_opaque_push_send($1,$2)").bind(delivery).bind(claim).fetch_optional(h.push_broker_pool()).await?;
+    assert!(permit.is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM messaging.opaque_push_deliveries WHERE delivery_id=$1"
+        )
+        .bind(delivery)
+        .fetch_one(h.admin_pool())
+        .await?,
+        "expired"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_authorize_vs_revoke_completes_without_deadlock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    register_push(&h, &f, Uuid::now_v7(), 0, 4).await?;
+    let delivery = Uuid::now_v7();
+    enqueue_push(&h, &f, delivery, 0).await?;
+    let claim = Uuid::now_v7();
+    sqlx::query("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,1)")
+        .bind(claim)
+        .fetch_one(h.push_broker_pool())
+        .await?;
+    let revoke_pool = h.push_registration_pool().clone();
+    let revoke_session = f.session_id;
+    let revoke = tokio::spawn(async move {
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT messaging.opaque_push_commit_delete($1,$2,'DELETE','/v43/push',$3,1::bigint,$4,1::smallint,1::smallint,1::smallint,1::smallint,'active',1::bigint,$5)").bind(revoke_session).bind(vec![3_u8;32]).bind(vec![5_u8]).bind(vec![5_u8;32]).bind(vec![1_u8;32]).fetch_one(&revoke_pool).await
+    });
+    let auth_pool = h.push_broker_pool().clone();
+    let authorize = tokio::spawn(async move {
+        sqlx::query_as::<_,(i64,i64)>("SELECT registration_revision,expires_at_ms FROM messaging.authorize_opaque_push_send($1,$2)").bind(delivery).bind(claim).fetch_optional(&auth_pool).await
+    });
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        (revoke.await, authorize.await)
+    })
+    .await?;
+    let _ = joined.0?;
+    let _ = joined.1??;
+    let state:(String,String)=sqlx::query_as("SELECT d.state,r.state FROM messaging.opaque_push_deliveries d JOIN messaging.opaque_push_registrations r ON r.registration_id=d.registration_id WHERE d.delivery_id=$1").bind(delivery).fetch_one(h.admin_pool()).await?;
+    assert_eq!(state.1, "revoked");
+    assert_ne!(state.0, "delivered");
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_enqueue_vs_invalid_token_is_provider_fenced()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let reg = Uuid::now_v7();
+    register_push(&h, &f, reg, 0, 6).await?;
+    let first = Uuid::now_v7();
+    enqueue_push(&h, &f, first, 0).await?;
+    let claim = Uuid::now_v7();
+    sqlx::query("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,1)")
+        .bind(claim)
+        .fetch_one(h.push_broker_pool())
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT messaging.finish_opaque_push_invalid_token($1,$2,1)")
+            .bind(first)
+            .bind(claim)
+            .fetch_one(h.push_broker_pool())
+            .await?
+    );
+    let second = Uuid::now_v7();
+    assert_eq!(enqueue_push(&h, &f, second, 0).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_invalid_token_terminalizes_all_pinned_rows_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let reg = Uuid::now_v7();
+    register_push(&h, &f, reg, 0, 7).await?;
+    let second_env = Uuid::now_v7();
+    sqlx::query("INSERT INTO messaging.mailbox_envelopes(mailbox_id,envelope_id,delivery_sequence,opaque_ciphertext,request_digest,receipt_bytes,receipt_hash,expires_at_ms,created_at_ms) VALUES($1,$2,2,decode('09','hex'),decode(repeat('09',32),'hex'),decode('09','hex'),decode(repeat('09',32),'hex'),253402300799999,0)").bind(f.mailbox_id).bind(second_env).execute(h.admin_pool()).await?;
+    let first = Uuid::now_v7();
+    enqueue_push(&h, &f, first, 0).await?;
+    let second = Uuid::now_v7();
+    sqlx::query_scalar::<_, i64>("SELECT messaging.enqueue_opaque_push_intent($1,$2,$3)")
+        .bind(second)
+        .bind(f.mailbox_id)
+        .bind(second_env)
+        .fetch_one(h.mailbox_runtime_pool())
+        .await?;
+    let claim = Uuid::now_v7();
+    let claimed: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,2)")
+            .bind(claim)
+            .fetch_all(h.push_broker_pool())
+            .await?;
+    assert_eq!(claimed.len(), 2);
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT messaging.finish_opaque_push_invalid_token($1,$2,1)")
+            .bind(claimed[0].0)
+            .bind(claim)
+            .fetch_one(h.push_broker_pool())
+            .await?
+    );
+    let states:Vec<String>=sqlx::query_scalar("SELECT state FROM messaging.opaque_push_deliveries WHERE registration_id=$1 ORDER BY delivery_id").bind(reg).fetch_all(h.admin_pool()).await?;
+    assert_eq!(states, vec!["permanent_failure", "permanent_failure"]);
+    register_push(&h, &f, reg, 1, 8).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_finish_transient_bounds_and_near_expiry_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let registration = Uuid::now_v7();
+    register_push(&h, &f, registration, 0, 0x26).await?;
+    let delivery = Uuid::now_v7();
+    enqueue_push(&h, &f, delivery, 0).await?;
+    let claim = Uuid::now_v7();
+    sqlx::query("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,1)")
+        .bind(claim)
+        .fetch_one(h.push_broker_pool())
+        .await?;
+    for retry in [0, 61] {
+        let error = sqlx::query_scalar::<_, bool>(
+            "SELECT messaging.finish_opaque_push_transient($1,$2,$3,'transient')",
+        )
+        .bind(delivery)
+        .bind(claim)
+        .bind(retry)
+        .fetch_one(h.push_broker_pool())
+        .await
+        .expect_err("retry bound must reject");
+        assert_eq!(sqlstate(&error).as_deref(), Some("22023"));
+    }
+    let transient: (String, i64, Option<i64>, Option<i64>) =
+        sqlx::query_as("SELECT * FROM messaging.finish_opaque_push_transient($1,$2,1,'transient')")
+            .bind(delivery)
+            .bind(claim)
+            .fetch_one(h.push_broker_pool())
+            .await?;
+    assert_eq!(transient.0, "scheduled");
+    let retry_at: (i64, i64) = sqlx::query_as("SELECT retry_at_ms,expires_at_ms FROM messaging.opaque_push_deliveries WHERE delivery_id=$1").bind(delivery).fetch_one(h.admin_pool()).await?;
+    assert!(retry_at.0 > 0 && retry_at.0 < retry_at.1);
+    sqlx::query("UPDATE messaging.opaque_push_deliveries SET retry_at_ms=0 WHERE delivery_id=$1")
+        .bind(delivery)
+        .execute(h.admin_pool())
+        .await?;
+    let claim2 = Uuid::now_v7();
+    sqlx::query("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,1)")
+        .bind(claim2)
+        .fetch_one(h.push_broker_pool())
+        .await?;
+    let transient_again: (String, i64, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT * FROM messaging.finish_opaque_push_transient($1,$2,60,'transient')",
+    )
+    .bind(delivery)
+    .bind(claim2)
+    .fetch_one(h.push_broker_pool())
+    .await?;
+    assert_eq!(transient_again.0, "scheduled");
+    let near_claim = Uuid::now_v7();
+    sqlx::query("UPDATE messaging.opaque_push_deliveries SET created_at_ms=(floor(extract(epoch FROM clock_timestamp())*1000)::bigint)-100,expires_at_ms=(floor(extract(epoch FROM clock_timestamp())*1000)::bigint)+59900,retry_at_ms=0 WHERE delivery_id=$1").bind(delivery).execute(h.admin_pool()).await?;
+    sqlx::query("UPDATE messaging.opaque_push_deliveries SET state='claimed',claim_token=$2,claim_expires_at_ms=(floor(extract(epoch FROM clock_timestamp())*1000)::bigint)+30000 WHERE delivery_id=$1").bind(delivery).bind(near_claim).execute(h.admin_pool()).await?;
+    sqlx::query("UPDATE messaging.opaque_push_deliveries SET created_at_ms=(floor(extract(epoch FROM clock_timestamp())*1000)::bigint)-60000,expires_at_ms=(floor(extract(epoch FROM clock_timestamp())*1000)::bigint) WHERE delivery_id=$1").bind(delivery).execute(h.admin_pool()).await?;
+    let expired: (String, i64, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT * FROM messaging.finish_opaque_push_transient($1,$2,60,'transient')",
+    )
+    .bind(delivery)
+    .bind(near_claim)
+    .fetch_one(h.push_broker_pool())
+    .await?;
+    assert_eq!(expired.0, "fence_lost");
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM messaging.opaque_push_deliveries WHERE delivery_id=$1"
+        )
+        .bind(delivery)
+        .fetch_one(h.admin_pool())
+        .await?,
+        "expired"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_role_topology_acl_is_exact_and_restored()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert!(LOCAL_RUNTIME_GRANTS.contains(
+        "GRANT EXECUTE ON FUNCTION messaging.enqueue_opaque_push_intent(uuid, uuid, uuid)\n    TO dtx_mailbox_runtime;"
+    ));
+    let h = PostgresHarness::start().await?;
+    let acl: (bool,bool,bool,bool,bool,bool,bool,bool,bool,bool,bool,bool) = sqlx::query_as("SELECT has_function_privilege('dtx_push_registration_runtime','messaging.opaque_push_prepare_mutation(uuid,bytea,text,text,bytea,bigint,bytea,uuid)','EXECUTE'),has_function_privilege('dtx_push_registration_runtime','messaging.opaque_push_commit_put(uuid,bytea,uuid,text,text,bytea,bigint,bytea,smallint,smallint,smallint,smallint,text,bigint,bytea,bytea,bytea,bytea,text,bytea)','EXECUTE'),has_function_privilege('dtx_push_registration_runtime','messaging.opaque_push_commit_delete(uuid,bytea,text,text,bytea,bigint,bytea,smallint,smallint,smallint,smallint,text,bigint,bytea)','EXECUTE'),NOT has_function_privilege('dtx_mailbox_runtime','messaging.opaque_push_commit_put(uuid,bytea,uuid,text,text,bytea,bigint,bytea,smallint,smallint,smallint,smallint,text,bigint,bytea,bytea,bytea,bytea,text,bytea)','EXECUTE'),has_function_privilege('dtx_mailbox_runtime','messaging.enqueue_opaque_push_intent(uuid,uuid,uuid)','EXECUTE'),has_function_privilege('dtx_push_broker_runtime','messaging.claim_opaque_push_deliveries(uuid,integer)','EXECUTE'),has_function_privilege('dtx_push_broker_runtime','messaging.authorize_opaque_push_send(uuid,uuid)','EXECUTE'),has_function_privilege('dtx_push_broker_runtime','messaging.finish_opaque_push_accepted(uuid,uuid)','EXECUTE'),has_function_privilege('dtx_push_broker_runtime','messaging.finish_opaque_push_permanent_failure(uuid,uuid,text)','EXECUTE'),has_function_privilege('dtx_push_broker_runtime','messaging.finish_opaque_push_transient(uuid,uuid,integer,text)','EXECUTE'),has_function_privilege('dtx_push_broker_runtime','messaging.finish_opaque_push_invalid_token(uuid,uuid,bigint)','EXECUTE'),NOT has_table_privilege('dtx_push_broker_runtime','messaging.opaque_push_registrations','SELECT')").fetch_one(h.admin_pool()).await?;
+    assert_eq!(
+        acl,
+        (
+            true, true, true, true, true, true, true, true, true, true, true, true
+        )
+    );
+    sqlx::raw_sql(OPAQUE_PUSH_V1_DOWN)
+        .execute(h.admin_pool())
+        .await?;
+    sqlx::raw_sql(OPAQUE_PUSH_V1_UP)
+        .execute(h.admin_pool())
+        .await?;
+    let restored: (bool,bool,bool,bool) = sqlx::query_as("SELECT has_function_privilege('dtx_push_registration_runtime','messaging.opaque_push_prepare_mutation(uuid,bytea,text,text,bytea,bigint,bytea,uuid)','EXECUTE'),has_function_privilege('dtx_mailbox_runtime','messaging.enqueue_opaque_push_intent(uuid,uuid,uuid)','EXECUTE'),has_function_privilege('dtx_push_broker_runtime','messaging.claim_opaque_push_deliveries(uuid,integer)','EXECUTE'),NOT has_table_privilege('dtx_push_broker_runtime','messaging.opaque_push_registrations','SELECT')").fetch_one(h.admin_pool()).await?;
+    assert_eq!(restored, (true, true, true, true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_prune_waits_for_commit_session_fence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let registration = Uuid::now_v7();
+    let mut age = h.admin_pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *age)
+        .await?;
+    let expiry: i64 = sqlx::query_scalar(
+        "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint + 100",
+    )
+    .fetch_one(&mut *age)
+    .await?;
+    sqlx::query("UPDATE identity.device_sessions SET expires_at_ms=$2 WHERE session_id=$1")
+        .bind(f.session_id)
+        .bind(expiry)
+        .execute(&mut *age)
+        .await?;
+    age.commit().await?;
+    let mut head_lock = h.admin_pool().begin().await?;
+    sqlx::query("SELECT 1 FROM identity.log_heads WHERE identity_id=$1 FOR UPDATE")
+        .bind(&f.identity_id)
+        .execute(&mut *head_lock)
+        .await?;
+    let mut conn = h.push_registration_pool().acquire().await?;
+    let commit_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let session = f.session_id;
+    let commit = tokio::spawn(async move {
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT messaging.opaque_push_commit_put($1,$2,$3,'PUT','/v43/push',$4,0::bigint,$5,1::smallint,1::smallint,1::smallint,1::smallint,'active',1::bigint,$6,decode(repeat('aa',17),'hex'),decode(repeat('01',24),'hex'),decode('bb','hex'),'kms-v1',decode('cc','hex'))").bind(session).bind(vec![3_u8;32]).bind(registration).bind(vec![0x61_u8]).bind(vec![0x61_u8;32]).bind(vec![1_u8;32]).fetch_one(&mut *conn).await
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        let pids: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+            .bind(commit_pid)
+            .fetch_one(h.admin_pool())
+            .await?;
+        if pids.iter().any(|pid| *pid != 0) {
+            waiting = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(waiting);
+    let mut prune_conn = h.identity_runtime_pool().acquire().await?;
+    let prune_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *prune_conn)
+        .await?;
+    let prune = tokio::spawn(async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT identity.prune_expired_device_sessions(253402300799999,100)",
+        )
+        .fetch_one(&mut *prune_conn)
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    let prune_blockers: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+        .bind(prune_pid)
+        .fetch_one(h.admin_pool())
+        .await?;
+    let prune_finished = prune.is_finished();
+    let session_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM identity.device_sessions WHERE session_id=$1)",
+    )
+    .bind(f.session_id)
+    .fetch_one(h.admin_pool())
+    .await?;
+    assert!(prune_blockers.is_empty());
+    assert!(prune_finished && session_exists);
+    head_lock.commit().await?;
+    let _ = commit.await?;
+    let _ = prune.await??;
+    let removed: i64 =
+        sqlx::query_scalar("SELECT identity.prune_expired_device_sessions(253402300799999,100)")
+            .fetch_one(h.identity_runtime_pool())
+            .await?;
+    assert!(removed >= 1);
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM identity.device_sessions WHERE session_id=$1)"
+        )
+        .bind(f.session_id)
+        .fetch_one(h.admin_pool())
+        .await?
+    );
     Ok(())
 }
 
@@ -1545,6 +2045,658 @@ async fn mcp_reference_queries_filter_private_rooms_and_return_public_facts()
     Ok(())
 }
 
+struct OpaquePushFixture {
+    identity_id: String,
+    device_id: Uuid,
+    session_id: Uuid,
+    mailbox_id: Uuid,
+    envelope_id: Uuid,
+}
+
+async fn opaque_push_fixture(
+    harness: &PostgresHarness,
+) -> Result<OpaquePushFixture, Box<dyn std::error::Error>> {
+    let f = OpaquePushFixture {
+        identity_id: "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la".to_owned(),
+        device_id: Uuid::now_v7(),
+        session_id: Uuid::now_v7(),
+        mailbox_id: Uuid::now_v7(),
+        envelope_id: Uuid::now_v7(),
+    };
+    let challenge = Uuid::now_v7();
+    let mut tx = harness.admin_pool().begin().await?;
+    sqlx::query("INSERT INTO identity.log_heads(identity_id,protocol_major,protocol_minor,minimum_reader_major,minimum_reader_minor,head_sequence,head_hash,state,created_at_ms,updated_at_ms) VALUES($1,1,1,1,1,1,$2,'active',0,0)").bind(&f.identity_id).bind(vec![1_u8;32]).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO identity.log_entries(identity_id,sequence,entry_hash,previous_hash,protocol_major,protocol_minor,minimum_reader_major,minimum_reader_minor,event_bytes,recorded_at_ms) VALUES($1,1,$2,NULL,1,1,1,1,$3,0)").bind(&f.identity_id).bind(vec![1_u8;32]).bind(vec![1_u8]).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO identity.device_session_challenges(challenge_id,identity_id,device_id,nonce_hash,audience,state,created_at_ms,expires_at_ms,session_expires_at_ms) VALUES($1,$2,$3,$4,'https://push.test','open',0,100000,253402300799999)").bind(challenge).bind(&f.identity_id).bind(f.device_id).bind(vec![2_u8;32]).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO identity.device_sessions(session_id,identity_id,device_id,challenge_id,session_secret_hash,issued_head_sequence,issued_head_hash,issued_at_ms,expires_at_ms) VALUES($1,$2,$3,$4,$5,1,$6,1,253402300799999)").bind(f.session_id).bind(&f.identity_id).bind(f.device_id).bind(challenge).bind(vec![3_u8;32]).bind(vec![1_u8;32]).execute(&mut *tx).await?;
+    sqlx::query("UPDATE identity.device_session_challenges SET state='consumed',consumed_at_ms=1,session_id=$2 WHERE challenge_id=$1").bind(challenge).bind(f.session_id).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO messaging.mailboxes(mailbox_id,owner_identity_id,owner_device_id,write_capability_hash,expires_at_ms,created_at_ms) VALUES($1,$2,$3,$4,253402300799999,0)").bind(f.mailbox_id).bind(&f.identity_id).bind(f.device_id).bind(vec![4_u8;32]).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO messaging.mailbox_envelopes(mailbox_id,envelope_id,delivery_sequence,opaque_ciphertext,request_digest,receipt_bytes,receipt_hash,expires_at_ms,created_at_ms) VALUES($1,$2,1,$3,$4,$5,$6,253402300799999,0)").bind(f.mailbox_id).bind(f.envelope_id).bind(vec![9_u8]).bind(vec![5_u8;32]).bind(vec![6_u8]).bind(vec![7_u8;32]).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(f)
+}
+
+async fn register_push(
+    harness: &PostgresHarness,
+    fixture: &OpaquePushFixture,
+    registration_id: Uuid,
+    expected_revision: i64,
+    key: u8,
+) -> Result<Vec<u8>, sqlx::Error> {
+    sqlx::query_scalar("SELECT messaging.opaque_push_commit_put($1,$2,$3,'PUT','/v43/push',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)")
+        .bind(fixture.session_id)
+        .bind(vec![3_u8; 32])
+        .bind(registration_id)
+        .bind(vec![key])
+        .bind(expected_revision)
+        .bind(vec![key; 32])
+        .bind(1_i16)
+        .bind(1_i16)
+        .bind(1_i16)
+        .bind(1_i16)
+        .bind("active")
+        .bind(1_i64)
+        .bind(vec![1_u8; 32])
+        .bind(vec![0xaa_u8; 17])
+        .bind(vec![1_u8; 24])
+        .bind(vec![0xbb_u8])
+        .bind("kms-v1")
+        .bind(vec![0xcc_u8])
+        .fetch_one(harness.push_registration_pool())
+        .await
+}
+
+async fn enqueue_push(
+    harness: &PostgresHarness,
+    fixture: &OpaquePushFixture,
+    delivery_id: Uuid,
+    _now_ms: i64,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT messaging.enqueue_opaque_push_intent($1,$2,$3)")
+        .bind(delivery_id)
+        .bind(fixture.mailbox_id)
+        .bind(fixture.envelope_id)
+        .fetch_one(harness.mailbox_runtime_pool())
+        .await
+}
+
+async fn revoke_push(
+    harness: &PostgresHarness,
+    fixture: &OpaquePushFixture,
+    expected_revision: i64,
+    key: u8,
+) -> Result<Vec<u8>, sqlx::Error> {
+    sqlx::query_scalar("SELECT messaging.opaque_push_commit_delete($1,$2,'DELETE','/v43/push',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
+        .bind(fixture.session_id)
+        .bind(vec![3_u8; 32])
+        .bind(vec![key])
+        .bind(expected_revision)
+        .bind(vec![key; 32])
+        .bind(1_i16)
+        .bind(1_i16)
+        .bind(1_i16)
+        .bind(1_i16)
+        .bind("active")
+        .bind(1_i64)
+        .bind(vec![1_u8; 32])
+        .fetch_one(harness.push_registration_pool())
+        .await
+}
+
+fn sqlstate(error: &sqlx::Error) -> Option<String> {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(|c| c.into_owned())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_put_delete_receipts_and_authorization_behave_as_frozen()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let reg = Uuid::now_v7();
+    let call = |expected: i64, key: u8| register_push(&h, &f, reg, expected, key);
+    let first = call(0, 11).await?;
+    let canonical: Vec<u8> =
+        sqlx::query_scalar("SELECT messaging.opaque_push_canonical_receipt(1,'active')")
+            .fetch_one(h.admin_pool())
+            .await?;
+    assert_eq!(first, canonical);
+    assert_eq!(
+        sqlstate(&call(1, 11).await.expect_err("wrong expectation")).as_deref(),
+        Some("23505")
+    );
+    let changed_path = sqlx::query_scalar::<_, Vec<u8>>("SELECT messaging.opaque_push_commit_put($1,$2,$3,'PUT','/v43/other',$4,0::bigint,$5,1::smallint,1::smallint,1::smallint,1::smallint,'active',1::bigint,$6,decode(repeat('aa',17),'hex'),decode(repeat('01',24),'hex'),decode('bb','hex'),'kms-v1',decode('cc','hex'))")
+        .bind(f.session_id).bind(vec![3_u8;32]).bind(reg).bind(vec![11_u8]).bind(vec![11_u8;32]).bind(vec![1_u8;32]).fetch_one(h.push_registration_pool()).await
+        .expect_err("same idempotency key with changed path conflicts");
+    assert_eq!(sqlstate(&changed_path).as_deref(), Some("23505"));
+    assert_eq!(
+        call(1, 13).await?,
+        sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT messaging.opaque_push_canonical_receipt(2,'active')"
+        )
+        .fetch_one(h.admin_pool())
+        .await?
+    );
+    assert_eq!(
+        sqlstate(&call(1, 14).await.expect_err("stale replace")).as_deref(),
+        Some("40001")
+    );
+    let deleted = revoke_push(&h, &f, 2, 0x15).await?;
+    let replay: Vec<u8> = sqlx::query_scalar("SELECT messaging.opaque_push_commit_delete($1,$2,'DELETE','/v43/push',$3,2::bigint,$4,1::smallint,1::smallint,1::smallint,1::smallint,'active',1::bigint,$5)").bind(f.session_id).bind(vec![3_u8;32]).bind(vec![0x15_u8]).bind(vec![0x15_u8;32]).bind(vec![1_u8;32]).fetch_one(h.push_registration_pool()).await?;
+    assert_eq!(replay, deleted);
+    assert_eq!(
+        sqlstate(&call(0, 22).await.expect_err("revoked create")).as_deref(),
+        Some("40001")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_broker_claim_finish_expiry_and_prune_are_transactional()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let mailbox_pool = h.mailbox_runtime_pool().clone();
+    let reg = Uuid::now_v7();
+    let _: Vec<u8> = register_push(&h, &f, reg, 0, 1).await?;
+    sqlx::query("INSERT INTO realtime.identity_heads(identity_id) VALUES($1)")
+        .bind(&f.identity_id)
+        .execute(h.admin_pool())
+        .await?;
+    sqlx::query("INSERT INTO realtime.encrypted_account_read_cursors(identity_id,conversation_digest,encrypted_cursor,revision,updated_by_device,updated_at_ms,identity_head,ciphertext_digest) VALUES($1,decode(repeat('01',32),'hex'),decode('aa','hex'),1,$2,20,decode(repeat('01',32),'hex'),decode(repeat('02',32),'hex'))").bind(&f.identity_id).bind(f.device_id).execute(h.mailbox_runtime_pool()).await?;
+    let before_cursor_mutation: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM messaging.opaque_push_deliveries")
+            .fetch_one(h.admin_pool())
+            .await?;
+    sqlx::query("UPDATE realtime.encrypted_account_read_cursors SET revision=2,updated_at_ms=21 WHERE identity_id=$1").bind(&f.identity_id).execute(h.mailbox_runtime_pool()).await?;
+    let after_cursor_mutation: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM messaging.opaque_push_deliveries")
+            .fetch_one(h.admin_pool())
+            .await?;
+    assert_eq!(before_cursor_mutation, after_cursor_mutation);
+    let delivery = Uuid::now_v7();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT messaging.enqueue_opaque_push_intent($1,$2,$3)")
+            .bind(delivery)
+            .bind(f.mailbox_id)
+            .bind(f.envelope_id)
+            .fetch_one(&mailbox_pool)
+            .await?,
+        1
+    );
+    let rollback_envelope = Uuid::now_v7();
+    let rollback_delivery = Uuid::now_v7();
+    let mut mailbox_tx = h.mailbox_runtime_pool().begin().await?;
+    sqlx::query("INSERT INTO messaging.mailbox_envelopes(mailbox_id,envelope_id,delivery_sequence,opaque_ciphertext,request_digest,receipt_bytes,receipt_hash,expires_at_ms,created_at_ms) VALUES($1,$2,2,decode('09','hex'),decode(repeat('09',32),'hex'),decode('09','hex'),decode(repeat('09',32),'hex'),1000000,0)")
+        .bind(f.mailbox_id).bind(rollback_envelope).execute(&mut *mailbox_tx).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT messaging.enqueue_opaque_push_intent($1,$2,$3)")
+            .bind(rollback_delivery)
+            .bind(f.mailbox_id)
+            .bind(rollback_envelope)
+            .fetch_one(&mut *mailbox_tx)
+            .await?,
+        1
+    );
+    mailbox_tx.rollback().await?;
+    let rolled_back: (bool, bool) = sqlx::query_as("SELECT EXISTS(SELECT 1 FROM messaging.mailbox_envelopes WHERE envelope_id=$1), EXISTS(SELECT 1 FROM messaging.opaque_push_deliveries WHERE delivery_id=$2)").bind(rollback_envelope).bind(rollback_delivery).fetch_one(h.admin_pool()).await?;
+    assert_eq!(rolled_back, (false, false));
+    let claim = Uuid::now_v7();
+    let mut claim_tx = h.push_broker_pool().begin().await?;
+    let claimed: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,1)")
+            .bind(claim)
+            .fetch_all(&mut *claim_tx)
+            .await?;
+    assert_eq!(claimed.len(), 1);
+    let other_claim = Uuid::now_v7();
+    let duplicate: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,1)")
+            .bind(other_claim)
+            .fetch_all(h.push_broker_pool())
+            .await?;
+    assert!(duplicate.is_empty());
+    claim_tx.commit().await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT messaging.finish_opaque_push_invalid_token($1,$2,1)")
+            .bind(claimed[0].0)
+            .bind(claim)
+            .fetch_one(h.push_broker_pool())
+            .await?
+    );
+    let states: (String,String) = sqlx::query_as("SELECT d.state,r.state FROM messaging.opaque_push_deliveries d JOIN messaging.opaque_push_registrations r ON r.registration_id=d.registration_id WHERE d.delivery_id=$1").bind(claimed[0].0).fetch_one(h.admin_pool()).await?;
+    assert_eq!(states, ("permanent_failure".into(), "suspended".into()));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT messaging.prune_opaque_push_terminal(256)")
+            .fetch_one(h.push_broker_pool())
+            .await?,
+        0
+    );
+    sqlx::query(
+        "UPDATE messaging.opaque_push_deliveries SET terminal_at_ms=0 WHERE delivery_id=$1",
+    )
+    .bind(claimed[0].0)
+    .execute(h.admin_pool())
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT messaging.prune_opaque_push_terminal(256)")
+            .fetch_one(h.push_broker_pool())
+            .await?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_concurrent_exact_retries_share_receipt_and_revision()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let registration = Uuid::now_v7();
+    let mut tx1 = h.push_registration_pool().begin().await?;
+    let tx1_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx1)
+        .await?;
+    let key = vec![0x0a_u8];
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('opaque_push:idempotency:'||$1::text||':'||encode($2,'hex'),0))")
+        .bind(f.device_id).bind(&key).execute(&mut *tx1).await?;
+    let first: Vec<u8> = sqlx::query_scalar("SELECT messaging.opaque_push_commit_put($1,$2,$3,'PUT','/v43/push',$4,0::bigint,$5,1::smallint,1::smallint,1::smallint,1::smallint,'active',1::bigint,$6,decode(repeat('aa',17),'hex'),decode(repeat('01',24),'hex'),decode('bb','hex'),'kms-v1',decode('cc','hex'))")
+        .bind(f.session_id).bind(vec![3_u8;32]).bind(registration).bind(&key).bind(vec![0x0a_u8;32]).bind(vec![1_u8;32]).fetch_one(&mut *tx1).await?;
+    let pool_b = h.push_registration_pool().clone();
+    let mut conn2 = pool_b.acquire().await?;
+    let tx2_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn2)
+        .await?;
+    let second = tokio::spawn(async move {
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT messaging.opaque_push_commit_put($1,$2,$3,'PUT','/v43/push',$4,0::bigint,$5,1::smallint,1::smallint,1::smallint,1::smallint,'active',1::bigint,$6,decode(repeat('aa',17),'hex'),decode(repeat('01',24),'hex'),decode('bb','hex'),'kms-v1',decode('cc','hex'))")
+            .bind(f.session_id).bind(vec![3_u8;32]).bind(registration).bind(vec![0x0a_u8]).bind(vec![0x0a_u8;32]).bind(vec![1_u8;32]).fetch_one(&mut *conn2).await
+    });
+    let mut blocked = false;
+    for _ in 0..50 {
+        let blockers: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+            .bind(tx2_pid)
+            .fetch_one(h.admin_pool())
+            .await?;
+        if blockers.contains(&tx1_pid) {
+            blocked = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        blocked,
+        "second connection must be observed blocked before winner commit"
+    );
+    tx1.commit().await?;
+    assert_eq!(second.await??, first);
+    let durable: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM messaging.opaque_push_registrations WHERE device_id=$1), (SELECT count(*) FROM messaging.opaque_push_idempotency_claims WHERE device_id=$1)")
+        .bind(f.device_id).fetch_one(h.admin_pool()).await?;
+    assert_eq!(durable, (1, 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_concurrent_if_match_zero_keys_have_one_stable_cas_winner()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let registration = Uuid::now_v7();
+    let key_a = vec![0x0b_u8];
+    let key_b = vec![0x0c_u8];
+    let mut tx1 = h.push_registration_pool().begin().await?;
+    let tx1_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx1)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('opaque_push:idempotency:'||$1::text||':'||encode($2,'hex'),0))").bind(f.device_id).bind(&key_a).execute(&mut *tx1).await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('opaque_push:provider:'||$1::text||':fcm',0))").bind(f.device_id).execute(&mut *tx1).await?;
+    let _: Vec<u8> = sqlx::query_scalar("SELECT messaging.opaque_push_commit_put($1,$2,$3,'PUT','/v43/push',$4,0::bigint,$5,1::smallint,1::smallint,1::smallint,1::smallint,'active',1::bigint,$6,decode(repeat('aa',17),'hex'),decode(repeat('01',24),'hex'),decode('bb','hex'),'kms-v1',decode('cc','hex'))").bind(f.session_id).bind(vec![3_u8;32]).bind(registration).bind(&key_a).bind(vec![0x0b_u8;32]).bind(vec![1_u8;32]).fetch_one(&mut *tx1).await?;
+    let pool_b = h.push_registration_pool().clone();
+    let mut conn2 = pool_b.acquire().await?;
+    let tx2_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn2)
+        .await?;
+    let second = tokio::spawn(async move {
+        sqlx::query_scalar::<_, Vec<u8>>("SELECT messaging.opaque_push_commit_put($1,$2,$3,'PUT','/v43/push',$4,0::bigint,$5,1::smallint,1::smallint,1::smallint,1::smallint,'active',1::bigint,$6,decode(repeat('aa',17),'hex'),decode(repeat('01',24),'hex'),decode('bb','hex'),'kms-v1',decode('cc','hex'))").bind(f.session_id).bind(vec![3_u8;32]).bind(registration).bind(&key_b).bind(vec![0x0c_u8;32]).bind(vec![1_u8;32]).fetch_one(&mut *conn2).await
+    });
+    let mut blocked = false;
+    for _ in 0..50 {
+        let blockers: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+            .bind(tx2_pid)
+            .fetch_one(h.admin_pool())
+            .await?;
+        if blockers.contains(&tx1_pid) {
+            blocked = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        blocked,
+        "competing provider mutation must be observed blocked before winner commit"
+    );
+    tx1.commit().await?;
+    let conflict = second.await?.expect_err("exactly one CAS conflict");
+    assert_eq!(sqlstate(&conflict).as_deref(), Some("40001"));
+    let state: (i64, i64, i64) = sqlx::query_as("SELECT count(*), max(revision), (SELECT count(*) FROM messaging.opaque_push_idempotency_claims WHERE device_id=$1) FROM messaging.opaque_push_registrations WHERE device_id=$1")
+        .bind(f.device_id).fetch_one(h.admin_pool()).await?;
+    assert_eq!(state, (1, 1, 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_identity_auth_force_rls_and_cross_role_denial()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let visible: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM identity.device_sessions),(SELECT count(*) FROM identity.log_heads),(SELECT count(*) FROM identity.log_entries)").fetch_one(h.push_identity_auth_pool()).await?;
+    assert!(visible.0 >= 1 && visible.1 >= 1 && visible.2 >= 1);
+    for query in [
+        "SELECT 1 FROM messaging.opaque_push_registrations",
+        "SELECT 1 FROM messaging.opaque_push_idempotency_claims",
+        "SELECT 1 FROM messaging.opaque_push_deliveries",
+        "UPDATE identity.device_sessions SET expires_at_ms=expires_at_ms WHERE false",
+    ] {
+        let error = sqlx::raw_sql(query)
+            .execute(h.push_identity_auth_pool())
+            .await
+            .expect_err("identity auth role must not access push/write surfaces");
+        assert_eq!(sqlstate(&error).as_deref(), Some("42501"));
+    }
+    let registration_read = sqlx::query("SELECT 1 FROM identity.device_sessions")
+        .fetch_one(h.push_registration_pool())
+        .await
+        .expect_err("registration role must not gain identity-auth visibility");
+    assert_eq!(sqlstate(&registration_read).as_deref(), Some("42501"));
+    let _ = f;
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_prepare_auth_replay_survives_logical_expiry_then_prune()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let key = vec![0x41_u8];
+    let digest = vec![0x42_u8; 32];
+    let prepared: (String, String, Uuid, Uuid, i64, Option<Vec<u8>>) = sqlx::query_as("SELECT outcome,identity_id,device_id,registration_id,next_revision,receipt_bytes FROM messaging.opaque_push_prepare_mutation($1,$2,'PUT','/v43/push',$3,0,$4,$5)").bind(f.session_id).bind(vec![3_u8;32]).bind(&key).bind(&digest).bind(Uuid::now_v7()).fetch_one(h.push_registration_pool()).await?;
+    assert_eq!(prepared.0, "execute");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM messaging.opaque_push_registrations WHERE device_id=$1"
+        )
+        .bind(f.device_id)
+        .fetch_one(h.admin_pool())
+        .await?,
+        0
+    );
+    let wrong = sqlx::query_as::<_, (String, String, Uuid, Uuid, i64, Option<Vec<u8>>)>(
+        "SELECT * FROM messaging.opaque_push_prepare_mutation($1,$2,'PUT','/v43/push',$3,0,$4,$5)",
+    )
+    .bind(f.session_id)
+    .bind(vec![9_u8; 32])
+    .bind(&key)
+    .bind(&digest)
+    .bind(Uuid::now_v7())
+    .fetch_one(h.push_registration_pool())
+    .await
+    .expect_err("wrong secret must fail before replay lookup");
+    assert_eq!(sqlstate(&wrong).as_deref(), Some("42501"));
+    let receipt = register_push(&h, &f, Uuid::now_v7(), 0, 0x43).await?;
+    let replay_key = vec![0x43_u8];
+    let replay_digest = vec![0x43_u8; 32];
+    let mut expiry_tx = h.admin_pool().begin().await?;
+    sqlx::query(
+        "ALTER TABLE identity.device_sessions DISABLE TRIGGER identity_device_sessions_append_only",
+    )
+    .execute(&mut *expiry_tx)
+    .await?;
+    sqlx::query("UPDATE identity.device_sessions SET expires_at_ms=1 WHERE session_id=$1")
+        .bind(f.session_id)
+        .execute(&mut *expiry_tx)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE identity.device_sessions ENABLE TRIGGER identity_device_sessions_append_only",
+    )
+    .execute(&mut *expiry_tx)
+    .await?;
+    expiry_tx.commit().await?;
+    let replay: (String, String, Uuid, Option<Uuid>, Option<i64>, Option<Vec<u8>>) = sqlx::query_as("SELECT outcome,identity_id,device_id,registration_id,next_revision,receipt_bytes FROM messaging.opaque_push_prepare_mutation($1,$2,'PUT','/v43/push',$3,0,$4,$5)").bind(f.session_id).bind(vec![3_u8;32]).bind(&replay_key).bind(&replay_digest).bind(Uuid::now_v7()).fetch_one(h.push_registration_pool()).await?;
+    assert_eq!(replay.0, "replay");
+    let wrong_replay = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            Uuid,
+            Option<Uuid>,
+            Option<i64>,
+            Option<Vec<u8>>,
+        ),
+    >(
+        "SELECT * FROM messaging.opaque_push_prepare_mutation($1,$2,'PUT','/v43/push',$3,0,$4,$5)",
+    )
+    .bind(f.session_id)
+    .bind(vec![9_u8; 32])
+    .bind(&replay_key)
+    .bind(&replay_digest)
+    .bind(Uuid::now_v7())
+    .fetch_one(h.push_registration_pool())
+    .await
+    .expect_err("wrong secret must fail before replay receipt lookup");
+    assert_eq!(sqlstate(&wrong_replay).as_deref(), Some("42501"));
+    let _ = receipt;
+    let _pruned: i64 =
+        sqlx::query_scalar("SELECT identity.prune_expired_device_sessions(253402300799999,100)")
+            .fetch_one(h.identity_runtime_pool())
+            .await?;
+    let physical = sqlx::query_as::<_, (String, String, Uuid, Uuid, i64, Option<Vec<u8>>)>(
+        "SELECT * FROM messaging.opaque_push_prepare_mutation($1,$2,'PUT','/v43/push',$3,0,$4,$5)",
+    )
+    .bind(f.session_id)
+    .bind(vec![3_u8; 32])
+    .bind(&replay_key)
+    .bind(&replay_digest)
+    .bind(Uuid::now_v7())
+    .fetch_one(h.push_registration_pool())
+    .await
+    .expect_err("physical prune must end replay");
+    assert_eq!(sqlstate(&physical).as_deref(), Some("42501"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_enqueue_ttl_starts_after_provider_lock_unblock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    register_push(&h, &f, Uuid::now_v7(), 0, 0x51).await?;
+    let mut blocker = h.admin_pool().begin().await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('opaque_push:provider:'||$1::text||':fcm',0))").bind(f.device_id).execute(&mut *blocker).await?;
+    let mut conn = h.mailbox_runtime_pool().acquire().await?;
+    let waiting_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let delivery = Uuid::now_v7();
+    let mailbox = f.mailbox_id;
+    let envelope = f.envelope_id;
+    let task = tokio::spawn(async move {
+        sqlx::query_scalar::<_, i64>("SELECT messaging.enqueue_opaque_push_intent($1,$2,$3)")
+            .bind(delivery)
+            .bind(mailbox)
+            .bind(envelope)
+            .fetch_one(&mut *conn)
+            .await
+    });
+    let mut blocked = false;
+    for _ in 0..100 {
+        let pids: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+            .bind(waiting_pid)
+            .fetch_one(h.admin_pool())
+            .await?;
+        if pids.contains(&blocker_pid) {
+            blocked = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(blocked);
+    let unblock: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+            .fetch_one(h.admin_pool())
+            .await?;
+    blocker.commit().await?;
+    assert_eq!(task.await??, 1);
+    let times:(i64,i64)=sqlx::query_as("SELECT created_at_ms,expires_at_ms FROM messaging.opaque_push_deliveries WHERE delivery_id=$1").bind(delivery).fetch_one(h.admin_pool()).await?;
+    assert!(times.0 >= unblock && times.1 - times.0 == 60000);
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_transient_clock_is_after_authorize_lock_unblock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    register_push(&h, &f, Uuid::now_v7(), 0, 0x52).await?;
+    let delivery = Uuid::now_v7();
+    enqueue_push(&h, &f, delivery, 0).await?;
+    let claim = Uuid::now_v7();
+    sqlx::query("SELECT delivery_id FROM messaging.claim_opaque_push_deliveries($1,1)")
+        .bind(claim)
+        .fetch_one(h.push_broker_pool())
+        .await?;
+    let mut blocker = h.admin_pool().begin().await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('opaque_push:provider:'||$1::text||':fcm',0))").bind(f.device_id).execute(&mut *blocker).await?;
+    let mut conn = h.push_broker_pool().acquire().await?;
+    let waiting_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let task = tokio::spawn(async move {
+        sqlx::query_as::<_, (String, i64, Option<i64>, Option<i64>)>(
+            "SELECT * FROM messaging.finish_opaque_push_transient($1,$2,1,'transient')",
+        )
+        .bind(delivery)
+        .bind(claim)
+        .fetch_one(&mut *conn)
+        .await
+    });
+    let mut blocked = false;
+    for _ in 0..100 {
+        let pids: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+            .bind(waiting_pid)
+            .fetch_one(h.admin_pool())
+            .await?;
+        if pids.contains(&blocker_pid) {
+            blocked = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(blocked);
+    let unblock: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+            .fetch_one(h.admin_pool())
+            .await?;
+    blocker.commit().await?;
+    let row = task.await??;
+    assert_eq!(row.0, "scheduled");
+    assert!(row.1 >= unblock && row.2.unwrap() > row.1 && row.2.unwrap() < row.3.unwrap());
+    Ok(())
+}
+
+#[tokio::test]
+async fn opaque_push_v43_commit_rechecks_expiry_after_provider_lock_unblock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = PostgresHarness::start().await?;
+    let f = opaque_push_fixture(&h).await?;
+    let registration = Uuid::now_v7();
+    let key = vec![0x53_u8];
+    let digest = vec![0x53_u8; 32];
+    let expiry: i64 = sqlx::query_scalar(
+        "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint + 100",
+    )
+    .fetch_one(h.admin_pool())
+    .await?;
+    let mut age = h.admin_pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *age)
+        .await?;
+    sqlx::query("UPDATE identity.device_sessions SET expires_at_ms=$2 WHERE session_id=$1")
+        .bind(f.session_id)
+        .bind(expiry)
+        .execute(&mut *age)
+        .await?;
+    age.commit().await?;
+    let mut blocker = h.admin_pool().begin().await?;
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('opaque_push:provider:'||$1::text||':fcm',0))").bind(f.device_id).execute(&mut *blocker).await?;
+    let mut conn = h.push_registration_pool().acquire().await?;
+    let waiting_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *conn)
+        .await?;
+    let session = f.session_id;
+    let task = tokio::spawn(async move {
+        sqlx::query_scalar::<_,Vec<u8>>("SELECT messaging.opaque_push_commit_put($1,$2,$3,'PUT','/v43/push',$4,0::bigint,$5,1::smallint,1::smallint,1::smallint,1::smallint,'active',1::bigint,$6,decode(repeat('aa',17),'hex'),decode(repeat('01',24),'hex'),decode('bb','hex'),'kms-v1',decode('cc','hex'))").bind(session).bind(vec![3_u8;32]).bind(registration).bind(key).bind(digest).bind(vec![1_u8;32]).fetch_one(&mut *conn).await
+    });
+    let mut blocked = false;
+    for _ in 0..100 {
+        let pids: Vec<i32> = sqlx::query_scalar("SELECT pg_blocking_pids($1)")
+            .bind(waiting_pid)
+            .fetch_one(h.admin_pool())
+            .await?;
+        if pids.contains(&blocker_pid) {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(blocked);
+    let mut expired = false;
+    for _ in 0..100 {
+        let now: i64 =
+            sqlx::query_scalar("SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint")
+                .fetch_one(h.admin_pool())
+                .await?;
+        if now > expiry {
+            expired = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        expired,
+        "observer clock must pass stored expiry while commit remains blocked"
+    );
+    blocker.commit().await?;
+    let error = task
+        .await?
+        .expect_err("expired session must reject after provider unblock");
+    assert!(matches!(
+        sqlstate(&error).as_deref(),
+        Some("42501") | Some("22023")
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM messaging.opaque_push_registrations WHERE device_id=$1"
+        )
+        .bind(f.device_id)
+        .fetch_one(h.admin_pool())
+        .await?,
+        0
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
@@ -2478,7 +3630,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -2532,8 +3684,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(MAILBOX_RETAINED_QUOTA_GC_V1_MIGRATION_VERSION)
     .bind(FEDERATED_MLS_V5_AUTHORIZATION_V1_MIGRATION_VERSION)
     .bind(RECOVERY_SCOPE_CATALOG_V1_MIGRATION_VERSION)
+    .bind(OPAQUE_PUSH_V1_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(OPAQUE_PUSH_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_DOWN)
         .execute(harness.admin_pool())
         .await?;

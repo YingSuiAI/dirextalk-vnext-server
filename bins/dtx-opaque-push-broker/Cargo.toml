@@ -1,0 +1,40 @@
+[package]
+name = "dtx-opaque-push-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "dtx-opaque-push-broker"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+axum-server.workspace = true
+base64ct.workspace = true
+bytes.workspace = true
+dtx-domain = { path = "../../crates/dtx-domain" }
+dtx-identity-persistence = { path = "../../crates/dtx-identity-persistence" }
+dtx-opaque-push = { path = "../../crates/dtx-opaque-push" }
+dtx-opaque-push-fcm = { path = "../../crates/dtx-opaque-push-fcm" }
+dtx-opaque-push-postgres = { path = "../../crates/dtx-opaque-push-postgres" }
+dtx-security = { path = "../../crates/dtx-security" }
+libc = "0.2.183"
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["process", "thread"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tower.workspace = true

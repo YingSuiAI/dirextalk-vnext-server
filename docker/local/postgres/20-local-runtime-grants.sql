@@ -67,6 +67,8 @@ GRANT EXECUTE ON FUNCTION identity.identity_realtime_reader_authorized()
     TO dtx_mailbox_runtime;
 GRANT EXECUTE ON FUNCTION identity.history_recovery_request_authorized(text,uuid,bytea,uuid,bigint)
     TO dtx_mailbox_runtime;
+GRANT EXECUTE ON FUNCTION messaging.enqueue_opaque_push_intent(uuid, uuid, uuid)
+    TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT, UPDATE ON messaging.mailboxes TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT ON messaging.mailbox_registration_claims TO dtx_mailbox_runtime;
 GRANT SELECT, INSERT, UPDATE ON messaging.mailbox_envelopes TO dtx_mailbox_runtime;
@@ -107,6 +109,26 @@ GRANT EXECUTE ON FUNCTION realtime.compact_expired(bigint,integer)
     TO dtx_realtime_sync_runtime;
 GRANT EXECUTE ON FUNCTION messaging.compact_expired_identity_deliveries(bigint,integer)
     TO dtx_realtime_sync_runtime;
+
+GRANT USAGE ON SCHEMA messaging TO dtx_push_registration_runtime;
+GRANT EXECUTE ON FUNCTION messaging.opaque_push_prepare_mutation(uuid,bytea,text,text,bytea,bigint,bytea,uuid),
+    messaging.opaque_push_commit_put(uuid,bytea,uuid,text,text,bytea,bigint,bytea,smallint,smallint,smallint,smallint,text,bigint,bytea,bytea,bytea,bytea,text,bytea),
+    messaging.opaque_push_commit_delete(uuid,bytea,text,text,bytea,bigint,bytea,smallint,smallint,smallint,smallint,text,bigint,bytea)
+    TO dtx_push_registration_runtime;
+
+GRANT USAGE ON SCHEMA identity TO dtx_push_identity_auth_runtime;
+GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
+    TO dtx_push_identity_auth_runtime;
+
+GRANT USAGE ON SCHEMA messaging TO dtx_push_broker_runtime;
+GRANT EXECUTE ON FUNCTION messaging.claim_opaque_push_deliveries(uuid,integer),
+    messaging.prune_opaque_push_terminal(integer),
+    messaging.authorize_opaque_push_send(uuid,uuid),
+    messaging.finish_opaque_push_accepted(uuid,uuid),
+    messaging.finish_opaque_push_permanent_failure(uuid,uuid,text),
+    messaging.finish_opaque_push_transient(uuid,uuid,integer,text),
+    messaging.finish_opaque_push_invalid_token(uuid,uuid,bigint)
+    TO dtx_push_broker_runtime;
 
 -- These login roles deliberately use direct grants with NOINHERIT. Membership
 -- in dtx_public_feed_runtime is only the RLS authorization marker and does not

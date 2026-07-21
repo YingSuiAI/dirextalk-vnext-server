@@ -42,8 +42,8 @@ impl SecretBytes {
     }
 
     /// Exposes the secret only for the lexical lifetime of the supplied closure.
-    pub fn expose(&self, use_secret: impl FnOnce(&[u8])) {
-        use_secret(self.0.as_slice());
+    pub fn expose<T>(&self, use_secret: impl FnOnce(&[u8]) -> T) -> T {
+        use_secret(self.0.as_slice())
     }
 
     /// Returns the secret byte length without exposing its value.

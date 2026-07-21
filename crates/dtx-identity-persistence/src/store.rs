@@ -63,6 +63,31 @@ impl IdentityPgStore {
         }
         Ok(IdentitySession { transaction })
     }
+
+    /// Begins a read-only repeatable-read transaction for a coherent durable
+    /// observation that must never contend with identity writers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error when the database cannot establish the
+    /// requested snapshot or a tenant setting leaked onto the pooled session.
+    pub async fn begin_readonly_repeatable(
+        &self,
+    ) -> Result<IdentitySession<'_>, IdentityPersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await?;
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT NULLIF(current_setting('dtx.tenant_id', true), '')")
+                .fetch_one(&mut *transaction)
+                .await?;
+        if existing.is_some() {
+            transaction.rollback().await?;
+            return Err(IdentityPersistenceError::TenantContextLeak);
+        }
+        Ok(IdentitySession { transaction })
+    }
 }
 
 #[allow(clippy::too_many_lines)] // One fail-closed audit must list every relation and privilege together.

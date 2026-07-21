@@ -433,6 +433,7 @@ dependencies = [
  "cipher",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -445,6 +446,7 @@ dependencies = [
  "chacha20",
  "cipher",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -617,7 +619,9 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
+ "getrandom 0.4.3",
  "hybrid-array",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1194,12 +1198,16 @@ name = "dtx-mailbox"
 version = "0.1.0"
 dependencies = [
  "dtx-domain",
+ "dtx-identity-log",
  "dtx-identity-persistence",
+ "dtx-storage",
  "dtx-wire",
  "ed25519-dalek",
  "sha2 0.11.0",
  "sqlx",
  "subtle",
+ "testcontainers-modules",
+ "tokio",
  "uuid",
  "zeroize",
 ]
@@ -1262,6 +1270,88 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tower",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "dtx-opaque-push"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "dtx-domain",
+ "dtx-security",
+ "dtx-wire",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "dtx-opaque-push-broker"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "axum-server",
+ "base64ct",
+ "bytes",
+ "dtx-domain",
+ "dtx-identity-persistence",
+ "dtx-opaque-push",
+ "dtx-opaque-push-fcm",
+ "dtx-opaque-push-postgres",
+ "dtx-security",
+ "libc",
+ "rustix 1.1.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tokio",
+ "tower",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "dtx-opaque-push-fcm"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "dtx-opaque-push",
+ "futures-core",
+ "futures-util",
+ "httpdate",
+ "reqwest",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "dtx-opaque-push-postgres"
+version = "0.1.0"
+dependencies = [
+ "dtx-domain",
+ "dtx-identity-log",
+ "dtx-identity-persistence",
+ "dtx-opaque-push",
+ "dtx-security",
+ "dtx-storage",
+ "dtx-wire",
+ "ed25519-dalek",
+ "sqlx",
+ "testcontainers-modules",
+ "tokio",
  "uuid",
  "zeroize",
 ]
@@ -1376,11 +1466,15 @@ dependencies = [
 name = "dtx-security"
 version = "0.1.0"
 dependencies = [
+ "chacha20poly1305",
  "dtx-domain",
  "dtx-wire",
+ "getrandom 0.4.3",
+ "libc",
  "rcgen",
  "rustls",
  "sha2 0.11.0",
+ "tempfile",
  "x509-parser",
  "zeroize",
 ]
@@ -3127,6 +3221,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -3143,12 +3238,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -4523,6 +4620,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

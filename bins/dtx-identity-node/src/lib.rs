@@ -2196,7 +2196,8 @@ fn map_mls_v5_recovery_authorization_persistence_error(
     match error {
         IdentityPersistenceError::HeadConflict { .. }
         | IdentityPersistenceError::IdentityInactive
-        | IdentityPersistenceError::DeviceAuthenticationRejected => {
+        | IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked => {
             MlsV5RecoveryAuthorizationFailure::Unavailable
         }
         _ => MlsV5RecoveryAuthorizationFailure::TemporarilyUnavailable,
@@ -2302,6 +2303,7 @@ fn map_persistence_error(error: &IdentityPersistenceError) -> BootstrapFailure {
         | IdentityPersistenceError::IncompleteCommand
         | IdentityPersistenceError::ReceiptIntegrity
         | IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked
         | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
@@ -2344,6 +2346,7 @@ fn map_initial_device_persistence_error(error: &IdentityPersistenceError) -> Ini
         | IdentityPersistenceError::IncompleteCommand
         | IdentityPersistenceError::ReceiptIntegrity
         | IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked
         | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
@@ -2376,6 +2379,7 @@ fn map_device_session_persistence_error(error: &IdentityPersistenceError) -> Dev
         }
         IdentityPersistenceError::IdempotencyConflict => DeviceSessionFailure::IdempotencyConflict,
         IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked
         | IdentityPersistenceError::IdentityInactive => {
             DeviceSessionFailure::AuthenticationRejected
         }
@@ -2428,6 +2432,7 @@ fn map_recovery_catalog_publish_error(error: &IdentityPersistenceError) -> Recov
             RecoveryCatalogFailure::ExactCborInvalid
         }
         IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked
         | IdentityPersistenceError::IdentityInactive => {
             RecoveryCatalogFailure::AuthenticationRejected
         }
@@ -2483,7 +2488,8 @@ fn map_recovery_catalog_prepare_error(error: &IdentityPersistenceError) -> Recov
         | IdentityPersistenceError::RecoveryResponseCapabilityRejected => {
             RecoveryCatalogFailure::CapabilityRejected
         }
-        IdentityPersistenceError::DeviceAuthenticationRejected => {
+        IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked => {
             RecoveryCatalogFailure::AuthenticationRejected
         }
         IdentityPersistenceError::RecoveryPreparationExpired
@@ -2559,6 +2565,7 @@ fn map_recovery_catalog_status_error(error: &IdentityPersistenceError) -> Recove
         | IdentityPersistenceError::GenesisConflict
         | IdentityPersistenceError::IdentityInactive
         | IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked
         | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
         | IdentityPersistenceError::DeviceSessionChallengeExpired
         | IdentityPersistenceError::DeviceSessionChallengeConsumed
@@ -2593,6 +2600,7 @@ fn map_recovery_catalog_provider_error(error: &IdentityPersistenceError) -> Reco
             RecoveryCatalogFailure::ExactCborInvalid
         }
         IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked
         | IdentityPersistenceError::IdentityInactive => {
             RecoveryCatalogFailure::AuthenticationRejected
         }
@@ -2654,7 +2662,8 @@ fn map_device_enrollment_persistence_error(
         IdentityPersistenceError::IdempotencyConflict => {
             DeviceEnrollmentFailure::IdempotencyConflict
         }
-        IdentityPersistenceError::DeviceAuthenticationRejected => {
+        IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked => {
             DeviceEnrollmentFailure::AuthenticationRejected
         }
         IdentityPersistenceError::DeviceEnrollmentCapabilityRejected => {
@@ -2709,6 +2718,7 @@ fn map_device_revoke_persistence_error(error: &IdentityPersistenceError) -> Devi
         }
         IdentityPersistenceError::IdempotencyConflict => DeviceRevokeFailure::IdempotencyConflict,
         IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked
         | IdentityPersistenceError::IdentityInactive => DeviceRevokeFailure::AuthenticationRejected,
         IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden => {
             DeviceRevokeFailure::CurrentSessionForbidden
@@ -2752,6 +2762,7 @@ fn map_key_package_persistence_error(error: &IdentityPersistenceError) -> KeyPac
             KeyPackageFailure::InvalidRequest
         }
         IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::DeviceSessionRevoked
         | IdentityPersistenceError::IdentityInactive => KeyPackageFailure::AuthenticationRejected,
         IdentityPersistenceError::KeyPackageUnavailable => KeyPackageFailure::Unavailable,
         IdentityPersistenceError::KeyPackageConflict

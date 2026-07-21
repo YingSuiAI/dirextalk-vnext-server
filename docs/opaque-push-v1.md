@@ -18,3 +18,18 @@ FCM is the only V43 provider. The internal provider payload is exact UTF-8 JSON
 `{"version":1,"wake_delivery_id":"<canonical UUIDv7>"}`; transport TTL 60
 seconds is metadata, not payload. Registration is only a wake preference:
 durable Mailbox Pull/ACK and the account read cursor remain delivery truth.
+
+The production runtime is the standalone `dtx-opaque-push-broker` process. It
+owns the public registration routes and a single cancellation-aware delivery
+loop, and uses three separately authenticated PostgreSQL pools for identity
+authentication, registration mutation, and broker delivery. Database URLs are
+accepted only from root-owned file references. The local root key, FCM service
+account, TLS material, and database URL files are loaded before the process
+clears supplementary groups and drops to its configured non-root UID/GID;
+Tokio, database pools, provider HTTP, and listeners start only after the drop is
+verified. The readiness listener is loopback-only and reports ready only after
+the pools, broker, and bound listeners are initialized.
+
+V43 code completion does not imply live activation. Container/release service
+wiring, Firebase project material, client platform token/cold-start handling,
+and device acceptance remain separate deployment and client stages.

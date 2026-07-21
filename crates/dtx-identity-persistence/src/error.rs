@@ -38,6 +38,9 @@ pub enum IdentityPersistenceError {
     IdentityInactive,
     /// A device-session request was not authorized by an active certified device.
     DeviceAuthenticationRejected,
+    /// A verified, fresh device session is bound to a device revoked by the
+    /// authoritative active identity projection.
+    DeviceSessionRevoked,
     /// A session attempted to revoke the same device that owns the session.
     CurrentSessionDeviceRevokeForbidden,
     /// A one-time device-session challenge was no longer within its validity window.
@@ -109,6 +112,7 @@ impl fmt::Display for IdentityPersistenceError {
             Self::GenesisConflict => "identity genesis conflicts with an existing identity log",
             Self::IdentityInactive => "identity log is not active",
             Self::DeviceAuthenticationRejected => "device session authentication was rejected",
+            Self::DeviceSessionRevoked => "device session is revoked",
             Self::CurrentSessionDeviceRevokeForbidden => {
                 "the current device session cannot revoke its own device"
             }
@@ -156,6 +160,7 @@ impl Error for IdentityPersistenceError {
             | Self::GenesisConflict
             | Self::IdentityInactive
             | Self::DeviceAuthenticationRejected
+            | Self::DeviceSessionRevoked
             | Self::CurrentSessionDeviceRevokeForbidden
             | Self::DeviceSessionChallengeExpired
             | Self::DeviceSessionChallengeConsumed
@@ -191,5 +196,17 @@ impl From<sqlx::Error> for IdentityPersistenceError {
 impl From<IdentityLogError> for IdentityPersistenceError {
     fn from(source: IdentityLogError) -> Self {
         Self::IdentityLog(source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revoked_session_error_has_only_a_redacted_public_representation() {
+        let error = IdentityPersistenceError::DeviceSessionRevoked;
+        assert_eq!(format!("{error:?}"), "DeviceSessionRevoked");
+        assert_eq!(error.to_string(), "device session is revoked");
     }
 }

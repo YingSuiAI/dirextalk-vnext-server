@@ -21,9 +21,12 @@ const ADMIN_USER: &str = "dtx_test_admin";
 const DATABASE: &str = "dtx_test";
 const RUNTIME_USER: &str = "dtx_runtime_test";
 const IDENTITY_RUNTIME_USER: &str = "dtx_identity_only_test";
+const PUSH_IDENTITY_AUTH_USER: &str = "dtx_push_identity_auth_only_test";
 const GROUP_RUNTIME_USER: &str = "dtx_group_only_test";
 const MAILBOX_RUNTIME_USER: &str = "dtx_mailbox_only_test";
+const PUSH_REGISTRATION_USER: &str = "dtx_push_registration_only_test";
 const REALTIME_SYNC_RUNTIME_USER: &str = "dtx_realtime_sync_only_test";
+const PUSH_BROKER_USER: &str = "dtx_push_broker_only_test";
 const POSTGRES_TAG: &str = "18.4-alpine3.24";
 const LOCAL_POSTGRES_MODE_ENV: &str = "DTX_TEST_LOCAL_POSTGRES";
 const LOCAL_POSTGRES_HOST_ENV: &str = "DTX_TEST_LOCAL_POSTGRES_HOST";
@@ -139,12 +142,18 @@ pub struct PostgresHarness {
     runtime_options: PgConnectOptions,
     identity_runtime_pool: PgPool,
     identity_runtime_options: PgConnectOptions,
+    push_identity_auth_pool: PgPool,
+    push_identity_auth_options: PgConnectOptions,
     group_runtime_pool: PgPool,
     group_runtime_options: PgConnectOptions,
     mailbox_runtime_pool: PgPool,
     mailbox_runtime_options: PgConnectOptions,
+    push_registration_pool: PgPool,
+    push_registration_options: PgConnectOptions,
     realtime_sync_runtime_pool: PgPool,
     realtime_sync_runtime_options: PgConnectOptions,
+    push_broker_pool: PgPool,
+    push_broker_options: PgConnectOptions,
     _container: Option<ContainerAsync<Postgres>>,
     local_database: Option<LocalPostgresDatabase>,
 }
@@ -154,9 +163,12 @@ impl PostgresHarness {
     pub async fn start() -> Result<Self, Box<dyn Error>> {
         let runtime_password = random_password("runtime");
         let identity_runtime_password = random_password("identity-runtime");
+        let push_identity_auth_password = random_password("push-identity-auth");
         let group_runtime_password = random_password("group-runtime");
         let mailbox_runtime_password = random_password("mailbox-runtime");
+        let push_registration_password = random_password("push-registration");
         let realtime_sync_runtime_password = random_password("realtime-sync-runtime");
+        let push_broker_password = random_password("push-broker");
         let local_config = local_postgres_config_from_env()?;
         let mut local_database = match local_config.as_ref() {
             Some(config) => Some(LocalPostgresDatabase::create(config).await?),
@@ -220,15 +232,21 @@ impl PostgresHarness {
         sqlx::query(
             "SELECT set_config('dtx.test_runtime_password', $1, true), \
                     set_config('dtx.test_identity_runtime_password', $2, true), \
-                    set_config('dtx.test_group_runtime_password', $3, true), \
-                    set_config('dtx.test_mailbox_runtime_password', $4, true), \
-                    set_config('dtx.test_realtime_sync_runtime_password', $5, true)",
+                    set_config('dtx.test_push_identity_auth_password', $3, true), \
+                    set_config('dtx.test_group_runtime_password', $4, true), \
+                    set_config('dtx.test_mailbox_runtime_password', $5, true), \
+                    set_config('dtx.test_push_registration_password', $6, true), \
+                    set_config('dtx.test_realtime_sync_runtime_password', $7, true), \
+                    set_config('dtx.test_push_broker_password', $8, true)",
         )
         .bind(&runtime_password)
         .bind(&identity_runtime_password)
+        .bind(&push_identity_auth_password)
         .bind(&group_runtime_password)
         .bind(&mailbox_runtime_password)
+        .bind(&push_registration_password)
         .bind(&realtime_sync_runtime_password)
+        .bind(&push_broker_password)
         .execute(&mut *role_transaction)
         .await?;
         sqlx::raw_sql(
@@ -254,6 +272,17 @@ impl PostgresHarness {
                       EXECUTE format(
                           'ALTER ROLE dtx_identity_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
                           current_setting('dtx.test_identity_runtime_password')
+                      );
+                  END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_push_identity_auth_only_test') THEN
+                      EXECUTE format(
+                          'CREATE ROLE dtx_push_identity_auth_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_push_identity_auth_password')
+                      );
+                  ELSE
+                      EXECUTE format(
+                          'ALTER ROLE dtx_push_identity_auth_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_push_identity_auth_password')
                       );
                   END IF;
                   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_group_only_test') THEN
@@ -289,10 +318,26 @@ impl PostgresHarness {
                           current_setting('dtx.test_realtime_sync_runtime_password')
                       );
                   END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_push_registration_only_test') THEN
+                      EXECUTE format(
+                          'CREATE ROLE dtx_push_registration_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_push_registration_password')
+                      );
+                  ELSE
+                      EXECUTE format(
+                          'ALTER ROLE dtx_push_registration_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_push_registration_password')
+                      );
+                  END IF;
                   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_identity_runtime') THEN
                       CREATE ROLE dtx_identity_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
                   ELSE
                       ALTER ROLE dtx_identity_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_push_identity_auth_runtime') THEN
+                      CREATE ROLE dtx_push_identity_auth_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  ELSE
+                      ALTER ROLE dtx_push_identity_auth_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
                   END IF;
                   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_group_runtime') THEN
                       CREATE ROLE dtx_group_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
@@ -309,26 +354,56 @@ impl PostgresHarness {
                   ELSE
                       ALTER ROLE dtx_realtime_sync_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
                   END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_push_broker_runtime') THEN
+                      CREATE ROLE dtx_push_broker_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  ELSE
+                      ALTER ROLE dtx_push_broker_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_push_registration_runtime') THEN
+                      CREATE ROLE dtx_push_registration_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  ELSE
+                      ALTER ROLE dtx_push_registration_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;
+                  END IF;
+                  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dtx_push_broker_only_test') THEN
+                      EXECUTE format(
+                          'CREATE ROLE dtx_push_broker_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_push_broker_password')
+                      );
+                  ELSE
+                      EXECUTE format(
+                          'ALTER ROLE dtx_push_broker_only_test LOGIN PASSWORD %L NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION',
+                          current_setting('dtx.test_push_broker_password')
+                      );
+                  END IF;
                   REVOKE dtx_identity_runtime FROM dtx_runtime_test;
                   REVOKE dtx_identity_runtime FROM dtx_identity_only_test;
+                  REVOKE dtx_push_identity_auth_runtime FROM dtx_push_identity_auth_only_test;
                   REVOKE dtx_group_runtime FROM dtx_group_only_test;
                   REVOKE dtx_identity_runtime FROM dtx_mailbox_runtime;
                   REVOKE dtx_group_runtime FROM dtx_mailbox_runtime;
                   REVOKE dtx_realtime_sync_runtime FROM dtx_mailbox_runtime;
+                  REVOKE dtx_push_broker_runtime FROM dtx_mailbox_runtime;
+                  REVOKE dtx_push_registration_runtime FROM dtx_mailbox_runtime;
                   REVOKE dtx_identity_runtime FROM dtx_realtime_sync_only_test;
                   REVOKE dtx_group_runtime FROM dtx_realtime_sync_only_test;
                   REVOKE dtx_mailbox_runtime FROM dtx_realtime_sync_only_test;
                   REVOKE dtx_realtime_sync_runtime FROM dtx_realtime_sync_only_test;
+                  REVOKE dtx_push_broker_runtime FROM dtx_realtime_sync_only_test;
                   REVOKE dtx_mailbox_runtime FROM dtx_runtime_test;
                   REVOKE dtx_mailbox_runtime FROM dtx_identity_only_test;
                   REVOKE dtx_mailbox_runtime FROM dtx_group_only_test;
                   REVOKE dtx_mailbox_runtime FROM dtx_mailbox_only_test;
                   REVOKE pg_read_server_files FROM dtx_runtime_test;
+                  REVOKE dtx_push_broker_runtime FROM dtx_push_broker_only_test;
+                  REVOKE dtx_push_registration_runtime FROM dtx_push_registration_only_test;
                   GRANT dtx_identity_runtime TO dtx_runtime_test;
                   GRANT dtx_identity_runtime TO dtx_identity_only_test;
+                  GRANT dtx_push_identity_auth_runtime TO dtx_push_identity_auth_only_test;
                   GRANT dtx_group_runtime TO dtx_group_only_test;
                   GRANT dtx_mailbox_runtime TO dtx_mailbox_only_test;
                   GRANT dtx_realtime_sync_runtime TO dtx_realtime_sync_only_test;
+                  GRANT dtx_push_broker_runtime TO dtx_push_broker_only_test;
+                  GRANT dtx_push_registration_runtime TO dtx_push_registration_only_test;
              END
              $role$;
              GRANT USAGE ON SCHEMA system TO dtx_runtime_test;
@@ -414,6 +489,9 @@ impl PostgresHarness {
 
              GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
              GRANT USAGE ON SCHEMA messaging TO dtx_identity_runtime;
+             GRANT USAGE ON SCHEMA identity TO dtx_push_identity_auth_runtime;
+             GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
+                TO dtx_push_identity_auth_runtime;
              GRANT EXECUTE ON FUNCTION messaging.is_uuid_v7(uuid)
                 TO dtx_identity_runtime;
              GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA identity TO dtx_identity_runtime;
@@ -529,6 +607,13 @@ impl PostgresHarness {
              GRANT SELECT, INSERT ON messaging.attachment_chunks TO dtx_mailbox_runtime;
              GRANT EXECUTE ON FUNCTION messaging.expire_attachment_objects(integer)
                 TO dtx_mailbox_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.enqueue_opaque_push_intent(uuid,uuid,uuid)
+                 TO dtx_mailbox_runtime;
+             GRANT USAGE ON SCHEMA messaging TO dtx_push_registration_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.opaque_push_prepare_mutation(uuid,bytea,text,text,bytea,bigint,bytea,uuid),
+                 messaging.opaque_push_commit_put(uuid,bytea,uuid,text,text,bytea,bigint,bytea,smallint,smallint,smallint,smallint,text,bigint,bytea,bytea,bytea,bytea,text,bytea),
+                 messaging.opaque_push_commit_delete(uuid,bytea,text,text,bytea,bigint,bytea,smallint,smallint,smallint,smallint,text,bigint,bytea)
+                 TO dtx_push_registration_runtime;
              GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
                 TO dtx_mailbox_runtime;
 
@@ -558,7 +643,16 @@ impl PostgresHarness {
              GRANT EXECUTE ON FUNCTION realtime.compact_expired(bigint,integer)
                 TO dtx_realtime_sync_runtime;
              GRANT EXECUTE ON FUNCTION messaging.compact_expired_identity_deliveries(bigint,integer)
-                TO dtx_realtime_sync_runtime;",
+                TO dtx_realtime_sync_runtime;
+             GRANT USAGE ON SCHEMA messaging TO dtx_push_broker_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.claim_opaque_push_deliveries(uuid,integer),
+                 messaging.prune_opaque_push_terminal(integer),
+                 messaging.authorize_opaque_push_send(uuid,uuid),
+                 messaging.finish_opaque_push_accepted(uuid,uuid),
+                 messaging.finish_opaque_push_permanent_failure(uuid,uuid,text),
+                 messaging.finish_opaque_push_transient(uuid,uuid,integer,text),
+                 messaging.finish_opaque_push_invalid_token(uuid,uuid,bigint)
+                 TO dtx_push_broker_runtime;",
         )
         .execute(&mut *role_transaction)
         .await?;
@@ -586,6 +680,17 @@ impl PostgresHarness {
                 .max_connections(4)
                 .connect_with(identity_runtime_options.clone())
                 .await?;
+            let push_identity_auth_options = connect_options(
+                &host,
+                port,
+                PUSH_IDENTITY_AUTH_USER,
+                &push_identity_auth_password,
+                &database,
+            );
+            let push_identity_auth_pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect_with(push_identity_auth_options.clone())
+                .await?;
             let group_runtime_options = connect_options(
                 &host,
                 port,
@@ -608,6 +713,17 @@ impl PostgresHarness {
                 .max_connections(4)
                 .connect_with(mailbox_runtime_options.clone())
                 .await?;
+            let push_registration_options = connect_options(
+                &host,
+                port,
+                PUSH_REGISTRATION_USER,
+                &push_registration_password,
+                &database,
+            );
+            let push_registration_pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect_with(push_registration_options.clone())
+                .await?;
             let realtime_sync_runtime_options = connect_options(
                 &host,
                 port,
@@ -619,6 +735,17 @@ impl PostgresHarness {
                 .max_connections(4)
                 .connect_with(realtime_sync_runtime_options.clone())
                 .await?;
+            let push_broker_options = connect_options(
+                &host,
+                port,
+                PUSH_BROKER_USER,
+                &push_broker_password,
+                &database,
+            );
+            let push_broker_pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect_with(push_broker_options.clone())
+                .await?;
 
             Ok::<Self, Box<dyn Error>>(Self {
                 admin_pool,
@@ -626,12 +753,18 @@ impl PostgresHarness {
                 runtime_options,
                 identity_runtime_pool,
                 identity_runtime_options,
+                push_identity_auth_pool,
+                push_identity_auth_options,
                 group_runtime_pool,
                 group_runtime_options,
                 mailbox_runtime_pool,
                 mailbox_runtime_options,
+                push_registration_pool,
+                push_registration_options,
                 realtime_sync_runtime_pool,
                 realtime_sync_runtime_options,
+                push_broker_pool,
+                push_broker_options,
                 _container: container,
                 local_database: local_database.take(),
             })
@@ -669,6 +802,14 @@ impl PostgresHarness {
         self.identity_runtime_options.clone()
     }
 
+    pub fn push_identity_auth_pool(&self) -> &PgPool {
+        &self.push_identity_auth_pool
+    }
+
+    pub fn push_identity_auth_options(&self) -> PgConnectOptions {
+        self.push_identity_auth_options.clone()
+    }
+
     pub fn group_runtime_pool(&self) -> &PgPool {
         &self.group_runtime_pool
     }
@@ -685,12 +826,28 @@ impl PostgresHarness {
         self.mailbox_runtime_options.clone()
     }
 
+    pub fn push_registration_pool(&self) -> &PgPool {
+        &self.push_registration_pool
+    }
+
+    pub fn push_registration_options(&self) -> PgConnectOptions {
+        self.push_registration_options.clone()
+    }
+
     pub fn realtime_sync_runtime_pool(&self) -> &PgPool {
         &self.realtime_sync_runtime_pool
     }
 
     pub fn realtime_sync_runtime_options(&self) -> PgConnectOptions {
         self.realtime_sync_runtime_options.clone()
+    }
+
+    pub fn push_broker_pool(&self) -> &PgPool {
+        &self.push_broker_pool
+    }
+
+    pub fn push_broker_options(&self) -> PgConnectOptions {
+        self.push_broker_options.clone()
     }
 
     pub async fn runtime_store(

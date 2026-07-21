@@ -11,6 +11,7 @@ members = [
     "bins/dtx-public-feed-node",
     "bins/dtx-realtime-sync-gateway",
     "bins/dtx-node",
+    "bins/dtx-opaque-push-broker",
     "crates/dtx-agent-control",
     "crates/dtx-agent-control-proto",
     "crates/dtx-agent-control-server",
@@ -31,6 +32,9 @@ members = [
     "crates/dtx-indexer",
     "crates/dtx-membership-command",
     "crates/dtx-mailbox",
+    "crates/dtx-opaque-push",
+    "crates/dtx-opaque-push-postgres",
+    "crates/dtx-opaque-push-fcm",
     "crates/dtx-public-descriptor",
     "crates/dtx-public-discussion",
     "crates/dtx-public-feed",
@@ -52,9 +56,12 @@ rust-version = "1.97.0"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "query", "tokio", "ws"] }
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
 base64ct = { version = "1.8.3", features = ["alloc"] }
+base64 = "0.22.1"
+bytes = "1.11.1"
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
 futures-core = "0.3.32"
 futures-util = "0.3.32"
+httpdate = "1.0.3"
 getrandom = "0.4.3"
 hpke = { version = "0.14.0", default-features = false, features = ["alloc", "x25519", "chacha"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
@@ -67,6 +74,7 @@ oas3 = { version = "0.22.0", default-features = false, features = ["yaml-spec"] 
 protox = "0.9.1"
 prost-types = "0.14.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
+ring = "0.17.14"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = { version = "0.11.0", default-features = false }
@@ -83,6 +91,7 @@ tonic-prost-build = "0.14.6"
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
 uuid = { version = "1.23.5", features = ["serde", "v7"] }
 zeroize = { version = "1.9.0", features = ["derive"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "getrandom", "zeroize"] }
 yaml_serde = "0.10.4"
 cddl-cat = { version = "0.7.1", default-features = false, features = ["ciborium"] }
 

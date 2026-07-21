@@ -156,6 +156,11 @@ async fn validate_mailbox_runtime_role(pool: &PgPool) -> Result<(), MailboxPersi
              )
              AND has_function_privilege(
                  current_user,
+                 'messaging.enqueue_opaque_push_intent(uuid,uuid,uuid)'::regprocedure,
+                 'EXECUTE'
+             )
+             AND has_function_privilege(
+                 current_user,
                  'messaging.mailbox_owner_authorized()'::regprocedure,
                  'EXECUTE'
              )",
@@ -276,7 +281,8 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, MailboxPersi
                         'messaging.mailbox_runtime_authorized()'::regprocedure,
                         'messaging.mailbox_owner_authorized()'::regprocedure,
                         'messaging.is_uuid_v7(uuid)'::regprocedure,
-                        'messaging.expire_attachment_objects(integer)'::regprocedure
+                        'messaging.expire_attachment_objects(integer)'::regprocedure,
+                        'messaging.enqueue_opaque_push_intent(uuid,uuid,uuid)'::regprocedure
                     )
              )",
     )

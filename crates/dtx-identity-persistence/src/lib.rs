@@ -30,8 +30,8 @@ pub use device_session::{
     DEVICE_SESSION_REQUEST_HASH_DOMAIN, DEVICE_SESSION_SECRET_HASH_DOMAIN,
     DEVICE_SESSION_SIGNATURE_DOMAIN, DEVICE_SESSION_TTL_MILLIS, DeviceSessionChallenge,
     DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
-    DeviceSessionReceipt, DeviceSessionRepository, device_session_proof_canonical_bytes,
-    device_session_proof_input,
+    DeviceSessionReceipt, DeviceSessionRepository, DeviceSessionSecretHash,
+    PushIdentityAuthObservation, device_session_proof_canonical_bytes, device_session_proof_input,
 };
 pub use error::IdentityPersistenceError;
 pub use key_package::{
