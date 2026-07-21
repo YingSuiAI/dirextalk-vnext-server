@@ -1,0 +1,399 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Recovery Scope Catalog V1
+  version: 1.0.0
+  description: >-
+    Publishes only an encrypted exhaustive scope catalog and a separately
+    authority-signed head bound to pre-enrollment Identity Log H. A preparation
+    is invalidated unless H+1 is the exact direct DeviceAdd for its candidate;
+    every other identity-head, catalog-head, authority, or candidate-key change
+    is rejected. All responses are non-cacheable.
+paths:
+  /v1/recovery-scope-catalogs/{generation}:
+    put:
+      operationId: putRecoveryScopeCatalogV1
+      parameters:
+        - $ref: '#/components/parameters/Generation'
+        - $ref: '#/components/parameters/DeviceAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.recovery-scope-catalog.v1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-leaf-count: 65535
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/CatalogHead'}
+        '200': {$ref: '#/components/responses/CatalogHead'}
+        '401': {$ref: '#/components/responses/DeviceAuthenticationFailed'}
+        '409': {$ref: '#/components/responses/CatalogConflict'}
+        '410': {$ref: '#/components/responses/CatalogGone'}
+        '412': {$ref: '#/components/responses/IdentityHeadChanged'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /v2/devices/enroll/catalog-preparations:
+    post:
+      operationId: prepareRecoveryScopeCatalogV1
+      parameters:
+        - $ref: '#/components/parameters/EnrollmentCapability'
+        - $ref: '#/components/parameters/ResponseCapability'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.recovery-scope-catalog-preparation.v1+cbor:
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/PreparationStatus'}
+        '200': {$ref: '#/components/responses/PreparationStatus'}
+        '401': {$ref: '#/components/responses/CapabilityRejected'}
+        '409': {$ref: '#/components/responses/PreparationConflict'}
+        '410': {$ref: '#/components/responses/PreparationGone'}
+        '412': {$ref: '#/components/responses/PreparationPreconditionFailed'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /v2/devices/enroll/catalog-preparations/{request_id}:
+    get:
+      operationId: getRecoveryScopeCatalogPreparationV1
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ResponseCapability'
+      responses:
+        '200': {$ref: '#/components/responses/PreparationStatus'}
+        '401': {$ref: '#/components/responses/CapabilityRejected'}
+        '410': {$ref: '#/components/responses/PreparationGoneStatus'}
+        '412': {$ref: '#/components/responses/PreparationInvalidatedStatus'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+  /v2/devices/enroll/catalog-preparations/{request_id}/provider-response:
+    put:
+      operationId: putRecoveryScopeCatalogProviderResponseV1
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/DeviceAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.recovery-scope-catalog-provider-response.v1+cbor:
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/PreparationStatus'}
+        '401': {$ref: '#/components/responses/DeviceAuthenticationFailed'}
+        '409': {$ref: '#/components/responses/PreparationConflict'}
+        '410': {$ref: '#/components/responses/PreparationGone'}
+        '412': {$ref: '#/components/responses/PreparationInvalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+components:
+  parameters:
+    Generation:
+      name: generation
+      in: path
+      required: true
+      schema: {type: integer, minimum: 1, maximum: 9007199254740991}
+    RequestId:
+      name: request_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    DeviceAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      schema: {type: string}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 16, maxLength: 128}
+    EnrollmentCapability:
+      name: DTX-Enrollment-Capability
+      in: header
+      required: true
+      schema: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
+    ResponseCapability:
+      name: DTX-Recovery-Response-Capability
+      in: header
+      required: true
+      schema: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
+  schemas:
+    ExactCanonicalCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    ErrorEnvelopeV1:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, request_id, retryable]
+          properties:
+            code: {type: string}
+            request_id: {$ref: '#/components/headers/XRequestId/schema'}
+            retryable: {type: boolean}
+  headers:
+    NoStore:
+      schema: {type: string, const: no-store}
+    NoSniff:
+      schema: {type: string, const: nosniff}
+    XRequestId:
+      schema: {$ref: '#/components/schemas/UuidV7'}
+  responses:
+    CatalogHead:
+      description: Exact signed catalog head; replay returns identical bytes.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-head.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    PreparationStatus:
+      description: Honest pending, ready, expired, or invalidated state.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    PreparationGoneStatus:
+      description: Exact terminal expired or revoked status; this is CBOR, not a JSON mutation error.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    PreparationInvalidatedStatus:
+      description: Exact terminal invalidated status; this is CBOR, not a JSON mutation error.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    DeviceAuthenticationFailed:
+      description: DEVICE_AUTHENTICATION_FAILED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [DEVICE_AUTHENTICATION_FAILED]}
+                      retryable: {type: boolean, const: false}
+    CatalogConflict:
+      description: RECOVERY_CATALOG_CONFLICT or IDEMPOTENCY_CONFLICT.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [RECOVERY_CATALOG_CONFLICT, IDEMPOTENCY_CONFLICT]}
+                      retryable: {type: boolean, const: false}
+    CatalogGone:
+      description: RECOVERY_CATALOG_EXPIRED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [RECOVERY_CATALOG_EXPIRED]}
+                      retryable: {type: boolean, const: false}
+    IdentityHeadChanged:
+      description: IDENTITY_HEAD_CHANGED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [IDENTITY_HEAD_CHANGED]}
+                      retryable: {type: boolean, const: false}
+    PreparationConflict:
+      description: RECOVERY_PREPARATION_CONFLICT or IDEMPOTENCY_CONFLICT.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [RECOVERY_PREPARATION_CONFLICT, IDEMPOTENCY_CONFLICT]}
+                      retryable: {type: boolean, const: false}
+    PreparationGone:
+      description: RECOVERY_PREPARATION_EXPIRED, RECOVERY_PREPARATION_REVOKED, or RECOVERY_CATALOG_EXPIRED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [RECOVERY_PREPARATION_EXPIRED, RECOVERY_PREPARATION_REVOKED, RECOVERY_CATALOG_EXPIRED]}
+                      retryable: {type: boolean, const: false}
+    PreparationPreconditionFailed:
+      description: IDENTITY_HEAD_CHANGED, CATALOG_HEAD_CHANGED, AUTHORITY_CHANGED, or CANDIDATE_KEY_CHANGED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [IDENTITY_HEAD_CHANGED, CATALOG_HEAD_CHANGED, AUTHORITY_CHANGED, CANDIDATE_KEY_CHANGED]}
+                      retryable: {type: boolean, const: false}
+    PreparationInvalidated:
+      description: RECOVERY_PREPARATION_INVALIDATED; provider mutation currentness or binding failed and no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [RECOVERY_PREPARATION_INVALIDATED]}
+                      retryable: {type: boolean, const: false}
+    CapabilityRejected:
+      description: RECOVERY_RESPONSE_CAPABILITY_REJECTED.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [RECOVERY_RESPONSE_CAPABILITY_REJECTED]}
+                      retryable: {type: boolean, const: false}
+    InvalidExactCbor:
+      description: EXACT_CBOR_INVALID or RECOVERY_CATALOG_INVALID.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [EXACT_CBOR_INVALID, RECOVERY_CATALOG_INVALID]}
+                      retryable: {type: boolean, const: false}
+    ServiceUnavailable:
+      description: IDENTITY_SERVICE_UNAVAILABLE; retryable and no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema:
+            allOf:
+              - {$ref: '#/components/schemas/ErrorEnvelopeV1'}
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      code: {type: string, enum: [IDENTITY_SERVICE_UNAVAILABLE]}
+                      retryable: {type: boolean, const: true}

@@ -1,0 +1,600 @@
+; Dirextalk MLS Recovery Sequencer V7 (V42). This private scope-origin
+; protocol validates the complete Catalog/History/KeyPackage chain before any
+; MLS mutation, fences routing after activation, issues one-use redacted
+; completion evidence, and caches an externally signed exhaustive identity
+; completion. It is additive and never decodes V6 as V7.
+;
+; All maps are closed deterministic canonical CBOR. UUIDv7, identity, channel,
+; scope, and HTTPS-origin semantic spelling is validated above CDDL. Ed25519
+; validation is strict. Digests are SHA-256(domain || exact bytes named below),
+; and signatures cover signature-domain || exact deterministic canonical
+; unsigned-map bytes. Every displayed domain includes its terminal NUL.
+;
+; This artifact deliberately does not redefine Catalog V2 descriptor, private
+; body, verifier binding, public leaf, opening, head, or proof types. Bounded
+; byte references below MUST be passed to recovery-scope-catalog/v2's exact
+; owning rule and all equality/validity semantics must be enforced.
+;
+; issuer-authorization-request-signature-domain = `dirextalk.mls-recovery.issuer-authorization-request-signature.v1\0`.
+; issuer-authorization-request-domain = `dirextalk.mls-recovery.issuer-authorization-request.v1\0`.
+; issuer-authorization-idempotency-domain = `dirextalk.mls-recovery.issuer-authorization-idempotency.v1\0`.
+; route-signature-domain = `dirextalk.mls-recovery.route-signature.v1\0`.
+; route-domain = `dirextalk.mls-recovery.route.v1\0`.
+; controller-proof-signature-domain = `dirextalk.mls-recovery.controller-proof-signature.v1\0`.
+; controller-proof-domain = `dirextalk.mls-recovery.controller-proof.v1\0`.
+; raw-mls-commit-domain = `dirextalk.mls-recovery.raw-mls-commit.v7\0`.
+; raw-mls-welcome-domain = `dirextalk.mls-recovery.raw-mls-welcome.v7\0`.
+; add-signature-domain = `dirextalk.mls-recovery.add-signature.v7\0`.
+; add-domain = `dirextalk.mls-recovery.add.v7\0`.
+; add-idempotency-domain = `dirextalk.mls-recovery.add-idempotency.v7\0`.
+; add-receipt-domain = `dirextalk.mls-recovery.add-receipt.v7\0`.
+; add-receipt-signature-domain = `dirextalk.mls-recovery.add-receipt-signature.v7\0`.
+; confirmation-signature-domain = `dirextalk.mls-recovery.confirmation-signature.v2\0`.
+; confirmation-domain = `dirextalk.mls-recovery.confirmation.v2\0`.
+; confirmation-idempotency-domain = `dirextalk.mls-recovery.confirmation-idempotency.v2\0`.
+; confirmation-receipt-domain = `dirextalk.mls-recovery.confirmation-receipt.v2\0`.
+; confirmation-receipt-signature-domain = `dirextalk.mls-recovery.confirmation-receipt-signature.v2\0`.
+; activation-signature-domain = `dirextalk.mls-recovery.activation-signature.v2\0`.
+; activation-domain = `dirextalk.mls-recovery.activation.v2\0`.
+; activation-idempotency-domain = `dirextalk.mls-recovery.activation-idempotency.v2\0`.
+; activation-receipt-domain = `dirextalk.mls-recovery.activation-receipt.v2\0`.
+; activation-receipt-signature-domain = `dirextalk.mls-recovery.activation-receipt-signature.v2\0`.
+; activation-readback-signature-domain = `dirextalk.mls-recovery.activation-readback-signature.v2\0`.
+; activation-readback-domain = `dirextalk.mls-recovery.activation-readback.v2\0`.
+; child-pop-domain = `dirextalk.mls-recovery.completion-child-pop.v1\0`.
+; child-certificate-signature-domain = `dirextalk.mls-recovery.completion-child-certificate-signature.v1\0`.
+; child-certificate-domain = `dirextalk.mls-recovery.completion-child-certificate.v1\0`.
+; redacted-evidence-signature-domain = `dirextalk.mls-recovery.redacted-evidence-signature.v1\0`.
+; redacted-evidence-domain = `dirextalk.mls-recovery.redacted-evidence.v1\0`.
+; evidence-issuance-signature-domain = `dirextalk.mls-recovery.evidence-issuance-signature.v1\0`.
+; evidence-issuance-domain = `dirextalk.mls-recovery.evidence-issuance.v1\0`.
+; evidence-issuance-idempotency-domain = `dirextalk.mls-recovery.evidence-issuance-idempotency.v1\0`.
+; evidence-issuance-receipt-domain = `dirextalk.mls-recovery.evidence-issuance-receipt.v1\0`.
+; completion-cache-signature-domain = `dirextalk.mls-recovery.completion-cache-signature.v2\0`.
+; completion-cache-domain = `dirextalk.mls-recovery.completion-cache.v2\0`.
+; completion-cache-idempotency-domain = `dirextalk.mls-recovery.completion-cache-idempotency.v2\0`.
+; completion-cache-receipt-domain = `dirextalk.mls-recovery.completion-cache-receipt.v2\0`.
+; completion-cache-receipt-signature-domain = `dirextalk.mls-recovery.completion-cache-receipt-signature.v2\0`.
+;
+; The phase-2a MLS inventory above has exactly 40 domains: the phase-1 set of
+; 38 plus only raw-mls-commit-domain and raw-mls-welcome-domain. It adds no MLS
+; domain for either membership-receipt payload/digest and no raw proof domain.
+; Those fields use the external Catalog-owned membership-receipt domain
+; `dirextalk.recovery-scope-membership-receipt.v1\0` verbatim, with no MLS
+; rehash. The History-owned context is likewise imported verbatim and MUST NOT
+; be hashed again under any MLS domain:
+; completion_context_digest = SHA-256("dirextalk.history-recovery-completion-context.v2\0" || exact deterministic-canonical history-recovery-completion-context-v2 bytes)
+
+digest = bstr .size 32
+signature = bstr .size 64
+ed25519-public-key = bstr .size 32
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+channel-id = tstr .size 57
+https-authority-origin = tstr .size (9..2048)
+safe-sequence = 0..9007199254740991
+safe-parent = 0..9007199254740990
+positive-uint = 1..9007199254740991
+utc-millis = 0..9007199254740991
+catalog-exhaustive-count = 1..1023
+scope = { 1: 1, 2: uuid-v7 } / { 1: 2, 2: channel-id }
+
+; Recovery state is monotonic: welcome_pending -> candidate_confirmed ->
+; activated_fenced. completion_cached is an immutable cache fact, not a state
+; that weakens the activated fence. Unknown state integers are rejected.
+welcome-pending = 1
+candidate-confirmed = 2
+activated-fenced = 3
+
+; Exact owner-validated upstream objects.
+exact-catalog-completion-verifier-descriptor-v1 = bstr .size (1..2226)
+exact-catalog-private-body-v2 = bstr .size (1..4360)
+exact-catalog-verifier-binding-fields-1-through-22-v1 = bstr .size (1..2613)
+exact-catalog-opening-v2 = bstr .size (1..7264)
+exact-signed-catalog-head-v2 = bstr .size (1..466)
+exact-catalog-proof-v2 = bstr .size (1..402)
+exact-history-recovery-request-v4 = bstr .size (1..37114)
+exact-history-recovery-manifest-v2 = bstr .size (1..35477)
+exact-history-recovery-grant-v4 = bstr .size (1..1050699)
+exact-recipient-history-offer-v2 = bstr .size (1..1049059)
+exact-history-recovery-delivery-fact-v2 = bstr .size (1..366)
+exact-key-package-publish-receipt-v4 = bstr .size (1..67531)
+exact-key-package-claim-receipt-v4 = bstr .size (1..135564)
+; History V3 now owns the phase-2-reconciled presentation. Its entry imports the
+; 389-byte certificate and 250-byte evidence above, and its exact presentation
+; maximum is 5660 bytes. This consumer imports that owner ceiling verbatim.
+exact-history-recovery-completion-presentation-v2 = bstr .size (1..5660)
+
+; This request occurs before Catalog publication. Field 7 is the exact private
+; body whose owning Catalog digest is field 8. Fields 2..8 establish the leaf
+; coordinates; 9 selects the currently fetched exact Catalog-owned descriptor;
+; 10..11 name the later Catalog authority; 12..15 freeze algorithm, purpose,
+; and the nonempty issuer window. This closed map has keys 1..19 exactly once;
+; field 19 signs exact fields 1..18. After field 7 is parsed and validated as an
+; exact Catalog V2 private body, field 17 MUST be byte-identical to its field-6
+; membership-receipt bstr payload. Field 18 MUST be byte-identical to private-
+; body field 7 and equal SHA-256("dirextalk.recovery-scope-membership-receipt.v1\0"
+; || exact field-17 bstr PAYLOAD bytes), excluding the enclosing CBOR bstr
+; header. The exact Catalog owner validator and currentness checks are required;
+; the bounded bstr alone is never validation. Caller-provided issuer EPK,
+; issuer PoP, issuer ESK, key handle, or proposed response bytes are forbidden.
+mls-recovery-issuer-authorization-request-v1 = {
+  1: 1,
+  2: scope,
+  3: identity-id,
+  4: uuid-v7,                    ; catalog_id
+  5: positive-uint,              ; generation
+  6: catalog-exhaustive-count,   ; one-based index
+  7: exact-catalog-private-body-v2,
+  8: digest,                     ; Catalog private-body digest P
+  9: digest,                     ; expected current descriptor digest
+  10: uuid-v7,                   ; catalog-authority device_id
+  11: uuid-v7,                   ; catalog-authority key_id
+  12: 1,                         ; Ed25519
+  13: 1,                         ; history completion evidence issuer
+  14: utc-millis,                ; issuer not_before
+  15: utc-millis,                ; issuer expires_at
+  16: digest,                    ; Idempotency-Key digest
+  17: bstr .size (1..4096),      ; exact owner membership-receipt payload
+  18: digest,                    ; exact Catalog-owned field-17 payload digest
+  19: signature                  ; catalog authority signs exact fields 1..18
+}
+
+; A first accepted tuple causes the scope service to generate and persist a
+; globally unique, non-exportable issuer ESK. The byte-identical retry returns
+; exact Catalog binding fields 1..22: origin-verifier descriptor information,
+; issuer EPK/window, issuer PoP, and origin authorization. The caller then has
+; the Catalog authority append field 23. This service never accepts a caller
+; EPK/PoP and never returns the ESK.
+mls-recovery-issuer-authorization-v1 =
+  exact-catalog-verifier-binding-fields-1-through-22-v1
+
+; Private authority-local route and controller proof. They never cross into an
+; identity-home completion entry or redacted evidence. Controller-proof field 7
+; is the exact current Catalog-owner membership-receipt payload. Field 8 is
+; SHA-256("dirextalk.recovery-scope-membership-receipt.v1\0" || exact field-7 bstr PAYLOAD bytes),
+; excluding its CBOR bstr header. The owner validator's
+; authenticated scope, identity, device, key, public key, epoch, head, validity
+; window, and controller role MUST exactly equal proof fields 2..6 and 9..12 and
+; the current route/group state. Owner validation and currentness are mandatory;
+; accepting the bounded bstr alone is forbidden.
+mls-recovery-route-v1 = {
+  1: 1,
+  2: https-authority-origin,
+  3: uuid-v7,                    ; route_id
+  4: uuid-v7,                    ; authority device_id
+  5: uuid-v7,                    ; authority key_id
+  6: positive-uint,              ; authority MLS epoch
+  7: digest,                     ; authority MLS head
+  8: utc-millis,
+  9: utc-millis,
+  10: signature                  ; authority signs exact fields 1..9
+}
+mls-recovery-controller-proof-v1 = {
+  1: 1,
+  2: scope,
+  3: identity-id,                ; controller identity
+  4: uuid-v7,                    ; controller device_id
+  5: uuid-v7,                    ; controller key_id
+  6: ed25519-public-key,
+  7: bstr .size (1..4096),       ; exact current owner membership receipt
+  8: digest,                     ; exact Catalog-owned field-7 payload digest
+  9: positive-uint,              ; authority MLS epoch
+  10: digest,                    ; authority MLS head
+  11: utc-millis,
+  12: utc-millis,
+  13: signature                  ; controller signs exact fields 1..12
+}
+
+; V7 add is intentionally private and exhaustive. Every exact upstream byte
+; string is parsed under its owning rule and all repeated coordinates/digests
+; must be byte-equal before any write. Field 25 contains the full Catalog
+; opening, including private scope, membership, and verifier binding. Fields
+; 29/31 are exact original V4 receipts. H+1 is the direct DeviceAdd and field 36
+; is the final Identity Log head at H+1; fields 37..39 are authority-local MLS
+; coordinates and are not interchangeable with it. Field 40 is exactly one
+; wholly consumed canonical MLS wire Commit object; field 41 is
+; SHA-256(raw-mls-commit-domain || exact field-40 bstr PAYLOAD bytes), excluding
+; the CBOR bstr header. Field 42 is exactly one wholly consumed canonical MLS
+; wire Welcome object; field 43 is SHA-256(raw-mls-welcome-domain || exact
+; field-42 bstr PAYLOAD bytes), likewise excluding the CBOR bstr header. Parsing
+; rejects remainder, re-encoding, or Commit/Welcome type substitution.
+; The Commit adds exactly the claimed candidate KeyPackage to the exact group
+; at field-37's prior epoch. The Welcome corresponds to that exact Commit,
+; group, field-38 next epoch, and candidate. Route and controller proof are
+; exact. Field 51 is candidate field-7's signature over exact fields 1..50.
+; Maximum canonical body is 4,489,149 bytes: 81 map/header/key bytes plus
+; 4,489,068 value bytes. Owner bstr encodings are request 37117, manifest
+; 35480, grant 1050704, recipient offer 1049064, delivery fact 369, signed
+; head 469, opening 7267, proof 405, publish receipt 67536, and claim receipt
+; 135569 bytes.
+mls-recovery-add-request-v7 = {
+  1: 7,
+  2: uuid-v7,                    ; submission_id
+  3: scope,
+  4: identity-id,                ; recovering identity
+  5: identity-id,                ; current controller identity
+  6: uuid-v7,                    ; candidate device_id
+  7: ed25519-public-key,         ; candidate signing key
+  8: uuid-v7,                    ; History Request id
+  9: exact-history-recovery-request-v4,
+  10: digest,
+  11: exact-history-recovery-manifest-v2,
+  12: digest,
+  13: exact-history-recovery-grant-v4,
+  14: digest,
+  15: exact-recipient-history-offer-v2,
+  16: digest,
+  17: exact-history-recovery-delivery-fact-v2,
+  18: digest,
+  19: uuid-v7,                   ; catalog_id
+  20: positive-uint,             ; generation
+  21: exact-signed-catalog-head-v2,
+  22: digest,
+  23: catalog-exhaustive-count,
+  24: catalog-exhaustive-count,  ; one-based index
+  25: exact-catalog-opening-v2,
+  26: digest,
+  27: exact-catalog-proof-v2,
+  28: digest,                    ; exact public-leaf digest
+  29: exact-key-package-publish-receipt-v4,
+  30: digest,
+  31: exact-key-package-claim-receipt-v4,
+  32: digest,
+  33: safe-parent,               ; H
+  34: digest,                    ; Identity Log head at H
+  35: positive-uint,             ; exactly H+1
+  36: digest,                    ; final Identity Log head at H+1
+  37: safe-parent,               ; prior authority MLS epoch
+  38: positive-uint,             ; exactly prior epoch + 1
+  39: digest,                    ; prior authority MLS head
+  40: bstr .size (1..1048576),   ; one whole canonical MLS Commit payload
+  41: digest,                    ; raw-mls-commit-domain digest of field 40
+  42: bstr .size (1..1048576),   ; one whole canonical MLS Welcome payload
+  43: digest,                    ; raw-mls-welcome-domain digest of field 42
+  44: mls-recovery-route-v1,
+  45: digest,
+  46: mls-recovery-controller-proof-v1,
+  47: digest,
+  48: utc-millis,
+  49: utc-millis,
+  50: digest,                    ; add Idempotency-Key digest
+  51: signature
+}
+
+mls-recovery-add-receipt-v7 = {
+  1: 7, 2: uuid-v7, 3: scope, 4: identity-id, 5: uuid-v7,
+  6: uuid-v7, 7: digest, 8: uuid-v7, 9: positive-uint,
+  10: digest, 11: catalog-exhaustive-count,
+  12: catalog-exhaustive-count, 13: digest,
+  14: positive-uint,             ; final Identity Log H+1
+  15: digest,                    ; final Identity Log head at H+1
+  16: positive-uint,             ; committed authority MLS epoch
+  17: digest,                    ; committed authority MLS head
+  18: digest, 19: digest, 20: digest,
+  21: welcome-pending,
+  22: utc-millis
+}
+signed-mls-recovery-add-receipt-v7 = {
+  1: mls-recovery-add-receipt-v7,
+  2: digest,
+  3: uuid-v7,                    ; authority signing key_id
+  4: ed25519-public-key,
+  5: signature                    ; authority signs exact fields 1..4
+}
+exact-signed-mls-recovery-add-receipt-v7 = bstr .size (1..791)
+
+; Candidate confirmation echoes all public coordinates. Field 15 is the final
+; Identity Log head at exact H+1. Field 17 is the final authority MLS head for
+; the admitted Commit and is a distinct digest with a distinct state machine.
+mls-recovery-confirmation-v2 = {
+  1: 2, 2: uuid-v7, 3: scope, 4: identity-id, 5: uuid-v7,
+  6: uuid-v7, 7: digest, 8: uuid-v7, 9: positive-uint,
+  10: digest, 11: catalog-exhaustive-count,
+  12: catalog-exhaustive-count, 13: digest,
+  14: positive-uint, 15: digest,
+  16: positive-uint, 17: digest,
+  18: digest, 19: digest,
+  20: exact-signed-mls-recovery-add-receipt-v7,
+  21: digest, 22: utc-millis,
+  23: digest,                    ; confirmation Idempotency-Key digest
+  24: signature                  ; candidate signs exact fields 1..23
+}
+mls-recovery-confirmation-receipt-v2 = {
+  1: 2, 2: uuid-v7, 3: scope, 4: identity-id, 5: uuid-v7,
+  6: uuid-v7, 7: digest, 8: uuid-v7, 9: positive-uint,
+  10: digest, 11: catalog-exhaustive-count,
+  12: catalog-exhaustive-count, 13: digest,
+  14: positive-uint, 15: digest,
+  16: positive-uint, 17: digest,
+  18: digest, 19: digest, 20: digest,
+  21: candidate-confirmed, 22: utc-millis
+}
+signed-mls-recovery-confirmation-receipt-v2 = {
+  1: mls-recovery-confirmation-receipt-v2,
+  2: digest, 3: uuid-v7, 4: ed25519-public-key,
+  5: signature                    ; authority signs exact fields 1..4
+}
+exact-signed-mls-recovery-confirmation-receipt-v2 = bstr .size (1..791)
+
+; Activation requires the exact confirmation and a still-current controller
+; proof. It performs a final authority-head CAS. Success is activated_fenced:
+; neither activation nor identity recovery_complete alone enables routing.
+mls-recovery-activation-command-v2 = {
+  1: 2, 2: uuid-v7,              ; activation_id
+  3: uuid-v7, 4: scope, 5: identity-id, 6: uuid-v7,
+  7: uuid-v7, 8: digest, 9: uuid-v7, 10: positive-uint,
+  11: digest, 12: catalog-exhaustive-count,
+  13: catalog-exhaustive-count, 14: digest,
+  15: positive-uint, 16: digest,
+  17: positive-uint, 18: digest,
+  19: exact-signed-mls-recovery-confirmation-receipt-v2,
+  20: digest,
+  21: mls-recovery-controller-proof-v1,
+  22: digest, 23: utc-millis,
+  24: digest,                    ; activation Idempotency-Key digest
+  25: signature                  ; controller proof field-6 key signs 1..24
+}
+mls-recovery-activation-receipt-v2 = {
+  1: 2, 2: uuid-v7, 3: uuid-v7, 4: scope,
+  5: identity-id, 6: uuid-v7, 7: uuid-v7, 8: digest,
+  9: uuid-v7, 10: positive-uint, 11: digest,
+  12: catalog-exhaustive-count, 13: catalog-exhaustive-count, 14: digest,
+  15: positive-uint, 16: digest, ; final Identity Log H+1/head
+  17: positive-uint, 18: digest, ; final authority MLS epoch/head
+  19: digest,                    ; raw MLS Commit digest
+  20: digest,                    ; raw MLS Welcome digest
+  21: digest,                    ; activation-command digest
+  22: digest,                    ; signed confirmation-receipt digest
+  23: digest,                    ; controller-proof digest
+  24: activated-fenced,
+  25: utc-millis
+}
+signed-mls-recovery-activation-receipt-v2 = {
+  1: mls-recovery-activation-receipt-v2,
+  2: digest, 3: uuid-v7, 4: ed25519-public-key,
+  5: signature                    ; authority signs exact fields 1..4
+}
+exact-signed-mls-recovery-activation-receipt-v2 = bstr .size (1..903)
+
+; Readback is authority-signed and echoes both distinct final heads. It is
+; returned only while pre-issuance descriptor, request, candidate, Catalog,
+; explicit revocation, activation, and normal authority MLS currentness pass.
+mls-recovery-activation-readback-v2 = {
+  1: 2, 2: scope, 3: uuid-v7, 4: uuid-v7,
+  5: identity-id, 6: uuid-v7, 7: uuid-v7, 8: digest,
+  9: uuid-v7, 10: positive-uint, 11: digest,
+  12: catalog-exhaustive-count, 13: catalog-exhaustive-count, 14: digest,
+  15: positive-uint, 16: digest, ; final Identity Log H+1/head
+  17: positive-uint, 18: digest, ; final authority MLS epoch/head
+  19: activated-fenced,
+  20: exact-signed-mls-recovery-activation-receipt-v2,
+  21: digest, 22: utc-millis,
+  23: signature                  ; authority signs exact fields 1..22
+}
+exact-mls-recovery-activation-readback-v2 = bstr .size (1..1556)
+
+; Privacy-minimal one-level delegation certificate. All fields are closed and
+; renumbered. Fields 2..9 exactly equal the Catalog opening, signed head,
+; issuance command, and imported History context; field 9 is the mandatory
+; History-owned completion_context_digest above, with no MLS rehash. Fields
+; 13..14 exactly equal the evidence and command times. A fresh child ESK is
+; generated internally. Its field-15 PoP signs exact fields 1..14; the persistent
+; Catalog issuer ESK signs exact fields 1..15 in field 16. The certificate has no
+; raw catalog/identity/candidate/request/completion ID and no digest of any such
+; ID. Its closed single-evidence purpose cannot delegate or issue descendants.
+mls-recovery-completion-child-certificate-v1 = {
+  1: 1,
+  2: ed25519-public-key,         ; exact Catalog public-leaf issuer EPK
+  3: digest,                     ; exact Catalog authorization digest A
+  4: positive-uint,              ; generation
+  5: digest,                     ; exact signed Catalog-head digest
+  6: catalog-exhaustive-count,
+  7: catalog-exhaustive-count,   ; exact one-based index <= field 6
+  8: digest,                     ; exact Catalog public-leaf digest
+  9: digest,                     ; exact History-owned completion context digest
+  10: 1,                         ; Ed25519
+  11: 1,                         ; single completion evidence only
+  12: ed25519-public-key,        ; fresh globally unique child EPK
+  13: utc-millis,                ; evidence issued_at
+  14: utc-millis,                ; evidence expires_at
+  15: signature,                 ; child ESK PoP over exact fields 1..14
+  16: signature                  ; persistent issuer ESK signs exact fields 1..15
+}
+; Maximum = 17 map/key bytes + version 1 + three public keys/digests 102
+; + generation 9 + head/context/leaf digests 102 + count/index 6
+; + algorithm/purpose 2 + two times 18 + two signatures 132 = 389 bytes.
+exact-mls-recovery-completion-child-certificate-v1 = bstr .size (1..389)
+
+; Identity-visible evidence is privacy-minimal, closed, and renumbered. It has
+; no origin, scope, identity, candidate, controller, raw catalog/request/
+; completion ID, digest of any such ID, request digest, activation receipt or
+; readback correlation, membership receipt, descriptor, private opening, route,
+; authority key ID, or key handle. Fields 3..8 and 10..11 exactly equal the
+; certificate and issuance command. Field 9 exactly equals the issuance-time
+; activation state. The fresh child signs exact fields 1..11 in field 12 and
+; signs no other evidence, object, or descendant.
+mls-recovery-redacted-completion-evidence-v1 = {
+  1: 1,
+  2: digest,                     ; exact child-certificate digest
+  3: digest,                     ; exact History-owned completion context digest
+  4: positive-uint,              ; exact generation
+  5: digest,                     ; exact signed Catalog-head digest
+  6: catalog-exhaustive-count,
+  7: catalog-exhaustive-count,   ; exact one-based index <= field 6
+  8: digest,                     ; exact Catalog public-leaf digest
+  9: activated-fenced,
+  10: utc-millis,                ; evidence issued_at
+  11: utc-millis,                ; evidence expires_at
+  12: signature                  ; child signs exact fields 1..11
+}
+; Maximum = 13 map/key bytes + version/state 2 + certificate/context/head/leaf
+; digests 136 + generation 9 + count/index 6 + two times 18 + signature 66
+; = 250 bytes.
+exact-mls-recovery-redacted-completion-evidence-v1 = bstr .size (1..250)
+
+; Issuance is a separate post-activation endpoint. Its route key is
+; (field-5 scope, field-2 issuance_id); the sole-evidence uniqueness key is
+; (exact full signed issuer-binding digest B extracted from field 17,
+; field-11 completion_context_digest). Every certificate/evidence coordinate
+; and time exactly equals the command, opening, signed head, activation receipt,
+; and current activation readback. The common validity rule is
+; authorization_nbf <= issued_at < expires_at <= authorization_exp; that window
+; is contained by the exact request, signed Catalog head, and grant windows.
+;
+; On first admission, one final atomic CAS rechecks the exact current descriptor,
+; activation receipt/readback, authority MLS anchor, authorization revisions,
+; and explicit-revocation revisions. It then generates the child and atomically
+; persists the exact issuance-receipt bytes containing the certificate/evidence
+; plus PRIVATE exact issuance-command bytes/digest (including its Catalog
+; opening), exact descriptor bytes/digest, exact activation receipt/readback
+; snapshot bytes/digests, authority MLS anchor, and all checked revisions before
+; commit. A losing race destroys the child key and writes nothing. An exact
+; route/body/idempotency replay returns those stored receipt bytes; changed
+; route reuse, body, idempotency, or sole-evidence key conflicts with no write.
+; Routine descriptor rotation or an ordinary descendant authority MLS head
+; after durable issuance is non-retroactive. Explicit issuer, Catalog, request,
+; candidate, device, member, or activation revocation remains a fence.
+;
+; Pre-issuance HTTP 410 covers those explicit revocations and expiration. HTTP
+; 412 covers descriptor, activation/readback, authority-anchor, authorization-
+; revision, or revocation-revision change before the final CAS.
+mls-recovery-evidence-issuance-command-v1 = {
+  1: 1, 2: uuid-v7,              ; issuance_id
+  3: uuid-v7,                    ; activation_id
+  4: uuid-v7,                    ; submission_id
+  5: scope,
+  6: identity-id,                ; recovering identity
+  7: uuid-v7,                    ; candidate device_id
+  8: uuid-v7,                    ; recovery request_id
+  9: digest,                     ; exact signed Request V4 digest
+  10: uuid-v7,                   ; History completion_id
+  11: digest,                    ; exact History-owned context digest
+  12: uuid-v7,                   ; catalog_id
+  13: positive-uint,             ; generation
+  14: digest,                    ; exact signed Catalog-head digest
+  15: catalog-exhaustive-count,
+  16: catalog-exhaustive-count,  ; exact one-based index
+  17: exact-catalog-opening-v2,
+  18: digest,                    ; exact opening digest
+  19: exact-catalog-completion-verifier-descriptor-v1,
+  20: digest,                    ; exact current descriptor digest
+  21: exact-signed-mls-recovery-activation-receipt-v2,
+  22: digest,                    ; exact activation-receipt digest
+  23: exact-mls-recovery-activation-readback-v2,
+  24: digest,                    ; exact issuance-time readback digest
+  25: utc-millis,                ; evidence issued_at
+  26: utc-millis,                ; evidence expires_at
+  27: digest,                    ; issuance Idempotency-Key digest
+  28: signature                  ; current controller signs fields 1..27
+}
+mls-recovery-evidence-issuance-receipt-v1 = {
+  1: 1, 2: uuid-v7,              ; exact issuance_id
+  3: digest,                     ; exact issuance-command digest
+  4: mls-recovery-completion-child-certificate-v1,
+  5: digest,                     ; exact child-certificate digest
+  6: mls-recovery-redacted-completion-evidence-v1,
+  7: digest,                     ; exact evidence digest
+  8: digest,                     ; full signed issuer-binding digest B
+  9: digest,                     ; exact History-owned context digest
+  10: digest,                    ; historical descriptor digest
+  11: digest,                    ; issuance-time activation-receipt digest
+  12: digest,                    ; issuance-time readback snapshot digest
+  13: utc-millis,                ; first-admission accepted_at
+  14: activated-fenced
+}
+; Maximum = 15 map/key bytes + version/state 2 + issuance UUID 38
+; + eight digests 272 + child certificate 389 + evidence 250 + time 9
+; = 975 bytes. Equivalently: 1401 - 251 - 210 + 35 = 975.
+exact-mls-recovery-evidence-issuance-receipt-v1 = bstr .size (1..975)
+
+; The child ESK exists only inside first-admission execution. It makes exactly
+; one certificate PoP and exactly one evidence signature, no other signature or
+; descendant, and is destroyed after the atomic certificate+evidence commit. It
+; is never exported, persisted, logged, retried, or reused. An interrupted or
+; losing operation without the atomic commit has no accepted issuance, destroys
+; its child, writes nothing, and generates a new child on later first admission.
+
+; Completion cache semantic uniqueness is (field-3 scope, field-9
+; completion_context_digest), not cache_id, request digest, descriptor digest,
+; or current authority MLS head. It consumes the exact identity-home signed
+; receipt + own entry + completion-tree proof presentation, not a Boolean
+; recovery_complete claim. Fields 18 and 20 are the exact PRIVATE issuance-time
+; activation receipt/readback snapshots, byte-equal to the stored issuance
+; record and its receipt fields 11..12; field 20 is never a freshly fetched
+; current readback. Field 16 is byte-equal to the Catalog opening in the PRIVATE
+; stored issuance command. The cache validates the stored historical descriptor
+; bytes, signature, digest, and validity AT issuance without a current descriptor
+; fetch. History presentation field [2,1,30] first-admission accepted_at MUST be
+; less than evidence_expires_at. A later cache remains allowed after evidence
+; expiry only when that signed timely-admission inequality holds.
+;
+; The final cache CAS rechecks the exact History presentation, current identity,
+; device, member, and controller authorization, explicit-revocation generations,
+; and that the stored activation anchor remains valid in the current local MLS
+; lineage. Routine post-issuance descriptor rotation and ordinary descendant MLS
+; head advance are not HTTP 412. Exact semantic-key/body/idempotency replay
+; returns stored bytes; changed body, idempotency, cache_id, or activation under
+; the same semantic key is HTTP 409 with no write.
+;
+; Post-issuance cache HTTP 410 covers explicit issuer, Catalog, request,
+; candidate, device, member, or activation revocation, never mere evidence
+; expiry. HTTP 412 covers stored-snapshot mismatch, invalid/changed History
+; presentation during first admission, untimely History first admission,
+; authorization/revocation race, or an activation anchor no longer in current
+; local MLS lineage. Reuse of a committed semantic key with a changed command
+; body, including changed presentation bytes, remains HTTP 409 as stated above.
+mls-recovery-completion-cache-command-v2 = {
+  1: 2, 2: uuid-v7,              ; cache_id
+  3: scope, 4: uuid-v7, 5: uuid-v7,
+  6: identity-id, 7: uuid-v7, 8: uuid-v7,
+  9: digest,                     ; exact History-owned context digest
+  10: uuid-v7, 11: positive-uint, 12: digest,
+  13: catalog-exhaustive-count, 14: catalog-exhaustive-count, 15: digest,
+  16: exact-catalog-opening-v2, 17: digest,
+  18: exact-signed-mls-recovery-activation-receipt-v2,
+  19: digest,                    ; exact issuance-time receipt-snapshot digest
+  20: exact-mls-recovery-activation-readback-v2,
+  21: digest,                    ; exact issuance-time readback-snapshot digest
+  22: exact-mls-recovery-evidence-issuance-receipt-v1,
+  23: digest,                    ; exact issuance-receipt digest
+  24: exact-history-recovery-completion-presentation-v2,
+  25: digest,                    ; exact History presentation digest
+  26: utc-millis,
+  27: digest,                    ; cache Idempotency-Key digest
+  28: signature                  ; current controller signs fields 1..27
+}
+; Maximum = 35 map/header/key bytes + 17,120 value bytes = 17,155 bytes.
+; History V3's 5660-byte presentation encodes as a 5663-byte bstr; the other
+; imported bstr encodings are opening 7267, activation receipt 906, readback
+; 1559, and issuance receipt 978 bytes.
+mls-recovery-completion-cache-receipt-v2 = {
+  1: 2, 2: uuid-v7, 3: scope, 4: uuid-v7, 5: uuid-v7,
+  6: uuid-v7,                    ; identity completion_id
+  7: digest,                     ; exact History-owned context digest
+  8: digest,                     ; exact Catalog public-leaf digest
+  9: digest,                     ; signed identity completion-receipt digest
+  10: digest,                    ; exact own completion-entry digest
+  11: digest,                    ; exact completion-entry proof digest
+  12: digest,                    ; activation-receipt digest
+  13: digest,                    ; activation-readback digest
+  14: activated-fenced,
+  15: true,
+  16: utc-millis
+}
+signed-mls-recovery-completion-cache-receipt-v2 = {
+  1: mls-recovery-completion-cache-receipt-v2,
+  2: digest, 3: uuid-v7, 4: ed25519-public-key,
+  5: signature                    ; authority signs exact fields 1..4
+}
+
+; Routing is allowed only when all remain true: durable state is
+; activated_fenced; the exact immutable (scope, completion_context_digest)
+; cache exists; current identity/device/member/controller authorization passes;
+; the cached activation anchor remains in current local MLS lineage; and no
+; explicit issuer/Catalog/request/candidate/device/member/activation revocation
+; fences it. Identity recovery_complete without this exact semantic-key cache
+; never enables routing. Current descriptor fetch/equality is not a routing
+; predicate;
+; routine descriptor rotation or ordinary descendant MLS head advance after
+; durable child issuance is non-retroactive.

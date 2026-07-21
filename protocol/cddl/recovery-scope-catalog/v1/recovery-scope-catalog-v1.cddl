@@ -1,0 +1,118 @@
+; V41 encrypted, exhaustive recovery-scope catalog and pre-enrollment handoff.
+digest = bstr .size 32
+signature = bstr .size 64
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+channel-id = tstr .size 57
+safe-uint = 0..9007199254740991
+positive-uint = 1..9007199254740991
+catalog-count = 1..65535
+utc-millis = 0..9007199254740991
+recovery-scope = { 1: 1, 2: uuid-v7 } / { 1: 2, 2: channel-id }
+
+; Candidate-decrypted plaintext only. Entries are exhaustive and must be
+; consecutive by index, sorted by exact canonical scope bytes, and unique.
+recovery-scope-catalog-leaf-v1 = {
+  1: 1,
+  2: catalog-count,             ; one-based catalog index
+  3: recovery-scope,
+  4: bstr .size (1..4096),      ; opaque authority membership receipt
+  5: digest,                    ; receipt digest
+  6: digest,                    ; authoritative group head
+  7: digest                     ; canonical recovery-scope digest
+}
+recovery-scope-catalog-plaintext-v1 = {
+  1: 1,
+  2: identity-id,
+  3: positive-uint,             ; generation
+  4: digest / null,             ; previous signed catalog-head digest
+  5: safe-uint,                 ; exact pre-enrollment Identity Log H
+  6: digest,                    ; exact Identity Log head at H
+  7: [1*65535 recovery-scope-catalog-leaf-v1]
+}
+
+recovery-scope-catalog-head-unsigned-v1 = {
+  1: 1,
+  2: identity-id,
+  3: positive-uint,             ; generation
+  4: digest / null,             ; previous signed catalog-head digest
+  5: catalog-count,             ; exhaustive leaf count
+  6: digest,                    ; binary Merkle root of exact leaf hashes
+  7: digest,                    ; opaque encrypted catalog ciphertext digest
+  8: safe-uint,                 ; exact pre-enrollment Identity Log H
+  9: digest,                    ; exact Identity Log head at H
+  10: utc-millis,
+  11: utc-millis
+}
+recovery-scope-catalog-head-v1 = {
+  1: 1, 2: identity-id, 3: positive-uint, 4: digest / null,
+  5: catalog-count, 6: digest, 7: digest, 8: safe-uint, 9: digest,
+  10: utc-millis, 11: utc-millis,
+  12: signature                 ; current authority signs fields 1..11
+}
+recovery-scope-catalog-upload-v1 = {
+  1: recovery-scope-catalog-head-v1,
+  2: bstr .size (1..1048576)    ; opaque encrypted catalog only
+}
+
+recovery-scope-catalog-preparation-unsigned-v1 = {
+  1: 1,
+  2: uuid-v7,                  ; candidate request_id
+  3: identity-id,
+  4: uuid-v7,                  ; candidate device
+  5: bstr .size 32,            ; candidate signing key
+  6: bstr .size 32,            ; candidate recipient HPKE key
+  7: safe-uint,                ; observed Identity Log H
+  8: digest,                   ; observed Identity Log head
+  9: bstr .size 32,            ; candidate nonce
+  10: utc-millis,
+  11: utc-millis,
+  12: digest                   ; response-capability hash
+}
+recovery-scope-catalog-preparation-v1 = {
+  1: 1, 2: uuid-v7, 3: identity-id, 4: uuid-v7,
+  5: bstr .size 32, 6: bstr .size 32, 7: safe-uint, 8: digest,
+  9: bstr .size 32, 10: utc-millis, 11: utc-millis, 12: digest,
+  13: signature                ; candidate signs fields 1..12
+}
+
+recovery-scope-catalog-provider-response-unsigned-v1 = {
+  1: 1,
+  2: uuid-v7,
+  3: digest,                   ; exact signed catalog-head digest
+  4: uuid-v7,                  ; active provider device
+  5: bstr .size 32,            ; provider signing key
+  6: digest,                   ; current independent-authority digest
+  7: digest,                   ; candidate recipient-key digest
+  8: bstr .size (1..1048576),  ; candidate-recipient HPKE ciphertext
+  9: digest,                   ; exact ciphertext digest
+  10: utc-millis
+}
+recovery-scope-catalog-provider-response-v1 = {
+  1: 1, 2: uuid-v7, 3: digest, 4: uuid-v7, 5: bstr .size 32,
+  6: digest, 7: digest, 8: bstr .size (1..1048576), 9: digest,
+  10: utc-millis,
+  11: signature                ; provider signs fields 1..10
+}
+
+recovery-scope-catalog-status-pending-v1 = {
+  1: 1, 2: uuid-v7, 3: 1, 4: null, 5: null, 6: utc-millis
+}
+recovery-scope-catalog-status-ready-v1 = {
+  1: 1, 2: uuid-v7, 3: 2,
+  4: recovery-scope-catalog-provider-response-v1,
+  5: null, 6: utc-millis
+}
+recovery-scope-catalog-status-expired-v1 = {
+  1: 1, 2: uuid-v7, 3: 3, 4: null, 5: 4, 6: utc-millis
+}
+recovery-scope-catalog-status-invalidated-v1 = {
+  1: 1, 2: uuid-v7, 3: 4, 4: null,
+  5: 1..3,                    ; Identity head, catalog, or key changed
+  6: utc-millis
+}
+recovery-scope-catalog-status-v1 =
+  recovery-scope-catalog-status-pending-v1 /
+  recovery-scope-catalog-status-ready-v1 /
+  recovery-scope-catalog-status-expired-v1 /
+  recovery-scope-catalog-status-invalidated-v1

@@ -55,7 +55,8 @@ const HISTORY_RECOVERY_V1_MIGRATION_VERSION: i64 = 202_607_200_048;
 const REALTIME_SYNC_RETENTION_SAFETY_V1_MIGRATION_VERSION: i64 = 202_607_200_049;
 const MAILBOX_RETAINED_QUOTA_GC_V1_MIGRATION_VERSION: i64 = 202_607_200_050;
 const FEDERATED_MLS_V5_AUTHORIZATION_V1_MIGRATION_VERSION: i64 = 202_607_200_051;
-const EXPECTED_MIGRATION_COUNT: i64 = 51;
+const RECOVERY_SCOPE_CATALOG_V1_MIGRATION_VERSION: i64 = 202_607_210_052;
+const EXPECTED_MIGRATION_COUNT: i64 = 52;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -185,6 +186,10 @@ const FEDERATED_MLS_V5_AUTHORIZATION_V1_DOWN: &str =
     include_str!("../../../migrations/202607200051_federated_mls_v5_authorization_v1.down.sql");
 const FEDERATED_MLS_V5_AUTHORIZATION_V1_UP: &str =
     include_str!("../../../migrations/202607200051_federated_mls_v5_authorization_v1.up.sql");
+const RECOVERY_SCOPE_CATALOG_V1_DOWN: &str =
+    include_str!("../../../migrations/202607210052_recovery_scope_catalog_v1.down.sql");
+const RECOVERY_SCOPE_CATALOG_V1_UP: &str =
+    include_str!("../../../migrations/202607210052_recovery_scope_catalog_v1.up.sql");
 
 #[tokio::test]
 async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn std::error::Error>> {
@@ -428,6 +433,524 @@ async fn federated_mls_v5_projection_is_identity_runtime_only_and_reversible()
                 AND NOT has_function_privilege('dtx_group_runtime',$1,'EXECUTE')",
         )
         .bind(function)
+        .fetch_one(harness.admin_pool())
+        .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_scope_catalog_acl_is_identity_runtime_only_and_reversible()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    let acl: (bool, bool, bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('dtx_identity_runtime','identity.recovery_scope_catalogs','SELECT,INSERT'),
+                has_table_privilege('dtx_identity_runtime','identity.recovery_scope_catalog_preparations','SELECT,INSERT'),
+                NOT has_table_privilege('dtx_identity_runtime','identity.recovery_scope_catalog_preparations','UPDATE'),
+                has_column_privilege('dtx_identity_runtime','identity.recovery_scope_catalog_preparations','provider_response_bytes','UPDATE'),
+                has_function_privilege('dtx_identity_runtime','messaging.is_uuid_v7(uuid)','EXECUTE'),
+                has_table_privilege('dtx_group_runtime','identity.recovery_scope_catalogs','SELECT'),
+                has_table_privilege('dtx_mailbox_runtime','identity.recovery_scope_catalogs','SELECT'),
+                (SELECT relrowsecurity AND relforcerowsecurity FROM pg_class WHERE oid='identity.recovery_scope_catalogs'::regclass),
+                (SELECT relrowsecurity AND relforcerowsecurity FROM pg_class WHERE oid='identity.recovery_scope_catalog_preparations'::regclass),
+                (SELECT count(*)=2 AND bool_and(position('identity_runtime_authorized' IN pg_get_expr(polqual,polrelid))>0)
+                   FROM pg_policy
+                  WHERE polrelid IN ('identity.recovery_scope_catalogs'::regclass,
+                                     'identity.recovery_scope_catalog_preparations'::regclass))",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(
+        acl,
+        (true, true, true, true, true, false, false, true, true, true)
+    );
+
+    let trigger_rejected = sqlx::query(
+        "UPDATE identity.recovery_scope_catalog_preparations SET candidate_nonce=$1 WHERE false",
+    )
+    .bind(vec![0_u8; 32])
+    .execute(harness.identity_runtime_pool())
+    .await
+    .expect_err("runtime must not have update privilege on signed preparation bindings");
+    assert_eq!(
+        trigger_rejected
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("42501")),
+    );
+
+    sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('identity.recovery_scope_catalogs') IS NULL
+                AND to_regclass('identity.recovery_scope_catalog_preparations') IS NULL",
+        )
+        .fetch_one(harness.admin_pool())
+        .await?
+    );
+    sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the retention regression needs linked Catalog and unlinked enrollment fixtures"
+)]
+async fn recovery_scope_catalog_retains_linked_enrollment_challenges_without_blocking_prune()
+-> Result<(), Box<dyn std::error::Error>> {
+    const IDENTITY_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+    let harness = PostgresHarness::start().await?;
+    let authority_device_id = Uuid::now_v7();
+    let linked_challenge_id = Uuid::now_v7();
+    let unrelated_challenge_id = Uuid::now_v7();
+    let candidate_device_id = Uuid::now_v7();
+
+    let mut identity_transaction = harness.admin_pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO identity.log_heads(
+             identity_id,protocol_major,protocol_minor,minimum_reader_major,
+             minimum_reader_minor,head_sequence,head_hash,state,created_at_ms,updated_at_ms
+         ) VALUES($1,1,1,1,1,1,$2,'active',0,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![1_u8; 32])
+    .execute(&mut *identity_transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.log_entries(
+             identity_id,sequence,entry_hash,previous_hash,protocol_major,
+             protocol_minor,minimum_reader_major,minimum_reader_minor,event_bytes,recorded_at_ms
+         ) VALUES($1,1,$2,NULL,1,1,1,1,$3,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![1_u8; 32])
+    .bind(vec![1_u8])
+    .execute(&mut *identity_transaction)
+    .await?;
+    identity_transaction.commit().await?;
+    sqlx::query(
+        "INSERT INTO identity.recovery_scope_catalogs(
+             identity_id,generation,previous_head_digest,leaf_count,merkle_root,
+             ciphertext_digest,observed_head_sequence,observed_head_hash,
+             authority_device_id,authority_signing_key,issued_at_ms,expires_at_ms,
+             signature,head_bytes,head_digest,encrypted_catalog,upload_digest,
+             idempotency_key_hash,created_at_ms
+         ) VALUES($1,1,NULL,1,$2,$3,1,$4,$5,$6,10,20,$7,$8,$9,$10,$11,$12,10)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![2_u8; 32])
+    .bind(vec![3_u8; 32])
+    .bind(vec![1_u8; 32])
+    .bind(authority_device_id)
+    .bind(vec![4_u8; 32])
+    .bind(vec![5_u8; 64])
+    .bind(vec![6_u8])
+    .bind(vec![7_u8; 32])
+    .bind(vec![8_u8])
+    .bind(vec![9_u8; 32])
+    .bind(vec![10_u8; 32])
+    .execute(harness.admin_pool())
+    .await?;
+    for (challenge_id, retention_until_ms, idempotency_byte) in [
+        (linked_challenge_id, 10_i64, 11_u8),
+        (unrelated_challenge_id, 20_i64, 12_u8),
+    ] {
+        sqlx::query(
+            "INSERT INTO identity.device_enrollment_challenges(
+                 challenge_id,creation_idempotency_key_hash,identity_id,target_device_id,
+                 target_device_signing_key,target_device_encryption_key,capability_hash,
+                 request_digest,state,created_at_ms,expires_at_ms,retention_until_ms
+             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'open',0,$9,$9)",
+        )
+        .bind(challenge_id)
+        .bind(vec![idempotency_byte; 32])
+        .bind(IDENTITY_ID)
+        .bind(candidate_device_id)
+        .bind(vec![13_u8; 32])
+        .bind(vec![14_u8; 32])
+        .bind(vec![15_u8; 32])
+        .bind(vec![16_u8; 32])
+        .bind(retention_until_ms)
+        .execute(harness.admin_pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO identity.recovery_scope_catalog_preparations(
+             request_id,identity_id,candidate_device_id,candidate_signing_key,
+             candidate_recipient_key,observed_head_sequence,observed_head_hash,
+             candidate_nonce,issued_at_ms,expires_at_ms,response_capability_hash,
+             enrollment_capability_hash,candidate_signature,preparation_bytes,
+             preparation_digest,catalog_generation,catalog_head_digest,
+             authority_device_id,authority_signing_key,idempotency_key_hash,created_at_ms
+         ) VALUES($1,$2,$3,$4,$5,1,$6,$7,10,20,$8,$9,$10,$11,$12,1,$13,$14,$15,$16,10)",
+    )
+    .bind(linked_challenge_id)
+    .bind(IDENTITY_ID)
+    .bind(candidate_device_id)
+    .bind(vec![13_u8; 32])
+    .bind(vec![14_u8; 32])
+    .bind(vec![1_u8; 32])
+    .bind(vec![17_u8; 32])
+    .bind(vec![18_u8; 32])
+    .bind(vec![15_u8; 32])
+    .bind(vec![19_u8; 64])
+    .bind(vec![20_u8])
+    .bind(vec![21_u8; 32])
+    .bind(vec![7_u8; 32])
+    .bind(authority_device_id)
+    .bind(vec![4_u8; 32])
+    .bind(vec![22_u8; 32])
+    .execute(harness.admin_pool())
+    .await?;
+
+    let removed: i64 =
+        sqlx::query_scalar("SELECT identity.prune_expired_device_enrollment_challenges($1, $2)")
+            .bind(100_i64)
+            .bind(1_i32)
+            .fetch_one(harness.identity_runtime_pool())
+            .await?;
+    assert_eq!(removed, 1);
+    let remaining: (bool, bool) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM identity.device_enrollment_challenges WHERE challenge_id=$1),
+                EXISTS(SELECT 1 FROM identity.device_enrollment_challenges WHERE challenge_id=$2)",
+    )
+    .bind(linked_challenge_id)
+    .bind(unrelated_challenge_id)
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(remaining, (true, false));
+
+    sqlx::query("DELETE FROM identity.recovery_scope_catalog_preparations")
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::query("DELETE FROM identity.recovery_scope_catalogs")
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    let restored_definition: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef(
+             'identity.prune_expired_device_enrollment_challenges(bigint,integer)'::regprocedure
+         )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!restored_definition.contains("recovery_scope_catalog_preparations"));
+    let removed_after_down: i64 =
+        sqlx::query_scalar("SELECT identity.prune_expired_device_enrollment_challenges($1, $2)")
+            .bind(100_i64)
+            .bind(1_i32)
+            .fetch_one(harness.identity_runtime_pool())
+            .await?;
+    assert_eq!(removed_after_down, 1);
+    sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(sqlx::query_scalar::<_, bool>(
+        "SELECT to_regclass('identity.recovery_scope_catalog_preparations') IS NOT NULL
+            AND position(
+                'recovery_scope_catalog_preparations' IN pg_get_functiondef(
+                    'identity.prune_expired_device_enrollment_challenges(bigint,integer)'::regprocedure
+                )
+            ) > 0",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_scope_catalog_down_waits_for_concurrent_insert_and_preserves_the_fact()
+-> Result<(), Box<dyn std::error::Error>> {
+    const IDENTITY_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+    let harness = PostgresHarness::start().await?;
+    let mut identity_transaction = harness.admin_pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO identity.log_heads(
+             identity_id,protocol_major,protocol_minor,minimum_reader_major,
+             minimum_reader_minor,head_sequence,head_hash,state,created_at_ms,updated_at_ms
+         ) VALUES($1,1,1,1,1,1,$2,'active',0,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![1_u8; 32])
+    .execute(&mut *identity_transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.log_entries(
+             identity_id,sequence,entry_hash,previous_hash,protocol_major,
+             protocol_minor,minimum_reader_major,minimum_reader_minor,event_bytes,recorded_at_ms
+         ) VALUES($1,1,$2,NULL,1,1,1,1,$3,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![1_u8; 32])
+    .bind(vec![1_u8])
+    .execute(&mut *identity_transaction)
+    .await?;
+    identity_transaction.commit().await?;
+
+    let mut writer = harness.admin_pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO identity.recovery_scope_catalogs(
+             identity_id,generation,previous_head_digest,leaf_count,merkle_root,
+             ciphertext_digest,observed_head_sequence,observed_head_hash,
+             authority_device_id,authority_signing_key,issued_at_ms,expires_at_ms,
+             signature,head_bytes,head_digest,encrypted_catalog,upload_digest,
+             idempotency_key_hash,created_at_ms
+         ) VALUES($1,1,NULL,1,$2,$3,1,$4,$5,$6,10,20,$7,$8,$9,$10,$11,$12,10)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![2_u8; 32])
+    .bind(vec![3_u8; 32])
+    .bind(vec![1_u8; 32])
+    .bind(Uuid::now_v7())
+    .bind(vec![4_u8; 32])
+    .bind(vec![5_u8; 64])
+    .bind(vec![6_u8])
+    .bind(vec![7_u8; 32])
+    .bind(vec![8_u8])
+    .bind(vec![9_u8; 32])
+    .bind(vec![10_u8; 32])
+    .execute(&mut *writer)
+    .await?;
+
+    let mut downgrade_connection = harness.admin_pool().acquire().await?;
+    let downgrade_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *downgrade_connection)
+        .await?;
+    let downgrade = tokio::spawn(async move {
+        sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_DOWN)
+            .execute(&mut *downgrade_connection)
+            .await
+    });
+    let blocked_mode = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let requested_mode: Option<String> = sqlx::query_scalar(
+                "SELECT mode
+                   FROM pg_locks
+                  WHERE pid=$1
+                    AND locktype='relation'
+                    AND relation='identity.recovery_scope_catalogs'::regclass
+                    AND NOT granted
+                  ORDER BY mode
+                  LIMIT 1",
+            )
+            .bind(downgrade_pid)
+            .fetch_optional(harness.admin_pool())
+            .await?;
+            if let Some(mode) = requested_mode {
+                break Ok::<String, sqlx::Error>(mode);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+
+    writer.commit().await?;
+    let downgrade_error = downgrade
+        .await?
+        .expect_err("a concurrently committed catalog fact must refuse the downgrade");
+    assert_eq!(blocked_mode, "ShareRowExclusiveLock");
+    assert_eq!(
+        downgrade_error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("55000")),
+    );
+    let unchanged: (bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT to_regclass('identity.recovery_scope_catalogs') IS NOT NULL,
+                to_regclass('identity.recovery_scope_catalog_preparations') IS NOT NULL,
+                to_regprocedure('identity.enforce_recovery_scope_catalog_preparation_transition()') IS NOT NULL,
+                EXISTS(SELECT 1 FROM pg_trigger
+                        WHERE tgname='identity_recovery_scope_catalog_preparation_transition'
+                          AND NOT tgisinternal),
+                has_table_privilege(
+                    'dtx_identity_runtime','identity.recovery_scope_catalogs','SELECT,INSERT')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(unchanged, (true, true, true, true, true));
+    let preserved_facts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM identity.recovery_scope_catalogs")
+            .fetch_one(harness.admin_pool())
+            .await?;
+    assert_eq!(preserved_facts, 1);
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one migration test proves populated-down refusal and both immutable transitions"
+)]
+async fn recovery_scope_catalog_down_refuses_populated_state_before_ddl()
+-> Result<(), Box<dyn std::error::Error>> {
+    const IDENTITY_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+    let harness = PostgresHarness::start().await?;
+    let authority_device_id = Uuid::now_v7();
+    let challenge_id = Uuid::now_v7();
+    let candidate_device_id = Uuid::now_v7();
+    let mut identity_transaction = harness.admin_pool().begin().await?;
+    sqlx::query(
+        "INSERT INTO identity.log_heads(
+             identity_id,protocol_major,protocol_minor,minimum_reader_major,
+             minimum_reader_minor,head_sequence,head_hash,state,created_at_ms,updated_at_ms
+         ) VALUES($1,1,1,1,1,1,$2,'active',0,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![1_u8; 32])
+    .execute(&mut *identity_transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.log_entries(
+             identity_id,sequence,entry_hash,previous_hash,protocol_major,
+             protocol_minor,minimum_reader_major,minimum_reader_minor,event_bytes,recorded_at_ms
+         ) VALUES($1,1,$2,NULL,1,1,1,1,$3,0)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![1_u8; 32])
+    .bind(vec![1_u8])
+    .execute(&mut *identity_transaction)
+    .await?;
+    identity_transaction.commit().await?;
+    sqlx::query(
+        "INSERT INTO identity.recovery_scope_catalogs(
+             identity_id,generation,previous_head_digest,leaf_count,merkle_root,
+             ciphertext_digest,observed_head_sequence,observed_head_hash,
+             authority_device_id,authority_signing_key,issued_at_ms,expires_at_ms,
+             signature,head_bytes,head_digest,encrypted_catalog,upload_digest,
+             idempotency_key_hash,created_at_ms
+         ) VALUES($1,1,NULL,1,$2,$3,1,$4,$5,$6,10,20,$7,$8,$9,$10,$11,$12,10)",
+    )
+    .bind(IDENTITY_ID)
+    .bind(vec![2_u8; 32])
+    .bind(vec![3_u8; 32])
+    .bind(vec![1_u8; 32])
+    .bind(authority_device_id)
+    .bind(vec![4_u8; 32])
+    .bind(vec![5_u8; 64])
+    .bind(vec![6_u8])
+    .bind(vec![7_u8; 32])
+    .bind(vec![8_u8])
+    .bind(vec![9_u8; 32])
+    .bind(vec![10_u8; 32])
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.device_enrollment_challenges(
+             challenge_id,creation_idempotency_key_hash,identity_id,target_device_id,
+             target_device_signing_key,target_device_encryption_key,capability_hash,
+             request_digest,state,created_at_ms,expires_at_ms,retention_until_ms
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'open',10,20,20)",
+    )
+    .bind(challenge_id)
+    .bind(vec![11_u8; 32])
+    .bind(IDENTITY_ID)
+    .bind(candidate_device_id)
+    .bind(vec![12_u8; 32])
+    .bind(vec![13_u8; 32])
+    .bind(vec![14_u8; 32])
+    .bind(vec![15_u8; 32])
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO identity.recovery_scope_catalog_preparations(
+             request_id,identity_id,candidate_device_id,candidate_signing_key,
+             candidate_recipient_key,observed_head_sequence,observed_head_hash,
+             candidate_nonce,issued_at_ms,expires_at_ms,response_capability_hash,
+             enrollment_capability_hash,candidate_signature,preparation_bytes,
+             preparation_digest,catalog_generation,catalog_head_digest,
+             authority_device_id,authority_signing_key,idempotency_key_hash,created_at_ms
+         ) VALUES($1,$2,$3,$4,$5,1,$6,$7,10,20,$8,$9,$10,$11,$12,1,$13,$14,$15,$16,10)",
+    )
+    .bind(challenge_id)
+    .bind(IDENTITY_ID)
+    .bind(candidate_device_id)
+    .bind(vec![12_u8; 32])
+    .bind(vec![13_u8; 32])
+    .bind(vec![1_u8; 32])
+    .bind(vec![16_u8; 32])
+    .bind(vec![17_u8; 32])
+    .bind(vec![14_u8; 32])
+    .bind(vec![18_u8; 64])
+    .bind(vec![19_u8])
+    .bind(vec![20_u8; 32])
+    .bind(vec![7_u8; 32])
+    .bind(authority_device_id)
+    .bind(vec![4_u8; 32])
+    .bind(vec![21_u8; 32])
+    .execute(harness.admin_pool())
+    .await?;
+
+    let immutable_error = sqlx::query(
+        "UPDATE identity.recovery_scope_catalog_preparations
+            SET candidate_nonce=$2 WHERE request_id=$1",
+    )
+    .bind(challenge_id)
+    .bind(vec![22_u8; 32])
+    .execute(harness.admin_pool())
+    .await
+    .expect_err("signed preparation binding must be immutable even to the owner");
+    assert_eq!(
+        immutable_error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("23514")),
+    );
+
+    sqlx::query(
+        "UPDATE identity.recovery_scope_catalog_preparations SET
+             provider_response_bytes=$2,provider_response_digest=$3,
+             provider_device_id=$4,provider_signing_key=$5,
+             provider_ciphertext_digest=$6,provider_expires_at_ms=19,
+             provider_idempotency_key_hash=$7,provider_recorded_at_ms=11
+         WHERE request_id=$1",
+    )
+    .bind(challenge_id)
+    .bind(vec![23_u8])
+    .bind(vec![24_u8; 32])
+    .bind(Uuid::now_v7())
+    .bind(vec![25_u8; 32])
+    .bind(vec![26_u8; 32])
+    .bind(vec![27_u8; 32])
+    .execute(harness.admin_pool())
+    .await?;
+    let response_mutation_error = sqlx::query(
+        "UPDATE identity.recovery_scope_catalog_preparations
+            SET provider_response_bytes=$2 WHERE request_id=$1",
+    )
+    .bind(challenge_id)
+    .bind(vec![28_u8])
+    .execute(harness.admin_pool())
+    .await
+    .expect_err("provider response must be immutable after its one transition");
+    assert_eq!(
+        response_mutation_error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("23514")),
+    );
+
+    let error = sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await
+        .expect_err("populated V41 downgrade must fail before DDL");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code),
+        Some(std::borrow::Cow::Borrowed("55000")),
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('identity.recovery_scope_catalogs') IS NOT NULL
+                AND to_regclass('identity.recovery_scope_catalog_preparations') IS NOT NULL",
+        )
         .fetch_one(harness.admin_pool())
         .await?
     );
@@ -1955,7 +2478,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -2008,8 +2531,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(REALTIME_SYNC_RETENTION_SAFETY_V1_MIGRATION_VERSION)
     .bind(MAILBOX_RETAINED_QUOTA_GC_V1_MIGRATION_VERSION)
     .bind(FEDERATED_MLS_V5_AUTHORIZATION_V1_MIGRATION_VERSION)
+    .bind(RECOVERY_SCOPE_CATALOG_V1_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(RECOVERY_SCOPE_CATALOG_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(FEDERATED_MLS_V5_AUTHORIZATION_V1_DOWN)
         .execute(harness.admin_pool())
         .await?;

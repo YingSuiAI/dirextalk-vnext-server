@@ -16,7 +16,7 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::device_session::DeviceSessionRepository;
-use crate::repository::lock_and_load_active_snapshot;
+use crate::repository::{lock_and_load_active_snapshot, lock_identity};
 use crate::{
     DeviceSessionCredential, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead,
     IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
@@ -95,7 +95,7 @@ impl DeviceEnrollmentCapability {
         &self.0
     }
 
-    fn hash(&self) -> Sha256Digest {
+    pub(crate) fn hash(&self) -> Sha256Digest {
         Sha256Digest::hash_domain(DEVICE_ENROLLMENT_CAPABILITY_HASH_DOMAIN, &self.0)
     }
 }
@@ -917,7 +917,15 @@ impl DeviceEnrollmentRepository {
         let event = IdentityLogEventV1::decode_and_verify(command.exact_device_add_bytes())?;
         let mut session = store.begin().await?;
         let result = async {
+            let identity_hint =
+                load_challenge_identity_hint(session.connection(), command.challenge_id()).await?;
+            lock_identity(session.connection(), identity_hint).await?;
             let challenge = lock_challenge(session.connection(), command.challenge_id()).await?;
+            if challenge.identity_id != identity_hint {
+                return Err(IdentityPersistenceError::CorruptData(
+                    "device enrollment challenge identity changed",
+                ));
+            }
             ensure_capability(&challenge, &command.capability)?;
 
             match challenge.state {
@@ -953,6 +961,11 @@ impl DeviceEnrollmentRepository {
                     Err(IdentityPersistenceError::DeviceEnrollmentChallengeExpired)
                 }
                 DurableChallengeState::Open => {
+                    if load_session_identity_hint(session.connection(), &credential).await?
+                        != challenge.identity_id
+                    {
+                        return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+                    }
                     let authenticated = DeviceSessionRepository::authenticate_in_transaction(
                         session.connection(),
                         &credential,
@@ -1040,7 +1053,15 @@ impl DeviceEnrollmentRepository {
     ) -> Result<DeviceEnrollmentChallengeStatus, IdentityPersistenceError> {
         let mut session = store.begin().await?;
         let result = async {
+            let identity_hint =
+                load_challenge_identity_hint(session.connection(), challenge_id).await?;
+            lock_identity(session.connection(), identity_hint).await?;
             let challenge = lock_challenge(session.connection(), challenge_id).await?;
+            if challenge.identity_id != identity_hint {
+                return Err(IdentityPersistenceError::CorruptData(
+                    "device enrollment challenge identity changed",
+                ));
+            }
             ensure_capability(&challenge, &capability)?;
             Ok(challenge.status_at(now))
         }
@@ -1075,7 +1096,15 @@ impl DeviceEnrollmentRepository {
     ) -> Result<DeviceEnrollmentChallengeStatus, IdentityPersistenceError> {
         let mut session = store.begin().await?;
         let result = async {
+            let identity_hint =
+                load_challenge_identity_hint(session.connection(), challenge_id).await?;
+            lock_identity(session.connection(), identity_hint).await?;
             let challenge = lock_challenge(session.connection(), challenge_id).await?;
+            if challenge.identity_id != identity_hint {
+                return Err(IdentityPersistenceError::CorruptData(
+                    "device enrollment challenge identity changed",
+                ));
+            }
             ensure_capability(&challenge, &capability)?;
             match challenge.state {
                 DurableChallengeState::Approved => {
@@ -1485,6 +1514,33 @@ async fn lock_challenge(
     .await?
     .ok_or(IdentityPersistenceError::DeviceEnrollmentCapabilityRejected)?;
     decode_stored_challenge(&row)
+}
+
+async fn load_challenge_identity_hint(
+    connection: &mut PgConnection,
+    challenge_id: DeviceEnrollmentChallengeId,
+) -> Result<IdentityId, IdentityPersistenceError> {
+    let identity_id: String = sqlx::query_scalar(
+        "SELECT identity_id FROM identity.device_enrollment_challenges WHERE challenge_id=$1",
+    )
+    .bind(*challenge_id.as_uuid())
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or(IdentityPersistenceError::DeviceEnrollmentCapabilityRejected)?;
+    parse_identity_id(&identity_id)
+}
+
+async fn load_session_identity_hint(
+    connection: &mut PgConnection,
+    credential: &DeviceSessionCredential,
+) -> Result<IdentityId, IdentityPersistenceError> {
+    let identity_id: String =
+        sqlx::query_scalar("SELECT identity_id FROM identity.device_sessions WHERE session_id=$1")
+            .bind(*credential.session_id().as_uuid())
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or(IdentityPersistenceError::DeviceAuthenticationRejected)?;
+    parse_identity_id(&identity_id)
 }
 
 async fn load_challenge_by_creation_key_optional(

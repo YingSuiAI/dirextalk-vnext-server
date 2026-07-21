@@ -1,0 +1,576 @@
+; V42 catalog-exhaustive History Recovery. This artifact owns wire Request V4,
+; Grant V4, immutable delivery fact V2, and identity-home Completion V2. It does
+; not supersede or convert V3 requests/grants or Completion V1.
+;
+; All maps are closed and use deterministic canonical CBOR. UUIDv7 text is
+; lower-case RFC spelling; identity IDs are canonical lower-case dtxi1 text.
+; HTTPS origins are `https://` plus a lower-case ASCII DNS host and optional
+; non-default decimal port: no IP literal, userinfo, trailing dot, path, slash,
+; query, fragment, redirect, or alternate origin spelling. Runtime performs
+; strict Ed25519 and X25519 semantic validation in addition to these sizes.
+; Digests are SHA-256(domain || exact bytes named below). Every displayed
+; domain is UTF-8 and includes the terminal NUL.
+;
+; manifest-domain = `dirextalk.history-recovery.manifest.v2\0`.
+; leaf-set-domain = `dirextalk.history-recovery.leaf-set.v2\0`.
+; request-signature-domain = `dirextalk.history-recovery.request-signature.v4\0`.
+; request-domain = `dirextalk.history-recovery.request.v4\0`.
+; request-idempotency-domain = `dirextalk.history-recovery.request-idempotency.v4\0`.
+; offer-domain = `dirextalk.history-recovery.recipient-offer.v2\0`.
+; offer-ciphertext-domain = `dirextalk.history-recovery.offer-ciphertext.v2\0`.
+; grant-signature-domain = `dirextalk.history-recovery.grant-provider-signature.v4\0`.
+; grant-authority-signature-domain = `dirextalk.history-recovery.grant-authority-signature.v4\0`.
+; grant-domain = `dirextalk.history-recovery.grant.v4\0`.
+; grant-idempotency-domain = `dirextalk.history-recovery.grant-idempotency.v4\0`.
+; delivery-fact-domain = `dirextalk.history-recovery.delivery-fact.v2\0`.
+; completion-key-descriptor-domain = `dirextalk.history-recovery.completion-key-descriptor.v2\0`.
+; completion-key-descriptor-signature-domain = `dirextalk.history-recovery.completion-key-descriptor-signature.v2\0`.
+; completion-context-domain = `dirextalk.history-recovery-completion-context.v2\0`.
+; completion-entry-domain = `dirextalk.history-recovery.completion-entry.v2\0`.
+; completion-entry-node-domain = `dirextalk.history-recovery.completion-entry-node.v2\0`.
+; completion-command-signature-domain = `dirextalk.history-recovery.completion-command-signature.v2\0`.
+; completion-command-domain = `dirextalk.history-recovery.completion-command.v2\0`.
+; completion-idempotency-domain = `dirextalk.history-recovery.completion-idempotency.v2\0`.
+; offer-ack-domain = `dirextalk.history-recovery.offer-ack.v2\0`.
+; recovery-complete-domain = `dirextalk.history-recovery.complete.v2\0`.
+; completion-receipt-domain = `dirextalk.history-recovery.completion-receipt.v2\0`.
+; completion-receipt-signature-domain = `dirextalk.history-recovery.completion-receipt-signature.v2\0`.
+; presentation-domain = `dirextalk.history-recovery.completion-presentation.v2\0`.
+;
+; A digest always covers exact deterministic canonical bytes, never decoded and
+; re-encoded values. Signature inputs are their distinct signature domain plus
+; exact deterministic canonical unsigned-map bytes. Raw capability and
+; Idempotency-Key values are neither persisted nor returned.
+; leaf-set digest = SHA-256(leaf-set-domain || exact canonical
+; history-recovery-leaf-set-v2 bytes).
+; completion-context digest = SHA-256(completion-context-domain || exact
+; canonical history-recovery-completion-context-v2 bytes).
+; completion-entry digest = SHA-256(completion-entry-domain || exact canonical
+; history-recovery-completion-entry-v2 bytes).
+; completion-entry node = SHA-256(completion-entry-node-domain || left32 ||
+; right32), with no CBOR wrapper or length prefix around the two digests.
+
+digest = bstr .size 32
+signature = bstr .size 64
+ed25519-public-key = bstr .size 32
+x25519-public-key = bstr .size 32
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+https-authority-origin = tstr .size (9..2048)
+safe-uint = 0..9007199254740991
+safe-highwater = 0..9007199254740990
+positive-uint = 1..9007199254740991
+utc-millis = 0..9007199254740991
+
+; Catalog V2 owning types are not redefined here. These byte strings must be
+; exact canonical encodings accepted by recovery-scope-catalog/v2 under the
+; named rule. A consumer MUST invoke that validator, not merely size-check.
+exact-signed-catalog-head-v2 = bstr .size (1..466)
+exact-catalog-public-leaf-v2 = bstr .size (1..220)
+exact-catalog-proof-v2 = bstr .size (1..402)
+exact-catalog-preparation-v2 = bstr .size (1..532)
+exact-device-add-event-v1 = bstr .size (1..533)
+
+; Catalog V2's encrypted plaintext is capped at 1,048,576 bytes. A minimum
+; structural opening is 1,019 bytes for one-based indices 1..23. The index is
+; encoded independently in private-body field 4, signed-binding field 5, and
+; public-leaf field 4: indices 24..255 add 3 bytes per opening and indices
+; 256+ add 6. With the 147-byte outer overhead, N=1023 is exactly
+; 147 + 1023*1019 + 232*3 + 768*6 = 1,047,888 bytes and fits; N=1024 is
+; 1,048,913 bytes and cannot fit. The exhaustive downstream ceiling therefore
+; admits every valid Catalog V2 without treating a repeated-index structural
+; fixture as a valid Catalog. The owner proof maximum is 10 siblings and 402
+; exact canonical bytes.
+catalog-exhaustive-count = 1..1023
+
+; Exact one-based Catalog index order. The array contains exactly the manifest
+; count, has no gaps or duplicates, and each digest is the Catalog owner-domain
+; digest of the corresponding exact public leaf. This exact array, not an
+; unordered set or JSON projection, is the leaf-set-domain digest input used by
+; Manifest, Grant, and Completion.
+history-recovery-leaf-set-v2 = [1*1023 digest]
+
+; The manifest is embedded in, and signed as part of, Request V4. It is not a
+; separately authority-signed object. Field 5 is the exact signed Catalog V2
+; head, fields 6..9 equal head fields 2..7 as applicable, and field 10 contains
+; exactly field 8 digests in one-based Catalog index order. Field 9 is the
+; digest of the exact ordered array in field 10.
+history-recovery-manifest-v2 = {
+  1: 2,
+  2: identity-id,
+  3: uuid-v7,                    ; catalog_id
+  4: positive-uint,              ; generation
+  5: exact-signed-catalog-head-v2,
+  6: digest,                     ; exact signed-head digest
+  7: digest,                     ; exact Catalog V2 Merkle root
+  8: catalog-exhaustive-count,
+  9: digest,                     ; leaf-set-domain digest of exact field 10
+  10: history-recovery-leaf-set-v2 ; exactly field-8 leaf digests
+}
+exact-history-recovery-manifest-v2 = bstr .size (1..35477)
+
+; request_id equals the prior preparation request_id and enrollment
+; challenge_id. The preparation is already ready after the exact direct
+; DeviceAdd at H+1. Fields 4..14 equal the preparation, DeviceAdd, and current
+; Identity Log facts; field 15 is the exhaustive manifest above. There is no
+; DELETE route: enrollment-challenge cancellation is the sole cancellation
+; truth and invalidates this request. Fields 17 < 18 and the interval is
+; contained by preparation, Catalog head, DeviceAdd, and challenge validity.
+history-recovery-request-unsigned-v4 = {
+  1: 4,
+  2: uuid-v7,                    ; request_id == preparation == challenge_id
+  3: identity-id,
+  4: uuid-v7,                    ; candidate device_id
+  5: ed25519-public-key,         ; candidate signing key
+  6: x25519-public-key,          ; candidate recipient key
+  7: safe-highwater,             ; exact pre-enrollment H
+  8: digest,                     ; exact Identity Log head at H
+  9: positive-uint,              ; exactly H+1
+  10: digest,                    ; exact Identity Log head at H+1
+  11: exact-device-add-event-v1,
+  12: digest,                    ; DeviceAdd domain digest of field 11
+  13: exact-catalog-preparation-v2,
+  14: digest,                    ; Catalog preparation domain digest of field 13
+  15: history-recovery-manifest-v2,
+  16: digest,                    ; manifest-domain digest of field 15
+  17: utc-millis,                ; issued_at
+  18: utc-millis,                ; expires_at
+  19: digest,                    ; response-capability digest
+  20: digest                     ; request Idempotency-Key digest
+}
+history-recovery-request-v4 = {
+  1: 4, 2: uuid-v7, 3: identity-id, 4: uuid-v7,
+  5: ed25519-public-key, 6: x25519-public-key,
+  7: safe-highwater, 8: digest, 9: positive-uint, 10: digest,
+  11: exact-device-add-event-v1, 12: digest,
+  13: exact-catalog-preparation-v2, 14: digest,
+  15: history-recovery-manifest-v2, 16: digest,
+  17: utc-millis, 18: utc-millis, 19: digest, 20: digest,
+  21: signature                  ; candidate signs exact fields 1..20
+}
+exact-history-recovery-request-v4 = bstr .size (1..37114)
+history-recovery-request-receipt-v4 = {
+  1: 4,                         ; version, constant Request V4
+  2: uuid-v7,                   ; exact accepted request field-2 request_id
+  3: digest,                    ; request-domain digest of exact signed request
+  4: digest,                    ; exact accepted request field-19 capability digest
+  5: utc-millis                 ; first-admission accepted_at, stored once
+}
+
+; Offer plaintext permits recovered message/timeline/read state and opaque
+; attachment references, but forbids MLS checkpoints, MLS private state,
+; epoch secrets, scope origins, scope identifiers, private verifier material,
+; and raw capabilities. Field 10 is encrypted directly to request field 6.
+history-recovery-attachment-reference-v2 = {
+  1: uuid-v7,                   ; opaque object id, not an origin
+  2: digest,
+  3: positive-uint,             ; exact byte length
+  4: digest                     ; high-entropy attachment capability digest
+}
+recipient-history-offer-v2 = {
+  1: 2,
+  2: uuid-v7,                   ; request_id
+  3: digest,                    ; exact signed request digest
+  4: digest,                    ; exact manifest digest
+  5: uuid-v7,                   ; catalog_id
+  6: positive-uint,             ; generation
+  7: digest,                    ; exact signed Catalog-head digest
+  8: digest,                    ; exhaustive leaf-set digest
+  9: digest,                    ; allowed snapshot plaintext digest
+  10: bstr .size (1..1048576),  ; candidate-recipient opaque ciphertext
+  11: digest,                   ; offer-ciphertext-domain digest of field 10
+  12: history-recovery-attachment-reference-v2 / null,
+  13: utc-millis,               ; issued_at
+  14: utc-millis,               ; expires_at
+  15: digest                    ; request recipient-key digest
+}
+exact-recipient-history-offer-v2 = bstr .size (1..1049059)
+
+; Exact Catalog-owned signer encodings. Semantics and closed unions are owned
+; by recovery-scope-catalog/v2 and must be validated there.
+exact-catalog-provider-descriptor-v2 = bstr .size 77
+exact-catalog-independent-authority-v2 = bstr .size (73..77)
+
+; Both signers sign the same exact unsigned fields 1..33 under distinct
+; domains. Field 36 is the exact offer whose digest is field 25. First
+; acceptance atomically appends the grant, opaque mailbox envelope, immutable
+; delivery fact, realtime journal row, and outbox row. No push delivery result
+; changes this commit. Durable opaque Mailbox Pull/ACK remains delivery truth.
+history-recovery-grant-unsigned-v4 = {
+  1: 4,
+  2: identity-id,
+  3: uuid-v7,                   ; request_id
+  4: digest,                    ; exact signed request digest
+  5: digest,                    ; exact manifest digest
+  6: uuid-v7,                   ; catalog_id
+  7: positive-uint,             ; generation
+  8: exact-signed-catalog-head-v2,
+  9: digest,                    ; exact signed-head digest
+  10: digest,                   ; Catalog Merkle root
+  11: catalog-exhaustive-count,
+  12: digest,                   ; exhaustive leaf-set digest
+  13: uuid-v7,                  ; candidate device_id
+  14: ed25519-public-key,       ; candidate signing key
+  15: x25519-public-key,        ; candidate recipient key
+  16: safe-highwater,           ; H
+  17: digest,                   ; head at H
+  18: positive-uint,            ; exactly H+1
+  19: digest,                   ; head at H+1
+  20: digest,                   ; exact DeviceAdd digest
+  21: digest,                   ; exact Catalog preparation digest
+  22: exact-catalog-provider-descriptor-v2,
+  23: exact-catalog-independent-authority-v2,
+  24: digest,                   ; candidate recipient-key digest
+  25: digest,                   ; exact offer digest
+  26: uuid-v7,                  ; mailbox_id
+  27: uuid-v7,                  ; opaque envelope_id
+  28: safe-highwater,           ; mailbox K
+  29: positive-uint,            ; exactly K+1
+  30: uuid-v7,                  ; immutable delivery_fact_id
+  31: utc-millis,               ; issued_at
+  32: utc-millis,               ; expires_at
+  33: digest                    ; grant Idempotency-Key digest
+}
+history-recovery-grant-v4 = {
+  1: 4, 2: identity-id, 3: uuid-v7, 4: digest, 5: digest,
+  6: uuid-v7, 7: positive-uint, 8: exact-signed-catalog-head-v2,
+  9: digest, 10: digest, 11: catalog-exhaustive-count, 12: digest,
+  13: uuid-v7, 14: ed25519-public-key, 15: x25519-public-key,
+  16: safe-highwater, 17: digest, 18: positive-uint, 19: digest,
+  20: digest, 21: digest,
+  22: exact-catalog-provider-descriptor-v2,
+  23: exact-catalog-independent-authority-v2,
+  24: digest, 25: digest, 26: uuid-v7, 27: uuid-v7,
+  28: safe-highwater, 29: positive-uint, 30: uuid-v7,
+  31: utc-millis, 32: utc-millis, 33: digest,
+  34: signature,                 ; provider signs exact fields 1..33
+  35: signature,                 ; authority signs the identical fields 1..33
+  36: recipient-history-offer-v2
+}
+exact-history-recovery-grant-v4 = bstr .size (1..1050699)
+
+; Immutable and retained independently of mailbox compaction. It records the
+; committed delivery, not a mutable cursor and not a device-global ACK.
+history-recovery-delivery-fact-v2 = {
+  1: 2,
+  2: uuid-v7,                   ; delivery_fact_id
+  3: uuid-v7,                   ; mailbox_id
+  4: uuid-v7,                   ; envelope_id
+  5: positive-uint,             ; exact K+1
+  6: digest,                    ; exact full grant digest
+  7: digest,                    ; exact offer digest
+  8: uuid-v7,                   ; request_id
+  9: uuid-v7,                   ; candidate device_id
+  10: utc-millis,               ; committed_at
+  11: uuid-v7,                  ; realtime journal event_id
+  12: uuid-v7                   ; outbox record_id
+}
+exact-history-recovery-delivery-fact-v2 = bstr .size (1..366)
+history-recovery-delivery-receipt-v2 = {
+  1: 2,                         ; version, constant Delivery V2
+  2: history-recovery-delivery-fact-v2, ; exact atomically committed fact
+  3: digest,                    ; delivery-fact-domain digest of exact field 2
+  4: utc-millis                 ; equals field-2 committed_at
+}
+
+; Origin-authenticated current and historical completion keys. Epoch is
+; strictly monotonic; rollback_floor_epoch never decreases. A current fetch is
+; HTTPS origin-authenticated with valid TLS, no redirects, and Cache-Control:
+; no-store; its epoch is at least the locally persisted rollback floor. Starting
+; with that exact current descriptor, field 9 is followed through immutable
+; historical GETs addressed by the exact descriptor digest, under the same
+; origin/TLS/no-redirect/no-store rules, until the descriptor named by a receipt
+; is reached. A reachable historical epoch may be below the current floor only
+; if its descriptor was valid at receipt issuance; accepting it never lowers
+; the floor. Field 9 is null only for epoch 1. key_id is never a historical
+; lookup address and a historical readback makes no currentness claim.
+history-recovery-completion-key-descriptor-unsigned-v2 = {
+  1: 2,
+  2: https-authority-origin,     ; one origin anchor for the complete chain
+  3: uuid-v7,                   ; key_id
+  4: ed25519-public-key,
+  5: positive-uint,             ; monotonic descriptor epoch
+  6: positive-uint,             ; monotonic rollback_floor_epoch <= field 5
+  7: utc-millis,                ; issued_at
+  8: utc-millis,                ; expires_at
+  9: digest / null              ; previous descriptor-domain digest/address
+}
+history-recovery-completion-key-descriptor-v2 = {
+  1: 2, 2: https-authority-origin, 3: uuid-v7,
+  4: ed25519-public-key, 5: positive-uint, 6: positive-uint,
+  7: utc-millis, 8: utc-millis, 9: digest / null,
+  10: signature                 ; field-4 key signs exact fields 1..9
+}
+exact-history-recovery-completion-key-descriptor-v2 = bstr .size (1..2271)
+
+; Created and domain-digested before any MLS child certificate/evidence is
+; issued. Field 2 is fresh, nonzero, unpredictable, and unique per completion.
+; Every other field is an already-known immutable identity completion
+; coordinate. This object deliberately has no certificate, evidence, entry,
+; entry root, Completion command/digest, receipt, ACK/complete fact, per-scope
+; presentation/cache bytes, or any digest of those later objects. It is thus a
+; cycle-free parent of child issuance. The digest is intentionally linkable
+; inside this identity-known completion and is not an anonymity claim.
+history-recovery-completion-context-v2 = {
+  1: 2,
+  2: bstr .size 32,             ; fresh candidate context nonce
+  3: uuid-v7,                   ; fresh completion_id; later command field 2
+  4: uuid-v7,                   ; exact Request V4 field-2 request_id
+  5: digest,                    ; request-domain digest of exact signed Request V4
+  6: identity-id,               ; exact Request V4 field 3
+  7: uuid-v7,                   ; exact Request V4 field-4 candidate device_id
+  8: uuid-v7,                   ; exact manifest field-3 catalog_id
+  9: positive-uint,             ; exact manifest field-4 generation
+  10: digest,                   ; exact manifest field-6 signed-head digest
+  11: catalog-exhaustive-count, ; exact manifest field-8 count
+  12: digest                    ; exact Request V4 field-16 manifest digest
+}
+; Maximum: one-byte map header + twelve one-byte keys + 360 value bytes = 373.
+exact-history-recovery-completion-context-v2 = bstr .size (1..373)
+
+; MLS Sequencer V7 owns both of these exact canonical objects and their
+; semantics. History Recovery owns only their bounded byte references and
+; requires the owner validator before accepting an entry. The certificate and
+; evidence carry the exact completion-context digest, never its bytes, and may
+; expose only intentional issuer/public-leaf coordinates. They contain no raw
+; identity, catalog, candidate, request, or completion ID and no individually
+; deterministic digest of any such ID. Evidence carries evidence_issued_at and
+; evidence_expires_at, and its child signature covers exact fields through
+; expires_at; the digest covers the full signed evidence. Owner validation must
+; prove authorization_nbf <= evidence_issued_at < evidence_expires_at <=
+; authorization_exp, contain the window in request/head/grant validity, and
+; require first Completion admission before evidence_expires_at.
+exact-mls-child-certificate-v1 = bstr .size (1..389)
+exact-mls-redacted-completion-evidence-v1 = bstr .size (1..250)
+
+; Each entry is one and only one Catalog index. Fields 3 and 5 validate under
+; the Catalog V2 leaf/proof rules against the command's exact head. Fields 6
+; and 8 validate under MLS Sequencer V7 and must carry the command's exact
+; field-35 context digest, the same intentional issuer/public-leaf coordinates,
+; and no raw/per-ID digests. Entry order is exactly 1..N. Field 7 is the MLS
+; owner-domain digest of the full signed certificate; field 9 is the MLS
+; owner-domain digest of the full child-signed evidence.
+history-recovery-completion-entry-v2 = {
+  1: 2,
+  2: catalog-exhaustive-count,  ; exact one-based Catalog index
+  3: exact-catalog-public-leaf-v2,
+  4: digest,                    ; Catalog leaf-domain digest of field 3
+  5: exact-catalog-proof-v2,
+  6: exact-mls-child-certificate-v1,
+  7: digest,                    ; MLS child-certificate digest of field 6
+  8: exact-mls-redacted-completion-evidence-v1,
+  9: digest                     ; MLS redacted-evidence digest of field 8
+}
+; Maximum = 10 map/key bytes + version 1 + index 3 + encoded public-leaf bstr
+; 222 + leaf digest 34 + encoded proof bstr 405 + encoded child-certificate
+; bstr 392 + certificate digest 34 + encoded evidence bstr 252 + evidence
+; digest 34 = 1387 bytes.
+exact-history-recovery-completion-entry-v2 = bstr .size (1..1387)
+
+; A separate Merkle tree starts with completion-entry-domain digests of exact
+; entry bytes in one-based index order. A single leaf is the root. Otherwise,
+; each bottom-up level hashes left/right with completion-entry-node-domain; an
+; odd final node duplicates itself and consumes no proof sibling. A proof
+; consumes exactly one bottom-up sibling only when the current node has a real
+; partner, then sets count=ceil(count/2), index=ceil(index/2). Missing or surplus
+; siblings are rejected. Count 1 consumes zero; count 1023 needs at most 10.
+history-recovery-completion-entry-proof-v2 = {
+  1: 2,
+  2: uuid-v7,                   ; completion_id
+  3: catalog-exhaustive-count,  ; exact entry count / root width
+  4: catalog-exhaustive-count,  ; one-based index <= field 3
+  5: digest,                    ; exact completion-entry digest
+  6: [0*10 digest]              ; exactly implied bottom-up siblings
+}
+exact-history-recovery-completion-entry-proof-v2 = bstr .size (1..427)
+
+; The completion command is exhaustive. It deliberately repeats exact
+; upstream artifacts so identity home can independently validate every public
+; signature, digest, equality, Catalog proof, child delegation, and child
+; evidence without trusting an MLS server assertion. It cannot validate hidden
+; scope origin currentness, private opening equality, HSM custody, or MLS
+; internal state. Fields 28 and 30 have exactly field-14 elements, and entry
+; indices are consecutive 1..N. Field 34 is the exact pre-issuance context;
+; field 35 is its completion-context-domain digest, and every raw context field
+; equals the corresponding command/upstream coordinate. The candidate signature
+; covers exact fields 1..35, including both exact context bytes and its digest.
+; The pre-context maximum is 3,593,422 bytes: the prior maximum loses 462 bytes
+; for each of the 1023 entries, or 472,626 bytes total. A 373-byte exact context
+; has a three-byte bstr header; its two-byte field key plus the two-byte digest
+; field key and 34-byte encoded digest add 2+376+2+34 = 414. The maximum
+; canonical command is therefore 3,593,836
+; bytes; implementations use that exact body/decoder ceiling, not 65,535 times
+; an entry allowance.
+history-recovery-completion-command-unsigned-v2 = {
+  1: 2,
+  2: uuid-v7,                   ; completion_id
+  3: identity-id,
+  4: uuid-v7,                   ; candidate device_id
+  5: safe-highwater,            ; H
+  6: digest,                    ; head at H
+  7: positive-uint,             ; exactly H+1
+  8: digest,                    ; final Identity Log head at H+1
+  9: uuid-v7,                   ; catalog_id
+  10: positive-uint,            ; generation
+  11: exact-signed-catalog-head-v2,
+  12: digest,                   ; exact signed Catalog-head digest
+  13: digest,                   ; Catalog Merkle root
+  14: catalog-exhaustive-count,
+  15: digest,                   ; exhaustive leaf-set digest
+  16: exact-catalog-preparation-v2,
+  17: digest,                   ; exact preparation digest
+  18: exact-history-recovery-request-v4,
+  19: digest,                   ; exact request digest
+  20: exact-history-recovery-manifest-v2,
+  21: digest,                   ; exact manifest digest
+  22: exact-history-recovery-grant-v4,
+  23: digest,                   ; exact grant digest
+  24: exact-recipient-history-offer-v2,
+  25: digest,                   ; exact offer digest
+  26: exact-history-recovery-delivery-fact-v2,
+  27: digest,                   ; exact immutable delivery-fact digest
+  28: catalog-exhaustive-count, ; exact entry count
+  29: digest,                   ; completion-entry Merkle root
+  30: [1*1023 history-recovery-completion-entry-v2],
+  31: utc-millis,               ; issued_at
+  32: utc-millis,               ; expires_at
+  33: digest,                   ; Completion Idempotency-Key digest
+  34: exact-history-recovery-completion-context-v2,
+  35: digest                    ; completion-context-domain digest of field 34
+}
+history-recovery-completion-command-v2 = {
+  1: 2, 2: uuid-v7, 3: identity-id, 4: uuid-v7,
+  5: safe-highwater, 6: digest, 7: positive-uint, 8: digest,
+  9: uuid-v7, 10: positive-uint,
+  11: exact-signed-catalog-head-v2, 12: digest, 13: digest,
+  14: catalog-exhaustive-count, 15: digest,
+  16: exact-catalog-preparation-v2, 17: digest,
+  18: exact-history-recovery-request-v4, 19: digest,
+  20: exact-history-recovery-manifest-v2, 21: digest,
+  22: exact-history-recovery-grant-v4, 23: digest,
+  24: exact-recipient-history-offer-v2, 25: digest,
+  26: exact-history-recovery-delivery-fact-v2, 27: digest,
+  28: catalog-exhaustive-count, 29: digest,
+  30: [1*1023 history-recovery-completion-entry-v2],
+  31: utc-millis, 32: utc-millis, 33: digest,
+  34: exact-history-recovery-completion-context-v2, 35: digest,
+  36: signature                  ; candidate signs exact fields 1..35
+}
+exact-history-recovery-completion-command-v2 = bstr .size (1..3593836)
+
+; These application facts are deterministically constructed and domain-digested
+; only after the signed Completion command and all immutable request, grant,
+; offer, and delivery facts have validated, but before receipt construction or
+; signing. They cannot contain or hash the receipt/signed receipt and create no
+; dependency back-edge. They are not generic Mailbox ACKs, cursors, envelope
+; mutations, quota, accounting, or request cancellation. Their durable append
+; is in the same final transaction as the receipt and still works after ordinary
+; Mailbox ACK/compaction. `recovery_complete` means exhaustive public completion
+; evidence accepted; it does not imply per-scope cache admission.
+history-recovery-offer-ack-v2 = {
+  1: 2,                         ; version, constant offer-application ACK V2
+  2: uuid-v7,                   ; completion_id = command field 2
+  3: uuid-v7,                   ; request_id = request field 2/context field 4
+  4: uuid-v7,                   ; delivery_fact_id = delivery fact field 2
+  5: digest,                    ; exact immutable delivery-fact digest
+  6: digest,                    ; exact offer digest = command field 25
+  7: digest,                    ; exact completion-context digest = command 35
+  8: utc-millis                 ; application_applied_at, stored once
+}
+exact-history-recovery-offer-ack-v2 = bstr .size (1..235)
+history-recovery-complete-v2 = {
+  1: 2,                         ; version, constant recovery_complete V2
+  2: identity-id,               ; identity = command field 3/context field 6
+  3: uuid-v7,                   ; completion_id = command field 2/context field 3
+  4: uuid-v7,                   ; request_id = request field 2/context field 4
+  5: uuid-v7,                   ; candidate device_id = command 4/context 7
+  6: digest,                    ; exact signed Request V4 digest = command 19
+  7: digest,                    ; exact completion-context digest = command 35
+  8: catalog-exhaustive-count,  ; exact command/context/manifest count
+  9: digest,                    ; exact completion-entry Merkle root = command 29
+  10: utc-millis,               ; completed_at = offer-ack field 8
+  11: 1                         ; exhaustive-public-completion-accepted
+}
+exact-history-recovery-complete-v2 = bstr .size (1..301)
+
+; Final admission ordering is: authenticate and authorize the candidate and
+; reject any immutable explicit revocation; resolve an already committed exact
+; idempotency claim and return it before mutable currentness; reject a committed
+; conflicting claim; then perform mutable head/currentness checks and one final
+; CAS. The transaction appends ACK fact, recovery_complete fact, and receipt,
+; but no Identity Log event. It remains verifiable after mailbox compaction
+; through field 19. Fields 22 and 24 are constructed first; fields 23 and 25
+; are their exact domain digests. Field 26 is the only context reference in the
+; receipt; exact context bytes are never embedded. Fields 27..29 bind the exact
+; signing descriptor key_id, domain digest, and epoch. Receipt accepted_at must
+; be within descriptor validity and first admission must precede every entry's
+; evidence_expires_at.
+history-recovery-completion-receipt-v2 = {
+  1: 2,
+  2: uuid-v7,                   ; completion_id
+  3: identity-id,
+  4: uuid-v7,                   ; candidate device_id
+  5: safe-highwater,            ; H
+  6: positive-uint,             ; H+1
+  7: digest,                    ; final Identity Log head at H+1
+  8: uuid-v7,                   ; catalog_id
+  9: positive-uint,             ; generation
+  10: digest,                   ; signed Catalog-head digest
+  11: catalog-exhaustive-count,
+  12: digest,                   ; exhaustive leaf-set digest
+  13: uuid-v7,                  ; request_id
+  14: digest,                   ; exact request digest
+  15: digest,                   ; exact manifest digest
+  16: digest,                   ; exact grant digest
+  17: digest,                   ; exact offer digest
+  18: uuid-v7,                  ; immutable delivery_fact_id
+  19: digest,                   ; immutable delivery-fact digest
+  20: digest,                   ; completion-entry Merkle root
+  21: catalog-exhaustive-count,
+  22: history-recovery-offer-ack-v2,
+  23: digest,                   ; offer-ack digest
+  24: history-recovery-complete-v2,
+  25: digest,                   ; recovery-complete digest
+  26: digest,                   ; exact completion-context digest
+  27: uuid-v7,                  ; exact signing descriptor key_id
+  28: digest,                   ; exact signing descriptor digest
+  29: positive-uint,            ; exact signing descriptor epoch
+  30: utc-millis,               ; accepted_at = fact timestamps
+  31: 1                         ; accepted
+}
+exact-history-recovery-completion-receipt-v2 = bstr .size (1..1359)
+signed-history-recovery-completion-receipt-v2 = {
+  1: history-recovery-completion-receipt-v2,
+  2: digest,                    ; completion-receipt-domain digest of field 1
+  3: history-recovery-completion-key-descriptor-v2,
+  4: digest,                    ; descriptor digest = receipt field 28
+  5: signature                  ; descriptor field-4 key signs fields 1..4
+}
+exact-signed-history-recovery-completion-receipt-v2 = bstr .size (1..3770)
+
+; Immutable receipt GET readback requires candidate-device bearer
+; authentication. The authenticated identity and device_id MUST equal the
+; stored signed wrapper's receipt fields at paths [1, 3] and [1, 4]; the route
+; completion_id MUST equal path [1, 2]. Current authorization and immutable
+; explicit revocation are checked before readback. Ordinary identity or head
+; advance does not invalidate this immutable receipt.
+; A scope-origin presentation contains the identity-signed receipt, exactly its
+; own exhaustive entry, and that entry's distinct completion-tree proof. It
+; contains no other entry and conveys no authority about hidden scope state.
+; It exposes the linkable context digest through the receipt/certificate/
+; evidence equality but never exact context bytes to this or any other scope.
+; Field 3 MUST equal SHA-256(presentation-domain || exact deterministic-canonical
+; field-2 signed-history-recovery-completion-receipt-v2 bytes). This
+; is a context-specific signed-receipt binding, not a self-digest of the
+; containing presentation.
+history-recovery-completion-presentation-v2 = {
+  1: 2,
+  2: signed-history-recovery-completion-receipt-v2,
+  3: digest,                    ; exact context-specific field-2 binding above
+  4: history-recovery-completion-entry-v2,
+  5: digest,                    ; exact entry digest
+  6: history-recovery-completion-entry-proof-v2
+}
+; Maximum = map/header/keys/version 8 + signed receipt 3770 + two encoded
+; digests 68 + entry 1387 + proof 427 = 5660 bytes.
+exact-history-recovery-completion-presentation-v2 = bstr .size (1..5660)

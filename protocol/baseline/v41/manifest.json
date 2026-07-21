@@ -1,0 +1,19 @@
+{
+  "version": 41,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/history-recovery/v2/history-recovery-v2.cddl": "sha256:eaba2f39b81173913fcb776e27a76702ee2361c4a93e147510e7ac6a91433dd0",
+    "protocol/cddl/key-package/v3/key-package-v3.cddl": "sha256:4eada126842afec7eda421a5b75fafc3e870af521c06963a504bf3824f877106",
+    "protocol/cddl/mls-sequencer/v6/mls-sequencer-v6.cddl": "sha256:e6dbf29d618a42397bdef3daa02d60eb3762987eff63a915c69b589f66d1f88f",
+    "protocol/cddl/recovery-scope-catalog/v1/recovery-scope-catalog-v1.cddl": "sha256:17a7e5caeba10df8c7d047449187734909af7e51c2620f7a37d26c8f647550f0",
+    "protocol/openapi/history-recovery/v2/openapi.yaml": "sha256:f5c532e266fe33ae0229b7d1c69320968f33643c2c227e999e18ee9736a7df80",
+    "protocol/openapi/key-package/v3/openapi.yaml": "sha256:5b776fc84edceca22ec037bd9f8f91123d877fb4d6c56759082841130d8372f2",
+    "protocol/openapi/mls-sequencer/v6/openapi.yaml": "sha256:befc33327c8641f3341a00fea912818252560d2fe2ee98d25ce250623e32f163",
+    "protocol/openapi/recovery-scope-catalog/v1/openapi.yaml": "sha256:a539d4b55156a4869ffe916fdcce9855e97bc0a925f0591bc9ad11f4f187e5c3",
+    "protocol/test-vectors/history-recovery/v2/history-recovery-v2.json": "sha256:e1bb7420f40b628749a7e5a26cf425b59e777363e9618d20705dae04a40de43f",
+    "protocol/test-vectors/key-package/v3/key-package-v3.json": "sha256:22f45f2cc4370741611fab99f0ea42d131f30e985ab0c022c7c8db9fa08d9e24",
+    "protocol/test-vectors/mls-sequencer/v6/mls-sequencer-v6.json": "sha256:0e29e621091c03f1b1027ef71326aca79bc6cfa27c98fe0350b8b56e37503fe1",
+    "protocol/test-vectors/recovery-scope-catalog/v1/recovery-scope-catalog-v1.json": "sha256:db364a44972152406352306ea0efbd818a9639894b44e590a8ae21bcf7408513"
+  }
+}

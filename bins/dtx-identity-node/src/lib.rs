@@ -38,6 +38,7 @@ use dtx_identity_log::{
     MAX_IDENTITY_LOG_PAGE_EVENTS,
 };
 use dtx_identity_persistence::{
+    CatalogPreparationCommand, CatalogProviderResponseCommand, CatalogStatus, CatalogUploadCommand,
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
     DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability, DeviceEnrollmentChallenge,
     DeviceEnrollmentChallengeOutcome, DeviceEnrollmentChallengeState,
@@ -48,7 +49,9 @@ use dtx_identity_persistence::{
     IdentityLogPageReadOutcome, IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
     KeyPackageClaimCommand, KeyPackageClaimOutcome, KeyPackagePublishCommand,
     KeyPackagePublishOutcome, KeyPackageRepository, MAX_KEY_PACKAGE_PUBLISH_BYTES,
-    lock_and_load_active_snapshot,
+    MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES, MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES,
+    RecoveryResponseCapability, RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository,
+    RecoveryScopeCatalogStatusOutcome, lock_and_load_active_snapshot,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -88,6 +91,17 @@ pub const MLS_V5_RECOVERY_AUTHORIZATION_PATH_TEMPLATE: &str =
 /// Active-device route for one exact root-signed revocation of another device.
 pub const DEVICE_REVOKE_PATH_TEMPLATE: &str =
     "/v1/identities/{identity_id}/devices/{device_id}/revoke";
+/// Active-device publication route for one immutable encrypted catalog generation.
+pub const RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE: &str = "/v1/recovery-scope-catalogs/{generation}";
+/// Candidate route that freezes the current catalog before ordinary enrollment.
+pub const RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH: &str =
+    "/v2/devices/enroll/catalog-preparations";
+/// Candidate capability route for one redacted preparation status.
+pub const RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE: &str =
+    "/v2/devices/enroll/catalog-preparations/{request_id}";
+/// Active-provider route for the preparation's one immutable response.
+pub const RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_PATH_TEMPLATE: &str =
+    "/v2/devices/enroll/catalog-preparations/{request_id}/provider-response";
 pub const CONTACT_INVITES_PATH: &str = "/v1/contact-invites";
 pub const CONTACT_INVITE_PATH: &str = "/v1/contact-invites/{invite_id}";
 pub const CONTACT_REQUESTS_PATH: &str = "/v1/contact-requests";
@@ -135,6 +149,21 @@ pub const KEY_PACKAGE_FEDERATED_CLAIM_CONTENT_TYPE: &str =
 /// Exact original publish envelope returned by a one-time claim.
 pub const KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.key-package-claim-receipt.v1+cbor";
+/// Exact encrypted catalog upload media type.
+pub const RECOVERY_SCOPE_CATALOG_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.recovery-scope-catalog.v1+cbor";
+/// Exact signed catalog-head response media type.
+pub const RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.recovery-scope-catalog-head.v1+cbor";
+/// Exact candidate preparation media type.
+pub const RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.recovery-scope-catalog-preparation.v1+cbor";
+/// Exact active-provider response media type.
+pub const RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.recovery-scope-catalog-provider-response.v1+cbor";
+/// Exact redacted preparation status media type.
+pub const RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor";
 pub const CONTACT_INVITE_CONTENT_TYPE: &str = "application/vnd.dirextalk.contact-invite.v1+cbor";
 pub const CONTACT_INVITE_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.contact-invite-receipt.v1+cbor";
@@ -147,6 +176,8 @@ pub const CONTACT_INVITE_SECRET_HEADER: &str = "DTX-Contact-Invite-Secret";
 pub const CONTACT_RECEIPT_SECRET_HEADER: &str = "DTX-Contact-Receipt-Secret";
 /// Header that carries a candidate-owned status/cancellation capability.
 pub const DEVICE_ENROLLMENT_CAPABILITY_HEADER: &str = "DTX-Enrollment-Capability";
+/// Candidate-held capability for reading the independent recovery response.
+pub const RECOVERY_RESPONSE_CAPABILITY_HEADER: &str = "DTX-Recovery-Response-Capability";
 /// Canonical remote identity origin covered by the V2 claim proof.
 pub const IDENTITY_ORIGIN_HEADER: &str = "DTX-Identity-Origin";
 /// Base64url canonical-CBOR V2 remote device proof.
@@ -187,6 +218,12 @@ const HTTP_KEY_PACKAGE_PUBLISH_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.key-package-http-publish-idempotency-key.v1\0";
 const HTTP_KEY_PACKAGE_CLAIM_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.key-package-http-claim-idempotency-key.v1\0";
+const HTTP_RECOVERY_CATALOG_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.recovery-scope-catalog-http-publish-idempotency-key.v1\0";
+const HTTP_RECOVERY_PREPARATION_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.recovery-scope-catalog-http-preparation-idempotency-key.v1\0";
+const HTTP_RECOVERY_PROVIDER_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.recovery-scope-catalog-http-provider-idempotency-key.v1\0";
 const DEFAULT_DEVICE_SESSION_AUDIENCE: &str = "http://127.0.0.1";
 
 /// State for bootstrap, device-session, and QR device-enrollment HTTP boundaries.
@@ -197,6 +234,7 @@ pub struct IdentityBootstrapState {
     device_sessions: DeviceSessionRepository,
     device_enrollments: DeviceEnrollmentRepository,
     key_packages: KeyPackageRepository,
+    recovery_catalogs: RecoveryScopeCatalogRepository,
     contacts: ContactRepository,
     federated_identity: FederatedIdentityVerifier,
     public_origin: Arc<str>,
@@ -241,6 +279,7 @@ impl IdentityBootstrapState {
             device_sessions: DeviceSessionRepository,
             device_enrollments: DeviceEnrollmentRepository,
             key_packages: KeyPackageRepository::new(),
+            recovery_catalogs: RecoveryScopeCatalogRepository,
             contacts: ContactRepository,
             federated_identity,
             public_origin: device_session_audience.clone(),
@@ -321,6 +360,22 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
         )
         .route(DEVICE_ENROLLMENT_PATH, post(approve_device_enrollment))
         .route(DEVICE_REVOKE_PATH_TEMPLATE, post(revoke_device))
+        .route(
+            RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE,
+            put(publish_recovery_scope_catalog),
+        )
+        .route(
+            RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH,
+            post(prepare_recovery_scope_catalog),
+        )
+        .route(
+            RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE,
+            get(get_recovery_scope_catalog_preparation),
+        )
+        .route(
+            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_PATH_TEMPLATE,
+            put(put_recovery_scope_catalog_provider_response),
+        )
         .route(KEY_PACKAGE_PUBLISH_PATH_TEMPLATE, put(publish_key_package))
         .route(KEY_PACKAGE_CLAIM_PATH, post(claim_key_package))
         .route(
@@ -787,6 +842,69 @@ async fn revoke_device(
     {
         Ok(success) => device_revoke_success_response(success, request_id),
         Err(failure) => device_revoke_failure_response(failure, request_id),
+    }
+}
+
+async fn publish_recovery_scope_catalog(
+    State(state): State<IdentityBootstrapState>,
+    Path(generation): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .publish_recovery_scope_catalog(&generation, &parts.headers, body)
+        .await
+    {
+        Ok(success) => recovery_catalog_head_response(success, request_id),
+        Err(failure) => recovery_catalog_failure_response(failure, request_id),
+    }
+}
+
+async fn prepare_recovery_scope_catalog(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .prepare_recovery_scope_catalog(&parts.headers, body)
+        .await
+    {
+        Ok(success) => recovery_catalog_status_response(&success, request_id),
+        Err(failure) => recovery_catalog_failure_response(failure, request_id),
+    }
+}
+
+async fn get_recovery_scope_catalog_preparation(
+    State(state): State<IdentityBootstrapState>,
+    Path(route_request_id): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .get_recovery_scope_catalog_preparation(&route_request_id, &parts.headers, body)
+        .await
+    {
+        Ok(success) => recovery_catalog_status_response(&success, request_id),
+        Err(failure) => recovery_catalog_failure_response(failure, request_id),
+    }
+}
+
+async fn put_recovery_scope_catalog_provider_response(
+    State(state): State<IdentityBootstrapState>,
+    Path(route_request_id): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .put_recovery_scope_catalog_provider_response(&route_request_id, &parts.headers, body)
+        .await
+    {
+        Ok(success) => recovery_catalog_status_response(&success, request_id),
+        Err(failure) => recovery_catalog_failure_response(failure, request_id),
     }
 }
 
@@ -1325,6 +1443,181 @@ impl IdentityBootstrapState {
             }),
             IdentityAppendOutcome::Forked { .. } => Err(DeviceRevokeFailure::IdentityConflict),
         }
+    }
+
+    async fn publish_recovery_scope_catalog(
+        &self,
+        route_generation: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<RecoveryCatalogHeadSuccess, RecoveryCatalogFailure> {
+        if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+            || headers.contains_key(RECOVERY_RESPONSE_CAPABILITY_HEADER)
+        {
+            return Err(RecoveryCatalogFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)
+            .map_err(|_| RecoveryCatalogFailure::AuthenticationRejected)?;
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_RECOVERY_CATALOG_IDEMPOTENCY_KEY_HASH_DOMAIN)
+                .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let generation = parse_positive_safe_uint_path(route_generation)?;
+        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES)
+            .await
+            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let command = CatalogUploadCommand::parse(idempotency_key_hash, generation, &bytes)
+            .map_err(|error| map_recovery_catalog_publish_error(&error))?;
+        let now = self
+            .committed_at()
+            .map_err(|()| RecoveryCatalogFailure::TemporarilyUnavailable)?;
+        let outcome = self
+            .recovery_catalogs
+            .publish(&self.store, &command, &credential, now)
+            .await
+            .map_err(|error| map_recovery_catalog_publish_error(&error))?;
+        Ok(RecoveryCatalogHeadSuccess {
+            status: if outcome.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            outcome,
+        })
+    }
+
+    async fn prepare_recovery_scope_catalog(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(header::AUTHORIZATION)
+        {
+            return Err(RecoveryCatalogFailure::InvalidRequest);
+        }
+        let idempotency_key_hash = idempotency_key_hash(
+            headers,
+            HTTP_RECOVERY_PREPARATION_IDEMPOTENCY_KEY_HASH_DOMAIN,
+        )
+        .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let enrollment_capability = parse_recovery_enrollment_capability(headers)?;
+        let response_capability = parse_recovery_response_capability(headers)?;
+        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES)
+            .await
+            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let command = CatalogPreparationCommand::parse(
+            idempotency_key_hash,
+            bytes.to_vec(),
+            enrollment_capability,
+            &response_capability,
+        )
+        .map_err(|error| map_recovery_catalog_prepare_error(&error))?;
+        let now = self
+            .committed_at()
+            .map_err(|()| RecoveryCatalogFailure::TemporarilyUnavailable)?;
+        let (created, outcome) = self
+            .recovery_catalogs
+            .prepare(&self.store, &command, now)
+            .await
+            .map_err(|error| map_recovery_catalog_prepare_error(&error))?;
+        Ok(RecoveryCatalogStatusSuccess {
+            status: if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            outcome,
+        })
+    }
+
+    async fn get_recovery_scope_catalog_preparation(
+        &self,
+        route_request_id: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        if headers.contains_key(header::CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(header::AUTHORIZATION)
+            || headers.contains_key(IDEMPOTENCY_KEY_HEADER)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+        {
+            return Err(RecoveryCatalogFailure::CapabilityRejected);
+        }
+        let body = to_bytes(body, 1)
+            .await
+            .map_err(|_| RecoveryCatalogFailure::CapabilityRejected)?;
+        if !body.is_empty() {
+            return Err(RecoveryCatalogFailure::CapabilityRejected);
+        }
+        let request_id = route_request_id
+            .parse::<DeviceEnrollmentChallengeId>()
+            .map_err(|_| RecoveryCatalogFailure::CapabilityRejected)?;
+        let response_capability = parse_recovery_response_capability(headers)?;
+        let now = self
+            .committed_at()
+            .map_err(|()| RecoveryCatalogFailure::TemporarilyUnavailable)?;
+        let outcome = self
+            .recovery_catalogs
+            .status(&self.store, request_id, &response_capability, now)
+            .await
+            .map_err(|error| map_recovery_catalog_status_error(&error))?;
+        let status = match outcome.status {
+            CatalogStatus::Pending | CatalogStatus::ResponseAvailable => StatusCode::OK,
+            CatalogStatus::Expired => StatusCode::GONE,
+            CatalogStatus::Invalidated(_) => StatusCode::PRECONDITION_FAILED,
+        };
+        Ok(RecoveryCatalogStatusSuccess { status, outcome })
+    }
+
+    async fn put_recovery_scope_catalog_provider_response(
+        &self,
+        route_request_id: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        if !has_exact_content_type(
+            headers,
+            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        ) || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+            || headers.contains_key(RECOVERY_RESPONSE_CAPABILITY_HEADER)
+        {
+            return Err(RecoveryCatalogFailure::InvalidRequest);
+        }
+        let request_id = route_request_id
+            .parse::<DeviceEnrollmentChallengeId>()
+            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let credential = parse_device_session_authorization(headers)
+            .map_err(|_| RecoveryCatalogFailure::AuthenticationRejected)?;
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_RECOVERY_PROVIDER_IDEMPOTENCY_KEY_HASH_DOMAIN)
+                .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES)
+            .await
+            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let command =
+            CatalogProviderResponseCommand::parse(idempotency_key_hash, request_id, bytes.to_vec())
+                .map_err(|error| map_recovery_catalog_provider_error(&error))?;
+        let now = self
+            .committed_at()
+            .map_err(|()| RecoveryCatalogFailure::TemporarilyUnavailable)?;
+        let outcome = self
+            .recovery_catalogs
+            .put_provider_response(&self.store, &command, &credential, now)
+            .await
+            .map_err(|error| map_recovery_catalog_provider_error(&error))?;
+        Ok(RecoveryCatalogStatusSuccess {
+            status: StatusCode::OK,
+            outcome,
+        })
     }
 
     async fn publish_key_package(
@@ -1924,6 +2217,57 @@ fn parse_canonical_safe_uint(value: &str) -> Result<u64, IdentityLogPageFailure>
     Ok(value)
 }
 
+fn parse_positive_safe_uint_path(value: &str) -> Result<SafeUint, RecoveryCatalogFailure> {
+    let value =
+        parse_canonical_safe_uint(value).map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+    if value == 0 {
+        return Err(RecoveryCatalogFailure::InvalidRequest);
+    }
+    SafeUint::new(value).map_err(|_| RecoveryCatalogFailure::InvalidRequest)
+}
+
+fn parse_recovery_enrollment_capability(
+    headers: &HeaderMap,
+) -> Result<DeviceEnrollmentCapability, RecoveryCatalogFailure> {
+    DeviceEnrollmentCapability::new(parse_recovery_capability_header(
+        headers,
+        DEVICE_ENROLLMENT_CAPABILITY_HEADER,
+    )?)
+    .map_err(|_| RecoveryCatalogFailure::CapabilityRejected)
+}
+
+fn parse_recovery_response_capability(
+    headers: &HeaderMap,
+) -> Result<RecoveryResponseCapability, RecoveryCatalogFailure> {
+    RecoveryResponseCapability::new(parse_recovery_capability_header(
+        headers,
+        RECOVERY_RESPONSE_CAPABILITY_HEADER,
+    )?)
+    .map_err(|_| RecoveryCatalogFailure::CapabilityRejected)
+}
+
+fn parse_recovery_capability_header(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<[u8; 32], RecoveryCatalogFailure> {
+    let mut values = headers.get_all(name).iter();
+    let value = values
+        .next()
+        .ok_or(RecoveryCatalogFailure::CapabilityRejected)?;
+    if values.next().is_some() {
+        return Err(RecoveryCatalogFailure::CapabilityRejected);
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| RecoveryCatalogFailure::CapabilityRejected)?;
+    let bytes =
+        decode_base64url_32(value).map_err(|_| RecoveryCatalogFailure::CapabilityRejected)?;
+    if Base64UrlUnpadded::encode_string(&bytes) != value {
+        return Err(RecoveryCatalogFailure::CapabilityRejected);
+    }
+    Ok(bytes)
+}
+
 const fn is_base64url_byte(value: u8) -> bool {
     value.is_ascii_uppercase()
         || value.is_ascii_lowercase()
@@ -1968,6 +2312,17 @@ fn map_persistence_error(error: &IdentityPersistenceError) -> BootstrapFailure {
         | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
         | IdentityPersistenceError::KeyPackageUnavailable
         | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::RecoveryExactCborInvalid
+        | IdentityPersistenceError::RecoveryCatalogConflict
+        | IdentityPersistenceError::RecoveryCatalogExpired
+        | IdentityPersistenceError::RecoveryPreparationConflict
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected
+        | IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::RecoveryCatalogHeadChanged
+        | IdentityPersistenceError::RecoveryAuthorityChanged
+        | IdentityPersistenceError::RecoveryCandidateKeyChanged
+        | IdentityPersistenceError::RecoveryPreparationInvalidated
         | IdentityPersistenceError::CorruptData(_) => BootstrapFailure::TemporarilyUnavailable,
     }
 }
@@ -1999,6 +2354,17 @@ fn map_initial_device_persistence_error(error: &IdentityPersistenceError) -> Ini
         | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
         | IdentityPersistenceError::KeyPackageUnavailable
         | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::RecoveryExactCborInvalid
+        | IdentityPersistenceError::RecoveryCatalogConflict
+        | IdentityPersistenceError::RecoveryCatalogExpired
+        | IdentityPersistenceError::RecoveryPreparationConflict
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected
+        | IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::RecoveryCatalogHeadChanged
+        | IdentityPersistenceError::RecoveryAuthorityChanged
+        | IdentityPersistenceError::RecoveryCandidateKeyChanged
+        | IdentityPersistenceError::RecoveryPreparationInvalidated
         | IdentityPersistenceError::CorruptData(_) => InitialDeviceFailure::TemporarilyUnavailable,
     }
 }
@@ -2038,7 +2404,243 @@ fn map_device_session_persistence_error(error: &IdentityPersistenceError) -> Dev
         | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
         | IdentityPersistenceError::KeyPackageUnavailable
         | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::RecoveryExactCborInvalid
+        | IdentityPersistenceError::RecoveryCatalogConflict
+        | IdentityPersistenceError::RecoveryCatalogExpired
+        | IdentityPersistenceError::RecoveryPreparationConflict
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected
+        | IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::RecoveryCatalogHeadChanged
+        | IdentityPersistenceError::RecoveryAuthorityChanged
+        | IdentityPersistenceError::RecoveryCandidateKeyChanged
+        | IdentityPersistenceError::RecoveryPreparationInvalidated
         | IdentityPersistenceError::CorruptData(_) => DeviceSessionFailure::TemporarilyUnavailable,
+    }
+}
+
+fn map_recovery_catalog_publish_error(error: &IdentityPersistenceError) -> RecoveryCatalogFailure {
+    match error {
+        IdentityPersistenceError::InvalidCommand(_) | IdentityPersistenceError::IdentityLog(_) => {
+            RecoveryCatalogFailure::InvalidRequest
+        }
+        IdentityPersistenceError::RecoveryExactCborInvalid => {
+            RecoveryCatalogFailure::ExactCborInvalid
+        }
+        IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::IdentityInactive => {
+            RecoveryCatalogFailure::AuthenticationRejected
+        }
+        IdentityPersistenceError::RecoveryCatalogExpired => RecoveryCatalogFailure::CatalogExpired,
+        IdentityPersistenceError::RecoveryCatalogConflict => {
+            RecoveryCatalogFailure::CatalogConflict
+        }
+        IdentityPersistenceError::HeadConflict { .. }
+        | IdentityPersistenceError::GenesisConflict => RecoveryCatalogFailure::IdentityHeadChanged,
+        IdentityPersistenceError::IdempotencyConflict => {
+            RecoveryCatalogFailure::IdempotencyConflict
+        }
+        IdentityPersistenceError::Database(_)
+        | IdentityPersistenceError::UnsafeRuntimeRole
+        | IdentityPersistenceError::RuntimeRoleUnauthorized
+        | IdentityPersistenceError::RuntimeRoleOverprivileged
+        | IdentityPersistenceError::TenantContextLeak
+        | IdentityPersistenceError::IncompleteCommand
+        | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
+        | IdentityPersistenceError::DeviceSessionChallengeExpired
+        | IdentityPersistenceError::DeviceSessionChallengeConsumed
+        | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+        | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
+        | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
+        | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
+        | IdentityPersistenceError::KeyPackageUnavailable
+        | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::RecoveryPreparationConflict
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected
+        | IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::RecoveryCatalogHeadChanged
+        | IdentityPersistenceError::RecoveryAuthorityChanged
+        | IdentityPersistenceError::RecoveryCandidateKeyChanged
+        | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::CorruptData(_) => {
+            RecoveryCatalogFailure::TemporarilyUnavailable
+        }
+    }
+}
+
+fn map_recovery_catalog_prepare_error(error: &IdentityPersistenceError) -> RecoveryCatalogFailure {
+    match error {
+        IdentityPersistenceError::InvalidCommand(_) | IdentityPersistenceError::IdentityLog(_) => {
+            RecoveryCatalogFailure::InvalidRequest
+        }
+        IdentityPersistenceError::RecoveryExactCborInvalid => {
+            RecoveryCatalogFailure::ExactCborInvalid
+        }
+        IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected => {
+            RecoveryCatalogFailure::CapabilityRejected
+        }
+        IdentityPersistenceError::DeviceAuthenticationRejected => {
+            RecoveryCatalogFailure::AuthenticationRejected
+        }
+        IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::DeviceEnrollmentChallengeExpired => {
+            RecoveryCatalogFailure::PreparationExpired
+        }
+        IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
+        | IdentityPersistenceError::DeviceEnrollmentChallengeApproved => {
+            RecoveryCatalogFailure::PreparationRevoked
+        }
+        IdentityPersistenceError::RecoveryCatalogExpired => RecoveryCatalogFailure::CatalogExpired,
+        IdentityPersistenceError::RecoveryPreparationInvalidated => {
+            RecoveryCatalogFailure::PreparationInvalidated
+        }
+        IdentityPersistenceError::RecoveryCatalogConflict => {
+            RecoveryCatalogFailure::CatalogConflict
+        }
+        IdentityPersistenceError::RecoveryPreparationConflict => {
+            RecoveryCatalogFailure::PreparationConflict
+        }
+        IdentityPersistenceError::HeadConflict { .. }
+        | IdentityPersistenceError::GenesisConflict
+        | IdentityPersistenceError::IdentityInactive => RecoveryCatalogFailure::IdentityHeadChanged,
+        IdentityPersistenceError::RecoveryCatalogHeadChanged => {
+            RecoveryCatalogFailure::CatalogHeadChanged
+        }
+        IdentityPersistenceError::RecoveryAuthorityChanged => {
+            RecoveryCatalogFailure::AuthorityChanged
+        }
+        IdentityPersistenceError::RecoveryCandidateKeyChanged => {
+            RecoveryCatalogFailure::CandidateKeyChanged
+        }
+        IdentityPersistenceError::IdempotencyConflict => {
+            RecoveryCatalogFailure::IdempotencyConflict
+        }
+        IdentityPersistenceError::Database(_)
+        | IdentityPersistenceError::UnsafeRuntimeRole
+        | IdentityPersistenceError::RuntimeRoleUnauthorized
+        | IdentityPersistenceError::RuntimeRoleOverprivileged
+        | IdentityPersistenceError::TenantContextLeak
+        | IdentityPersistenceError::IncompleteCommand
+        | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
+        | IdentityPersistenceError::DeviceSessionChallengeExpired
+        | IdentityPersistenceError::DeviceSessionChallengeConsumed
+        | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::KeyPackageUnavailable
+        | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::CorruptData(_) => {
+            RecoveryCatalogFailure::TemporarilyUnavailable
+        }
+    }
+}
+
+fn map_recovery_catalog_status_error(error: &IdentityPersistenceError) -> RecoveryCatalogFailure {
+    match error {
+        IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected => {
+            RecoveryCatalogFailure::CapabilityRejected
+        }
+        IdentityPersistenceError::Database(_)
+        | IdentityPersistenceError::UnsafeRuntimeRole
+        | IdentityPersistenceError::RuntimeRoleUnauthorized
+        | IdentityPersistenceError::RuntimeRoleOverprivileged
+        | IdentityPersistenceError::TenantContextLeak
+        | IdentityPersistenceError::InvalidCommand(_)
+        | IdentityPersistenceError::IdentityLog(_)
+        | IdentityPersistenceError::IdempotencyConflict
+        | IdentityPersistenceError::IncompleteCommand
+        | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::HeadConflict { .. }
+        | IdentityPersistenceError::GenesisConflict
+        | IdentityPersistenceError::IdentityInactive
+        | IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
+        | IdentityPersistenceError::DeviceSessionChallengeExpired
+        | IdentityPersistenceError::DeviceSessionChallengeConsumed
+        | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
+        | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
+        | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
+        | IdentityPersistenceError::KeyPackageUnavailable
+        | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::RecoveryExactCborInvalid
+        | IdentityPersistenceError::RecoveryCatalogConflict
+        | IdentityPersistenceError::RecoveryCatalogExpired
+        | IdentityPersistenceError::RecoveryPreparationConflict
+        | IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::RecoveryCatalogHeadChanged
+        | IdentityPersistenceError::RecoveryAuthorityChanged
+        | IdentityPersistenceError::RecoveryCandidateKeyChanged
+        | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::CorruptData(_) => {
+            RecoveryCatalogFailure::TemporarilyUnavailable
+        }
+    }
+}
+
+fn map_recovery_catalog_provider_error(error: &IdentityPersistenceError) -> RecoveryCatalogFailure {
+    match error {
+        IdentityPersistenceError::InvalidCommand(_) | IdentityPersistenceError::IdentityLog(_) => {
+            RecoveryCatalogFailure::InvalidRequest
+        }
+        IdentityPersistenceError::RecoveryExactCborInvalid => {
+            RecoveryCatalogFailure::ExactCborInvalid
+        }
+        IdentityPersistenceError::DeviceAuthenticationRejected
+        | IdentityPersistenceError::IdentityInactive => {
+            RecoveryCatalogFailure::AuthenticationRejected
+        }
+        IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::DeviceEnrollmentChallengeExpired => {
+            RecoveryCatalogFailure::PreparationExpired
+        }
+        IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled => {
+            RecoveryCatalogFailure::PreparationRevoked
+        }
+        IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected
+        | IdentityPersistenceError::DeviceEnrollmentCapabilityRejected
+        | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
+        | IdentityPersistenceError::HeadConflict { .. }
+        | IdentityPersistenceError::GenesisConflict
+        | IdentityPersistenceError::RecoveryCatalogExpired
+        | IdentityPersistenceError::RecoveryCatalogHeadChanged
+        | IdentityPersistenceError::RecoveryAuthorityChanged
+        | IdentityPersistenceError::RecoveryCandidateKeyChanged => {
+            RecoveryCatalogFailure::PreparationInvalidated
+        }
+        IdentityPersistenceError::RecoveryCatalogConflict => {
+            RecoveryCatalogFailure::CatalogConflict
+        }
+        IdentityPersistenceError::RecoveryPreparationConflict => {
+            RecoveryCatalogFailure::PreparationConflict
+        }
+        IdentityPersistenceError::IdempotencyConflict => {
+            RecoveryCatalogFailure::IdempotencyConflict
+        }
+        IdentityPersistenceError::Database(_)
+        | IdentityPersistenceError::UnsafeRuntimeRole
+        | IdentityPersistenceError::RuntimeRoleUnauthorized
+        | IdentityPersistenceError::RuntimeRoleOverprivileged
+        | IdentityPersistenceError::TenantContextLeak
+        | IdentityPersistenceError::IncompleteCommand
+        | IdentityPersistenceError::ReceiptIntegrity
+        | IdentityPersistenceError::CurrentSessionDeviceRevokeForbidden
+        | IdentityPersistenceError::DeviceSessionChallengeExpired
+        | IdentityPersistenceError::DeviceSessionChallengeConsumed
+        | IdentityPersistenceError::DeviceSessionChallengeRateLimited
+        | IdentityPersistenceError::KeyPackageUnavailable
+        | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::CorruptData(_) => {
+            RecoveryCatalogFailure::TemporarilyUnavailable
+        }
     }
 }
 
@@ -2083,6 +2685,17 @@ fn map_device_enrollment_persistence_error(
         | IdentityPersistenceError::DeviceSessionChallengeRateLimited
         | IdentityPersistenceError::KeyPackageUnavailable
         | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::RecoveryExactCborInvalid
+        | IdentityPersistenceError::RecoveryCatalogConflict
+        | IdentityPersistenceError::RecoveryCatalogExpired
+        | IdentityPersistenceError::RecoveryPreparationConflict
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected
+        | IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::RecoveryCatalogHeadChanged
+        | IdentityPersistenceError::RecoveryAuthorityChanged
+        | IdentityPersistenceError::RecoveryCandidateKeyChanged
+        | IdentityPersistenceError::RecoveryPreparationInvalidated
         | IdentityPersistenceError::CorruptData(_) => {
             DeviceEnrollmentFailure::TemporarilyUnavailable
         }
@@ -2118,6 +2731,17 @@ fn map_device_revoke_persistence_error(error: &IdentityPersistenceError) -> Devi
         | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
         | IdentityPersistenceError::KeyPackageUnavailable
         | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::RecoveryExactCborInvalid
+        | IdentityPersistenceError::RecoveryCatalogConflict
+        | IdentityPersistenceError::RecoveryCatalogExpired
+        | IdentityPersistenceError::RecoveryPreparationConflict
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected
+        | IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::RecoveryCatalogHeadChanged
+        | IdentityPersistenceError::RecoveryAuthorityChanged
+        | IdentityPersistenceError::RecoveryCandidateKeyChanged
+        | IdentityPersistenceError::RecoveryPreparationInvalidated
         | IdentityPersistenceError::CorruptData(_) => DeviceRevokeFailure::TemporarilyUnavailable,
     }
 }
@@ -2149,6 +2773,17 @@ fn map_key_package_persistence_error(error: &IdentityPersistenceError) -> KeyPac
         | IdentityPersistenceError::DeviceEnrollmentChallengeExpired
         | IdentityPersistenceError::DeviceEnrollmentChallengeCancelled
         | IdentityPersistenceError::DeviceEnrollmentChallengeApproved
+        | IdentityPersistenceError::RecoveryExactCborInvalid
+        | IdentityPersistenceError::RecoveryCatalogConflict
+        | IdentityPersistenceError::RecoveryCatalogExpired
+        | IdentityPersistenceError::RecoveryPreparationConflict
+        | IdentityPersistenceError::RecoveryResponseCapabilityRejected
+        | IdentityPersistenceError::RecoveryPreparationExpired
+        | IdentityPersistenceError::RecoveryPreparationRevoked
+        | IdentityPersistenceError::RecoveryCatalogHeadChanged
+        | IdentityPersistenceError::RecoveryAuthorityChanged
+        | IdentityPersistenceError::RecoveryCandidateKeyChanged
+        | IdentityPersistenceError::RecoveryPreparationInvalidated
         | IdentityPersistenceError::CorruptData(_) => KeyPackageFailure::TemporarilyUnavailable,
     }
 }
@@ -2952,6 +3587,36 @@ struct KeyPackageClaimSuccess {
     exact_publish_bytes: Vec<u8>,
 }
 
+struct RecoveryCatalogHeadSuccess {
+    status: StatusCode,
+    outcome: RecoveryScopeCatalogOutcome,
+}
+
+struct RecoveryCatalogStatusSuccess {
+    status: StatusCode,
+    outcome: RecoveryScopeCatalogStatusOutcome,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RecoveryCatalogFailure {
+    InvalidRequest,
+    ExactCborInvalid,
+    CapabilityRejected,
+    AuthenticationRejected,
+    PreparationExpired,
+    PreparationRevoked,
+    CatalogExpired,
+    PreparationInvalidated,
+    CatalogConflict,
+    PreparationConflict,
+    IdentityHeadChanged,
+    CatalogHeadChanged,
+    AuthorityChanged,
+    CandidateKeyChanged,
+    IdempotencyConflict,
+    TemporarilyUnavailable,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum DeviceEnrollmentFailure {
     InvalidRequest,
@@ -3111,6 +3776,42 @@ enum KeyPackageErrorCode {
     Unavailable,
     #[serde(rename = "KEY_PACKAGE_CONFLICT")]
     Conflict,
+    #[serde(rename = "IDEMPOTENCY_CONFLICT")]
+    IdempotencyConflict,
+    #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, Serialize)]
+enum RecoveryCatalogErrorCode {
+    #[serde(rename = "RECOVERY_CATALOG_INVALID")]
+    InvalidRequest,
+    #[serde(rename = "EXACT_CBOR_INVALID")]
+    ExactCborInvalid,
+    #[serde(rename = "RECOVERY_RESPONSE_CAPABILITY_REJECTED")]
+    CapabilityRejected,
+    #[serde(rename = "DEVICE_AUTHENTICATION_FAILED")]
+    AuthenticationRejected,
+    #[serde(rename = "RECOVERY_PREPARATION_EXPIRED")]
+    PreparationExpired,
+    #[serde(rename = "RECOVERY_PREPARATION_REVOKED")]
+    PreparationRevoked,
+    #[serde(rename = "RECOVERY_CATALOG_EXPIRED")]
+    CatalogExpired,
+    #[serde(rename = "RECOVERY_PREPARATION_INVALIDATED")]
+    PreparationInvalidated,
+    #[serde(rename = "RECOVERY_CATALOG_CONFLICT")]
+    CatalogConflict,
+    #[serde(rename = "RECOVERY_PREPARATION_CONFLICT")]
+    PreparationConflict,
+    #[serde(rename = "IDENTITY_HEAD_CHANGED")]
+    IdentityHeadChanged,
+    #[serde(rename = "CATALOG_HEAD_CHANGED")]
+    CatalogHeadChanged,
+    #[serde(rename = "AUTHORITY_CHANGED")]
+    AuthorityChanged,
+    #[serde(rename = "CANDIDATE_KEY_CHANGED")]
+    CandidateKeyChanged,
     #[serde(rename = "IDEMPOTENCY_CONFLICT")]
     IdempotencyConflict,
     #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
@@ -3546,6 +4247,125 @@ fn key_package_failure_response(failure: KeyPackageFailure, request_id: RequestI
         KeyPackageFailure::TemporarilyUnavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             KeyPackageErrorCode::TemporarilyUnavailable,
+            true,
+        ),
+    };
+    safe_error_response(status, code, retryable, request_id)
+}
+
+fn recovery_catalog_head_response(
+    success: RecoveryCatalogHeadSuccess,
+    request_id: RequestId,
+) -> Response {
+    exact_cbor_response(
+        success.status,
+        success.outcome.exact_head_bytes,
+        RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
+        request_id,
+    )
+}
+
+fn recovery_catalog_status_response(
+    success: &RecoveryCatalogStatusSuccess,
+    request_id: RequestId,
+) -> Response {
+    match success.outcome.exact_bytes() {
+        Ok(bytes) => exact_cbor_response(
+            success.status,
+            bytes,
+            RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+            request_id,
+        ),
+        Err(_) => recovery_catalog_failure_response(
+            RecoveryCatalogFailure::TemporarilyUnavailable,
+            request_id,
+        ),
+    }
+}
+
+fn recovery_catalog_failure_response(
+    failure: RecoveryCatalogFailure,
+    request_id: RequestId,
+) -> Response {
+    let (status, code, retryable) = match failure {
+        RecoveryCatalogFailure::InvalidRequest => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            RecoveryCatalogErrorCode::InvalidRequest,
+            false,
+        ),
+        RecoveryCatalogFailure::ExactCborInvalid => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            RecoveryCatalogErrorCode::ExactCborInvalid,
+            false,
+        ),
+        RecoveryCatalogFailure::CapabilityRejected => (
+            StatusCode::UNAUTHORIZED,
+            RecoveryCatalogErrorCode::CapabilityRejected,
+            false,
+        ),
+        RecoveryCatalogFailure::AuthenticationRejected => (
+            StatusCode::UNAUTHORIZED,
+            RecoveryCatalogErrorCode::AuthenticationRejected,
+            false,
+        ),
+        RecoveryCatalogFailure::PreparationExpired => (
+            StatusCode::GONE,
+            RecoveryCatalogErrorCode::PreparationExpired,
+            false,
+        ),
+        RecoveryCatalogFailure::PreparationRevoked => (
+            StatusCode::GONE,
+            RecoveryCatalogErrorCode::PreparationRevoked,
+            false,
+        ),
+        RecoveryCatalogFailure::CatalogExpired => (
+            StatusCode::GONE,
+            RecoveryCatalogErrorCode::CatalogExpired,
+            false,
+        ),
+        RecoveryCatalogFailure::PreparationInvalidated => (
+            StatusCode::PRECONDITION_FAILED,
+            RecoveryCatalogErrorCode::PreparationInvalidated,
+            false,
+        ),
+        RecoveryCatalogFailure::CatalogConflict => (
+            StatusCode::CONFLICT,
+            RecoveryCatalogErrorCode::CatalogConflict,
+            false,
+        ),
+        RecoveryCatalogFailure::PreparationConflict => (
+            StatusCode::CONFLICT,
+            RecoveryCatalogErrorCode::PreparationConflict,
+            false,
+        ),
+        RecoveryCatalogFailure::IdentityHeadChanged => (
+            StatusCode::PRECONDITION_FAILED,
+            RecoveryCatalogErrorCode::IdentityHeadChanged,
+            false,
+        ),
+        RecoveryCatalogFailure::CatalogHeadChanged => (
+            StatusCode::PRECONDITION_FAILED,
+            RecoveryCatalogErrorCode::CatalogHeadChanged,
+            false,
+        ),
+        RecoveryCatalogFailure::AuthorityChanged => (
+            StatusCode::PRECONDITION_FAILED,
+            RecoveryCatalogErrorCode::AuthorityChanged,
+            false,
+        ),
+        RecoveryCatalogFailure::CandidateKeyChanged => (
+            StatusCode::PRECONDITION_FAILED,
+            RecoveryCatalogErrorCode::CandidateKeyChanged,
+            false,
+        ),
+        RecoveryCatalogFailure::IdempotencyConflict => (
+            StatusCode::CONFLICT,
+            RecoveryCatalogErrorCode::IdempotencyConflict,
+            false,
+        ),
+        RecoveryCatalogFailure::TemporarilyUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            RecoveryCatalogErrorCode::TemporarilyUnavailable,
             true,
         ),
     };

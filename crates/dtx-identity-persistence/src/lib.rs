@@ -6,6 +6,7 @@ mod device_enrollment;
 mod device_session;
 mod error;
 mod key_package;
+mod recovery_scope_catalog;
 mod repository;
 mod store;
 mod types;
@@ -49,6 +50,17 @@ pub use key_package::{
     VerifiedFederatedKeyPackageClaimant, federated_key_package_claim_body_digest,
     federated_key_package_claim_signature_input, key_package_publish_binding_canonical_bytes,
     key_package_publish_signature_input,
+};
+pub use recovery_scope_catalog::{
+    CATALOG_CIPHERTEXT_HASH_DOMAIN, CATALOG_HEAD_DIGEST_DOMAIN, CATALOG_HEAD_SIGNATURE_DOMAIN,
+    CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN, CatalogPreparationCommand,
+    CatalogProviderResponseCommand, CatalogStatus, CatalogStatusInvalidation, CatalogUploadCommand,
+    MAX_RECOVERY_SCOPE_CATALOG_CIPHERTEXT_BYTES, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES,
+    MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES, PREPARATION_DIGEST_DOMAIN,
+    PREPARATION_SIGNATURE_DOMAIN, PROVIDER_CIPHERTEXT_HASH_DOMAIN, PROVIDER_RESPONSE_DIGEST_DOMAIN,
+    PROVIDER_RESPONSE_SIGNATURE_DOMAIN, RECIPIENT_KEY_HASH_DOMAIN, RESPONSE_CAPABILITY_HASH_DOMAIN,
+    RecoveryResponseCapability, RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository,
+    RecoveryScopeCatalogStatusOutcome,
 };
 pub use repository::{
     IdentityLogPageReadOutcome, IdentityLogRepository, lock_and_load_active_snapshot,

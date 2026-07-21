@@ -1,0 +1,574 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk History Recovery V4 and Completion V2
+  version: 4.0.0
+  description: >-
+    Catalog-exhaustive candidate-signed recovery requests, dual-signed opaque
+    mailbox grants, immutable delivery facts, and identity-home completion.
+    Durable Mailbox Pull/ACK remains the only offline-delivery truth. This
+    additive artifact neither accepts nor converts earlier wire versions.
+x-dirextalk-cddl-artifact: protocol/cddl/history-recovery/v3/history-recovery-v3.cddl
+x-dirextalk-strict-wire:
+  deterministic-canonical-cbor: required
+  closed-maps-and-enums: required
+  duplicate-or-unknown-map-keys: rejected
+  noncanonical-ed25519-keys-or-signatures: rejected
+  x25519-all-zero-or-low-order-output: rejected-at-semantic-validation
+  exact-header-body-idempotency-digest-match: required
+  raw-capabilities-or-idempotency-keys-persisted: false
+  version-discriminator-is-exact: true
+  cross-version-conversion-or-fallback: forbidden
+x-dirextalk-crypto-domains:
+  manifest: "dirextalk.history-recovery.manifest.v2\0"
+  leaf-set: "dirextalk.history-recovery.leaf-set.v2\0"
+  request-signature: "dirextalk.history-recovery.request-signature.v4\0"
+  request: "dirextalk.history-recovery.request.v4\0"
+  request-idempotency: "dirextalk.history-recovery.request-idempotency.v4\0"
+  offer: "dirextalk.history-recovery.recipient-offer.v2\0"
+  offer-ciphertext: "dirextalk.history-recovery.offer-ciphertext.v2\0"
+  grant-provider-signature: "dirextalk.history-recovery.grant-provider-signature.v4\0"
+  grant-authority-signature: "dirextalk.history-recovery.grant-authority-signature.v4\0"
+  grant: "dirextalk.history-recovery.grant.v4\0"
+  grant-idempotency: "dirextalk.history-recovery.grant-idempotency.v4\0"
+  delivery-fact: "dirextalk.history-recovery.delivery-fact.v2\0"
+  completion-key-descriptor: "dirextalk.history-recovery.completion-key-descriptor.v2\0"
+  completion-key-descriptor-signature: "dirextalk.history-recovery.completion-key-descriptor-signature.v2\0"
+  completion-context: "dirextalk.history-recovery-completion-context.v2\0"
+  completion-command-signature: "dirextalk.history-recovery.completion-command-signature.v2\0"
+  completion-command: "dirextalk.history-recovery.completion-command.v2\0"
+  completion-idempotency: "dirextalk.history-recovery.completion-idempotency.v2\0"
+  completion-entry: "dirextalk.history-recovery.completion-entry.v2\0"
+  completion-entry-node: "dirextalk.history-recovery.completion-entry-node.v2\0"
+  offer-ack: "dirextalk.history-recovery.offer-ack.v2\0"
+  recovery-complete: "dirextalk.history-recovery.complete.v2\0"
+  completion-receipt: "dirextalk.history-recovery.completion-receipt.v2\0"
+  completion-receipt-signature: "dirextalk.history-recovery.completion-receipt-signature.v2\0"
+  presentation: "dirextalk.history-recovery.completion-presentation.v2\0"
+x-dirextalk-catalog-exhaustiveness:
+  catalog-v2-plaintext-ceiling-bytes: 1048576
+  minimum-opening-bytes: 1019
+  minimum-outer-overhead-at-derived-count-bytes: 147
+  index-occurrences-per-opening: 3
+  one-byte-index-maximum: 23
+  two-byte-index-maximum: 255
+  indices-24-through-255-count: 232
+  indices-24-through-255-extra-bytes-per-opening: 3
+  indices-256-through-1023-count: 768
+  indices-256-plus-extra-bytes-per-opening: 6
+  consecutive-one-based-indices-required: true
+  maximum-valid-catalog-count: 1023
+  bytes-at-1023-minimum-openings: 1047888
+  maximum-valid-catalog-count-plus-one: 1024
+  bytes-at-1024-minimum-openings: 1048913
+  catalog-proof-maximum-siblings: 10
+  catalog-proof-exact-canonical-ceiling-bytes: 402
+  completion-command-decoder-and-body-ceiling-bytes: 3593836
+  abstract-catalog-count-65535-used-as-body-multiplier: false
+x-dirextalk-history-body-ceilings:
+  manifest-v2: 35477
+  request-v4: 37114
+  completion-context-v2: 373
+  completion-entry-v2: 1387
+  completion-entry-proof-v2: 427
+  completion-command-v2: 3593836
+  offer-application-ack-v2: 235
+  recovery-complete-v2: 301
+  completion-receipt-v2: 1359
+  signed-completion-receipt-v2: 3770
+  completion-presentation-v2: 5660
+x-dirextalk-privacy:
+  identity-home-never-receives:
+    - recovery-scope
+    - scope-origin
+    - private-catalog-body
+    - full-verifier-binding
+    - origin-verifier-descriptor
+    - raw-membership-receipt
+    - raw-capability
+    - raw-idempotency-key
+    - mls-private-state
+    - mls-epoch-secret
+  identity-home-can-verify:
+    - exact-catalog-head-and-public-leaf-proofs
+    - public-issuer-delegation-in-every-leaf
+    - child-certificate-signatures-and-context-digest
+    - child-signed-redacted-evidence-context-digest-and-validity-window
+    - request-grant-delivery-and-completion-coordinate-equality
+  identity-home-cannot-prove:
+    - hidden-origin-currentness
+    - private-opening-equality
+    - hsm-or-nonexportable-key-custody
+    - internal-mls-state
+x-dirextalk-leaf-set:
+  cddl-rule: history-recovery-leaf-set-v2
+  digest-domain: "dirextalk.history-recovery.leaf-set.v2\0"
+  digest-input: exact-deterministic-canonical-cbor-array
+  order: exact-one-based-catalog-index-order
+  count-equals: [manifest-field-8, grant-field-11, completion-command-field-14]
+  digest-equals: [manifest-field-9, grant-field-12, completion-command-field-15]
+  gaps-duplicates-reordering-or-json-projection: rejected
+x-dirextalk-completion-context:
+  cddl-rule: history-recovery-completion-context-v2
+  exact-bytes-cddl-rule: exact-history-recovery-completion-context-v2
+  exact-byte-ceiling: 373
+  digest-domain: "dirextalk.history-recovery-completion-context.v2\0"
+  digest-formula: SHA-256(exact-domain-bytes || exact-canonical-context-cbor)
+  second-hash-or-domain-alias: forbidden
+  created: before-any-child-certificate-or-evidence-issuance
+  digest-linkability: intentional-within-one-identity-known-completion-not-an-anonymity-claim
+  fields:
+    '1': {name: version, const: 2}
+    '2': {name: candidate-context-nonce, source: candidate, requirements: [fresh, nonzero, unpredictable, unique-per-completion]}
+    '3': {name: completion-id, source: fresh-identity-known-workflow-coordinate, equals: completion-command-field-2}
+    '4': {name: request-id, source: exact-request-field-2, equals: completion-command-decoded-request-field-2}
+    '5': {name: request-digest, source: request-domain-digest-of-exact-signed-request, equals: completion-command-field-19}
+    '6': {name: identity, source: exact-request-field-3, equals: completion-command-field-3}
+    '7': {name: candidate-device-id, source: exact-request-field-4, equals: completion-command-field-4}
+    '8': {name: catalog-id, source: exact-manifest-field-3, equals: completion-command-field-9}
+    '9': {name: generation, source: exact-manifest-field-4, equals: completion-command-field-10}
+    '10': {name: signed-catalog-head-digest, source: exact-manifest-field-6, equals: completion-command-field-12}
+    '11': {name: catalog-count, source: exact-manifest-field-8, equals: completion-command-field-14}
+    '12': {name: manifest-digest, source: exact-request-field-16, equals: completion-command-field-21}
+  forbidden-dependencies:
+    - child-certificate-or-evidence
+    - completion-entry-or-entry-root
+    - completion-command-or-command-digest
+    - receipt-or-signed-receipt
+    - offer-ack-or-recovery-complete-fact
+    - per-scope-presentation-or-cache
+  command-binding:
+    exact-context-bytes-cbor-path: [34]
+    context-digest-cbor-path: [35]
+    candidate-signature-cbor-path: [36]
+    candidate-signature-covers-exact-fields: [1, 35]
+    candidate-signature-input: completion-command-signature-domain-plus-exact-canonical-unsigned-fields-1-through-35
+  child-certificate-and-evidence:
+    expose: [context-digest, intentional-public-leaf-coordinates, intentional-public-issuer-coordinates]
+    forbid:
+      - exact-context-bytes
+      - raw-identity-catalog-candidate-request-or-completion-id
+      - individually-deterministic-digest-of-any-forbidden-raw-id
+  scope-presentation:
+    exact-context-bytes-disclosed: false
+    context-digest-equality-visible: true
+  dependency-order:
+    - immutable-request-and-manifest-to-exact-context-bytes-and-digest
+    - context-digest-to-child-certificate-and-child-signed-evidence
+    - context-bytes-digest-and-every-child-object-to-candidate-signed-command
+    - validated-command-to-application-facts-and-their-digests
+    - facts-and-signing-descriptor-to-signed-receipt
+    - signed-receipt-own-entry-and-entry-proof-to-scope-presentation-and-cache
+  dependency-back-edge: forbidden
+x-dirextalk-entry-owned-mls-evidence:
+  owner: mls-sequencer-v7
+  child-certificate-exact-byte-ceiling: 389
+  redacted-evidence-exact-byte-ceiling: 250
+  history-requires-owner-validation: true
+  required-context-binding: exact-completion-command-field-35-digest-only
+  raw-or-per-id-digests: forbidden
+  evidence-time-fields: [evidence-issued-at, evidence-expires-at]
+  child-signature-input: exact-evidence-fields-through-evidence-expires-at
+  evidence-digest-input: exact-full-child-signed-evidence
+  validity:
+    - authorization-nbf-less-than-or-equal-evidence-issued-at
+    - evidence-issued-at-less-than-evidence-expires-at
+    - evidence-expires-at-less-than-or-equal-authorization-exp
+    - evidence-window-contained-by-request-head-and-grant
+    - first-completion-admission-before-evidence-expires-at
+x-dirextalk-completion-entry-merkle:
+  leaf-input: exact-deterministic-canonical-history-recovery-completion-entry-v2
+  entry-digest-formula: SHA-256(completion-entry-domain || exact-entry-cbor)
+  node-formula: SHA-256(completion-entry-node-domain || left32 || right32)
+  order: one-based-entry-index
+  odd-node-rule: duplicate-last-without-consuming-sibling
+  single-leaf-root: exact-entry-digest
+  proof-order: bottom-up
+  proof-count-and-index-base: {count-minimum: 1, count-maximum: 1023, index-base: 1}
+  maximum-siblings: 10
+  exact-sibling-consumption: required-no-missing-or-surplus
+x-dirextalk-compact-map-fields:
+  request-receipt-v4:
+    '1': {name: version, const: 4}
+    '2': {name: request-id, equals: accepted-request-field-2}
+    '3': {name: request-digest, source: request-domain-digest-of-exact-signed-request}
+    '4': {name: response-capability-digest, equals: accepted-request-field-19}
+    '5': {name: accepted-at, source: first-admission-transaction-stored-once}
+  delivery-receipt-v2:
+    '1': {name: version, const: 2}
+    '2': {name: delivery-fact, source: exact-atomically-committed-delivery-fact}
+    '3': {name: delivery-fact-digest, source: delivery-fact-domain-digest-of-exact-field-2}
+    '4': {name: committed-at, equals: delivery-fact-field-10}
+  offer-application-ack-v2:
+    '1': {name: version, const: 2}
+    '2': {name: completion-id, equals: completion-command-field-2}
+    '3': {name: request-id, equals: [completion-context-field-4, exact-request-field-2]}
+    '4': {name: delivery-fact-id, equals: exact-delivery-fact-field-2}
+    '5': {name: delivery-fact-digest, equals: completion-command-field-27}
+    '6': {name: offer-digest, equals: [completion-command-field-25, exact-grant-field-25, exact-delivery-fact-field-7]}
+    '7': {name: completion-context-digest, equals: completion-command-field-35}
+    '8': {name: application-applied-at, source: final-first-admission-transaction-stored-once}
+  recovery-complete-v2:
+    '1': {name: version, const: 2}
+    '2': {name: identity, equals: [completion-command-field-3, completion-context-field-6]}
+    '3': {name: completion-id, equals: [completion-command-field-2, completion-context-field-3]}
+    '4': {name: request-id, equals: [exact-request-field-2, completion-context-field-4]}
+    '5': {name: candidate-device-id, equals: [completion-command-field-4, completion-context-field-7]}
+    '6': {name: request-digest, equals: [completion-command-field-19, completion-context-field-5]}
+    '7': {name: completion-context-digest, equals: completion-command-field-35}
+    '8': {name: catalog-count, equals: [completion-command-field-14, completion-context-field-11, manifest-field-8]}
+    '9': {name: completion-entry-root, equals: completion-command-field-29}
+    '10': {name: completed-at, equals: offer-application-ack-field-8}
+    '11': {name: status, const: exhaustive-public-completion-accepted}
+  signed-completion-receipt-v2:
+    '1': {name: receipt, source: exact-cycle-free-receipt-fields-1-through-31}
+    '2': {name: receipt-digest, source: completion-receipt-domain-digest-of-exact-field-1}
+    '3': {name: signing-descriptor, source: exact-origin-authenticated-current-descriptor-at-first-admission}
+    '4': {name: signing-descriptor-digest, equals: receipt-field-28}
+    '5': {name: signature, source: descriptor-field-4-signs-exact-fields-1-through-4}
+x-dirextalk-replay-order:
+  first: endpoint-specific-caller-authentication-current-authorization-and-immutable-explicit-revocation
+  second: static-media-path-size-signature-and-idempotency-shape
+  committed-exact-replay: return-byte-identical-stored-receipt-before-mutable-currentness
+  committed-conflict: reject-without-write
+  first-admission: all-mutable-currentness-and-revocation-checks-then-one-final-cas
+  partial-writes: forbidden
+x-dirextalk-history-state:
+  request-created-only-after: exact-ready-preparation-and-direct-device-add-h-plus-1
+  request-id-equalities: [request-id, preparation-request-id, enrollment-challenge-id]
+  history-request-delete-route: forbidden
+  cancellation-truth: enrollment-challenge-cancellation-only
+  request-invalidation:
+    - challenge-cancelled
+    - identity-head-not-exactly-h-plus-1
+    - candidate-revoked-or-keys-changed
+    - preparation-not-ready
+    - catalog-head-or-authority-changed
+    - expiry
+  grant-atomic-append:
+    - exact-dual-signed-grant
+    - opaque-mailbox-envelope-at-k-plus-1
+    - immutable-delivery-fact
+    - realtime-journal-event
+    - outbox-record
+  realtime-push-after-commit: true
+  push-success-is-delivery-truth: false
+  durable-mailbox-pull-ack-is-only-offline-truth: true
+  immutable-delivery-fact-survives-mailbox-compaction: true
+x-dirextalk-request-header-bindings:
+  response-capability:
+    digest-domain: "dirextalk.recovery-response-capability.v1\0"
+    header: DTX-Recovery-Response-Capability
+    request-v4-cbor-path: [19]
+  request-idempotency: {header: Idempotency-Key, request-v4-cbor-path: [20]}
+  grant-idempotency: {header: Idempotency-Key, grant-v4-cbor-path: [33]}
+  completion-idempotency: {header: Idempotency-Key, completion-v2-cbor-path: [33]}
+x-dirextalk-grant-signatures:
+  exact-common-unsigned-fields: [1, 33]
+  provider-signature: {cbor-path: [34], domain: "dirextalk.history-recovery.grant-provider-signature.v4\0"}
+  independent-authority-signature: {cbor-path: [35], domain: "dirextalk.history-recovery.grant-authority-signature.v4\0"}
+  provider-descriptor: {cbor-path: [22], owner-rule: recovery-scope-catalog-provider-descriptor-v2}
+  independent-authority: {cbor-path: [23], owner-rule: recovery-scope-catalog-independent-authority-v2}
+  authenticated-provider-session-equals-descriptor: true
+  candidate-provider-authority-keys-pairwise-distinct: true
+  preparation-digest-cbor-path: [21]
+  exact-offer-cbor-path: [36]
+  exact-offer-digest-cbor-path: [25]
+  offer-digest-comparison: exact
+x-dirextalk-completion:
+  exhaustive-entry-order: consecutive-one-through-catalog-count
+  entries-count-cbor-path: [28]
+  entries-root-cbor-path: [29]
+  entries-array-cbor-path: [30]
+  entries-count-equals:
+    - catalog-count
+    - entries-array-length
+    - {signed-receipt-cbor-path: [1, 21]}
+  entries-root-equals: {signed-receipt-cbor-path: [1, 20]}
+  final-identity-coordinate: exact-h-plus-1-head
+  no-identity-log-event: true
+  application-facts-written-with-receipt: [offer-ack-v2, recovery-complete-v2]
+  facts-construction-order: validated-command-then-facts-then-fact-digests-then-receipt-then-receipt-signature
+  facts-inputs-only: [validated-completion-command, immutable-request, immutable-grant, immutable-offer, immutable-delivery-fact]
+  facts-forbidden-inputs: [receipt, signed-receipt, generic-mailbox-cursor, generic-mailbox-ack, envelope-mutation, quota, accounting]
+  completion-after-ordinary-mailbox-ack-or-compaction: supported
+  generic-mailbox-ack-or-cursor-in-receipt: forbidden
+  recovery-complete-means: exhaustive-public-completion-accepted
+  recovery-complete-does-not-mean: every-scope-completion-cache-admitted
+  presentation:
+    contains: [signed-receipt, exact-own-entry, entry-root-proof]
+    signed-receipt-field-cbor-path: [2]
+    signed-receipt-digest-field-cbor-path: [3]
+    field-3-digest-formula: SHA-256(presentation-domain || exact deterministic-canonical field-2 signed-history-recovery-completion-receipt-v2 bytes)
+    field-3-equals: exact-context-specific-digest-of-field-2
+    field-3-binding-kind: context-specific-signed-receipt-binding
+    field-3-is-self-digest-of-containing-presentation: false
+    exact-context-bytes: forbidden
+    other-scope-entry: forbidden
+  current-key-descriptor:
+    transport: origin-authenticated-https
+    exact-origin-match: required
+    tls-server-identity-and-chain-validation: required
+    cache-control: no-store
+    redirects: forbidden
+    epoch-at-least-persisted-rollback-floor: required
+    valid-at-fetch: required
+  historical-key-descriptor:
+    address: lower-case-hex-exact-descriptor-domain-digest
+    start: exact-current-descriptor
+    next: exact-previous-descriptor-digest-field-9
+    immutable-readback: true
+    same-origin-tls-no-redirect-no-store-as-current: required
+    chain-reachable-from-current: required
+    previous-epoch-strictly-lower-and-chain-loop-or-fork: rejected
+    receipt-descriptor-valid-at-receipt-issued-at: required
+    epoch-below-current-floor: allowed-only-when-reachable-and-valid-at-receipt-issuance
+    persisted-rollback-floor-lowered: never
+    currentness-claim: false
+  receipt-signing-descriptor-binding:
+    key-id: receipt-field-27-equals-descriptor-field-3
+    descriptor-digest: receipt-field-28-equals-signed-wrapper-field-4
+    epoch: receipt-field-29-equals-descriptor-field-5
+    accepted-at-validity: descriptor-field-7-less-than-or-equal-receipt-field-30-less-than-descriptor-field-8
+  receipt-context-binding:
+    receipt-field-26-equals:
+      - completion-command-field-35
+      - offer-application-ack-field-7
+      - recovery-complete-field-7
+      - every-entry-child-certificate-context-digest
+      - every-entry-child-evidence-context-digest
+paths:
+  /v4/devices/history-recovery-requests:
+    post:
+      operationId: createHistoryRecoveryRequestV4
+      x-dirextalk-authentication: {kind: candidate-device, required: true}
+      x-dirextalk-body-ceiling-bytes: 37114
+      parameters:
+        - $ref: '#/components/parameters/ResponseCapability'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.history-recovery-request.v4+cbor:
+            x-dirextalk-cddl-rule: history-recovery-request-v4
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/RequestReceipt'}
+        '200': {$ref: '#/components/responses/RequestReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+  /v5/devices/history-grants:
+    post:
+      operationId: grantDeviceHistoryV4
+      x-dirextalk-authentication: {kind: active-provider-device, required: true}
+      x-dirextalk-body-ceiling-bytes: 1050699
+      x-dirextalk-atomic-commit: [grant, mailbox-envelope, immutable-delivery-fact, realtime-journal, outbox]
+      parameters:
+        - $ref: '#/components/parameters/DeviceAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.history-recovery-grant.v4+cbor:
+            x-dirextalk-cddl-rule: history-recovery-grant-v4
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/DeliveryReceipt'}
+        '200': {$ref: '#/components/responses/DeliveryReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+  /v2/identity-home/history-recovery-completion-key:
+    get:
+      operationId: getCurrentHistoryRecoveryCompletionKeyV2
+      x-dirextalk-origin-authenticated-https:
+        exact-request-origin-match: true
+        redirects: forbidden
+        tls-validation: required
+        dns-origin-only: true
+        cache-control: no-store
+      responses:
+        '200': {$ref: '#/components/responses/CompletionKeyDescriptor'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410': {$ref: '#/components/responses/Gone'}
+  /v2/identity-home/history-recovery-completion-keys/{descriptor_digest}:
+    get:
+      operationId: getHistoricalHistoryRecoveryCompletionKeyV2
+      x-dirextalk-origin-authenticated-https:
+        exact-request-origin-match: true
+        redirects: forbidden
+        tls-validation: required
+        dns-origin-only: true
+        cache-control: no-store
+      x-dirextalk-path-coordinate-binding:
+        coordinate: descriptor_digest
+        source: completion-key-descriptor-domain-digest-of-exact-response-cbor
+        encoding: lower-case-hex-32-bytes
+        comparison: exact
+      parameters:
+        - $ref: '#/components/parameters/DescriptorDigest'
+      responses:
+        '200': {$ref: '#/components/responses/CompletionKeyDescriptor'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410': {$ref: '#/components/responses/Gone'}
+  /v2/identity-home/history-recovery-completions/{completion_id}:
+    post:
+      operationId: completeHistoryRecoveryV2
+      x-dirextalk-authentication: {kind: candidate-device, required: true}
+      x-dirextalk-body-ceiling-bytes: 3593836
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-durable-writes
+        coordinates:
+          completion_id:
+            source: candidate-signed-completion-command-cbor
+            cddl-rule: history-recovery-completion-command-v2
+            cbor-path: [2]
+            comparison: exact
+      parameters:
+        - $ref: '#/components/parameters/CompletionId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.history-recovery-completion-command.v2+cbor:
+            x-dirextalk-cddl-rule: history-recovery-completion-command-v2
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/CompletionReceipt'}
+        '200': {$ref: '#/components/responses/CompletionReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+    get:
+      operationId: getHistoryRecoveryCompletionV2
+      description: >-
+        Candidate-device bearer authentication, current authorization, and
+        immutable explicit-revocation checks precede readback. The authenticated
+        identity and device_id must equal the stored signed receipt values at
+        paths [1, 3] and [1, 4]. Ordinary identity or head advance does not
+        invalidate the immutable receipt.
+      x-dirextalk-authentication: {kind: candidate-device, scheme: bearer, required: true}
+      x-dirextalk-readback-authorization:
+        cddl-rule: signed-history-recovery-completion-receipt-v2
+        cbor-path-convention: nested-map-keys-listed-once-from-signed-wrapper
+        authenticated-identity-equals-cbor-path: [1, 3]
+        authenticated-device-id-equals-cbor-path: [1, 4]
+        current-candidate-device-authorization: required-before-readback
+        immutable-explicit-revocation: reject-before-readback
+        ordinary-identity-or-head-advance-invalidates-immutable-receipt: false
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-readback
+        coordinates:
+          completion_id:
+            source: stored-returned-signed-receipt-cbor
+            cddl-rule: signed-history-recovery-completion-receipt-v2
+            cbor-path: [1, 2]
+            comparison: exact
+      parameters:
+        - $ref: '#/components/parameters/CompletionId'
+        - $ref: '#/components/parameters/DeviceAuthorization'
+      responses:
+        '200': {$ref: '#/components/responses/CompletionReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410': {$ref: '#/components/responses/Gone'}
+components:
+  parameters:
+    CompletionId:
+      name: completion_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    DescriptorDigest:
+      name: descriptor_digest
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+    DeviceAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      schema: {type: string}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 16, maxLength: 128}
+    ResponseCapability:
+      name: DTX-Recovery-Response-Capability
+      in: header
+      required: true
+      schema: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
+  schemas:
+    ExactCanonicalCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  headers:
+    NoStore:
+      schema: {type: string, const: no-store}
+  responses:
+    RequestReceipt:
+      description: Immutable exact Request V4 receipt; replay is byte-identical.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.history-recovery-request-receipt.v4+cbor:
+          x-dirextalk-cddl-rule: history-recovery-request-receipt-v4
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    DeliveryReceipt:
+      description: Immutable grant and delivery-fact receipt; independent of mailbox compaction.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.history-recovery-delivery-receipt.v2+cbor:
+          x-dirextalk-cddl-rule: history-recovery-delivery-receipt-v2
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    CompletionKeyDescriptor:
+      description: >-
+        Origin-authenticated current or immutable digest-addressed historical
+        Completion V2 signing descriptor. Historical responses are accepted
+        only along the exact previous-digest chain from a validated current
+        descriptor and never lower the persisted rollback floor.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.history-recovery-completion-key-descriptor.v2+cbor:
+          x-dirextalk-cddl-rule: history-recovery-completion-key-descriptor-v2
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    CompletionReceipt:
+      description: >-
+        Immutable identity-home receipt. It signs application ACK and
+        recovery_complete facts, not a generic mailbox cursor or ACK.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.history-recovery-completion-receipt.v2+cbor:
+          x-dirextalk-cddl-rule: signed-history-recovery-completion-receipt-v2
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    Unauthorized:
+      description: AUTHENTICATION_REQUIRED or CURRENT_DEVICE_AUTHORIZATION_REQUIRED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Conflict:
+      description: IDEMPOTENCY_CONFLICT, MAILBOX_HEAD_CONFLICT, ALREADY_COMPLETED_DIFFERENT_BYTES, or FINAL_CAS_CONFLICT.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Gone:
+      description: CHALLENGE_CANCELLED, REQUEST_REVOKED, DEVICE_REVOKED, or WORKFLOW_EXPIRED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Invalidated:
+      description: IDENTITY_HEAD_CHANGED, CATALOG_CHANGED, AUTHORITY_CHANGED, PREPARATION_NOT_READY, or KEY_CHANGED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    InvalidExactCbor:
+      description: EXACT_CBOR_INVALID, NON_EXHAUSTIVE_MANIFEST, NON_EXHAUSTIVE_COMPLETION, PROOF_INVALID, SIGNATURE_INVALID, FORBIDDEN_PRIVATE_DATA, or COORDINATE_MISMATCH.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    NotFound:
+      description: The exact immutable descriptor or receipt does not exist.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}

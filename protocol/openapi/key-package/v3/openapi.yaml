@@ -1,0 +1,109 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Recovery KeyPackage V3
+  version: 3.0.0
+  description: >-
+    Publishes and claims an opaque KeyPackage for exactly one recovery request,
+    signed catalog head, one-based exhaustive leaf index, canonical scope, and
+    directly added candidate device. Exact replay returns the original receipt;
+    request revocation, expiry, or head/key/catalog drift invalidates the item.
+    All responses are non-cacheable.
+paths:
+  /v3/key-packages/{package_id}:
+    put:
+      operationId: publishRecoveryKeyPackageV3
+      parameters:
+        - $ref: '#/components/parameters/PackageId'
+        - $ref: '#/components/parameters/DeviceAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.key-package-publish.v3+cbor:
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/PublishReceipt'}
+        '200': {$ref: '#/components/responses/PublishReceipt'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+  /v3/key-packages/claim:
+    post:
+      operationId: claimRecoveryKeyPackageV3
+      parameters:
+        - $ref: '#/components/parameters/DeviceAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.key-package-claim.v3+cbor:
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/ClaimReceipt'}
+        '200': {$ref: '#/components/responses/ClaimReceipt'}
+        '404': {$ref: '#/components/responses/Unavailable'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+components:
+  parameters:
+    PackageId:
+      name: package_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    DeviceAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      schema: {type: string}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 16, maxLength: 128}
+  schemas:
+    ExactCanonicalCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  headers:
+    NoStore:
+      schema: {type: string, const: no-store}
+  responses:
+    PublishReceipt:
+      description: Immutable exact publish receipt.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.key-package-publish-receipt.v3+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    ClaimReceipt:
+      description: Exact original publish envelope and exact claim binding.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.key-package-claim-receipt.v3+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    Unavailable:
+      description: KEY_PACKAGE_UNAVAILABLE for the exact request/catalog/index/leaf/scope tuple.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Conflict:
+      description: KEY_PACKAGE_CONFLICT or IDEMPOTENCY_CONFLICT.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Gone:
+      description: HISTORY_RECOVERY_EXPIRED or HISTORY_RECOVERY_REVOKED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Invalidated:
+      description: IDENTITY_HEAD_CHANGED, CATALOG_HEAD_CHANGED, CANDIDATE_KEY_CHANGED, or CATALOG_LEAF_CHANGED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    InvalidExactCbor:
+      description: EXACT_CBOR_INVALID or KEY_PACKAGE_INVALID.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}

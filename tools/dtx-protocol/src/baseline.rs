@@ -199,6 +199,31 @@ const V40_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/mls-sequencer/v5",
     "protocol/test-vectors/mls-sequencer/v5",
 ];
+const V41_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/recovery-scope-catalog/v1/recovery-scope-catalog-v1.cddl",
+    "protocol/openapi/recovery-scope-catalog/v1/openapi.yaml",
+    "protocol/test-vectors/recovery-scope-catalog/v1/recovery-scope-catalog-v1.json",
+    "protocol/cddl/history-recovery/v2/history-recovery-v2.cddl",
+    "protocol/openapi/history-recovery/v2/openapi.yaml",
+    "protocol/test-vectors/history-recovery/v2/history-recovery-v2.json",
+    "protocol/cddl/key-package/v3/key-package-v3.cddl",
+    "protocol/openapi/key-package/v3/openapi.yaml",
+    "protocol/test-vectors/key-package/v3/key-package-v3.json",
+    "protocol/cddl/mls-sequencer/v6/mls-sequencer-v6.cddl",
+    "protocol/openapi/mls-sequencer/v6/openapi.yaml",
+    "protocol/test-vectors/mls-sequencer/v6/mls-sequencer-v6.json",
+];
+const V42_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/recovery-scope-catalog/v2/recovery-scope-catalog-v2.cddl",
+    "protocol/openapi/recovery-scope-catalog/v2/openapi.yaml",
+    "protocol/test-vectors/recovery-scope-catalog/v2/recovery-scope-catalog-v2.json",
+    "protocol/cddl/history-recovery/v3/history-recovery-v3.cddl",
+    "protocol/openapi/history-recovery/v3/openapi.yaml",
+    "protocol/cddl/key-package/v4/key-package-v4.cddl",
+    "protocol/openapi/key-package/v4/openapi.yaml",
+    "protocol/cddl/mls-sequencer/v7/mls-sequencer-v7.cddl",
+    "protocol/openapi/mls-sequencer/v7/openapi.yaml",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -454,6 +479,18 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v40/manifest.json",
         includes_registries: false,
         artifact_paths: V40_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 41,
+        path: "protocol/baseline/v41/manifest.json",
+        includes_registries: false,
+        artifact_paths: V41_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 42,
+        path: "protocol/baseline/v42/manifest.json",
+        includes_registries: false,
+        artifact_paths: V42_ARTIFACT_PATHS,
     },
 ];
 
@@ -835,6 +872,10 @@ fn baseline_version_label(version: u16) -> String {
 mod tests {
     use super::*;
 
+    fn repository_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
     fn entries(values: &[(&str, &str)]) -> BTreeMap<String, String> {
         values
             .iter()
@@ -1070,5 +1111,130 @@ mod tests {
             ]
         );
         assert!(!v40.includes_registries);
+    }
+
+    #[test]
+    fn v41_selects_exactly_the_twelve_recovery_completion_artifacts() {
+        let expected = [
+            "protocol/cddl/recovery-scope-catalog/v1/recovery-scope-catalog-v1.cddl",
+            "protocol/openapi/recovery-scope-catalog/v1/openapi.yaml",
+            "protocol/test-vectors/recovery-scope-catalog/v1/recovery-scope-catalog-v1.json",
+            "protocol/cddl/history-recovery/v2/history-recovery-v2.cddl",
+            "protocol/openapi/history-recovery/v2/openapi.yaml",
+            "protocol/test-vectors/history-recovery/v2/history-recovery-v2.json",
+            "protocol/cddl/key-package/v3/key-package-v3.cddl",
+            "protocol/openapi/key-package/v3/openapi.yaml",
+            "protocol/test-vectors/key-package/v3/key-package-v3.json",
+            "protocol/cddl/mls-sequencer/v6/mls-sequencer-v6.cddl",
+            "protocol/openapi/mls-sequencer/v6/openapi.yaml",
+            "protocol/test-vectors/mls-sequencer/v6/mls-sequencer-v6.json",
+        ];
+        assert_eq!(V41_ARTIFACT_PATHS, expected);
+        assert_eq!(V41_ARTIFACT_PATHS.len(), 12);
+
+        let v41 = BASELINE_SPECS
+            .iter()
+            .find(|spec| spec.version == 41)
+            .expect("v41 baseline spec");
+        assert_eq!(v41.path, "protocol/baseline/v41/manifest.json");
+        assert_eq!(v41.artifact_paths, V41_ARTIFACT_PATHS);
+        assert!(!v41.includes_registries);
+
+        let manifest = current_manifest(&repository_root(), *v41).unwrap();
+        assert_eq!(manifest.artifacts.len(), 12);
+        assert_eq!(
+            manifest
+                .artifacts
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            expected.into_iter().collect::<BTreeSet<_>>()
+        );
+        let v41_paths = V41_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
+        for older in BASELINE_SPECS.iter().filter(|spec| spec.version < 41) {
+            let older_paths = older
+                .artifact_paths
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert!(v41_paths.is_disjoint(&older_paths));
+        }
+    }
+
+    #[test]
+    fn v41_addition_preserves_every_older_baseline() {
+        let root = repository_root();
+        let older = BASELINE_SPECS
+            .iter()
+            .filter(|spec| spec.version < 41)
+            .collect::<Vec<_>>();
+        assert_eq!(older.len(), 40);
+        for (index, spec) in older.into_iter().enumerate() {
+            assert_eq!(usize::from(spec.version), index + 1);
+            let frozen = read_manifest(&root.join(spec.path)).unwrap();
+            let current = current_manifest(&root, *spec).unwrap();
+            compare_manifest(*spec, &frozen, &current).unwrap();
+        }
+    }
+
+    #[test]
+    fn v42_selects_exactly_the_nine_current_recovery_artifacts() {
+        let expected = [
+            "protocol/cddl/recovery-scope-catalog/v2/recovery-scope-catalog-v2.cddl",
+            "protocol/openapi/recovery-scope-catalog/v2/openapi.yaml",
+            "protocol/test-vectors/recovery-scope-catalog/v2/recovery-scope-catalog-v2.json",
+            "protocol/cddl/history-recovery/v3/history-recovery-v3.cddl",
+            "protocol/openapi/history-recovery/v3/openapi.yaml",
+            "protocol/cddl/key-package/v4/key-package-v4.cddl",
+            "protocol/openapi/key-package/v4/openapi.yaml",
+            "protocol/cddl/mls-sequencer/v7/mls-sequencer-v7.cddl",
+            "protocol/openapi/mls-sequencer/v7/openapi.yaml",
+        ];
+        assert_eq!(V42_ARTIFACT_PATHS, expected);
+        assert_eq!(V42_ARTIFACT_PATHS.len(), 9);
+
+        let v42 = BASELINE_SPECS
+            .iter()
+            .find(|spec| spec.version == 42)
+            .expect("v42 baseline spec");
+        assert_eq!(v42.path, "protocol/baseline/v42/manifest.json");
+        assert_eq!(v42.artifact_paths, V42_ARTIFACT_PATHS);
+        assert!(!v42.includes_registries);
+
+        let manifest = current_manifest(&repository_root(), *v42).unwrap();
+        assert_eq!(manifest.artifacts.len(), 9);
+        assert_eq!(
+            manifest
+                .artifacts
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            expected.into_iter().collect::<BTreeSet<_>>()
+        );
+        let v42_paths = V42_ARTIFACT_PATHS.iter().copied().collect::<BTreeSet<_>>();
+        for older in BASELINE_SPECS.iter().filter(|spec| spec.version < 42) {
+            let older_paths = older
+                .artifact_paths
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert!(v42_paths.is_disjoint(&older_paths));
+        }
+    }
+
+    #[test]
+    fn v42_addition_preserves_every_older_baseline() {
+        let root = repository_root();
+        let older = BASELINE_SPECS
+            .iter()
+            .filter(|spec| spec.version < 42)
+            .collect::<Vec<_>>();
+        assert_eq!(older.len(), 41);
+        for (index, spec) in older.into_iter().enumerate() {
+            assert_eq!(usize::from(spec.version), index + 1);
+            let frozen = read_manifest(&root.join(spec.path)).unwrap();
+            let current = current_manifest(&root, *spec).unwrap();
+            compare_manifest(*spec, &frozen, &current).unwrap();
+        }
     }
 }

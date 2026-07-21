@@ -1,0 +1,110 @@
+; Dirextalk MLS Recovery Sequencer V6 (baseline V41).
+; Recovery admission is fenced until candidate confirmation, authority-local
+; activation, and presentation of an externally verified identity completion.
+
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+channel-id = tstr .size 57
+sha256 = bstr .size 32
+signature = bstr .size 64
+safe-sequence = 0..9007199254740991
+safe-parent = 0..9007199254740990
+scope = { 1: 1, 2: uuid-v7 } / { 1: 2, 2: channel-id }
+
+mls-recovery-add-request-v6 = {
+  1: 6, 2: uuid-v7, 3: scope,
+  4: identity-id, 5: identity-id, 6: uuid-v7, 7: uuid-v7,
+  8: bstr .size 32,
+  9: uuid-v7, 10: sha256, 11: sha256, 12: sha256, 13: sha256,
+  14: sha256, 15: sha256,
+  16: safe-sequence, 17: sha256, 18: 1..65535, 19: sha256,
+  20: 1..65535, 21: bstr .size (1..4096), 22: sha256, 23: sha256,
+  24: safe-parent, 25: 1..9007199254740991,
+  26: safe-parent, 27: sha256,
+  28: bstr .size (1..1048576), 29: sha256,
+  30: bstr .size (1..1048576), 31: sha256,
+  32: sha256, 33: sha256, 34: signature, 35: sha256
+}
+
+mls-recovery-controller-consent-transcript-v6 = {
+  1: 6, 2: uuid-v7, 3: scope,
+  4: identity-id, 5: identity-id, 6: uuid-v7, 7: uuid-v7,
+  8: bstr .size 32,
+  9: uuid-v7, 10: sha256, 11: sha256, 12: sha256, 13: sha256,
+  14: sha256, 15: sha256,
+  16: safe-sequence, 17: sha256, 18: 1..65535, 19: sha256,
+  20: 1..65535, 21: bstr .size (1..4096), 22: sha256, 23: sha256,
+  24: safe-parent, 25: 1..9007199254740991,
+  26: safe-parent, 27: sha256,
+  28: bstr .size (1..1048576), 29: sha256,
+  30: bstr .size (1..1048576), 31: sha256,
+  32: sha256, 35: sha256
+}
+
+mls-recovery-head-transcript-v6 = {
+  1: 1, 2: sha256, 3: 1..9007199254740991,
+  4: sha256, 5: sha256, 6: identity-id, 7: uuid-v7
+}
+
+mls-recovery-add-receipt-v6 = {
+  1: 6, 2: uuid-v7, 3: scope, 4: identity-id, 5: uuid-v7,
+  6: sha256, 7: 1..9007199254740991, 8: sha256,
+  9: sha256, 10: sha256, 11: sha256, 12: 1
+}
+
+signed-mls-recovery-add-receipt-v6 = {
+  1: mls-recovery-add-receipt-v6, 2: sha256, 3: bstr .size 32, 4: signature
+}
+
+mls-recovery-confirmation-v1 = {
+  1: 1, 2: uuid-v7, 3: identity-id, 4: uuid-v7,
+  5: sha256, 6: sha256, 7: 1..9007199254740991, 8: sha256,
+  9: bstr .size 32, 10: 2, 11: signature
+}
+
+mls-recovery-activation-command-v1 = {
+  1: 1, 2: uuid-v7, 3: uuid-v7, 4: identity-id, 5: uuid-v7,
+  6: sha256, 7: sha256, 8: sha256, 9: sha256,
+  10: 1..9007199254740991, 11: sha256,
+  12: bstr .size 32, 13: signature,
+  14: safe-sequence, 15: 1..9007199254740991, 16: sha256, 17: 2
+}
+
+mls-recovery-activation-receipt-v1 = {
+  1: 1, 2: identity-id, 3: bstr .size 32,
+  4: identity-id, 5: uuid-v7, 6: uuid-v7, 7: sha256,
+  8: sha256, 9: 1..65535, 10: 1..65535, 11: sha256,
+  12: uuid-v7, 13: sha256, 14: uuid-v7, 15: sha256,
+  16: 1..9007199254740991, 17: sha256,
+  18: safe-sequence, 19: 1..9007199254740991, 20: 3
+}
+
+signed-mls-recovery-activation-receipt-v1 = {
+  1: mls-recovery-activation-receipt-v1,
+  2: sha256, 3: bstr .size 32, 4: signature
+}
+
+mls-recovery-activation-readback-v1 = {
+  1: 1, 2: scope, 3: uuid-v7, 4: uuid-v7,
+  5: sha256, 6: sha256, 7: 1..9007199254740991, 8: sha256,
+  9: 3, 10: bstr .size (1..4096)
+}
+
+mls-recovery-completion-presentation-v1 = {
+  1: 1, 2: uuid-v7, 3: identity-id, 4: uuid-v7, 5: sha256,
+  6: bstr .size (1..4096), 7: sha256,
+  8: bstr .size (1..4096), 9: sha256,
+  10: sha256, 11: 0..65534, 12: [1*32 sha256],
+  13: bstr .size 32, 14: signature, 15: sha256
+}
+
+mls-recovery-completion-receipt-v1 = {
+  1: 1, 2: uuid-v7, 3: uuid-v7,
+  4: sha256, 5: sha256, 6: sha256, 7: 0..65534,
+  8: 3, 9: true, 10: safe-sequence
+}
+
+signed-mls-recovery-completion-receipt-v1 = {
+  1: mls-recovery-completion-receipt-v1,
+  2: sha256, 3: bstr .size 32, 4: signature
+}

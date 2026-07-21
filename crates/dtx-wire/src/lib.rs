@@ -15,7 +15,8 @@ pub use api_error::{
 };
 pub use canonical_cbor::{
     CanonicalCborError, CanonicalEncode, CanonicalValue, decode_deterministic_cbor,
-    encode_deterministic_cbor, validate_deterministic_cbor,
+    decode_deterministic_cbor_with_limit, encode_deterministic_cbor,
+    encode_deterministic_cbor_with_limit, validate_deterministic_cbor,
 };
 pub use canonical_decode::{
     CanonicalDecode, CanonicalDecodeError, decode_struct_field, decode_struct_map,

@@ -20,6 +20,7 @@ use crate::{
 };
 
 const SAFE_UINT_MAX: u64 = 9_007_199_254_740_991;
+const V41_RECOVERY_SCOPE_CATALOG_MAX_LEAVES: usize = 65_535;
 const PRIVATE_EVENT_MAX_ENCODED_BYTES: usize = 66_383;
 const PRIVATE_EVENT_MLS_GROUP_ID_DOMAIN: &[u8] = b"dirextalk.mls-group-id.conversation.v1\0";
 const PRIVATE_EVENT_MLS_CIPHERTEXT_DIGEST_DOMAIN: &[u8] =
@@ -161,6 +162,11 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     validate_realtime_sync_v2(root)?;
     validate_history_recovery_v1(root)?;
     validate_mls_sequencer_v5(root)?;
+    validate_recovery_scope_catalog_v1(root)?;
+    validate_history_recovery_v2(root)?;
+    validate_key_package_v3(root)?;
+    validate_mls_sequencer_v6(root)?;
+    validate_mls_sequencer_v7_index_contract(root)?;
 
     let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
     let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
@@ -2516,6 +2522,7156 @@ fn validate_mls_v5_invalid_vectors(
                 }
             }
             _ => unreachable!("invalid labels were checked above"),
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V41 gate proves one complete fenced recovery and completion workflow"
+)]
+fn validate_mls_sequencer_v6(root: &Path) -> Result<(), ProtocolToolError> {
+    const DOMAINS: &[(&str, &[u8])] = &[
+        (
+            "dirextalk.mls-opaque-commit.v1",
+            b"dirextalk.mls-opaque-commit.v1\0",
+        ),
+        (
+            "dirextalk.mls-opaque-welcome.v1",
+            b"dirextalk.mls-opaque-welcome.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-route-proof.v6",
+            b"dirextalk.mls-recovery-route-proof.v6\0",
+        ),
+        (
+            "dirextalk.mls-recovery-controller-consent.v6",
+            b"dirextalk.mls-recovery-controller-consent.v6\0",
+        ),
+        (
+            "dirextalk.mls-recovery-controller-consent-signature.v6",
+            b"dirextalk.mls-recovery-controller-consent-signature.v6\0",
+        ),
+        (
+            "dirextalk.mls-recovery-add-request.v6",
+            b"dirextalk.mls-recovery-add-request.v6\0",
+        ),
+        (
+            "dirextalk.mls-sequencer-head.v1",
+            b"dirextalk.mls-sequencer-head.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-add-receipt.v6",
+            b"dirextalk.mls-recovery-add-receipt.v6\0",
+        ),
+        (
+            "dirextalk.mls-recovery-add-receipt-signature.v6",
+            b"dirextalk.mls-recovery-add-receipt-signature.v6\0",
+        ),
+        (
+            "dirextalk.mls-recovery-confirmation.v1",
+            b"dirextalk.mls-recovery-confirmation.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-confirmation-signature.v1",
+            b"dirextalk.mls-recovery-confirmation-signature.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-activation-command.v1",
+            b"dirextalk.mls-recovery-activation-command.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-activation-signature.v1",
+            b"dirextalk.mls-recovery-activation-signature.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-activation-receipt.v1",
+            b"dirextalk.mls-recovery-activation-receipt.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-activation-receipt-signature.v1",
+            b"dirextalk.mls-recovery-activation-receipt-signature.v1\0",
+        ),
+        (
+            "dirextalk.identity-recovery-completion-receipt.v1",
+            b"dirextalk.identity-recovery-completion-receipt.v1\0",
+        ),
+        (
+            "dirextalk.identity-recovery-completion-receipt-signature.v1",
+            b"dirextalk.identity-recovery-completion-receipt-signature.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-completion-leaf.v1",
+            b"dirextalk.mls-recovery-completion-leaf.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-completion-node.v1",
+            b"dirextalk.mls-recovery-completion-node.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-completion-presentation.v1",
+            b"dirextalk.mls-recovery-completion-presentation.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-completion-presentation-signature.v1",
+            b"dirextalk.mls-recovery-completion-presentation-signature.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-completion-receipt.v1",
+            b"dirextalk.mls-recovery-completion-receipt.v1\0",
+        ),
+        (
+            "dirextalk.mls-recovery-completion-receipt-signature.v1",
+            b"dirextalk.mls-recovery-completion-receipt-signature.v1\0",
+        ),
+    ];
+    let cddl = read(&root.join("protocol/cddl/mls-sequencer/v6/mls-sequencer-v6.cddl"))?;
+    cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse MLS Sequencer V6 CDDL: {error}")))?;
+    let vector =
+        read_json(&root.join("protocol/test-vectors/mls-sequencer/v6/mls-sequencer-v6.json"))?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "baseline",
+            "media_types",
+            "domains",
+            "candidate_public_key_hex",
+            "controller_public_key_hex",
+            "sequencer_public_key_hex",
+            "identity_completion_public_key_hex",
+            "cross_bindings",
+            "flow",
+            "invalid_cbor",
+        ],
+        "MLS Sequencer V6 vector",
+    )?;
+    if vector.get("version").and_then(Value::as_u64) != Some(6)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(41)
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V6 version/baseline must be 6/41",
+        ));
+    }
+    let domain_map = v40_json_field(&vector, "domains", "MLS Sequencer V6 vector")?;
+    require_exact_object_keys(
+        domain_map,
+        &DOMAINS.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        "MLS Sequencer V6 domains",
+    )?;
+    for (name, bytes) in DOMAINS {
+        if domain_map.get(*name).and_then(Value::as_str) != std::str::from_utf8(bytes).ok() {
+            return Err(ProtocolToolError::new(format!(
+                "MLS Sequencer V6 domain drift: {name}"
+            )));
+        }
+    }
+    validate_mls_sequencer_v6_openapi(root, &vector)?;
+    let candidate_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "candidate_public_key_hex")?)?;
+    let controller_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "controller_public_key_hex")?)?;
+    let sequencer_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "sequencer_public_key_hex")?)?;
+    let completion_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "identity_completion_public_key_hex")?)?;
+    if [candidate_key, controller_key, sequencer_key, completion_key]
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 4
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V6 signing roles must use independent keys",
+        ));
+    }
+    validate_mls_v6_flow(
+        root,
+        &vector,
+        &cddl,
+        candidate_key,
+        controller_key,
+        sequencer_key,
+        completion_key,
+    )?;
+    validate_mls_v6_invalid(&vector, &cddl, sequencer_key)?;
+    Ok(())
+}
+
+fn validate_mls_sequencer_v7_index_contract(root: &Path) -> Result<(), ProtocolToolError> {
+    const EXPECTED_MAX: u64 = 1023;
+    const CDDL_RELATIVE: &str = "protocol/cddl/mls-sequencer/v7/mls-sequencer-v7.cddl";
+    const OPENAPI_RELATIVE: &str = "protocol/openapi/mls-sequencer/v7/openapi.yaml";
+    const ISSUER_OPERATION: &str = "/paths/~1v2~1groups~1{scope_kind}~1{scope_id}~1recovery-completion-issuer-authorizations~1{catalog_id}~1{generation}~1{index}/put";
+
+    let cddl = read(&root.join(CDDL_RELATIVE))?;
+    let cddl = cddl_cat::parse_cddl(&cddl)
+        .map_err(|error| ProtocolToolError::new(format!("parse MLS Sequencer V7 CDDL: {error}")))?;
+    let catalog_max = mls_v7_catalog_max_from_ast(&cddl)?;
+    mls_v7_validate_issuer_request_ast(&cddl)?;
+
+    let openapi_max = mls_v7_openapi_index_max(root, OPENAPI_RELATIVE, ISSUER_OPERATION)?;
+    if catalog_max != openapi_max || catalog_max != EXPECTED_MAX {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V7 catalog/index maximum drift: CDDL={catalog_max}, OpenAPI={openapi_max}, required={EXPECTED_MAX}"
+        )));
+    }
+    Ok(())
+}
+
+fn mls_v7_openapi_index_max(
+    root: &Path,
+    relative: &str,
+    issuer_operation_pointer: &str,
+) -> Result<u64, ProtocolToolError> {
+    let openapi = v41_read_openapi_tree(root, relative, "MLS Sequencer V7 OpenAPI")?;
+    let index_parameter = openapi
+        .pointer("/components/parameters/Index")
+        .ok_or_else(|| {
+            ProtocolToolError::new("MLS Sequencer V7 OpenAPI Index parameter is missing")
+        })?;
+    if json_string(index_parameter, "name")? != "index"
+        || json_string(index_parameter, "in")? != "path"
+        || index_parameter.get("required").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V7 OpenAPI Index must be a required index path parameter",
+        ));
+    }
+    let maximum = index_parameter
+        .pointer("/schema/maximum")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "MLS Sequencer V7 OpenAPI components parameter Index.schema.maximum must be an integer",
+            )
+        })?;
+    let issuer_operation = openapi.pointer(issuer_operation_pointer).ok_or_else(|| {
+        ProtocolToolError::new("MLS Sequencer V7 issuer authorization operation is missing")
+    })?;
+    if json_string(issuer_operation, "operationId")? != "authorizeCatalogCompletionIssuerV1" {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V7 issuer authorization operationId drift",
+        ));
+    }
+    let index_parameter_references = v40_json_array_field(
+        issuer_operation,
+        "parameters",
+        "MLS Sequencer V7 issuer authorization operation",
+    )?
+    .iter()
+    .filter(|parameter| {
+        parameter.get("$ref").and_then(Value::as_str) == Some("#/components/parameters/Index")
+    })
+    .count();
+    if index_parameter_references != 1 {
+        return Err(ProtocolToolError::new(format!(
+            "MLS Sequencer V7 issuer authorization operation must reference Index exactly once, found {index_parameter_references}"
+        )));
+    }
+    let issuer_index_binding = openapi
+        .pointer(&format!(
+            "{issuer_operation_pointer}/x-dirextalk-path-coordinate-binding/coordinates/index"
+        ))
+        .ok_or_else(|| {
+            ProtocolToolError::new(
+                "MLS Sequencer V7 issuer authorization index path binding is missing",
+            )
+        })?;
+    require_exact_object_keys(
+        issuer_index_binding,
+        &["source", "cddl-rule", "cbor-path", "comparison"],
+        "MLS Sequencer V7 issuer authorization index path binding",
+    )?;
+    if json_string(issuer_index_binding, "source")? != "signed-request-cbor"
+        || json_string(issuer_index_binding, "cddl-rule")?
+            != "mls-recovery-issuer-authorization-request-v1"
+        || v40_json_array_field(
+            issuer_index_binding,
+            "cbor-path",
+            "MLS Sequencer V7 issuer authorization index path binding",
+        )? != [json!(6)]
+        || json_string(issuer_index_binding, "comparison")? != "exact-decimal"
+    {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V7 issuer authorization index source/rule/path/comparison drift",
+        ));
+    }
+    Ok(maximum)
+}
+
+fn mls_v7_unique_ast_rule<'a>(
+    cddl: &'a cddl_cat::ast::Cddl,
+    rule: &str,
+    label: &str,
+) -> Result<&'a cddl_cat::ast::Rule, ProtocolToolError> {
+    let matches = cddl
+        .rules
+        .iter()
+        .filter(|candidate| candidate.name == rule)
+        .collect::<Vec<_>>();
+    let [rule] = matches.as_slice() else {
+        return Err(ProtocolToolError::new(format!(
+            "{label} rule must be defined exactly once, found {}",
+            matches.len()
+        )));
+    };
+    if !rule.generic_parms.is_empty() {
+        return Err(ProtocolToolError::new(format!(
+            "{label} rule must not declare generic parameters"
+        )));
+    }
+    Ok(rule)
+}
+
+fn mls_v7_catalog_max_from_ast(cddl: &cddl_cat::ast::Cddl) -> Result<u64, ProtocolToolError> {
+    use cddl_cat::ast::{RuleVal, Type1, Type2, Value as CddlValue};
+
+    const LABEL: &str = "MLS Sequencer V7 catalog exhaustive count";
+    let rule = mls_v7_unique_ast_rule(cddl, "catalog-exhaustive-count", LABEL)?;
+    let RuleVal::AssignType(rule_type) = &rule.val else {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} must be a type-assignment rule"
+        )));
+    };
+    let [Type1::Range(range)] = rule_type.0.as_slice() else {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} must be exactly one integer range"
+        )));
+    };
+    let (Type2::Value(CddlValue::Uint(1)), Type2::Value(CddlValue::Uint(maximum))) =
+        (&range.start, &range.end)
+    else {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} must be exactly 1..N"
+        )));
+    };
+    if !range.inclusive {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} range must include its maximum"
+        )));
+    }
+    Ok(*maximum)
+}
+
+fn mls_v7_validate_issuer_request_ast(cddl: &cddl_cat::ast::Cddl) -> Result<(), ProtocolToolError> {
+    use cddl_cat::ast::{GrpEntVal, MemberKeyVal, RuleVal, Type1, Type2, Value as CddlValue};
+
+    const LABEL: &str = "MLS Sequencer V7 issuer authorization request";
+    let rule = mls_v7_unique_ast_rule(cddl, "mls-recovery-issuer-authorization-request-v1", LABEL)?;
+    let RuleVal::AssignType(rule_type) = &rule.val else {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} must be a type-assignment rule"
+        )));
+    };
+    let [Type1::Simple(Type2::Map(group))] = rule_type.0.as_slice() else {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} must be exactly one map with no type choices"
+        )));
+    };
+    let [group_choice] = group.0.as_slice() else {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} map must contain exactly one group choice"
+        )));
+    };
+
+    let mut keys = BTreeSet::new();
+    let mut field_six = None;
+    for entry in &group_choice.0 {
+        if entry.occur.is_some() {
+            return Err(ProtocolToolError::new(format!(
+                "{LABEL} numbered fields must not use occurrence operators"
+            )));
+        }
+        let GrpEntVal::Member(member) = &entry.val else {
+            return Err(ProtocolToolError::new(format!(
+                "{LABEL} must contain only direct numbered map members"
+            )));
+        };
+        let Some(member_key) = &member.key else {
+            return Err(ProtocolToolError::new(format!(
+                "{LABEL} map member is missing its numeric key"
+            )));
+        };
+        let MemberKeyVal::Value(CddlValue::Uint(key)) = &member_key.val else {
+            return Err(ProtocolToolError::new(format!(
+                "{LABEL} must use only unsigned-integer literal keys"
+            )));
+        };
+        if !member_key.cut {
+            return Err(ProtocolToolError::new(format!(
+                "{LABEL} field {key} must use closed-map cut semantics"
+            )));
+        }
+        if !keys.insert(*key) {
+            return Err(ProtocolToolError::new(format!(
+                "{LABEL} field {key} is duplicated"
+            )));
+        }
+        if *key == 6 {
+            field_six = Some(&member.value);
+        }
+    }
+    let Some(field_six) = field_six else {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} field 6 is missing"
+        )));
+    };
+    let [Type1::Simple(Type2::Typename(field_type))] = field_six.0.as_slice() else {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} field 6 must have one simple named type"
+        )));
+    };
+    if field_type.name != "catalog-exhaustive-count" || !field_type.generic_args.is_empty() {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} field 6 must have exact type catalog-exhaustive-count"
+        )));
+    }
+    Ok(())
+}
+
+fn v41_v6_unsigned_bytes(
+    value: &CanonicalValue,
+    signature_key: u64,
+    label: &str,
+) -> Result<Vec<u8>, ProtocolToolError> {
+    let CanonicalValue::Map(entries) = value else {
+        return Err(ProtocolToolError::new(format!("{label} must be a map")));
+    };
+    let mut removed = 0;
+    let unsigned = CanonicalValue::Map(
+        entries
+            .iter()
+            .filter_map(|(key, value)| {
+                if key == &CanonicalValue::Unsigned(signature_key) {
+                    removed += 1;
+                    None
+                } else {
+                    Some((key.clone(), value.clone()))
+                }
+            })
+            .collect(),
+    );
+    if removed != 1 {
+        return Err(ProtocolToolError::new(format!(
+            "{label} signature field drift"
+        )));
+    }
+    encode_deterministic_cbor(&unsigned)
+        .map_err(|error| ProtocolToolError::new(format!("encode unsigned {label}: {error}")))
+}
+
+fn v41_v6_verify(
+    key: [u8; 32],
+    domain: &[u8],
+    digest: [u8; 32],
+    signature: [u8; 64],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    let mut input = domain.to_vec();
+    input.extend_from_slice(&digest);
+    v40_verify_signature(key, &input, signature, label)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn validate_mls_v6_flow(
+    root: &Path,
+    vector: &Value,
+    cddl: &str,
+    candidate_key: [u8; 32],
+    controller_key: [u8; 32],
+    sequencer_key: [u8; 32],
+    completion_key: [u8; 32],
+) -> Result<(), ProtocolToolError> {
+    let cross = v40_json_field(vector, "cross_bindings", "MLS Sequencer V6 vector")?;
+    require_exact_object_keys(
+        cross,
+        &[
+            "identity_id",
+            "candidate_device_id",
+            "controller_device_id",
+            "request_id",
+            "request_digest_hex",
+            "grant_digest_hex",
+            "offer_digest_hex",
+            "delivery_receipt_digest_hex",
+            "key_package_publish_receipt_digest_hex",
+            "key_package_claim_receipt_digest_hex",
+            "catalog_generation",
+            "catalog_head_digest_hex",
+            "catalog_leaf_count",
+            "catalog_merkle_root_hex",
+            "catalog_index",
+            "catalog_leaf_cbor_hex",
+            "catalog_leaf_digest_hex",
+            "scope_cbor_hex",
+            "scope_digest_hex",
+            "identity_h",
+            "identity_h_plus_one",
+        ],
+        "MLS Sequencer V6 cross bindings",
+    )?;
+    validate_mls_v6_stage_a_links(root, cross)?;
+    let flow = v40_json_field(vector, "flow", "MLS Sequencer V6 vector")?;
+    require_exact_object_keys(
+        flow,
+        &[
+            "recovery_add",
+            "confirmation",
+            "activation",
+            "readback",
+            "completion",
+            "routing",
+        ],
+        "MLS Sequencer V6 flow",
+    )?;
+    let add = v40_json_field(flow, "recovery_add", "MLS Sequencer V6 flow")?;
+    require_exact_object_keys(
+        add,
+        &[
+            "request_cbor_hex",
+            "request_digest_hex",
+            "controller_transcript_cbor_hex",
+            "controller_consent_digest_hex",
+            "controller_signature_hex",
+            "commit_hex",
+            "commit_digest_hex",
+            "welcome_hex",
+            "welcome_digest_hex",
+            "head_transcript_cbor_hex",
+            "result_head_digest_hex",
+            "receipt_cbor_hex",
+            "receipt_digest_hex",
+            "receipt_signature_hex",
+            "signed_receipt_cbor_hex",
+            "state",
+        ],
+        "MLS Sequencer V6 recovery add",
+    )?;
+    if json_string(add, "state")? != "welcome_pending" {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V6 must begin welcome_pending",
+        ));
+    }
+    let (request_bytes, request) = v40_decode_exact_cddl(
+        "mls-recovery-add-request-v6",
+        cddl,
+        json_string(add, "request_cbor_hex")?,
+        "MLS recovery add V6",
+    )?;
+    let fields = v40_numbered_fields(&request, 35, "MLS recovery add V6")?;
+    if v40_unsigned(fields[0], "V6 version")? != 6
+        || v40_text(fields[3], "V6 origin identity")? != json_string(cross, "identity_id")?
+        || fields[3] != fields[4]
+        || v40_text(fields[5], "V6 candidate")? != json_string(cross, "candidate_device_id")?
+        || v40_text(fields[6], "V6 controller")? != json_string(cross, "controller_device_id")?
+        || v40_fixed_bytes::<32>(fields[7], "V6 controller key")? != controller_key
+        || v40_text(fields[8], "V6 request id")? != json_string(cross, "request_id")?
+    {
+        return Err(ProtocolToolError::new(
+            "MLS recovery add V6 identity/origin/candidate/controller linkage drift",
+        ));
+    }
+    for value in [
+        v40_text(fields[1], "V6 submission")?,
+        v40_text(fields[5], "V6 candidate")?,
+        v40_text(fields[6], "V6 controller")?,
+        v40_text(fields[8], "V6 request id")?,
+    ] {
+        validate_uuid_v7(value)?;
+    }
+    validate_identity_id(
+        v40_text(fields[3], "V6 identity")?,
+        "MLS recovery add V6 identity",
+    )?;
+    let expected_hex_fields = [
+        (9, "request_digest_hex"),
+        (10, "grant_digest_hex"),
+        (11, "offer_digest_hex"),
+        (12, "delivery_receipt_digest_hex"),
+        (13, "key_package_publish_receipt_digest_hex"),
+        (14, "key_package_claim_receipt_digest_hex"),
+        (16, "catalog_head_digest_hex"),
+        (18, "catalog_merkle_root_hex"),
+        (21, "catalog_leaf_digest_hex"),
+        (22, "scope_digest_hex"),
+    ];
+    for (index, name) in expected_hex_fields {
+        if v40_fixed_bytes::<32>(fields[index], name)?
+            != decode_lower_hex_fixed::<32>(json_string(cross, name)?)?
+        {
+            return Err(ProtocolToolError::new(format!(
+                "MLS recovery add V6 cross-binding drift: {name}"
+            )));
+        }
+    }
+    if v40_unsigned(fields[15], "catalog generation")?
+        != v41_json_u64(cross, "catalog_generation", "V6 cross")?
+        || v40_unsigned(fields[17], "catalog count")?
+            != v41_json_u64(cross, "catalog_leaf_count", "V6 cross")?
+        || v40_unsigned(fields[19], "catalog index")?
+            != v41_json_u64(cross, "catalog_index", "V6 cross")?
+        || v40_bytes(fields[20], "opaque catalog leaf")?
+            != decode_hex(json_string(cross, "catalog_leaf_cbor_hex")?)?
+        || encode_deterministic_cbor(fields[2])
+            .map_err(|error| ProtocolToolError::new(format!("encode V6 scope: {error}")))?
+            != decode_hex(json_string(cross, "scope_cbor_hex")?)?
+    {
+        return Err(ProtocolToolError::new(
+            "MLS recovery add V6 catalog/count/index/opaque-leaf/scope linkage drift",
+        ));
+    }
+    let h = v40_unsigned(fields[23], "identity H")?;
+    let h1 = v40_unsigned(fields[24], "identity H+1")?;
+    if h != v41_json_u64(cross, "identity_h", "V6 cross")?
+        || h1 != v41_json_u64(cross, "identity_h_plus_one", "V6 cross")?
+        || h.checked_add(1) != Some(h1)
+    {
+        return Err(ProtocolToolError::new(
+            "MLS recovery add V6 must bind exact H/H+1",
+        ));
+    }
+    let commit = decode_hex(json_string(add, "commit_hex")?)?;
+    let welcome = decode_hex(json_string(add, "welcome_hex")?)?;
+    let commit_digest = v40_digest(b"dirextalk.mls-opaque-commit.v1\0", &commit);
+    let welcome_digest = v40_digest(b"dirextalk.mls-opaque-welcome.v1\0", &welcome);
+    if v40_bytes(fields[27], "V6 Commit")? != commit
+        || v40_fixed_bytes::<32>(fields[28], "V6 Commit digest")? != commit_digest
+        || v40_bytes(fields[29], "V6 Welcome")? != welcome
+        || v40_fixed_bytes::<32>(fields[30], "V6 Welcome digest")? != welcome_digest
+    {
+        return Err(ProtocolToolError::new(
+            "MLS recovery add V6 Commit/Welcome linkage drift",
+        ));
+    }
+    v40_require_json_digest(add, "commit_digest_hex", commit_digest, "V6 Commit")?;
+    v40_require_json_digest(add, "welcome_digest_hex", welcome_digest, "V6 Welcome")?;
+    let route_transcript = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), fields[22].clone()),
+        (CanonicalValue::Unsigned(2), fields[16].clone()),
+        (CanonicalValue::Unsigned(3), fields[21].clone()),
+        (CanonicalValue::Unsigned(4), fields[26].clone()),
+    ]);
+    let route_bytes = encode_deterministic_cbor(&route_transcript)
+        .map_err(|error| ProtocolToolError::new(format!("encode V6 route proof: {error}")))?;
+    if v40_fixed_bytes::<32>(fields[31], "V6 route proof")?
+        != v40_digest(b"dirextalk.mls-recovery-route-proof.v6\0", &route_bytes)
+    {
+        return Err(ProtocolToolError::new(
+            "MLS recovery add V6 route proof drift",
+        ));
+    }
+    let (controller_bytes, controller_value) = v40_decode_exact_cddl(
+        "mls-recovery-controller-consent-transcript-v6",
+        cddl,
+        json_string(add, "controller_transcript_cbor_hex")?,
+        "V6 controller transcript",
+    )?;
+    let CanonicalValue::Map(request_entries) = &request else {
+        unreachable!()
+    };
+    let expected_controller = CanonicalValue::Map(
+        request_entries
+            .iter()
+            .filter(|(key, _)| {
+                key != &CanonicalValue::Unsigned(33) && key != &CanonicalValue::Unsigned(34)
+            })
+            .cloned()
+            .collect(),
+    );
+    if controller_value != expected_controller {
+        return Err(ProtocolToolError::new(
+            "V6 controller transcript escaped the exact recovery facts",
+        ));
+    }
+    let controller_digest = v40_digest(
+        b"dirextalk.mls-recovery-controller-consent.v6\0",
+        &controller_bytes,
+    );
+    let controller_signature =
+        decode_lower_hex_fixed::<64>(json_string(add, "controller_signature_hex")?)?;
+    v40_require_json_digest(
+        add,
+        "controller_consent_digest_hex",
+        controller_digest,
+        "V6 controller consent",
+    )?;
+    if v40_fixed_bytes::<32>(fields[32], "V6 controller digest")? != controller_digest
+        || v40_fixed_bytes::<64>(fields[33], "V6 controller signature")? != controller_signature
+    {
+        return Err(ProtocolToolError::new("V6 controller proof wrapper drift"));
+    }
+    v41_v6_verify(
+        controller_key,
+        b"dirextalk.mls-recovery-controller-consent-signature.v6\0",
+        controller_digest,
+        controller_signature,
+        "V6 controller consent",
+    )?;
+    let request_digest = v40_digest(b"dirextalk.mls-recovery-add-request.v6\0", &request_bytes);
+    v40_require_json_digest(
+        add,
+        "request_digest_hex",
+        request_digest,
+        "V6 recovery add request",
+    )?;
+
+    let (_, head) = v40_decode_exact_cddl(
+        "mls-recovery-head-transcript-v6",
+        cddl,
+        json_string(add, "head_transcript_cbor_hex")?,
+        "V6 MLS head transcript",
+    )?;
+    let head_fields = v40_numbered_fields(&head, 7, "V6 MLS head transcript")?;
+    let parent_epoch = v40_unsigned(fields[25], "V6 parent epoch")?;
+    if v40_unsigned(head_fields[2], "V6 admitted epoch")? != parent_epoch + 1
+        || head_fields[1] != fields[26]
+        || v40_fixed_bytes::<32>(head_fields[3], "head Commit")? != commit_digest
+        || v40_fixed_bytes::<32>(head_fields[4], "head Welcome")? != welcome_digest
+        || head_fields[5] != fields[4]
+        || head_fields[6] != fields[5]
+    {
+        return Err(ProtocolToolError::new(
+            "V6 exact parent H/H+1 MLS head linkage drift",
+        ));
+    }
+    let head_bytes = decode_hex(json_string(add, "head_transcript_cbor_hex")?)?;
+    let result_head = v40_digest(b"dirextalk.mls-sequencer-head.v1\0", &head_bytes);
+    v40_require_json_digest(add, "result_head_digest_hex", result_head, "V6 result head")?;
+    let (receipt_bytes, receipt) = v40_decode_exact_cddl(
+        "mls-recovery-add-receipt-v6",
+        cddl,
+        json_string(add, "receipt_cbor_hex")?,
+        "V6 recovery add receipt",
+    )?;
+    let receipt_fields = v40_numbered_fields(&receipt, 12, "V6 recovery add receipt")?;
+    if receipt_fields[1] != fields[1]
+        || receipt_fields[2] != fields[2]
+        || receipt_fields[3] != fields[4]
+        || receipt_fields[4] != fields[5]
+        || v40_fixed_bytes::<32>(receipt_fields[5], "receipt request")? != request_digest
+        || v40_unsigned(receipt_fields[6], "receipt epoch")? != parent_epoch + 1
+        || v40_fixed_bytes::<32>(receipt_fields[7], "receipt head")? != result_head
+        || v40_fixed_bytes::<32>(receipt_fields[8], "receipt Commit")? != commit_digest
+        || v40_fixed_bytes::<32>(receipt_fields[9], "receipt Welcome")? != welcome_digest
+        || receipt_fields[10] != fields[21]
+        || v40_unsigned(receipt_fields[11], "receipt state")? != 1
+    {
+        return Err(ProtocolToolError::new(
+            "V6 welcome_pending receipt linkage drift",
+        ));
+    }
+    let receipt_digest = v40_digest(b"dirextalk.mls-recovery-add-receipt.v6\0", &receipt_bytes);
+    v40_require_json_digest(add, "receipt_digest_hex", receipt_digest, "V6 add receipt")?;
+    validate_mls_v6_signed_wrapper(
+        add,
+        "signed_receipt_cbor_hex",
+        "signed-mls-recovery-add-receipt-v6",
+        cddl,
+        &receipt,
+        receipt_digest,
+        sequencer_key,
+        b"dirextalk.mls-recovery-add-receipt-signature.v6\0",
+        "V6 add receipt",
+    )?;
+
+    let confirmation = v40_json_field(flow, "confirmation", "V6 flow")?;
+    require_exact_object_keys(
+        confirmation,
+        &["cbor_hex", "digest_hex", "signature_hex", "state"],
+        "V6 confirmation",
+    )?;
+    if json_string(confirmation, "state")? != "confirmed_pending_activation" {
+        return Err(ProtocolToolError::new("V6 confirmation state drift"));
+    }
+    let (_, confirmation_value) = v40_decode_exact_cddl(
+        "mls-recovery-confirmation-v1",
+        cddl,
+        json_string(confirmation, "cbor_hex")?,
+        "V6 confirmation",
+    )?;
+    let confirmation_fields = v40_numbered_fields(&confirmation_value, 11, "V6 confirmation")?;
+    if confirmation_fields[1] != fields[1]
+        || confirmation_fields[2] != fields[4]
+        || confirmation_fields[3] != fields[5]
+        || v40_fixed_bytes::<32>(confirmation_fields[4], "confirmation request")? != request_digest
+        || v40_fixed_bytes::<32>(confirmation_fields[5], "confirmation receipt")? != receipt_digest
+        || confirmation_fields[6] != receipt_fields[6]
+        || v40_fixed_bytes::<32>(confirmation_fields[7], "confirmation head")? != result_head
+        || v40_fixed_bytes::<32>(confirmation_fields[8], "candidate key")? != candidate_key
+        || v40_unsigned(confirmation_fields[9], "confirmation state")? != 2
+    {
+        return Err(ProtocolToolError::new(
+            "V6 candidate confirmation linkage drift",
+        ));
+    }
+    let confirmation_digest = v40_digest(
+        b"dirextalk.mls-recovery-confirmation.v1\0",
+        &v41_v6_unsigned_bytes(&confirmation_value, 11, "V6 confirmation")?,
+    );
+    v40_require_json_digest(
+        confirmation,
+        "digest_hex",
+        confirmation_digest,
+        "V6 confirmation",
+    )?;
+    let confirmation_signature =
+        v40_fixed_bytes::<64>(confirmation_fields[10], "confirmation signature")?;
+    if confirmation_signature
+        != decode_lower_hex_fixed::<64>(json_string(confirmation, "signature_hex")?)?
+    {
+        return Err(ProtocolToolError::new(
+            "V6 confirmation signature wrapper drift",
+        ));
+    }
+    v41_v6_verify(
+        candidate_key,
+        b"dirextalk.mls-recovery-confirmation-signature.v1\0",
+        confirmation_digest,
+        confirmation_signature,
+        "V6 confirmation",
+    )?;
+
+    validate_mls_v6_activation_and_completion(
+        root,
+        flow,
+        cddl,
+        cross,
+        &fields,
+        request_digest,
+        receipt_digest,
+        confirmation_digest,
+        result_head,
+        candidate_key,
+        sequencer_key,
+        completion_key,
+    )
+}
+
+fn v41_json_u64(value: &Value, field: &str, label: &str) -> Result<u64, ProtocolToolError> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new(format!("{label}.{field} must be unsigned")))
+}
+
+fn validate_mls_v6_stage_a_links(root: &Path, cross: &Value) -> Result<(), ProtocolToolError> {
+    let history = read_json(
+        &root.join("protocol/test-vectors/history-recovery/v2/history-recovery-v2.json"),
+    )?;
+    let key_package =
+        read_json(&root.join("protocol/test-vectors/key-package/v3/key-package-v3.json"))?;
+    let catalog = read_json(
+        &root
+            .join("protocol/test-vectors/recovery-scope-catalog/v1/recovery-scope-catalog-v1.json"),
+    )?;
+    let history_request = v40_json_field(&history, "request", "History Recovery V3 vector")?;
+    let history_grant = v40_json_field(&history, "grant", "History Recovery V3 vector")?;
+    let history_offer = v40_json_field(&history, "offer", "History Recovery V3 vector")?;
+    let transition = v40_json_field(
+        &history,
+        "identity_transition",
+        "History Recovery V3 vector",
+    )?;
+    let publish = v40_json_field(&key_package, "publish", "KeyPackage V3 vector")?;
+    let claim = v40_json_field(&key_package, "claim", "KeyPackage V3 vector")?;
+    let kp_cross = v40_json_field(&key_package, "cross_bindings", "KeyPackage V3 vector")?;
+    let catalog_value = v40_json_field(&catalog, "catalog", "catalog vector")?;
+    let leaves = v40_json_array_field(catalog_value, "leaves", "catalog")?;
+    let first_leaf = leaves
+        .first()
+        .ok_or_else(|| ProtocolToolError::new("catalog leaf missing"))?;
+    let string_links = [
+        ("identity_id", kp_cross, "identity_id"),
+        ("candidate_device_id", kp_cross, "candidate_device_id"),
+        ("request_id", kp_cross, "request_id"),
+        ("request_digest_hex", history_request, "digest_hex"),
+        ("grant_digest_hex", history_grant, "digest_hex"),
+        ("offer_digest_hex", history_offer, "digest_hex"),
+        (
+            "delivery_receipt_digest_hex",
+            history_grant,
+            "delivery_receipt_digest_hex",
+        ),
+        (
+            "key_package_publish_receipt_digest_hex",
+            publish,
+            "receipt_digest_hex",
+        ),
+        (
+            "key_package_claim_receipt_digest_hex",
+            claim,
+            "receipt_digest_hex",
+        ),
+        ("catalog_head_digest_hex", catalog_value, "head_digest_hex"),
+        ("catalog_merkle_root_hex", catalog_value, "merkle_root_hex"),
+        ("catalog_leaf_cbor_hex", first_leaf, "leaf_cbor_hex"),
+        ("catalog_leaf_digest_hex", first_leaf, "leaf_digest_hex"),
+        ("scope_cbor_hex", first_leaf, "scope_cbor_hex"),
+        ("scope_digest_hex", first_leaf, "scope_digest_hex"),
+    ];
+    for (left, source, right) in string_links {
+        if json_string(cross, left)? != json_string(source, right)? {
+            return Err(ProtocolToolError::new(format!(
+                "MLS V6 Stage-A cross-read drift: {left}"
+            )));
+        }
+    }
+    if v41_json_u64(cross, "catalog_generation", "V6 cross")?
+        != v41_json_u64(catalog_value, "generation", "catalog")?
+        || v41_json_u64(cross, "catalog_leaf_count", "V6 cross")?
+            != u64::try_from(leaves.len()).expect("leaf count fits")
+        || v41_json_u64(cross, "catalog_index", "V6 cross")?
+            != v41_json_u64(first_leaf, "index", "catalog leaf")?
+        || v41_json_u64(cross, "identity_h", "V6 cross")?
+            != v41_json_u64(transition, "pre_sequence", "history transition")?
+        || v41_json_u64(cross, "identity_h_plus_one", "V6 cross")?
+            != v41_json_u64(transition, "post_sequence", "history transition")?
+    {
+        return Err(ProtocolToolError::new(
+            "MLS V6 Stage-A numeric cross-read drift",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_mls_v6_signed_wrapper(
+    object: &Value,
+    encoded_field: &str,
+    rule: &str,
+    cddl: &str,
+    expected_inner: &CanonicalValue,
+    expected_digest: [u8; 32],
+    expected_key: [u8; 32],
+    signature_domain: &[u8],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    let (_, signed) =
+        v40_decode_exact_cddl(rule, cddl, json_string(object, encoded_field)?, label)?;
+    let signed_fields = v40_numbered_fields(&signed, 4, label)?;
+    let signature = v40_fixed_bytes::<64>(signed_fields[3], label)?;
+    if signed_fields[0] != expected_inner
+        || v40_fixed_bytes::<32>(signed_fields[1], label)? != expected_digest
+        || v40_fixed_bytes::<32>(signed_fields[2], label)? != expected_key
+        || decode_lower_hex_fixed::<64>(json_string(object, "receipt_signature_hex")?)? != signature
+    {
+        return Err(ProtocolToolError::new(format!(
+            "{label} wrapper linkage drift"
+        )));
+    }
+    v41_v6_verify(
+        expected_key,
+        signature_domain,
+        expected_digest,
+        signature,
+        label,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn validate_mls_v6_activation_and_completion(
+    root: &Path,
+    flow: &Value,
+    cddl: &str,
+    cross: &Value,
+    add_fields: &[&CanonicalValue],
+    request_digest: [u8; 32],
+    add_receipt_digest: [u8; 32],
+    confirmation_digest: [u8; 32],
+    result_head: [u8; 32],
+    candidate_key: [u8; 32],
+    sequencer_key: [u8; 32],
+    completion_key: [u8; 32],
+) -> Result<(), ProtocolToolError> {
+    let activation = v40_json_field(flow, "activation", "V6 flow")?;
+    require_exact_object_keys(
+        activation,
+        &[
+            "command_cbor_hex",
+            "command_digest_hex",
+            "candidate_signature_hex",
+            "receipt_cbor_hex",
+            "receipt_digest_hex",
+            "receipt_signature_hex",
+            "signed_receipt_cbor_hex",
+            "state",
+        ],
+        "V6 activation",
+    )?;
+    if json_string(activation, "state")? != "activated_fenced" {
+        return Err(ProtocolToolError::new(
+            "V6 activation must remain activated_fenced",
+        ));
+    }
+    let (_, command) = v40_decode_exact_cddl(
+        "mls-recovery-activation-command-v1",
+        cddl,
+        json_string(activation, "command_cbor_hex")?,
+        "V6 activation command",
+    )?;
+    let command_fields = v40_numbered_fields(&command, 17, "V6 activation command")?;
+    if command_fields[2] != add_fields[1]
+        || command_fields[3] != add_fields[4]
+        || command_fields[4] != add_fields[5]
+        || v40_fixed_bytes::<32>(command_fields[5], "activation request")? != request_digest
+        || command_fields[6] != add_fields[16]
+        || command_fields[7] != add_fields[21]
+        || v40_fixed_bytes::<32>(command_fields[8], "activation confirmation")?
+            != confirmation_digest
+        || *command_fields[9]
+            != CanonicalValue::Unsigned(v40_unsigned(add_fields[25], "parent epoch")? + 1)
+        || v40_fixed_bytes::<32>(command_fields[10], "activation current head")? != result_head
+        || v40_fixed_bytes::<32>(command_fields[11], "activation candidate key")? != candidate_key
+        || v40_unsigned(command_fields[13], "activation issued")?
+            >= v40_unsigned(command_fields[14], "activation expiry")?
+        || v40_unsigned(command_fields[16], "activation prior state")? != 2
+    {
+        return Err(ProtocolToolError::new(
+            "V6 activation command does not bind the exact current authority-local MLS head",
+        ));
+    }
+    let command_digest = v40_digest(
+        b"dirextalk.mls-recovery-activation-command.v1\0",
+        &v41_v6_unsigned_bytes(&command, 13, "V6 activation command")?,
+    );
+    v40_require_json_digest(
+        activation,
+        "command_digest_hex",
+        command_digest,
+        "V6 activation command",
+    )?;
+    let command_signature = v40_fixed_bytes::<64>(command_fields[12], "activation signature")?;
+    if command_signature
+        != decode_lower_hex_fixed::<64>(json_string(activation, "candidate_signature_hex")?)?
+    {
+        return Err(ProtocolToolError::new(
+            "V6 activation signature wrapper drift",
+        ));
+    }
+    v41_v6_verify(
+        candidate_key,
+        b"dirextalk.mls-recovery-activation-signature.v1\0",
+        command_digest,
+        command_signature,
+        "V6 activation command",
+    )?;
+
+    let (activation_receipt_bytes, activation_receipt) = v40_decode_exact_cddl(
+        "mls-recovery-activation-receipt-v1",
+        cddl,
+        json_string(activation, "receipt_cbor_hex")?,
+        "V6 activation receipt",
+    )?;
+    let receipt_fields = v40_numbered_fields(&activation_receipt, 20, "V6 activation receipt")?;
+    if receipt_fields[1] != add_fields[3]
+        || v40_fixed_bytes::<32>(receipt_fields[2], "activation sequencer key")? != sequencer_key
+        || receipt_fields[3] != add_fields[4]
+        || receipt_fields[4] != add_fields[5]
+        || v40_text(receipt_fields[5], "activation request id")?
+            != json_string(cross, "request_id")?
+        || v40_fixed_bytes::<32>(receipt_fields[6], "activation History request")?
+            != decode_lower_hex_fixed::<32>(json_string(cross, "request_digest_hex")?)?
+        || receipt_fields[7] != add_fields[16]
+        || receipt_fields[8] != add_fields[17]
+        || receipt_fields[9] != add_fields[19]
+        || receipt_fields[10] != add_fields[21]
+        || receipt_fields[11] != add_fields[1]
+        || receipt_fields[12] != add_fields[28]
+        || receipt_fields[13] != command_fields[1]
+        || v40_fixed_bytes::<32>(receipt_fields[14], "activation command digest")? != command_digest
+        || receipt_fields[15] != command_fields[9]
+        || v40_fixed_bytes::<32>(receipt_fields[16], "activation head")? != result_head
+        || v40_unsigned(receipt_fields[17], "activated_at")?
+            < v40_unsigned(command_fields[13], "issued_at")?
+        || receipt_fields[18] != command_fields[14]
+        || v40_unsigned(receipt_fields[19], "activation receipt state")? != 3
+    {
+        return Err(ProtocolToolError::new(
+            "V6 authority activation receipt field linkage drift",
+        ));
+    }
+    let activation_receipt_digest = v40_digest(
+        b"dirextalk.mls-recovery-activation-receipt.v1\0",
+        &activation_receipt_bytes,
+    );
+    v40_require_json_digest(
+        activation,
+        "receipt_digest_hex",
+        activation_receipt_digest,
+        "V6 activation receipt",
+    )?;
+    validate_mls_v6_signed_wrapper(
+        activation,
+        "signed_receipt_cbor_hex",
+        "signed-mls-recovery-activation-receipt-v1",
+        cddl,
+        &activation_receipt,
+        activation_receipt_digest,
+        sequencer_key,
+        b"dirextalk.mls-recovery-activation-receipt-signature.v1\0",
+        "V6 activation receipt",
+    )?;
+
+    let readback = v40_json_field(flow, "readback", "V6 flow")?;
+    require_exact_object_keys(
+        readback,
+        &["cbor_hex", "returned_only_if"],
+        "V6 activation readback",
+    )?;
+    if json_string(readback, "returned_only_if")?
+        != "candidate/request/leaf/head current and activated_fenced"
+    {
+        return Err(ProtocolToolError::new(
+            "V6 readback currentness invariant drift",
+        ));
+    }
+    let (_, readback_value) = v40_decode_exact_cddl(
+        "mls-recovery-activation-readback-v1",
+        cddl,
+        json_string(readback, "cbor_hex")?,
+        "V6 activation readback",
+    )?;
+    let readback_fields = v40_numbered_fields(&readback_value, 10, "V6 activation readback")?;
+    if readback_fields[1] != add_fields[2]
+        || readback_fields[2] != add_fields[1]
+        || readback_fields[3] != add_fields[5]
+        || readback_fields[4] != add_fields[9]
+        || readback_fields[5] != add_fields[21]
+        || readback_fields[6] != command_fields[9]
+        || readback_fields[7] != command_fields[10]
+        || v40_unsigned(readback_fields[8], "readback state")? != 3
+        || v40_bytes(readback_fields[9], "readback receipt")?
+            != decode_hex(json_string(activation, "signed_receipt_cbor_hex")?)?
+    {
+        return Err(ProtocolToolError::new(
+            "V6 hardened activation readback coordinate drift",
+        ));
+    }
+
+    let completion = v40_json_field(flow, "completion", "V6 flow")?;
+    require_exact_object_keys(
+        completion,
+        &[
+            "identity_completion_receipt_cbor_hex",
+            "identity_completion_receipt_digest_hex",
+            "identity_completion_signature_hex",
+            "activation_set_leaf_digest_hex",
+            "activation_set_count",
+            "activation_set_root_hex",
+            "presentation_cbor_hex",
+            "presentation_digest_hex",
+            "candidate_signature_hex",
+            "receipt_cbor_hex",
+            "receipt_digest_hex",
+            "receipt_signature_hex",
+            "signed_receipt_cbor_hex",
+        ],
+        "V6 completion",
+    )?;
+    validate_history_recovery_v2(root)?;
+    let history_cddl =
+        read(&root.join("protocol/cddl/history-recovery/v2/history-recovery-v2.cddl"))?;
+    let history_vector = read_json(
+        &root.join("protocol/test-vectors/history-recovery/v2/history-recovery-v2.json"),
+    )?;
+    let history_completion =
+        v40_json_field(&history_vector, "completion", "History completion vector")?;
+    let history_receipt =
+        v40_json_field(history_completion, "receipt", "History completion vector")?;
+    let history_descriptor_object = v40_json_field(
+        &history_vector,
+        "completion_key_descriptor",
+        "History completion vector",
+    )?;
+    let mut history_descriptor_for_validation = history_descriptor_object.clone();
+    history_descriptor_for_validation
+        .as_object_mut()
+        .ok_or_else(|| ProtocolToolError::new("History completion descriptor must be an object"))?
+        .remove("tls_origin_bound");
+    let history_descriptor = validate_history_completion_descriptor(
+        &history_descriptor_for_validation,
+        &history_cddl,
+        "history-recovery-completion-key-descriptor-v1",
+        b"dirextalk.history-recovery-completion-key-descriptor.v1\0",
+        b"dirextalk.history-recovery-completion-key-descriptor-signature.v1\0",
+        "MLS V6 History completion key descriptor",
+    )?;
+    if completion_key != history_descriptor.public_key {
+        return Err(ProtocolToolError::new(
+            "MLS V6 completion key is not the exact History completion key",
+        ));
+    }
+
+    let identity_completion_bytes = decode_hex(json_string(
+        completion,
+        "identity_completion_receipt_cbor_hex",
+    )?)?;
+    if identity_completion_bytes != decode_hex(json_string(history_receipt, "signed_cbor_hex")?)? {
+        return Err(ProtocolToolError::new(
+            "MLS V6 did not present the exact signed History completion receipt",
+        ));
+    }
+    let identity_completion = v40_decode_exact_bytes(
+        &identity_completion_bytes,
+        "exact signed History completion receipt",
+    )?;
+    cddl_cat::validate_cbor_bytes(
+        "signed-history-recovery-completion-receipt-v1",
+        &history_cddl,
+        &identity_completion_bytes,
+    )
+    .map_err(|error| {
+        ProtocolToolError::new(format!(
+            "CDDL rejected exact signed History completion receipt: {error}"
+        ))
+    })?;
+    let identity_fields = v40_numbered_fields(
+        &identity_completion,
+        5,
+        "exact signed History completion receipt",
+    )?;
+    let identity_receipt_bytes =
+        encode_deterministic_cbor(identity_fields[0]).map_err(|error| {
+            ProtocolToolError::new(format!(
+                "re-encode exact History completion receipt: {error}"
+            ))
+        })?;
+    if identity_receipt_bytes != decode_hex(json_string(history_receipt, "inner_cbor_hex")?)? {
+        return Err(ProtocolToolError::new(
+            "MLS V6 History completion receipt did not re-encode byte-identically",
+        ));
+    }
+    let identity_receipt_fields =
+        v40_numbered_fields(identity_fields[0], 31, "exact History completion receipt")?;
+    let identity_completion_digest = v40_digest(
+        b"dirextalk.history-recovery-completion-receipt.v1\0",
+        &identity_receipt_bytes,
+    );
+    v40_require_json_digest(
+        completion,
+        "identity_completion_receipt_digest_hex",
+        identity_completion_digest,
+        "identity completion receipt",
+    )?;
+    if v40_fixed_bytes::<32>(identity_fields[1], "History completion receipt digest")?
+        != identity_completion_digest
+        || v40_bytes(identity_fields[2], "History completion key descriptor")?
+            != history_descriptor.exact
+        || v40_fixed_bytes::<32>(identity_fields[3], "History completion descriptor digest")?
+            != history_descriptor.digest
+    {
+        return Err(ProtocolToolError::new(
+            "signed History completion receipt wrapper drift",
+        ));
+    }
+    let identity_signature =
+        v40_fixed_bytes::<64>(identity_fields[4], "History completion receipt signature")?;
+    if identity_signature
+        != decode_lower_hex_fixed::<64>(json_string(
+            completion,
+            "identity_completion_signature_hex",
+        )?)?
+    {
+        return Err(ProtocolToolError::new(
+            "History completion signature wrapper drift",
+        ));
+    }
+    v41_v6_verify(
+        completion_key,
+        b"dirextalk.history-recovery-completion-receipt-signature.v1\0",
+        identity_completion_digest,
+        identity_signature,
+        "exact History completion receipt",
+    )?;
+
+    let activation_count = v40_unsigned(
+        identity_receipt_fields[23],
+        "History completion activation-set count",
+    )?;
+    let activation_root = v40_fixed_bytes::<32>(
+        identity_receipt_fields[24],
+        "History completion activation-set root",
+    )?;
+    if activation_count != v41_json_u64(completion, "activation_set_count", "V6 completion")?
+        || activation_count
+            != v41_json_u64(
+                history_completion,
+                "activation_set_count",
+                "History completion",
+            )?
+        || activation_root
+            != decode_lower_hex_fixed::<32>(json_string(
+                history_completion,
+                "activation_set_root_hex",
+            )?)?
+    {
+        return Err(ProtocolToolError::new(
+            "MLS V6 activation-set count/root escaped the signed History receipt",
+        ));
+    }
+    let history_activation_entries = v40_json_array_field(
+        history_completion,
+        "activation_entries",
+        "History completion",
+    )?;
+    if usize::try_from(activation_count).ok() != Some(history_activation_entries.len()) {
+        return Err(ProtocolToolError::new(
+            "MLS V6 History completion activation-set count drift",
+        ));
+    }
+    let history_first_activation = history_activation_entries
+        .first()
+        .ok_or_else(|| ProtocolToolError::new("History completion activation set is empty"))?;
+    let completion_leaf = decode_lower_hex_fixed::<32>(json_string(
+        history_first_activation,
+        "activation_leaf_digest_hex",
+    )?)?;
+    v40_require_json_digest(
+        completion,
+        "activation_set_leaf_digest_hex",
+        completion_leaf,
+        "exact History completion activation-set leaf",
+    )?;
+    let history_proof_index = v41_json_u64(
+        history_first_activation,
+        "proof_index",
+        "History completion activation entry",
+    )?;
+    let history_proof = v40_json_array_field(
+        history_first_activation,
+        "proof_hex",
+        "History completion activation entry",
+    )?;
+
+    let (_, presentation) = v40_decode_exact_cddl(
+        "mls-recovery-completion-presentation-v1",
+        cddl,
+        json_string(completion, "presentation_cbor_hex")?,
+        "V6 completion presentation",
+    )?;
+    let presentation_fields = v40_numbered_fields(&presentation, 15, "V6 completion presentation")?;
+    if presentation_fields[2] != add_fields[4]
+        || presentation_fields[3] != add_fields[5]
+        || presentation_fields[4] != add_fields[9]
+        || v40_bytes(presentation_fields[5], "presentation activation receipt")?
+            != decode_hex(json_string(activation, "signed_receipt_cbor_hex")?)?
+        || v40_fixed_bytes::<32>(presentation_fields[6], "presentation activation digest")?
+            != activation_receipt_digest
+        || v40_bytes(presentation_fields[7], "presentation completion receipt")?
+            != identity_completion_bytes
+        || v40_fixed_bytes::<32>(presentation_fields[8], "presentation completion digest")?
+            != identity_completion_digest
+        || v40_fixed_bytes::<32>(presentation_fields[9], "completion root")? != activation_root
+        || v40_unsigned(presentation_fields[10], "completion inclusion index")?
+            != history_proof_index
+        || v40_fixed_bytes::<32>(presentation_fields[12], "presentation completion key")?
+            != completion_key
+    {
+        return Err(ProtocolToolError::new(
+            "V6 completion presentation exact-receipt linkage drift",
+        ));
+    }
+    let proof = v40_array(presentation_fields[11], "completion inclusion proof")?;
+    if history_proof_index != 0
+        || proof.len() != history_proof.len()
+        || proof.iter().zip(history_proof).any(|(actual, expected)| {
+            v40_fixed_bytes::<32>(actual, "completion sibling").ok()
+                != expected
+                    .as_str()
+                    .and_then(|value| decode_lower_hex_fixed::<32>(value).ok())
+        })
+    {
+        return Err(ProtocolToolError::new(
+            "V6 completion did not present the exact History inclusion proof",
+        ));
+    }
+    let mut node_input = completion_leaf.to_vec();
+    node_input.extend_from_slice(v40_bytes(&proof[0], "completion sibling")?);
+    if v40_digest(
+        b"dirextalk.history-recovery-completion-activation-node.v1\0",
+        &node_input,
+    ) != activation_root
+    {
+        return Err(ProtocolToolError::new(
+            "V6 exact History inclusion proof/root mismatch",
+        ));
+    }
+    v40_require_json_digest(
+        completion,
+        "activation_set_root_hex",
+        activation_root,
+        "completion activation-set root",
+    )?;
+    let presentation_digest = v40_digest(
+        b"dirextalk.mls-recovery-completion-presentation.v1\0",
+        &v41_v6_unsigned_bytes(&presentation, 14, "completion presentation")?,
+    );
+    v40_require_json_digest(
+        completion,
+        "presentation_digest_hex",
+        presentation_digest,
+        "completion presentation",
+    )?;
+    let presentation_signature =
+        v40_fixed_bytes::<64>(presentation_fields[13], "presentation signature")?;
+    if presentation_signature
+        != decode_lower_hex_fixed::<64>(json_string(completion, "candidate_signature_hex")?)?
+    {
+        return Err(ProtocolToolError::new(
+            "completion presentation signature wrapper drift",
+        ));
+    }
+    v41_v6_verify(
+        completion_key,
+        b"dirextalk.mls-recovery-completion-presentation-signature.v1\0",
+        presentation_digest,
+        presentation_signature,
+        "completion presentation",
+    )?;
+
+    let (completion_receipt_bytes, completion_receipt) = v40_decode_exact_cddl(
+        "mls-recovery-completion-receipt-v1",
+        cddl,
+        json_string(completion, "receipt_cbor_hex")?,
+        "V6 completion receipt",
+    )?;
+    let completion_receipt_fields =
+        v40_numbered_fields(&completion_receipt, 10, "V6 completion receipt")?;
+    if completion_receipt_fields[1] != presentation_fields[1]
+        || completion_receipt_fields[2] != command_fields[1]
+        || v40_fixed_bytes::<32>(completion_receipt_fields[3], "completion presentation")?
+            != presentation_digest
+        || v40_fixed_bytes::<32>(completion_receipt_fields[4], "identity completion")?
+            != identity_completion_digest
+        || v40_fixed_bytes::<32>(completion_receipt_fields[5], "completion root")?
+            != activation_root
+        || completion_receipt_fields[6] != presentation_fields[10]
+        || v40_unsigned(completion_receipt_fields[7], "completion state")? != 3
+        || completion_receipt_fields[8] != &CanonicalValue::Bool(true)
+    {
+        return Err(ProtocolToolError::new(
+            "V6 completion-cache receipt linkage drift",
+        ));
+    }
+    let completion_receipt_digest = v40_digest(
+        b"dirextalk.mls-recovery-completion-receipt.v1\0",
+        &completion_receipt_bytes,
+    );
+    v40_require_json_digest(
+        completion,
+        "receipt_digest_hex",
+        completion_receipt_digest,
+        "V6 completion receipt",
+    )?;
+    validate_mls_v6_signed_wrapper(
+        completion,
+        "signed_receipt_cbor_hex",
+        "signed-mls-recovery-completion-receipt-v1",
+        cddl,
+        &completion_receipt,
+        completion_receipt_digest,
+        sequencer_key,
+        b"dirextalk.mls-recovery-completion-receipt-signature.v1\0",
+        "V6 completion receipt",
+    )?;
+
+    let routing = v40_json_field(flow, "routing", "V6 flow")?;
+    require_exact_object_keys(
+        routing,
+        &[
+            "legacy_active",
+            "mls_state",
+            "matching_valid_completion_cache",
+            "route_allowed",
+            "activation_without_completion_route_allowed",
+            "cached_completion_receipt_digest_hex",
+        ],
+        "V6 routing",
+    )?;
+    if routing.get("legacy_active").and_then(Value::as_bool) != Some(false)
+        || json_string(routing, "mls_state")? != "activated_fenced"
+        || routing
+            .get("matching_valid_completion_cache")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || routing.get("route_allowed").and_then(Value::as_bool) != Some(true)
+        || routing
+            .get("activation_without_completion_route_allowed")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(ProtocolToolError::new(
+            "V6 routing must be legacy active OR fenced+matching completion; activation alone never routes",
+        ));
+    }
+    v40_require_json_digest(
+        routing,
+        "cached_completion_receipt_digest_hex",
+        completion_receipt_digest,
+        "V6 completion cache",
+    )?;
+    let _ = add_receipt_digest;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_mls_v6_invalid(
+    vector: &Value,
+    cddl: &str,
+    sequencer_key: [u8; 32],
+) -> Result<(), ProtocolToolError> {
+    let invalid = v40_json_array_field(vector, "invalid_cbor", "MLS Sequencer V6 vector")?;
+    let expected = [
+        ("missing_field", "mls-recovery-add-request-v6"),
+        ("unknown_field", "mls-recovery-add-request-v6"),
+        ("noncanonical_integer", "mls-recovery-add-request-v6"),
+        ("wrong_h_plus_one", "mls-recovery-add-request-v6"),
+        ("wrong_catalog_head", "mls-recovery-add-request-v6"),
+        ("wrong_catalog_leaf", "mls-recovery-add-request-v6"),
+        ("wrong_welcome", "mls-recovery-add-request-v6"),
+        (
+            "stale_activation_head",
+            "mls-recovery-activation-command-v1",
+        ),
+        (
+            "activation_receipt_signature",
+            "signed-mls-recovery-activation-receipt-v1",
+        ),
+        (
+            "activation_receipt_digest",
+            "signed-mls-recovery-activation-receipt-v1",
+        ),
+        (
+            "presentation_inclusion",
+            "mls-recovery-completion-presentation-v1",
+        ),
+        (
+            "presentation_root",
+            "mls-recovery-completion-presentation-v1",
+        ),
+        (
+            "completion_mismatch",
+            "mls-recovery-completion-presentation-v1",
+        ),
+    ];
+    if invalid.len() != expected.len() {
+        return Err(ProtocolToolError::new(
+            "MLS Sequencer V6 invalid family drift",
+        ));
+    }
+    let cross = v40_json_field(vector, "cross_bindings", "V6 vector")?;
+    let flow = v40_json_field(vector, "flow", "V6 vector")?;
+    let add = v40_json_field(flow, "recovery_add", "V6 flow")?;
+    let activation = v40_json_field(flow, "activation", "V6 flow")?;
+    let completion = v40_json_field(flow, "completion", "V6 flow")?;
+    let result_head = decode_lower_hex_fixed::<32>(json_string(add, "result_head_digest_hex")?)?;
+    let expected_activation_digest =
+        decode_lower_hex_fixed::<32>(json_string(activation, "receipt_digest_hex")?)?;
+    let expected_history_receipt = decode_hex(json_string(
+        completion,
+        "identity_completion_receipt_cbor_hex",
+    )?)?;
+    let expected_history_leaf =
+        decode_lower_hex_fixed::<32>(json_string(completion, "activation_set_leaf_digest_hex")?)?;
+    for ((expected_label, expected_rule), item) in expected.into_iter().zip(invalid) {
+        require_exact_object_keys(
+            item,
+            &["label", "rule", "cbor_hex"],
+            "MLS Sequencer V6 invalid specimen",
+        )?;
+        let label = json_string(item, "label")?;
+        let rule = json_string(item, "rule")?;
+        if label != expected_label || rule != expected_rule {
+            return Err(ProtocolToolError::new(
+                "MLS Sequencer V6 invalid label/rule drift",
+            ));
+        }
+        let bytes = decode_hex(json_string(item, "cbor_hex")?)?;
+        match label {
+            "noncanonical_integer" => {
+                if decode_deterministic_cbor(&bytes).is_ok() {
+                    return Err(ProtocolToolError::new(
+                        "V6 noncanonical specimen was accepted",
+                    ));
+                }
+            }
+            "missing_field" | "unknown_field" => {
+                v40_decode_exact_bytes(&bytes, label)?;
+                if cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).is_ok() {
+                    return Err(ProtocolToolError::new(format!("V6 CDDL accepted {label}")));
+                }
+            }
+            "wrong_h_plus_one" | "wrong_catalog_head" | "wrong_catalog_leaf" | "wrong_welcome" => {
+                let value = v40_decode_exact_bytes(&bytes, label)?;
+                cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).map_err(|error| {
+                    ProtocolToolError::new(format!("V6 semantic invalid must pass CDDL: {error}"))
+                })?;
+                let fields = v40_numbered_fields(&value, 35, label)?;
+                let rejected = match label {
+                    "wrong_h_plus_one" => {
+                        v40_unsigned(fields[23], label)?.checked_add(1)
+                            != Some(v40_unsigned(fields[24], label)?)
+                    }
+                    "wrong_catalog_head" => {
+                        v40_fixed_bytes::<32>(fields[16], label)?
+                            != decode_lower_hex_fixed::<32>(json_string(
+                                cross,
+                                "catalog_head_digest_hex",
+                            )?)?
+                    }
+                    "wrong_catalog_leaf" => {
+                        v40_fixed_bytes::<32>(fields[21], label)?
+                            != decode_lower_hex_fixed::<32>(json_string(
+                                cross,
+                                "catalog_leaf_digest_hex",
+                            )?)?
+                    }
+                    "wrong_welcome" => {
+                        v40_fixed_bytes::<32>(fields[30], label)?
+                            != v40_digest(
+                                b"dirextalk.mls-opaque-welcome.v1\0",
+                                v40_bytes(fields[29], label)?,
+                            )
+                    }
+                    _ => unreachable!(),
+                };
+                if !rejected {
+                    return Err(ProtocolToolError::new(format!(
+                        "V6 invalid {label} was semantically accepted"
+                    )));
+                }
+            }
+            "stale_activation_head" => {
+                let value = v40_decode_exact_bytes(&bytes, label)?;
+                cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).map_err(|error| {
+                    ProtocolToolError::new(format!("V6 activation invalid must pass CDDL: {error}"))
+                })?;
+                if v40_fixed_bytes::<32>(v40_numbered_fields(&value, 17, label)?[10], label)?
+                    == result_head
+                {
+                    return Err(ProtocolToolError::new(
+                        "V6 stale activation head was accepted",
+                    ));
+                }
+            }
+            "activation_receipt_signature" | "activation_receipt_digest" => {
+                let value = v40_decode_exact_bytes(&bytes, label)?;
+                cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).map_err(|error| {
+                    ProtocolToolError::new(format!("V6 receipt invalid must pass CDDL: {error}"))
+                })?;
+                let fields = v40_numbered_fields(&value, 4, label)?;
+                let inner = encode_deterministic_cbor(fields[0]).map_err(|error| {
+                    ProtocolToolError::new(format!("encode invalid activation receipt: {error}"))
+                })?;
+                let actual = v40_digest(b"dirextalk.mls-recovery-activation-receipt.v1\0", &inner);
+                let wrapper_digest = v40_fixed_bytes::<32>(fields[1], label)?;
+                let signature = v40_fixed_bytes::<64>(fields[3], label)?;
+                let rejected = wrapper_digest != actual
+                    || v41_v6_verify(
+                        sequencer_key,
+                        b"dirextalk.mls-recovery-activation-receipt-signature.v1\0",
+                        wrapper_digest,
+                        signature,
+                        label,
+                    )
+                    .is_err();
+                if !rejected
+                    || (label == "activation_receipt_digest"
+                        && wrapper_digest == expected_activation_digest)
+                {
+                    return Err(ProtocolToolError::new(format!(
+                        "V6 invalid {label} was accepted"
+                    )));
+                }
+            }
+            "presentation_inclusion" | "presentation_root" | "completion_mismatch" => {
+                let value = v40_decode_exact_bytes(&bytes, label)?;
+                cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).map_err(|error| {
+                    ProtocolToolError::new(format!(
+                        "V6 presentation invalid must pass CDDL: {error}"
+                    ))
+                })?;
+                let fields = v40_numbered_fields(&value, 15, label)?;
+                let identity_bytes = v40_bytes(fields[7], label)?;
+                if identity_bytes != expected_history_receipt {
+                    return Err(ProtocolToolError::new(format!(
+                        "V6 invalid {label} did not preserve the exact signed History receipt"
+                    )));
+                }
+                let identity = v40_decode_exact_bytes(identity_bytes, label)?;
+                let identity_fields = v40_numbered_fields(&identity, 5, label)?;
+                let identity_inner =
+                    encode_deterministic_cbor(identity_fields[0]).map_err(|error| {
+                        ProtocolToolError::new(format!(
+                            "re-encode invalid History completion receipt: {error}"
+                        ))
+                    })?;
+                let identity_digest = v40_digest(
+                    b"dirextalk.history-recovery-completion-receipt.v1\0",
+                    &identity_inner,
+                );
+                if v40_fixed_bytes::<32>(identity_fields[1], label)? != identity_digest {
+                    return Err(ProtocolToolError::new(format!(
+                        "V6 invalid {label} carried a malformed signed History receipt"
+                    )));
+                }
+                let completion_mismatch =
+                    v40_fixed_bytes::<32>(fields[8], label)? != identity_digest;
+                let proof = v40_array(fields[11], label)?;
+                let first_sibling = proof.first().ok_or_else(|| {
+                    ProtocolToolError::new(format!("V6 invalid {label} proof is empty"))
+                })?;
+                let mut node_input = expected_history_leaf.to_vec();
+                node_input.extend_from_slice(v40_bytes(first_sibling, label)?);
+                let root = v40_digest(
+                    b"dirextalk.history-recovery-completion-activation-node.v1\0",
+                    &node_input,
+                );
+                let proof_mismatch = v40_fixed_bytes::<32>(fields[9], label)? != root;
+                let rejected = if label == "completion_mismatch" {
+                    completion_mismatch
+                } else {
+                    proof_mismatch
+                };
+                if !rejected {
+                    return Err(ProtocolToolError::new(format!(
+                        "V6 invalid {label} was accepted"
+                    )));
+                }
+            }
+            _ => unreachable!("invalid labels were checked"),
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V6 OpenAPI gate enumerates every exact route, media type, and error token"
+)]
+fn validate_mls_sequencer_v6_openapi(root: &Path, vector: &Value) -> Result<(), ProtocolToolError> {
+    const RELATIVE: &str = "protocol/openapi/mls-sequencer/v6/openapi.yaml";
+    let media = v40_json_field(vector, "media_types", "MLS Sequencer V6 vector")?;
+    v40_require_string_map(
+        media,
+        &[
+            (
+                "commit",
+                "application/vnd.dirextalk.mls-recovery-commit.v6+cbor",
+            ),
+            (
+                "commit_receipt",
+                "application/vnd.dirextalk.mls-recovery-commit-receipt.v6+cbor",
+            ),
+            (
+                "confirmation",
+                "application/vnd.dirextalk.mls-recovery-confirmation.v1+cbor",
+            ),
+            (
+                "activation",
+                "application/vnd.dirextalk.mls-recovery-activation.v1+cbor",
+            ),
+            (
+                "activation_receipt",
+                "application/vnd.dirextalk.mls-recovery-activation-receipt.v1+cbor",
+            ),
+            (
+                "activation_readback",
+                "application/vnd.dirextalk.mls-recovery-activation-readback.v1+cbor",
+            ),
+            (
+                "completion_presentation",
+                "application/vnd.dirextalk.mls-recovery-completion-presentation.v1+cbor",
+            ),
+            (
+                "completion_receipt",
+                "application/vnd.dirextalk.mls-recovery-completion-receipt.v1+cbor",
+            ),
+        ],
+        "MLS Sequencer V6 media types",
+    )?;
+    v41_validate_openapi(
+        root,
+        RELATIVE,
+        &[
+            (
+                "/v1/groups/{scope_kind}/{scope_id}/mls-recovery-commits/{submission_id}",
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-commits~1{submission_id}",
+                &["post"],
+            ),
+            (
+                "/v1/groups/{scope_kind}/{scope_id}/mls-recovery-commits/{submission_id}/confirmation",
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-commits~1{submission_id}~1confirmation",
+                &["put"],
+            ),
+            (
+                "/v1/groups/{scope_kind}/{scope_id}/mls-recovery-activations/{activation_id}",
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}",
+                &["put", "get"],
+            ),
+            (
+                "/v1/groups/{scope_kind}/{scope_id}/mls-recovery-activations/{activation_id}/completion",
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}~1completion",
+                &["put"],
+            ),
+        ],
+        &[
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-commits~1{submission_id}/post/operationId",
+                "submitMlsRecoveryCommitV6",
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-commits~1{submission_id}~1confirmation/put/operationId",
+                "confirmMlsRecoveryCommitV1",
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}/put/operationId",
+                "activateMlsRecoveryV1",
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}/get/operationId",
+                "getMlsRecoveryActivationReceiptV1",
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}~1completion/put/operationId",
+                "presentMlsRecoveryCompletionV1",
+            ),
+        ],
+        &[
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-commits~1{submission_id}/post/requestBody/content",
+                json_string(media, "commit")?,
+            ),
+            (
+                "/components/responses/CommitReceipt/content",
+                json_string(media, "commit_receipt")?,
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-commits~1{submission_id}~1confirmation/put/requestBody/content",
+                json_string(media, "confirmation")?,
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}/put/requestBody/content",
+                json_string(media, "activation")?,
+            ),
+            (
+                "/components/responses/ActivationReceipt/content",
+                json_string(media, "activation_receipt")?,
+            ),
+            (
+                "/components/responses/ActivationReadback/content",
+                json_string(media, "activation_readback")?,
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}~1completion/put/requestBody/content",
+                json_string(media, "completion_presentation")?,
+            ),
+            (
+                "/components/responses/CompletionReceipt/content",
+                json_string(media, "completion_receipt")?,
+            ),
+        ],
+        &[
+            "CommitReceipt",
+            "ActivationReceipt",
+            "ActivationReadback",
+            "CompletionReceipt",
+            "Conflict",
+            "Gone",
+            "Invalidated",
+            "NotCurrent",
+            "InvalidExactCbor",
+        ],
+        &[
+            "IDEMPOTENCY_CONFLICT",
+            "MLS_HEAD_CONFLICT",
+            "RECOVERY_REQUEST_REVOKED",
+            "RECOVERY_ACTIVATION_EXPIRED",
+            "IDENTITY_HEAD_CHANGED",
+            "CATALOG_HEAD_CHANGED",
+            "CATALOG_LEAF_CHANGED",
+            "CANDIDATE_KEY_CHANGED",
+            "AUTHORITY_CHANGED",
+            "ACTIVATION_RECEIPT_NOT_CURRENT",
+            "SIGNATURE_INVALID",
+            "INCLUSION_PROOF_INVALID",
+        ],
+        "MLS Sequencer V6 OpenAPI",
+    )?;
+    let document = v41_read_openapi_tree(root, RELATIVE, "MLS Sequencer V6 OpenAPI")?;
+    v41_validate_openapi_coordinate_bindings(
+        &document,
+        &[
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-commits~1{submission_id}/post",
+                v41_path_coordinate_binding(
+                    "reject-before-durable-writes",
+                    &[
+                        (
+                            "scope_kind",
+                            "signed-request-cbor",
+                            "mls-recovery-add-request-v6",
+                            &[3, 1],
+                            "scope-kind-mapping",
+                        ),
+                        (
+                            "scope_id",
+                            "signed-request-cbor",
+                            "mls-recovery-add-request-v6",
+                            &[3, 2],
+                            "exact",
+                        ),
+                        (
+                            "submission_id",
+                            "signed-request-cbor",
+                            "mls-recovery-add-request-v6",
+                            &[2],
+                            "exact",
+                        ),
+                    ],
+                ),
+                Some(v41_scope_kind_pairing()),
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-commits~1{submission_id}~1confirmation/put",
+                v41_path_coordinate_binding(
+                    "reject-before-durable-writes",
+                    &[
+                        (
+                            "scope_kind",
+                            "stored-signed-request-cbor",
+                            "mls-recovery-add-request-v6",
+                            &[3, 1],
+                            "scope-kind-mapping",
+                        ),
+                        (
+                            "scope_id",
+                            "stored-signed-request-cbor",
+                            "mls-recovery-add-request-v6",
+                            &[3, 2],
+                            "exact",
+                        ),
+                        (
+                            "submission_id",
+                            "signed-request-cbor",
+                            "mls-recovery-confirmation-v1",
+                            &[2],
+                            "exact",
+                        ),
+                    ],
+                ),
+                Some(v41_scope_kind_pairing()),
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}/put",
+                v41_path_coordinate_binding(
+                    "reject-before-durable-writes",
+                    &[
+                        (
+                            "scope_kind",
+                            "stored-signed-request-cbor",
+                            "mls-recovery-add-request-v6",
+                            &[3, 1],
+                            "scope-kind-mapping",
+                        ),
+                        (
+                            "scope_id",
+                            "stored-signed-request-cbor",
+                            "mls-recovery-add-request-v6",
+                            &[3, 2],
+                            "exact",
+                        ),
+                        (
+                            "activation_id",
+                            "signed-request-cbor",
+                            "mls-recovery-activation-command-v1",
+                            &[2],
+                            "exact",
+                        ),
+                    ],
+                ),
+                Some(v41_scope_kind_pairing()),
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}/get",
+                v41_path_coordinate_binding(
+                    "reject-before-readback",
+                    &[
+                        (
+                            "scope_kind",
+                            "stored-returned-readback-cbor",
+                            "mls-recovery-activation-readback-v1",
+                            &[2, 1],
+                            "scope-kind-mapping",
+                        ),
+                        (
+                            "scope_id",
+                            "stored-returned-readback-cbor",
+                            "mls-recovery-activation-readback-v1",
+                            &[2, 2],
+                            "exact",
+                        ),
+                        (
+                            "activation_id",
+                            "stored-returned-signed-receipt-cbor",
+                            "signed-mls-recovery-activation-receipt-v1",
+                            &[1, 14],
+                            "exact",
+                        ),
+                    ],
+                ),
+                Some(v41_scope_kind_pairing()),
+            ),
+            (
+                "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}~1completion/put",
+                v41_path_coordinate_binding(
+                    "reject-before-durable-writes",
+                    &[
+                        (
+                            "scope_kind",
+                            "stored-signed-request-cbor",
+                            "mls-recovery-add-request-v6",
+                            &[3, 1],
+                            "scope-kind-mapping",
+                        ),
+                        (
+                            "scope_id",
+                            "stored-signed-request-cbor",
+                            "mls-recovery-add-request-v6",
+                            &[3, 2],
+                            "exact",
+                        ),
+                        (
+                            "activation_id",
+                            "embedded-signed-activation-receipt-cbor",
+                            "signed-mls-recovery-activation-receipt-v1",
+                            &[1, 14],
+                            "exact",
+                        ),
+                    ],
+                ),
+                Some(v41_scope_kind_pairing()),
+            ),
+        ],
+        "MLS Sequencer V6 OpenAPI",
+    )?;
+    v41_validate_mls_activation_route_coordinates(&document, vector)
+}
+
+fn v41_validate_mls_activation_route_coordinates(
+    document: &Value,
+    vector: &Value,
+) -> Result<(), ProtocolToolError> {
+    let flow = v40_json_field(vector, "flow", "MLS Sequencer V6 vector")?;
+    let activation = v40_json_field(flow, "activation", "MLS Sequencer V6 flow")?;
+    let activation_command = v40_decode_exact_bytes(
+        &decode_hex(json_string(activation, "command_cbor_hex")?)?,
+        "MLS V6 activation command",
+    )?;
+    let activation_command_fields =
+        v40_numbered_fields(&activation_command, 17, "MLS V6 activation command")?;
+    let activation_id = v40_text(activation_command_fields[1], "MLS V6 activation id")?;
+    let submission_id = v40_text(activation_command_fields[2], "MLS V6 submission id")?;
+
+    let signed_receipt_bytes = decode_hex(json_string(activation, "signed_receipt_cbor_hex")?)?;
+    let signed_receipt =
+        v40_decode_exact_bytes(&signed_receipt_bytes, "MLS V6 signed activation receipt")?;
+    let signed_receipt_fields =
+        v40_numbered_fields(&signed_receipt, 4, "MLS V6 signed activation receipt")?;
+    let receipt_fields =
+        v40_numbered_fields(signed_receipt_fields[0], 20, "MLS V6 activation receipt")?;
+    if v40_text(receipt_fields[13], "MLS V6 receipt activation id")? != activation_id
+        || v40_text(receipt_fields[11], "MLS V6 receipt submission id")? != submission_id
+    {
+        return Err(ProtocolToolError::new(
+            "MLS V6 activation receipt ID linkage drift",
+        ));
+    }
+
+    let readback = v40_json_field(flow, "readback", "MLS Sequencer V6 flow")?;
+    let readback_value = v40_decode_exact_bytes(
+        &decode_hex(json_string(readback, "cbor_hex")?)?,
+        "MLS V6 activation readback",
+    )?;
+    let readback_fields = v40_numbered_fields(&readback_value, 10, "MLS V6 activation readback")?;
+    if v40_text(readback_fields[2], "MLS V6 readback submission id")? != submission_id
+        || v40_bytes(readback_fields[9], "MLS V6 readback signed receipt")? != signed_receipt_bytes
+    {
+        return Err(ProtocolToolError::new(
+            "MLS V6 activation readback stored-receipt linkage drift",
+        ));
+    }
+    let returned_signed_receipt = v40_decode_exact_bytes(
+        v40_bytes(readback_fields[9], "MLS V6 readback signed receipt")?,
+        "MLS V6 returned signed activation receipt",
+    )?;
+
+    let completion = v40_json_field(flow, "completion", "MLS Sequencer V6 flow")?;
+    let presentation = v40_decode_exact_bytes(
+        &decode_hex(json_string(completion, "presentation_cbor_hex")?)?,
+        "MLS V6 completion presentation",
+    )?;
+    let presentation_fields =
+        v40_numbered_fields(&presentation, 15, "MLS V6 completion presentation")?;
+    let presentation_id = v40_text(presentation_fields[1], "MLS V6 presentation id")?;
+    let embedded_signed_receipt = v40_decode_exact_bytes(
+        v40_bytes(
+            presentation_fields[5],
+            "MLS V6 presentation signed activation receipt",
+        )?,
+        "MLS V6 embedded signed activation receipt",
+    )?;
+
+    for (operation, source, expected_source) in [
+        (
+            "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}/get",
+            &returned_signed_receipt,
+            "stored-returned-signed-receipt-cbor",
+        ),
+        (
+            "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}~1completion/put",
+            &embedded_signed_receipt,
+            "embedded-signed-activation-receipt-cbor",
+        ),
+    ] {
+        let metadata_pointer =
+            format!("{operation}/x-dirextalk-path-coordinate-binding/coordinates/activation_id");
+        let metadata = document.pointer(&metadata_pointer).ok_or_else(|| {
+            ProtocolToolError::new(format!(
+                "MLS V6 activation route binding missing at {metadata_pointer}"
+            ))
+        })?;
+        if json_string(metadata, "source")? != expected_source
+            || json_string(metadata, "cddl-rule")? != "signed-mls-recovery-activation-receipt-v1"
+            || json_string(metadata, "comparison")? != "exact"
+        {
+            return Err(ProtocolToolError::new(
+                "MLS V6 activation route source/rule/comparison drift",
+            ));
+        }
+        let resolved = v41_resolve_numbered_cbor_path(
+            source,
+            v40_json_array_field(metadata, "cbor-path", "MLS V6 activation route binding")?,
+            "MLS V6 activation route binding",
+        )?;
+        let resolved = v40_text(resolved, "MLS V6 resolved activation id")?;
+        if resolved != activation_id || resolved == submission_id || resolved == presentation_id {
+            return Err(ProtocolToolError::new(
+                "MLS V6 route activation_id resolved to submission_id or presentation_id",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn v41_resolve_numbered_cbor_path<'a>(
+    value: &'a CanonicalValue,
+    path: &[Value],
+    label: &str,
+) -> Result<&'a CanonicalValue, ProtocolToolError> {
+    let mut current = value;
+    for segment in path {
+        let key = segment.as_u64().ok_or_else(|| {
+            ProtocolToolError::new(format!("{label} CBOR path must use unsigned map keys"))
+        })?;
+        let CanonicalValue::Map(entries) = current else {
+            return Err(ProtocolToolError::new(format!(
+                "{label} CBOR path traversed a non-map"
+            )));
+        };
+        current = entries
+            .iter()
+            .find_map(|(candidate, value)| {
+                (candidate == &CanonicalValue::Unsigned(key)).then_some(value)
+            })
+            .ok_or_else(|| {
+                ProtocolToolError::new(format!("{label} CBOR path key {key} is missing"))
+            })?;
+    }
+    Ok(current)
+}
+
+const V41_SCOPE_DOMAIN: &[u8] = b"dirextalk.recovery-scope.v1\0";
+const V41_CATALOG_LEAF_DOMAIN: &[u8] = b"dirextalk.recovery-scope-catalog-leaf.v1\0";
+const V41_CATALOG_NODE_DOMAIN: &[u8] = b"dirextalk.recovery-scope-catalog-node.v1\0";
+const V41_MEMBERSHIP_RECEIPT_DOMAIN: &[u8] = b"dirextalk.recovery-scope-membership-receipt.v1\0";
+
+struct V41CatalogLeafFacts {
+    exact: Vec<u8>,
+    digest: [u8; 32],
+    scope_exact: Vec<u8>,
+    scope_digest: [u8; 32],
+    membership_receipt: Vec<u8>,
+    membership_receipt_digest: [u8; 32],
+    group_head_digest: [u8; 32],
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V41 catalog gate proves exact encryption metadata, H binding, signatures, and invalid states"
+)]
+fn validate_recovery_scope_catalog_v1(root: &Path) -> Result<(), ProtocolToolError> {
+    const PLAINTEXT: &[u8] = b"dirextalk.recovery-scope-catalog-plaintext.v1\0";
+    const CIPHERTEXT: &[u8] = b"dirextalk.recovery-scope-catalog-ciphertext.v1\0";
+    const HEAD_SIGNATURE: &[u8] = b"dirextalk.recovery-scope-catalog-head-signature.v1\0";
+    const HEAD_DIGEST: &[u8] = b"dirextalk.recovery-scope-catalog-head-digest.v1\0";
+    const PREPARATION_SIGNATURE: &[u8] =
+        b"dirextalk.recovery-scope-catalog-preparation-signature.v1\0";
+    const PREPARATION_DIGEST: &[u8] = b"dirextalk.recovery-scope-catalog-preparation-digest.v1\0";
+    const RESPONSE_CAPABILITY: &[u8] = b"dirextalk.recovery-response-capability.v1\0";
+    const RECIPIENT_KEY: &[u8] = b"dirextalk.recovery-recipient-key.v1\0";
+    const PROVIDER_CIPHERTEXT: &[u8] = b"dirextalk.recovery-scope-catalog-provider-ciphertext.v1\0";
+    const CURRENT_AUTHORITY: &[u8] = b"dirextalk.current-history-authority.v1\0";
+    const PROVIDER_SIGNATURE: &[u8] = b"dirextalk.recovery-scope-catalog-provider-signature.v1\0";
+    const PROVIDER_RESPONSE: &[u8] = b"dirextalk.recovery-scope-catalog-provider-response.v1\0";
+    const HISTORY_DEVICE_ADD: &[u8] = b"dirextalk.identity-device-add.v1\0";
+    const HISTORY_LEAF_SET: &[u8] = b"dirextalk.history-recovery-leaf-set.v1\0";
+    const HISTORY_MANIFEST: &[u8] = b"dirextalk.history-recovery-manifest.v1\0";
+    const HISTORY_REQUEST_SIGNATURE: &[u8] = b"dirextalk.history-recovery-request-signature.v3\0";
+
+    let cddl =
+        read(&root.join("protocol/cddl/recovery-scope-catalog/v1/recovery-scope-catalog-v1.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse Recovery Scope Catalog V1 CDDL: {error}"))
+    })?;
+    let vector = read_json(
+        &root
+            .join("protocol/test-vectors/recovery-scope-catalog/v1/recovery-scope-catalog-v1.json"),
+    )?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "baseline",
+            "max_leaf_count",
+            "media_types",
+            "domains",
+            "catalog_signing_public_key_hex",
+            "candidate_public_key_hex",
+            "provider_public_key_hex",
+            "recipient_public_key_hex",
+            "response_capability_hex",
+            "identity_head",
+            "catalog",
+            "preparation",
+            "provider_response",
+            "statuses",
+            "invalid_cbor",
+        ],
+        "Recovery Scope Catalog V1 vector",
+    )?;
+    if vector.get("version").and_then(Value::as_u64) != Some(1)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(41)
+        || vector.get("max_leaf_count").and_then(Value::as_u64)
+            != Some(
+                u64::try_from(V41_RECOVERY_SCOPE_CATALOG_MAX_LEAVES)
+                    .expect("catalog bound fits u64"),
+            )
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery Scope Catalog vector version/baseline/max-leaf-count must be 1/41/65535",
+        ));
+    }
+    v40_require_string_map(
+        v40_json_field(&vector, "media_types", "Recovery Scope Catalog vector")?,
+        &[
+            (
+                "catalog_upload",
+                "application/vnd.dirextalk.recovery-scope-catalog.v1+cbor",
+            ),
+            (
+                "catalog_head",
+                "application/vnd.dirextalk.recovery-scope-catalog-head.v1+cbor",
+            ),
+            (
+                "preparation",
+                "application/vnd.dirextalk.recovery-scope-catalog-preparation.v1+cbor",
+            ),
+            (
+                "provider_response",
+                "application/vnd.dirextalk.recovery-scope-catalog-provider-response.v1+cbor",
+            ),
+            (
+                "status",
+                "application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor",
+            ),
+        ],
+        "Recovery Scope Catalog media types",
+    )?;
+    v40_require_string_map(
+        v40_json_field(&vector, "domains", "Recovery Scope Catalog vector")?,
+        &[
+            (
+                "membership_receipt",
+                std::str::from_utf8(V41_MEMBERSHIP_RECEIPT_DOMAIN).expect("ASCII domain"),
+            ),
+            (
+                "recovery_scope",
+                std::str::from_utf8(V41_SCOPE_DOMAIN).expect("ASCII domain"),
+            ),
+            (
+                "catalog_leaf",
+                std::str::from_utf8(V41_CATALOG_LEAF_DOMAIN).expect("ASCII domain"),
+            ),
+            (
+                "merkle_node",
+                std::str::from_utf8(V41_CATALOG_NODE_DOMAIN).expect("ASCII domain"),
+            ),
+            (
+                "catalog_plaintext",
+                std::str::from_utf8(PLAINTEXT).expect("ASCII domain"),
+            ),
+            (
+                "catalog_ciphertext",
+                std::str::from_utf8(CIPHERTEXT).expect("ASCII domain"),
+            ),
+            (
+                "catalog_head_signature",
+                std::str::from_utf8(HEAD_SIGNATURE).expect("ASCII domain"),
+            ),
+            (
+                "catalog_head_digest",
+                std::str::from_utf8(HEAD_DIGEST).expect("ASCII domain"),
+            ),
+            (
+                "preparation_signature",
+                std::str::from_utf8(PREPARATION_SIGNATURE).expect("ASCII domain"),
+            ),
+            (
+                "preparation_digest",
+                std::str::from_utf8(PREPARATION_DIGEST).expect("ASCII domain"),
+            ),
+            (
+                "response_capability",
+                std::str::from_utf8(RESPONSE_CAPABILITY).expect("ASCII domain"),
+            ),
+            (
+                "recipient_key",
+                std::str::from_utf8(RECIPIENT_KEY).expect("ASCII domain"),
+            ),
+            (
+                "provider_ciphertext",
+                std::str::from_utf8(PROVIDER_CIPHERTEXT).expect("ASCII domain"),
+            ),
+            (
+                "current_authority",
+                std::str::from_utf8(CURRENT_AUTHORITY).expect("ASCII domain"),
+            ),
+            (
+                "provider_signature",
+                std::str::from_utf8(PROVIDER_SIGNATURE).expect("ASCII domain"),
+            ),
+            (
+                "provider_response_digest",
+                std::str::from_utf8(PROVIDER_RESPONSE).expect("ASCII domain"),
+            ),
+        ],
+        "Recovery Scope Catalog domains",
+    )?;
+    validate_recovery_scope_catalog_openapi(root, &vector)?;
+
+    let catalog_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "catalog_signing_public_key_hex")?)?;
+    let candidate_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "candidate_public_key_hex")?)?;
+    let provider_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "provider_public_key_hex")?)?;
+    let recipient_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "recipient_public_key_hex")?)?;
+    if catalog_key == candidate_key
+        || catalog_key == provider_key
+        || candidate_key == provider_key
+        || recipient_key == catalog_key
+        || recipient_key == candidate_key
+        || recipient_key == provider_key
+        || catalog_key.iter().all(|byte| *byte == 0)
+        || candidate_key.iter().all(|byte| *byte == 0)
+        || provider_key.iter().all(|byte| *byte == 0)
+        || recipient_key.iter().all(|byte| *byte == 0)
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery Scope Catalog signer/candidate/provider keys must be independent",
+        ));
+    }
+    let identity_head = v40_json_field(&vector, "identity_head", "catalog vector")?;
+    require_exact_object_keys(
+        identity_head,
+        &["sequence", "digest_hex"],
+        "catalog identity head",
+    )?;
+    let identity_sequence = identity_head
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("catalog identity sequence must be unsigned"))?;
+    let identity_digest = decode_lower_hex_fixed::<32>(json_string(identity_head, "digest_hex")?)?;
+
+    let catalog = v40_json_field(&vector, "catalog", "catalog vector")?;
+    require_exact_object_keys(
+        catalog,
+        &[
+            "generation",
+            "previous_head_digest_hex",
+            "plaintext_cbor_hex",
+            "plaintext_digest_hex",
+            "leaves",
+            "merkle_root_hex",
+            "encrypted_catalog_hex",
+            "ciphertext_digest_hex",
+            "head_unsigned_cbor_hex",
+            "head_signature_hex",
+            "head_signed_cbor_hex",
+            "head_digest_hex",
+            "upload_cbor_hex",
+        ],
+        "Recovery Scope Catalog positive catalog",
+    )?;
+    let generation = catalog
+        .get("generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("catalog generation must be unsigned"))?;
+    let previous = decode_lower_hex_fixed::<32>(json_string(catalog, "previous_head_digest_hex")?)?;
+    if generation <= 1 || previous.iter().all(|byte| *byte == 0) {
+        return Err(ProtocolToolError::new(
+            "catalog generation after genesis must bind a non-zero previous head",
+        ));
+    }
+    let (plaintext_bytes, plaintext) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-plaintext-v1",
+        &cddl,
+        json_string(catalog, "plaintext_cbor_hex")?,
+        "Recovery Scope Catalog plaintext",
+    )?;
+    let leaf_facts = v41_catalog_plaintext_leaf_facts(&plaintext)?;
+    let plaintext_fields = v40_numbered_fields(&plaintext, 7, "catalog plaintext")?;
+    validate_identity_id(
+        v40_text(plaintext_fields[1], "catalog identity")?,
+        "catalog identity",
+    )?;
+    if v40_unsigned(plaintext_fields[2], "catalog generation")? != generation
+        || v40_fixed_bytes::<32>(plaintext_fields[3], "catalog previous head")? != previous
+        || v40_unsigned(plaintext_fields[4], "catalog Identity H")? != identity_sequence
+        || v40_fixed_bytes::<32>(plaintext_fields[5], "catalog Identity head")? != identity_digest
+    {
+        return Err(ProtocolToolError::new(
+            "catalog plaintext generation/previous/Identity H linkage drift",
+        ));
+    }
+    v40_require_json_digest(
+        catalog,
+        "plaintext_digest_hex",
+        v40_digest(PLAINTEXT, &plaintext_bytes),
+        "catalog plaintext",
+    )?;
+    let leaves_json = v40_json_array_field(catalog, "leaves", "catalog")?;
+    if leaves_json.len() != leaf_facts.len() {
+        return Err(ProtocolToolError::new(
+            "catalog JSON leaf family is not exhaustive",
+        ));
+    }
+    for (index, (leaf, expected)) in leaf_facts.iter().zip(leaves_json).enumerate() {
+        require_exact_object_keys(
+            expected,
+            &[
+                "index",
+                "scope_cbor_hex",
+                "scope_digest_hex",
+                "membership_receipt_hex",
+                "membership_receipt_digest_hex",
+                "group_head_digest_hex",
+                "leaf_cbor_hex",
+                "leaf_digest_hex",
+            ],
+            "catalog leaf vector",
+        )?;
+        if expected.get("index").and_then(Value::as_u64)
+            != Some(u64::try_from(index + 1).expect("leaf count fits u64"))
+            || decode_hex(json_string(expected, "leaf_cbor_hex")?)? != leaf.exact
+            || decode_hex(json_string(expected, "scope_cbor_hex")?)? != leaf.scope_exact
+            || decode_lower_hex_fixed::<32>(json_string(expected, "leaf_digest_hex")?)?
+                != leaf.digest
+            || decode_lower_hex_fixed::<32>(json_string(expected, "scope_digest_hex")?)?
+                != leaf.scope_digest
+            || decode_hex(json_string(expected, "membership_receipt_hex")?)?
+                != leaf.membership_receipt
+            || decode_lower_hex_fixed::<32>(json_string(
+                expected,
+                "membership_receipt_digest_hex",
+            )?)? != leaf.membership_receipt_digest
+            || decode_lower_hex_fixed::<32>(json_string(expected, "group_head_digest_hex")?)?
+                != leaf.group_head_digest
+        {
+            return Err(ProtocolToolError::new(
+                "catalog leaf exact-byte/digest linkage drift",
+            ));
+        }
+    }
+    let merkle_root = v41_merkle_root(
+        leaf_facts
+            .iter()
+            .map(|leaf| leaf.digest)
+            .collect::<Vec<_>>(),
+    )?;
+    v40_require_json_digest(
+        catalog,
+        "merkle_root_hex",
+        merkle_root,
+        "catalog Merkle root",
+    )?;
+    let encrypted_catalog = decode_hex(json_string(catalog, "encrypted_catalog_hex")?)?;
+    if encrypted_catalog.is_empty() || encrypted_catalog.len() > 1_048_576 {
+        return Err(ProtocolToolError::new(
+            "encrypted catalog is outside its opaque byte bound",
+        ));
+    }
+    let ciphertext_digest = v40_digest(CIPHERTEXT, &encrypted_catalog);
+    v40_require_json_digest(
+        catalog,
+        "ciphertext_digest_hex",
+        ciphertext_digest,
+        "encrypted catalog",
+    )?;
+    let (head_unsigned_bytes, head_unsigned) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-head-unsigned-v1",
+        &cddl,
+        json_string(catalog, "head_unsigned_cbor_hex")?,
+        "Recovery Scope Catalog unsigned head",
+    )?;
+    let (head_signed_bytes, head_signed) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-head-v1",
+        &cddl,
+        json_string(catalog, "head_signed_cbor_hex")?,
+        "Recovery Scope Catalog signed head",
+    )?;
+    let head_unsigned_fields = v40_numbered_fields(&head_unsigned, 11, "catalog unsigned head")?;
+    let head_signed_fields = v40_numbered_fields(&head_signed, 12, "catalog signed head")?;
+    if head_unsigned_fields != head_signed_fields[..11]
+        || head_signed_fields[1] != plaintext_fields[1]
+        || v40_unsigned(head_signed_fields[2], "catalog head generation")? != generation
+        || v40_fixed_bytes::<32>(head_signed_fields[3], "catalog head previous")? != previous
+        || v40_unsigned(head_signed_fields[4], "catalog head count")?
+            != u64::try_from(leaf_facts.len()).expect("leaf count fits u64")
+        || v40_fixed_bytes::<32>(head_signed_fields[5], "catalog head root")? != merkle_root
+        || v40_fixed_bytes::<32>(head_signed_fields[6], "catalog ciphertext digest")?
+            != ciphertext_digest
+        || v40_unsigned(head_signed_fields[7], "catalog head Identity H")? != identity_sequence
+        || v40_fixed_bytes::<32>(head_signed_fields[8], "catalog head Identity digest")?
+            != identity_digest
+        || v40_unsigned(head_signed_fields[9], "catalog head created_at")?
+            >= v40_unsigned(head_signed_fields[10], "catalog head expires_at")?
+    {
+        return Err(ProtocolToolError::new(
+            "signed catalog head escaped exact generation/count/root/ciphertext/Identity H facts",
+        ));
+    }
+    let mut head_signature_input = HEAD_SIGNATURE.to_vec();
+    head_signature_input.extend_from_slice(&head_unsigned_bytes);
+    let head_signature = decode_lower_hex_fixed::<64>(json_string(catalog, "head_signature_hex")?)?;
+    if v40_fixed_bytes::<64>(head_signed_fields[11], "catalog head signature")? != head_signature {
+        return Err(ProtocolToolError::new("catalog head signature field drift"));
+    }
+    v40_verify_signature(
+        catalog_key,
+        &head_signature_input,
+        head_signature,
+        "Recovery Scope Catalog head",
+    )?;
+    let head_digest = v40_digest(HEAD_DIGEST, &head_signed_bytes);
+    v40_require_json_digest(catalog, "head_digest_hex", head_digest, "catalog head")?;
+    let (_, upload) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-upload-v1",
+        &cddl,
+        json_string(catalog, "upload_cbor_hex")?,
+        "Recovery Scope Catalog upload",
+    )?;
+    let upload_fields = v40_numbered_fields(&upload, 2, "catalog upload")?;
+    if upload_fields[0] != &head_signed
+        || v40_bytes(upload_fields[1], "catalog upload ciphertext")? != encrypted_catalog
+    {
+        return Err(ProtocolToolError::new(
+            "catalog upload does not pair the exact signed head and ciphertext",
+        ));
+    }
+
+    let preparation = v40_json_field(&vector, "preparation", "catalog vector")?;
+    require_exact_object_keys(
+        preparation,
+        &[
+            "unsigned_cbor_hex",
+            "signature_hex",
+            "signed_cbor_hex",
+            "digest_hex",
+            "response_capability_digest_hex",
+        ],
+        "catalog preparation",
+    )?;
+    let (preparation_unsigned_bytes, preparation_unsigned) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-preparation-unsigned-v1",
+        &cddl,
+        json_string(preparation, "unsigned_cbor_hex")?,
+        "catalog preparation unsigned",
+    )?;
+    let (preparation_signed_bytes, preparation_signed) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-preparation-v1",
+        &cddl,
+        json_string(preparation, "signed_cbor_hex")?,
+        "catalog preparation signed",
+    )?;
+    let prep_unsigned_fields =
+        v40_numbered_fields(&preparation_unsigned, 12, "catalog preparation unsigned")?;
+    let prep_signed_fields =
+        v40_numbered_fields(&preparation_signed, 13, "catalog preparation signed")?;
+    let response_capability =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "response_capability_hex")?)?;
+    let response_capability_digest = v40_digest(RESPONSE_CAPABILITY, &response_capability);
+    let preparation_nonce =
+        v40_fixed_bytes::<32>(prep_signed_fields[8], "catalog preparation nonce")?;
+    if preparation_nonce.iter().all(|byte| *byte == 0)
+        || preparation_nonce == response_capability
+        || preparation_nonce == catalog_key
+        || preparation_nonce == candidate_key
+        || preparation_nonce == provider_key
+        || preparation_nonce == recipient_key
+        || response_capability.iter().all(|byte| *byte == 0)
+        || response_capability == catalog_key
+        || response_capability == candidate_key
+        || response_capability == provider_key
+        || response_capability == recipient_key
+        || prep_unsigned_fields != prep_signed_fields[..12]
+        || prep_signed_fields[2] != plaintext_fields[1]
+        || v40_fixed_bytes::<32>(prep_signed_fields[4], "candidate signing key")? != candidate_key
+        || v40_fixed_bytes::<32>(prep_signed_fields[5], "candidate recipient key")? != recipient_key
+        || v40_unsigned(prep_signed_fields[6], "preparation Identity H")? != identity_sequence
+        || v40_fixed_bytes::<32>(prep_signed_fields[7], "preparation Identity head")?
+            != identity_digest
+        || v40_unsigned(prep_signed_fields[9], "preparation issued_at")?
+            >= v40_unsigned(prep_signed_fields[10], "preparation expires_at")?
+        || v40_unsigned(prep_signed_fields[9], "preparation issued_at")?
+            < v40_unsigned(head_signed_fields[9], "catalog created_at")?
+        || v40_unsigned(prep_signed_fields[10], "preparation expires_at")?
+            > v40_unsigned(head_signed_fields[10], "catalog expires_at")?
+        || v40_fixed_bytes::<32>(prep_signed_fields[11], "response capability hash")?
+            != response_capability_digest
+    {
+        return Err(ProtocolToolError::new(
+            "catalog preparation candidate key/recipient/H/nonce/expiry/capability binding drift",
+        ));
+    }
+    for field in [prep_signed_fields[1], prep_signed_fields[3]] {
+        validate_uuid_v7(v40_text(field, "catalog preparation UUID")?)?;
+    }
+    let preparation_signature =
+        decode_lower_hex_fixed::<64>(json_string(preparation, "signature_hex")?)?;
+    let mut preparation_signature_input = PREPARATION_SIGNATURE.to_vec();
+    preparation_signature_input.extend_from_slice(&preparation_unsigned_bytes);
+    v40_verify_signature(
+        candidate_key,
+        &preparation_signature_input,
+        preparation_signature,
+        "Recovery Scope Catalog preparation",
+    )?;
+    if v40_fixed_bytes::<64>(prep_signed_fields[12], "preparation signature")?
+        != preparation_signature
+    {
+        return Err(ProtocolToolError::new("preparation signature field drift"));
+    }
+    v40_require_json_digest(
+        preparation,
+        "digest_hex",
+        v40_digest(PREPARATION_DIGEST, &preparation_signed_bytes),
+        "catalog preparation",
+    )?;
+    v40_require_json_digest(
+        preparation,
+        "response_capability_digest_hex",
+        response_capability_digest,
+        "response capability",
+    )?;
+
+    let provider = v40_json_field(&vector, "provider_response", "catalog vector")?;
+    require_exact_object_keys(
+        provider,
+        &[
+            "unsigned_cbor_hex",
+            "signature_hex",
+            "signed_cbor_hex",
+            "digest_hex",
+            "recipient_key_digest_hex",
+            "current_authority_digest_hex",
+            "hpke_ciphertext_hex",
+            "hpke_ciphertext_digest_hex",
+        ],
+        "catalog provider response",
+    )?;
+    let (provider_unsigned_bytes, provider_unsigned) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-provider-response-unsigned-v1",
+        &cddl,
+        json_string(provider, "unsigned_cbor_hex")?,
+        "catalog provider response unsigned",
+    )?;
+    let (provider_signed_bytes, provider_signed) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-provider-response-v1",
+        &cddl,
+        json_string(provider, "signed_cbor_hex")?,
+        "catalog provider response signed",
+    )?;
+    let provider_unsigned_fields =
+        v40_numbered_fields(&provider_unsigned, 10, "catalog provider unsigned")?;
+    let provider_signed_fields =
+        v40_numbered_fields(&provider_signed, 11, "catalog provider signed")?;
+    let hpke_ciphertext = decode_hex(json_string(provider, "hpke_ciphertext_hex")?)?;
+    if hpke_ciphertext.is_empty() || hpke_ciphertext.len() > 1_048_576 {
+        return Err(ProtocolToolError::new(
+            "catalog provider HPKE ciphertext is outside its byte bound",
+        ));
+    }
+    let recipient_digest = v40_digest(RECIPIENT_KEY, &recipient_key);
+    let authority_digest = v40_digest(CURRENT_AUTHORITY, &catalog_key);
+    let provider_ciphertext_digest = v40_digest(PROVIDER_CIPHERTEXT, &hpke_ciphertext);
+    if provider_unsigned_fields != provider_signed_fields[..10]
+        || provider_signed_fields[1] != prep_signed_fields[1]
+        || provider_signed_fields[3] == prep_signed_fields[3]
+        || v40_fixed_bytes::<32>(provider_signed_fields[2], "provider catalog head")? != head_digest
+        || v40_fixed_bytes::<32>(provider_signed_fields[4], "provider key")? != provider_key
+        || v40_fixed_bytes::<32>(provider_signed_fields[5], "provider authority")?
+            != authority_digest
+        || v40_fixed_bytes::<32>(provider_signed_fields[6], "provider recipient")?
+            != recipient_digest
+        || v40_bytes(provider_signed_fields[7], "provider HPKE ciphertext")? != hpke_ciphertext
+        || v40_fixed_bytes::<32>(provider_signed_fields[8], "provider ciphertext digest")?
+            != provider_ciphertext_digest
+        || provider_signed_fields[9] != prep_signed_fields[10]
+    {
+        return Err(ProtocolToolError::new(
+            "catalog provider response escaped catalog/provider/authority/recipient/ciphertext/expiry binding",
+        ));
+    }
+    validate_uuid_v7(v40_text(
+        provider_signed_fields[3],
+        "catalog provider device",
+    )?)?;
+    let provider_signature = decode_lower_hex_fixed::<64>(json_string(provider, "signature_hex")?)?;
+    let mut provider_signature_input = PROVIDER_SIGNATURE.to_vec();
+    provider_signature_input.extend_from_slice(&provider_unsigned_bytes);
+    v40_verify_signature(
+        provider_key,
+        &provider_signature_input,
+        provider_signature,
+        "Recovery Scope Catalog provider response",
+    )?;
+    if v40_fixed_bytes::<64>(provider_signed_fields[10], "provider signature")?
+        != provider_signature
+    {
+        return Err(ProtocolToolError::new("provider signature field drift"));
+    }
+    for (field, expected, label) in [
+        (
+            "recipient_key_digest_hex",
+            recipient_digest,
+            "provider recipient key",
+        ),
+        (
+            "current_authority_digest_hex",
+            authority_digest,
+            "provider current authority",
+        ),
+        (
+            "hpke_ciphertext_digest_hex",
+            provider_ciphertext_digest,
+            "provider HPKE ciphertext",
+        ),
+        (
+            "digest_hex",
+            v40_digest(PROVIDER_RESPONSE, &provider_signed_bytes),
+            "provider response",
+        ),
+    ] {
+        v40_require_json_digest(provider, field, expected, label)?;
+    }
+
+    let history_cddl =
+        read(&root.join("protocol/cddl/history-recovery/v2/history-recovery-v2.cddl"))?;
+    let history_vector = read_json(
+        &root.join("protocol/test-vectors/history-recovery/v2/history-recovery-v2.json"),
+    )?;
+    if decode_lower_hex_fixed::<32>(json_string(&history_vector, "candidate_public_key_hex")?)?
+        != candidate_key
+        || decode_lower_hex_fixed::<32>(json_string(&history_vector, "provider_public_key_hex")?)?
+            != provider_key
+        || decode_lower_hex_fixed::<32>(json_string(&history_vector, "authority_public_key_hex")?)?
+            != catalog_key
+        || decode_lower_hex_fixed::<32>(json_string(&history_vector, "recipient_public_key_hex")?)?
+            != recipient_key
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery Scope Catalog keys drifted from History Recovery V3",
+        ));
+    }
+    let history_transition = v40_json_field(
+        &history_vector,
+        "identity_transition",
+        "History Recovery V3 vector",
+    )?;
+    let history_pre_sequence = history_transition
+        .get("pre_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("history pre-enrollment H must be unsigned"))?;
+    let history_post_sequence = history_transition
+        .get("post_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("history direct DeviceAdd H+1 must be unsigned"))?;
+    let history_pre_head =
+        decode_lower_hex_fixed::<32>(json_string(history_transition, "pre_head_digest_hex")?)?;
+    let history_post_head =
+        decode_lower_hex_fixed::<32>(json_string(history_transition, "post_head_digest_hex")?)?;
+    let (history_device_add_bytes, history_device_add) = v40_decode_exact(
+        json_string(history_transition, "direct_device_add_cbor_hex")?,
+        "catalog-bound History Recovery direct DeviceAdd",
+    )?;
+    let history_device_add_fields = v40_numbered_fields(
+        &history_device_add,
+        7,
+        "catalog-bound History Recovery direct DeviceAdd",
+    )?;
+    let history_device_add_digest = v40_digest(HISTORY_DEVICE_ADD, &history_device_add_bytes);
+    v40_require_json_digest(
+        history_transition,
+        "direct_device_add_digest_hex",
+        history_device_add_digest,
+        "catalog-bound direct DeviceAdd",
+    )?;
+    if v40_unsigned(history_device_add_fields[0], "history DeviceAdd version")? != 1
+        || history_pre_sequence != identity_sequence
+        || history_pre_head != identity_digest
+        || history_pre_sequence.checked_add(1) != Some(history_post_sequence)
+        || history_device_add_fields[1] != plaintext_fields[1]
+        || history_device_add_fields[2] != prep_signed_fields[3]
+        || v40_fixed_bytes::<32>(history_device_add_fields[3], "history candidate key")?
+            != candidate_key
+        || v40_fixed_bytes::<32>(history_device_add_fields[4], "history recipient key")?
+            != recipient_key
+        || v40_unsigned(history_device_add_fields[5], "history direct DeviceAdd H+1")?
+            != history_post_sequence
+        || v40_fixed_bytes::<32>(
+            history_device_add_fields[6],
+            "history DeviceAdd previous head",
+        )? != identity_digest
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V3 is not based on the exact direct candidate DeviceAdd H+1",
+        ));
+    }
+
+    let history_leaf_set = CanonicalValue::Array(
+        leaf_facts
+            .iter()
+            .map(|leaf| CanonicalValue::Bytes(leaf.digest.to_vec()))
+            .collect(),
+    );
+    let history_leaf_set_bytes = encode_deterministic_cbor(&history_leaf_set)
+        .map_err(|error| ProtocolToolError::new(format!("encode history leaf set: {error}")))?;
+    let history_leaf_set_digest = v40_digest(HISTORY_LEAF_SET, &history_leaf_set_bytes);
+    let history_manifest = CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(2),
+            CanonicalValue::Bytes(head_digest.to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(3),
+            CanonicalValue::Unsigned(generation),
+        ),
+        (
+            CanonicalValue::Unsigned(4),
+            CanonicalValue::Bytes(merkle_root.to_vec()),
+        ),
+        (
+            CanonicalValue::Unsigned(5),
+            CanonicalValue::Unsigned(
+                u64::try_from(leaf_facts.len()).expect("catalog leaf count fits u64"),
+            ),
+        ),
+        (
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Bytes(history_leaf_set_digest.to_vec()),
+        ),
+        (CanonicalValue::Unsigned(7), history_leaf_set),
+    ]);
+    let history_manifest_bytes = encode_deterministic_cbor(&history_manifest)
+        .map_err(|error| ProtocolToolError::new(format!("encode history manifest: {error}")))?;
+    let history_manifest_digest = v40_digest(HISTORY_MANIFEST, &history_manifest_bytes);
+
+    let history_request = v40_json_field(&history_vector, "request", "History Recovery V3 vector")?;
+    let (history_request_unsigned_bytes, history_request_unsigned) = v40_decode_exact_cddl(
+        "history-recovery-request-unsigned-v3",
+        &history_cddl,
+        json_string(history_request, "unsigned_cbor_hex")?,
+        "catalog-bound History Recovery unsigned request",
+    )?;
+    let (_, history_request_signed) = v40_decode_exact_cddl(
+        "history-recovery-request-v3",
+        &history_cddl,
+        json_string(history_request, "signed_cbor_hex")?,
+        "catalog-bound History Recovery signed request",
+    )?;
+    let history_request_unsigned_fields = v40_numbered_fields(
+        &history_request_unsigned,
+        20,
+        "catalog-bound History Recovery unsigned request",
+    )?;
+    let history_request_fields = v40_numbered_fields(
+        &history_request_signed,
+        21,
+        "catalog-bound History Recovery signed request",
+    )?;
+    let history_request_signature =
+        decode_lower_hex_fixed::<64>(json_string(history_request, "signature_hex")?)?;
+    let mut history_request_signature_input = HISTORY_REQUEST_SIGNATURE.to_vec();
+    history_request_signature_input.extend_from_slice(&history_request_unsigned_bytes);
+    v40_verify_signature(
+        candidate_key,
+        &history_request_signature_input,
+        history_request_signature,
+        "catalog-bound History Recovery request",
+    )?;
+    if history_request_unsigned_fields != history_request_fields[..20]
+        || v40_fixed_bytes::<64>(history_request_fields[20], "history request signature")?
+            != history_request_signature
+        || history_request_fields[1] != prep_signed_fields[1]
+        || history_request_fields[2] != plaintext_fields[1]
+        || history_request_fields[3] != prep_signed_fields[3]
+        || v40_fixed_bytes::<32>(history_request_fields[4], "history candidate key")?
+            != candidate_key
+        || v40_fixed_bytes::<32>(history_request_fields[5], "history recipient key")?
+            != recipient_key
+        || v40_unsigned(history_request_fields[6], "history pre-enrollment H")? != identity_sequence
+        || v40_fixed_bytes::<32>(history_request_fields[7], "history pre-enrollment head")?
+            != identity_digest
+        || v40_unsigned(history_request_fields[8], "history direct DeviceAdd H+1")?
+            != history_post_sequence
+        || v40_fixed_bytes::<32>(history_request_fields[9], "history post-DeviceAdd head")?
+            != history_post_head
+        || v40_fixed_bytes::<32>(history_request_fields[10], "history DeviceAdd digest")?
+            != history_device_add_digest
+        || v40_unsigned(history_request_fields[11], "history catalog generation")? != generation
+        || v40_fixed_bytes::<32>(history_request_fields[12], "history catalog head")? != head_digest
+        || v40_fixed_bytes::<32>(history_request_fields[13], "history catalog Merkle root")?
+            != merkle_root
+        || v40_unsigned(history_request_fields[14], "history catalog leaf count")?
+            != u64::try_from(leaf_facts.len()).expect("catalog leaf count fits u64")
+        || v40_fixed_bytes::<32>(history_request_fields[15], "history catalog leaf set")?
+            != history_leaf_set_digest
+        || v40_fixed_bytes::<32>(history_request_fields[16], "history catalog manifest")?
+            != history_manifest_digest
+        || v40_unsigned(history_request_fields[17], "history request issued_at")?
+            < v40_unsigned(prep_signed_fields[9], "preparation issued_at")?
+        || v40_unsigned(history_request_fields[17], "history request issued_at")?
+            >= v40_unsigned(history_request_fields[18], "history request expires_at")?
+        || v40_unsigned(history_request_fields[18], "history request expires_at")?
+            > v40_unsigned(prep_signed_fields[10], "preparation expires_at")?
+        || v40_fixed_bytes::<32>(history_request_fields[19], "history response capability")?
+            != response_capability_digest
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery V3 signed request escaped the exact catalog/head/H/direct-DeviceAdd binding",
+        ));
+    }
+
+    let statuses = v40_json_field(&vector, "statuses", "catalog vector")?;
+    require_exact_object_keys(
+        statuses,
+        &[
+            "pending_cbor_hex",
+            "ready_cbor_hex",
+            "expired_cbor_hex",
+            "invalidated_cbor_hex",
+        ],
+        "Recovery Scope Catalog statuses",
+    )?;
+    for (field, rule, state, response, reason) in [
+        (
+            "pending_cbor_hex",
+            "recovery-scope-catalog-status-pending-v1",
+            1,
+            None,
+            None,
+        ),
+        (
+            "ready_cbor_hex",
+            "recovery-scope-catalog-status-ready-v1",
+            2,
+            Some(&provider_signed),
+            None,
+        ),
+        (
+            "expired_cbor_hex",
+            "recovery-scope-catalog-status-expired-v1",
+            3,
+            None,
+            Some(4),
+        ),
+        (
+            "invalidated_cbor_hex",
+            "recovery-scope-catalog-status-invalidated-v1",
+            4,
+            None,
+            Some(1),
+        ),
+    ] {
+        let (_, status) = v40_decode_exact_cddl(
+            rule,
+            &cddl,
+            json_string(statuses, field)?,
+            &format!("Recovery Scope Catalog status {field}"),
+        )?;
+        let fields = v40_numbered_fields(&status, 6, "catalog status")?;
+        let observed_at = v40_unsigned(fields[5], "catalog status observed_at")?;
+        let preparation_issued_at = v40_unsigned(prep_signed_fields[9], "preparation issued_at")?;
+        let preparation_expires_at =
+            v40_unsigned(prep_signed_fields[10], "preparation expires_at")?;
+        if fields[1] != prep_signed_fields[1]
+            || v40_unsigned(fields[2], "catalog status state")? != state
+            || response.is_some_and(|expected| fields[3] != expected)
+            || response.is_none() && fields[3] != &CanonicalValue::Null
+            || reason.is_some_and(|expected| {
+                v40_unsigned(fields[4], "status reason").ok() != Some(expected)
+            })
+            || reason.is_none() && fields[4] != &CanonicalValue::Null
+            || state == 3 && observed_at != preparation_expires_at
+            || state != 3
+                && (observed_at < preparation_issued_at || observed_at >= preparation_expires_at)
+        {
+            return Err(ProtocolToolError::new(
+                "Recovery Scope Catalog status is not an honest pending/ready/expired/invalidated state",
+            ));
+        }
+    }
+    validate_recovery_scope_catalog_invalid(&vector, &cddl)?;
+    Ok(())
+}
+
+fn v41_catalog_plaintext_leaf_facts(
+    plaintext: &CanonicalValue,
+) -> Result<Vec<V41CatalogLeafFacts>, ProtocolToolError> {
+    let fields = v40_numbered_fields(plaintext, 7, "Recovery Scope Catalog plaintext")?;
+    let leaves = v40_array(fields[6], "Recovery Scope Catalog leaves")?;
+    if leaves.is_empty() || leaves.len() > V41_RECOVERY_SCOPE_CATALOG_MAX_LEAVES {
+        return Err(ProtocolToolError::new(
+            "Recovery Scope Catalog must contain between 1 and 65535 exhaustive leaves",
+        ));
+    }
+    let mut facts = Vec::with_capacity(leaves.len());
+    let mut previous_scope: Option<Vec<u8>> = None;
+    for (index, leaf) in leaves.iter().enumerate() {
+        let fields = v40_numbered_fields(leaf, 7, "Recovery Scope Catalog leaf")?;
+        let expected_index = u64::try_from(index + 1).expect("catalog leaf count fits u64");
+        if v40_unsigned(fields[1], "catalog leaf index")? != expected_index {
+            return Err(ProtocolToolError::new(
+                "Recovery Scope Catalog leaf indexes must be consecutive",
+            ));
+        }
+        let scope_exact = encode_deterministic_cbor(fields[2])
+            .map_err(|error| ProtocolToolError::new(format!("encode catalog scope: {error}")))?;
+        if previous_scope
+            .as_ref()
+            .is_some_and(|previous| previous >= &scope_exact)
+        {
+            return Err(ProtocolToolError::new(
+                "Recovery Scope Catalog scopes must be strictly sorted and unique",
+            ));
+        }
+        previous_scope = Some(scope_exact.clone());
+        let receipt = v40_bytes(fields[3], "catalog membership receipt")?;
+        let membership_receipt_digest = v40_digest(V41_MEMBERSHIP_RECEIPT_DOMAIN, receipt);
+        if v40_fixed_bytes::<32>(fields[4], "catalog membership receipt digest")?
+            != membership_receipt_digest
+        {
+            return Err(ProtocolToolError::new(
+                "Recovery Scope Catalog membership receipt digest drift",
+            ));
+        }
+        let scope_digest = v40_digest(V41_SCOPE_DOMAIN, &scope_exact);
+        if v40_fixed_bytes::<32>(fields[6], "catalog scope digest")? != scope_digest {
+            return Err(ProtocolToolError::new(
+                "Recovery Scope Catalog scope digest drift",
+            ));
+        }
+        let exact = encode_deterministic_cbor(leaf)
+            .map_err(|error| ProtocolToolError::new(format!("encode catalog leaf: {error}")))?;
+        facts.push(V41CatalogLeafFacts {
+            digest: v40_digest(V41_CATALOG_LEAF_DOMAIN, &exact),
+            exact,
+            scope_exact,
+            scope_digest,
+            membership_receipt: receipt.to_vec(),
+            membership_receipt_digest,
+            group_head_digest: v40_fixed_bytes::<32>(fields[5], "catalog group head")?,
+        });
+    }
+    Ok(facts)
+}
+
+fn v41_merkle_root(mut level: Vec<[u8; 32]>) -> Result<[u8; 32], ProtocolToolError> {
+    if level.is_empty() {
+        return Err(ProtocolToolError::new(
+            "catalog Merkle tree cannot be empty",
+        ));
+    }
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let right = pair.get(1).copied().unwrap_or(pair[0]);
+            let mut children = [0_u8; 64];
+            children[..32].copy_from_slice(&pair[0]);
+            children[32..].copy_from_slice(&right);
+            next.push(v40_digest(V41_CATALOG_NODE_DOMAIN, &children));
+        }
+        level = next;
+    }
+    Ok(level[0])
+}
+
+fn validate_recovery_scope_catalog_invalid(
+    vector: &Value,
+    cddl: &str,
+) -> Result<(), ProtocolToolError> {
+    let invalid = v40_json_array_field(vector, "invalid_cbor", "catalog vector")?;
+    let expected = [
+        (
+            "noncanonical_integer",
+            "recovery-scope-catalog-preparation-v1",
+        ),
+        (
+            "omitted_catalog_head_field",
+            "recovery-scope-catalog-head-v1",
+        ),
+        (
+            "unknown_preparation_field",
+            "recovery-scope-catalog-preparation-v1",
+        ),
+        (
+            "unsorted_catalog_leaf",
+            "recovery-scope-catalog-plaintext-v1",
+        ),
+        (
+            "duplicate_catalog_leaf",
+            "recovery-scope-catalog-plaintext-v1",
+        ),
+        (
+            "catalog_leaf_count_above_limit",
+            "recovery-scope-catalog-head-v1",
+        ),
+    ];
+    if invalid.len() != expected.len() {
+        return Err(ProtocolToolError::new("catalog invalid family drift"));
+    }
+    for ((expected_label, expected_rule), item) in expected.into_iter().zip(invalid) {
+        require_exact_object_keys(item, &["label", "rule", "cbor_hex"], "catalog invalid")?;
+        let label = json_string(item, "label")?;
+        let rule = json_string(item, "rule")?;
+        if label != expected_label || rule != expected_rule {
+            return Err(ProtocolToolError::new("catalog invalid label/rule drift"));
+        }
+        let bytes = decode_hex(json_string(item, "cbor_hex")?)?;
+        match label {
+            "noncanonical_integer" => {
+                if decode_deterministic_cbor(&bytes).is_ok() {
+                    return Err(ProtocolToolError::new(
+                        "catalog noncanonical integer was accepted",
+                    ));
+                }
+            }
+            "omitted_catalog_head_field"
+            | "unknown_preparation_field"
+            | "catalog_leaf_count_above_limit" => {
+                v40_decode_exact_bytes(&bytes, label)?;
+                if cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).is_ok() {
+                    return Err(ProtocolToolError::new(format!(
+                        "catalog CDDL accepted {label}"
+                    )));
+                }
+            }
+            "unsorted_catalog_leaf" | "duplicate_catalog_leaf" => {
+                let value = v40_decode_exact_bytes(&bytes, label)?;
+                cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).map_err(|error| {
+                    ProtocolToolError::new(format!(
+                        "catalog semantic invalid must pass CDDL: {error}"
+                    ))
+                })?;
+                if v41_catalog_plaintext_leaf_facts(&value).is_ok() {
+                    return Err(ProtocolToolError::new(format!(
+                        "catalog semantic invalid {label} was accepted"
+                    )));
+                }
+            }
+            _ => unreachable!("exact invalid labels were checked"),
+        }
+    }
+    Ok(())
+}
+
+const V41_RECOVERY_CATALOG_OPERATION_PARAMETERS: &[(&str, &[&str])] = &[
+    (
+        "/paths/~1v1~1recovery-scope-catalogs~1{generation}/put",
+        &["Generation", "DeviceAuthorization", "IdempotencyKey"],
+    ),
+    (
+        "/paths/~1v2~1devices~1enroll~1catalog-preparations/post",
+        &[
+            "EnrollmentCapability",
+            "ResponseCapability",
+            "IdempotencyKey",
+        ],
+    ),
+    (
+        "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}/get",
+        &["RequestId", "ResponseCapability"],
+    ),
+    (
+        "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}~1provider-response/put",
+        &["RequestId", "DeviceAuthorization", "IdempotencyKey"],
+    ),
+];
+
+fn validate_recovery_scope_catalog_openapi(
+    root: &Path,
+    vector: &Value,
+) -> Result<(), ProtocolToolError> {
+    let media = v40_json_field(vector, "media_types", "catalog vector")?;
+    v41_validate_recovery_scope_catalog_openapi_surface(root, media)?;
+    let source = read(&root.join("protocol/openapi/recovery-scope-catalog/v1/openapi.yaml"))?;
+    let document: Value = yaml_serde::from_str(&source).map_err(|error| {
+        ProtocolToolError::new(format!(
+            "parse Recovery Scope Catalog OpenAPI tree: {error}"
+        ))
+    })?;
+    v41_validate_recovery_catalog_parameter_contract(&document)?;
+    v41_validate_recovery_catalog_response_contract(&document)?;
+    expect_value(
+        &document,
+        "/paths/~1v1~1recovery-scope-catalogs~1{generation}/put/requestBody/content/application~1vnd.dirextalk.recovery-scope-catalog.v1+cbor/x-dirextalk-max-leaf-count",
+        &json!(V41_RECOVERY_SCOPE_CATALOG_MAX_LEAVES),
+    )
+}
+
+fn v41_validate_recovery_scope_catalog_openapi_surface(
+    root: &Path,
+    media: &Value,
+) -> Result<(), ProtocolToolError> {
+    v41_validate_openapi(
+        root,
+        "protocol/openapi/recovery-scope-catalog/v1/openapi.yaml",
+        &[
+            (
+                "/v1/recovery-scope-catalogs/{generation}",
+                "/paths/~1v1~1recovery-scope-catalogs~1{generation}",
+                &["put"],
+            ),
+            (
+                "/v2/devices/enroll/catalog-preparations",
+                "/paths/~1v2~1devices~1enroll~1catalog-preparations",
+                &["post"],
+            ),
+            (
+                "/v2/devices/enroll/catalog-preparations/{request_id}",
+                "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}",
+                &["get"],
+            ),
+            (
+                "/v2/devices/enroll/catalog-preparations/{request_id}/provider-response",
+                "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}~1provider-response",
+                &["put"],
+            ),
+        ],
+        &[
+            (
+                "/paths/~1v1~1recovery-scope-catalogs~1{generation}/put/operationId",
+                "putRecoveryScopeCatalogV1",
+            ),
+            (
+                "/paths/~1v2~1devices~1enroll~1catalog-preparations/post/operationId",
+                "prepareRecoveryScopeCatalogV1",
+            ),
+            (
+                "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}/get/operationId",
+                "getRecoveryScopeCatalogPreparationV1",
+            ),
+            (
+                "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}~1provider-response/put/operationId",
+                "putRecoveryScopeCatalogProviderResponseV1",
+            ),
+        ],
+        &[
+            (
+                "/paths/~1v1~1recovery-scope-catalogs~1{generation}/put/requestBody/content",
+                json_string(media, "catalog_upload")?,
+            ),
+            (
+                "/components/responses/CatalogHead/content",
+                json_string(media, "catalog_head")?,
+            ),
+            (
+                "/paths/~1v2~1devices~1enroll~1catalog-preparations/post/requestBody/content",
+                json_string(media, "preparation")?,
+            ),
+            (
+                "/components/responses/PreparationStatus/content",
+                json_string(media, "status")?,
+            ),
+            (
+                "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}~1provider-response/put/requestBody/content",
+                json_string(media, "provider_response")?,
+            ),
+        ],
+        &[
+            "CatalogHead",
+            "PreparationStatus",
+            "PreparationGoneStatus",
+            "PreparationInvalidatedStatus",
+            "DeviceAuthenticationFailed",
+            "CapabilityRejected",
+            "CatalogConflict",
+            "CatalogGone",
+            "IdentityHeadChanged",
+            "PreparationConflict",
+            "PreparationGone",
+            "PreparationPreconditionFailed",
+            "PreparationInvalidated",
+            "InvalidExactCbor",
+            "ServiceUnavailable",
+        ],
+        &[
+            "DEVICE_AUTHENTICATION_FAILED",
+            "IDENTITY_HEAD_CHANGED",
+            "CATALOG_HEAD_CHANGED",
+            "AUTHORITY_CHANGED",
+            "CANDIDATE_KEY_CHANGED",
+            "RECOVERY_CATALOG_EXPIRED",
+            "RECOVERY_PREPARATION_EXPIRED",
+            "RECOVERY_PREPARATION_REVOKED",
+            "RECOVERY_PREPARATION_INVALIDATED",
+            "RECOVERY_RESPONSE_CAPABILITY_REJECTED",
+            "IDENTITY_SERVICE_UNAVAILABLE",
+        ],
+        "Recovery Scope Catalog OpenAPI",
+    )
+}
+
+fn v41_validate_recovery_catalog_parameter_contract(
+    document: &Value,
+) -> Result<(), ProtocolToolError> {
+    v41_validate_openapi_operation_parameters(
+        document,
+        V41_RECOVERY_CATALOG_OPERATION_PARAMETERS,
+        "Recovery Scope Catalog OpenAPI",
+    )?;
+    expect_value(
+        document,
+        "/components/parameters/EnrollmentCapability",
+        &json!({
+            "name": "DTX-Enrollment-Capability",
+            "in": "header",
+            "required": true,
+            "schema": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{43}$",
+            },
+        }),
+    )
+}
+
+fn v41_validate_recovery_catalog_response_contract(
+    document: &Value,
+) -> Result<(), ProtocolToolError> {
+    v41_validate_recovery_catalog_response_statuses(document)?;
+    v41_validate_recovery_catalog_response_components(document)?;
+    v41_validate_recovery_catalog_success_responses(document)?;
+    v41_validate_recovery_catalog_error_responses(document)
+}
+
+fn v41_validate_recovery_catalog_response_statuses(
+    document: &Value,
+) -> Result<(), ProtocolToolError> {
+    const LABEL: &str = "Recovery Scope Catalog OpenAPI";
+    const CATALOG_OPERATION: &str = "/paths/~1v1~1recovery-scope-catalogs~1{generation}/put";
+    const PREPARATION_OPERATION: &str = "/paths/~1v2~1devices~1enroll~1catalog-preparations/post";
+    const STATUS_OPERATION: &str =
+        "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}/get";
+    const PROVIDER_OPERATION: &str =
+        "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}~1provider-response/put";
+
+    for (operation, expected) in [
+        (
+            CATALOG_OPERATION,
+            &[
+                ("200", "CatalogHead"),
+                ("201", "CatalogHead"),
+                ("401", "DeviceAuthenticationFailed"),
+                ("409", "CatalogConflict"),
+                ("410", "CatalogGone"),
+                ("412", "IdentityHeadChanged"),
+                ("422", "InvalidExactCbor"),
+                ("503", "ServiceUnavailable"),
+            ][..],
+        ),
+        (
+            PREPARATION_OPERATION,
+            &[
+                ("200", "PreparationStatus"),
+                ("201", "PreparationStatus"),
+                ("401", "CapabilityRejected"),
+                ("409", "PreparationConflict"),
+                ("410", "PreparationGone"),
+                ("412", "PreparationPreconditionFailed"),
+                ("422", "InvalidExactCbor"),
+                ("503", "ServiceUnavailable"),
+            ][..],
+        ),
+        (
+            STATUS_OPERATION,
+            &[
+                ("200", "PreparationStatus"),
+                ("401", "CapabilityRejected"),
+                ("410", "PreparationGoneStatus"),
+                ("412", "PreparationInvalidatedStatus"),
+                ("503", "ServiceUnavailable"),
+            ][..],
+        ),
+        (
+            PROVIDER_OPERATION,
+            &[
+                ("200", "PreparationStatus"),
+                ("401", "DeviceAuthenticationFailed"),
+                ("409", "PreparationConflict"),
+                ("410", "PreparationGone"),
+                ("412", "PreparationInvalidated"),
+                ("422", "InvalidExactCbor"),
+                ("503", "ServiceUnavailable"),
+            ][..],
+        ),
+    ] {
+        let responses_pointer = format!("{operation}/responses");
+        let responses = document.pointer(&responses_pointer).ok_or_else(|| {
+            ProtocolToolError::new(format!("{LABEL} responses missing at {responses_pointer}"))
+        })?;
+        require_exact_object_keys(
+            responses,
+            &expected
+                .iter()
+                .map(|(status, _)| *status)
+                .collect::<Vec<_>>(),
+            &format!("{LABEL} responses at {operation}"),
+        )?;
+        for (status, response) in expected {
+            expect_value(
+                document,
+                &format!("{responses_pointer}/{status}"),
+                &json!({"$ref": format!("#/components/responses/{response}")}),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn v41_validate_recovery_catalog_response_components(
+    document: &Value,
+) -> Result<(), ProtocolToolError> {
+    const LABEL: &str = "Recovery Scope Catalog OpenAPI";
+    require_exact_object_keys(
+        document
+            .pointer("/components/headers")
+            .ok_or_else(|| ProtocolToolError::new(format!("{LABEL} headers missing")))?,
+        &["NoStore", "NoSniff", "XRequestId"],
+        &format!("{LABEL} headers"),
+    )?;
+    for (pointer, expected) in [
+        (
+            "/components/headers/NoStore",
+            json!({"schema": {"type": "string", "const": "no-store"}}),
+        ),
+        (
+            "/components/headers/NoSniff",
+            json!({"schema": {"type": "string", "const": "nosniff"}}),
+        ),
+        (
+            "/components/headers/XRequestId",
+            json!({"schema": {"$ref": "#/components/schemas/UuidV7"}}),
+        ),
+        (
+            "/components/schemas/ErrorEnvelopeV1",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["error"],
+                "properties": {
+                    "error": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["code", "request_id", "retryable"],
+                        "properties": {
+                            "code": {"type": "string"},
+                            "request_id": {"$ref": "#/components/headers/XRequestId/schema"},
+                            "retryable": {"type": "boolean"}
+                        }
+                    }
+                }
+            }),
+        ),
+    ] {
+        expect_value(document, pointer, &expected)?;
+    }
+
+    Ok(())
+}
+
+fn v41_validate_recovery_catalog_success_responses(
+    document: &Value,
+) -> Result<(), ProtocolToolError> {
+    const LABEL: &str = "Recovery Scope Catalog OpenAPI";
+    for (response, media) in [
+        (
+            "CatalogHead",
+            "application/vnd.dirextalk.recovery-scope-catalog-head.v1+cbor",
+        ),
+        (
+            "PreparationStatus",
+            "application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor",
+        ),
+        (
+            "PreparationGoneStatus",
+            "application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor",
+        ),
+        (
+            "PreparationInvalidatedStatus",
+            "application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor",
+        ),
+    ] {
+        v41_validate_recovery_catalog_response_headers(document, response, false)?;
+        let content_pointer = format!("/components/responses/{response}/content");
+        v40_validate_exact_cbor_content(document, &content_pointer, media, LABEL)?;
+        require_exact_object_keys(
+            document
+                .pointer(&format!("{content_pointer}/{}", media.replace('/', "~1")))
+                .ok_or_else(|| {
+                    ProtocolToolError::new(format!("{LABEL} response media missing for {response}"))
+                })?,
+            &["x-dirextalk-exact-cbor", "schema"],
+            &format!("{LABEL} response media for {response}"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn v41_validate_recovery_catalog_error_responses(
+    document: &Value,
+) -> Result<(), ProtocolToolError> {
+    for (response, codes, retryable) in [
+        (
+            "DeviceAuthenticationFailed",
+            &["DEVICE_AUTHENTICATION_FAILED"][..],
+            false,
+        ),
+        (
+            "CapabilityRejected",
+            &["RECOVERY_RESPONSE_CAPABILITY_REJECTED"][..],
+            false,
+        ),
+        (
+            "CatalogConflict",
+            &["RECOVERY_CATALOG_CONFLICT", "IDEMPOTENCY_CONFLICT"][..],
+            false,
+        ),
+        ("CatalogGone", &["RECOVERY_CATALOG_EXPIRED"][..], false),
+        ("IdentityHeadChanged", &["IDENTITY_HEAD_CHANGED"][..], false),
+        (
+            "PreparationConflict",
+            &["RECOVERY_PREPARATION_CONFLICT", "IDEMPOTENCY_CONFLICT"][..],
+            false,
+        ),
+        (
+            "PreparationGone",
+            &[
+                "RECOVERY_PREPARATION_EXPIRED",
+                "RECOVERY_PREPARATION_REVOKED",
+                "RECOVERY_CATALOG_EXPIRED",
+            ][..],
+            false,
+        ),
+        (
+            "PreparationPreconditionFailed",
+            &[
+                "IDENTITY_HEAD_CHANGED",
+                "CATALOG_HEAD_CHANGED",
+                "AUTHORITY_CHANGED",
+                "CANDIDATE_KEY_CHANGED",
+            ][..],
+            false,
+        ),
+        (
+            "PreparationInvalidated",
+            &["RECOVERY_PREPARATION_INVALIDATED"][..],
+            false,
+        ),
+        (
+            "InvalidExactCbor",
+            &["EXACT_CBOR_INVALID", "RECOVERY_CATALOG_INVALID"][..],
+            false,
+        ),
+        (
+            "ServiceUnavailable",
+            &["IDENTITY_SERVICE_UNAVAILABLE"][..],
+            true,
+        ),
+    ] {
+        v41_validate_recovery_catalog_response_headers(document, response, true)?;
+        expect_value(
+            document,
+            &format!("/components/responses/{response}/content"),
+            &json!({
+                "application/json": {
+                    "schema": {
+                        "allOf": [
+                            {"$ref": "#/components/schemas/ErrorEnvelopeV1"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "error": {
+                                        "type": "object",
+                                        "properties": {
+                                            "code": {"type": "string", "enum": codes},
+                                            "retryable": {"type": "boolean", "const": retryable}
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn v41_validate_recovery_catalog_response_headers(
+    document: &Value,
+    response: &str,
+    error: bool,
+) -> Result<(), ProtocolToolError> {
+    const LABEL: &str = "Recovery Scope Catalog OpenAPI";
+    let response_pointer = format!("/components/responses/{response}");
+    require_exact_object_keys(
+        document.pointer(&response_pointer).ok_or_else(|| {
+            ProtocolToolError::new(format!("{LABEL} response {response} is missing"))
+        })?,
+        if error {
+            &[
+                "description",
+                "x-dirextalk-request-id-header-matches-body",
+                "headers",
+                "content",
+            ]
+        } else {
+            &["description", "headers", "content"]
+        },
+        &format!("{LABEL} response {response}"),
+    )?;
+    if document
+        .pointer(&format!("{response_pointer}/description"))
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(ProtocolToolError::new(format!(
+            "{LABEL} response {response} needs a description"
+        )));
+    }
+    if error {
+        expect_value(
+            document,
+            &format!("{response_pointer}/x-dirextalk-request-id-header-matches-body"),
+            &json!(true),
+        )?;
+    }
+    expect_value(
+        document,
+        &format!("{response_pointer}/headers"),
+        &json!({
+            "Cache-Control": {"$ref": "#/components/headers/NoStore"},
+            "X-Content-Type-Options": {"$ref": "#/components/headers/NoSniff"},
+            "X-Request-Id": {"$ref": "#/components/headers/XRequestId"}
+        }),
+    )
+}
+
+fn v41_validate_openapi_operation_parameters(
+    document: &Value,
+    expected: &[(&str, &[&str])],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    for &(operation_pointer, expected_components) in expected {
+        let parameters_pointer = format!("{operation_pointer}/parameters");
+        let parameters = document
+            .pointer(&parameters_pointer)
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ProtocolToolError::new(format!(
+                    "{label} operation parameters must be an array at {parameters_pointer}"
+                ))
+            })?;
+        let mut actual_components = Vec::with_capacity(parameters.len());
+        let mut seen = BTreeSet::new();
+        for (index, parameter) in parameters.iter().enumerate() {
+            let parameter_label =
+                format!("{label} operation parameter {index} at {operation_pointer}");
+            require_exact_object_keys(parameter, &["$ref"], &parameter_label)?;
+            let reference = parameter
+                .get("$ref")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProtocolToolError::new(format!("{parameter_label} must contain a string $ref"))
+                })?;
+            let component = reference
+                .strip_prefix("#/components/parameters/")
+                .filter(|component| {
+                    !component.is_empty() && !component.contains('/') && !component.contains('~')
+                })
+                .ok_or_else(|| {
+                    ProtocolToolError::new(format!(
+                        "{parameter_label} must reference one local parameter component: {reference}"
+                    ))
+                })?;
+            if !seen.insert(component) {
+                return Err(ProtocolToolError::new(format!(
+                    "{label} operation {operation_pointer} duplicates parameter component {component}"
+                )));
+            }
+            let component_pointer = format!("/components/parameters/{component}");
+            let resolved = document.pointer(&component_pointer).ok_or_else(|| {
+                ProtocolToolError::new(format!(
+                    "{label} operation {operation_pointer} references missing parameter component {component}"
+                ))
+            })?;
+            if resolved.get("required").and_then(Value::as_bool) != Some(true) {
+                return Err(ProtocolToolError::new(format!(
+                    "{label} operation {operation_pointer} parameter component {component} must be required"
+                )));
+            }
+            actual_components.push(component);
+        }
+        if actual_components.as_slice() != expected_components {
+            return Err(ProtocolToolError::new(format!(
+                "{label} operation {operation_pointer} parameter references drifted: expected {expected_components:?}, found {actual_components:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn v41_validate_openapi(
+    root: &Path,
+    relative: &str,
+    routes: &[(&str, &str, &[&str])],
+    operations: &[(&str, &str)],
+    contents: &[(&str, &str)],
+    responses: &[&str],
+    required_tokens: &[&str],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    let source = read(&root.join(relative))?;
+    let spec = oas3::from_yaml(&source)
+        .map_err(|error| ProtocolToolError::new(format!("parse {label}: {error}")))?;
+    if spec.openapi != "3.1.0" {
+        return Err(ProtocolToolError::new(format!(
+            "{label} must declare OpenAPI 3.1.0"
+        )));
+    }
+    let document: Value = yaml_serde::from_str(&source)
+        .map_err(|error| ProtocolToolError::new(format!("parse {label} tree: {error}")))?;
+    v41_validate_openapi_path_parameters(&document, label)?;
+    require_exact_object_keys(
+        document
+            .pointer("/paths")
+            .ok_or_else(|| ProtocolToolError::new(format!("{label} paths missing")))?,
+        &routes.iter().map(|(path, _, _)| *path).collect::<Vec<_>>(),
+        &format!("{label} paths"),
+    )?;
+    for (_, pointer, methods) in routes {
+        require_exact_object_keys(
+            document.pointer(pointer).ok_or_else(|| {
+                ProtocolToolError::new(format!("{label} route {pointer} missing"))
+            })?,
+            methods,
+            &format!("{label} route {pointer}"),
+        )?;
+    }
+    for (pointer, operation) in operations {
+        if document.pointer(pointer).and_then(Value::as_str) != Some(*operation) {
+            return Err(ProtocolToolError::new(format!(
+                "{label} operation drift at {pointer}"
+            )));
+        }
+    }
+    for (pointer, media_type) in contents {
+        v40_validate_exact_cbor_content(&document, pointer, media_type, label)?;
+    }
+    require_exact_object_keys(
+        document.pointer("/components/responses").ok_or_else(|| {
+            ProtocolToolError::new(format!("{label} component responses missing"))
+        })?,
+        responses,
+        &format!("{label} component responses"),
+    )?;
+    for response in responses {
+        let pointer = format!("/components/responses/{response}/headers/Cache-Control/$ref");
+        if document.pointer(&pointer).and_then(Value::as_str)
+            != Some("#/components/headers/NoStore")
+        {
+            return Err(ProtocolToolError::new(format!(
+                "{label} response {response} must be no-store"
+            )));
+        }
+    }
+    if document
+        .pointer("/components/schemas/ExactCanonicalCbor/x-dirextalk-exact-cbor")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || document
+            .pointer("/components/headers/NoStore/schema/const")
+            .and_then(Value::as_str)
+            != Some("no-store")
+    {
+        return Err(ProtocolToolError::new(format!(
+            "{label} exact-CBOR or no-store schema drift"
+        )));
+    }
+    for token in required_tokens {
+        if !source.contains(token) {
+            return Err(ProtocolToolError::new(format!(
+                "{label} is missing exact error {token}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn v41_validate_openapi_path_parameters(
+    document: &Value,
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    const HTTP_METHODS: &[&str] = &[
+        "delete", "get", "head", "options", "patch", "post", "put", "trace",
+    ];
+    let paths = document
+        .pointer("/paths")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ProtocolToolError::new(format!("{label} paths must be an object")))?;
+    for (path, path_item) in paths {
+        let variables = v41_openapi_template_variables(path, label)?;
+        let path_item = path_item.as_object().ok_or_else(|| {
+            ProtocolToolError::new(format!("{label} path item {path} must be an object"))
+        })?;
+        for method in HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            let operation = operation.as_object().ok_or_else(|| {
+                ProtocolToolError::new(format!(
+                    "{label} operation {method} {path} must be an object"
+                ))
+            })?;
+            let mut counts = BTreeMap::<String, usize>::new();
+            for parameters in [path_item.get("parameters"), operation.get("parameters")]
+                .into_iter()
+                .flatten()
+            {
+                let parameters = parameters.as_array().ok_or_else(|| {
+                    ProtocolToolError::new(format!(
+                        "{label} parameters for {method} {path} must be an array"
+                    ))
+                })?;
+                for parameter in parameters {
+                    let parameter = v41_resolve_openapi_parameter(document, parameter, label)?;
+                    let parameter = parameter.as_object().ok_or_else(|| {
+                        ProtocolToolError::new(format!(
+                            "{label} parameter for {method} {path} must be an object"
+                        ))
+                    })?;
+                    if parameter.get("in").and_then(Value::as_str) != Some("path") {
+                        continue;
+                    }
+                    let name = parameter
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ProtocolToolError::new(format!(
+                                "{label} path parameter for {method} {path} must have a name"
+                            ))
+                        })?;
+                    if parameter.get("required").and_then(Value::as_bool) != Some(true) {
+                        return Err(ProtocolToolError::new(format!(
+                            "{label} path parameter {name} for {method} {path} must be required"
+                        )));
+                    }
+                    if !variables.contains(name) {
+                        return Err(ProtocolToolError::new(format!(
+                            "{label} declares extra path parameter {name} for {method} {path}"
+                        )));
+                    }
+                    *counts.entry(name.to_owned()).or_default() += 1;
+                }
+            }
+            for variable in &variables {
+                match counts.get(variable).copied().unwrap_or_default() {
+                    1 => {}
+                    0 => {
+                        return Err(ProtocolToolError::new(format!(
+                            "{label} is missing path parameter {variable} for {method} {path}"
+                        )));
+                    }
+                    _ => {
+                        return Err(ProtocolToolError::new(format!(
+                            "{label} declares duplicate path parameter {variable} for {method} {path}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn v41_openapi_template_variables(
+    path: &str,
+    label: &str,
+) -> Result<BTreeSet<String>, ProtocolToolError> {
+    let mut variables = BTreeSet::new();
+    let mut remainder = path;
+    loop {
+        let Some(open) = remainder.find('{') else {
+            if remainder.contains('}') {
+                return Err(ProtocolToolError::new(format!(
+                    "{label} path template has an unmatched closing brace: {path}"
+                )));
+            }
+            break;
+        };
+        if remainder[..open].contains('}') {
+            return Err(ProtocolToolError::new(format!(
+                "{label} path template has an unmatched closing brace: {path}"
+            )));
+        }
+        let after_open = &remainder[open + 1..];
+        let close = after_open.find('}').ok_or_else(|| {
+            ProtocolToolError::new(format!(
+                "{label} path template has an unmatched opening brace: {path}"
+            ))
+        })?;
+        let variable = &after_open[..close];
+        if variable.is_empty() || variable.contains(['{', '}']) {
+            return Err(ProtocolToolError::new(format!(
+                "{label} path template variable is malformed: {path}"
+            )));
+        }
+        if !variables.insert(variable.to_owned()) {
+            return Err(ProtocolToolError::new(format!(
+                "{label} path template variable is duplicated: {variable}"
+            )));
+        }
+        remainder = &after_open[close + 1..];
+    }
+    Ok(variables)
+}
+
+fn v41_resolve_openapi_parameter<'a>(
+    document: &'a Value,
+    parameter: &'a Value,
+    label: &str,
+) -> Result<&'a Value, ProtocolToolError> {
+    let Some(reference) = parameter.get("$ref").and_then(Value::as_str) else {
+        return Ok(parameter);
+    };
+    let component = reference
+        .strip_prefix("#/components/parameters/")
+        .filter(|component| {
+            !component.is_empty() && !component.contains('/') && !component.contains('~')
+        })
+        .ok_or_else(|| {
+            ProtocolToolError::new(format!(
+                "{label} path parameter reference must target a local component: {reference}"
+            ))
+        })?;
+    document
+        .pointer(&format!("/components/parameters/{component}"))
+        .ok_or_else(|| {
+            ProtocolToolError::new(format!(
+                "{label} path parameter component is missing: {component}"
+            ))
+        })
+}
+
+fn v41_path_coordinate_binding(
+    reject: &str,
+    coordinates: &[(&str, &str, &str, &[u64], &str)],
+) -> Value {
+    let coordinates = coordinates
+        .iter()
+        .map(|(name, source, cddl_rule, cbor_path, comparison)| {
+            (
+                (*name).to_owned(),
+                json!({
+                    "source": source,
+                    "cddl-rule": cddl_rule,
+                    "cbor-path": cbor_path,
+                    "comparison": comparison,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "reject": reject,
+        "coordinates": coordinates,
+    })
+}
+
+fn v41_scope_kind_pairing() -> Value {
+    json!({
+        "path-kind": "scope_kind",
+        "path-id": "scope_id",
+        "mappings": {
+            "private-conversation": {
+                "signed-cbor-kind": 1,
+                "scope-id-schema": "#/components/schemas/UuidV7",
+            },
+            "controlled-public-channel": {
+                "signed-cbor-kind": 2,
+                "scope-id-schema": "#/components/schemas/ChannelId",
+            },
+        },
+    })
+}
+
+fn v41_read_openapi_tree(
+    root: &Path,
+    relative: &str,
+    label: &str,
+) -> Result<Value, ProtocolToolError> {
+    yaml_serde::from_str(&read(&root.join(relative))?)
+        .map_err(|error| ProtocolToolError::new(format!("parse {label} tree: {error}")))
+}
+
+fn v41_validate_openapi_coordinate_bindings(
+    document: &Value,
+    expected: &[(&str, Value, Option<Value>)],
+    label: &str,
+) -> Result<(), ProtocolToolError> {
+    const HTTP_METHODS: &[&str] = &[
+        "delete", "get", "head", "options", "patch", "post", "put", "trace",
+    ];
+    let mut expected = expected
+        .iter()
+        .map(|(pointer, binding, pairing)| ((*pointer).to_owned(), (binding, pairing.as_ref())))
+        .collect::<BTreeMap<_, _>>();
+    if expected.values().any(|(_, pairing)| pairing.is_some()) {
+        v41_validate_scope_kind_schema_pairing(document)?;
+    }
+    let paths = document
+        .pointer("/paths")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ProtocolToolError::new(format!("{label} paths must be an object")))?;
+    for (path, path_item) in paths {
+        let templated = !v41_openapi_template_variables(path, label)?.is_empty();
+        let path_item = path_item.as_object().ok_or_else(|| {
+            ProtocolToolError::new(format!("{label} path item {path} must be an object"))
+        })?;
+        for method in HTTP_METHODS {
+            let Some(operation) = path_item.get(*method) else {
+                continue;
+            };
+            let path_token = path.replace('~', "~0").replace('/', "~1");
+            let operation_pointer = format!("/paths/{path_token}/{method}");
+            let binding_pointer =
+                format!("{operation_pointer}/x-dirextalk-path-coordinate-binding");
+            let pairing_pointer = format!("{operation_pointer}/x-dirextalk-scope-kind-pairing");
+            if templated {
+                let Some((binding, pairing)) = expected.remove(&operation_pointer) else {
+                    return Err(ProtocolToolError::new(format!(
+                        "{label} has no frozen coordinate-binding contract for {method} {path}"
+                    )));
+                };
+                expect_value(document, &binding_pointer, binding)?;
+                if let Some(pairing) = pairing {
+                    expect_value(document, &pairing_pointer, pairing)?;
+                } else if document.pointer(&pairing_pointer).is_some() {
+                    return Err(ProtocolToolError::new(format!(
+                        "{label} has unexpected scope-kind pairing for {method} {path}"
+                    )));
+                }
+            } else if document.pointer(&binding_pointer).is_some()
+                || document.pointer(&pairing_pointer).is_some()
+            {
+                return Err(ProtocolToolError::new(format!(
+                    "{label} has coordinate metadata on untemplated operation {method} {path}"
+                )));
+            }
+            if !operation.is_object() {
+                return Err(ProtocolToolError::new(format!(
+                    "{label} operation {method} {path} must be an object"
+                )));
+            }
+        }
+    }
+    if let Some(pointer) = expected.keys().next() {
+        return Err(ProtocolToolError::new(format!(
+            "{label} coordinate-binding expectation does not name an operation: {pointer}"
+        )));
+    }
+    Ok(())
+}
+
+fn v41_validate_scope_kind_schema_pairing(document: &Value) -> Result<(), ProtocolToolError> {
+    for (pointer, expected) in [
+        (
+            "/components/parameters/ScopeKind",
+            json!({
+                "name": "scope_kind",
+                "in": "path",
+                "required": true,
+                "schema": {
+                    "type": "string",
+                    "enum": ["private-conversation", "controlled-public-channel"],
+                },
+            }),
+        ),
+        (
+            "/components/parameters/ScopeId",
+            json!({
+                "name": "scope_id",
+                "in": "path",
+                "required": true,
+                "schema": {"$ref": "#/components/schemas/GroupScopeId"},
+            }),
+        ),
+        (
+            "/components/schemas/UuidV7",
+            json!({
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            }),
+        ),
+        (
+            "/components/schemas/ChannelId",
+            json!({
+                "type": "string",
+                "minLength": 57,
+                "maxLength": 57,
+                "pattern": "^dtxc1[a-z2-7]{52}$",
+            }),
+        ),
+        (
+            "/components/schemas/GroupScopeId",
+            json!({
+                "oneOf": [
+                    {"$ref": "#/components/schemas/UuidV7"},
+                    {"$ref": "#/components/schemas/ChannelId"},
+                ],
+            }),
+        ),
+    ] {
+        expect_value(document, pointer, &expected)?;
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V41 history gate proves every signed catalog, identity, offer, attachment, and mailbox binding"
+)]
+fn validate_history_recovery_v2(root: &Path) -> Result<(), ProtocolToolError> {
+    const LEAF_SET: &[u8] = b"dirextalk.history-recovery-leaf-set.v1\0";
+    const MANIFEST: &[u8] = b"dirextalk.history-recovery-manifest.v1\0";
+    const DEVICE_ADD: &[u8] = b"dirextalk.identity-device-add.v1\0";
+    const REQUEST_SIGNATURE: &[u8] = b"dirextalk.history-recovery-request-signature.v3\0";
+    const REQUEST_DIGEST: &[u8] = b"dirextalk.history-recovery-request-digest.v3\0";
+    const RESPONSE_CAPABILITY: &[u8] = b"dirextalk.recovery-response-capability.v1\0";
+    const RECIPIENT_KEY: &[u8] = b"dirextalk.recovery-recipient-key.v1\0";
+    const SNAPSHOT: &[u8] = b"dirextalk.history-snapshot-plaintext.v1\0";
+    const ATTACHMENT: &[u8] = b"dirextalk.history-recovery-attachment.v1\0";
+    const ATTACHMENT_CAPABILITY: &[u8] = b"dirextalk.history-recovery-attachment-capability.v1\0";
+    const OFFER_CIPHERTEXT: &[u8] = b"dirextalk.recipient-history-offer-hpke.v1\0";
+    const OFFER_DIGEST: &[u8] = b"dirextalk.recipient-history-offer.v1\0";
+    const PROVIDER_SIGNATURE: &[u8] = b"dirextalk.history-recovery-grant-provider.v3\0";
+    const AUTHORITY_SIGNATURE: &[u8] = b"dirextalk.history-recovery-grant-authority.v3\0";
+    const GRANT_DIGEST: &[u8] = b"dirextalk.history-recovery-grant.v3\0";
+    const REQUEST_RECEIPT: &[u8] = b"dirextalk.history-recovery-request-receipt.v3\0";
+    const REVOCATION_RECEIPT: &[u8] = b"dirextalk.history-recovery-revocation-receipt.v1\0";
+    const DELIVERY_RECEIPT: &[u8] = b"dirextalk.history-recovery-delivery-receipt.v1\0";
+    const CATALOG_HEAD: &[u8] = b"dirextalk.recovery-scope-catalog-head-digest.v1\0";
+    const PACKAGE_BYTES: &[u8] = b"dirextalk.key-package-bytes.v1\0";
+
+    let cddl = read(&root.join("protocol/cddl/history-recovery/v2/history-recovery-v2.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse History Recovery V3 CDDL: {error}"))
+    })?;
+    let vector = read_json(
+        &root.join("protocol/test-vectors/history-recovery/v2/history-recovery-v2.json"),
+    )?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "baseline",
+            "media_types",
+            "domains",
+            "candidate_public_key_hex",
+            "provider_public_key_hex",
+            "authority_public_key_hex",
+            "recipient_public_key_hex",
+            "response_capability_hex",
+            "catalog_binding",
+            "identity_transition",
+            "request",
+            "snapshot",
+            "offer",
+            "grant",
+            "invalid_cbor",
+            "completion_key_descriptor",
+            "completion",
+        ],
+        "History Recovery V3 vector",
+    )?;
+    if vector.get("version").and_then(Value::as_u64) != Some(3)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(41)
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery vector version/baseline must be 3/41",
+        ));
+    }
+    v40_require_string_map(
+        v40_json_field(&vector, "media_types", "History Recovery vector")?,
+        &[
+            (
+                "request",
+                "application/vnd.dirextalk.history-recovery-request.v3+cbor",
+            ),
+            (
+                "request_receipt",
+                "application/vnd.dirextalk.history-recovery-request-receipt.v3+cbor",
+            ),
+            (
+                "revocation_receipt",
+                "application/vnd.dirextalk.history-recovery-revocation-receipt.v1+cbor",
+            ),
+            (
+                "grant",
+                "application/vnd.dirextalk.history-recovery-grant.v3+cbor",
+            ),
+            (
+                "delivery_receipt",
+                "application/vnd.dirextalk.history-recovery-delivery-receipt.v1+cbor",
+            ),
+            (
+                "completion_key_descriptor",
+                "application/vnd.dirextalk.history-recovery-completion-key-descriptor.v1+cbor",
+            ),
+            (
+                "completion_command",
+                "application/vnd.dirextalk.history-recovery-completion-command.v1+cbor",
+            ),
+            (
+                "completion_receipt",
+                "application/vnd.dirextalk.history-recovery-completion-receipt.v1+cbor",
+            ),
+        ],
+        "History Recovery media types",
+    )?;
+    v40_require_string_map(
+        v40_json_field(&vector, "domains", "History Recovery vector")?,
+        &[
+            ("leaf_set", std::str::from_utf8(LEAF_SET).expect("ASCII")),
+            ("manifest", std::str::from_utf8(MANIFEST).expect("ASCII")),
+            (
+                "device_add",
+                std::str::from_utf8(DEVICE_ADD).expect("ASCII"),
+            ),
+            (
+                "request_signature",
+                std::str::from_utf8(REQUEST_SIGNATURE).expect("ASCII"),
+            ),
+            (
+                "request_digest",
+                std::str::from_utf8(REQUEST_DIGEST).expect("ASCII"),
+            ),
+            (
+                "response_capability",
+                std::str::from_utf8(RESPONSE_CAPABILITY).expect("ASCII"),
+            ),
+            (
+                "recipient_key",
+                std::str::from_utf8(RECIPIENT_KEY).expect("ASCII"),
+            ),
+            (
+                "snapshot_plaintext",
+                std::str::from_utf8(SNAPSHOT).expect("ASCII"),
+            ),
+            (
+                "attachment_bytes",
+                std::str::from_utf8(ATTACHMENT).expect("ASCII"),
+            ),
+            (
+                "attachment_capability",
+                std::str::from_utf8(ATTACHMENT_CAPABILITY).expect("ASCII"),
+            ),
+            (
+                "offer_hpke_ciphertext",
+                std::str::from_utf8(OFFER_CIPHERTEXT).expect("ASCII"),
+            ),
+            (
+                "offer_digest",
+                std::str::from_utf8(OFFER_DIGEST).expect("ASCII"),
+            ),
+            (
+                "grant_provider_signature",
+                std::str::from_utf8(PROVIDER_SIGNATURE).expect("ASCII"),
+            ),
+            (
+                "grant_authority_signature",
+                std::str::from_utf8(AUTHORITY_SIGNATURE).expect("ASCII"),
+            ),
+            (
+                "grant_digest",
+                std::str::from_utf8(GRANT_DIGEST).expect("ASCII"),
+            ),
+            (
+                "request_receipt",
+                std::str::from_utf8(REQUEST_RECEIPT).expect("ASCII"),
+            ),
+            (
+                "revocation_receipt",
+                std::str::from_utf8(REVOCATION_RECEIPT).expect("ASCII"),
+            ),
+            (
+                "delivery_receipt",
+                std::str::from_utf8(DELIVERY_RECEIPT).expect("ASCII"),
+            ),
+            (
+                "completion_key_descriptor",
+                "dirextalk.history-recovery-completion-key-descriptor.v1\0",
+            ),
+            (
+                "completion_key_descriptor_signature",
+                "dirextalk.history-recovery-completion-key-descriptor-signature.v1\0",
+            ),
+            (
+                "completion_sequencer_descriptor",
+                "dirextalk.history-recovery-completion-sequencer-descriptor.v1\0",
+            ),
+            (
+                "completion_sequencer_descriptor_signature",
+                "dirextalk.history-recovery-completion-sequencer-descriptor-signature.v1\0",
+            ),
+            (
+                "completion_readback",
+                "dirextalk.history-recovery-completion-readback.v1\0",
+            ),
+            (
+                "completion_activation_leaf",
+                "dirextalk.history-recovery-completion-activation-leaf.v1\0",
+            ),
+            (
+                "completion_activation_node",
+                "dirextalk.history-recovery-completion-activation-node.v1\0",
+            ),
+            (
+                "completion_mailbox_offer_envelope",
+                "dirextalk.history-recovery-completion-mailbox-offer-envelope.v1\0",
+            ),
+            (
+                "completion_staged_generation",
+                "dirextalk.history-recovery-completion-staged-generation.v1\0",
+            ),
+            (
+                "completion_command",
+                "dirextalk.history-recovery-completion-command.v1\0",
+            ),
+            (
+                "completion_command_signature",
+                "dirextalk.history-recovery-completion-command-signature.v1\0",
+            ),
+            (
+                "completion_offer_ack",
+                "dirextalk.history-recovery-completion-offer-ack.v1\0",
+            ),
+            (
+                "completion_recovery_complete",
+                "dirextalk.history-recovery-completion-recovery-complete.v1\0",
+            ),
+            (
+                "completion_receipt",
+                "dirextalk.history-recovery-completion-receipt.v1\0",
+            ),
+            (
+                "completion_receipt_signature",
+                "dirextalk.history-recovery-completion-receipt-signature.v1\0",
+            ),
+        ],
+        "History Recovery domains",
+    )?;
+    validate_history_recovery_v2_openapi(root, &vector)?;
+
+    let candidate_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "candidate_public_key_hex")?)?;
+    let provider_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "provider_public_key_hex")?)?;
+    let authority_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "authority_public_key_hex")?)?;
+    let recipient_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "recipient_public_key_hex")?)?;
+    if candidate_key == provider_key
+        || candidate_key == authority_key
+        || provider_key == authority_key
+        || recipient_key == candidate_key
+        || recipient_key == provider_key
+        || recipient_key == authority_key
+        || recipient_key.iter().all(|byte| *byte == 0)
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery candidate/provider/authority/recipient keys are not independent",
+        ));
+    }
+
+    let catalog_cddl =
+        read(&root.join("protocol/cddl/recovery-scope-catalog/v1/recovery-scope-catalog-v1.cddl"))?;
+    let catalog_vector = read_json(
+        &root
+            .join("protocol/test-vectors/recovery-scope-catalog/v1/recovery-scope-catalog-v1.json"),
+    )?;
+    let catalog_positive = v40_json_field(&catalog_vector, "catalog", "catalog vector")?;
+    let (_, catalog_plaintext) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-plaintext-v1",
+        &catalog_cddl,
+        json_string(catalog_positive, "plaintext_cbor_hex")?,
+        "History Recovery source catalog plaintext",
+    )?;
+    let catalog_plaintext_fields = v40_numbered_fields(
+        &catalog_plaintext,
+        7,
+        "History Recovery source catalog plaintext",
+    )?;
+    let catalog_leaf_facts = v41_catalog_plaintext_leaf_facts(&catalog_plaintext)?;
+    let (catalog_head_bytes, catalog_head_value) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-head-v1",
+        &catalog_cddl,
+        json_string(catalog_positive, "head_signed_cbor_hex")?,
+        "History Recovery source signed catalog head",
+    )?;
+    let catalog_head_fields = v40_numbered_fields(
+        &catalog_head_value,
+        12,
+        "History Recovery source signed catalog head",
+    )?;
+    let catalog_binding = v40_json_field(&vector, "catalog_binding", "history vector")?;
+    require_exact_object_keys(
+        catalog_binding,
+        &[
+            "generation",
+            "head_digest_hex",
+            "merkle_root_hex",
+            "leaf_count",
+            "leaf_digests_hex",
+            "leaf_set_cbor_hex",
+            "leaf_set_digest_hex",
+            "manifest_cbor_hex",
+            "manifest_digest_hex",
+        ],
+        "History Recovery catalog binding",
+    )?;
+    let catalog_generation = catalog_binding
+        .get("generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("history catalog generation must be unsigned"))?;
+    let catalog_head = v40_digest(CATALOG_HEAD, &catalog_head_bytes);
+    v40_require_json_digest(
+        catalog_positive,
+        "head_digest_hex",
+        catalog_head,
+        "source signed catalog head",
+    )?;
+    v40_require_json_digest(
+        catalog_binding,
+        "head_digest_hex",
+        catalog_head,
+        "history catalog head",
+    )?;
+    let catalog_root = v41_merkle_root(
+        catalog_leaf_facts
+            .iter()
+            .map(|leaf| leaf.digest)
+            .collect::<Vec<_>>(),
+    )?;
+    v40_require_json_digest(
+        catalog_positive,
+        "merkle_root_hex",
+        catalog_root,
+        "source catalog Merkle root",
+    )?;
+    v40_require_json_digest(
+        catalog_binding,
+        "merkle_root_hex",
+        catalog_root,
+        "history catalog Merkle root",
+    )?;
+    let catalog_count = catalog_binding
+        .get("leaf_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("history catalog leaf count must be unsigned"))?;
+    if catalog_positive.get("generation").and_then(Value::as_u64) != Some(catalog_generation)
+        || v40_unsigned(catalog_plaintext_fields[2], "source catalog generation")?
+            != catalog_generation
+        || v40_unsigned(catalog_head_fields[2], "source catalog head generation")?
+            != catalog_generation
+        || v40_unsigned(catalog_head_fields[4], "source catalog head leaf count")? != catalog_count
+        || v40_fixed_bytes::<32>(catalog_head_fields[5], "source catalog head Merkle root")?
+            != catalog_root
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery catalog binding drifted from the signed catalog vector",
+        ));
+    }
+    let catalog_leaves = v40_json_array_field(catalog_positive, "leaves", "catalog")?;
+    let leaf_digest_json = v40_json_array_field(catalog_binding, "leaf_digests_hex", "history")?;
+    if catalog_count != u64::try_from(catalog_leaf_facts.len()).expect("leaf count fits")
+        || catalog_leaves.len() != catalog_leaf_facts.len()
+        || leaf_digest_json.len() != catalog_leaf_facts.len()
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery leaf set is not the exhaustive catalog leaf family",
+        ));
+    }
+    for ((fact, catalog_leaf), history_leaf) in catalog_leaf_facts
+        .iter()
+        .zip(catalog_leaves)
+        .zip(leaf_digest_json)
+    {
+        if decode_hex(json_string(catalog_leaf, "leaf_cbor_hex")?)? != fact.exact
+            || decode_lower_hex_fixed::<32>(json_string(catalog_leaf, "leaf_digest_hex")?)?
+                != fact.digest
+            || decode_lower_hex_fixed::<32>(history_leaf.as_str().ok_or_else(|| {
+                ProtocolToolError::new("history leaf digest must be lowercase hexadecimal")
+            })?)?
+                != fact.digest
+        {
+            return Err(ProtocolToolError::new(
+                "History Recovery catalog leaf exact bytes or digest drifted",
+            ));
+        }
+    }
+    let (leaf_set_bytes, leaf_set) = v40_decode_exact_cddl(
+        "history-recovery-leaf-set-v1",
+        &cddl,
+        json_string(catalog_binding, "leaf_set_cbor_hex")?,
+        "History Recovery leaf set",
+    )?;
+    let leaf_values = v40_array(&leaf_set, "History Recovery leaf set")?;
+    if leaf_values.len() != catalog_leaf_facts.len()
+        || leaf_values
+            .iter()
+            .zip(&catalog_leaf_facts)
+            .any(|(actual, expected)| {
+                v40_fixed_bytes::<32>(actual, "history leaf") != Ok(expected.digest)
+            })
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery exact leaf-set bytes drifted from catalog order",
+        ));
+    }
+    let leaf_set_digest = v40_digest(LEAF_SET, &leaf_set_bytes);
+    v40_require_json_digest(
+        catalog_binding,
+        "leaf_set_digest_hex",
+        leaf_set_digest,
+        "history leaf set",
+    )?;
+    let (manifest_bytes, manifest) = v40_decode_exact_cddl(
+        "history-recovery-manifest-v1",
+        &cddl,
+        json_string(catalog_binding, "manifest_cbor_hex")?,
+        "History Recovery manifest",
+    )?;
+    let manifest_fields = v40_numbered_fields(&manifest, 7, "history manifest")?;
+    if v40_fixed_bytes::<32>(manifest_fields[1], "manifest catalog head")? != catalog_head
+        || v40_unsigned(manifest_fields[2], "manifest catalog generation")? != catalog_generation
+        || v40_fixed_bytes::<32>(manifest_fields[3], "manifest catalog root")? != catalog_root
+        || v40_unsigned(manifest_fields[4], "manifest catalog count")? != catalog_count
+        || v40_fixed_bytes::<32>(manifest_fields[5], "manifest leaf-set digest")? != leaf_set_digest
+        || manifest_fields[6] != &leaf_set
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery manifest escaped the exhaustive catalog binding",
+        ));
+    }
+    let manifest_digest = v40_digest(MANIFEST, &manifest_bytes);
+    v40_require_json_digest(
+        catalog_binding,
+        "manifest_digest_hex",
+        manifest_digest,
+        "history manifest",
+    )?;
+
+    let transition = v40_json_field(&vector, "identity_transition", "history vector")?;
+    require_exact_object_keys(
+        transition,
+        &[
+            "pre_sequence",
+            "pre_head_digest_hex",
+            "post_sequence",
+            "post_head_digest_hex",
+            "direct_device_add_cbor_hex",
+            "direct_device_add_digest_hex",
+        ],
+        "History Recovery identity transition",
+    )?;
+    let pre_sequence = transition
+        .get("pre_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("history pre-sequence must be unsigned"))?;
+    let post_sequence = transition
+        .get("post_sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ProtocolToolError::new("history post-sequence must be unsigned"))?;
+    let pre_head = decode_lower_hex_fixed::<32>(json_string(transition, "pre_head_digest_hex")?)?;
+    let post_head = decode_lower_hex_fixed::<32>(json_string(transition, "post_head_digest_hex")?)?;
+    if pre_sequence.checked_add(1) != Some(post_sequence) {
+        return Err(ProtocolToolError::new(
+            "History Recovery Identity transition is not exactly H+1",
+        ));
+    }
+    let (device_add_bytes, device_add) = v40_decode_exact(
+        json_string(transition, "direct_device_add_cbor_hex")?,
+        "History Recovery direct DeviceAdd",
+    )?;
+    let device_add_fields = v40_numbered_fields(&device_add, 7, "direct candidate DeviceAdd")?;
+    if v40_unsigned(device_add_fields[0], "DeviceAdd version")? != 1
+        || catalog_plaintext_fields[1] != device_add_fields[1]
+        || catalog_head_fields[1] != device_add_fields[1]
+        || v40_unsigned(catalog_plaintext_fields[4], "source catalog Identity H")? != pre_sequence
+        || v40_fixed_bytes::<32>(catalog_plaintext_fields[5], "source catalog Identity head")?
+            != pre_head
+        || v40_unsigned(catalog_head_fields[7], "source catalog head Identity H")? != pre_sequence
+        || v40_fixed_bytes::<32>(
+            catalog_head_fields[8],
+            "source catalog head Identity digest",
+        )? != pre_head
+        || v40_unsigned(catalog_head_fields[9], "source catalog issued_at")?
+            >= v40_unsigned(catalog_head_fields[10], "source catalog expires_at")?
+        || v40_fixed_bytes::<32>(device_add_fields[3], "DeviceAdd signing key")? != candidate_key
+        || v40_fixed_bytes::<32>(device_add_fields[4], "DeviceAdd recipient key")? != recipient_key
+        || v40_unsigned(device_add_fields[5], "DeviceAdd H+1")? != post_sequence
+        || v40_fixed_bytes::<32>(device_add_fields[6], "DeviceAdd previous head")? != pre_head
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery transition is not the exact direct candidate DeviceAdd",
+        ));
+    }
+    let device_add_digest = v40_digest(DEVICE_ADD, &device_add_bytes);
+    v40_require_json_digest(
+        transition,
+        "direct_device_add_digest_hex",
+        device_add_digest,
+        "direct DeviceAdd",
+    )?;
+
+    let request = v40_json_field(&vector, "request", "history vector")?;
+    require_exact_object_keys(
+        request,
+        &[
+            "unsigned_cbor_hex",
+            "signature_hex",
+            "signed_cbor_hex",
+            "digest_hex",
+            "receipt_cbor_hex",
+            "receipt_digest_hex",
+            "revocation_receipt_cbor_hex",
+            "revocation_receipt_digest_hex",
+            "response_capability_digest_hex",
+        ],
+        "History Recovery request",
+    )?;
+    let (request_unsigned_bytes, request_unsigned) = v40_decode_exact_cddl(
+        "history-recovery-request-unsigned-v3",
+        &cddl,
+        json_string(request, "unsigned_cbor_hex")?,
+        "History Recovery unsigned request",
+    )?;
+    let (request_signed_bytes, request_signed) = v40_decode_exact_cddl(
+        "history-recovery-request-v3",
+        &cddl,
+        json_string(request, "signed_cbor_hex")?,
+        "History Recovery signed request",
+    )?;
+    let request_unsigned_fields =
+        v40_numbered_fields(&request_unsigned, 20, "history unsigned request")?;
+    let request_fields = v40_numbered_fields(&request_signed, 21, "history signed request")?;
+    let response_capability =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "response_capability_hex")?)?;
+    let response_capability_digest = v40_digest(RESPONSE_CAPABILITY, &response_capability);
+    if response_capability.iter().all(|byte| *byte == 0)
+        || request_unsigned_fields != request_fields[..20]
+        || request_fields[2] != device_add_fields[1]
+        || request_fields[3] != device_add_fields[2]
+        || v40_fixed_bytes::<32>(request_fields[4], "request signing key")? != candidate_key
+        || v40_fixed_bytes::<32>(request_fields[5], "request recipient key")? != recipient_key
+        || v40_unsigned(request_fields[6], "request H")? != pre_sequence
+        || v40_fixed_bytes::<32>(request_fields[7], "request head H")? != pre_head
+        || v40_unsigned(request_fields[8], "request H+1")? != post_sequence
+        || v40_fixed_bytes::<32>(request_fields[9], "request head H+1")? != post_head
+        || v40_fixed_bytes::<32>(request_fields[10], "request DeviceAdd")? != device_add_digest
+        || v40_unsigned(request_fields[11], "request catalog generation")? != catalog_generation
+        || v40_fixed_bytes::<32>(request_fields[12], "request catalog head")? != catalog_head
+        || v40_fixed_bytes::<32>(request_fields[13], "request catalog root")? != catalog_root
+        || v40_unsigned(request_fields[14], "request catalog count")? != catalog_count
+        || v40_fixed_bytes::<32>(request_fields[15], "request leaf set")? != leaf_set_digest
+        || v40_fixed_bytes::<32>(request_fields[16], "request manifest")? != manifest_digest
+        || v40_unsigned(request_fields[17], "request issued_at")?
+            >= v40_unsigned(request_fields[18], "request expires_at")?
+        || v40_unsigned(request_fields[17], "request issued_at")?
+            < v40_unsigned(catalog_head_fields[9], "catalog issued_at")?
+        || v40_unsigned(request_fields[18], "request expires_at")?
+            > v40_unsigned(catalog_head_fields[10], "catalog expires_at")?
+        || v40_fixed_bytes::<32>(request_fields[19], "request response capability")?
+            != response_capability_digest
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery request escaped its exact H/H+1, catalog, leaf-set, key, or expiry binding",
+        ));
+    }
+    validate_identity_id(
+        v40_text(request_fields[2], "history identity")?,
+        "history identity",
+    )?;
+    for field in [request_fields[1], request_fields[3]] {
+        validate_uuid_v7(v40_text(field, "history request UUID")?)?;
+    }
+    let request_signature = decode_lower_hex_fixed::<64>(json_string(request, "signature_hex")?)?;
+    if v40_fixed_bytes::<64>(request_fields[20], "history request signature")? != request_signature
+    {
+        return Err(ProtocolToolError::new(
+            "history request signature field drift",
+        ));
+    }
+    let mut request_signature_input = REQUEST_SIGNATURE.to_vec();
+    request_signature_input.extend_from_slice(&request_unsigned_bytes);
+    v40_verify_signature(
+        candidate_key,
+        &request_signature_input,
+        request_signature,
+        "History Recovery candidate request",
+    )?;
+    let request_digest = v40_digest(REQUEST_DIGEST, &request_signed_bytes);
+    v40_require_json_digest(request, "digest_hex", request_digest, "history request")?;
+    v40_require_json_digest(
+        request,
+        "response_capability_digest_hex",
+        response_capability_digest,
+        "history response capability",
+    )?;
+
+    let key_package_cddl = read(&root.join("protocol/cddl/key-package/v3/key-package-v3.cddl"))?;
+    let key_package_vector =
+        read_json(&root.join("protocol/test-vectors/key-package/v3/key-package-v3.json"))?;
+    if decode_lower_hex_fixed::<32>(json_string(
+        &key_package_vector,
+        "candidate_public_key_hex",
+    )?)? != candidate_key
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery candidate key drifted from KeyPackage V3",
+        ));
+    }
+    let key_package_publish =
+        v40_json_field(&key_package_vector, "publish", "KeyPackage V3 vector")?;
+    let opaque_key_package =
+        decode_hex(json_string(key_package_publish, "opaque_key_package_hex")?)?;
+    if opaque_key_package.is_empty() || opaque_key_package.len() > 65_536 {
+        return Err(ProtocolToolError::new(
+            "History Recovery KeyPackage bytes are outside their bound",
+        ));
+    }
+    let key_package_digest = v40_digest(PACKAGE_BYTES, &opaque_key_package);
+    v40_require_json_digest(
+        key_package_publish,
+        "package_digest_hex",
+        key_package_digest,
+        "History Recovery KeyPackage bytes",
+    )?;
+    let (_, key_package_binding) = v40_decode_exact_cddl(
+        "key-package-publish-binding-v3",
+        &key_package_cddl,
+        json_string(key_package_publish, "binding_cbor_hex")?,
+        "History Recovery KeyPackage V3 binding",
+    )?;
+    let key_package_fields = v40_numbered_fields(
+        &key_package_binding,
+        17,
+        "History Recovery KeyPackage V3 binding",
+    )?;
+    let key_package_catalog_index =
+        v40_unsigned(key_package_fields[8], "KeyPackage catalog index")?;
+    let key_package_leaf_offset = usize::try_from(key_package_catalog_index - 1)
+        .map_err(|_| ProtocolToolError::new("KeyPackage catalog index does not fit usize"))?;
+    let key_package_leaf = catalog_leaf_facts
+        .get(key_package_leaf_offset)
+        .ok_or_else(|| {
+            ProtocolToolError::new("KeyPackage catalog index is outside the exhaustive leaf set")
+        })?;
+    let key_package_scope = encode_deterministic_cbor(key_package_fields[10])
+        .map_err(|error| ProtocolToolError::new(format!("encode KeyPackage scope: {error}")))?;
+    if key_package_fields[1] != request_fields[2]
+        || key_package_fields[2] != request_fields[3]
+        || key_package_fields[4] != request_fields[1]
+        || v40_fixed_bytes::<32>(key_package_fields[5], "KeyPackage request digest")?
+            != request_digest
+        || v40_fixed_bytes::<32>(key_package_fields[6], "KeyPackage catalog head")? != catalog_head
+        || v40_unsigned(key_package_fields[7], "KeyPackage catalog generation")?
+            != catalog_generation
+        || v40_fixed_bytes::<32>(key_package_fields[9], "KeyPackage catalog leaf")?
+            != key_package_leaf.digest
+        || key_package_scope != key_package_leaf.scope_exact
+        || v40_fixed_bytes::<32>(key_package_fields[11], "KeyPackage recovery scope")?
+            != key_package_leaf.scope_digest
+        || v40_fixed_bytes::<32>(key_package_fields[12], "KeyPackage candidate key")?
+            != candidate_key
+        || v40_unsigned(key_package_fields[13], "KeyPackage Identity H+1")? != post_sequence
+        || v40_fixed_bytes::<32>(key_package_fields[14], "KeyPackage Identity head")? != post_head
+        || key_package_fields[15] != request_fields[18]
+        || v40_fixed_bytes::<32>(key_package_fields[16], "KeyPackage package digest")?
+            != key_package_digest
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery KeyPackage V3 escaped request/catalog/leaf/scope/candidate/H+1/expiry binding",
+        ));
+    }
+    let (request_receipt_bytes, request_receipt) = v40_decode_exact_cddl(
+        "history-recovery-request-receipt-v3",
+        &cddl,
+        json_string(request, "receipt_cbor_hex")?,
+        "History Recovery request receipt",
+    )?;
+    let request_receipt_fields =
+        v40_numbered_fields(&request_receipt, 5, "history request receipt")?;
+    if request_receipt_fields[1] != request_fields[1]
+        || v40_fixed_bytes::<32>(request_receipt_fields[2], "receipt request")? != request_digest
+        || v40_fixed_bytes::<32>(request_receipt_fields[3], "receipt catalog")? != catalog_head
+        || request_receipt_fields[4] != request_fields[18]
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery request receipt escaped exact request/catalog/expiry",
+        ));
+    }
+    v40_require_json_digest(
+        request,
+        "receipt_digest_hex",
+        v40_digest(REQUEST_RECEIPT, &request_receipt_bytes),
+        "history request receipt",
+    )?;
+    let (revocation_bytes, revocation) = v40_decode_exact_cddl(
+        "history-recovery-revocation-receipt-v1",
+        &cddl,
+        json_string(request, "revocation_receipt_cbor_hex")?,
+        "History Recovery revocation receipt",
+    )?;
+    let revocation_fields = v40_numbered_fields(&revocation, 4, "history revocation receipt")?;
+    if revocation_fields[1] != request_fields[1]
+        || v40_fixed_bytes::<32>(revocation_fields[2], "revoked request")? != request_digest
+        || v40_unsigned(revocation_fields[3], "revoked_at")?
+            < v40_unsigned(request_fields[17], "request issued_at")?
+        || v40_unsigned(revocation_fields[3], "revoked_at")?
+            > v40_unsigned(request_fields[18], "request expires_at")?
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery revocation receipt escaped request validity",
+        ));
+    }
+    v40_require_json_digest(
+        request,
+        "revocation_receipt_digest_hex",
+        v40_digest(REVOCATION_RECEIPT, &revocation_bytes),
+        "history revocation receipt",
+    )?;
+
+    let snapshot = v40_json_field(&vector, "snapshot", "history vector")?;
+    require_exact_object_keys(
+        snapshot,
+        &["plaintext_cbor_hex", "plaintext_digest_hex"],
+        "History Recovery snapshot",
+    )?;
+    let (snapshot_bytes, snapshot_value) = v40_decode_exact_cddl(
+        "history-snapshot-plaintext-v1",
+        &cddl,
+        json_string(snapshot, "plaintext_cbor_hex")?,
+        "History Recovery allowed snapshot",
+    )?;
+    let snapshot_fields = v40_numbered_fields(&snapshot_value, 5, "history snapshot")?;
+    if v40_fixed_bytes::<32>(snapshot_fields[1], "snapshot request")? != request_digest
+        || v40_fixed_bytes::<32>(snapshot_fields[2], "snapshot catalog")? != catalog_head
+        || v40_fixed_bytes::<32>(snapshot_fields[3], "snapshot manifest")? != manifest_digest
+        || v40_array(snapshot_fields[4], "snapshot members")?
+            .iter()
+            .any(|member| {
+                !v40_numbered_fields(member, 2, "snapshot member")
+                    .and_then(|fields| v40_unsigned(fields[0], "snapshot member kind"))
+                    .is_ok_and(|kind| (1..=3).contains(&kind))
+            })
+    {
+        return Err(ProtocolToolError::new(
+            "History snapshot contains an unbound member or forbidden MLS checkpoint/private state/epoch secret",
+        ));
+    }
+    let snapshot_digest = v40_digest(SNAPSHOT, &snapshot_bytes);
+    v40_require_json_digest(
+        snapshot,
+        "plaintext_digest_hex",
+        snapshot_digest,
+        "history snapshot",
+    )?;
+
+    let offer = v40_json_field(&vector, "offer", "history vector")?;
+    require_exact_object_keys(
+        offer,
+        &[
+            "cbor_hex",
+            "digest_hex",
+            "hpke_ciphertext_hex",
+            "hpke_ciphertext_digest_hex",
+            "recipient_key_digest_hex",
+            "attachment_bytes_hex",
+            "attachment_digest_hex",
+            "attachment_capability_hex",
+            "attachment_capability_digest_hex",
+        ],
+        "History Recovery recipient offer",
+    )?;
+    let (offer_bytes, offer_value) = v40_decode_exact_cddl(
+        "recipient-history-offer-v1",
+        &cddl,
+        json_string(offer, "cbor_hex")?,
+        "History Recovery recipient offer",
+    )?;
+    let offer_fields = v40_numbered_fields(&offer_value, 11, "history offer")?;
+    let offer_ciphertext = decode_hex(json_string(offer, "hpke_ciphertext_hex")?)?;
+    let offer_ciphertext_digest = v40_digest(OFFER_CIPHERTEXT, &offer_ciphertext);
+    let recipient_key_digest = v40_digest(RECIPIENT_KEY, &recipient_key);
+    let attachment_bytes = decode_hex(json_string(offer, "attachment_bytes_hex")?)?;
+    let attachment_digest = v40_digest(ATTACHMENT, &attachment_bytes);
+    let attachment_capability =
+        decode_lower_hex_fixed::<32>(json_string(offer, "attachment_capability_hex")?)?;
+    let attachment_capability_digest = v40_digest(ATTACHMENT_CAPABILITY, &attachment_capability);
+    let attachment_fields =
+        v40_numbered_fields(offer_fields[8], 5, "history attachment descriptor")?;
+    validate_strict_https_origin(v40_text(attachment_fields[0], "attachment origin")?)?;
+    validate_uuid_v7(v40_text(attachment_fields[1], "attachment object")?)?;
+    if attachment_capability.iter().all(|byte| *byte == 0)
+        || offer_fields[1] != request_fields[1]
+        || v40_fixed_bytes::<32>(offer_fields[2], "offer catalog")? != catalog_head
+        || v40_fixed_bytes::<32>(offer_fields[3], "offer leaf set")? != leaf_set_digest
+        || v40_fixed_bytes::<32>(offer_fields[4], "offer manifest")? != manifest_digest
+        || v40_fixed_bytes::<32>(offer_fields[5], "offer snapshot")? != snapshot_digest
+        || v40_bytes(offer_fields[6], "offer ciphertext")? != offer_ciphertext
+        || v40_fixed_bytes::<32>(offer_fields[7], "offer ciphertext digest")?
+            != offer_ciphertext_digest
+        || v40_fixed_bytes::<32>(attachment_fields[2], "attachment digest")? != attachment_digest
+        || v40_unsigned(attachment_fields[3], "attachment length")?
+            != u64::try_from(attachment_bytes.len()).expect("attachment length fits")
+        || v40_fixed_bytes::<32>(attachment_fields[4], "attachment capability")?
+            != attachment_capability_digest
+        || offer_fields[9] != request_fields[18]
+        || v40_fixed_bytes::<32>(offer_fields[10], "offer recipient key")? != recipient_key_digest
+    {
+        return Err(ProtocolToolError::new(
+            "RecipientHistoryOffer escaped request/catalog/leaf/snapshot/recipient/attachment/expiry binding",
+        ));
+    }
+    let offer_digest = v40_digest(OFFER_DIGEST, &offer_bytes);
+    for (field, expected, label) in [
+        ("digest_hex", offer_digest, "history offer"),
+        (
+            "hpke_ciphertext_digest_hex",
+            offer_ciphertext_digest,
+            "offer ciphertext",
+        ),
+        (
+            "recipient_key_digest_hex",
+            recipient_key_digest,
+            "offer recipient key",
+        ),
+        (
+            "attachment_digest_hex",
+            attachment_digest,
+            "history attachment",
+        ),
+        (
+            "attachment_capability_digest_hex",
+            attachment_capability_digest,
+            "attachment capability",
+        ),
+    ] {
+        v40_require_json_digest(offer, field, expected, label)?;
+    }
+
+    let grant = v40_json_field(&vector, "grant", "history vector")?;
+    require_exact_object_keys(
+        grant,
+        &[
+            "unsigned_cbor_hex",
+            "provider_signature_hex",
+            "authority_signature_hex",
+            "signed_cbor_hex",
+            "digest_hex",
+            "idempotency_key_hash_hex",
+            "delivery_receipt_cbor_hex",
+            "delivery_receipt_digest_hex",
+        ],
+        "History Recovery grant",
+    )?;
+    let (grant_unsigned_bytes, grant_unsigned) = v40_decode_exact_cddl(
+        "history-recovery-grant-unsigned-v3",
+        &cddl,
+        json_string(grant, "unsigned_cbor_hex")?,
+        "History Recovery unsigned grant",
+    )?;
+    let (grant_signed_bytes, grant_signed) = v40_decode_exact_cddl(
+        "history-recovery-grant-v3",
+        &cddl,
+        json_string(grant, "signed_cbor_hex")?,
+        "History Recovery signed grant",
+    )?;
+    let grant_unsigned_fields = v40_numbered_fields(&grant_unsigned, 23, "history unsigned grant")?;
+    let grant_fields = v40_numbered_fields(&grant_signed, 26, "history signed grant")?;
+    let idempotency =
+        decode_lower_hex_fixed::<32>(json_string(grant, "idempotency_key_hash_hex")?)?;
+    if grant_unsigned_fields != grant_fields[..23]
+        || grant_fields[1] != request_fields[2]
+        || grant_fields[2] != request_fields[1]
+        || v40_fixed_bytes::<32>(grant_fields[3], "grant request")? != request_digest
+        || grant_fields[4] != request_fields[3]
+        || grant_fields[5] == grant_fields[4]
+        || grant_fields[7] == grant_fields[5]
+        || grant_fields[7] == grant_fields[4]
+        || v40_fixed_bytes::<32>(grant_fields[8], "grant catalog")? != catalog_head
+        || v40_unsigned(grant_fields[9], "grant generation")? != catalog_generation
+        || v40_fixed_bytes::<32>(grant_fields[10], "grant root")? != catalog_root
+        || v40_unsigned(grant_fields[11], "grant count")? != catalog_count
+        || v40_fixed_bytes::<32>(grant_fields[12], "grant leaf set")? != leaf_set_digest
+        || v40_fixed_bytes::<32>(grant_fields[13], "grant manifest")? != manifest_digest
+        || v40_fixed_bytes::<32>(grant_fields[14], "grant offer")? != offer_digest
+        || v40_fixed_bytes::<32>(grant_fields[15], "grant recipient")? != recipient_key_digest
+        || v40_unsigned(grant_fields[19], "grant mailbox H+1")?
+            != v40_unsigned(grant_fields[18], "grant mailbox H")? + 1
+        || v40_unsigned(grant_fields[20], "grant issued_at")?
+            >= v40_unsigned(grant_fields[21], "grant expires_at")?
+        || v40_unsigned(grant_fields[20], "grant issued_at")?
+            < v40_unsigned(request_fields[17], "request issued_at")?
+        || grant_fields[21] != request_fields[18]
+        || v40_fixed_bytes::<32>(grant_fields[22], "grant idempotency")? != idempotency
+        || grant_fields[25] != &offer_value
+    {
+        return Err(ProtocolToolError::new(
+            "HistoryRecoveryGrant escaped provider/authority/request/catalog/offer/mailbox/expiry binding",
+        ));
+    }
+    for field in [
+        grant_fields[2],
+        grant_fields[4],
+        grant_fields[5],
+        grant_fields[7],
+        grant_fields[16],
+        grant_fields[17],
+    ] {
+        validate_uuid_v7(v40_text(field, "history grant UUID")?)?;
+    }
+    let provider_signature =
+        decode_lower_hex_fixed::<64>(json_string(grant, "provider_signature_hex")?)?;
+    let authority_signature =
+        decode_lower_hex_fixed::<64>(json_string(grant, "authority_signature_hex")?)?;
+    if v40_fixed_bytes::<64>(grant_fields[23], "grant provider signature")? != provider_signature
+        || v40_fixed_bytes::<64>(grant_fields[24], "grant authority signature")?
+            != authority_signature
+    {
+        return Err(ProtocolToolError::new(
+            "history grant signature field drift",
+        ));
+    }
+    for (key, domain, signature, label) in [
+        (
+            provider_key,
+            PROVIDER_SIGNATURE,
+            provider_signature,
+            "provider",
+        ),
+        (
+            authority_key,
+            AUTHORITY_SIGNATURE,
+            authority_signature,
+            "authority",
+        ),
+    ] {
+        let mut input = domain.to_vec();
+        input.extend_from_slice(&grant_unsigned_bytes);
+        v40_verify_signature(
+            key,
+            &input,
+            signature,
+            &format!("History Recovery {label} grant"),
+        )?;
+    }
+    let grant_digest = v40_digest(GRANT_DIGEST, &grant_signed_bytes);
+    v40_require_json_digest(grant, "digest_hex", grant_digest, "history grant")?;
+    let (delivery_bytes, delivery) = v40_decode_exact_cddl(
+        "history-recovery-delivery-receipt-v1",
+        &cddl,
+        json_string(grant, "delivery_receipt_cbor_hex")?,
+        "History Recovery delivery receipt",
+    )?;
+    let delivery_fields = v40_numbered_fields(&delivery, 7, "history delivery receipt")?;
+    if v40_unsigned(delivery_fields[0], "delivery receipt version")? != 1
+        || delivery_fields[1] != grant_fields[16]
+        || delivery_fields[2] != grant_fields[17]
+        || delivery_fields[3] != grant_fields[19]
+        || delivery_fields[4] != grant_fields[21]
+        || v40_fixed_bytes::<32>(delivery_fields[5], "delivery grant")? != grant_digest
+        || v40_fixed_bytes::<32>(delivery_fields[6], "delivery offer")? != offer_digest
+    {
+        return Err(ProtocolToolError::new(
+            "History Recovery delivery receipt escaped exact mailbox H+1/grant/offer/expiry",
+        ));
+    }
+    v40_require_json_digest(
+        grant,
+        "delivery_receipt_digest_hex",
+        v40_digest(DELIVERY_RECEIPT, &delivery_bytes),
+        "history delivery receipt",
+    )?;
+    validate_history_recovery_v2_invalid(
+        &vector,
+        &cddl,
+        post_sequence,
+        catalog_head,
+        recipient_key_digest,
+        attachment_digest,
+        response_capability_digest,
+    )?;
+    validate_history_recovery_completion_v1(root, &vector, &cddl, candidate_key)?;
+    Ok(())
+}
+
+fn validate_history_recovery_v2_invalid(
+    vector: &Value,
+    cddl: &str,
+    post_sequence: u64,
+    catalog_head: [u8; 32],
+    recipient_key_digest: [u8; 32],
+    attachment_digest: [u8; 32],
+    response_capability_digest: [u8; 32],
+) -> Result<(), ProtocolToolError> {
+    let invalid = v40_json_array_field(vector, "invalid_cbor", "history vector")?;
+    let expected = [
+        ("wrong_identity_h_plus_one", "history-recovery-request-v3"),
+        ("wrong_catalog_head_digest", "history-recovery-request-v3"),
+        ("wrong_recipient_key_digest", "recipient-history-offer-v1"),
+        ("wrong_attachment_digest", "recipient-history-offer-v1"),
+        (
+            "wrong_response_capability_digest",
+            "history-recovery-request-v3",
+        ),
+        ("forbidden_snapshot_member", "history-snapshot-plaintext-v1"),
+    ];
+    if invalid.len() != expected.len() {
+        return Err(ProtocolToolError::new("history invalid family drift"));
+    }
+    for ((expected_label, expected_rule), item) in expected.into_iter().zip(invalid) {
+        require_exact_object_keys(item, &["label", "rule", "cbor_hex"], "history invalid")?;
+        let label = json_string(item, "label")?;
+        let rule = json_string(item, "rule")?;
+        if label != expected_label || rule != expected_rule {
+            return Err(ProtocolToolError::new("history invalid label/rule drift"));
+        }
+        let bytes = decode_hex(json_string(item, "cbor_hex")?)?;
+        let value = v40_decode_exact_bytes(&bytes, label)?;
+        if label == "forbidden_snapshot_member" {
+            if cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).is_ok() {
+                return Err(ProtocolToolError::new(
+                    "History Recovery CDDL accepted forbidden MLS snapshot state",
+                ));
+            }
+            continue;
+        }
+        cddl_cat::validate_cbor_bytes(rule, cddl, &bytes).map_err(|error| {
+            ProtocolToolError::new(format!("history semantic invalid must pass CDDL: {error}"))
+        })?;
+        let rejected = match label {
+            "wrong_identity_h_plus_one" => {
+                v40_unsigned(v40_numbered_fields(&value, 21, label)?[8], "invalid H+1")?
+                    != post_sequence
+            }
+            "wrong_catalog_head_digest" => {
+                v40_fixed_bytes::<32>(v40_numbered_fields(&value, 21, label)?[12], label)?
+                    != catalog_head
+            }
+            "wrong_recipient_key_digest" => {
+                v40_fixed_bytes::<32>(v40_numbered_fields(&value, 11, label)?[10], label)?
+                    != recipient_key_digest
+            }
+            "wrong_attachment_digest" => {
+                let offer = v40_numbered_fields(&value, 11, label)?;
+                v40_fixed_bytes::<32>(v40_numbered_fields(offer[8], 5, label)?[2], label)?
+                    != attachment_digest
+            }
+            "wrong_response_capability_digest" => {
+                v40_fixed_bytes::<32>(v40_numbered_fields(&value, 21, label)?[19], label)?
+                    != response_capability_digest
+            }
+            _ => unreachable!("labels checked above"),
+        };
+        if !rejected {
+            return Err(ProtocolToolError::new(format!(
+                "history invalid specimen {label} did not violate its named binding"
+            )));
+        }
+    }
+    Ok(())
+}
+
+struct V41CompletionDescriptorFacts {
+    origin: String,
+    public_key: [u8; 32],
+    exact: Vec<u8>,
+    digest: [u8; 32],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_history_completion_descriptor(
+    object: &Value,
+    cddl: &str,
+    rule: &str,
+    digest_domain: &[u8],
+    signature_domain: &[u8],
+    label: &str,
+) -> Result<V41CompletionDescriptorFacts, ProtocolToolError> {
+    require_exact_object_keys(
+        object,
+        &[
+            "origin",
+            "key_id",
+            "public_key_hex",
+            "epoch",
+            "issued_at",
+            "expires_at",
+            "unsigned_cbor_hex",
+            "unsigned_digest_hex",
+            "signature_hex",
+            "cbor_hex",
+            "digest_hex",
+        ],
+        label,
+    )?;
+    let (exact, value) =
+        v40_decode_exact_cddl(rule, cddl, json_string(object, "cbor_hex")?, label)?;
+    let fields = v40_numbered_fields(&value, 8, label)?;
+    let origin = v40_text(fields[1], label)?;
+    if !origin.starts_with("https://")
+        || origin != json_string(object, "origin")?
+        || v40_text(fields[2], label)? != json_string(object, "key_id")?
+        || v40_unsigned(fields[4], label)? != v41_json_u64(object, "epoch", label)?
+        || v40_unsigned(fields[5], label)? != v41_json_u64(object, "issued_at", label)?
+        || v40_unsigned(fields[6], label)? != v41_json_u64(object, "expires_at", label)?
+        || v40_unsigned(fields[5], label)? >= v40_unsigned(fields[6], label)?
+    {
+        return Err(ProtocolToolError::new(format!(
+            "{label} origin/epoch/expiry drift"
+        )));
+    }
+    validate_uuid_v7(v40_text(fields[2], label)?)?;
+    let key = v40_fixed_bytes::<32>(fields[3], label)?;
+    if key != decode_lower_hex_fixed::<32>(json_string(object, "public_key_hex")?)? {
+        return Err(ProtocolToolError::new(format!("{label} public key drift")));
+    }
+    let unsigned = v41_v6_unsigned_bytes(&value, 8, label)?;
+    if unsigned != decode_hex(json_string(object, "unsigned_cbor_hex")?)? {
+        return Err(ProtocolToolError::new(format!(
+            "{label} unsigned bytes drift"
+        )));
+    }
+    let unsigned_digest = v40_digest(digest_domain, &unsigned);
+    v40_require_json_digest(object, "unsigned_digest_hex", unsigned_digest, label)?;
+    let signature = v40_fixed_bytes::<64>(fields[7], label)?;
+    if signature != decode_lower_hex_fixed::<64>(json_string(object, "signature_hex")?)? {
+        return Err(ProtocolToolError::new(format!(
+            "{label} signature wrapper drift"
+        )));
+    }
+    v41_v6_verify(key, signature_domain, unsigned_digest, signature, label)?;
+    let digest = v40_digest(digest_domain, &exact);
+    v40_require_json_digest(object, "digest_hex", digest, label)?;
+    Ok(V41CompletionDescriptorFacts {
+        origin: origin.to_owned(),
+        public_key: key,
+        exact,
+        digest,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the identity-home completion gate proves its entire pre-write transaction boundary"
+)]
+fn validate_history_recovery_completion_v1(
+    root: &Path,
+    vector: &Value,
+    cddl: &str,
+    candidate_key: [u8; 32],
+) -> Result<(), ProtocolToolError> {
+    const KEY_DESCRIPTOR: &[u8] = b"dirextalk.history-recovery-completion-key-descriptor.v1\0";
+    const KEY_DESCRIPTOR_SIGNATURE: &[u8] =
+        b"dirextalk.history-recovery-completion-key-descriptor-signature.v1\0";
+    const SEQUENCER_DESCRIPTOR: &[u8] =
+        b"dirextalk.history-recovery-completion-sequencer-descriptor.v1\0";
+    const SEQUENCER_DESCRIPTOR_SIGNATURE: &[u8] =
+        b"dirextalk.history-recovery-completion-sequencer-descriptor-signature.v1\0";
+    const READBACK: &[u8] = b"dirextalk.history-recovery-completion-readback.v1\0";
+    const ACTIVATION_LEAF: &[u8] = b"dirextalk.history-recovery-completion-activation-leaf.v1\0";
+    const ACTIVATION_NODE: &[u8] = b"dirextalk.history-recovery-completion-activation-node.v1\0";
+    const OFFER_ENVELOPE: &[u8] =
+        b"dirextalk.history-recovery-completion-mailbox-offer-envelope.v1\0";
+    const STAGED: &[u8] = b"dirextalk.history-recovery-completion-staged-generation.v1\0";
+    const COMMAND: &[u8] = b"dirextalk.history-recovery-completion-command.v1\0";
+    const COMMAND_SIGNATURE: &[u8] =
+        b"dirextalk.history-recovery-completion-command-signature.v1\0";
+    const OFFER_ACK: &[u8] = b"dirextalk.history-recovery-completion-offer-ack.v1\0";
+    const RECOVERY_COMPLETE: &[u8] =
+        b"dirextalk.history-recovery-completion-recovery-complete.v1\0";
+    const RECEIPT: &[u8] = b"dirextalk.history-recovery-completion-receipt.v1\0";
+    const RECEIPT_SIGNATURE: &[u8] =
+        b"dirextalk.history-recovery-completion-receipt-signature.v1\0";
+
+    let descriptor_object = v40_json_field(
+        vector,
+        "completion_key_descriptor",
+        "History completion vector",
+    )?;
+    require_exact_object_keys(
+        descriptor_object,
+        &[
+            "origin",
+            "key_id",
+            "public_key_hex",
+            "epoch",
+            "issued_at",
+            "expires_at",
+            "unsigned_cbor_hex",
+            "unsigned_digest_hex",
+            "signature_hex",
+            "cbor_hex",
+            "digest_hex",
+            "tls_origin_bound",
+        ],
+        "history completion key descriptor",
+    )?;
+    if descriptor_object
+        .get("tls_origin_bound")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err(ProtocolToolError::new(
+            "history completion key descriptor must be TLS-origin-bound",
+        ));
+    }
+    let mut descriptor_for_validation = descriptor_object.clone();
+    descriptor_for_validation
+        .as_object_mut()
+        .expect("descriptor was checked as object")
+        .remove("tls_origin_bound");
+    let completion_descriptor = validate_history_completion_descriptor(
+        &descriptor_for_validation,
+        cddl,
+        "history-recovery-completion-key-descriptor-v1",
+        KEY_DESCRIPTOR,
+        KEY_DESCRIPTOR_SIGNATURE,
+        "history completion key descriptor",
+    )?;
+
+    let completion = v40_json_field(vector, "completion", "History Recovery vector")?;
+    require_exact_object_keys(
+        completion,
+        &[
+            "staged_generation_bytes_hex",
+            "staged_generation_digest_hex",
+            "sequencer_descriptor",
+            "activation_entries",
+            "activation_set_count",
+            "activation_set_root_hex",
+            "mailbox_offer_envelope",
+            "command",
+            "transaction",
+            "receipt",
+            "replay",
+            "invalid_cbor",
+        ],
+        "History recovery completion",
+    )?;
+    let staged_bytes = decode_hex(json_string(completion, "staged_generation_bytes_hex")?)?;
+    let staged_digest = v40_digest(STAGED, &staged_bytes);
+    v40_require_json_digest(
+        completion,
+        "staged_generation_digest_hex",
+        staged_digest,
+        "history completion staged generation",
+    )?;
+    let sequencer_descriptor = validate_history_completion_descriptor(
+        v40_json_field(completion, "sequencer_descriptor", "History completion")?,
+        cddl,
+        "history-recovery-completion-sequencer-descriptor-v1",
+        SEQUENCER_DESCRIPTOR,
+        SEQUENCER_DESCRIPTOR_SIGNATURE,
+        "history completion sequencer descriptor",
+    )?;
+
+    let command_object = v40_json_field(completion, "command", "History completion")?;
+    require_exact_object_keys(
+        command_object,
+        &[
+            "completion_id",
+            "idempotency_key_hash_hex",
+            "cbor_hex",
+            "digest_hex",
+            "signature_hex",
+        ],
+        "History completion command",
+    )?;
+    let (_, command) = v40_decode_exact_cddl(
+        "history-recovery-completion-command-v1",
+        cddl,
+        json_string(command_object, "cbor_hex")?,
+        "HistoryRecoveryCompletionCommandV1",
+    )?;
+    let command_fields = v40_numbered_fields(&command, 30, "HistoryRecoveryCompletionCommandV1")?;
+    let catalog = v40_json_field(vector, "catalog_binding", "History vector")?;
+    let transition = v40_json_field(vector, "identity_transition", "History vector")?;
+    let request = v40_json_field(vector, "request", "History vector")?;
+    let grant = v40_json_field(vector, "grant", "History vector")?;
+    let offer = v40_json_field(vector, "offer", "History vector")?;
+    if v40_text(command_fields[1], "completion id")?
+        != json_string(command_object, "completion_id")?
+        || v40_text(command_fields[2], "completion identity origin")?
+            != completion_descriptor.origin
+        || v40_text(command_fields[3], "completion identity")?
+            != v40_text(
+                v40_numbered_fields(
+                    &v40_decode_exact_bytes(
+                        &decode_hex(json_string(request, "signed_cbor_hex")?)?,
+                        "history request",
+                    )?,
+                    21,
+                    "history request",
+                )?[2],
+                "request identity",
+            )?
+        || v40_text(command_fields[4], "completion candidate")?
+            != v40_text(
+                v40_numbered_fields(
+                    &v40_decode_exact_bytes(
+                        &decode_hex(json_string(request, "signed_cbor_hex")?)?,
+                        "history request",
+                    )?,
+                    21,
+                    "history request",
+                )?[3],
+                "request candidate",
+            )?
+        || v40_fixed_bytes::<32>(command_fields[5], "completion candidate key")? != candidate_key
+        || v40_unsigned(command_fields[6], "completion H")?
+            != v41_json_u64(transition, "pre_sequence", "identity transition")?
+        || v40_unsigned(command_fields[7], "completion H+1")?
+            != v41_json_u64(transition, "post_sequence", "identity transition")?
+        || v40_unsigned(command_fields[6], "completion H")?.checked_add(1)
+            != Some(v40_unsigned(command_fields[7], "completion H+1")?)
+        || v40_fixed_bytes::<32>(command_fields[8], "completion DeviceAdd")?
+            != decode_lower_hex_fixed::<32>(json_string(
+                transition,
+                "direct_device_add_digest_hex",
+            )?)?
+        || v40_unsigned(command_fields[9], "completion catalog generation")?
+            != v41_json_u64(catalog, "generation", "catalog binding")?
+        || v40_fixed_bytes::<32>(command_fields[10], "completion catalog head")?
+            != decode_lower_hex_fixed::<32>(json_string(catalog, "head_digest_hex")?)?
+        || v40_unsigned(command_fields[11], "completion catalog count")?
+            != v41_json_u64(catalog, "leaf_count", "catalog binding")?
+        || v40_fixed_bytes::<32>(command_fields[12], "completion catalog root")?
+            != decode_lower_hex_fixed::<32>(json_string(catalog, "merkle_root_hex")?)?
+    {
+        return Err(ProtocolToolError::new(
+            "History completion origin/identity/H/catalog binding drift",
+        ));
+    }
+    validate_uuid_v7(v40_text(command_fields[1], "completion id")?)?;
+    let request_digest = decode_lower_hex_fixed::<32>(json_string(request, "digest_hex")?)?;
+    let grant_digest = decode_lower_hex_fixed::<32>(json_string(grant, "digest_hex")?)?;
+    let offer_digest = decode_lower_hex_fixed::<32>(json_string(offer, "digest_hex")?)?;
+    let delivery_digest =
+        decode_lower_hex_fixed::<32>(json_string(grant, "delivery_receipt_digest_hex")?)?;
+    let attachment_digest =
+        decode_lower_hex_fixed::<32>(json_string(offer, "attachment_digest_hex")?)?;
+    let attachment_capability =
+        decode_lower_hex_fixed::<32>(json_string(offer, "attachment_capability_digest_hex")?)?;
+    let key_package =
+        read_json(&root.join("protocol/test-vectors/key-package/v3/key-package-v3.json"))?;
+    let kp_cross = v40_json_field(&key_package, "cross_bindings", "KeyPackage V3 vector")?;
+    if v40_text(command_fields[13], "completion request id")?
+        != json_string(kp_cross, "request_id")?
+        || v40_fixed_bytes::<32>(command_fields[14], "completion request")? != request_digest
+        || v40_fixed_bytes::<32>(command_fields[15], "completion grant")? != grant_digest
+        || v40_fixed_bytes::<32>(command_fields[16], "completion offer")? != offer_digest
+        || v40_fixed_bytes::<32>(command_fields[17], "completion delivery")? != delivery_digest
+        || v40_fixed_bytes::<32>(command_fields[18], "completion attachment")? != attachment_digest
+        || v40_fixed_bytes::<32>(command_fields[19], "completion attachment capability")?
+            != attachment_capability
+        || v40_fixed_bytes::<32>(command_fields[20], "completion staged generation")?
+            != staged_digest
+    {
+        return Err(ProtocolToolError::new(
+            "History completion request/grant/offer/delivery/attachment/staging drift",
+        ));
+    }
+
+    let envelope_object =
+        v40_json_field(completion, "mailbox_offer_envelope", "History completion")?;
+    require_exact_object_keys(
+        envelope_object,
+        &[
+            "mailbox_id",
+            "envelope_id",
+            "sequence",
+            "cbor_hex",
+            "digest_hex",
+        ],
+        "History completion mailbox offer envelope",
+    )?;
+    let (envelope_bytes, envelope) = v40_decode_exact_cddl(
+        "history-recovery-completion-mailbox-offer-envelope-v1",
+        cddl,
+        json_string(envelope_object, "cbor_hex")?,
+        "History completion mailbox offer envelope",
+    )?;
+    let envelope_fields = v40_numbered_fields(&envelope, 7, "completion mailbox envelope")?;
+    let envelope_digest = v40_digest(OFFER_ENVELOPE, &envelope_bytes);
+    if v40_bytes(command_fields[21], "completion offer envelope")? != envelope_bytes
+        || command_fields[22] != envelope_fields[2]
+        || command_fields[23] != envelope_fields[3]
+        || v40_fixed_bytes::<32>(command_fields[24], "completion envelope digest")?
+            != envelope_digest
+        || v40_text(envelope_fields[1], "completion mailbox id")?
+            != json_string(envelope_object, "mailbox_id")?
+        || v40_text(envelope_fields[2], "completion envelope id")?
+            != json_string(envelope_object, "envelope_id")?
+        || v40_unsigned(envelope_fields[3], "completion offer sequence")?
+            != v41_json_u64(envelope_object, "sequence", "completion envelope")?
+        || v40_bytes(envelope_fields[4], "completion exact offer")?
+            != decode_hex(json_string(offer, "cbor_hex")?)?
+        || v40_fixed_bytes::<32>(envelope_fields[5], "completion offer digest")? != offer_digest
+        || v40_fixed_bytes::<32>(envelope_fields[6], "completion grant digest")? != grant_digest
+    {
+        return Err(ProtocolToolError::new(
+            "History completion exact mailbox offer envelope/id/sequence/digest drift",
+        ));
+    }
+    v40_require_json_digest(
+        envelope_object,
+        "digest_hex",
+        envelope_digest,
+        "completion envelope",
+    )?;
+
+    let activation_count = v40_unsigned(command_fields[25], "activation set count")?;
+    let entries = v40_array(command_fields[27], "completion activation entries")?;
+    if activation_count != v41_json_u64(completion, "activation_set_count", "completion")?
+        || usize::try_from(activation_count).ok() != Some(entries.len())
+        || activation_count != v41_json_u64(catalog, "leaf_count", "catalog binding")?
+    {
+        return Err(ProtocolToolError::new(
+            "History completion activation set must exhaust the catalog",
+        ));
+    }
+    let activation_root = validate_history_completion_entries(
+        root,
+        completion,
+        entries,
+        &sequencer_descriptor,
+        request_digest,
+        candidate_key,
+        ACTIVATION_LEAF,
+        ACTIVATION_NODE,
+        READBACK,
+    )?;
+    if v40_fixed_bytes::<32>(command_fields[26], "activation set root")? != activation_root {
+        return Err(ProtocolToolError::new(
+            "History completion activation-set root drift",
+        ));
+    }
+    v40_require_json_digest(
+        completion,
+        "activation_set_root_hex",
+        activation_root,
+        "activation set root",
+    )?;
+    let idempotency =
+        decode_lower_hex_fixed::<32>(json_string(command_object, "idempotency_key_hash_hex")?)?;
+    if v40_fixed_bytes::<32>(command_fields[28], "completion idempotency")? != idempotency
+        || idempotency.iter().all(|byte| *byte == 0)
+    {
+        return Err(ProtocolToolError::new(
+            "History completion idempotency binding drift",
+        ));
+    }
+    let command_digest = v40_digest(
+        COMMAND,
+        &v41_v6_unsigned_bytes(&command, 30, "History completion command")?,
+    );
+    v40_require_json_digest(
+        command_object,
+        "digest_hex",
+        command_digest,
+        "History completion command",
+    )?;
+    let command_signature =
+        v40_fixed_bytes::<64>(command_fields[29], "completion command signature")?;
+    if command_signature
+        != decode_lower_hex_fixed::<64>(json_string(command_object, "signature_hex")?)?
+    {
+        return Err(ProtocolToolError::new(
+            "History completion candidate signature wrapper drift",
+        ));
+    }
+    v41_v6_verify(
+        candidate_key,
+        COMMAND_SIGNATURE,
+        command_digest,
+        command_signature,
+        "History completion command",
+    )?;
+
+    validate_history_completion_transaction(completion)?;
+    let signed_receipt = validate_history_completion_receipt(
+        completion,
+        cddl,
+        &completion_descriptor,
+        &command_fields,
+        command_digest,
+        activation_root,
+        &envelope_fields,
+        envelope_digest,
+        OFFER_ACK,
+        RECOVERY_COMPLETE,
+        RECEIPT,
+        RECEIPT_SIGNATURE,
+    )?;
+    validate_history_completion_replay(completion, command_object, &signed_receipt)?;
+    validate_history_completion_invalid(
+        completion,
+        cddl,
+        candidate_key,
+        &command_fields,
+        activation_root,
+        &envelope_fields,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn validate_history_completion_entries(
+    root: &Path,
+    completion: &Value,
+    entries: &[CanonicalValue],
+    descriptor: &V41CompletionDescriptorFacts,
+    request_digest: [u8; 32],
+    candidate_key: [u8; 32],
+    leaf_domain: &[u8],
+    node_domain: &[u8],
+    readback_domain: &[u8],
+) -> Result<[u8; 32], ProtocolToolError> {
+    let entry_vectors = v40_json_array_field(completion, "activation_entries", "completion")?;
+    if entries.len() != 2 || entry_vectors.len() != entries.len() {
+        return Err(ProtocolToolError::new(
+            "history completion vector must cover both catalog leaves",
+        ));
+    }
+    let catalog = read_json(
+        &root
+            .join("protocol/test-vectors/recovery-scope-catalog/v1/recovery-scope-catalog-v1.json"),
+    )?;
+    let leaves = v40_json_array_field(
+        v40_json_field(&catalog, "catalog", "catalog vector")?,
+        "leaves",
+        "catalog",
+    )?;
+    let mls_cddl = read(&root.join("protocol/cddl/mls-sequencer/v6/mls-sequencer-v6.cddl"))?;
+    let mls =
+        read_json(&root.join("protocol/test-vectors/mls-sequencer/v6/mls-sequencer-v6.json"))?;
+    if decode_lower_hex_fixed::<32>(json_string(&mls, "candidate_public_key_hex")?)?
+        != candidate_key
+    {
+        return Err(ProtocolToolError::new(
+            "history completion candidate key escaped MLS V6",
+        ));
+    }
+    let mls_flow = v40_json_field(&mls, "flow", "MLS V6 vector")?;
+    let mls_activation = v40_json_field(mls_flow, "activation", "MLS V6 flow")?;
+    let mls_readback = v40_json_field(mls_flow, "readback", "MLS V6 flow")?;
+    let mut seen = BTreeSet::new();
+    let mut leaf_hashes = Vec::with_capacity(entries.len());
+    for (position, (entry, entry_vector)) in entries.iter().zip(entry_vectors).enumerate() {
+        require_exact_object_keys(
+            entry_vector,
+            &[
+                "catalog_index",
+                "leaf_digest_hex",
+                "authority_origin",
+                "sequencer_descriptor_cbor_hex",
+                "sequencer_descriptor_digest_hex",
+                "signed_activation_receipt_cbor_hex",
+                "activation_receipt_digest_hex",
+                "readback_cbor_hex",
+                "readback_digest_hex",
+                "coordinates_cbor_hex",
+                "proof_index",
+                "proof_hex",
+                "activation_leaf_digest_hex",
+                "entry_cbor_hex",
+            ],
+            "history completion activation entry",
+        )?;
+        let fields = v40_numbered_fields(entry, 12, "history completion activation entry")?;
+        let catalog_index = v40_unsigned(fields[0], "activation catalog index")?;
+        if !seen.insert(catalog_index)
+            || usize::try_from(catalog_index).ok() != Some(position + 1)
+            || entry_vector.get("catalog_index").and_then(Value::as_u64) != Some(catalog_index)
+        {
+            return Err(ProtocolToolError::new(
+                "history completion has missing, duplicate, or unordered catalog index",
+            ));
+        }
+        let leaf = leaves
+            .get(position)
+            .ok_or_else(|| ProtocolToolError::new("catalog leaf missing"))?;
+        let leaf_digest = decode_lower_hex_fixed::<32>(json_string(leaf, "leaf_digest_hex")?)?;
+        if v40_fixed_bytes::<32>(fields[1], "activation leaf")? != leaf_digest
+            || decode_lower_hex_fixed::<32>(json_string(entry_vector, "leaf_digest_hex")?)?
+                != leaf_digest
+            || v40_text(fields[2], "activation authority origin")? != descriptor.origin
+            || json_string(entry_vector, "authority_origin")? != descriptor.origin
+            || v40_bytes(fields[3], "sequencer descriptor")? != descriptor.exact
+            || v40_fixed_bytes::<32>(fields[4], "sequencer descriptor digest")? != descriptor.digest
+            || decode_hex(json_string(entry_vector, "sequencer_descriptor_cbor_hex")?)?
+                != descriptor.exact
+            || decode_lower_hex_fixed::<32>(json_string(
+                entry_vector,
+                "sequencer_descriptor_digest_hex",
+            )?)? != descriptor.digest
+        {
+            return Err(ProtocolToolError::new(
+                "history completion leaf/authority/sequencer descriptor drift",
+            ));
+        }
+        let signed_activation_bytes = v40_bytes(fields[5], "signed activation receipt")?;
+        if signed_activation_bytes
+            != decode_hex(json_string(
+                entry_vector,
+                "signed_activation_receipt_cbor_hex",
+            )?)?
+        {
+            return Err(ProtocolToolError::new(
+                "completion activation exact bytes drift",
+            ));
+        }
+        let signed_activation =
+            v40_decode_exact_bytes(signed_activation_bytes, "signed activation receipt")?;
+        cddl_cat::validate_cbor_bytes(
+            "signed-mls-recovery-activation-receipt-v1",
+            &mls_cddl,
+            signed_activation_bytes,
+        )
+        .map_err(|error| {
+            ProtocolToolError::new(format!(
+                "CDDL rejected completion activation receipt: {error}"
+            ))
+        })?;
+        let signed_fields =
+            v40_numbered_fields(&signed_activation, 4, "signed activation receipt")?;
+        let activation_receipt_bytes =
+            encode_deterministic_cbor(signed_fields[0]).map_err(|error| {
+                ProtocolToolError::new(format!("encode activation receipt: {error}"))
+            })?;
+        let activation_digest = v40_digest(
+            b"dirextalk.mls-recovery-activation-receipt.v1\0",
+            &activation_receipt_bytes,
+        );
+        let activation_fields = v40_numbered_fields(signed_fields[0], 20, "activation receipt")?;
+        if v40_fixed_bytes::<32>(signed_fields[1], "activation receipt digest")?
+            != activation_digest
+            || v40_fixed_bytes::<32>(signed_fields[2], "activation receipt key")?
+                != descriptor.public_key
+            || v40_fixed_bytes::<32>(fields[6], "entry activation digest")? != activation_digest
+            || decode_lower_hex_fixed::<32>(json_string(
+                entry_vector,
+                "activation_receipt_digest_hex",
+            )?)? != activation_digest
+            || v40_fixed_bytes::<32>(activation_fields[6], "activation request")? != request_digest
+            || v40_unsigned(activation_fields[8], "activation catalog count")?
+                != u64::try_from(entries.len()).expect("two entries")
+            || v40_unsigned(activation_fields[9], "activation catalog index")? != catalog_index
+            || v40_fixed_bytes::<32>(activation_fields[10], "activation leaf")? != leaf_digest
+            || v40_unsigned(activation_fields[19], "activation state")? != 3
+        {
+            return Err(ProtocolToolError::new(
+                "history completion activation receipt linkage drift",
+            ));
+        }
+        v41_v6_verify(
+            descriptor.public_key,
+            b"dirextalk.mls-recovery-activation-receipt-signature.v1\0",
+            activation_digest,
+            v40_fixed_bytes::<64>(signed_fields[3], "activation receipt signature")?,
+            "history completion activation receipt",
+        )?;
+
+        let readback_bytes = v40_bytes(fields[7], "activation current readback")?;
+        if readback_bytes != decode_hex(json_string(entry_vector, "readback_cbor_hex")?)? {
+            return Err(ProtocolToolError::new(
+                "completion readback exact bytes drift",
+            ));
+        }
+        let readback = v40_decode_exact_bytes(readback_bytes, "activation current readback")?;
+        cddl_cat::validate_cbor_bytes(
+            "mls-recovery-activation-readback-v1",
+            &mls_cddl,
+            readback_bytes,
+        )
+        .map_err(|error| {
+            ProtocolToolError::new(format!("CDDL rejected completion readback: {error}"))
+        })?;
+        let readback_fields = v40_numbered_fields(&readback, 10, "activation current readback")?;
+        let readback_digest = v40_digest(readback_domain, readback_bytes);
+        let coordinates = v40_numbered_fields(fields[9], 8, "activation readback coordinates")?;
+        let scope_exact = encode_deterministic_cbor(readback_fields[1])
+            .map_err(|error| ProtocolToolError::new(format!("encode readback scope: {error}")))?;
+        if v40_fixed_bytes::<32>(fields[8], "readback digest")? != readback_digest
+            || decode_lower_hex_fixed::<32>(json_string(entry_vector, "readback_digest_hex")?)?
+                != readback_digest
+            || v40_bytes(coordinates[0], "readback scope coordinate")? != scope_exact
+            || v40_bytes(coordinates[0], "readback scope coordinate")?
+                != decode_hex(json_string(leaf, "scope_cbor_hex")?)?
+            || coordinates[1] != readback_fields[3]
+            || v40_fixed_bytes::<32>(coordinates[2], "readback request")? != request_digest
+            || coordinates[2] != readback_fields[4]
+            || v40_fixed_bytes::<32>(coordinates[3], "readback leaf")? != leaf_digest
+            || coordinates[3] != readback_fields[5]
+            || coordinates[4] != readback_fields[6]
+            || coordinates[5] != readback_fields[7]
+            || v40_fixed_bytes::<32>(coordinates[6], "readback activation")? != activation_digest
+            || v40_unsigned(readback_fields[8], "readback state")? != 3
+            || v40_bytes(readback_fields[9], "readback signed receipt")? != signed_activation_bytes
+            || v40_unsigned(coordinates[7], "readback observed_at")?
+                >= v40_unsigned(
+                    v40_numbered_fields(
+                        &v40_decode_exact_bytes(&descriptor.exact, "sequencer descriptor")?,
+                        8,
+                        "sequencer descriptor",
+                    )?[6],
+                    "sequencer descriptor expiry",
+                )?
+        {
+            return Err(ProtocolToolError::new(
+                "history completion stale or mismatched current readback",
+            ));
+        }
+        let transcript = CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), fields[0].clone()),
+            (CanonicalValue::Unsigned(2), fields[1].clone()),
+            (CanonicalValue::Unsigned(3), fields[2].clone()),
+            (CanonicalValue::Unsigned(4), fields[4].clone()),
+            (CanonicalValue::Unsigned(5), fields[6].clone()),
+            (CanonicalValue::Unsigned(6), fields[8].clone()),
+            (CanonicalValue::Unsigned(7), fields[9].clone()),
+        ]);
+        let transcript_bytes = encode_deterministic_cbor(&transcript)
+            .map_err(|error| ProtocolToolError::new(format!("encode activation leaf: {error}")))?;
+        let leaf_hash = v40_digest(leaf_domain, &transcript_bytes);
+        v40_require_json_digest(
+            entry_vector,
+            "activation_leaf_digest_hex",
+            leaf_hash,
+            "activation leaf",
+        )?;
+        if encode_deterministic_cbor(entry)
+            .map_err(|error| ProtocolToolError::new(format!("encode activation entry: {error}")))?
+            != decode_hex(json_string(entry_vector, "entry_cbor_hex")?)?
+        {
+            return Err(ProtocolToolError::new("activation entry exact bytes drift"));
+        }
+        if position == 0
+            && (signed_activation_bytes
+                != decode_hex(json_string(mls_activation, "signed_receipt_cbor_hex")?)?
+                || readback_bytes != decode_hex(json_string(mls_readback, "cbor_hex")?)?)
+        {
+            return Err(ProtocolToolError::new(
+                "history completion first entry is not exact MLS V6 activation/readback",
+            ));
+        }
+        leaf_hashes.push(leaf_hash);
+    }
+    let mut node_input = leaf_hashes[0].to_vec();
+    node_input.extend_from_slice(&leaf_hashes[1]);
+    let root_digest = v40_digest(node_domain, &node_input);
+    for (position, entry) in entries.iter().enumerate() {
+        let fields = v40_numbered_fields(entry, 12, "activation entry proof")?;
+        let proof = v40_array(fields[11], "activation entry proof")?;
+        if v40_unsigned(fields[10], "activation proof index")?
+            != u64::try_from(position).expect("two")
+            || proof.len() != 1
+        {
+            return Err(ProtocolToolError::new("activation proof coordinates drift"));
+        }
+        let sibling = v40_fixed_bytes::<32>(&proof[0], "activation proof sibling")?;
+        let mut proof_input = if position == 0 {
+            leaf_hashes[0].to_vec()
+        } else {
+            sibling.to_vec()
+        };
+        if position == 0 {
+            proof_input.extend_from_slice(&sibling);
+        } else {
+            proof_input.extend_from_slice(&leaf_hashes[1]);
+        }
+        if v40_digest(node_domain, &proof_input) != root_digest {
+            return Err(ProtocolToolError::new(
+                "activation inclusion proof/root mismatch",
+            ));
+        }
+    }
+    Ok(root_digest)
+}
+
+fn validate_history_completion_transaction(completion: &Value) -> Result<(), ProtocolToolError> {
+    let transaction = v40_json_field(completion, "transaction", "completion")?;
+    require_exact_object_keys(
+        transaction,
+        &[
+            "single_local_sql_transaction",
+            "rechecks",
+            "writes",
+            "failure_before_local_write",
+            "partial_completion_acks_offer",
+            "partial_completion_opens_wss",
+            "wss_opens_after_commit",
+        ],
+        "completion transaction",
+    )?;
+    let expected_rechecks = json!([
+        "identity_current",
+        "catalog_current",
+        "request_current",
+        "grant_current",
+        "offer_current",
+        "not_expired",
+        "not_revoked"
+    ]);
+    let expected_writes = json!([
+        "immutable_completion",
+        "dedicated_offer_ack",
+        "recovery_complete"
+    ]);
+    if transaction
+        .get("single_local_sql_transaction")
+        .and_then(Value::as_bool)
+        != Some(true)
+        || transaction.get("rechecks") != Some(&expected_rechecks)
+        || transaction.get("writes") != Some(&expected_writes)
+        || transaction
+            .get("failure_before_local_write")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || transaction
+            .get("partial_completion_acks_offer")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || transaction
+            .get("partial_completion_opens_wss")
+            .and_then(Value::as_bool)
+            != Some(false)
+        || transaction
+            .get("wss_opens_after_commit")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(ProtocolToolError::new(
+            "history completion transaction atomicity drift",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn validate_history_completion_receipt(
+    completion: &Value,
+    cddl: &str,
+    descriptor: &V41CompletionDescriptorFacts,
+    command_fields: &[&CanonicalValue],
+    command_digest: [u8; 32],
+    activation_root: [u8; 32],
+    envelope_fields: &[&CanonicalValue],
+    envelope_digest: [u8; 32],
+    ack_domain: &[u8],
+    recovery_complete_domain: &[u8],
+    receipt_domain: &[u8],
+    receipt_signature_domain: &[u8],
+) -> Result<Vec<u8>, ProtocolToolError> {
+    let receipt_object = v40_json_field(completion, "receipt", "completion")?;
+    require_exact_object_keys(
+        receipt_object,
+        &[
+            "inner_cbor_hex",
+            "digest_hex",
+            "signature_hex",
+            "signed_cbor_hex",
+            "offer_ack_cbor_hex",
+            "offer_ack_digest_hex",
+            "recovery_complete_cbor_hex",
+            "recovery_complete_digest_hex",
+            "completed_at",
+        ],
+        "history completion receipt",
+    )?;
+    let (receipt_bytes, receipt) = v40_decode_exact_cddl(
+        "history-recovery-completion-receipt-v1",
+        cddl,
+        json_string(receipt_object, "inner_cbor_hex")?,
+        "HistoryRecoveryCompletionReceiptV1",
+    )?;
+    let fields = v40_numbered_fields(&receipt, 31, "HistoryRecoveryCompletionReceiptV1")?;
+    let direct = [
+        (1, 1),
+        (2, 2),
+        (3, 3),
+        (4, 4),
+        (5, 6),
+        (6, 7),
+        (7, 8),
+        (8, 9),
+        (9, 10),
+        (10, 11),
+        (11, 12),
+        (12, 13),
+        (13, 14),
+        (14, 15),
+        (15, 16),
+        (16, 17),
+        (17, 18),
+        (18, 19),
+        (19, 20),
+        (20, 22),
+        (21, 23),
+        (22, 24),
+        (23, 25),
+    ];
+    if v40_unsigned(fields[0], "completion receipt version")? != 1
+        || direct.iter().any(|(receipt_index, command_index)| {
+            fields[*receipt_index] != command_fields[*command_index]
+        })
+        || v40_fixed_bytes::<32>(fields[24], "receipt activation root")? != activation_root
+        || v40_fixed_bytes::<32>(fields[25], "receipt command digest")? != command_digest
+        || v40_unsigned(fields[30], "receipt completed_at")?
+            != v41_json_u64(receipt_object, "completed_at", "completion receipt")
+                .unwrap_or(u64::MAX)
+    {
+        return Err(ProtocolToolError::new(
+            "History completion receipt escaped exact command facts",
+        ));
+    }
+    let (ack_bytes, ack) = v40_decode_exact_cddl(
+        "history-recovery-completion-offer-ack-v1",
+        cddl,
+        json_string(receipt_object, "offer_ack_cbor_hex")?,
+        "history completion dedicated offer ACK",
+    )?;
+    let ack_fields = v40_numbered_fields(&ack, 7, "history completion offer ACK")?;
+    let ack_digest = v40_digest(ack_domain, &ack_bytes);
+    if v40_bytes(fields[26], "receipt ACK bytes")? != ack_bytes
+        || v40_fixed_bytes::<32>(fields[27], "receipt ACK digest")? != ack_digest
+        || ack_fields[1] != envelope_fields[1]
+        || ack_fields[2] != envelope_fields[2]
+        || ack_fields[3] != envelope_fields[3]
+        || v40_fixed_bytes::<32>(ack_fields[4], "ACK envelope digest")? != envelope_digest
+        || ack_fields[5] != command_fields[1]
+        || ack_fields[6] != fields[30]
+    {
+        return Err(ProtocolToolError::new(
+            "History completion dedicated offer ACK linkage drift",
+        ));
+    }
+    v40_require_json_digest(
+        receipt_object,
+        "offer_ack_digest_hex",
+        ack_digest,
+        "completion offer ACK",
+    )?;
+    let (complete_bytes, complete) = v40_decode_exact_cddl(
+        "history-recovery-complete-v1",
+        cddl,
+        json_string(receipt_object, "recovery_complete_cbor_hex")?,
+        "history recovery_complete",
+    )?;
+    let complete_fields = v40_numbered_fields(&complete, 9, "history recovery_complete")?;
+    let complete_digest = v40_digest(recovery_complete_domain, &complete_bytes);
+    if v40_bytes(fields[28], "receipt recovery_complete bytes")? != complete_bytes
+        || v40_fixed_bytes::<32>(fields[29], "receipt recovery_complete digest")? != complete_digest
+        || complete_fields[1] != command_fields[3]
+        || complete_fields[2] != command_fields[4]
+        || complete_fields[3] != command_fields[13]
+        || complete_fields[4] != command_fields[1]
+        || v40_fixed_bytes::<32>(complete_fields[5], "recovery_complete command")? != command_digest
+        || v40_fixed_bytes::<32>(complete_fields[6], "recovery_complete root")? != activation_root
+        || v40_fixed_bytes::<32>(complete_fields[7], "recovery_complete ACK")? != ack_digest
+        || complete_fields[8] != fields[30]
+    {
+        return Err(ProtocolToolError::new(
+            "History completion recovery_complete linkage drift",
+        ));
+    }
+    v40_require_json_digest(
+        receipt_object,
+        "recovery_complete_digest_hex",
+        complete_digest,
+        "history recovery_complete",
+    )?;
+    let receipt_digest = v40_digest(receipt_domain, &receipt_bytes);
+    v40_require_json_digest(
+        receipt_object,
+        "digest_hex",
+        receipt_digest,
+        "history completion receipt",
+    )?;
+    let (signed_bytes, signed) = v40_decode_exact_cddl(
+        "signed-history-recovery-completion-receipt-v1",
+        cddl,
+        json_string(receipt_object, "signed_cbor_hex")?,
+        "signed history completion receipt",
+    )?;
+    let signed_fields = v40_numbered_fields(&signed, 5, "signed history completion receipt")?;
+    let signature =
+        v40_fixed_bytes::<64>(signed_fields[4], "history completion receipt signature")?;
+    if signed_fields[0] != &receipt
+        || v40_fixed_bytes::<32>(signed_fields[1], "history completion receipt digest")?
+            != receipt_digest
+        || v40_bytes(signed_fields[2], "history completion descriptor")? != descriptor.exact
+        || v40_fixed_bytes::<32>(signed_fields[3], "history completion descriptor digest")?
+            != descriptor.digest
+        || signature != decode_lower_hex_fixed::<64>(json_string(receipt_object, "signature_hex")?)?
+    {
+        return Err(ProtocolToolError::new(
+            "signed History completion receipt wrapper drift",
+        ));
+    }
+    v41_v6_verify(
+        descriptor.public_key,
+        receipt_signature_domain,
+        receipt_digest,
+        signature,
+        "History completion receipt",
+    )?;
+    Ok(signed_bytes)
+}
+
+fn validate_history_completion_replay(
+    completion: &Value,
+    command: &Value,
+    signed_receipt: &[u8],
+) -> Result<(), ProtocolToolError> {
+    let replay = v40_json_field(completion, "replay", "completion")?;
+    require_exact_object_keys(
+        replay,
+        &[
+            "same_completion_id",
+            "same_idempotency_key_hash_hex",
+            "command_cbor_hex",
+            "signed_receipt_cbor_hex",
+            "byte_identical",
+        ],
+        "history completion replay",
+    )?;
+    if json_string(replay, "same_completion_id")? != json_string(command, "completion_id")?
+        || json_string(replay, "same_idempotency_key_hash_hex")?
+            != json_string(command, "idempotency_key_hash_hex")?
+        || json_string(replay, "command_cbor_hex")? != json_string(command, "cbor_hex")?
+        || decode_hex(json_string(replay, "signed_receipt_cbor_hex")?)? != signed_receipt
+        || replay.get("byte_identical").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(ProtocolToolError::new(
+            "History completion exact replay must return byte-identical receipt",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn validate_history_completion_invalid(
+    completion: &Value,
+    cddl: &str,
+    candidate_key: [u8; 32],
+    positive: &[&CanonicalValue],
+    activation_root: [u8; 32],
+    envelope: &[&CanonicalValue],
+) -> Result<(), ProtocolToolError> {
+    let invalid = v40_json_array_field(completion, "invalid_cbor", "completion")?;
+    let expected = [
+        ("missing_catalog_index", "current", false),
+        ("duplicate_catalog_index", "current", false),
+        ("changed_command_bytes", "replay_changed_bytes", false),
+        ("changed_idempotency", "replay_changed_idempotency", false),
+        ("stale_readback", "current", false),
+        ("revoked_request", "request_revoked", true),
+        ("expired_request", "request_expired", true),
+        ("wrong_authority_origin", "current", false),
+        ("wrong_sequencer_key", "current", false),
+        ("wrong_candidate_signature", "current", false),
+        ("wrong_readback_leaf", "current", false),
+        ("wrong_inclusion_proof", "current", false),
+        ("wrong_activation_root", "current", false),
+        ("wrong_offer_sequence", "current", false),
+    ];
+    if invalid.len() != expected.len() {
+        return Err(ProtocolToolError::new(
+            "history completion invalid family drift",
+        ));
+    }
+    for ((expected_label, expected_precondition, expected_precondition_only), item) in
+        expected.into_iter().zip(invalid)
+    {
+        require_exact_object_keys(
+            item,
+            &["label", "rule", "precondition", "cbor_hex"],
+            "completion invalid",
+        )?;
+        let label = json_string(item, "label")?;
+        if label != expected_label
+            || json_string(item, "precondition")? != expected_precondition
+            || json_string(item, "rule")? != "history-recovery-completion-command-v1"
+        {
+            return Err(ProtocolToolError::new(
+                "history completion invalid label/precondition drift",
+            ));
+        }
+        let bytes = decode_hex(json_string(item, "cbor_hex")?)?;
+        let value = v40_decode_exact_bytes(&bytes, label)?;
+        cddl_cat::validate_cbor_bytes("history-recovery-completion-command-v1", cddl, &bytes)
+            .map_err(|error| {
+                ProtocolToolError::new(format!("completion invalid must pass CDDL: {error}"))
+            })?;
+        let fields = v40_numbered_fields(&value, 30, label)?;
+        let entries = v40_array(fields[27], label)?;
+        let precondition_only = matches!(label, "revoked_request" | "expired_request");
+        if precondition_only != expected_precondition_only {
+            return Err(ProtocolToolError::new(
+                "history completion precondition-only invalid allowlist drift",
+            ));
+        }
+        let rejected = match label {
+            "missing_catalog_index" => entries.len() != 2,
+            "duplicate_catalog_index" => {
+                entries.len() == 2
+                    && v40_numbered_fields(&entries[0], 12, label)?[0]
+                        == v40_numbered_fields(&entries[1], 12, label)?[0]
+            }
+            "changed_command_bytes" => {
+                fields[1] == positive[1] && fields[28] == positive[28] && fields[20] != positive[20]
+            }
+            "changed_idempotency" => fields[1] == positive[1] && fields[28] != positive[28],
+            "revoked_request" | "expired_request" => fields == positive,
+            "wrong_candidate_signature" => {
+                let digest = v40_digest(
+                    b"dirextalk.history-recovery-completion-command.v1\0",
+                    &v41_v6_unsigned_bytes(&value, 30, label)?,
+                );
+                v41_v6_verify(
+                    candidate_key,
+                    b"dirextalk.history-recovery-completion-command-signature.v1\0",
+                    digest,
+                    v40_fixed_bytes::<64>(fields[29], label)?,
+                    label,
+                )
+                .is_err()
+            }
+            "wrong_activation_root" => v40_fixed_bytes::<32>(fields[26], label)? != activation_root,
+            "wrong_offer_sequence" => fields[23] != envelope[3],
+            "wrong_authority_origin" => {
+                v40_text(v40_numbered_fields(&entries[0], 12, label)?[2], label)?
+                    != v40_text(v40_numbered_fields(&entries[1], 12, label)?[2], label)?
+            }
+            "wrong_sequencer_key" => {
+                let first = v40_numbered_fields(&entries[0], 12, label)?;
+                v40_fixed_bytes::<32>(first[4], label)?
+                    != v40_digest(
+                        b"dirextalk.history-recovery-completion-sequencer-descriptor.v1\0",
+                        v40_bytes(first[3], label)?,
+                    )
+            }
+            "stale_readback" | "wrong_readback_leaf" => {
+                let first = v40_numbered_fields(&entries[0], 12, label)?;
+                let coords = v40_numbered_fields(first[9], 8, label)?;
+                let readback = v40_decode_exact_bytes(v40_bytes(first[7], label)?, label)?;
+                let readback_fields = v40_numbered_fields(&readback, 10, label)?;
+                if label == "stale_readback" {
+                    coords[5] != readback_fields[7]
+                } else {
+                    coords[3] != readback_fields[5]
+                }
+            }
+            "wrong_inclusion_proof" => {
+                let first = v40_numbered_fields(&entries[0], 12, label)?;
+                let proof = v40_array(first[11], label)?;
+                let positive_first = v40_numbered_fields(
+                    v40_array(positive[27], label)?
+                        .first()
+                        .expect("positive entry"),
+                    12,
+                    label,
+                )?;
+                proof != v40_array(positive_first[11], label)?
+            }
+            _ => false,
+        };
+        if !rejected {
+            return Err(ProtocolToolError::new(format!(
+                "history completion invalid {label} did not fail before local writes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_history_recovery_v2_openapi(
+    root: &Path,
+    vector: &Value,
+) -> Result<(), ProtocolToolError> {
+    const RELATIVE: &str = "protocol/openapi/history-recovery/v2/openapi.yaml";
+    let media = v40_json_field(vector, "media_types", "history vector")?;
+    v41_validate_openapi(
+        root,
+        RELATIVE,
+        &[
+            (
+                "/v3/devices/history-recovery-requests",
+                "/paths/~1v3~1devices~1history-recovery-requests",
+                &["post"],
+            ),
+            (
+                "/v3/devices/history-recovery-requests/{request_id}",
+                "/paths/~1v3~1devices~1history-recovery-requests~1{request_id}",
+                &["delete"],
+            ),
+            (
+                "/v4/devices/history-grants",
+                "/paths/~1v4~1devices~1history-grants",
+                &["post"],
+            ),
+            (
+                "/v1/identity-home/history-recovery-completion-key",
+                "/paths/~1v1~1identity-home~1history-recovery-completion-key",
+                &["get"],
+            ),
+            (
+                "/v1/identity-home/history-recovery-completions/{completion_id}",
+                "/paths/~1v1~1identity-home~1history-recovery-completions~1{completion_id}",
+                &["post", "get"],
+            ),
+        ],
+        &[
+            (
+                "/paths/~1v3~1devices~1history-recovery-requests/post/operationId",
+                "createHistoryRecoveryRequestV3",
+            ),
+            (
+                "/paths/~1v3~1devices~1history-recovery-requests~1{request_id}/delete/operationId",
+                "revokeHistoryRecoveryRequestV3",
+            ),
+            (
+                "/paths/~1v4~1devices~1history-grants/post/operationId",
+                "grantDeviceHistoryV3",
+            ),
+            (
+                "/paths/~1v1~1identity-home~1history-recovery-completion-key/get/operationId",
+                "getHistoryRecoveryCompletionKeyDescriptorV1",
+            ),
+            (
+                "/paths/~1v1~1identity-home~1history-recovery-completions~1{completion_id}/post/operationId",
+                "completeHistoryRecoveryV1",
+            ),
+            (
+                "/paths/~1v1~1identity-home~1history-recovery-completions~1{completion_id}/get/operationId",
+                "getHistoryRecoveryCompletionV1",
+            ),
+        ],
+        &[
+            (
+                "/paths/~1v3~1devices~1history-recovery-requests/post/requestBody/content",
+                json_string(media, "request")?,
+            ),
+            (
+                "/components/responses/RequestReceipt/content",
+                json_string(media, "request_receipt")?,
+            ),
+            (
+                "/components/responses/RevocationReceipt/content",
+                json_string(media, "revocation_receipt")?,
+            ),
+            (
+                "/paths/~1v4~1devices~1history-grants/post/requestBody/content",
+                json_string(media, "grant")?,
+            ),
+            (
+                "/components/responses/DeliveryReceipt/content",
+                json_string(media, "delivery_receipt")?,
+            ),
+            (
+                "/components/responses/CompletionKeyDescriptor/content",
+                json_string(media, "completion_key_descriptor")?,
+            ),
+            (
+                "/paths/~1v1~1identity-home~1history-recovery-completions~1{completion_id}/post/requestBody/content",
+                json_string(media, "completion_command")?,
+            ),
+            (
+                "/components/responses/CompletionReceipt/content",
+                json_string(media, "completion_receipt")?,
+            ),
+        ],
+        &[
+            "RequestReceipt",
+            "RevocationReceipt",
+            "DeliveryReceipt",
+            "CompletionKeyDescriptor",
+            "CompletionReceipt",
+            "Conflict",
+            "Gone",
+            "Invalidated",
+            "CapabilityRejected",
+            "InvalidExactCbor",
+            "NotCurrent",
+        ],
+        &[
+            "HISTORY_RECOVERY_CONFLICT",
+            "MAILBOX_HEAD_CONFLICT",
+            "HISTORY_RECOVERY_EXPIRED",
+            "HISTORY_RECOVERY_REVOKED",
+            "IDENTITY_HEAD_CHANGED",
+            "CATALOG_HEAD_CHANGED",
+            "AUTHORITY_CHANGED",
+            "CANDIDATE_KEY_CHANGED",
+            "ATTACHMENT_INVALIDATED",
+            "RECOVERY_RESPONSE_CAPABILITY_REJECTED",
+            "FORBIDDEN_SNAPSHOT_MEMBER",
+            "IDEMPOTENCY_CONFLICT",
+            "COMPLETION_SIGNATURE_INVALID",
+            "ACTIVATION_READBACK_INVALID",
+            "ACTIVATION_PROOF_INVALID",
+            "COMPLETION_KEY_NOT_CURRENT",
+            "COMPLETION_RECEIPT_NOT_CURRENT",
+        ],
+        "History Recovery V3 OpenAPI",
+    )?;
+    let document = v41_read_openapi_tree(root, RELATIVE, "History Recovery V3 OpenAPI")?;
+    v41_validate_openapi_coordinate_bindings(
+        &document,
+        &[
+            (
+                "/paths/~1v3~1devices~1history-recovery-requests~1{request_id}/delete",
+                v41_path_coordinate_binding(
+                    "reject-before-durable-writes",
+                    &[(
+                        "request_id",
+                        "stored-signed-request-cbor",
+                        "history-recovery-request-v3",
+                        &[2],
+                        "exact",
+                    )],
+                ),
+                None,
+            ),
+            (
+                "/paths/~1v1~1identity-home~1history-recovery-completions~1{completion_id}/post",
+                v41_path_coordinate_binding(
+                    "reject-before-durable-writes",
+                    &[(
+                        "completion_id",
+                        "signed-request-cbor",
+                        "history-recovery-completion-command-v1",
+                        &[2],
+                        "exact",
+                    )],
+                ),
+                None,
+            ),
+            (
+                "/paths/~1v1~1identity-home~1history-recovery-completions~1{completion_id}/get",
+                v41_path_coordinate_binding(
+                    "reject-before-readback",
+                    &[(
+                        "completion_id",
+                        "stored-returned-signed-receipt-cbor",
+                        "signed-history-recovery-completion-receipt-v1",
+                        &[1, 2],
+                        "exact",
+                    )],
+                ),
+                None,
+            ),
+        ],
+        "History Recovery V3 OpenAPI",
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the V41 KeyPackage gate proves every request, catalog, scope, candidate, package, and receipt binding"
+)]
+fn validate_key_package_v3(root: &Path) -> Result<(), ProtocolToolError> {
+    const PACKAGE_BYTES: &[u8] = b"dirextalk.key-package-bytes.v1\0";
+    const PUBLISH_BINDING: &[u8] = b"dirextalk.key-package-publish-binding.v3\0";
+    const PUBLISH_SIGNATURE: &[u8] = b"dirextalk.key-package-publish-signature.v3\0";
+    const PUBLISH_ENVELOPE: &[u8] = b"dirextalk.key-package-publish-envelope.v3\0";
+    const PUBLISH_RECEIPT: &[u8] = b"dirextalk.key-package-publish-receipt.v3\0";
+    const CLAIM_REQUEST: &[u8] = b"dirextalk.key-package-claim-request.v3\0";
+    const CLAIM_RECEIPT: &[u8] = b"dirextalk.key-package-claim-receipt.v3\0";
+    const HISTORY_REQUEST: &[u8] = b"dirextalk.history-recovery-request-digest.v3\0";
+    const CATALOG_HEAD: &[u8] = b"dirextalk.recovery-scope-catalog-head-digest.v1\0";
+
+    let cddl = read(&root.join("protocol/cddl/key-package/v3/key-package-v3.cddl"))?;
+    cddl_cat::parse_cddl(&cddl).map_err(|error| {
+        ProtocolToolError::new(format!("parse Recovery KeyPackage V3 CDDL: {error}"))
+    })?;
+    let vector = read_json(&root.join("protocol/test-vectors/key-package/v3/key-package-v3.json"))?;
+    require_exact_object_keys(
+        &vector,
+        &[
+            "version",
+            "baseline",
+            "media_types",
+            "domains",
+            "candidate_public_key_hex",
+            "cross_bindings",
+            "publish",
+            "claim",
+            "invalid_cbor",
+        ],
+        "Recovery KeyPackage V3 vector",
+    )?;
+    if vector.get("version").and_then(Value::as_u64) != Some(3)
+        || vector.get("baseline").and_then(Value::as_u64) != Some(41)
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage vector version/baseline must be 3/41",
+        ));
+    }
+    v40_require_string_map(
+        v40_json_field(&vector, "media_types", "Recovery KeyPackage vector")?,
+        &[
+            (
+                "publish",
+                "application/vnd.dirextalk.key-package-publish.v3+cbor",
+            ),
+            (
+                "publish_receipt",
+                "application/vnd.dirextalk.key-package-publish-receipt.v3+cbor",
+            ),
+            (
+                "claim",
+                "application/vnd.dirextalk.key-package-claim.v3+cbor",
+            ),
+            (
+                "claim_receipt",
+                "application/vnd.dirextalk.key-package-claim-receipt.v3+cbor",
+            ),
+        ],
+        "Recovery KeyPackage media types",
+    )?;
+    v40_require_string_map(
+        v40_json_field(&vector, "domains", "Recovery KeyPackage vector")?,
+        &[
+            (
+                "package_bytes",
+                std::str::from_utf8(PACKAGE_BYTES).expect("ASCII domain"),
+            ),
+            (
+                "publish_binding",
+                std::str::from_utf8(PUBLISH_BINDING).expect("ASCII domain"),
+            ),
+            (
+                "publish_signature",
+                std::str::from_utf8(PUBLISH_SIGNATURE).expect("ASCII domain"),
+            ),
+            (
+                "publish_envelope",
+                std::str::from_utf8(PUBLISH_ENVELOPE).expect("ASCII domain"),
+            ),
+            (
+                "publish_receipt",
+                std::str::from_utf8(PUBLISH_RECEIPT).expect("ASCII domain"),
+            ),
+            (
+                "claim_request",
+                std::str::from_utf8(CLAIM_REQUEST).expect("ASCII domain"),
+            ),
+            (
+                "claim_receipt",
+                std::str::from_utf8(CLAIM_RECEIPT).expect("ASCII domain"),
+            ),
+            (
+                "recovery_scope",
+                std::str::from_utf8(V41_SCOPE_DOMAIN).expect("ASCII domain"),
+            ),
+        ],
+        "Recovery KeyPackage domains",
+    )?;
+
+    let media = v40_json_field(&vector, "media_types", "Recovery KeyPackage vector")?;
+    v41_validate_openapi(
+        root,
+        "protocol/openapi/key-package/v3/openapi.yaml",
+        &[
+            (
+                "/v3/key-packages/{package_id}",
+                "/paths/~1v3~1key-packages~1{package_id}",
+                &["put"],
+            ),
+            (
+                "/v3/key-packages/claim",
+                "/paths/~1v3~1key-packages~1claim",
+                &["post"],
+            ),
+        ],
+        &[
+            (
+                "/paths/~1v3~1key-packages~1{package_id}/put/operationId",
+                "publishRecoveryKeyPackageV3",
+            ),
+            (
+                "/paths/~1v3~1key-packages~1claim/post/operationId",
+                "claimRecoveryKeyPackageV3",
+            ),
+        ],
+        &[
+            (
+                "/paths/~1v3~1key-packages~1{package_id}/put/requestBody/content",
+                json_string(media, "publish")?,
+            ),
+            (
+                "/components/responses/PublishReceipt/content",
+                json_string(media, "publish_receipt")?,
+            ),
+            (
+                "/paths/~1v3~1key-packages~1claim/post/requestBody/content",
+                json_string(media, "claim")?,
+            ),
+            (
+                "/components/responses/ClaimReceipt/content",
+                json_string(media, "claim_receipt")?,
+            ),
+        ],
+        &[
+            "PublishReceipt",
+            "ClaimReceipt",
+            "Unavailable",
+            "Conflict",
+            "Gone",
+            "Invalidated",
+            "InvalidExactCbor",
+        ],
+        &[
+            "KEY_PACKAGE_UNAVAILABLE",
+            "KEY_PACKAGE_CONFLICT",
+            "IDEMPOTENCY_CONFLICT",
+            "HISTORY_RECOVERY_EXPIRED",
+            "HISTORY_RECOVERY_REVOKED",
+            "IDENTITY_HEAD_CHANGED",
+            "CATALOG_HEAD_CHANGED",
+            "CANDIDATE_KEY_CHANGED",
+            "CATALOG_LEAF_CHANGED",
+            "EXACT_CBOR_INVALID",
+            "KEY_PACKAGE_INVALID",
+        ],
+        "Recovery KeyPackage V3 OpenAPI",
+    )?;
+
+    let candidate_key =
+        decode_lower_hex_fixed::<32>(json_string(&vector, "candidate_public_key_hex")?)?;
+    let cross = v40_json_field(&vector, "cross_bindings", "Recovery KeyPackage vector")?;
+    require_exact_object_keys(
+        cross,
+        &[
+            "identity_id",
+            "candidate_device_id",
+            "request_id",
+            "request_digest_hex",
+            "catalog_generation",
+            "catalog_head_digest_hex",
+            "catalog_index",
+            "catalog_leaf_digest_hex",
+            "scope_cbor_hex",
+            "scope_digest_hex",
+            "identity_head_sequence",
+            "identity_head_digest_hex",
+        ],
+        "Recovery KeyPackage cross bindings",
+    )?;
+    let identity_id = json_string(cross, "identity_id")?;
+    let candidate_device_id = json_string(cross, "candidate_device_id")?;
+    let request_id = json_string(cross, "request_id")?;
+    validate_identity_id(identity_id, "Recovery KeyPackage identity")?;
+    validate_uuid_v7(candidate_device_id)?;
+    validate_uuid_v7(request_id)?;
+    let request_digest = decode_lower_hex_fixed::<32>(json_string(cross, "request_digest_hex")?)?;
+    let catalog_generation = cross
+        .get("catalog_generation")
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=SAFE_UINT_MAX).contains(value))
+        .ok_or_else(|| ProtocolToolError::new("KeyPackage catalog generation must be positive"))?;
+    let catalog_head =
+        decode_lower_hex_fixed::<32>(json_string(cross, "catalog_head_digest_hex")?)?;
+    let catalog_index = cross
+        .get("catalog_index")
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=SAFE_UINT_MAX).contains(value))
+        .ok_or_else(|| ProtocolToolError::new("KeyPackage catalog index must be positive"))?;
+    let catalog_leaf =
+        decode_lower_hex_fixed::<32>(json_string(cross, "catalog_leaf_digest_hex")?)?;
+    let (scope_bytes, scope) = v40_decode_exact_cddl(
+        "recovery-scope",
+        &cddl,
+        json_string(cross, "scope_cbor_hex")?,
+        "Recovery KeyPackage scope",
+    )?;
+    let scope_fields = v40_numbered_fields(&scope, 2, "Recovery KeyPackage scope")?;
+    match v40_unsigned(scope_fields[0], "Recovery KeyPackage scope kind")? {
+        1 => validate_uuid_v7(v40_text(scope_fields[1], "Recovery KeyPackage scope id")?)?,
+        2 => {
+            let channel_id = v40_text(scope_fields[1], "Recovery KeyPackage channel id")?;
+            let bytes = channel_id.as_bytes();
+            if bytes.len() != 57
+                || !bytes.starts_with(b"dtxc1")
+                || !bytes[5..]
+                    .iter()
+                    .all(|byte| matches!(*byte, b'a'..=b'z' | b'2'..=b'7'))
+                || base32_lower_value(bytes[56]).is_none_or(|value| value.trailing_zeros() < 4)
+            {
+                return Err(ProtocolToolError::new(
+                    "Recovery KeyPackage channel scope must be canonical",
+                ));
+            }
+        }
+        _ => {
+            return Err(ProtocolToolError::new(
+                "Recovery KeyPackage scope kind is unsupported",
+            ));
+        }
+    }
+    let scope_digest = v40_digest(V41_SCOPE_DOMAIN, &scope_bytes);
+    v40_require_json_digest(cross, "scope_digest_hex", scope_digest, "recovery scope")?;
+    let identity_sequence = cross
+        .get("identity_head_sequence")
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=SAFE_UINT_MAX).contains(value))
+        .ok_or_else(|| ProtocolToolError::new("KeyPackage Identity H+1 must be positive"))?;
+    let identity_head =
+        decode_lower_hex_fixed::<32>(json_string(cross, "identity_head_digest_hex")?)?;
+
+    let history_cddl =
+        read(&root.join("protocol/cddl/history-recovery/v2/history-recovery-v2.cddl"))?;
+    let history_vector = read_json(
+        &root.join("protocol/test-vectors/history-recovery/v2/history-recovery-v2.json"),
+    )?;
+    let history_request = v40_json_field(&history_vector, "request", "History Recovery vector")?;
+    let (history_request_bytes, history_request_value) = v40_decode_exact_cddl(
+        "history-recovery-request-v3",
+        &history_cddl,
+        json_string(history_request, "signed_cbor_hex")?,
+        "Recovery KeyPackage source recovery request",
+    )?;
+    let history_request_fields = v40_numbered_fields(
+        &history_request_value,
+        21,
+        "Recovery KeyPackage source recovery request",
+    )?;
+    let recomputed_request_digest = v40_digest(HISTORY_REQUEST, &history_request_bytes);
+    v40_require_json_digest(
+        history_request,
+        "digest_hex",
+        recomputed_request_digest,
+        "source history request",
+    )?;
+    let request_expires_at = v40_unsigned(
+        history_request_fields[18],
+        "Recovery KeyPackage source request expiry",
+    )?;
+    if recomputed_request_digest != request_digest
+        || v40_text(history_request_fields[1], "source recovery request id")? != request_id
+        || v40_text(history_request_fields[2], "source recovery identity")? != identity_id
+        || v40_text(history_request_fields[3], "source recovery candidate")? != candidate_device_id
+        || v40_fixed_bytes::<32>(history_request_fields[4], "source recovery candidate key")?
+            != candidate_key
+        || v40_unsigned(history_request_fields[8], "source recovery Identity H+1")?
+            != identity_sequence
+        || v40_fixed_bytes::<32>(history_request_fields[9], "source recovery Identity head")?
+            != identity_head
+        || v40_unsigned(
+            history_request_fields[11],
+            "source recovery catalog generation",
+        )? != catalog_generation
+        || v40_fixed_bytes::<32>(history_request_fields[12], "source recovery catalog head")?
+            != catalog_head
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage cross bindings drifted from the exact signed recovery request",
+        ));
+    }
+
+    let catalog_cddl =
+        read(&root.join("protocol/cddl/recovery-scope-catalog/v1/recovery-scope-catalog-v1.cddl"))?;
+    let catalog_vector = read_json(
+        &root
+            .join("protocol/test-vectors/recovery-scope-catalog/v1/recovery-scope-catalog-v1.json"),
+    )?;
+    let catalog = v40_json_field(&catalog_vector, "catalog", "Recovery Scope Catalog vector")?;
+    let (catalog_head_bytes, catalog_head_value) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-head-v1",
+        &catalog_cddl,
+        json_string(catalog, "head_signed_cbor_hex")?,
+        "Recovery KeyPackage source catalog head",
+    )?;
+    let catalog_head_fields = v40_numbered_fields(
+        &catalog_head_value,
+        12,
+        "Recovery KeyPackage source catalog head",
+    )?;
+    let recomputed_catalog_head = v40_digest(CATALOG_HEAD, &catalog_head_bytes);
+    v40_require_json_digest(
+        catalog,
+        "head_digest_hex",
+        recomputed_catalog_head,
+        "source catalog head",
+    )?;
+    let catalog_leaves = v40_json_array_field(catalog, "leaves", "Recovery Scope Catalog")?;
+    let leaf_offset = usize::try_from(catalog_index - 1)
+        .map_err(|_| ProtocolToolError::new("KeyPackage catalog index does not fit usize"))?;
+    let selected_leaf = catalog_leaves.get(leaf_offset).ok_or_else(|| {
+        ProtocolToolError::new("KeyPackage catalog index is outside the exhaustive catalog")
+    })?;
+    let (selected_leaf_bytes, selected_leaf_value) = v40_decode_exact_cddl(
+        "recovery-scope-catalog-leaf-v1",
+        &catalog_cddl,
+        json_string(selected_leaf, "leaf_cbor_hex")?,
+        "Recovery KeyPackage selected catalog leaf",
+    )?;
+    let selected_leaf_fields = v40_numbered_fields(
+        &selected_leaf_value,
+        7,
+        "Recovery KeyPackage selected catalog leaf",
+    )?;
+    let recomputed_catalog_leaf = v40_digest(V41_CATALOG_LEAF_DOMAIN, &selected_leaf_bytes);
+    v40_require_json_digest(
+        selected_leaf,
+        "leaf_digest_hex",
+        recomputed_catalog_leaf,
+        "selected catalog leaf",
+    )?;
+    if recomputed_catalog_head != catalog_head
+        || v40_unsigned(catalog_head_fields[2], "source catalog generation")? != catalog_generation
+        || selected_leaf.get("index").and_then(Value::as_u64) != Some(catalog_index)
+        || v40_unsigned(selected_leaf_fields[1], "selected catalog index")? != catalog_index
+        || recomputed_catalog_leaf != catalog_leaf
+        || selected_leaf_fields[2] != &scope
+        || v40_fixed_bytes::<32>(selected_leaf_fields[6], "selected catalog scope digest")?
+            != scope_digest
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage catalog index/leaf/scope binding drifted from the signed catalog",
+        ));
+    }
+
+    let publish = v40_json_field(&vector, "publish", "Recovery KeyPackage vector")?;
+    require_exact_object_keys(
+        publish,
+        &[
+            "opaque_key_package_hex",
+            "package_digest_hex",
+            "binding_cbor_hex",
+            "binding_digest_hex",
+            "signature_hex",
+            "cbor_hex",
+            "digest_hex",
+            "receipt_cbor_hex",
+            "receipt_digest_hex",
+        ],
+        "Recovery KeyPackage publish vector",
+    )?;
+    let opaque_package = decode_hex(json_string(publish, "opaque_key_package_hex")?)?;
+    if opaque_package.is_empty() || opaque_package.len() > 65_536 {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage opaque package is outside its byte bound",
+        ));
+    }
+    let package_digest = v40_digest(PACKAGE_BYTES, &opaque_package);
+    v40_require_json_digest(
+        publish,
+        "package_digest_hex",
+        package_digest,
+        "KeyPackage bytes",
+    )?;
+    let (binding_bytes, binding) = v40_decode_exact_cddl(
+        "key-package-publish-binding-v3",
+        &cddl,
+        json_string(publish, "binding_cbor_hex")?,
+        "Recovery KeyPackage publish binding",
+    )?;
+    let (publish_bytes, publish_value) = v40_decode_exact_cddl(
+        "key-package-publish-v3",
+        &cddl,
+        json_string(publish, "cbor_hex")?,
+        "Recovery KeyPackage publish envelope",
+    )?;
+    let (publish_receipt_bytes, publish_receipt) = v40_decode_exact_cddl(
+        "key-package-publish-receipt-v3",
+        &cddl,
+        json_string(publish, "receipt_cbor_hex")?,
+        "Recovery KeyPackage publish receipt",
+    )?;
+    let binding_fields = v40_numbered_fields(&binding, 17, "Recovery KeyPackage binding")?;
+    let publish_fields = v40_numbered_fields(&publish_value, 3, "Recovery KeyPackage publish")?;
+    let publish_receipt_fields =
+        v40_numbered_fields(&publish_receipt, 9, "Recovery KeyPackage publish receipt")?;
+    let package_id = v40_text(binding_fields[3], "Recovery KeyPackage package id")?;
+    validate_uuid_v7(package_id)?;
+    let expires_at = v40_unsigned(binding_fields[15], "Recovery KeyPackage expiry")?;
+    if v40_unsigned(binding_fields[0], "Recovery KeyPackage binding version")? != 3
+        || v40_text(binding_fields[1], "Recovery KeyPackage binding identity")? != identity_id
+        || v40_text(binding_fields[2], "Recovery KeyPackage binding candidate")?
+            != candidate_device_id
+        || v40_text(binding_fields[4], "Recovery KeyPackage binding request")? != request_id
+        || v40_fixed_bytes::<32>(binding_fields[5], "Recovery KeyPackage request digest")?
+            != request_digest
+        || v40_fixed_bytes::<32>(binding_fields[6], "Recovery KeyPackage catalog head")?
+            != catalog_head
+        || v40_unsigned(binding_fields[7], "Recovery KeyPackage catalog generation")?
+            != catalog_generation
+        || v40_unsigned(binding_fields[8], "Recovery KeyPackage catalog index")? != catalog_index
+        || v40_fixed_bytes::<32>(binding_fields[9], "Recovery KeyPackage catalog leaf")?
+            != catalog_leaf
+        || binding_fields[10] != &scope
+        || v40_fixed_bytes::<32>(binding_fields[11], "Recovery KeyPackage scope digest")?
+            != scope_digest
+        || v40_fixed_bytes::<32>(binding_fields[12], "Recovery KeyPackage candidate key")?
+            != candidate_key
+        || v40_unsigned(binding_fields[13], "Recovery KeyPackage Identity H+1")?
+            != identity_sequence
+        || v40_fixed_bytes::<32>(binding_fields[14], "Recovery KeyPackage Identity head")?
+            != identity_head
+        || expires_at == 0
+        || expires_at != request_expires_at
+        || v40_fixed_bytes::<32>(binding_fields[16], "Recovery KeyPackage package digest")?
+            != package_digest
+        || publish_fields[0] != &binding
+        || v40_bytes(publish_fields[1], "Recovery KeyPackage bytes")? != opaque_package
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage publish escaped its request/catalog/scope/candidate/package/expiry binding",
+        ));
+    }
+    let binding_digest = v40_digest(PUBLISH_BINDING, &binding_bytes);
+    v40_require_json_digest(
+        publish,
+        "binding_digest_hex",
+        binding_digest,
+        "KeyPackage publish binding",
+    )?;
+    let signature = decode_lower_hex_fixed::<64>(json_string(publish, "signature_hex")?)?;
+    if v40_fixed_bytes::<64>(publish_fields[2], "Recovery KeyPackage signature")? != signature {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage publish signature field drift",
+        ));
+    }
+    let mut signature_input = PUBLISH_SIGNATURE.to_vec();
+    signature_input.extend_from_slice(&binding_digest);
+    v40_verify_signature(
+        candidate_key,
+        &signature_input,
+        signature,
+        "Recovery KeyPackage publish",
+    )?;
+    let publish_digest = v40_digest(PUBLISH_ENVELOPE, &publish_bytes);
+    v40_require_json_digest(publish, "digest_hex", publish_digest, "KeyPackage publish")?;
+    if v40_unsigned(
+        publish_receipt_fields[0],
+        "KeyPackage publish receipt version",
+    )? != 3
+        || publish_receipt_fields[1] != binding_fields[3]
+        || publish_receipt_fields[2] != binding_fields[4]
+        || publish_receipt_fields[3] != binding_fields[6]
+        || publish_receipt_fields[4] != binding_fields[8]
+        || publish_receipt_fields[5] != binding_fields[9]
+        || publish_receipt_fields[6] != binding_fields[11]
+        || publish_receipt_fields[7] != binding_fields[16]
+        || publish_receipt_fields[8] != binding_fields[15]
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage publish receipt escaped its exact publish binding",
+        ));
+    }
+    v40_require_json_digest(
+        publish,
+        "receipt_digest_hex",
+        v40_digest(PUBLISH_RECEIPT, &publish_receipt_bytes),
+        "KeyPackage publish receipt",
+    )?;
+
+    let claim = v40_json_field(&vector, "claim", "Recovery KeyPackage vector")?;
+    require_exact_object_keys(
+        claim,
+        &[
+            "cbor_hex",
+            "digest_hex",
+            "receipt_cbor_hex",
+            "receipt_digest_hex",
+        ],
+        "Recovery KeyPackage claim vector",
+    )?;
+    let (claim_bytes, claim_value) = v40_decode_exact_cddl(
+        "key-package-claim-v3",
+        &cddl,
+        json_string(claim, "cbor_hex")?,
+        "Recovery KeyPackage claim",
+    )?;
+    let (claim_receipt_bytes, claim_receipt) = v40_decode_exact_cddl(
+        "key-package-claim-receipt-v3",
+        &cddl,
+        json_string(claim, "receipt_cbor_hex")?,
+        "Recovery KeyPackage claim receipt",
+    )?;
+    let claim_fields = v40_numbered_fields(&claim_value, 8, "Recovery KeyPackage claim")?;
+    let claim_receipt_fields =
+        v40_numbered_fields(&claim_receipt, 12, "Recovery KeyPackage claim receipt")?;
+    if v40_unsigned(claim_fields[0], "KeyPackage claim version")? != 3
+        || claim_fields[1] != binding_fields[1]
+        || claim_fields[2] != binding_fields[2]
+        || claim_fields[3] != binding_fields[5]
+        || claim_fields[4] != binding_fields[6]
+        || claim_fields[5] != binding_fields[8]
+        || claim_fields[6] != binding_fields[9]
+        || claim_fields[7] != binding_fields[11]
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage claim escaped its request/catalog/index/leaf/scope/candidate binding",
+        ));
+    }
+    let claim_digest = v40_digest(CLAIM_REQUEST, &claim_bytes);
+    v40_require_json_digest(claim, "digest_hex", claim_digest, "KeyPackage claim")?;
+    let claim_expiry = v40_unsigned(claim_receipt_fields[11], "KeyPackage claim receipt expiry")?;
+    if v40_unsigned(claim_receipt_fields[0], "KeyPackage claim receipt version")? != 3
+        || claim_receipt_fields[1] != binding_fields[3]
+        || claim_receipt_fields[2] != binding_fields[4]
+        || claim_receipt_fields[3] != binding_fields[6]
+        || claim_receipt_fields[4] != binding_fields[8]
+        || claim_receipt_fields[5] != binding_fields[9]
+        || claim_receipt_fields[6] != binding_fields[11]
+        || claim_receipt_fields[7] != binding_fields[16]
+        || v40_bytes(claim_receipt_fields[8], "KeyPackage original publish")? != publish_bytes
+        || v40_fixed_bytes::<32>(claim_receipt_fields[9], "KeyPackage publish digest")?
+            != publish_digest
+        || v40_fixed_bytes::<32>(claim_receipt_fields[10], "KeyPackage claim digest")?
+            != claim_digest
+        || claim_expiry == 0
+        || claim_expiry > expires_at
+    {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage claim receipt escaped its exact publish/claim/expiry linkage",
+        ));
+    }
+    v40_require_json_digest(
+        claim,
+        "receipt_digest_hex",
+        v40_digest(CLAIM_RECEIPT, &claim_receipt_bytes),
+        "KeyPackage claim receipt",
+    )?;
+
+    let invalid = v40_json_array_field(&vector, "invalid_cbor", "Recovery KeyPackage vector")?;
+    let expected_invalid = [
+        "wrong_catalog_head_digest",
+        "wrong_catalog_leaf_digest",
+        "wrong_recovery_scope_digest",
+        "wrong_candidate_device",
+        "unknown_publish_field",
+    ];
+    if invalid.len() != expected_invalid.len() {
+        return Err(ProtocolToolError::new(
+            "Recovery KeyPackage invalid specimen family drift",
+        ));
+    }
+    for (item, expected_label) in invalid.iter().zip(expected_invalid) {
+        require_exact_object_keys(
+            item,
+            &["label", "rule", "cbor_hex"],
+            "Recovery KeyPackage invalid specimen",
+        )?;
+        let label = json_string(item, "label")?;
+        let rule = json_string(item, "rule")?;
+        if label != expected_label || rule != "key-package-publish-v3" {
+            return Err(ProtocolToolError::new(
+                "Recovery KeyPackage invalid label/rule family drift",
+            ));
+        }
+        let bytes = decode_hex(json_string(item, "cbor_hex")?)?;
+        let value = v40_decode_exact_bytes(&bytes, label)?;
+        if label == "unknown_publish_field" {
+            if cddl_cat::validate_cbor_bytes(rule, &cddl, &bytes).is_ok() {
+                return Err(ProtocolToolError::new(
+                    "Recovery KeyPackage CDDL accepted unknown publish field",
+                ));
+            }
+            continue;
+        }
+        cddl_cat::validate_cbor_bytes(rule, &cddl, &bytes).map_err(|error| {
+            ProtocolToolError::new(format!(
+                "Recovery KeyPackage semantic invalid must pass CDDL: {error}"
+            ))
+        })?;
+        let invalid_publish = v40_numbered_fields(&value, 3, label)?;
+        let invalid_binding = v40_numbered_fields(invalid_publish[0], 17, label)?;
+        let rejected = match label {
+            "wrong_catalog_head_digest" => {
+                v40_fixed_bytes::<32>(invalid_binding[6], label)? != catalog_head
+            }
+            "wrong_catalog_leaf_digest" => {
+                v40_fixed_bytes::<32>(invalid_binding[9], label)? != catalog_leaf
+            }
+            "wrong_recovery_scope_digest" => {
+                v40_fixed_bytes::<32>(invalid_binding[11], label)? != scope_digest
+            }
+            "wrong_candidate_device" => v40_text(invalid_binding[2], label)? != candidate_device_id,
+            _ => unreachable!("invalid labels were checked above"),
+        };
+        if !rejected {
+            return Err(ProtocolToolError::new(format!(
+                "Recovery KeyPackage invalid specimen {label} did not violate its named binding"
+            )));
         }
     }
     Ok(())
@@ -9042,6 +16198,677 @@ mod tests {
         }
     }
 
+    fn v41_recovery_catalog_openapi_fixture() -> Value {
+        let source =
+            read(&root().join("protocol/openapi/recovery-scope-catalog/v1/openapi.yaml")).unwrap();
+        yaml_serde::from_str(&source).unwrap()
+    }
+
+    fn assert_v41_recovery_catalog_parameter_contract_rejected(document: &Value, mutation: &str) {
+        assert!(
+            v41_validate_recovery_catalog_parameter_contract(document).is_err(),
+            "Recovery Scope Catalog parameter contract accepted {mutation}"
+        );
+    }
+
+    #[test]
+    fn v41_recovery_catalog_parameter_gate_accepts_exact_actual_contract() {
+        v41_validate_recovery_catalog_parameter_contract(&v41_recovery_catalog_openapi_fixture())
+            .unwrap();
+    }
+
+    #[test]
+    fn v41_recovery_catalog_parameter_gate_rejects_reference_set_mutations() {
+        const PREPARE_PARAMETERS: &str =
+            "/paths/~1v2~1devices~1enroll~1catalog-preparations/post/parameters";
+
+        let mut missing_enrollment = v41_recovery_catalog_openapi_fixture();
+        missing_enrollment
+            .pointer_mut(PREPARE_PARAMETERS)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        assert_v41_recovery_catalog_parameter_contract_rejected(
+            &missing_enrollment,
+            "a missing enrollment capability reference",
+        );
+
+        let mut extra = v41_recovery_catalog_openapi_fixture();
+        extra
+            .pointer_mut(PREPARE_PARAMETERS)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"$ref": "#/components/parameters/DeviceAuthorization"}));
+        assert_v41_recovery_catalog_parameter_contract_rejected(
+            &extra,
+            "an extra parameter reference",
+        );
+
+        let mut duplicate = v41_recovery_catalog_openapi_fixture();
+        let parameters = duplicate
+            .pointer_mut(PREPARE_PARAMETERS)
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        parameters.push(parameters[0].clone());
+        assert_v41_recovery_catalog_parameter_contract_rejected(
+            &duplicate,
+            "a duplicate parameter reference",
+        );
+
+        let mut reordered = v41_recovery_catalog_openapi_fixture();
+        reordered
+            .pointer_mut(PREPARE_PARAMETERS)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        assert_v41_recovery_catalog_parameter_contract_rejected(
+            &reordered,
+            "reordered parameter references",
+        );
+
+        let mut nonlocal = v41_recovery_catalog_openapi_fixture();
+        *nonlocal
+            .pointer_mut(&format!("{PREPARE_PARAMETERS}/0/$ref"))
+            .unwrap() = json!("https://example.invalid/parameters/EnrollmentCapability");
+        assert_v41_recovery_catalog_parameter_contract_rejected(
+            &nonlocal,
+            "a nonlocal parameter reference",
+        );
+
+        let mut unresolved = v41_recovery_catalog_openapi_fixture();
+        *unresolved
+            .pointer_mut(&format!("{PREPARE_PARAMETERS}/0/$ref"))
+            .unwrap() = json!("#/components/parameters/Unknown");
+        assert_v41_recovery_catalog_parameter_contract_rejected(
+            &unresolved,
+            "an unresolved local parameter reference",
+        );
+
+        let mut sibling = v41_recovery_catalog_openapi_fixture();
+        sibling
+            .pointer_mut(&format!("{PREPARE_PARAMETERS}/0"))
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("description".to_owned(), json!("not a sole reference"));
+        assert_v41_recovery_catalog_parameter_contract_rejected(
+            &sibling,
+            "a parameter reference with a sibling field",
+        );
+    }
+
+    #[test]
+    fn v41_recovery_catalog_parameter_gate_rejects_enrollment_component_mutations() {
+        for (pointer, replacement, mutation) in [
+            (
+                "/components/parameters/EnrollmentCapability/required",
+                json!(false),
+                "an optional enrollment capability",
+            ),
+            (
+                "/components/parameters/EnrollmentCapability/name",
+                json!("DTX-Other-Capability"),
+                "the wrong enrollment capability header name",
+            ),
+            (
+                "/components/parameters/EnrollmentCapability/in",
+                json!("query"),
+                "the wrong enrollment capability location",
+            ),
+            (
+                "/components/parameters/EnrollmentCapability/schema/pattern",
+                json!("^[A-Za-z0-9_-]+$"),
+                "the wrong enrollment capability pattern",
+            ),
+        ] {
+            let mut document = v41_recovery_catalog_openapi_fixture();
+            *document.pointer_mut(pointer).unwrap() = replacement;
+            assert_v41_recovery_catalog_parameter_contract_rejected(&document, mutation);
+        }
+    }
+
+    fn assert_v41_recovery_catalog_response_contract_rejected(document: &Value, mutation: &str) {
+        assert!(
+            v41_validate_recovery_catalog_response_contract(document).is_err(),
+            "Recovery Scope Catalog response contract accepted {mutation}"
+        );
+    }
+
+    #[test]
+    fn v41_recovery_catalog_response_gate_accepts_exact_actual_contract() {
+        v41_validate_recovery_catalog_response_contract(&v41_recovery_catalog_openapi_fixture())
+            .unwrap();
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exhaustive response matrix keeps every status, body, and header mutation together"
+    )]
+    fn v41_recovery_catalog_response_gate_rejects_status_code_body_and_header_drift() {
+        const CATALOG_RESPONSES: &str =
+            "/paths/~1v1~1recovery-scope-catalogs~1{generation}/put/responses";
+
+        let mut missing = v41_recovery_catalog_openapi_fixture();
+        missing
+            .pointer_mut(CATALOG_RESPONSES)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("401");
+        assert_v41_recovery_catalog_response_contract_rejected(
+            &missing,
+            "a missing response status",
+        );
+
+        let mut extra = v41_recovery_catalog_openapi_fixture();
+        extra
+            .pointer_mut(CATALOG_RESPONSES)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "418".to_owned(),
+                json!({"$ref": "#/components/responses/InvalidExactCbor"}),
+            );
+        assert_v41_recovery_catalog_response_contract_rejected(&extra, "an extra response status");
+
+        let mut wrong_status_mapping = v41_recovery_catalog_openapi_fixture();
+        *wrong_status_mapping
+            .pointer_mut(&format!("{CATALOG_RESPONSES}/412/$ref"))
+            .unwrap() = json!("#/components/responses/PreparationPreconditionFailed");
+        assert_v41_recovery_catalog_response_contract_rejected(
+            &wrong_status_mapping,
+            "a wrong status-to-component mapping",
+        );
+
+        let mut wrong_code = v41_recovery_catalog_openapi_fixture();
+        *wrong_code
+            .pointer_mut(
+                "/components/responses/CatalogGone/content/application~1json/schema/allOf/1/properties/error/properties/code/enum/0",
+            )
+            .unwrap() = json!("RECOVERY_PREPARATION_EXPIRED");
+        assert_v41_recovery_catalog_response_contract_rejected(
+            &wrong_code,
+            "an error code mutation",
+        );
+
+        let mut wrong_body = v41_recovery_catalog_openapi_fixture();
+        wrong_body
+            .pointer_mut("/components/schemas/ErrorEnvelopeV1/required")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .clear();
+        assert_v41_recovery_catalog_response_contract_rejected(
+            &wrong_body,
+            "an error envelope mutation",
+        );
+
+        let mut wrong_header = v41_recovery_catalog_openapi_fixture();
+        wrong_header
+            .pointer_mut("/components/responses/CatalogConflict/headers")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("X-Request-Id");
+        assert_v41_recovery_catalog_response_contract_rejected(
+            &wrong_header,
+            "a missing error response header",
+        );
+    }
+
+    #[test]
+    fn v41_recovery_catalog_get_terminal_statuses_remain_exact_cbor_not_json_errors() {
+        const STATUS_RESPONSES: &str =
+            "/paths/~1v2~1devices~1enroll~1catalog-preparations~1{request_id}/get/responses";
+        let document = v41_recovery_catalog_openapi_fixture();
+        for (status, component) in [
+            ("410", "PreparationGoneStatus"),
+            ("412", "PreparationInvalidatedStatus"),
+        ] {
+            let expected_reference = format!("#/components/responses/{component}");
+            assert_eq!(
+                document
+                    .pointer(&format!("{STATUS_RESPONSES}/{status}/$ref"))
+                    .and_then(Value::as_str),
+                Some(expected_reference.as_str())
+            );
+            let content = document
+                .pointer(&format!("/components/responses/{component}/content"))
+                .and_then(Value::as_object)
+                .unwrap();
+            assert!(
+                content.contains_key(
+                    "application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor"
+                )
+            );
+            assert!(!content.contains_key("application/json"));
+        }
+
+        let mut json_gone = document.clone();
+        *json_gone
+            .pointer_mut(&format!("{STATUS_RESPONSES}/410/$ref"))
+            .unwrap() = json!("#/components/responses/PreparationGone");
+        assert_v41_recovery_catalog_response_contract_rejected(
+            &json_gone,
+            "a JSON mutation error substituted for the GET 410 status CBOR",
+        );
+
+        let mut json_invalidated = document;
+        *json_invalidated
+            .pointer_mut(&format!("{STATUS_RESPONSES}/412/$ref"))
+            .unwrap() = json!("#/components/responses/PreparationInvalidated");
+        assert_v41_recovery_catalog_response_contract_rejected(
+            &json_invalidated,
+            "a JSON mutation error substituted for the GET 412 status CBOR",
+        );
+    }
+
+    fn v41_path_parameter_fixture() -> Value {
+        json!({
+            "paths": {
+                "/v1/scopes/{scope_id}/items/{item_id}": {
+                    "parameters": [
+                        {"$ref": "#/components/parameters/ScopeId"}
+                    ],
+                    "get": {
+                        "parameters": [
+                            {
+                                "name": "item_id",
+                                "in": "path",
+                                "required": true,
+                                "schema": {"type": "string"}
+                            },
+                            {
+                                "name": "limit",
+                                "in": "query",
+                                "required": false,
+                                "schema": {"type": "integer"}
+                            }
+                        ]
+                    }
+                }
+            },
+            "components": {
+                "parameters": {
+                    "ScopeId": {
+                        "name": "scope_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"type": "string"}
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn v41_openapi_path_parameter_gate_accepts_exact_path_and_operation_declarations() {
+        v41_validate_openapi_path_parameters(&v41_path_parameter_fixture(), "fixture").unwrap();
+    }
+
+    #[test]
+    fn v41_openapi_path_parameter_gate_rejects_missing_extra_duplicate_and_optional_parameters() {
+        let mut missing = v41_path_parameter_fixture();
+        missing
+            .pointer_mut("/paths/~1v1~1scopes~1{scope_id}~1items~1{item_id}/get/parameters")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        assert!(
+            v41_validate_openapi_path_parameters(&missing, "fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("missing path parameter item_id")
+        );
+
+        let mut extra = v41_path_parameter_fixture();
+        *extra
+            .pointer_mut("/paths/~1v1~1scopes~1{scope_id}~1items~1{item_id}/get/parameters/0/name")
+            .unwrap() = json!("other_id");
+        assert!(
+            v41_validate_openapi_path_parameters(&extra, "fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("extra path parameter other_id")
+        );
+
+        let mut duplicate = v41_path_parameter_fixture();
+        let parameters = duplicate
+            .pointer_mut("/paths/~1v1~1scopes~1{scope_id}~1items~1{item_id}/get/parameters")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        parameters.push(parameters[0].clone());
+        assert!(
+            v41_validate_openapi_path_parameters(&duplicate, "fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate path parameter item_id")
+        );
+
+        let mut optional = v41_path_parameter_fixture();
+        *optional
+            .pointer_mut(
+                "/paths/~1v1~1scopes~1{scope_id}~1items~1{item_id}/get/parameters/0/required",
+            )
+            .unwrap() = json!(false);
+        assert!(
+            v41_validate_openapi_path_parameters(&optional, "fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("path parameter item_id")
+        );
+    }
+
+    fn v41_coordinate_binding_fixture() -> Value {
+        json!({
+            "paths": {
+                "/v1/groups/{scope_kind}/{scope_id}/items/{item_id}": {
+                    "get": {
+                        "x-dirextalk-path-coordinate-binding": v41_path_coordinate_binding(
+                            "reject-before-readback",
+                            &[
+                                (
+                                    "scope_kind",
+                                    "stored-returned-readback-cbor",
+                                    "fixture-readback-v1",
+                                    &[2, 1],
+                                    "scope-kind-mapping",
+                                ),
+                                (
+                                    "scope_id",
+                                    "stored-returned-readback-cbor",
+                                    "fixture-readback-v1",
+                                    &[2, 2],
+                                    "exact",
+                                ),
+                                (
+                                    "item_id",
+                                    "stored-returned-readback-cbor",
+                                    "fixture-readback-v1",
+                                    &[3],
+                                    "exact",
+                                ),
+                            ],
+                        ),
+                        "x-dirextalk-scope-kind-pairing": v41_scope_kind_pairing(),
+                    }
+                }
+            },
+            "components": {
+                "parameters": {
+                    "ScopeKind": {
+                        "name": "scope_kind",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "enum": ["private-conversation", "controlled-public-channel"]
+                        }
+                    },
+                    "ScopeId": {
+                        "name": "scope_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {"$ref": "#/components/schemas/GroupScopeId"}
+                    }
+                },
+                "schemas": {
+                    "UuidV7": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                    },
+                    "ChannelId": {
+                        "type": "string",
+                        "minLength": 57,
+                        "maxLength": 57,
+                        "pattern": "^dtxc1[a-z2-7]{52}$"
+                    },
+                    "GroupScopeId": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/UuidV7"},
+                            {"$ref": "#/components/schemas/ChannelId"}
+                        ]
+                    }
+                }
+            }
+        })
+    }
+
+    fn v41_coordinate_binding_expectation() -> [(&'static str, Value, Option<Value>); 1] {
+        [(
+            "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1items~1{item_id}/get",
+            v41_path_coordinate_binding(
+                "reject-before-readback",
+                &[
+                    (
+                        "scope_kind",
+                        "stored-returned-readback-cbor",
+                        "fixture-readback-v1",
+                        &[2, 1],
+                        "scope-kind-mapping",
+                    ),
+                    (
+                        "scope_id",
+                        "stored-returned-readback-cbor",
+                        "fixture-readback-v1",
+                        &[2, 2],
+                        "exact",
+                    ),
+                    (
+                        "item_id",
+                        "stored-returned-readback-cbor",
+                        "fixture-readback-v1",
+                        &[3],
+                        "exact",
+                    ),
+                ],
+            ),
+            Some(v41_scope_kind_pairing()),
+        )]
+    }
+
+    #[test]
+    fn v41_openapi_coordinate_binding_gate_accepts_exact_metadata() {
+        v41_validate_openapi_coordinate_bindings(
+            &v41_coordinate_binding_fixture(),
+            &v41_coordinate_binding_expectation(),
+            "fixture",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v41_openapi_coordinate_binding_gate_rejects_contract_mutations() {
+        const OPERATION: &str =
+            "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1items~1{item_id}/get";
+        let expected = v41_coordinate_binding_expectation();
+
+        let mut missing = v41_coordinate_binding_fixture();
+        missing
+            .pointer_mut(OPERATION)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("x-dirextalk-path-coordinate-binding");
+        assert!(v41_validate_openapi_coordinate_bindings(&missing, &expected, "fixture").is_err());
+
+        let mut wrong_binding = v41_coordinate_binding_fixture();
+        *wrong_binding
+            .pointer_mut(&format!(
+                "{OPERATION}/x-dirextalk-path-coordinate-binding/reject"
+            ))
+            .unwrap() = json!("reject-before-durable-writes");
+        assert!(
+            v41_validate_openapi_coordinate_bindings(&wrong_binding, &expected, "fixture").is_err()
+        );
+
+        let mut wrong_pairing = v41_coordinate_binding_fixture();
+        *wrong_pairing
+            .pointer_mut(&format!(
+                "{OPERATION}/x-dirextalk-scope-kind-pairing/mappings/private-conversation/scope-id-schema"
+            ))
+            .unwrap() = json!("#/components/schemas/ChannelId");
+        assert!(
+            v41_validate_openapi_coordinate_bindings(&wrong_pairing, &expected, "fixture").is_err()
+        );
+
+        let mut path_body_mismatch = v41_coordinate_binding_fixture();
+        *path_body_mismatch
+            .pointer_mut(&format!(
+                "{OPERATION}/x-dirextalk-path-coordinate-binding/coordinates/item_id/cbor-path"
+            ))
+            .unwrap() = json!([9]);
+        assert!(
+            v41_validate_openapi_coordinate_bindings(&path_body_mismatch, &expected, "fixture")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn mls_v6_activation_route_metadata_resolves_f2_not_f1_or_f3() {
+        const GET: &str = "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}/get/x-dirextalk-path-coordinate-binding/coordinates/activation_id";
+        const COMPLETION: &str = "/paths/~1v1~1groups~1{scope_kind}~1{scope_id}~1mls-recovery-activations~1{activation_id}~1completion/put/x-dirextalk-path-coordinate-binding/coordinates/activation_id";
+        let root = root();
+        let vector =
+            read_json(&root.join("protocol/test-vectors/mls-sequencer/v6/mls-sequencer-v6.json"))
+                .unwrap();
+        let flow = v40_json_field(&vector, "flow", "MLS V6 vector").unwrap();
+        let activation = v40_json_field(flow, "activation", "MLS V6 flow").unwrap();
+        let command = v40_decode_exact_bytes(
+            &decode_hex(json_string(activation, "command_cbor_hex").unwrap()).unwrap(),
+            "activation command",
+        )
+        .unwrap();
+        let command_fields = v40_numbered_fields(&command, 17, "activation command").unwrap();
+        assert_eq!(
+            v40_text(command_fields[1], "activation id").unwrap(),
+            "0190f2a5-7b1c-7abc-8def-0123456789f2"
+        );
+        assert_eq!(
+            v40_text(command_fields[2], "submission id").unwrap(),
+            "0190f2a5-7b1c-7abc-8def-0123456789f1"
+        );
+        let completion = v40_json_field(flow, "completion", "MLS V6 flow").unwrap();
+        let presentation = v40_decode_exact_bytes(
+            &decode_hex(json_string(completion, "presentation_cbor_hex").unwrap()).unwrap(),
+            "completion presentation",
+        )
+        .unwrap();
+        assert_eq!(
+            v40_text(
+                v40_numbered_fields(&presentation, 15, "completion presentation").unwrap()[1],
+                "presentation id",
+            )
+            .unwrap(),
+            "0190f2a5-7b1c-7abc-8def-0123456789f3"
+        );
+
+        let document = v41_read_openapi_tree(
+            &root,
+            "protocol/openapi/mls-sequencer/v6/openapi.yaml",
+            "MLS V6 OpenAPI",
+        )
+        .unwrap();
+        v41_validate_mls_activation_route_coordinates(&document, &vector).unwrap();
+
+        let mut old_get = document.clone();
+        let get = old_get.pointer_mut(GET).unwrap().as_object_mut().unwrap();
+        get.insert("source".to_owned(), json!("stored-returned-readback-cbor"));
+        get.insert(
+            "cddl-rule".to_owned(),
+            json!("mls-recovery-activation-readback-v1"),
+        );
+        get.insert("cbor-path".to_owned(), json!([3]));
+        assert!(v41_validate_mls_activation_route_coordinates(&old_get, &vector).is_err());
+
+        let mut old_completion = document.clone();
+        let completion = old_completion
+            .pointer_mut(COMPLETION)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        completion.insert("source".to_owned(), json!("signed-request-cbor"));
+        completion.insert(
+            "cddl-rule".to_owned(),
+            json!("mls-recovery-completion-presentation-v1"),
+        );
+        completion.insert("cbor-path".to_owned(), json!([2]));
+        assert!(v41_validate_mls_activation_route_coordinates(&old_completion, &vector).is_err());
+    }
+
+    #[test]
+    fn mls_v7_index_and_issuer_path_binding_are_cross_artifact_frozen() {
+        const CDDL_RELATIVE: &str = "protocol/cddl/mls-sequencer/v7/mls-sequencer-v7.cddl";
+        const OPENAPI_RELATIVE: &str = "protocol/openapi/mls-sequencer/v7/openapi.yaml";
+
+        let repository_root = root();
+        validate_mls_sequencer_v7_index_contract(&repository_root).unwrap();
+        let cddl = read(&repository_root.join(CDDL_RELATIVE)).unwrap();
+        let openapi = read(&repository_root.join(OPENAPI_RELATIVE)).unwrap();
+        let temporary_root = std::env::temp_dir().join(format!(
+            "dtx-protocol-mls-v7-index-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cddl_path = temporary_root.join(CDDL_RELATIVE);
+        let openapi_path = temporary_root.join(OPENAPI_RELATIVE);
+        fs::create_dir_all(cddl_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(openapi_path.parent().unwrap()).unwrap();
+
+        let wrong_openapi_max = openapi.replacen(
+            "schema: {type: integer, minimum: 1, maximum: 1023}",
+            "schema: {type: integer, minimum: 1, maximum: 1024}",
+            1,
+        );
+        assert_ne!(wrong_openapi_max, openapi);
+        fs::write(&cddl_path, &cddl).unwrap();
+        fs::write(&openapi_path, wrong_openapi_max).unwrap();
+        assert!(validate_mls_sequencer_v7_index_contract(&temporary_root).is_err());
+
+        let wrong_field_type = cddl.replacen(
+            "  6: catalog-exhaustive-count,   ; one-based index",
+            "  6: positive-uint,              ; one-based index",
+            1,
+        );
+        assert_ne!(wrong_field_type, cddl);
+        fs::write(&cddl_path, wrong_field_type).unwrap();
+        fs::write(&openapi_path, &openapi).unwrap();
+        assert!(validate_mls_sequencer_v7_index_contract(&temporary_root).is_err());
+
+        let alternate_issuer_map = cddl.replacen(
+            "  19: signature                  ; catalog authority signs exact fields 1..18\n}\n\n; A first accepted tuple",
+            "  19: signature                  ; catalog authority signs exact fields 1..18\n} / { 1: 99 }\n\n; A first accepted tuple",
+            1,
+        );
+        assert_ne!(alternate_issuer_map, cddl);
+        fs::write(&cddl_path, alternate_issuer_map).unwrap();
+        fs::write(&openapi_path, &openapi).unwrap();
+        assert!(validate_mls_sequencer_v7_index_contract(&temporary_root).is_err());
+
+        let wrong_path = openapi.replacen(
+            "index: {source: signed-request-cbor, cddl-rule: mls-recovery-issuer-authorization-request-v1, cbor-path: [6], comparison: exact-decimal}",
+            "index: {source: signed-request-cbor, cddl-rule: mls-recovery-issuer-authorization-request-v1, cbor-path: [5], comparison: exact-decimal}",
+            1,
+        );
+        assert_ne!(wrong_path, openapi);
+        fs::write(&cddl_path, &cddl).unwrap();
+        fs::write(&openapi_path, wrong_path).unwrap();
+        assert!(validate_mls_sequencer_v7_index_contract(&temporary_root).is_err());
+
+        fs::remove_dir_all(temporary_root).unwrap();
+    }
+
     #[test]
     fn cddl_event_page_preserves_nonempty_exact_envelope_bytes_and_cursor() {
         let cddl = format!(
@@ -9096,5 +16923,10 @@ message Common {}
         .unwrap();
         validate_protobuf(&root).unwrap();
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mls_sequencer_v6_proves_fenced_recovery_completion() {
+        validate_mls_sequencer_v6(&root()).unwrap();
     }
 }

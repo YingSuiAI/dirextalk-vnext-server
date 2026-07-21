@@ -1,0 +1,205 @@
+; V42 catalog-public, request-isolated recovery KeyPackage V4. This artifact is
+; additive and disjoint from V2/V3. No decoder may convert, reinterpret, or
+; fall back between versions.
+;
+; Every map is closed deterministic canonical CBOR. Runtime additionally
+; validates canonical lower-case UUIDv7 and dtxi1 text, strict Ed25519, exact
+; Catalog V2 objects/proofs, all equality constraints, and time intervals.
+; Digest = SHA-256(domain || exact deterministic canonical bytes named below).
+; Every displayed domain is UTF-8 including its terminal NUL.
+;
+; publish-binding-domain = `dirextalk.key-package.publish-binding.v4\0`.
+; publish-signature-domain = `dirextalk.key-package.publish-signature.v4\0`.
+; publish-envelope-domain = `dirextalk.key-package.publish-envelope.v4\0`.
+; publish-idempotency-domain = `dirextalk.key-package.publish-idempotency.v4\0`.
+; publish-receipt-domain = `dirextalk.key-package.publish-receipt.v4\0`.
+; claim-domain = `dirextalk.key-package.claim.v4\0`.
+; claim-idempotency-domain = `dirextalk.key-package.claim-idempotency.v4\0`.
+; claim-receipt-domain = `dirextalk.key-package.claim-receipt.v4\0`.
+; package-domain = `dirextalk.key-package.opaque-body.v4\0`.
+;
+; Each endpoint accepts exactly one Idempotency-Key header field and exactly
+; one value. The accepted value is 16..128 octets, every octet is ASCII VCHAR
+; 0x21..0x7e. Duplicate fields or parser-exposed values, obs-fold, non-ASCII,
+; and any whitespace (including leading or trailing whitespace) are rejected
+; before idempotency lookup. After HTTP field parsing, the accepted ASCII
+; octets are used byte-for-byte without normalization or re-encoding. Before
+; storage, publish field 24 is SHA-256(publish-idempotency-domain || octets)
+; and claim field 18 is SHA-256(claim-idempotency-domain || octets). Only those
+; digests may be persisted or returned; the raw key is never persisted or
+; returned.
+
+digest = bstr .size 32
+signature = bstr .size 64
+ed25519-public-key = bstr .size 32
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+positive-uint = 1..9007199254740991
+utc-millis = 0..9007199254740991
+catalog-exhaustive-count = 1..1023
+
+; Exact owning types from recovery-scope-catalog/v2. The bounded bytes MUST be
+; parsed and validated by those rules; a size check is never sufficient. Count
+; is 1..1023, index is one-based and <= count, and sibling count is exactly the
+; owner proof algorithm's requirement, never exceeding ceil(log2(count)) or 10.
+exact-signed-catalog-head-v2 = bstr .size (1..466)
+exact-catalog-public-leaf-v2 = bstr .size (1..220)
+exact-catalog-proof-v2 = bstr .size (1..402)
+
+; This is the complete identity-visible V4 publish projection. The exact head,
+; public leaf, and proof are public Catalog objects. Scope, scope digest, scope
+; origin, verifier descriptor/key/id/epoch, private body, full verifier
+; binding, membership receipt, opening, nonce, and any private authorization
+; body are forbidden. Fields 16..17 are exact public leaf fields 9 and 12.
+; Fields 11..15 validate field 14 at field 12 against field 9. Field 19 is the
+; exact direct DeviceAdd H+1 and field 20 its exact head. Field 21 < field 22.
+; The authenticated candidate identity_id, device_id, and current Ed25519
+; signing public key MUST equal fields 2, 3, and 18 respectively. Envelope
+; field 3 MUST verify with that exact authenticated field-18 key over the exact
+; canonical binding under publish-signature-domain.
+key-package-publish-binding-v4 = {
+  1: 4,
+  2: identity-id,
+  3: uuid-v7,                   ; candidate device_id
+  4: uuid-v7,                   ; package_id
+  5: uuid-v7,                   ; recovery request_id
+  6: digest,                    ; exact signed Request V4 digest
+  7: uuid-v7,                   ; catalog_id
+  8: positive-uint,             ; generation
+  9: exact-signed-catalog-head-v2,
+  10: digest,                   ; exact signed Catalog-head digest
+  11: catalog-exhaustive-count,
+  12: catalog-exhaustive-count, ; exact one-based Catalog index <= field 11
+  13: exact-catalog-public-leaf-v2,
+  14: digest,                   ; Catalog leaf-domain digest of field 13
+  15: exact-catalog-proof-v2,
+  16: ed25519-public-key,       ; exact public leaf issuer EPK
+  17: digest,                   ; exact public leaf authorization digest A
+  18: ed25519-public-key,       ; candidate signing public key
+  19: positive-uint,            ; exact direct DeviceAdd H+1
+  20: digest,                   ; exact Identity Log head at H+1
+  21: utc-millis,               ; issued_at
+  22: utc-millis,               ; expires_at
+  23: digest,                   ; package-domain digest of opaque body
+  24: digest                    ; publish Idempotency-Key digest
+}
+
+; Binding ceiling table: map header = 2; keys 1..23 = 23 and key 24 = 2;
+; field 1 version = 1; field 2 identity = 59; fields 3/4/5/7 UUIDs = 152;
+; fields 6/10/14/17/20/23/24 digests = 238; fields 8/19/21/22 uints = 36;
+; field 9 head = 469; fields 11/12 counts = 6; field 13 leaf = 222;
+; field 15 proof = 405; fields 16/18 public keys = 68. Values therefore total
+; 1 + 59 + 152 + 238 + 36 + 469 + 6 + 222 + 405 + 68 = 1656 bytes,
+; including the one-byte version, and the binding is 2 + 25 + 1656 = 1683.
+; The opaque body has an explicit V4 package domain and no earlier version
+; decoder is attempted. The exact maximum envelope is
+; 4 map/key bytes + 1683 binding + 65541 encoded bstr(65536) + 66 signature =
+; 67294 bytes.
+key-package-publish-v4 = {
+  1: key-package-publish-binding-v4,
+  2: bstr .size (1..65536),
+  3: signature
+}
+exact-key-package-publish-v4 = bstr .size (1..67294)
+
+; The receipt binds and returns the exact accepted HTTP publish body, not a
+; reconstructed equivalent: field 5 is byte-for-byte that source envelope.
+; Decode field 5 under key-package-publish-v4. Receipt fields 2 and 3 equal its
+; binding fields 4 and 5. Field 4 is the publish-binding-domain digest of its
+; exact inner binding; field 6 is the publish-envelope-domain digest of exact
+; field 5. Field 7 both equals inner binding field 23 and is the package-domain
+; digest of its exact opaque body. Field 8 equals inner binding field 24 and
+; the accepted publish Idempotency-Key digest. A committed exact retry returns
+; identical receipt bytes even after mutable head advance; changed bytes
+; conflict.
+key-package-publish-receipt-v4 = {
+  1: 4,
+  2: uuid-v7,                   ; package_id
+  3: uuid-v7,                   ; request_id
+  4: digest,                    ; exact publish-binding digest
+  5: exact-key-package-publish-v4,
+  6: digest,                    ; exact publish-envelope digest
+  7: digest,                    ; exact opaque package digest
+  8: digest,                    ; publish Idempotency-Key digest
+  9: utc-millis                 ; accepted_at
+}
+; Maximum = 10 map/key bytes + version 1 + two UUIDs 76 + digest 34 + encoded
+; bstr(67294) 67299 + three digests 102 + timestamp 9 = 67531 bytes.
+exact-key-package-publish-receipt-v4 = bstr .size (1..67531)
+
+; Claim has only the same public coordinates. Current-scope-controller
+; authentication and authorization are resolved out of band. The authenticated
+; controller identity/device MUST equal the current authorization subject, and
+; its authorized target identity/candidate/request/catalog/leaf/DeviceAdd/
+; package tuple MUST equal claim fields 2..17. Claim fields 2 and 3 name the
+; candidate, never the controller, and no controller or scope/origin identifier
+; is encoded.
+; Against the stored original publish binding, exhaustive exact equality is:
+; claim 2->publish 2, 3->3, 4->5, 5->6, 6->4, 7->7, 8->8, 9->10,
+; 10->11, 11->12, 12->14, 13->16, 14->17, 15->19, 16->20, 17->23.
+; Claim field 18 instead equals the claim Idempotency-Key digest defined above.
+; One accepted claim consumes exactly one accepted V4 publish for this tuple
+; and exact package digest.
+key-package-claim-v4 = {
+  1: 4,
+  2: identity-id,
+  3: uuid-v7,                   ; candidate device_id
+  4: uuid-v7,                   ; request_id
+  5: digest,                    ; exact signed Request V4 digest
+  6: uuid-v7,                   ; package_id
+  7: uuid-v7,                   ; catalog_id
+  8: positive-uint,             ; generation
+  9: digest,                    ; exact signed Catalog-head digest
+  10: catalog-exhaustive-count,
+  11: catalog-exhaustive-count, ; exact one-based Catalog index
+  12: digest,                   ; exact Catalog public-leaf digest
+  13: ed25519-public-key,       ; exact public leaf issuer EPK
+  14: digest,                   ; exact public leaf authorization digest A
+  15: positive-uint,            ; exact direct DeviceAdd H+1
+  16: digest,                   ; exact Identity Log head at H+1
+  17: digest,                   ; exact opaque package digest
+  18: digest                    ; claim Idempotency-Key digest
+}
+exact-key-package-claim-v4 = bstr .size (1..527)
+
+; Claim receipt field 4 is the exact original publish envelope and MUST equal
+; decoded exact publish-receipt field 6's field 5 byte-for-byte. Field 5 both
+; equals that inner publish receipt's field 6 and is the publish-envelope-domain
+; digest of exact field 4. Field 6 is the exact original publish receipt and
+; field 7 is its publish-receipt-domain digest. Field 8 is byte-for-byte the
+; exact accepted HTTP claim body and field 9 is its claim-domain digest.
+; Receipt fields 2 and 3 equal, respectively, decoded publish binding fields
+; 4 and 5, decoded publish-receipt fields 2 and 3, and decoded claim fields 6
+; and 4. The exhaustive claim-to-publish equalities above also hold between
+; decoded fields 8 and 4. Exact replay returns these stored byte strings without
+; rewriting or re-reserving the package.
+key-package-claim-receipt-v4 = {
+  1: 4,
+  2: uuid-v7,                   ; package_id
+  3: uuid-v7,                   ; request_id
+  4: exact-key-package-publish-v4,
+  5: digest,                    ; exact publish-envelope digest
+  6: exact-key-package-publish-receipt-v4,
+  7: digest,                    ; exact publish-receipt digest
+  8: exact-key-package-claim-v4,
+  9: digest,                    ; exact claim digest
+  10: utc-millis                ; claimed_at
+}
+; Claim maximum = 19 map/key bytes + 508 value bytes = 527. Claim-receipt
+; maximum = 11 map/key bytes + version 1 + two UUIDs 76 + encoded bstr(67294)
+; 67299 + digest 34 + encoded bstr(67531) 67536 + digest 34 + encoded bstr(527)
+; 530 + digest 34 + timestamp 9 = 135564 bytes.
+exact-key-package-claim-receipt-v4 = bstr .size (1..135564)
+
+; Persistent invariants enforced across the shared KeyPackage store:
+; * package digest is globally unique across retained V2, V3, and V4 records;
+; * consumption is global across retained V2, V3, and V4 records;
+; * exactly one publish and at most one claim exist for the full V4 tuple
+;   (identity, candidate, request and digest, catalog id/generation/head,
+;   count/index/leaf, package id/digest, exact version discriminator);
+; * the same Catalog issuer EPK may legitimately occur in multiple recovery
+;   requests and therefore is neither a uniqueness key nor consumption key;
+; * authentication, authorization, and immutable explicit revocation are
+;   checked first; a committed exact idempotency claim is then resolved before
+;   mutable currentness; first admission performs final currentness and one CAS;
+; * no rejected operation performs a partial reservation or durable write.

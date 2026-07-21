@@ -1,0 +1,1492 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk MLS Recovery Sequencer V7
+  version: 7.0.0
+  description: >-
+    Private scope-origin sequencing for exhaustive V42 recovery: Catalog-owned
+    issuer authorization, V7 MLS add, V2 confirm/activate/readback, one-use
+    child evidence issuance, and immutable scope-and-History-context completion
+    cache. Routing remains fenced until activation, cache, and current
+    authorization all hold.
+x-dirextalk-cddl-artifact: protocol/cddl/mls-sequencer/v7/mls-sequencer-v7.cddl
+x-dirextalk-catalog-type-ownership:
+  owner-artifact: protocol/cddl/recovery-scope-catalog/v2/recovery-scope-catalog-v2.cddl
+  never-redefined-here:
+    - recovery-scope-catalog-completion-verifier-descriptor-v1
+    - recovery-scope-catalog-private-body-v2
+    - recovery-scope-catalog-completion-verifier-binding-v1
+    - recovery-scope-catalog-leaf-commitment-v2
+    - recovery-scope-catalog-opening-v2
+    - recovery-scope-catalog-head-v2
+    - catalog-merkle-proof-v2
+  exact-byte-reference-validation:
+    descriptor: recovery-scope-catalog-completion-verifier-descriptor-v1
+    private-body: recovery-scope-catalog-private-body-v2
+    issuer-authorization-response: recovery-scope-catalog-completion-verifier-binding-unsigned-v1
+    opening: recovery-scope-catalog-opening-v2
+    signed-head: recovery-scope-catalog-head-v2
+    proof: catalog-merkle-proof-v2
+  external-domain-ownership:
+    membership-receipt:
+      owner-artifact: protocol/cddl/recovery-scope-catalog/v2/recovery-scope-catalog-v2.cddl
+      owner-private-body-rule: recovery-scope-catalog-private-body-v2
+      payload-cbor-path: [6]
+      digest-cbor-path: [7]
+      domain: "dirextalk.recovery-scope-membership-receipt.v1\0"
+      digest-input: exact-raw-bstr-payload-bytes-without-enclosing-cbor-header
+      owner-validator-and-currentness: required
+      imported-verbatim-without-mls-rehash: required
+      counted-in-mls-owned-domain-inventory: false
+      bounded-bstr-alone-is-validation: false
+  size-check-alone-is-validation: false
+x-dirextalk-strict-wire:
+  deterministic-canonical-cbor: required
+  closed-maps-and-enums: required
+  duplicate-or-unknown-map-keys: rejected
+  exact-version-discriminator: required
+  v6-v7-conversion-or-decoder-fallback: forbidden
+  strict-ed25519-and-x25519-semantics: required
+  dns-https-authority-origin-only: true
+  exact-header-body-idempotency-digest: required
+  raw-authorization-or-idempotency-values-persisted: false
+  no-partial-durable-writes: true
+  request-content-type: exactly-the-operation-media-type-with-no-parameters
+  request-content-encoding-header: forbidden
+  response-content-encoding-header: forbidden
+  body-trailing-bytes: rejected
+x-dirextalk-http-header-contract:
+  authorization:
+    field-count: exactly-one-on-every-authenticated-operation
+    value-count: exactly-one
+    grammar: 'DTX-Device-Session <uuidv7>.<43-character-base64url-without-padding>'
+    pattern: '^DTX-Device-Session [0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$'
+    duplicate-comma-list-obs-fold-or-surrounding-whitespace: rejected-before-authentication
+    raw-value-persistence-or-response: forbidden
+    role-binding: authenticated-identity-device-and-current-key-must-exactly-match-the-operation-role-and-signed-body
+  idempotency-key:
+    field-count: exactly-one-on-every-mutation
+    value-count: exactly-one
+    length-octets: {minimum: 16, maximum: 128}
+    allowed-octets: 'ASCII VCHAR 0x21..0x7e'
+    duplicate-comma-list-obs-fold-non-ascii-or-any-whitespace: rejected-before-idempotency-lookup
+    normalization-or-re-encoding: forbidden
+    digest-input: exact-post-http-parsing-ascii-octets
+    raw-value-persistence-or-response: forbidden
+x-dirextalk-owner-consumer-ceilings:
+  catalog-v2:
+    owner-artifact: protocol/cddl/recovery-scope-catalog/v2/recovery-scope-catalog-v2.cddl
+    private-body: {owner-raw: 4360, consumer-bstr: 4363, consumed-by: [issuer-authorization-request]}
+    descriptor-signed: {owner-raw: 2226, consumer-bstr: 2229, consumed-by: [issuance-command]}
+    verifier-binding-unsigned-fields-1-through-22: {owner-raw: 2613, response-body: 2613}
+    verifier-binding-signed: {owner-raw: 2680}
+    public-leaf: {owner-raw: 220}
+    opening: {owner-raw: 7264, consumer-bstr: 7267, consumed-by: [recovery-add-v7, issuance-command, completion-cache-v2]}
+    signed-head: {owner-raw: 466, consumer-bstr: 469, consumed-by: [recovery-add-v7]}
+    proof: {owner-raw: 402, consumer-bstr: 405, consumed-by: [recovery-add-v7]}
+  history-v3:
+    owner-artifact: protocol/cddl/history-recovery/v3/history-recovery-v3.cddl
+    manifest: {owner-raw: 35477, consumer-bstr: 35480, consumed-by: [recovery-add-v7]}
+    request: {owner-raw: 37114, consumer-bstr: 37117, consumed-by: [recovery-add-v7]}
+    grant: {owner-raw: 1050699, consumer-bstr: 1050704, consumed-by: [recovery-add-v7]}
+    recipient-offer: {owner-raw: 1049059, consumer-bstr: 1049064, consumed-by: [recovery-add-v7]}
+    delivery-fact: {owner-raw: 366, consumer-bstr: 369, consumed-by: [recovery-add-v7]}
+    completion-command: {owner-raw: 3593836, consumed-by: []}
+    completion-presentation: {owner-raw: 5660, consumer-bstr: 5663, consumed-by: [completion-cache-v2]}
+    mls-child-certificate: {owner-imported-raw: 389}
+    mls-redacted-evidence: {owner-imported-raw: 250}
+  key-package-v4:
+    owner-artifact: protocol/cddl/key-package/v4/key-package-v4.cddl
+    publish-binding: {owner-raw: 1683}
+    publish-envelope: {owner-raw: 67294, consumer-bstr: 67299}
+    publish-receipt: {owner-raw: 67531, consumer-bstr: 67536, consumed-by: [recovery-add-v7]}
+    claim: {owner-raw: 527, consumer-bstr: 530}
+    claim-receipt: {owner-raw: 135564, consumer-bstr: 135569, consumed-by: [recovery-add-v7]}
+x-dirextalk-body-ceilings:
+  catalog-descriptor-response: 2226
+  issuer-authorization-request: 8953
+  issuer-authorization-response-fields-1-through-22: 2613
+  route-v1: 2304
+  controller-proof-v1: 4507
+  recovery-add-v7: 4489149
+  recovery-add-receipt-v7: 613
+  signed-recovery-add-receipt-v7: 791
+  confirmation-v2: 1510
+  confirmation-receipt-v2: 613
+  signed-confirmation-receipt-v2: 791
+  activation-v2: 6023
+  activation-receipt-v2: 725
+  signed-activation-receipt-v2: 903
+  activation-readback-v2: 1556
+  evidence-issuance-v1: 12756
+  child-certificate-v1: 389
+  redacted-evidence-v1: 250
+  evidence-issuance-receipt-v1: 975
+  completion-cache-v2: 17155
+  completion-cache-receipt-v2: 482
+  signed-completion-cache-receipt-v2: 660
+x-dirextalk-defensive-decode-limits:
+  rule: >-
+    HTTP entity-body decoding is capped at the exact operation body ceiling;
+    transport framing buffers are outside the CBOR entity and confer no larger
+    valid-body allowance. Embedded owner objects are additionally capped by the
+    owner raw and enclosing-bstr ceilings above before owner validation.
+  request-body-limits-equal-exact-schema-max-length: true
+  response-body-limits-equal-exact-schema-max-length: true
+  implementation-headroom-is-valid-body-allowance: false
+x-dirextalk-crypto-domains:
+  issuer-authorization-request-signature: "dirextalk.mls-recovery.issuer-authorization-request-signature.v1\0"
+  issuer-authorization-request: "dirextalk.mls-recovery.issuer-authorization-request.v1\0"
+  issuer-authorization-idempotency: "dirextalk.mls-recovery.issuer-authorization-idempotency.v1\0"
+  route-signature: "dirextalk.mls-recovery.route-signature.v1\0"
+  route: "dirextalk.mls-recovery.route.v1\0"
+  controller-proof-signature: "dirextalk.mls-recovery.controller-proof-signature.v1\0"
+  controller-proof: "dirextalk.mls-recovery.controller-proof.v1\0"
+  raw-mls-commit: "dirextalk.mls-recovery.raw-mls-commit.v7\0"
+  raw-mls-welcome: "dirextalk.mls-recovery.raw-mls-welcome.v7\0"
+  add-signature: "dirextalk.mls-recovery.add-signature.v7\0"
+  add: "dirextalk.mls-recovery.add.v7\0"
+  add-idempotency: "dirextalk.mls-recovery.add-idempotency.v7\0"
+  add-receipt: "dirextalk.mls-recovery.add-receipt.v7\0"
+  add-receipt-signature: "dirextalk.mls-recovery.add-receipt-signature.v7\0"
+  confirmation-signature: "dirextalk.mls-recovery.confirmation-signature.v2\0"
+  confirmation: "dirextalk.mls-recovery.confirmation.v2\0"
+  confirmation-idempotency: "dirextalk.mls-recovery.confirmation-idempotency.v2\0"
+  confirmation-receipt: "dirextalk.mls-recovery.confirmation-receipt.v2\0"
+  confirmation-receipt-signature: "dirextalk.mls-recovery.confirmation-receipt-signature.v2\0"
+  activation-signature: "dirextalk.mls-recovery.activation-signature.v2\0"
+  activation: "dirextalk.mls-recovery.activation.v2\0"
+  activation-idempotency: "dirextalk.mls-recovery.activation-idempotency.v2\0"
+  activation-receipt: "dirextalk.mls-recovery.activation-receipt.v2\0"
+  activation-receipt-signature: "dirextalk.mls-recovery.activation-receipt-signature.v2\0"
+  activation-readback-signature: "dirextalk.mls-recovery.activation-readback-signature.v2\0"
+  activation-readback: "dirextalk.mls-recovery.activation-readback.v2\0"
+  child-pop: "dirextalk.mls-recovery.completion-child-pop.v1\0"
+  child-certificate-signature: "dirextalk.mls-recovery.completion-child-certificate-signature.v1\0"
+  child-certificate: "dirextalk.mls-recovery.completion-child-certificate.v1\0"
+  redacted-evidence-signature: "dirextalk.mls-recovery.redacted-evidence-signature.v1\0"
+  redacted-evidence: "dirextalk.mls-recovery.redacted-evidence.v1\0"
+  evidence-issuance-signature: "dirextalk.mls-recovery.evidence-issuance-signature.v1\0"
+  evidence-issuance: "dirextalk.mls-recovery.evidence-issuance.v1\0"
+  evidence-issuance-idempotency: "dirextalk.mls-recovery.evidence-issuance-idempotency.v1\0"
+  evidence-issuance-receipt: "dirextalk.mls-recovery.evidence-issuance-receipt.v1\0"
+  completion-cache-signature: "dirextalk.mls-recovery.completion-cache-signature.v2\0"
+  completion-cache: "dirextalk.mls-recovery.completion-cache.v2\0"
+  completion-cache-idempotency: "dirextalk.mls-recovery.completion-cache-idempotency.v2\0"
+  completion-cache-receipt: "dirextalk.mls-recovery.completion-cache-receipt.v2\0"
+  completion-cache-receipt-signature: "dirextalk.mls-recovery.completion-cache-receipt-signature.v2\0"
+x-dirextalk-domain-inventory:
+  exact-count: 40
+  cddl-and-openapi-exactly-equal: required
+  terminal-nul-on-every-domain: required
+  phase-1-exact-count: 38
+  phase-2a-only-additions: [raw-mls-commit, raw-mls-welcome]
+  membership-receipt-domain-owner: recovery-scope-catalog-v2
+  membership-receipt-domain-counted-as-mls-owned: false
+  history-context-domain-owner: history-recovery-v3
+  history-context-domain-added-to-mls-inventory: false
+  raw-commit-welcome-or-proof-digest-domains-added-in-phase-1: false
+  raw-commit-and-welcome-domains-added-in-phase-2a: true
+  raw-proof-or-membership-receipt-domain-added-in-phase-2a: false
+x-dirextalk-history-completion-context-owner:
+  owner-artifact: protocol/cddl/history-recovery/v3/history-recovery-v3.cddl
+  owner-rule: history-recovery-completion-context-v2
+  formula: 'completion_context_digest = SHA-256("dirextalk.history-recovery-completion-context.v2\0" || exact deterministic-canonical history-recovery-completion-context-v2 bytes)'
+  imported-verbatim: required
+  mls-domain-alias-second-hash-or-re-encoding: forbidden
+  exact-equalities:
+    child-certificate-cbor-path: [9]
+    evidence-cbor-path: [3]
+    issuance-command-cbor-path: [11]
+    issuance-receipt-cbor-path: [9]
+    cache-command-cbor-path: [9]
+    cache-receipt-cbor-path: [7]
+    history-presentation-receipt-cbor-path: [2, 1, 26]
+x-dirextalk-cbor-ceiling-arithmetic:
+  issuer-authorization-request-v1: >-
+    20-map-header-and-key-bytes + 8933-value-bytes = 8953; the private-body
+    owner maximum contributes a 4363-byte enclosing bstr.
+  route-v1: >-
+    11-map-header-and-key-bytes + 2293-value-bytes = 2304.
+  controller-proof-v1: >-
+    14-map-header-and-key-bytes + 4493-value-bytes = 4507; the exact owner
+    membership-receipt payload contributes a 4099-byte enclosing bstr.
+  recovery-add-v7: >-
+    81-map-header-and-key-bytes + 4489068-value-bytes = 4489149; owner bstr
+    encodings are request 37117, manifest 35480, grant 1050704, recipient offer
+    1049064, delivery fact 369, signed head 469, opening 7267, proof 405,
+    publish receipt 67536, and claim receipt 135569 bytes.
+  add-and-confirmation-receipts: >-
+    each raw receipt is 23-map-header-and-key-bytes + 590-value-bytes = 613;
+    each signed wrapper is 6-map-header-and-key-bytes + 613 + 34 + 38 + 34
+    + 66 = 791.
+  confirmation-v2: >-
+    27-map-header-and-key-bytes + 1483-value-bytes = 1510.
+  activation-v2: >-
+    29-map-header-and-key-bytes + 5994-value-bytes = 6023.
+  activation-receipt-v2: >-
+    raw 29-map-header-and-key-bytes + 696-value-bytes = 725; signed wrapper
+    6 + 725 + 34 + 38 + 34 + 66 = 903.
+  activation-readback-v2: >-
+    24-map-header-and-key-bytes + 1532-value-bytes = 1556.
+  evidence-issuance-v1: >-
+    35-map-header-and-key-bytes + 12721-value-bytes = 12756; owner bstr
+    encodings are opening 7267 and descriptor 2229, with activation receipt
+    906 and readback 1559.
+  child-certificate-v1: >-
+    17-map-key-bytes + 1-version + 102-three-public-keys-or-digests
+    + 9-generation + 102-head-context-leaf-digests + 6-count-index
+    + 2-algorithm-purpose + 18-times + 132-signatures = 389
+  redacted-evidence-v1: >-
+    13-map-key-bytes + 2-version-state + 136-four-digests + 9-generation
+    + 6-count-index + 18-times + 66-signature = 250
+  evidence-issuance-receipt-v1: >-
+    15-map-key-bytes + 2-version-state + 38-issuance-uuid + 272-eight-digests
+    + 389-child-certificate + 250-evidence + 9-time = 975
+  completion-cache-v2: >-
+    35-map-header-and-key-bytes + (1-version + 228-six-uuids + 59-identity + 63-scope
+    + 306-nine-digests + 18-generation-and-time + 6-count-index
+    + 7267-opening-bstr + 906-activation-receipt-bstr + 1559-readback-bstr
+    + 978-issuance-receipt-bstr + 5663-history-presentation-bstr
+    + 66-signature = 17120-values) = 17155.
+  completion-cache-receipt-v2: >-
+    raw 17-map-header-and-key-bytes + 465-value-bytes = 482; signed wrapper
+    6 + 482 + 34 + 38 + 34 + 66 = 660.
+x-dirextalk-compact-map-fields:
+  scope:
+    '1': {name: kind, const-private-conversation: 1, const-controlled-public-channel: 2}
+    '2': {name: scope-id, type-when-kind-1: uuid-v7, type-when-kind-2: channel-id, equals: route-scope-id}
+  recovery-scope-catalog-completion-verifier-descriptor-v1:
+    '1': {name: version, const: 1}
+    '2': {name: authority-origin, equals: requested-origin}
+    '3': {name: verifier-key-id, equals: current-origin-verifier-key}
+    '4': {name: verifier-public-key, equals: current-origin-verifier-key}
+    '5': {name: descriptor-epoch, rule: monotonic-and-not-below-observed-floor}
+    '6': {name: issued-at, source: catalog-v2-owner}
+    '7': {name: expires-at, rule: issued-at-less-than-expires-at-and-current-at-fetch}
+    '8': {name: signature, source: field-4-key-signs-exact-owner-fields-1-through-7}
+  recovery-scope-catalog-completion-verifier-binding-unsigned-v1:
+    '1': {name: version, const: 1}
+    '2': {name: recovering-identity, equals: issuer-request-field-3}
+    '3': {name: catalog-id, equals: issuer-request-field-4}
+    '4': {name: generation, equals: issuer-request-field-5}
+    '5': {name: one-based-index, equals: issuer-request-field-6}
+    '6': {name: private-body-digest-p, equals: issuer-request-field-8}
+    '7': {name: authority-origin, equals: current-descriptor-field-2}
+    '8': {name: verifier-key-id, equals: current-descriptor-field-3}
+    '9': {name: verifier-public-key, equals: current-descriptor-field-4}
+    '10': {name: descriptor-epoch, equals: current-descriptor-field-5}
+    '11': {name: descriptor-digest, equals: issuer-request-field-9}
+    '12': {name: binding-issued-at, source: catalog-v2-owner}
+    '13': {name: binding-expires-at, rule: within-signed-catalog-head-window}
+    '14': {name: catalog-authority-device-id, equals: issuer-request-field-10}
+    '15': {name: catalog-authority-key-id, equals: issuer-request-field-11}
+    '16': {name: algorithm, const: ed25519}
+    '17': {name: purpose, const: history-completion-evidence-issuer}
+    '18': {name: persistent-issuer-epk, source: internally-generated-nonexportable-issuer-esk}
+    '19': {name: issuer-not-before, equals: issuer-request-field-14}
+    '20': {name: issuer-expires-at, equals: issuer-request-field-15}
+    '21': {name: issuer-pop, source: field-18-esk-signs-exact-owner-fields-1-through-20}
+    '22': {name: origin-authorization, source: descriptor-field-4-key-signs-exact-owner-fields-1-through-21}
+  mls-recovery-issuer-authorization-request-v1:
+    '1': {name: version, const: 1}
+    '2': {name: scope, equals: route-scope}
+    '3': {name: recovering-identity, equals: catalog-authority-target-identity-and-later-binding-field-2}
+    '4': {name: catalog-id, equals: [route-catalog-id, private-body-field-2]}
+    '5': {name: generation, equals: [route-generation, private-body-field-3]}
+    '6': {name: one-based-index, equals: private-body-field-4}
+    '7': {name: exact-catalog-private-body, source: catalog-v2-owner-rule}
+    '8': {name: private-body-digest-p, source: catalog-private-body-domain-digest-of-field-7}
+    '9': {name: expected-current-descriptor-digest, equals: origin-authenticated-current-descriptor}
+    '10': {name: catalog-authority-device-id, equals: authenticated-current-catalog-authority-device}
+    '11': {name: catalog-authority-key-id, equals: authenticated-current-catalog-authority-key}
+    '12': {name: algorithm, const: ed25519}
+    '13': {name: purpose, const: history-completion-evidence-issuer}
+    '14': {name: issuer-not-before, equals: later-catalog-binding-field-19}
+    '15': {name: issuer-expires-at, equals: later-catalog-binding-field-20}
+    '16': {name: idempotency-key-digest, source: issuer-authorization-idempotency-domain-over-exact-header-octets}
+    '17': {name: exact-owner-membership-receipt, equals: private-body-field-6-byte-for-byte}
+    '18': {name: owner-membership-receipt-digest, equals: private-body-field-7, formula: catalog-membership-receipt-domain-over-exact-field-17-bstr-payload-without-header, mls-rehash: forbidden}
+    '19': {name: catalog-authority-signature, source: authenticated-field-11-key-signs-exact-fields-1-through-18}
+  mls-recovery-route-v1:
+    '1': {name: version, const: 1}
+    '2': {name: authority-origin, equals: exact-request-scope-origin}
+    '3': {name: route-id, equals: durable-private-route}
+    '4': {name: authority-device-id, equals: current-route-authority-device}
+    '5': {name: authority-key-id, equals: current-route-authority-key}
+    '6': {name: authority-mls-epoch, equals: current-route-group-epoch}
+    '7': {name: authority-mls-head, equals: current-route-group-head}
+    '8': {name: issued-at, source: authority}
+    '9': {name: expires-at, rule: issued-at-less-than-expires-at}
+    '10': {name: authority-signature, source: field-5-key-signs-exact-fields-1-through-9}
+  mls-recovery-controller-proof-v1:
+    '1': {name: version, const: 1}
+    '2': {name: scope, equals: [route-scope, current-group-scope]}
+    '3': {name: controller-identity, equals: authenticated-current-controller-identity}
+    '4': {name: controller-device-id, equals: authenticated-current-controller-device}
+    '5': {name: controller-key-id, equals: authenticated-current-controller-key}
+    '6': {name: controller-public-key, equals: authenticated-current-controller-public-key}
+    '7': {name: exact-current-owner-membership-receipt, source: catalog-v2-owner-current-validator}
+    '8': {name: owner-membership-receipt-digest, equals: exact-owner-validator-digest-of-field-7, formula: catalog-membership-receipt-domain-over-exact-field-7-bstr-payload-without-header, mls-rehash: forbidden}
+    '9': {name: authority-mls-epoch, equals: [route-field-6, current-route-group-epoch]}
+    '10': {name: authority-mls-head, equals: [route-field-7, current-route-group-head]}
+    '11': {name: issued-at, equals: owner-validated-window-start}
+    '12': {name: expires-at, equals: owner-validated-window-end}
+    '13': {name: controller-signature, source: field-6-key-signs-exact-fields-1-through-12}
+  mls-recovery-add-request-v7:
+    '1': {name: version, const: 7}
+    '2': {name: submission-id, equals: route-submission-id}
+    '3': {name: scope, equals: route-scope}
+    '4': {name: recovering-identity, equals: all-history-catalog-and-key-package-owner-coordinates}
+    '5': {name: current-controller-identity, equals: authenticated-current-controller}
+    '6': {name: candidate-device-id, equals: all-history-and-key-package-owner-coordinates}
+    '7': {name: candidate-signing-key, equals: exact-current-candidate-key-from-history-request-and-direct-device-add}
+    '8': {name: history-request-id, equals: decoded-field-9-request-id}
+    '9': {name: exact-history-request-v4, source: history-v3-owner-rule}
+    '10': {name: history-request-digest, source: history-owner-domain-digest-of-field-9}
+    '11': {name: exact-history-manifest-v2, source: history-v3-owner-rule}
+    '12': {name: history-manifest-digest, source: history-owner-domain-digest-of-field-11}
+    '13': {name: exact-history-grant-v4, source: history-v3-owner-rule}
+    '14': {name: history-grant-digest, source: history-owner-domain-digest-of-field-13}
+    '15': {name: exact-recipient-offer-v2, source: history-v3-owner-rule}
+    '16': {name: recipient-offer-digest, source: history-owner-domain-digest-of-field-15}
+    '17': {name: exact-delivery-fact-v2, source: history-v3-owner-rule}
+    '18': {name: delivery-fact-digest, source: history-owner-domain-digest-of-field-17}
+    '19': {name: catalog-id, equals: all-catalog-history-and-key-package-owner-coordinates}
+    '20': {name: generation, equals: all-catalog-history-and-key-package-owner-coordinates}
+    '21': {name: exact-signed-catalog-head-v2, source: catalog-v2-owner-rule}
+    '22': {name: signed-catalog-head-digest, source: catalog-owner-domain-digest-of-field-21}
+    '23': {name: catalog-count, equals: [signed-head-count, manifest-count]}
+    '24': {name: one-based-index, equals: opening-and-proof-index}
+    '25': {name: exact-catalog-opening-v2, source: catalog-v2-owner-rule}
+    '26': {name: catalog-opening-digest, source: catalog-owner-domain-digest-of-field-25}
+    '27': {name: exact-catalog-proof-v2, source: catalog-v2-owner-rule}
+    '28': {name: catalog-public-leaf-digest, equals: opening-public-leaf-and-proof-leaf}
+    '29': {name: exact-key-package-publish-receipt-v4, source: key-package-v4-owner-rule}
+    '30': {name: publish-receipt-digest, source: key-package-owner-domain-digest-of-field-29}
+    '31': {name: exact-key-package-claim-receipt-v4, source: key-package-v4-owner-rule}
+    '32': {name: claim-receipt-digest, source: key-package-owner-domain-digest-of-field-31}
+    '33': {name: identity-log-h, equals: exact-history-and-catalog-pre-enrollment-highwater}
+    '34': {name: identity-log-head-at-h, equals: exact-history-and-catalog-head-at-h}
+    '35': {name: identity-log-h-plus-1, rule: exactly-field-33-plus-one}
+    '36': {name: final-identity-log-head-at-h-plus-1, equals: exact-direct-device-add-final-head}
+    '37': {name: prior-authority-mls-epoch, equals: [route-field-6, current-cas-epoch]}
+    '38': {name: committed-authority-mls-epoch, rule: exactly-field-37-plus-one}
+    '39': {name: prior-authority-mls-head, equals: [route-field-7, current-cas-head]}
+    '40': {name: exact-raw-mls-commit, validation: [one-wholly-consumed-canonical-mls-wire-commit, parser-remainder-rejected, reencoding-rejected, welcome-or-other-type-substitution-rejected]}
+    '41': {name: raw-mls-commit-digest, source: raw-mls-commit-domain-over-exact-field-40-bstr-payload, digest-input-excludes: enclosing-cbor-bstr-header}
+    '42': {name: exact-raw-mls-welcome, validation: [one-wholly-consumed-canonical-mls-wire-welcome, parser-remainder-rejected, reencoding-rejected, commit-or-other-type-substitution-rejected]}
+    '43': {name: raw-mls-welcome-digest, source: raw-mls-welcome-domain-over-exact-field-42-bstr-payload, digest-input-excludes: enclosing-cbor-bstr-header}
+    '44': {name: private-route, source: route-v1}
+    '45': {name: route-digest, source: route-domain-digest-of-exact-field-44}
+    '46': {name: current-controller-proof, source: controller-proof-v1}
+    '47': {name: controller-proof-digest, source: controller-proof-domain-digest-of-exact-field-46}
+    '48': {name: issued-at, source: candidate}
+    '49': {name: expires-at, rule: issued-at-less-than-expires-at-within-all-owner-windows}
+    '50': {name: idempotency-key-digest, source: add-idempotency-domain-over-exact-header-octets}
+    '51': {name: candidate-signature, source: field-7-key-signs-exact-fields-1-through-50}
+  mls-recovery-add-receipt-v7:
+    '1': {name: version, const: 7}
+    '2': {name: submission-id, equals: add-field-2}
+    '3': {name: scope, equals: add-field-3}
+    '4': {name: recovering-identity, equals: add-field-4}
+    '5': {name: candidate-device-id, equals: add-field-6}
+    '6': {name: history-request-id, equals: add-field-8}
+    '7': {name: history-request-digest, equals: add-field-10}
+    '8': {name: catalog-id, equals: add-field-19}
+    '9': {name: generation, equals: add-field-20}
+    '10': {name: signed-catalog-head-digest, equals: add-field-22}
+    '11': {name: catalog-count, equals: add-field-23}
+    '12': {name: one-based-index, equals: add-field-24}
+    '13': {name: catalog-public-leaf-digest, equals: add-field-28}
+    '14': {name: final-identity-log-h-plus-1, equals: add-field-35}
+    '15': {name: final-identity-log-head, equals: add-field-36}
+    '16': {name: committed-authority-mls-epoch, equals: add-field-38}
+    '17': {name: committed-authority-mls-head, equals: commit-result}
+    '18': {name: raw-mls-commit-digest, equals: add-field-41}
+    '19': {name: raw-mls-welcome-digest, equals: add-field-43}
+    '20': {name: add-command-digest, source: add-domain-digest-of-exact-request}
+    '21': {name: state, const: welcome-pending}
+    '22': {name: accepted-at, source: first-durable-add-cas}
+  signed-mls-recovery-add-receipt-v7:
+    '1': {name: receipt, source: recovery-add-receipt-v7}
+    '2': {name: receipt-digest, source: add-receipt-domain-digest-of-exact-field-1}
+    '3': {name: authority-signing-key-id, equals: durable-authority-signer}
+    '4': {name: authority-signing-public-key, equals: durable-authority-signer}
+    '5': {name: authority-signature, source: field-4-key-signs-exact-fields-1-through-4}
+  mls-recovery-confirmation-v2:
+    '1': {name: version, const: 2}
+    '2': {name: submission-id, equals: route-and-add-receipt}
+    '3': {name: scope, equals: route-and-add-receipt}
+    '4': {name: recovering-identity, equals: add-receipt}
+    '5': {name: candidate-device-id, equals: authenticated-candidate-device}
+    '6': {name: history-request-id, equals: add-receipt}
+    '7': {name: history-request-digest, equals: add-receipt}
+    '8': {name: catalog-id, equals: add-receipt}
+    '9': {name: generation, equals: add-receipt}
+    '10': {name: signed-catalog-head-digest, equals: add-receipt}
+    '11': {name: catalog-count, equals: add-receipt}
+    '12': {name: one-based-index, equals: add-receipt}
+    '13': {name: catalog-public-leaf-digest, equals: add-receipt}
+    '14': {name: final-identity-log-h-plus-1, equals: add-receipt-field-14}
+    '15': {name: final-identity-log-head, equals: add-receipt-field-15}
+    '16': {name: committed-authority-mls-epoch, equals: add-receipt-field-16}
+    '17': {name: committed-authority-mls-head, equals: add-receipt-field-17}
+    '18': {name: raw-mls-commit-digest, equals: add-receipt-field-18}
+    '19': {name: raw-mls-welcome-digest, equals: add-receipt-field-19}
+    '20': {name: exact-signed-add-receipt, equals: durable-byte-identical-add-receipt}
+    '21': {name: signed-add-receipt-digest, source: add-receipt-signature-domain-digest-of-field-20}
+    '22': {name: confirmed-at, source: candidate}
+    '23': {name: idempotency-key-digest, source: confirmation-idempotency-domain-over-exact-header-octets}
+    '24': {name: candidate-signature, source: authenticated-candidate-key-signs-exact-fields-1-through-23}
+  mls-recovery-confirmation-receipt-v2:
+    '1': {name: version, const: 2}
+    '2': {name: submission-id, equals: confirmation-field-2}
+    '3': {name: scope, equals: confirmation-field-3}
+    '4': {name: recovering-identity, equals: confirmation-field-4}
+    '5': {name: candidate-device-id, equals: confirmation-field-5}
+    '6': {name: history-request-id, equals: confirmation-field-6}
+    '7': {name: history-request-digest, equals: confirmation-field-7}
+    '8': {name: catalog-id, equals: confirmation-field-8}
+    '9': {name: generation, equals: confirmation-field-9}
+    '10': {name: signed-catalog-head-digest, equals: confirmation-field-10}
+    '11': {name: catalog-count, equals: confirmation-field-11}
+    '12': {name: one-based-index, equals: confirmation-field-12}
+    '13': {name: catalog-public-leaf-digest, equals: confirmation-field-13}
+    '14': {name: final-identity-log-h-plus-1, equals: confirmation-field-14}
+    '15': {name: final-identity-log-head, equals: confirmation-field-15}
+    '16': {name: committed-authority-mls-epoch, equals: confirmation-field-16}
+    '17': {name: committed-authority-mls-head, equals: confirmation-field-17}
+    '18': {name: raw-mls-commit-digest, equals: confirmation-field-18}
+    '19': {name: raw-mls-welcome-digest, equals: confirmation-field-19}
+    '20': {name: confirmation-command-digest, source: confirmation-domain-digest-of-exact-command}
+    '21': {name: state, const: candidate-confirmed}
+    '22': {name: accepted-at, source: first-durable-confirmation-cas}
+  signed-mls-recovery-confirmation-receipt-v2:
+    '1': {name: receipt, source: confirmation-receipt-v2}
+    '2': {name: receipt-digest, source: confirmation-receipt-domain-digest-of-exact-field-1}
+    '3': {name: authority-signing-key-id, equals: durable-authority-signer}
+    '4': {name: authority-signing-public-key, equals: durable-authority-signer}
+    '5': {name: authority-signature, source: field-4-key-signs-exact-fields-1-through-4}
+  mls-recovery-activation-command-v2:
+    '1': {name: version, const: 2}
+    '2': {name: activation-id, equals: route-activation-id}
+    '3': {name: submission-id, equals: confirmation-receipt}
+    '4': {name: scope, equals: route-and-confirmation-receipt}
+    '5': {name: recovering-identity, equals: confirmation-receipt}
+    '6': {name: candidate-device-id, equals: confirmation-receipt}
+    '7': {name: history-request-id, equals: confirmation-receipt}
+    '8': {name: history-request-digest, equals: confirmation-receipt}
+    '9': {name: catalog-id, equals: confirmation-receipt}
+    '10': {name: generation, equals: confirmation-receipt}
+    '11': {name: signed-catalog-head-digest, equals: confirmation-receipt}
+    '12': {name: catalog-count, equals: confirmation-receipt}
+    '13': {name: one-based-index, equals: confirmation-receipt}
+    '14': {name: catalog-public-leaf-digest, equals: confirmation-receipt}
+    '15': {name: final-identity-log-h-plus-1, equals: confirmation-receipt}
+    '16': {name: final-identity-log-head, equals: confirmation-receipt}
+    '17': {name: committed-authority-mls-epoch, equals: confirmation-receipt}
+    '18': {name: committed-authority-mls-head, equals: confirmation-receipt}
+    '19': {name: exact-signed-confirmation-receipt, equals: durable-byte-identical-confirmation-receipt}
+    '20': {name: confirmation-receipt-digest, source: confirmation-receipt-signature-domain-digest-of-field-19}
+    '21': {name: current-controller-proof, source: controller-proof-v1}
+    '22': {name: controller-proof-digest, source: controller-proof-domain-digest-of-field-21}
+    '23': {name: activated-at, source: current-controller}
+    '24': {name: idempotency-key-digest, source: activation-idempotency-domain-over-exact-header-octets}
+    '25': {name: controller-signature, source: proof-field-6-key-signs-exact-fields-1-through-24}
+  mls-recovery-activation-receipt-v2:
+    '1': {name: version, const: 2}
+    '2': {name: activation-id, equals: activation-command-field-2}
+    '3': {name: submission-id, equals: activation-command-field-3}
+    '4': {name: scope, equals: activation-command-field-4}
+    '5': {name: recovering-identity, equals: activation-command-field-5}
+    '6': {name: candidate-device-id, equals: activation-command-field-6}
+    '7': {name: history-request-id, equals: activation-command-field-7}
+    '8': {name: history-request-digest, equals: activation-command-field-8}
+    '9': {name: catalog-id, equals: activation-command-field-9}
+    '10': {name: generation, equals: activation-command-field-10}
+    '11': {name: signed-catalog-head-digest, equals: activation-command-field-11}
+    '12': {name: catalog-count, equals: activation-command-field-12}
+    '13': {name: one-based-index, equals: activation-command-field-13}
+    '14': {name: catalog-public-leaf-digest, equals: activation-command-field-14}
+    '15': {name: final-identity-log-h-plus-1, equals: activation-command-field-15}
+    '16': {name: final-identity-log-head, equals: activation-command-field-16}
+    '17': {name: final-authority-mls-epoch, equals: activation-command-field-17}
+    '18': {name: final-authority-mls-head, equals: activation-command-field-18}
+    '19': {name: raw-mls-commit-digest, equals: embedded-confirmation-receipt-field-18}
+    '20': {name: raw-mls-welcome-digest, equals: embedded-confirmation-receipt-field-19}
+    '21': {name: activation-command-digest, source: activation-domain-digest-of-exact-command}
+    '22': {name: signed-confirmation-receipt-digest, equals: activation-command-field-20}
+    '23': {name: controller-proof-digest, equals: activation-command-field-22}
+    '24': {name: state, const: activated-fenced}
+    '25': {name: accepted-at, source: first-durable-activation-cas}
+  signed-mls-recovery-activation-receipt-v2:
+    '1': {name: receipt, source: activation-receipt-v2}
+    '2': {name: receipt-digest, source: activation-receipt-domain-digest-of-exact-field-1}
+    '3': {name: authority-signing-key-id, equals: durable-authority-signer}
+    '4': {name: authority-signing-public-key, equals: durable-authority-signer}
+    '5': {name: authority-signature, source: field-4-key-signs-exact-fields-1-through-4}
+  mls-recovery-activation-readback-v2:
+    '1': {name: version, const: 2}
+    '2': {name: scope, equals: route-scope}
+    '3': {name: activation-id, equals: route-and-receipt}
+    '4': {name: submission-id, equals: receipt}
+    '5': {name: recovering-identity, equals: authenticated-candidate-identity-and-receipt}
+    '6': {name: candidate-device-id, equals: authenticated-candidate-device-and-receipt}
+    '7': {name: history-request-id, equals: receipt}
+    '8': {name: history-request-digest, equals: receipt}
+    '9': {name: catalog-id, equals: receipt}
+    '10': {name: generation, equals: receipt}
+    '11': {name: signed-catalog-head-digest, equals: receipt}
+    '12': {name: catalog-count, equals: receipt}
+    '13': {name: one-based-index, equals: receipt}
+    '14': {name: catalog-public-leaf-digest, equals: receipt}
+    '15': {name: final-identity-log-h-plus-1, equals: receipt}
+    '16': {name: final-identity-log-head, equals: receipt}
+    '17': {name: final-authority-mls-epoch, equals: receipt}
+    '18': {name: final-authority-mls-head, equals: receipt}
+    '19': {name: state, const: activated-fenced}
+    '20': {name: exact-signed-activation-receipt, equals: durable-byte-identical-receipt}
+    '21': {name: activation-receipt-digest, source: activation-receipt-signature-domain-digest-of-field-20}
+    '22': {name: read-at, source: candidate-authenticated-current-read}
+    '23': {name: authority-signature, source: authority-key-signs-exact-fields-1-through-22}
+  mls-recovery-completion-child-certificate-v1:
+    '1': {name: version, const: 1}
+    '2': {name: catalog-issuer-epk, source: exact-opening-public-leaf-issuer-epk}
+    '3': {name: catalog-authorization-digest-a, source: exact-opening-public-leaf-authorization-digest-a}
+    '4': {name: generation, equals: issuance-command-field-13}
+    '5': {name: signed-catalog-head-digest, equals: issuance-command-field-14}
+    '6': {name: catalog-count, equals: issuance-command-field-15}
+    '7': {name: one-based-index, equals: issuance-command-field-16}
+    '8': {name: catalog-public-leaf-digest, source: exact-opening-public-leaf-digest}
+    '9': {name: history-completion-context-digest, equals: issuance-command-field-11}
+    '10': {name: algorithm, const: ed25519}
+    '11': {name: purpose, const: single-completion-evidence-only}
+    '12': {name: fresh-child-epk, source: internally-generated-one-use-child}
+    '13': {name: evidence-issued-at, equals: [issuance-command-field-25, evidence-field-10]}
+    '14': {name: evidence-expires-at, equals: [issuance-command-field-26, evidence-field-11]}
+    '15': {name: child-pop, source: child-field-12-key-signs-exact-fields-1-through-14}
+    '16': {name: issuer-signature, source: persistent-issuer-signs-exact-fields-1-through-15}
+  mls-recovery-redacted-completion-evidence-v1:
+    '1': {name: version, const: 1}
+    '2': {name: child-certificate-digest, source: child-certificate-domain-digest-of-exact-certificate}
+    '3': {name: history-completion-context-digest, equals: [child-certificate-field-9, issuance-command-field-11]}
+    '4': {name: generation, equals: [child-certificate-field-4, issuance-command-field-13]}
+    '5': {name: signed-catalog-head-digest, equals: [child-certificate-field-5, issuance-command-field-14]}
+    '6': {name: catalog-count, equals: [child-certificate-field-6, issuance-command-field-15]}
+    '7': {name: one-based-index, equals: [child-certificate-field-7, issuance-command-field-16]}
+    '8': {name: catalog-public-leaf-digest, equals: child-certificate-field-8}
+    '9': {name: state, const: activated-fenced}
+    '10': {name: evidence-issued-at, equals: [child-certificate-field-13, issuance-command-field-25]}
+    '11': {name: evidence-expires-at, equals: [child-certificate-field-14, issuance-command-field-26]}
+    '12': {name: child-signature, source: child-certificate-field-12-key-signs-exact-fields-1-through-11}
+  mls-recovery-evidence-issuance-command-v1:
+    '1': {name: version, const: 1}
+    '2': {name: issuance-id, equals: route-issuance-id}
+    '3': {name: activation-id, equals: activation-receipt-and-readback}
+    '4': {name: submission-id, equals: activation-receipt-and-readback}
+    '5': {name: scope, equals: route-scope}
+    '6': {name: recovering-identity, equals: activation-receipt-and-readback}
+    '7': {name: candidate-device-id, equals: activation-receipt-and-readback}
+    '8': {name: request-id, equals: activation-receipt-and-readback}
+    '9': {name: exact-signed-request-digest, equals: activation-receipt-and-readback}
+    '10': {name: history-completion-id, source: exact-history-context}
+    '11': {name: history-completion-context-digest, source: mandatory-history-owner-formula}
+    '12': {name: catalog-id, equals: [opening, activation-receipt, activation-readback]}
+    '13': {name: generation, equals: [opening, activation-receipt, activation-readback]}
+    '14': {name: signed-catalog-head-digest, equals: [opening, activation-receipt, activation-readback]}
+    '15': {name: catalog-count, equals: [opening, activation-receipt, activation-readback]}
+    '16': {name: one-based-index, equals: [opening, activation-receipt, activation-readback]}
+    '17': {name: exact-catalog-opening, source: catalog-owner-rule}
+    '18': {name: exact-opening-digest, source: catalog-owner-domain-digest-of-field-17}
+    '19': {name: exact-current-descriptor, source: origin-authenticated-current-fetch}
+    '20': {name: exact-current-descriptor-digest, source: catalog-owner-domain-digest-of-field-19}
+    '21': {name: exact-activation-receipt, source: durable-activation}
+    '22': {name: exact-activation-receipt-digest, source: activation-receipt-domain-digest-of-field-21}
+    '23': {name: exact-current-activation-readback, source: pre-issuance-current-read}
+    '24': {name: exact-activation-readback-digest, source: activation-readback-domain-digest-of-field-23}
+    '25': {name: evidence-issued-at, equals: [child-certificate-field-13, evidence-field-10]}
+    '26': {name: evidence-expires-at, equals: [child-certificate-field-14, evidence-field-11]}
+    '27': {name: issuance-idempotency-digest, source: exact-header-domain-digest}
+    '28': {name: controller-signature, source: current-controller-signs-exact-fields-1-through-27}
+  mls-recovery-evidence-issuance-receipt-v1:
+    '1': {name: version, const: 1}
+    '2': {name: issuance-id, equals: issuance-command-field-2}
+    '3': {name: issuance-command-digest, source: issuance-domain-digest-of-exact-command}
+    '4': {name: exact-child-certificate, source: atomically-generated-and-persisted}
+    '5': {name: child-certificate-digest, source: child-certificate-domain-digest-of-field-4}
+    '6': {name: exact-redacted-evidence, source: atomically-generated-and-persisted}
+    '7': {name: evidence-digest, source: redacted-evidence-domain-digest-of-field-6}
+    '8': {name: full-signed-issuer-binding-digest-b, source: exact-opening}
+    '9': {name: history-completion-context-digest, equals: [issuance-command-field-11, child-certificate-field-9, evidence-field-3]}
+    '10': {name: historical-descriptor-digest, equals: issuance-command-field-20}
+    '11': {name: issuance-time-activation-receipt-digest, equals: issuance-command-field-22}
+    '12': {name: issuance-time-readback-snapshot-digest, equals: issuance-command-field-24}
+    '13': {name: accepted-at, source: first-durable-issuance-commit-stored-once}
+    '14': {name: state, const: activated-fenced}
+  mls-recovery-completion-cache-command-v2:
+    '1': {name: version, const: 2}
+    '2': {name: cache-id, source: caller-stable-coordinate}
+    '3': {name: scope, equals: route-scope}
+    '4': {name: submission-id, equals: stored-issuance-snapshot}
+    '5': {name: activation-id, equals: route-and-stored-issuance-snapshot}
+    '6': {name: recovering-identity, equals: stored-issuance-snapshot}
+    '7': {name: candidate-device-id, equals: stored-issuance-snapshot}
+    '8': {name: request-id, equals: stored-issuance-snapshot}
+    '9': {name: history-completion-context-digest, equals: [issuance-receipt-field-9, history-presentation-receipt-field-26]}
+    '10': {name: catalog-id, equals: stored-issuance-snapshot}
+    '11': {name: generation, equals: stored-issuance-snapshot}
+    '12': {name: signed-catalog-head-digest, equals: stored-issuance-snapshot}
+    '13': {name: catalog-count, equals: stored-issuance-snapshot}
+    '14': {name: one-based-index, equals: stored-issuance-snapshot}
+    '15': {name: catalog-public-leaf-digest, equals: stored-issuance-snapshot}
+    '16': {name: exact-catalog-opening, equals: stored-issuance-opening}
+    '17': {name: exact-opening-digest, source: catalog-owner-domain-digest-of-field-16}
+    '18': {name: exact-issuance-time-activation-receipt-snapshot, equals: private-stored-issuance-snapshot}
+    '19': {name: activation-receipt-snapshot-digest, equals: issuance-receipt-field-11}
+    '20': {name: exact-issuance-time-activation-readback-snapshot, equals: private-stored-issuance-snapshot}
+    '21': {name: activation-readback-snapshot-digest, equals: issuance-receipt-field-12}
+    '22': {name: exact-issuance-receipt, source: stored-issuance}
+    '23': {name: issuance-receipt-digest, source: evidence-issuance-receipt-domain-digest-of-field-22}
+    '24': {name: exact-history-completion-presentation, source: history-owner-rule}
+    '25': {name: history-presentation-digest, source: history-presentation-domain-digest-of-field-24}
+    '26': {name: cache-requested-at, source: signed-command}
+    '27': {name: cache-idempotency-digest, source: exact-header-domain-digest}
+    '28': {name: controller-signature, source: current-controller-signs-exact-fields-1-through-27}
+  mls-recovery-completion-cache-receipt-v2:
+    '1': {name: version, const: 2}
+    '2': {name: cache-id, equals: cache-command-field-2}
+    '3': {name: scope, equals: cache-command-field-3}
+    '4': {name: submission-id, equals: cache-command-field-4}
+    '5': {name: activation-id, equals: cache-command-field-5}
+    '6': {name: identity-completion-id, source: exact-history-presentation}
+    '7': {name: history-completion-context-digest, equals: [cache-command-field-9, issuance-receipt-field-9, history-presentation-receipt-field-26]}
+    '8': {name: catalog-public-leaf-digest, equals: cache-command-field-15}
+    '9': {name: signed-history-completion-receipt-digest, source: exact-history-presentation}
+    '10': {name: own-completion-entry-digest, source: exact-history-presentation}
+    '11': {name: completion-entry-proof-digest, source: exact-history-presentation}
+    '12': {name: issuance-time-activation-receipt-digest, equals: cache-command-field-19}
+    '13': {name: issuance-time-readback-snapshot-digest, equals: cache-command-field-21}
+    '14': {name: state, const: activated-fenced}
+    '15': {name: completion-cached, const: true}
+    '16': {name: cached-at, source: final-cache-cas-stored-once}
+  signed-mls-recovery-completion-cache-receipt-v2:
+    '1': {name: receipt, source: completion-cache-receipt-v2}
+    '2': {name: receipt-digest, source: completion-cache-receipt-domain-digest-of-exact-field-1}
+    '3': {name: authority-signing-key-id, equals: durable-authority-signer}
+    '4': {name: authority-signing-public-key, equals: durable-authority-signer}
+    '5': {name: authority-signature, source: field-4-key-signs-exact-fields-1-through-4}
+x-dirextalk-descriptor-fetch:
+  response-cddl-owner-rule: recovery-scope-catalog-completion-verifier-descriptor-v1
+  response-domain-owner: "dirextalk.recovery-scope-catalog-completion-verifier-descriptor.v1\0"
+  signature-domain-owner: "dirextalk.recovery-scope-catalog-completion-verifier-descriptor-signature.v1\0"
+  requested-origin-equals-descriptor-field-2: exact
+  tls-server-identity-and-chain-validation: required
+  redirects: forbidden
+  ip-literal-userinfo-path-query-fragment-or-trailing-dot: forbidden
+  cache-control: no-store
+  epoch-rollback-or-rollback-below-observed-floor: rejected
+  current-descriptor-signature-and-validity: required
+x-dirextalk-issuer-authorization:
+  timing: before-catalog-publication
+  full-tuple:
+    - exact-scope-and-identity
+    - catalog-id-generation-index
+    - exact-private-body-and-digest-p
+    - exact-current-descriptor-digest
+    - catalog-authority-device-and-key
+    - algorithm-purpose-and-window
+    - exact-membership-proof-and-digest
+  response: exact-catalog-binding-fields-1-through-22
+  caller-supplied-issuer-epk-pop-esk-key-handle-or-response: forbidden
+  first-admission:
+    generate: globally-unique-per-catalog-leaf-ed25519-issuer-keypair
+    private-key: persistent-nonexportable-scope-origin-only
+    retain-through: signed-catalog-validity-or-explicit-revocation
+  exact-tuple-retry: byte-identical-response
+  changed-tuple-or-idempotency: conflict-no-write
+x-dirextalk-add-validation:
+  all-before-any-write: true
+  validates:
+    - exact-ready-history-request-manifest-grant-offer-and-immutable-delivery-fact
+    - direct-device-add-and-final-identity-log-h-plus-1
+    - exact-catalog-head-full-private-opening-public-leaf-and-proof
+    - current-origin-descriptor-and-full-issuer-binding
+    - exact-key-package-v4-publish-and-claim-receipts-and-global-consumption
+    - mls-commit-welcome-route-and-current-controller-proof
+    - every-repeated-coordinate-digest-signature-and-validity-window
+    - candidate-request-device-catalog-authority-controller-and-mls-currentness
+  final-atomic-cas:
+    from: exact-prior-authority-mls-epoch-and-head
+    to: exact-next-epoch-and-committed-authority-mls-head
+  first-state: welcome_pending
+x-dirextalk-state-machine:
+  states:
+    welcome_pending: 1
+    candidate_confirmed: 2
+    activated_fenced: 3
+  transitions:
+    - welcome_pending-to-candidate_confirmed-by-exact-candidate-confirmation
+    - candidate_confirmed-to-activated_fenced-by-current-controller-and-final-head-cas
+  skip-or-regress: forbidden
+  activation-enables-routing: false
+  identity-recovery-complete-enables-routing: false
+  final-heads:
+    identity: exact-identity-log-head-at-direct-device-add-h-plus-1
+    authority-mls: exact-scope-authority-mls-head-after-recovery-commit
+    interchangeable: false
+x-dirextalk-child-evidence:
+  endpoint-after-state: activated_fenced
+  route-key: [scope, issuance-id]
+  sole-evidence-key:
+    - exact-full-signed-issuer-binding-digest-b
+    - history-completion-context-digest
+  caller-supplied-child-epk-pop-esk-certificate-or-evidence: forbidden
+  mandatory-history-context:
+    owner: history-recovery-v3
+    formula: exact-owner-formula-above
+    mls-rehash-or-re-encoding: forbidden
+  generation:
+    child-keypair: globally-fresh-internally-generated-ed25519
+    child-pop: signs-exact-certificate-fields-1-through-14
+    issuer-signature: persistent-catalog-issuer-signs-fields-1-through-15
+    child-signature: signs-exactly-one-redacted-evidence-fields-1-through-11
+    total-child-signatures:
+      - one-certificate-pop
+      - one-evidence-signature
+    child-esk-any-third-overall-signature: forbidden
+    child-esk-second-evidence-signature: forbidden
+    child-esk-descendant-certificate: forbidden
+    delegation-depth: exactly-one
+    child-private-key-after-atomic-commit: destroyed
+    child-private-key-reuse-export-persist-or-log: forbidden
+  validity:
+    authorization-nbf-less-than-or-equal-issued-at: required
+    issued-at-less-than-expires-at: required
+    expires-at-less-than-or-equal-authorization-exp: required
+    window-contained-by: [exact-request, exact-signed-catalog-head, exact-grant]
+    every-command-certificate-evidence-coordinate-and-time: exact
+  final-atomic-cas:
+    rechecks:
+      - exact-current-origin-descriptor
+      - exact-activation-receipt-and-current-readback
+      - exact-authority-mls-anchor
+      - authorization-revisions
+      - explicit-revocation-revisions
+    child-generated-after-rechecks: true
+    persists-atomically:
+      - exact-issuance-receipt-bytes-containing-child-certificate-and-redacted-evidence
+      - private-exact-issuance-command-bytes-and-digest-including-catalog-opening
+      - private-exact-descriptor-bytes-and-digest
+      - private-exact-activation-receipt-snapshot-bytes-and-digest
+      - private-exact-activation-readback-snapshot-bytes-and-digest
+      - private-authority-mls-anchor
+      - private-authorization-and-revocation-revisions
+    losing-race: destroy-child-and-write-nothing
+  after-commit-nonretroactive:
+    - routine-descriptor-rotation
+    - ordinary-descendant-authority-mls-head-advance
+  after-commit-still-fenced-by:
+    - explicit-issuer-revocation
+    - explicit-catalog-request-candidate-device-member-or-activation-revocation
+  exact-route-body-idempotency-replay: byte-identical-stored-receipt
+  changed-route-body-idempotency-or-sole-evidence-key: conflict-no-write
+x-dirextalk-redacted-evidence-privacy:
+  contains:
+    - child-certificate-digest
+    - history-completion-context-digest
+    - generation-signed-catalog-head-count-index-and-public-leaf-digest
+    - activated-fenced-state-issued-at-expires-at-and-child-signature
+  forbidden:
+    - scope-or-scope-origin
+    - raw-identity-candidate-controller-completion-request-or-catalog-id
+    - deterministic-digest-of-any-raw-identity-candidate-controller-completion-request-or-catalog-id
+    - signed-request-digest
+    - activation-receipt-or-readback-correlation
+    - membership-receipt
+    - descriptor-or-verifier-key-id-epoch
+    - private-opening-or-full-verifier-binding
+    - route-or-authority-key-id
+    - issuer-or-child-private-key-handle
+x-dirextalk-completion-cache:
+  semantic-key: [scope, history-completion-context-digest]
+  cache-id-is-semantic-key: false
+  consumes:
+    - exact-history-completion-presentation-with-signed-receipt-own-entry-and-proof
+    - exact-stored-child-issuance-receipt
+    - exact-private-catalog-opening-from-stored-issuance-command
+    - exact-private-stored-issuance-descriptor-bytes-and-digest
+    - exact-private-stored-issuance-activation-receipt-snapshot-bytes-and-digest
+    - exact-private-stored-issuance-readback-snapshot-bytes-and-digest
+  validates:
+    - history-completion-key-descriptor-signature-historical-chain-and-origin
+    - history-signed-receipt-own-entry-proof-count-index-and-public-leaf-equality
+    - private-opening-and-persistent-issuer-delegation
+    - child-certificate-pop-issuer-signature-and-single-evidence-signature
+    - stored-historical-descriptor-signature-digest-and-validity-at-issuance
+    - exact-issuance-time-activation-receipt-and-readback-snapshots-at-activated-fenced
+    - history-first-admission-accepted-at-path-2-1-30-less-than-evidence-expires-at
+  current-descriptor-fetch: forbidden
+  evidence-expiry-after-timely-signed-history-admission: allowed
+  final-atomic-cas-rechecks:
+    - exact-history-completion-presentation
+    - current-identity-device-member-and-controller-authorization
+    - explicit-revocation-generations
+    - stored-activation-anchor-remains-in-current-local-mls-lineage
+  routine-post-issuance-descriptor-rotation-is-412: false
+  ordinary-descendant-authority-mls-head-is-412: false
+  exact-semantic-key-body-idempotency-replay: byte-identical-stored-receipt
+  changed-body-idempotency-cache-id-or-activation-under-semantic-key: conflict-no-write
+  immutable-exact-cache: true
+  generic-recovery-complete-boolean-accepted: false
+x-dirextalk-issuance-and-cache-errors:
+  pre-issuance-410:
+    - explicit-issuer-catalog-request-candidate-device-member-or-activation-revocation
+    - workflow-or-authority-window-expired
+  pre-issuance-412:
+    - descriptor-activation-readback-or-authority-anchor-changed-before-final-cas
+    - authorization-or-revocation-revision-changed-before-final-cas
+  post-issuance-cache-410:
+    - explicit-issuer-catalog-request-candidate-device-member-or-activation-revocation
+  post-issuance-cache-410-excludes: evidence-expiry-alone
+  post-issuance-cache-412:
+    - stored-issuance-snapshot-mismatch
+    - invalid-or-changed-history-presentation-during-first-admission
+    - history-first-admission-not-before-evidence-expiry
+    - current-authorization-or-revocation-race
+    - stored-activation-anchor-not-in-current-local-mls-lineage
+  committed-semantic-key-with-changed-command-including-presentation: 409
+  post-issuance-cache-412-excludes:
+    - routine-descriptor-rotation
+    - ordinary-descendant-authority-mls-head-advance
+x-dirextalk-routing-predicate:
+  all-required:
+    - durable-state-equals-activated-fenced
+    - exact-immutable-scope-and-history-context-cache-exists
+    - current-identity-device-member-and-controller-authorization
+    - local-activation-anchor-remains-valid-in-current-local-mls-lineage
+    - no-explicit-issuer-catalog-request-candidate-device-member-or-activation-revocation
+  recovery-complete-without-cache: deny
+  cache-without-current-authorization: deny
+  current-descriptor-fetch-or-equality: not-a-predicate
+  historical-issuer-currentness: not-a-predicate
+  historical-descriptor-currentness: not-a-predicate
+  nonretroactive-after-durable-issuance:
+    - routine-authority-rotation
+    - routine-controller-rotation
+    - ordinary-descendant-authority-mls-head-advance
+x-dirextalk-replay-order:
+  first: parse-exact-path-and-header-shapes-then-authenticate-caller-current-route-authorization-and-immutable-explicit-revocation
+  second: exact-media-content-encoding-size-version-signature-and-idempotency-digest-equality
+  committed-exact-replay: return-byte-identical-receipt-before-mutable-currentness
+  committed-conflict: reject-without-write
+  first-admission: complete-mutable-validation-then-one-final-cas
+  partial-write-or-key-generation-before-required-checks: forbidden
+x-dirextalk-exact-http-operations:
+  get-catalog-descriptor:
+    path: /v2/groups/{scope_kind}/{scope_id}/recovery-completion-verifier-descriptor
+    method: GET
+    authorization: forbidden-origin-authenticated-https-only
+    idempotency-key: forbidden
+    response-media-type: application/vnd.dirextalk.recovery-scope-catalog-completion-verifier-descriptor.v1+cbor
+    response-ceiling: 2226
+  authorize-catalog-completion-issuer:
+    path: /v2/groups/{scope_kind}/{scope_id}/recovery-completion-issuer-authorizations/{catalog_id}/{generation}/{index}
+    method: PUT
+    authorization: current-catalog-authority-device-session
+    request-media-type: application/vnd.dirextalk.mls-recovery-issuer-authorization-request.v1+cbor
+    request-ceiling: 8953
+    response-media-type: application/vnd.dirextalk.recovery-scope-catalog-completion-verifier-binding-unsigned.v1+cbor
+    response-ceiling: 2613
+    idempotency-digest-cbor-path: [16]
+  submit-mls-recovery-commit:
+    path: /v2/groups/{scope_kind}/{scope_id}/mls-recovery-commits/{submission_id}
+    method: POST
+    authorization: current-scope-controller-device-session
+    request-media-type: application/vnd.dirextalk.mls-recovery-commit.v7+cbor
+    request-ceiling: 4489149
+    response-media-type: application/vnd.dirextalk.mls-recovery-commit-receipt.v7+cbor
+    response-ceiling: 791
+    idempotency-digest-cbor-path: [50]
+  confirm-mls-recovery-commit:
+    path: /v2/groups/{scope_kind}/{scope_id}/mls-recovery-commits/{submission_id}/confirmation
+    method: PUT
+    authorization: exact-candidate-device-session
+    request-media-type: application/vnd.dirextalk.mls-recovery-confirmation.v2+cbor
+    request-ceiling: 1510
+    response-media-type: application/vnd.dirextalk.mls-recovery-confirmation-receipt.v2+cbor
+    response-ceiling: 791
+    idempotency-digest-cbor-path: [23]
+  activate-mls-recovery:
+    path: /v2/groups/{scope_kind}/{scope_id}/mls-recovery-activations/{activation_id}
+    method: PUT
+    authorization: current-scope-controller-device-session
+    request-media-type: application/vnd.dirextalk.mls-recovery-activation.v2+cbor
+    request-ceiling: 6023
+    response-media-type: application/vnd.dirextalk.mls-recovery-activation-receipt.v2+cbor
+    response-ceiling: 903
+    idempotency-digest-cbor-path: [24]
+  read-mls-recovery-activation:
+    path: /v2/groups/{scope_kind}/{scope_id}/mls-recovery-activations/{activation_id}
+    method: GET
+    authorization: exact-candidate-device-session
+    idempotency-key: forbidden
+    response-media-type: application/vnd.dirextalk.mls-recovery-activation-readback.v2+cbor
+    response-ceiling: 1556
+  issue-mls-recovery-evidence:
+    path: /v2/groups/{scope_kind}/{scope_id}/mls-recovery-evidence-issuances/{issuance_id}
+    method: POST
+    authorization: current-scope-controller-device-session
+    request-media-type: application/vnd.dirextalk.mls-recovery-evidence-issuance.v1+cbor
+    request-ceiling: 12756
+    response-media-type: application/vnd.dirextalk.mls-recovery-evidence-issuance-receipt.v1+cbor
+    response-ceiling: 975
+    idempotency-digest-cbor-path: [27]
+  cache-mls-recovery-completion:
+    path: /v2/groups/{scope_kind}/{scope_id}/mls-recovery-activations/{activation_id}/completion-cache
+    method: PUT
+    authorization: current-scope-controller-device-session
+    request-media-type: application/vnd.dirextalk.mls-recovery-completion-cache.v2+cbor
+    request-ceiling: 17155
+    response-media-type: application/vnd.dirextalk.mls-recovery-completion-cache-receipt.v2+cbor
+    response-ceiling: 660
+    idempotency-digest-cbor-path: [27]
+paths:
+  /v2/groups/{scope_kind}/{scope_id}/recovery-completion-verifier-descriptor:
+    get:
+      operationId: getCatalogCompletionVerifierDescriptorV1
+      x-dirextalk-authentication: {kind: origin-authenticated-https, bearer: forbidden}
+      x-dirextalk-authorization-header: forbidden
+      x-dirextalk-idempotency-key-header: forbidden
+      x-dirextalk-origin-authenticated-https:
+        exact-request-origin-equals-response-field-2: true
+        redirects: forbidden
+        dns-host-only: true
+        tls-validation: required
+      parameters:
+        - $ref: '#/components/parameters/ScopeKind'
+        - $ref: '#/components/parameters/ScopeId'
+      responses:
+        '200': {$ref: '#/components/responses/CatalogDescriptor'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+  /v2/groups/{scope_kind}/{scope_id}/recovery-completion-issuer-authorizations/{catalog_id}/{generation}/{index}:
+    put:
+      operationId: authorizeCatalogCompletionIssuerV1
+      x-dirextalk-authentication: {kind: current-catalog-authority, required: true}
+      x-dirextalk-replay-order: '#/x-dirextalk-replay-order'
+      x-dirextalk-body-ceiling-bytes: 8953
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-durable-writes
+        coordinates:
+          scope_kind: {source: signed-request-cbor, cddl-rule: mls-recovery-issuer-authorization-request-v1, cbor-path: [2, 1], comparison: scope-kind-mapping}
+          scope_id: {source: signed-request-cbor, cddl-rule: mls-recovery-issuer-authorization-request-v1, cbor-path: [2, 2], comparison: exact}
+          catalog_id: {source: signed-request-cbor, cddl-rule: mls-recovery-issuer-authorization-request-v1, cbor-path: [4], comparison: exact}
+          generation: {source: signed-request-cbor, cddl-rule: mls-recovery-issuer-authorization-request-v1, cbor-path: [5], comparison: exact-decimal}
+          index: {source: signed-request-cbor, cddl-rule: mls-recovery-issuer-authorization-request-v1, cbor-path: [6], comparison: exact-decimal}
+      parameters:
+        - $ref: '#/components/parameters/ScopeKind'
+        - $ref: '#/components/parameters/ScopeId'
+        - $ref: '#/components/parameters/CatalogId'
+        - $ref: '#/components/parameters/Generation'
+        - $ref: '#/components/parameters/Index'
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.mls-recovery-issuer-authorization-request.v1+cbor:
+            x-dirextalk-cddl-rule: mls-recovery-issuer-authorization-request-v1
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/IssuerAuthorizationRequestCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/IssuerAuthorization'}
+        '200': {$ref: '#/components/responses/IssuerAuthorization'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+  /v2/groups/{scope_kind}/{scope_id}/mls-recovery-commits/{submission_id}:
+    post:
+      operationId: submitMlsRecoveryCommitV7
+      x-dirextalk-authentication: {kind: current-scope-controller, required: true}
+      x-dirextalk-replay-order: '#/x-dirextalk-replay-order'
+      x-dirextalk-body-ceiling-bytes: 4489149
+      x-dirextalk-all-validation-before-write: true
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-durable-writes
+        coordinates:
+          scope_kind: {source: signed-request-cbor, cddl-rule: mls-recovery-add-request-v7, cbor-path: [3, 1], comparison: scope-kind-mapping}
+          scope_id: {source: signed-request-cbor, cddl-rule: mls-recovery-add-request-v7, cbor-path: [3, 2], comparison: exact}
+          submission_id: {source: signed-request-cbor, cddl-rule: mls-recovery-add-request-v7, cbor-path: [2], comparison: exact}
+      parameters:
+        - $ref: '#/components/parameters/ScopeKind'
+        - $ref: '#/components/parameters/ScopeId'
+        - $ref: '#/components/parameters/SubmissionId'
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.mls-recovery-commit.v7+cbor:
+            x-dirextalk-cddl-rule: mls-recovery-add-request-v7
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/RecoveryAddRequestCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/AddReceipt'}
+        '200': {$ref: '#/components/responses/AddReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+  /v2/groups/{scope_kind}/{scope_id}/mls-recovery-commits/{submission_id}/confirmation:
+    put:
+      operationId: confirmMlsRecoveryCommitV2
+      x-dirextalk-authentication: {kind: candidate-device, required: true}
+      x-dirextalk-replay-order: '#/x-dirextalk-replay-order'
+      x-dirextalk-body-ceiling-bytes: 1510
+      x-dirextalk-transition: welcome_pending-to-candidate_confirmed
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-durable-writes
+        coordinates:
+          scope_kind: {source: signed-request-cbor, cddl-rule: mls-recovery-confirmation-v2, cbor-path: [3, 1], comparison: scope-kind-mapping}
+          scope_id: {source: signed-request-cbor, cddl-rule: mls-recovery-confirmation-v2, cbor-path: [3, 2], comparison: exact}
+          submission_id: {source: signed-request-cbor, cddl-rule: mls-recovery-confirmation-v2, cbor-path: [2], comparison: exact}
+      parameters:
+        - $ref: '#/components/parameters/ScopeKind'
+        - $ref: '#/components/parameters/ScopeId'
+        - $ref: '#/components/parameters/SubmissionId'
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.mls-recovery-confirmation.v2+cbor:
+            x-dirextalk-cddl-rule: mls-recovery-confirmation-v2
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ConfirmationCommandCbor'}
+      responses:
+        '200': {$ref: '#/components/responses/ConfirmationReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+  /v2/groups/{scope_kind}/{scope_id}/mls-recovery-activations/{activation_id}:
+    put:
+      operationId: activateMlsRecoveryV2
+      x-dirextalk-authentication: {kind: current-scope-controller, required: true}
+      x-dirextalk-replay-order: '#/x-dirextalk-replay-order'
+      x-dirextalk-body-ceiling-bytes: 6023
+      x-dirextalk-transition: candidate_confirmed-to-activated_fenced
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-durable-writes
+        coordinates:
+          scope_kind: {source: signed-request-cbor, cddl-rule: mls-recovery-activation-command-v2, cbor-path: [4, 1], comparison: scope-kind-mapping}
+          scope_id: {source: signed-request-cbor, cddl-rule: mls-recovery-activation-command-v2, cbor-path: [4, 2], comparison: exact}
+          activation_id: {source: signed-request-cbor, cddl-rule: mls-recovery-activation-command-v2, cbor-path: [2], comparison: exact}
+      parameters:
+        - $ref: '#/components/parameters/ScopeKind'
+        - $ref: '#/components/parameters/ScopeId'
+        - $ref: '#/components/parameters/ActivationId'
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.mls-recovery-activation.v2+cbor:
+            x-dirextalk-cddl-rule: mls-recovery-activation-command-v2
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ActivationCommandCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/ActivationReceipt'}
+        '200': {$ref: '#/components/responses/ActivationReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+    get:
+      operationId: getMlsRecoveryActivationReadbackV2
+      x-dirextalk-authentication: {kind: candidate-device, required: true}
+      x-dirextalk-idempotency-key-header: forbidden
+      x-dirextalk-pre-issuance-currentness-read: true
+      x-dirextalk-candidate-readback-binding:
+        authenticated-identity-equals-readback-cbor-path: [5]
+        authenticated-device-equals-readback-cbor-path: [6]
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-readback
+        coordinates:
+          scope_kind: {source: stored-returned-readback-cbor, cddl-rule: mls-recovery-activation-readback-v2, cbor-path: [2, 1], comparison: scope-kind-mapping}
+          scope_id: {source: stored-returned-readback-cbor, cddl-rule: mls-recovery-activation-readback-v2, cbor-path: [2, 2], comparison: exact}
+          activation_id: {source: stored-returned-readback-cbor, cddl-rule: mls-recovery-activation-readback-v2, cbor-path: [3], comparison: exact}
+      parameters:
+        - $ref: '#/components/parameters/ScopeKind'
+        - $ref: '#/components/parameters/ScopeId'
+        - $ref: '#/components/parameters/ActivationId'
+        - $ref: '#/components/parameters/Authorization'
+      responses:
+        '200': {$ref: '#/components/responses/ActivationReadback'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+  /v2/groups/{scope_kind}/{scope_id}/mls-recovery-evidence-issuances/{issuance_id}:
+    post:
+      operationId: issueMlsRecoveryCompletionEvidenceV1
+      x-dirextalk-authentication: {kind: current-scope-controller, required: true}
+      x-dirextalk-replay-order: '#/x-dirextalk-replay-order'
+      x-dirextalk-body-ceiling-bytes: 12756
+      x-dirextalk-required-state: activated_fenced
+      x-dirextalk-linearization-point: first-durable-certificate-and-evidence-commit
+      x-dirextalk-idempotency-and-uniqueness:
+        route-key: [scope, issuance-id]
+        sole-evidence-key:
+          - exact-full-signed-issuer-binding-digest-b
+          - history-completion-context-digest
+        exact-route-body-idempotency-replay: byte-identical-stored-receipt
+        changed-route-body-idempotency-or-sole-evidence-key: conflict-no-write
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-durable-writes
+        coordinates:
+          scope_kind: {source: signed-request-cbor, cddl-rule: mls-recovery-evidence-issuance-command-v1, cbor-path: [5, 1], comparison: scope-kind-mapping}
+          scope_id: {source: signed-request-cbor, cddl-rule: mls-recovery-evidence-issuance-command-v1, cbor-path: [5, 2], comparison: exact}
+          issuance_id: {source: signed-request-cbor, cddl-rule: mls-recovery-evidence-issuance-command-v1, cbor-path: [2], comparison: exact}
+      parameters:
+        - $ref: '#/components/parameters/ScopeKind'
+        - $ref: '#/components/parameters/ScopeId'
+        - $ref: '#/components/parameters/IssuanceId'
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.mls-recovery-evidence-issuance.v1+cbor:
+            x-dirextalk-cddl-rule: mls-recovery-evidence-issuance-command-v1
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/EvidenceIssuanceCommandCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/EvidenceIssuanceReceipt'}
+        '200': {$ref: '#/components/responses/EvidenceIssuanceReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/PreIssuanceGone'}
+        '412': {$ref: '#/components/responses/PreIssuanceInvalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+  /v2/groups/{scope_kind}/{scope_id}/mls-recovery-activations/{activation_id}/completion-cache:
+    put:
+      operationId: cacheMlsRecoveryCompletionV2
+      x-dirextalk-authentication: {kind: current-scope-controller, required: true}
+      x-dirextalk-replay-order: '#/x-dirextalk-replay-order'
+      x-dirextalk-body-ceiling-bytes: 17155
+      x-dirextalk-required-state: activated_fenced
+      x-dirextalk-idempotency-and-uniqueness:
+        semantic-key: [scope, history-completion-context-digest]
+        exact-semantic-key-body-idempotency-replay: byte-identical-stored-receipt
+        changed-body-idempotency-cache-id-or-activation: conflict-no-write
+      x-dirextalk-snapshot-validation:
+        activation-receipt-and-readback: exact-private-issuance-time-snapshots
+        historical-descriptor-validity: evaluated-at-issuance
+        current-descriptor-fetch: forbidden
+        later-cache-after-evidence-expiry: allowed-only-after-signed-timely-history-admission
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-durable-writes
+        coordinates:
+          scope_kind: {source: signed-request-cbor, cddl-rule: mls-recovery-completion-cache-command-v2, cbor-path: [3, 1], comparison: scope-kind-mapping}
+          scope_id: {source: signed-request-cbor, cddl-rule: mls-recovery-completion-cache-command-v2, cbor-path: [3, 2], comparison: exact}
+          activation_id: {source: signed-request-cbor, cddl-rule: mls-recovery-completion-cache-command-v2, cbor-path: [5], comparison: exact}
+      parameters:
+        - $ref: '#/components/parameters/ScopeKind'
+        - $ref: '#/components/parameters/ScopeId'
+        - $ref: '#/components/parameters/ActivationId'
+        - $ref: '#/components/parameters/Authorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.mls-recovery-completion-cache.v2+cbor:
+            x-dirextalk-cddl-rule: mls-recovery-completion-cache-command-v2
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/CompletionCacheCommandCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/CompletionCacheReceipt'}
+        '200': {$ref: '#/components/responses/CompletionCacheReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/PostIssuanceCacheGone'}
+        '412': {$ref: '#/components/responses/PostIssuanceCacheInvalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+components:
+  parameters:
+    ScopeKind:
+      name: scope_kind
+      in: path
+      required: true
+      schema: {type: string, enum: [private-conversation, controlled-public-channel]}
+    ScopeId:
+      name: scope_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/GroupScopeId'}
+    CatalogId:
+      name: catalog_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    Generation:
+      name: generation
+      in: path
+      required: true
+      schema: {type: integer, minimum: 1, maximum: 9007199254740991}
+    Index:
+      name: index
+      in: path
+      required: true
+      schema: {type: integer, minimum: 1, maximum: 1023}
+    SubmissionId:
+      name: submission_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    ActivationId:
+      name: activation_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    IssuanceId:
+      name: issuance_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    Authorization:
+      name: Authorization
+      in: header
+      required: true
+      description: >-
+        Exactly one active-device session value in canonical
+        DTX-Device-Session <uuidv7>.<43-character-base64url-secret> form.
+        Duplicate fields or values, comma lists, obs-fold, and surrounding
+        whitespace are rejected before authentication. The authenticated
+        identity, device, and current key must satisfy the operation role and
+        exact signed-body equality rules.
+      x-dirextalk-exact-field-count: 1
+      x-dirextalk-exact-value-count: 1
+      schema:
+        type: string
+        pattern: '^DTX-Device-Session [0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Exactly one value of 16..128 ASCII octets, each in 0x21..0x7e.
+        Duplicate fields or values, comma lists, obs-fold, non-ASCII, invalid
+        length, and any whitespace are rejected before lookup. Accepted octets
+        are hashed byte-for-byte under the operation domain without
+        normalization; the raw value is never persisted or returned.
+      x-dirextalk-exact-field-count: 1
+      x-dirextalk-exact-value-count: 1
+      schema: {type: string, minLength: 16, maxLength: 128, pattern: '^[!-~]{16,128}$'}
+  schemas:
+    ExactCanonicalCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+    IssuerAuthorizationRequestCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 8953
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: mls-recovery-issuer-authorization-request-v1
+    RecoveryAddRequestCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 4489149
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: mls-recovery-add-request-v7
+    ConfirmationCommandCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 1510
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: mls-recovery-confirmation-v2
+    ActivationCommandCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 6023
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: mls-recovery-activation-command-v2
+    EvidenceIssuanceCommandCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 12756
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: mls-recovery-evidence-issuance-command-v1
+    CompletionCacheCommandCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 17155
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: mls-recovery-completion-cache-command-v2
+    CatalogDescriptorCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 2226
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-owner-cddl-rule: recovery-scope-catalog-completion-verifier-descriptor-v1
+    IssuerAuthorizationCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 2613
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-owner-cddl-rule: recovery-scope-catalog-completion-verifier-binding-unsigned-v1
+    SignedAddReceiptCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 791
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: signed-mls-recovery-add-receipt-v7
+    SignedConfirmationReceiptCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 791
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: signed-mls-recovery-confirmation-receipt-v2
+    SignedActivationReceiptCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 903
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: signed-mls-recovery-activation-receipt-v2
+    ActivationReadbackCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 1556
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: mls-recovery-activation-readback-v2
+    EvidenceIssuanceReceiptCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 975
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: mls-recovery-evidence-issuance-receipt-v1
+    SignedCompletionCacheReceiptCbor:
+      type: string
+      contentEncoding: binary
+      maxLength: 660
+      x-dirextalk-exact-cbor: true
+      x-dirextalk-cddl-rule: signed-mls-recovery-completion-cache-receipt-v2
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    ChannelId:
+      type: string
+      minLength: 57
+      maxLength: 57
+      pattern: '^dtxc1[a-z2-7]{52}$'
+    GroupScopeId:
+      oneOf:
+        - $ref: '#/components/schemas/UuidV7'
+        - $ref: '#/components/schemas/ChannelId'
+  headers:
+    NoStore:
+      schema: {type: string, const: no-store}
+  responses:
+    CatalogDescriptor:
+      description: Exact Catalog V2-owned current completion verifier descriptor; no MLS-local lookalike type.
+      x-dirextalk-body-ceiling-bytes: 2226
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-completion-verifier-descriptor.v1+cbor:
+          x-dirextalk-owner-cddl-rule: recovery-scope-catalog-completion-verifier-descriptor-v1
+          x-dirextalk-exact-cbor: true
+          schema: {$ref: '#/components/schemas/CatalogDescriptorCbor'}
+    IssuerAuthorization:
+      description: Exact Catalog V2 verifier-binding fields 1 through 22; caller appends no scope-service alternative representation.
+      x-dirextalk-body-ceiling-bytes: 2613
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-completion-verifier-binding-unsigned.v1+cbor:
+          x-dirextalk-owner-cddl-rule: recovery-scope-catalog-completion-verifier-binding-unsigned-v1
+          x-dirextalk-exact-fields: [1, 22]
+          schema: {$ref: '#/components/schemas/IssuerAuthorizationCbor'}
+    AddReceipt:
+      description: Immutable authority-signed V7 welcome_pending receipt.
+      x-dirextalk-body-ceiling-bytes: 791
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.mls-recovery-commit-receipt.v7+cbor:
+          x-dirextalk-cddl-rule: signed-mls-recovery-add-receipt-v7
+          schema: {$ref: '#/components/schemas/SignedAddReceiptCbor'}
+    ConfirmationReceipt:
+      description: Immutable authority-signed V2 candidate_confirmed receipt echoing both distinct final heads.
+      x-dirextalk-body-ceiling-bytes: 791
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.mls-recovery-confirmation-receipt.v2+cbor:
+          x-dirextalk-cddl-rule: signed-mls-recovery-confirmation-receipt-v2
+          schema: {$ref: '#/components/schemas/SignedConfirmationReceiptCbor'}
+    ActivationReceipt:
+      description: Immutable authority-signed activated_fenced receipt; routing remains denied.
+      x-dirextalk-body-ceiling-bytes: 903
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.mls-recovery-activation-receipt.v2+cbor:
+          x-dirextalk-cddl-rule: signed-mls-recovery-activation-receipt-v2
+          schema: {$ref: '#/components/schemas/SignedActivationReceiptCbor'}
+    ActivationReadback:
+      description: Authority-signed V2 readback after current pre-issuance checks, with identity H+1 and authority MLS head kept distinct.
+      x-dirextalk-body-ceiling-bytes: 1556
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.mls-recovery-activation-readback.v2+cbor:
+          x-dirextalk-cddl-rule: mls-recovery-activation-readback-v2
+          schema: {$ref: '#/components/schemas/ActivationReadbackCbor'}
+    EvidenceIssuanceReceipt:
+      description: Atomic immutable child certificate plus exactly one redacted child-signed evidence and digests of the private historical issuance snapshots.
+      x-dirextalk-body-ceiling-bytes: 975
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.mls-recovery-evidence-issuance-receipt.v1+cbor:
+          x-dirextalk-cddl-rule: mls-recovery-evidence-issuance-receipt-v1
+          schema: {$ref: '#/components/schemas/EvidenceIssuanceReceiptCbor'}
+    CompletionCacheReceipt:
+      description: Immutable authority-signed scope-and-History-context cache receipt; one required input to the routing predicate.
+      x-dirextalk-body-ceiling-bytes: 660
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.mls-recovery-completion-cache-receipt.v2+cbor:
+          x-dirextalk-cddl-rule: signed-mls-recovery-completion-cache-receipt-v2
+          schema: {$ref: '#/components/schemas/SignedCompletionCacheReceiptCbor'}
+    Unauthorized:
+      description: AUTHENTICATION_REQUIRED, CATALOG_AUTHORITY_REQUIRED, CANDIDATE_REQUIRED, or CURRENT_CONTROLLER_REQUIRED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Conflict:
+      description: IDEMPOTENCY_CONFLICT, MLS_HEAD_CONFLICT, STATE_CONFLICT, ISSUER_REQUEST_ALREADY_USED, CHILD_EVIDENCE_ALREADY_ISSUED, or CACHE_CONFLICT.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Gone:
+      description: REQUEST_REVOKED, DEVICE_REVOKED, ISSUER_REVOKED, ACTIVATION_REVOKED, or WORKFLOW_EXPIRED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Invalidated:
+      description: DESCRIPTOR_CHANGED, CATALOG_CHANGED, AUTHORITY_CHANGED, MLS_HEAD_CHANGED, CONTROLLER_CHANGED, or ACTIVATION_NOT_CURRENT.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    PreIssuanceGone:
+      description: Before durable issuance only — EXPLICIT_ISSUER_CATALOG_REQUEST_CANDIDATE_DEVICE_MEMBER_OR_ACTIVATION_REVOCATION, or WORKFLOW_OR_AUTHORITY_WINDOW_EXPIRED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    PreIssuanceInvalidated:
+      description: Before the final issuance CAS only — DESCRIPTOR_ACTIVATION_READBACK_OR_AUTHORITY_ANCHOR_CHANGED, or AUTHORIZATION_OR_REVOCATION_REVISION_CHANGED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    PostIssuanceCacheGone:
+      description: After durable issuance — EXPLICIT_ISSUER_CATALOG_REQUEST_CANDIDATE_DEVICE_MEMBER_OR_ACTIVATION_REVOCATION; evidence expiry alone is not gone after timely signed History admission.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    PostIssuanceCacheInvalidated:
+      description: During first admission — STORED_ISSUANCE_SNAPSHOT_MISMATCH, INVALID_OR_CHANGED_HISTORY_PRESENTATION_BEFORE_FINAL_CAS, HISTORY_FIRST_ADMISSION_NOT_BEFORE_EVIDENCE_EXPIRY, CURRENT_AUTHORIZATION_OR_REVOCATION_RACE, or ACTIVATION_ANCHOR_NOT_IN_CURRENT_LOCAL_MLS_LINEAGE. A committed semantic key with any changed command is 409; routine descriptor rotation and ordinary descendant MLS head advance are not invalidation.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    InvalidExactCbor:
+      description: EXACT_CBOR_INVALID, OWNER_TYPE_INVALID, COORDINATE_MISMATCH, SIGNATURE_INVALID, PROOF_INVALID, FORBIDDEN_PRIVATE_OR_REDACTED_FIELD, or VERSION_FALLBACK_FORBIDDEN.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    NotFound:
+      description: Exact current descriptor, activation, or readback does not exist.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}

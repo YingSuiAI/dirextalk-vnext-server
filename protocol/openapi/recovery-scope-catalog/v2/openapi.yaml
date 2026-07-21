@@ -1,0 +1,1118 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Recovery Scope Catalog V2
+  version: 2.0.0
+  description: >-
+    Publishes only an authority-signed V2 catalog head and opaque encrypted
+    ciphertext. The identity home remains blind to recovery-scope plaintext.
+    The additive V3 enrollment handoff carries only signed coordinates,
+    receipts, status, exact DeviceAdd evidence, and opaque HPKE ciphertext.
+x-dirextalk-handoff-crypto-domains:
+  response-capability: "dirextalk.recovery-response-capability.v1\0"
+  recipient-key: "dirextalk.recovery-recipient-key.v1\0"
+  device-history-authority-id: "dirextalk.device-history-authority-id.v1\0"
+  identity-device-add: "dirextalk.identity-device-add.v1\0"
+  preparation-idempotency: "dirextalk.recovery-scope-catalog-handoff-preparation-idempotency.v2\0"
+  response-idempotency: "dirextalk.recovery-scope-catalog-handoff-response-idempotency.v2\0"
+  preparation-signature: "dirextalk.recovery-scope-catalog-handoff-preparation-signature.v2\0"
+  preparation-digest: "dirextalk.recovery-scope-catalog-handoff-preparation-digest.v2\0"
+  provider-package: "dirextalk.recovery-scope-catalog-handoff-provider-package.v2\0"
+  provider-aad: "dirextalk.recovery-scope-catalog-handoff-provider-aad.v2\0"
+  provider-envelope: "dirextalk.recovery-scope-catalog-handoff-provider-envelope.v2\0"
+  provider-signature: "dirextalk.recovery-scope-catalog-handoff-provider-signature.v2\0"
+  provider-authority-signature: "dirextalk.recovery-scope-catalog-handoff-provider-authority-signature.v2\0"
+  provider-response: "dirextalk.recovery-scope-catalog-handoff-provider-response.v2\0"
+x-dirextalk-handoff-hpke:
+  mode: base
+  kem: {id: 32, name: X25519-HKDF-SHA256}
+  kdf: {id: 1, name: HKDF-SHA256}
+  aead: {id: 3, name: ChaCha20Poly1305}
+  info: "dirextalk.recovery-scope-catalog-handoff-hpke.v2\0"
+  info-kind: exact-literal-not-hash-domain-alias
+  encapsulation: fresh-only-on-first-accepted-response
+  exact-replay: return-stored-byte-identical-envelope
+  package-cddl-rule: recovery-scope-catalog-provider-package-v2
+  package-max-bytes: 1049457
+  public-aad-cddl-rule: recovery-scope-catalog-provider-public-aad-v2
+  aad-input: exact-deterministic-canonical-cbor-bytes-of-recovery-scope-catalog-provider-public-aad-v2
+  aad-input-not: [response-field-18-digest, provider-aad-domain-prefixed, json, hex, alternate-cbor-encoding]
+  deterministic-hpke-vector-required-in: C1b-B
+  envelope-cddl-rule: recovery-scope-catalog-hpke-envelope-v2
+  ciphertext-max-bytes: 1049473
+  encoded-envelope-max-bytes: 1049517
+  decoder-ceiling-bytes: 1065984
+  decoder-ceiling-is-not-envelope-allowance: true
+  envelope-digest-input: exact-deterministic-canonical-envelope-not-ciphertext-alone
+  dh-rejection: reject-all-zero-and-low-order-at-semantic-runtime-stage
+x-dirextalk-canonical-cbor-ceilings:
+  signed-catalog-head:
+    cddl-rule: recovery-scope-catalog-head-v2
+    maximum-bytes: 466
+    arithmetic: map-header-1-plus-sixteen-one-byte-keys-16-plus-values-449
+    encoded-as-bstr-maximum-bytes: 469
+  catalog-upload:
+    cddl-rule: recovery-scope-catalog-upload-v2
+    maximum-body-bytes: 1049050
+    arithmetic: map-and-keys-3-plus-signed-head-466-plus-encoded-ciphertext-bstr-1048581
+    decoder-ceiling-bytes: 1065984
+    decoder-ceiling-is-not-valid-body-allowance: true
+  provider-package:
+    cddl-rule: recovery-scope-catalog-provider-package-v2
+    maximum-bytes: 1049457
+  hpke-ciphertext:
+    cddl-rule: hpke-ciphertext-v2
+    maximum-bytes: 1049473
+    arithmetic: provider-package-1049457-plus-aead-tag-16
+  hpke-envelope:
+    cddl-rule: recovery-scope-catalog-hpke-envelope-v2
+    maximum-bytes: 1049517
+  provider-response:
+    cddl-rule: recovery-scope-catalog-provider-response-v2
+    maximum-body-bytes: 1050929
+  ready-status:
+    cddl-rule: recovery-scope-catalog-status-ready-v2
+    maximum-body-bytes: 1050986
+x-dirextalk-handoff-currentness:
+  portable-signatures: issuance-evidence-only
+  first-admission-and-status: origin-authenticated-exact-identity-log-state-at-h-plus-1
+  authenticated-committed-exact-replay: before-mutable-business-currentness
+  transition: exact-direct-device-add
+  no-h-plus-2: true
+  portable-checkpoint-claimed: false
+  first-admission-and-status-current-provider-and-authority-required: true
+  candidate-can-never-be-provider: true
+  server-visible-invalidation-drift: [identity-head, public-catalog-head-or-authority, candidate, provider, authority]
+  hidden-verifier-currentness: candidate-only-never-server-admission-cas-replay-or-status
+  hidden-verifier-status: only-transitive-via-new-or-invalid-public-catalog-head
+  availability-cost: independent-authority-required-for-first-accepted-response
+x-dirextalk-handoff-signers:
+  provider-descriptor:
+    cddl-rule: recovery-scope-catalog-provider-descriptor-v2
+    fields: {version: 1, device-id: 2, ed25519-public-key: 3}
+    key-id-present: false
+  independent-authority:
+    closed-union: true
+    unknown-kind: rejected
+    free-form-descriptor: forbidden
+    kinds:
+      active-device: {kind: 1, fields: [kind, device-id, ed25519-public-key]}
+      identity-root: {kind: 2, fields: [kind, authority-id, ed25519-public-key]}
+      recovery-authority: {kind: 3, fields: [kind, authority-id, ed25519-public-key]}
+  key-separation:
+    candidate-provider-and-authority-ed25519-public-keys: pairwise-distinct
+    candidate-ed25519-and-x25519-public-key-bytes: distinct
+    candidate-provider-and-active-authority-device-ids: pairwise-distinct
+x-dirextalk-handoff-equality-validity:
+  highwater:
+    h: 0..9007199254740990
+    h-plus-1: positive-and-exactly-h-plus-1
+    repeated-h-head-pairs: byte-equal
+  duplicate-coordinates:
+    preparation-to-response:
+      - request-id: preparation-2-equals-response-2
+      - identity: preparation-3-equals-response-4
+      - catalog-id: preparation-4-equals-response-5
+      - generation: preparation-5-equals-response-6
+      - signed-head-digest: preparation-6-equals-response-7
+      - candidate-device-id: preparation-7-equals-response-8
+      - h: preparation-10-equals-response-10
+      - head-at-h: preparation-11-equals-response-11
+      - signed-preparation-digest: digest-exact-preparation-1-through-17-equals-response-3
+      - recipient-key-digest: digest-exact-preparation-9-x25519-bytes-equals-response-9
+    response-to-package:
+      - request-id: response-2-equals-package-2
+      - signed-preparation-digest: response-3-equals-package-3
+      - identity: response-4-equals-package-6
+      - catalog-id: response-5-equals-package-7
+      - generation: response-6-equals-package-8
+      - candidate-device-id: response-8-equals-package-9
+      - h: response-10-equals-package-11
+      - head-at-h: response-11-equals-package-12
+      - h-plus-1: response-12-equals-package-13
+      - head-at-h-plus-1: response-13-equals-package-14
+      - device-add-digest: response-14-equals-package-15
+      - recipient-key: package-10-equals-preparation-9
+    response-to-public-aad:
+      - fields-2-through-17: byte-equal-same-numbered-fields
+      - idempotency-digest: response-20-equals-aad-18
+      - issued-at: response-21-equals-aad-19
+      - expires-at: response-22-equals-aad-20
+      - aad-digest: digest-exact-aad-1-through-20-equals-response-18
+      - envelope-digest: digest-exact-envelope-equals-response-19
+    response-to-package-times:
+      - issued-at: response-21-equals-package-16
+      - expires-at: response-22-equals-package-17
+    preparation-to-device-add:
+      - candidate-device-id: preparation-7-equals-certificate-3
+      - candidate-ed25519-key: preparation-8-equals-certificate-4
+      - candidate-x25519-key: preparation-9-equals-certificate-5
+  signed-head:
+    package-field-4: exact-signed-head-cbor
+    digest-equals: [preparation-field-6, response-field-7, aad-field-7]
+  catalog-plaintext:
+    package-field-5: exact-catalog-plaintext-cbor
+    validates-against-signed-head: [identity, catalog-id, generation, previous-head, count, merkle-root, h, head-at-h]
+  device-add:
+    cddl-rule: identity-log-device-add-event-v1-1
+    canonical-kind: device-add
+    validates: [identity, sequence-exact-h-plus-1, predecessor-head-at-h, candidate-device-id, candidate-ed25519-key, candidate-x25519-key, certificate-signature, event-signature]
+    digest-domain: "dirextalk.identity-device-add.v1\0"
+    digest-equals: [response-field-14, package-field-15, aad-field-14]
+  validity:
+    every-issued-at-before-expires-at: true
+    response-package-aad-times: byte-equal
+    response-contained-by: [preparation-validity, signed-catalog-validity]
+    preparation-accepted-at: stored-once
+    provider-accepted-at: stored-once
+  identity-server-validation:
+    validates: [public-aad-structure-and-digest, hpke-envelope-structure-and-digest, provider-signature, authority-signature, public-signed-catalog-id-generation-head-root-count-authority-validity, current-identity-candidate-provider-independent-authority]
+    never: [decrypt-package, recompute-package-digest, validate-catalog-plaintext, observe-or-fence-completion-verifier-origin-key-epoch-or-descriptor]
+  candidate-post-decryption-validation:
+    validates:
+      - package-digest
+      - exact-signed-head
+      - exact-catalog-plaintext
+      - complete-equality-validity-matrix
+      - exact-current-origin-authenticated-completion-verifier-descriptor-signature-and-digest
+      - every-verifier-binding-exact-origin-key-id-public-key-epoch-and-descriptor-digest
+      - every-completion-evidence-algorithm-purpose-validity-and-globally-unique-issuer-epk
+      - every-completion-evidence-pop-origin-authorization-and-catalog-countersignature
+      - every-completion-evidence-authorization-digest-a-full-binding-digest-b-and-leaf-copy
+      - all-completion-evidence-before-any-catalog-leaf-acceptance-or-delivery
+    verifier-rotation-before-child-issuance: stops-new-child-issuance
+    committed-child-certificate-and-evidence: non-retroactive-across-routine-descriptor-rotation-or-head-advance
+x-dirextalk-handoff-replay-order:
+  prerequisite: successful-caller-capability-or-session-authentication
+  before-claim-resolution: [static-media-size-path, idempotency-key-shape-and-lookup, exact-body-and-signature-match]
+  committed-exact-claim: return-stored-byte-identical-receipt-no-writes-before-mutable-currentness
+  committed-conflict: 409-no-writes
+  mutable-currentness-and-final-cas: first-admission-only
+  get-currentness: revalidated-read-only
+x-dirextalk-handoff-state-machine:
+  status-codes: {pending: 1, ready: 2, expired: 3, cancelled: 4, invalidated: 5}
+  reason-codes:
+    expired: {expiry: 1}
+    cancelled: {challenge-cancellation: 2}
+    invalidated-priority:
+      identity-head-or-h-plus-2: 1
+      catalog-id-generation-or-head: 2
+      public-catalog-authority-or-head: 3
+      candidate-device-add-or-key: 4
+      provider-session-or-key: 5
+      independent-authority: 6
+  only-ready-embeds-response: true
+  pending-to-ready: exact-direct-h-plus-1-device-add-only
+  cancellation-truth: enrollment-challenge-delete-only
+  preparation-delete: forbidden
+  receipts-remain-immutable-after-get-invalidation: true
+  state-changed-at:
+    pending: preparation-accepted-at
+    ready: provider-accepted-at
+    expired: earliest-exact-expiry
+    cancelled: challenge-cancellation-time
+    invalidated: exact-first-invalidating-public-event-or-head-time
+  terminal-selection:
+    primary: earliest-exact-transition-timestamp
+    equal-time-state-priority: [cancelled, invalidated, expired]
+    equal-time-invalidated-reason: lowest-numeric-priority
+  get-semantics: authoritative-derived-read-only-never-writes-transition
+x-dirextalk-handoff-privacy:
+  forbidden-persistence-and-responses:
+    - raw-enrollment-capability
+    - raw-response-capability
+    - raw-idempotency-key
+    - catalog-plaintext
+    - recovery-scope
+    - membership-receipt
+    - private-body
+    - catalog-opening
+    - hiding-nonce
+    - completion-verifier-origin
+    - completion-verifier-key
+    - completion-verifier-key-id
+    - completion-verifier-epoch
+    - completion-verifier-descriptor
+    - completion-evidence-issuer-epk
+    - completion-evidence-issuer-pop
+    - completion-evidence-issuer-origin-authorization
+    - completion-evidence-issuer-authorization-digest
+  http-visible-provider-response:
+    - signed-public-coordinates-and-descriptors
+    - exact-device-add-cbor
+    - opaque-hpke-envelope
+x-dirextalk-completion-evidence:
+  descriptor:
+    cddl-rule: recovery-scope-catalog-completion-verifier-descriptor-v1
+    source: candidate-fetches-current-descriptor-over-origin-authenticated-channel
+    identity-home-endpoint: forbidden
+    signature-key: exact-descriptor-field-4-current-verifier-key
+    digest-input: exact-full-signed-descriptor
+    binding-equality: [origin, key-id, public-key, epoch, descriptor-digest, issued-at, expires-at]
+  issuer-authorization:
+    algorithm: {value: 1, name: Ed25519}
+    purpose: {value: 1, name: history-recovery-completion-evidence-issuer-v2}
+    issuer-epk-cbor-path: [18]
+    key-id-handle-or-uuid: forbidden
+    generation-owner: scope-origin-service
+    caller-supplied-issuer-epk-or-pop: forbidden
+    issuer-esk-custody: persistent-non-exportable-scope-origin-service-only
+    issuer-esk-retained-through: signed-catalog-validity
+    candidate-receives-issuer-esk: false
+    exact-tuple-retry: byte-identical-issuer-epk-pop-origin-authorization
+    issuer-pop-input: terminal-nul-pop-domain-plus-exact-binding-fields-1-through-20
+    origin-authorization-input: terminal-nul-origin-authorization-domain-plus-exact-binding-fields-1-through-21
+    catalog-countersignature-input: existing-terminal-nul-binding-signature-domain-plus-exact-binding-fields-1-through-22
+    authorization-digest-a-input: terminal-nul-authorization-digest-domain-plus-exact-binding-fields-1-through-22
+    full-binding-digest-b-input: existing-binding-domain-plus-exact-full-fields-1-through-23
+    pre-freeze-cycle-forbidden-inputs: [authorization-digest-a, full-binding-digest-b, leaf-digest, merkle-root, signed-head, ciphertext-digest, completion-digest]
+  validity:
+    nonempty: true
+    contained-by: [current-origin-verifier-descriptor, binding-validity, signed-catalog-validity]
+    catalog-wide-exact-issuer-authorization-window-for-every-leaf: true
+    later-completion-runtime-validity-may-be-shorter: true
+  key-separation:
+    issuer-epk-globally-unique-across-all-retained-catalog-v2-bindings-and-generations: true
+    issuer-epk-distinct-from: [candidate, provider, catalog-authority, origin-verifier, identity-root, recovery-authority, every-other-visible-key]
+  downstream-child-evidence:
+    encoded-in-catalog-v2: false
+    issuer-fields-a-b-and-leaf-request-dependent-data: forbidden
+    signed-catalog-head-allows-multiple-preparations-and-recovery-requests: true
+    new-child-issuance-stops-on: [descriptor-invalidation, catalog-invalidation]
+    per-request: [globally-fresh-child-epk, child-pop, issuer-signed-certificate]
+    child-esk: signs-exactly-one-evidence-then-destroyed
+    linearization-point: child-issuance-transaction-validates-current-descriptor-and-normal-mls-currentness
+    committed-child-certificate-and-evidence: non-retroactive-across-routine-descriptor-rotation-or-head-advance
+    exact-replay-after-commit: valid
+    single-use-catalog-head-reservation: forbidden
+    identity-later-verifies-only: [committed-issuer-delegation, child-signature]
+    identity-cannot-prove: [hidden-origin-currentness, hsm-custody]
+  leaf-public-binding:
+    cddl-rule: recovery-scope-catalog-leaf-commitment-v2
+    fields:
+      algorithm: {cbor-path: [7], binding-cbor-path: [16], comparison: exact}
+      purpose: {cbor-path: [8], binding-cbor-path: [17], comparison: exact}
+      issuer-epk: {cbor-path: [9], binding-cbor-path: [18], comparison: exact}
+      issuer-authorization-not-before: {cbor-path: [10], binding-cbor-path: [19], comparison: exact}
+      issuer-authorization-expires: {cbor-path: [11], binding-cbor-path: [20], comparison: exact}
+      issuer-authorization-digest-a: {cbor-path: [12], derivation: exact-binding-fields-1-through-22}
+    leaf-digest: existing-leaf-v2-domain-over-exact-full-leaf
+  visibility:
+    candidate-private: [full-descriptor, full-binding, issuer-pop, issuer-origin-authorization]
+    hidden-from-upload-and-handoff-server-projections: [issuer-epk, issuer-authorization-not-before, issuer-authorization-expires, issuer-authorization-digest-a]
+    later-redacted-completion-v2-leaf-disclosure-only: [issuer-epk, issuer-authorization-not-before, issuer-authorization-expires, issuer-authorization-digest-a]
+    identity-server-upload-handoff-projection: unchanged-and-blind
+paths:
+  /v2/recovery-scope-catalogs/{catalog_id}:
+    put:
+      operationId: putRecoveryScopeCatalogV2
+      description: >-
+        Before any durable write, catalog_id must equal field 2 of the signed
+        head at upload field 1. Exact request replay returns byte-identical
+        signed-head bytes; conflicting bytes perform no write.
+      x-dirextalk-authentication:
+        kind: active-device
+        header: Authorization
+        required: true
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-durable-writes
+        coordinates:
+          catalog_id:
+            source: signed-request-cbor
+            cddl-rule: recovery-scope-catalog-upload-v2
+            cbor-path: [1, 2]
+            comparison: exact
+      x-dirextalk-server-visible-projection:
+        signed-head-cddl-rule: recovery-scope-catalog-head-v2
+        opaque-ciphertext-cbor-path: [2]
+        allowed-cbor-paths:
+          - [1, 1]
+          - [1, 2]
+          - [1, 3]
+          - [1, 4]
+          - [1, 5]
+          - [1, 6]
+          - [1, 7]
+          - [1, 8]
+          - [1, 9]
+          - [1, 10]
+          - [1, 11]
+          - [1, 12]
+          - [1, 13]
+          - [1, 14]
+          - [1, 15]
+          - [1, 16]
+          - [2]
+        forbidden-data:
+          - recovery-scope
+          - membership-receipt
+          - private-body
+          - hiding-nonce
+          - completion-verifier-binding
+          - verifier-origin
+          - verifier-public-key
+          - verifier-key-id
+          - verifier-epoch
+          - verifier-descriptor
+          - completion-evidence-issuer-epk
+          - completion-evidence-issuer-pop
+          - completion-evidence-issuer-origin-authorization
+          - completion-evidence-issuer-authorization-digest
+      x-dirextalk-validity:
+        head-issued-at-cbor-path: [1, 14]
+        head-expires-at-cbor-path: [1, 15]
+        head-relation: issued-at-before-expires-at
+        candidate-post-decryption-binding-validity-contained-in-head: true
+        candidate-validates-every-verifier-binding-against-current-origin-authenticated-descriptor-before-leaf-acceptance-or-delivery: true
+        candidate-verifier-rotation-before-child-issuance: stops-new-child-issuance
+        committed-child-certificate-and-evidence: non-retroactive-across-routine-descriptor-rotation-or-head-advance
+        identity-server-hidden-verifier-enforcement: impossible-ciphertext-only
+      x-dirextalk-crypto-domains:
+        membership-receipt: "dirextalk.recovery-scope-membership-receipt.v1\0"
+        recovery-scope: "dirextalk.recovery-scope.v1\0"
+        private-body: "dirextalk.recovery-scope-catalog-private-body.v2\0"
+        opening: "dirextalk.recovery-scope-catalog-opening.v2\0"
+        verifier-binding: "dirextalk.recovery-scope-catalog-verifier-binding.v1\0"
+        verifier-binding-signature: "dirextalk.recovery-scope-catalog-verifier-binding-signature.v1\0"
+        completion-verifier-descriptor: "dirextalk.recovery-scope-catalog-completion-verifier-descriptor.v1\0"
+        completion-verifier-descriptor-signature: "dirextalk.recovery-scope-catalog-completion-verifier-descriptor-signature.v1\0"
+        completion-evidence-pop: "dirextalk.recovery-scope-catalog-completion-evidence-pop.v1\0"
+        completion-evidence-origin-authorization: "dirextalk.recovery-scope-catalog-completion-evidence-origin-authorization.v1\0"
+        completion-evidence-authorization-digest: "dirextalk.recovery-scope-catalog-completion-evidence-authorization-digest.v1\0"
+        leaf-commitment: "dirextalk.recovery-scope-catalog-leaf-commitment.v2\0"
+        ciphertext: "dirextalk.recovery-scope-catalog-ciphertext.v2\0"
+        head: "dirextalk.recovery-scope-catalog-head.v2\0"
+        head-signature: "dirextalk.recovery-scope-catalog-head-signature.v2\0"
+        merkle-node: "dirextalk.recovery-scope-catalog-node.v2\0"
+      x-dirextalk-opening-digest:
+        algorithm: SHA-256
+        domain: "dirextalk.recovery-scope-catalog-opening.v2\0"
+        cddl-rule: recovery-scope-catalog-opening-v2
+        input: exact-deterministic-canonical-cbor-complete-opening
+        complete-cbor-fields:
+          private-body: [1]
+          full-signed-issuer-binding: [2]
+          public-leaf: [3]
+        subset-or-reencoding: forbidden
+      x-dirextalk-private-body-derived-digests:
+        membership-receipt:
+          algorithm: SHA-256
+          domain: "dirextalk.recovery-scope-membership-receipt.v1\0"
+          output-cbor-path: [7]
+          input-cbor-path: [6]
+          input-encoding: exact raw bstr bytes
+        recovery-scope:
+          algorithm: SHA-256
+          domain: "dirextalk.recovery-scope.v1\0"
+          output-cbor-path: [9]
+          input-cbor-path: [5]
+          input-encoding: exact deterministic canonical CBOR
+      x-dirextalk-merkle-proof:
+        cddl-rule: catalog-merkle-proof-v2
+        leaf-cddl-rule: recovery-scope-catalog-leaf-commitment-v2
+        leaf-digest-domain: "dirextalk.recovery-scope-catalog-leaf-commitment.v2\0"
+        node-digest-domain: "dirextalk.recovery-scope-catalog-node.v2\0"
+        sibling-order: bottom-up
+        index-base: 1
+        count-minimum: 1
+        count-maximum: 1023
+        maximum-siblings: 10
+        odd-node-rule: duplicate-last
+        odd-final-node-consumes-sibling: false
+        sibling-count-rule: exact-count-index-height
+        reject-surplus-or-missing-siblings: true
+        field-bindings:
+          version: {cbor-path: [1], const: 2}
+          catalog_id: {cbor-path: [2], signed-head-cbor-path: [2], comparison: exact}
+          generation: {cbor-path: [3], signed-head-cbor-path: [4], comparison: exact}
+          count: {cbor-path: [4], signed-head-cbor-path: [6], comparison: exact}
+          index: {cbor-path: [5], minimum: 1, maximum-from: count}
+          siblings: {cbor-path: [6], maximum-items: 10, order: bottom-up}
+      x-dirextalk-catalog-count-boundary:
+        count-minimum: 1
+        count-maximum: 1023
+        exact-plaintext-ceiling-bytes: 1048576
+        minimum-valid-opening-bytes: 1019
+        minimum-outer-plaintext-overhead-bytes: 147
+        index-occurrences-per-opening: 3
+        one-byte-index-maximum: 23
+        two-byte-index-maximum: 255
+        indices-24-through-255-count: 232
+        indices-24-through-255-extra-bytes-per-opening: 3
+        indices-256-through-1023-count: 768
+        indices-256-plus-extra-bytes-per-opening: 6
+        consecutive-one-based-indices-required: true
+        count-maximum-minimum-bytes: 1047888
+        count-maximum-plus-one: 1024
+        count-maximum-plus-one-minimum-bytes: 1048913
+        count-maximum-fits-ceiling: true
+        count-maximum-plus-one-exceeds-ceiling: true
+        validation-classification: structural-cddl-and-consecutive-index-semantic-size-model
+        full-cryptographic-1023-opening-fixture: intentionally-not-claimed
+      x-dirextalk-replay-semantics:
+        exact-request-replay: identical-signed-head-bytes
+        changed-request: RECOVERY_CATALOG_CONFLICT
+        idempotency-key-reuse: IDEMPOTENCY_CONFLICT
+        conflict-side-effects: none
+      parameters:
+        - $ref: '#/components/parameters/CatalogId'
+        - $ref: '#/components/parameters/DeviceAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.recovery-scope-catalog.v2+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-leaf-count: 1023
+            x-dirextalk-max-ciphertext-bytes: 1048576
+            x-dirextalk-max-body-bytes: 1049050
+            x-dirextalk-decoder-ceiling-bytes: 1065984
+            x-dirextalk-decoder-ceiling-is-not-body-allowance: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/CatalogCreated'}
+        '200': {$ref: '#/components/responses/CatalogReplay'}
+        '401': {$ref: '#/components/responses/DeviceAuthenticationFailed'}
+        '409': {$ref: '#/components/responses/CatalogConflict'}
+        '410': {$ref: '#/components/responses/CatalogGone'}
+        '412': {$ref: '#/components/responses/HeadOrAuthorityChanged'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+  /v3/devices/enroll/catalog-preparations:
+    post:
+      operationId: createRecoveryScopeCatalogPreparationV2
+      description: >-
+        Accepts the candidate-signed preparation. The enrollment and response
+        capabilities are distinct; Authorization is forbidden. First acceptance
+        returns an immutable receipt, and exact replay returns its original bytes.
+      x-dirextalk-authentication:
+        kind: distinct-capability-pair
+        required-headers: [DTX-Enrollment-Capability, DTX-Recovery-Response-Capability]
+        authorization-header: forbidden
+        unknown-or-wrong-capability-status: 401
+      x-dirextalk-path-body-binding:
+        request-id-cbor-path: [2]
+        request-id-equals-enrollment-challenge-id: true
+        candidate-recipient-key-cbor-path: [9]
+        candidate-recipient-key-equals-enrollment-candidate-field-5: true
+        candidate-recipient-key-equals-device-add-certificate-field-5: true
+        recipient-key-source: protected-candidate-x25519-secret
+        arbitrary-recovery-key: rejected
+      x-dirextalk-idempotency:
+        digest-domain: "dirextalk.recovery-scope-catalog-handoff-preparation-idempotency.v2\0"
+        scope: operation+identity+request
+        same-key-identical-body: byte-identical-original-receipt-no-writes
+        same-key-changed-body: 409
+        different-key-after-existence: 409
+        raw-key-persisted-or-returned: false
+        key-pattern: '^[A-Za-z0-9_-]{16,128}$'
+        committed-exact-replay-currentness: not-rechecked
+      x-dirextalk-reject-before-write-order:
+        - media-and-size
+        - exact-canonical-cbor
+        - capabilities
+        - path-and-challenge-binding
+        - idempotency-key-shape-and-claim-lookup
+        - exact-body-candidate-signature-and-digest-match
+        - committed-exact-claim-resolution-before-mutable-currentness
+        - mutable-identity-public-catalog-candidate-currentness-first-admission-only
+        - one-final-cas-first-admission-only
+      x-dirextalk-cas-transaction:
+        count: one
+        lock-order: [identity, challenge, preparation]
+        final-predicate-fences:
+          - exact-identity-h-and-head-at-h
+          - exact-enrollment-challenge-and-capabilities
+          - preparation-absence-or-committed-exact-claim
+          - public-signed-catalog-id-generation-head-root-count-authority-and-validity
+          - candidate-device-signing-and-x25519-keys
+          - idempotency-claim-key-and-body-digest
+        first-acceptance-writes: [preparation, immutable-preparation-receipt]
+        exact-replay-writes: none
+        partial-write: forbidden
+      parameters:
+        - $ref: '#/components/parameters/EnrollmentCapability'
+        - $ref: '#/components/parameters/ResponseCapability'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.recovery-scope-catalog-preparation.v2+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-cddl-rule: recovery-scope-catalog-preparation-v2
+            x-dirextalk-max-body-bytes: 533
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/PreparationCreated'}
+        '200': {$ref: '#/components/responses/PreparationReplay'}
+        '401': {$ref: '#/components/responses/HandoffCapabilityRejected'}
+        '409': {$ref: '#/components/responses/HandoffConflict'}
+        '410': {$ref: '#/components/responses/HandoffGone'}
+        '412': {$ref: '#/components/responses/HandoffPreconditionFailed'}
+        '413': {$ref: '#/components/responses/HandoffTooLarge'}
+        '415': {$ref: '#/components/responses/HandoffUnsupportedMedia'}
+        '422': {$ref: '#/components/responses/HandoffInvalidExactCbor'}
+  /v3/devices/enroll/catalog-preparations/{request_id}:
+    get:
+      operationId: getRecoveryScopeCatalogStatusV2
+      description: >-
+        A valid response capability returns authoritative 200 pending, ready,
+        expired, cancelled, or invalidated status. GET derives currentness
+        read-only, never writes a transition, never changes either immutable
+        mutation receipt, and has no request body.
+      x-dirextalk-authentication:
+        kind: response-capability
+        required-header: DTX-Recovery-Response-Capability
+        authorization-header: forbidden
+        unknown-or-wrong-capability-status: 401
+      x-dirextalk-path-body-binding:
+        path-request-id-equals-stored-preparation-field-2: true
+        request-body: forbidden
+      x-dirextalk-currentness:
+        required-state: origin-authenticated-exact-identity-log-h-plus-1
+        ready-transition: exact-direct-device-add-only
+        no-h-plus-2: true
+        portable-checkpoint-claimed: false
+        invalidates-on: [identity-head, public-catalog-head-or-authority, candidate, provider, authority]
+        hidden-verifier-status: only-transitive-via-new-or-invalid-public-catalog-head
+        status-result: authoritative-200-one-of-five
+        transition-write: forbidden
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/ResponseCapability'
+        - $ref: '#/components/parameters/StatusAccept'
+      responses:
+        '200': {$ref: '#/components/responses/HandoffStatus'}
+        '401': {$ref: '#/components/responses/HandoffCapabilityRejected'}
+        '406': {$ref: '#/components/responses/HandoffNotAcceptable'}
+  /v3/devices/enroll/catalog-preparations/{request_id}/provider-response:
+    put:
+      operationId: putRecoveryScopeCatalogProviderResponseV2
+      description: >-
+        The authenticated active provider must equal the signed descriptor and
+        cannot be the candidate. First acceptance stores one fresh HPKE envelope;
+        exact replay returns the original immutable receipt with no writes.
+      x-dirextalk-authentication:
+        kind: active-device
+        header: Authorization
+        required: true
+        authenticated-session-equals-provider-descriptor: true
+        candidate-can-never-be-provider: true
+        provider-mismatch-status: 403
+      x-dirextalk-path-body-binding:
+        request-id-path: request_id
+        request-id-cbor-path: [2]
+        comparison: exact
+        reject: reject-before-durable-writes
+      x-dirextalk-idempotency:
+        digest-domain: "dirextalk.recovery-scope-catalog-handoff-response-idempotency.v2\0"
+        scope: operation+identity+request
+        same-key-identical-body: byte-identical-original-receipt-no-writes
+        same-key-changed-body: 409
+        different-key-after-existence: 409
+        raw-key-persisted-or-returned: false
+        key-pattern: '^[A-Za-z0-9_-]{16,128}$'
+        committed-exact-replay-currentness: not-rechecked
+      x-dirextalk-reject-before-write-order:
+        - media-accept-and-size
+        - exact-canonical-cbor
+        - authorization-and-provider-session
+        - path-and-preparation-binding
+        - idempotency-key-shape-and-claim-lookup
+        - exact-body-dual-signatures-typed-authority-and-public-digest-match
+        - public-aad-and-envelope-structure-validation-no-package-decryption
+        - committed-exact-claim-resolution-before-mutable-currentness
+        - mutable-device-add-identity-public-catalog-candidate-provider-authority-currentness-first-admission-only
+        - one-final-cas-first-admission-only
+      x-dirextalk-cas-transaction:
+        count: one
+        lock-order: [identity, challenge, preparation]
+        final-predicate-fences:
+          - exact-identity-h-head-at-h-h-plus-1-and-head-at-h-plus-1
+          - exact-enrollment-challenge
+          - exact-signed-preparation-and-stored-preparation-receipt
+          - public-signed-catalog-id-generation-head-root-count-authority-and-validity
+          - provider-session-device-id-ed25519-key-and-currentness
+          - authority-kind-id-ed25519-key-and-currentness
+          - candidate-device-ed25519-x25519-and-device-add
+          - idempotency-claim-key-and-exact-body-digest
+        first-acceptance-writes: [provider-response, hpke-envelope, immutable-provider-response-receipt]
+        exact-replay-writes: none
+        partial-write: forbidden
+      x-dirextalk-portable-evidence:
+        dual-signatures: issuance-evidence-only
+        first-admission-and-get-require: origin-authenticated-exact-identity-log-state-at-h-plus-1
+        authenticated-committed-exact-replay: before-mutable-currentness
+        exact-transition: direct-device-add
+        first-admission-and-get-current-provider-and-authority-required: true
+        no-h-plus-2: true
+        portable-checkpoint-claimed: false
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/DeviceAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/ProviderReceiptAccept'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.recovery-scope-catalog-provider-response.v2+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-cddl-rule: recovery-scope-catalog-provider-response-v2
+            x-dirextalk-max-device-add-bytes: 533
+            x-dirextalk-max-hpke-envelope-bytes: 1049517
+            x-dirextalk-max-body-bytes: 1050929
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/ProviderResponseCreated'}
+        '200': {$ref: '#/components/responses/ProviderResponseReplay'}
+        '401': {$ref: '#/components/responses/DeviceAuthenticationFailed'}
+        '403': {$ref: '#/components/responses/HandoffProviderForbidden'}
+        '406': {$ref: '#/components/responses/HandoffNotAcceptable'}
+        '409': {$ref: '#/components/responses/HandoffConflict'}
+        '410': {$ref: '#/components/responses/HandoffGone'}
+        '412': {$ref: '#/components/responses/HandoffProviderPreconditionFailed'}
+        '413': {$ref: '#/components/responses/HandoffTooLarge'}
+        '415': {$ref: '#/components/responses/HandoffUnsupportedMedia'}
+        '422': {$ref: '#/components/responses/HandoffInvalidExactCbor'}
+components:
+  parameters:
+    CatalogId:
+      name: catalog_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    RequestId:
+      name: request_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    DeviceAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      description: Active-device bearer authorization.
+      schema: {type: string}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 16, maxLength: 128, pattern: '^[A-Za-z0-9_-]{16,128}$'}
+    EnrollmentCapability:
+      name: DTX-Enrollment-Capability
+      in: header
+      required: true
+      schema: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
+    ResponseCapability:
+      name: DTX-Recovery-Response-Capability
+      in: header
+      required: true
+      schema: {type: string, pattern: '^[A-Za-z0-9_-]{43}$'}
+    StatusAccept:
+      name: Accept
+      in: header
+      required: true
+      schema: {type: string, const: application/vnd.dirextalk.recovery-scope-catalog-status.v2+cbor}
+    ProviderReceiptAccept:
+      name: Accept
+      in: header
+      required: true
+      schema: {type: string, const: application/vnd.dirextalk.recovery-scope-catalog-provider-response-receipt.v2+cbor}
+  schemas:
+    ExactCanonicalCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    ErrorEnvelopeV2:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, request_id, retryable]
+          properties:
+            code: {type: string}
+            request_id: {$ref: '#/components/headers/XRequestId/schema'}
+            retryable: {type: boolean}
+    DeviceAuthenticationErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [DEVICE_AUTHENTICATION_FAILED]}
+                retryable: {type: boolean, const: false}
+    CatalogConflictErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [RECOVERY_CATALOG_CONFLICT, IDEMPOTENCY_CONFLICT]}
+                retryable: {type: boolean, const: false}
+    CatalogGoneErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [RECOVERY_CATALOG_EXPIRED]}
+                retryable: {type: boolean, const: false}
+    CatalogPreconditionErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [CATALOG_HEAD_CHANGED, CATALOG_AUTHORITY_CHANGED]}
+                retryable: {type: boolean, const: false}
+    InvalidCatalogErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [EXACT_CBOR_INVALID, RECOVERY_CATALOG_INVALID]}
+                retryable: {type: boolean, const: false}
+    HandoffCapabilityErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [RECOVERY_RESPONSE_CAPABILITY_REJECTED]}
+                retryable: {type: boolean, const: false}
+    HandoffProviderForbiddenErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [RECOVERY_PROVIDER_FORBIDDEN]}
+                retryable: {type: boolean, const: false}
+    HandoffNotAcceptableErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [RECOVERY_HANDOFF_NOT_ACCEPTABLE]}
+                retryable: {type: boolean, const: false}
+    HandoffConflictErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [IDEMPOTENCY_CONFLICT, RECOVERY_PREPARATION_CONFLICT]}
+                retryable: {type: boolean, const: false}
+    HandoffGoneErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [RECOVERY_PREPARATION_EXPIRED, RECOVERY_PREPARATION_REVOKED]}
+                retryable: {type: boolean, const: false}
+    HandoffPreconditionErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [IDENTITY_HEAD_CHANGED, CATALOG_HEAD_CHANGED, CATALOG_AUTHORITY_CHANGED, CANDIDATE_KEY_CHANGED]}
+                retryable: {type: boolean, const: false}
+    HandoffProviderPreconditionErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [IDENTITY_HEAD_CHANGED, CATALOG_HEAD_CHANGED, CATALOG_AUTHORITY_CHANGED, CANDIDATE_KEY_CHANGED, PROVIDER_KEY_CHANGED, AUTHORITY_CHANGED]}
+                retryable: {type: boolean, const: false}
+    HandoffTooLargeErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [RECOVERY_HANDOFF_TOO_LARGE]}
+                retryable: {type: boolean, const: false}
+    HandoffUnsupportedMediaErrorV2:
+      allOf:
+        - {$ref: '#/components/schemas/ErrorEnvelopeV2'}
+        - type: object
+          properties:
+            error:
+              type: object
+              properties:
+                code: {type: string, enum: [RECOVERY_HANDOFF_UNSUPPORTED_MEDIA_TYPE]}
+                retryable: {type: boolean, const: false}
+  headers:
+    NoStore:
+      schema: {type: string, const: no-store}
+    NoSniff:
+      schema: {type: string, const: nosniff}
+    XRequestId:
+      schema: {$ref: '#/components/schemas/UuidV7'}
+  responses:
+    CatalogCreated:
+      description: Created; returns the exact signed V2 catalog head bytes.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-head.v2+cbor:
+          x-dirextalk-exact-cbor: true
+          x-dirextalk-max-body-bytes: 466
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    CatalogReplay:
+      description: Exact request replay; returns byte-identical signed V2 catalog head bytes.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-head.v2+cbor:
+          x-dirextalk-exact-cbor: true
+          x-dirextalk-max-body-bytes: 466
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    PreparationCreated:
+      description: First acceptance; immutable preparation receipt binds request, signed-preparation digest, and stored accepted_at.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-preparation-receipt.v2+cbor:
+          x-dirextalk-exact-cbor: true
+          x-dirextalk-cddl-rule: recovery-scope-catalog-preparation-receipt-v2
+          x-dirextalk-max-body-bytes: 87
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    PreparationReplay:
+      description: Exact replay; byte-identical original preparation receipt and no writes.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-preparation-receipt.v2+cbor:
+          x-dirextalk-exact-cbor: true
+          x-dirextalk-cddl-rule: recovery-scope-catalog-preparation-receipt-v2
+          x-dirextalk-max-body-bytes: 87
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    ProviderResponseCreated:
+      description: First acceptance; immutable provider-response receipt binds request, full response digest, and stored accepted_at.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-provider-response-receipt.v2+cbor:
+          x-dirextalk-exact-cbor: true
+          x-dirextalk-cddl-rule: recovery-scope-catalog-provider-response-receipt-v2
+          x-dirextalk-max-body-bytes: 87
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    ProviderResponseReplay:
+      description: Exact replay; byte-identical original provider-response receipt, stored HPKE envelope, and no writes.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-provider-response-receipt.v2+cbor:
+          x-dirextalk-exact-cbor: true
+          x-dirextalk-cddl-rule: recovery-scope-catalog-provider-response-receipt-v2
+          x-dirextalk-max-body-bytes: 87
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    HandoffStatus:
+      description: Mutable pending, ready, expired, cancelled, or invalidated status; only ready embeds the stored provider response.
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/vnd.dirextalk.recovery-scope-catalog-status.v2+cbor:
+          x-dirextalk-exact-cbor: true
+          x-dirextalk-cddl-rule: recovery-scope-catalog-status-v2
+          x-dirextalk-max-body-bytes: 1050986
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    DeviceAuthenticationFailed:
+      description: DEVICE_AUTHENTICATION_FAILED; active-device authorization failed and no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/DeviceAuthenticationErrorV2'}
+    HandoffCapabilityRejected:
+      description: RECOVERY_RESPONSE_CAPABILITY_REJECTED; no existence disclosure and no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/HandoffCapabilityErrorV2'}
+    HandoffProviderForbidden:
+      description: RECOVERY_PROVIDER_FORBIDDEN; the active device is not the current provider or is the candidate, and no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/HandoffProviderForbiddenErrorV2'}
+    HandoffNotAcceptable:
+      description: RECOVERY_HANDOFF_NOT_ACCEPTABLE; Accept is absent or not the exact response media type, and no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/HandoffNotAcceptableErrorV2'}
+    HandoffConflict:
+      description: IDEMPOTENCY_CONFLICT or RECOVERY_PREPARATION_CONFLICT; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/HandoffConflictErrorV2'}
+    HandoffGone:
+      description: RECOVERY_PREPARATION_EXPIRED or RECOVERY_PREPARATION_REVOKED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/HandoffGoneErrorV2'}
+    HandoffPreconditionFailed:
+      description: IDENTITY_HEAD_CHANGED, CATALOG_HEAD_CHANGED, CATALOG_AUTHORITY_CHANGED, or CANDIDATE_KEY_CHANGED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/HandoffPreconditionErrorV2'}
+    HandoffProviderPreconditionFailed:
+      description: IDENTITY_HEAD_CHANGED, CATALOG_HEAD_CHANGED, CATALOG_AUTHORITY_CHANGED, CANDIDATE_KEY_CHANGED, PROVIDER_KEY_CHANGED, or AUTHORITY_CHANGED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/HandoffProviderPreconditionErrorV2'}
+    HandoffTooLarge:
+      description: RECOVERY_HANDOFF_TOO_LARGE; the exact request exceeds its frozen cap and no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/HandoffTooLargeErrorV2'}
+    HandoffUnsupportedMedia:
+      description: RECOVERY_HANDOFF_UNSUPPORTED_MEDIA_TYPE; Content-Type is not exact and no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/HandoffUnsupportedMediaErrorV2'}
+    HandoffInvalidExactCbor:
+      description: EXACT_CBOR_INVALID or RECOVERY_CATALOG_INVALID; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/InvalidCatalogErrorV2'}
+    CatalogConflict:
+      description: RECOVERY_CATALOG_CONFLICT or IDEMPOTENCY_CONFLICT; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/CatalogConflictErrorV2'}
+    CatalogGone:
+      description: RECOVERY_CATALOG_EXPIRED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/CatalogGoneErrorV2'}
+    HeadOrAuthorityChanged:
+      description: CATALOG_HEAD_CHANGED or CATALOG_AUTHORITY_CHANGED; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/CatalogPreconditionErrorV2'}
+    InvalidExactCbor:
+      description: EXACT_CBOR_INVALID or RECOVERY_CATALOG_INVALID; no write occurs.
+      x-dirextalk-request-id-header-matches-body: true
+      headers:
+        Cache-Control: {$ref: '#/components/headers/NoStore'}
+        X-Content-Type-Options: {$ref: '#/components/headers/NoSniff'}
+        X-Request-Id: {$ref: '#/components/headers/XRequestId'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/InvalidCatalogErrorV2'}

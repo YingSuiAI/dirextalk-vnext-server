@@ -413,6 +413,9 @@ impl PostgresHarness {
                 TO dtx_runtime_test;
 
              GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
+             GRANT USAGE ON SCHEMA messaging TO dtx_identity_runtime;
+             GRANT EXECUTE ON FUNCTION messaging.is_uuid_v7(uuid)
+                TO dtx_identity_runtime;
              GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA identity TO dtx_identity_runtime;
              GRANT SELECT, INSERT, UPDATE ON identity.log_heads TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.log_entries TO dtx_identity_runtime;
@@ -447,6 +450,16 @@ impl PostgresHarness {
              GRANT SELECT, INSERT ON
                 identity.contact_delivery_outbox,
                 identity.contact_owner_commands
+                TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.recovery_scope_catalogs
+                TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.recovery_scope_catalog_preparations
+                TO dtx_identity_runtime;
+             GRANT UPDATE(
+                provider_response_bytes,provider_response_digest,provider_device_id,
+                provider_signing_key,provider_ciphertext_digest,provider_expires_at_ms,
+                provider_idempotency_key_hash,provider_recorded_at_ms
+             ) ON identity.recovery_scope_catalog_preparations
                 TO dtx_identity_runtime;
 
              GRANT USAGE ON SCHEMA system TO dtx_group_runtime;

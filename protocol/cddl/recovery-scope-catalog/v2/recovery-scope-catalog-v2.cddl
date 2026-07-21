@@ -1,0 +1,603 @@
+; V42 encrypted recovery-scope catalog core. V1 remains byte-for-byte frozen.
+; UUID values use lower-case hyphenated RFC UUIDv7 spelling. Identity and
+; channel IDs use canonical lower-case dtxi1 and dtxc1 self-certifying text.
+; HTTPS authority origins are exactly `https://` plus a lower-case ASCII DNS
+; host and optional non-default decimal port: no IP literal, trailing dot,
+; userinfo, path, trailing slash, query, or fragment. These semantic forms are
+; checked above CDDL. Digests and keys are raw 32 bytes; Ed25519 signatures are
+; raw 64 bytes.
+; All maps use deterministic canonical CBOR. Digest = SHA-256(domain || exact
+; bytes named below). Strict Ed25519 rejects non-canonical keys/signatures and
+; signs signature-domain || exact deterministic canonical unsigned CBOR.
+; Every quoted domain below is UTF-8 including its displayed terminal NUL.
+; membership-receipt-domain = `dirextalk.recovery-scope-membership-receipt.v1\0`.
+; recovery-scope-domain = `dirextalk.recovery-scope.v1\0`.
+; private-body-domain = `dirextalk.recovery-scope-catalog-private-body.v2\0`.
+; opening-domain = `dirextalk.recovery-scope-catalog-opening.v2\0`.
+; verifier-binding-domain = `dirextalk.recovery-scope-catalog-verifier-binding.v1\0`.
+; verifier-binding-signature-domain = `dirextalk.recovery-scope-catalog-verifier-binding-signature.v1\0`.
+; completion-verifier-descriptor-domain = `dirextalk.recovery-scope-catalog-completion-verifier-descriptor.v1\0`.
+; completion-verifier-descriptor-signature-domain = `dirextalk.recovery-scope-catalog-completion-verifier-descriptor-signature.v1\0`.
+; completion-evidence-pop-domain = `dirextalk.recovery-scope-catalog-completion-evidence-pop.v1\0`.
+; completion-evidence-origin-authorization-domain = `dirextalk.recovery-scope-catalog-completion-evidence-origin-authorization.v1\0`.
+; completion-evidence-authorization-digest-domain = `dirextalk.recovery-scope-catalog-completion-evidence-authorization-digest.v1\0`.
+; leaf-commitment-domain = `dirextalk.recovery-scope-catalog-leaf-commitment.v2\0`.
+; ciphertext-domain = `dirextalk.recovery-scope-catalog-ciphertext.v2\0`.
+; head-domain = `dirextalk.recovery-scope-catalog-head.v2\0`.
+; head-signature-domain = `dirextalk.recovery-scope-catalog-head-signature.v2\0`.
+; merkle-node-domain = `dirextalk.recovery-scope-catalog-node.v2\0`.
+; response-capability-domain = `dirextalk.recovery-response-capability.v1\0`.
+; recipient-key-domain = `dirextalk.recovery-recipient-key.v1\0`.
+; device-history-authority-id-domain = `dirextalk.device-history-authority-id.v1\0`.
+; identity-device-add-domain = `dirextalk.identity-device-add.v1\0`.
+; preparation-idempotency-domain = `dirextalk.recovery-scope-catalog-handoff-preparation-idempotency.v2\0`.
+; response-idempotency-domain = `dirextalk.recovery-scope-catalog-handoff-response-idempotency.v2\0`.
+; preparation-signature-domain = `dirextalk.recovery-scope-catalog-handoff-preparation-signature.v2\0`.
+; preparation-digest-domain = `dirextalk.recovery-scope-catalog-handoff-preparation-digest.v2\0`.
+; provider-package-domain = `dirextalk.recovery-scope-catalog-handoff-provider-package.v2\0`.
+; provider-aad-domain = `dirextalk.recovery-scope-catalog-handoff-provider-aad.v2\0`.
+; provider-envelope-domain = `dirextalk.recovery-scope-catalog-handoff-provider-envelope.v2\0`.
+; provider-signature-domain = `dirextalk.recovery-scope-catalog-handoff-provider-signature.v2\0`.
+; provider-authority-signature-domain = `dirextalk.recovery-scope-catalog-handoff-provider-authority-signature.v2\0`.
+; provider-response-domain = `dirextalk.recovery-scope-catalog-handoff-provider-response.v2\0`.
+; hpke-info = `dirextalk.recovery-scope-catalog-handoff-hpke.v2\0`.
+; membership receipt digest = SHA-256(membership-receipt-domain || exact field-6 bytes).
+; recovery-scope digest = SHA-256(recovery-scope-domain || exact canonical CBOR(field 5)).
+; private-body digest = SHA-256(private-body-domain || exact canonical CBOR(private-body-v2)).
+; opening digest = SHA-256(opening-domain || exact canonical CBOR(recovery-scope-catalog-opening-v2)).
+; signed verifier-binding digest = SHA-256(verifier-binding-domain || exact canonical CBOR(signed verifier-binding-v1)).
+; verifier-binding signature input = verifier-binding-signature-domain || exact canonical CBOR(unsigned verifier-binding-v1).
+; completion-verifier descriptor digest = SHA-256(completion-verifier-descriptor-domain || exact canonical CBOR(signed descriptor-v1)).
+; completion-verifier descriptor signature input = completion-verifier-descriptor-signature-domain || exact canonical CBOR(unsigned descriptor fields 1..7).
+; completion-evidence ESK proof input = completion-evidence-pop-domain || exact canonical CBOR(binding fields 1..20).
+; completion-evidence origin authorization input = completion-evidence-origin-authorization-domain || exact canonical CBOR(binding fields 1..21).
+; completion-evidence authorization digest A = SHA-256(completion-evidence-authorization-digest-domain || exact canonical CBOR(binding fields 1..22)).
+; leaf-commitment digest = SHA-256(leaf-commitment-domain || exact canonical CBOR(leaf-commitment-v2)).
+; ciphertext digest = SHA-256(ciphertext-domain || exact opaque upload ciphertext bytes).
+; signed head digest = SHA-256(head-domain || exact canonical CBOR(signed head-v2)).
+; head signature input = head-signature-domain || exact canonical CBOR(unsigned head-v2).
+; Merkle node digest = SHA-256(merkle-node-domain || left32 || right32).
+; response-capability digest = SHA-256(response-capability-domain || exact raw response capability bytes).
+; recipient-key digest = SHA-256(recipient-key-domain || exact candidate X25519 public-key bytes).
+; root/recovery authority key digest = SHA-256(device-history-authority-id-domain || exact Ed25519 public-key bytes).
+; DeviceAdd event digest = SHA-256(identity-device-add-domain || exact direct DeviceAdd canonical CBOR bytes).
+; preparation idempotency digest = SHA-256(preparation-idempotency-domain || exact raw Idempotency-Key bytes).
+; response idempotency digest = SHA-256(response-idempotency-domain || exact raw Idempotency-Key bytes).
+; preparation signature input = preparation-signature-domain || exact deterministic canonical CBOR(unsigned preparation fields 1..16).
+; signed preparation digest = SHA-256(preparation-digest-domain || exact deterministic canonical CBOR(signed preparation fields 1..17)).
+; decrypted package digest = SHA-256(provider-package-domain || exact deterministic canonical CBOR(decrypted package)).
+; public AAD digest = SHA-256(provider-aad-domain || exact deterministic canonical CBOR(public AAD)).
+; RFC 9180 Seal/Open aad input = exact deterministic canonical CBOR bytes of
+; recovery-scope-catalog-provider-public-aad-v2, with no digest, domain prefix,
+; JSON, hex, or alternate CBOR encoding. Response field 18 remains the public
+; AAD digest above and is not the HPKE aad input. C1b-B must freeze a
+; deterministic HPKE vector for this exact raw-byte selection.
+; HPKE envelope digest = SHA-256(provider-envelope-domain || exact deterministic canonical CBOR(HPKE envelope)).
+; provider signature input = provider-signature-domain || exact deterministic canonical CBOR(provider response unsigned fields 1..22).
+; authority signature input = provider-authority-signature-domain || exact deterministic canonical CBOR(provider response unsigned fields 1..22).
+; provider response digest = SHA-256(provider-response-domain || exact deterministic canonical CBOR(full provider response fields 1..26)).
+digest = bstr .size 32
+signature = bstr .size 64
+ed25519-public-key = bstr .size 32
+completion-evidence-algorithm = 1       ; Ed25519 only
+completion-evidence-purpose = 1         ; history-recovery-completion-evidence-issuer-v2 only
+hiding-nonce = bstr .size 32
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+channel-id = tstr .size 57
+safe-uint = 0..9007199254740991
+safe-highwater = 0..9007199254740990
+positive-uint = 1..9007199254740991
+positive-safe-successor = 1..9007199254740991
+; A minimum structurally valid opening is 1019 bytes for indices 1..23 and the
+; minimum outer plaintext overhead is 147 bytes. Its one-based index occurs in
+; private-body field 4, signed-binding field 5, and public-leaf field 4, so
+; indices 24..255 add 3 bytes per opening and indices 256+ add 6. Therefore
+; N=1023 requires exactly 147 + 1023*1019 + 232*3 + 768*6 = 1047888 bytes and
+; fits the 1048576-byte exact plaintext ceiling. N=1024 requires 1048913 bytes
+; and cannot fit. This is a structural CDDL plus consecutive-index semantic
+; size boundary, not a 1023-opening full-cryptographic fixture.
+catalog-count = 1..1023
+utc-millis = 0..9007199254740991
+https-authority-origin = tstr .size (9..2048)
+recovery-scope = { 1: 1, 2: uuid-v7 } / { 1: 2, 2: channel-id }
+
+; Candidate-decrypted only. The catalog authority never receives this body.
+; Fields 2..4 match the containing plaintext and opening position. Fields 7
+; and 9 hash the exact receipt bytes and canonical field-5 scope bytes. Field
+; 10 is a unique unpredictable per-leaf nonce covered by the private-body
+; digest. Validation rejects an absent, all-zero, or catalog-reused nonce.
+recovery-scope-catalog-private-body-v2 = {
+  1: 2,
+  2: uuid-v7,                  ; catalog_id
+  3: positive-uint,            ; generation
+  4: catalog-count,            ; one-based index
+  5: recovery-scope,
+  6: bstr .size (1..4096),      ; opaque authority membership receipt
+  7: digest,                    ; owning-contract domain hash of exact field 6
+  8: digest,                    ; authoritative group head digest
+  9: digest,                    ; owning-contract domain hash of canonical field 5
+  10: hiding-nonce              ; unique unpredictable per-leaf hiding nonce
+}
+
+; Candidate-fetched over an origin-authenticated channel. The current verifier
+; key proves possession by signing its exact descriptor. Its digest is carried
+; in binding field 11. No identity-home endpoint or evidence-key handle exists.
+; Fields 6..7 form a nonempty interval and the descriptor is current at use.
+recovery-scope-catalog-completion-verifier-descriptor-unsigned-v1 = {
+  1: 1,
+  2: https-authority-origin,
+  3: uuid-v7,                  ; current verifier key_id
+  4: ed25519-public-key,
+  5: positive-uint,            ; monotonic descriptor epoch
+  6: utc-millis,               ; issued_at
+  7: utc-millis                ; expires_at
+}
+recovery-scope-catalog-completion-verifier-descriptor-v1 = {
+  1: 1, 2: https-authority-origin, 3: uuid-v7,
+  4: ed25519-public-key, 5: positive-uint,
+  6: utc-millis, 7: utc-millis,
+  8: signature                 ; field-4 key signs exact fields 1..7
+}
+
+; Public completion verifier information, origin-authorized and then signed by
+; the catalog authority key. Scope-origin service generates and non-exportably
+; holds field-18's persistent per-catalog/per-leaf completion-evidence issuer
+; ESK through catalog validity. Caller-supplied issuer EPK/PoP is forbidden,
+; exact tuple retry returns the same authorization, and the candidate never
+; receives the issuer ESK. Fields 1..15 retain their original meanings.
+; Fields 2..5 match the enclosing plaintext/private body; field 6 hashes the
+; exact canonical private body. Fields 14..15 identify the same authority
+; device/key as the signed catalog head, whose field-13 public key verifies the
+; field-23 signature over exact canonical fields 1..22.
+; Fields 12 and 13 are issued_at and expires_at with issued_at < expires_at.
+; Head issued_at <= binding issued_at < binding expires_at <= head expires_at.
+; Fields 16..17 are closed enums. Field 18 is a globally unique Ed25519 issuer
+; EPK across all retained Catalog V2 bindings and generations. Fields 19..20
+; are its nonempty authorization interval contained by the current descriptor,
+; binding, and catalog validity. Every leaf in one Catalog uses one exact
+; catalog-wide issuer authorization window. Field 21 proves issuer-ESK
+; possession over exact fields 1..20. The current origin-verifier descriptor
+; key authorizes exact fields 1..21 in field 22. Neither authorization may
+; reference A, B, a leaf digest, Merkle/root/head, ciphertext, or completion
+; digest. A hashes exact fields 1..22; B hashes the full signed binding.
+; After decrypting, the candidate validates every verifier tuple (origin,
+; key_id, public key, epoch, descriptor digest) against the current
+; origin-authenticated descriptor before accepting or delivering any leaf.
+; Before downstream child issuance, descriptor or Catalog invalidation stops
+; new work. After an exact child certificate and evidence commit, routine
+; descriptor rotation or ordinary MLS head advance is non-retroactive. The
+; identity server
+; cannot observe or enforce this hidden tuple.
+; Issuer EPK, issuer authorization window, and A remain hidden from
+; upload/handoff server projections; only later redacted Completion V2 leaf
+; entries disclose them. Downstream, each recovery request receives a globally
+; fresh child
+; EPK, child PoP, and issuer-signed certificate; that child ESK signs exactly
+; one evidence and is destroyed. The child-issuance transaction is the
+; descriptor/normal-MLS-currentness linearization point. Once its exact child
+; certificate and evidence commit, routine descriptor rotation or ordinary MLS
+; head advance is non-retroactive and exact replay remains valid. No single-use
+; Catalog-head
+; reservation exists.
+; Multiple preparations and recovery requests may use one signed Catalog head.
+; Issuer fields, A, B, and the leaf contain no request-dependent data. Identity
+; later verifies only committed issuer delegation plus the child signature; it
+; cannot prove hidden origin currentness or HSM custody.
+recovery-scope-catalog-completion-verifier-binding-unsigned-v1 = {
+  1: 1,
+  2: identity-id,
+  3: uuid-v7,                  ; catalog_id
+  4: positive-uint,            ; generation
+  5: catalog-count,            ; one-based index
+  6: digest,                   ; exact private-body-v2 digest
+  7: https-authority-origin,   ; validator enforces canonical HTTPS authority origin
+  8: uuid-v7,                  ; verifier key_id
+  9: ed25519-public-key,
+  10: positive-uint,           ; monotonic verifier descriptor epoch
+  11: digest,                  ; exact current verifier descriptor digest
+  12: utc-millis,              ; issued_at
+  13: utc-millis,              ; expires_at
+  14: uuid-v7,                 ; catalog-authority device_id
+  15: uuid-v7,                 ; catalog-authority key_id
+  16: completion-evidence-algorithm,
+  17: completion-evidence-purpose,
+  18: ed25519-public-key,       ; persistent completion-evidence issuer EPK; no key ID/handle
+  19: utc-millis,              ; issuer authorization not_before_ms
+  20: utc-millis,              ; issuer authorization expires_at_ms
+  21: signature,               ; issuer-ESK PoP signs exact fields 1..20
+  22: signature                ; current origin verifier signs exact fields 1..21
+}
+recovery-scope-catalog-completion-verifier-binding-v1 = {
+  1: 1, 2: identity-id, 3: uuid-v7, 4: positive-uint,
+  5: catalog-count, 6: digest, 7: https-authority-origin,
+  8: uuid-v7, 9: ed25519-public-key, 10: positive-uint,
+  11: digest, 12: utc-millis, 13: utc-millis,
+  14: uuid-v7, 15: uuid-v7,
+  16: completion-evidence-algorithm,
+  17: completion-evidence-purpose,
+  18: ed25519-public-key,
+  19: utc-millis, 20: utc-millis,
+  21: signature, 22: signature,
+  23: signature                ; catalog authority signs exact fields 1..22
+}
+
+recovery-scope-catalog-leaf-commitment-v2 = {
+  1: 2,
+  2: uuid-v7,                  ; catalog_id
+  3: positive-uint,            ; generation
+  4: catalog-count,            ; one-based index
+  5: digest,                   ; exact private-body-v2 digest
+  6: digest,                   ; B: exact full signed verifier-binding digest
+  7: completion-evidence-algorithm,
+  8: completion-evidence-purpose,
+  9: ed25519-public-key,       ; exact binding field-18 issuer EPK
+  10: utc-millis,              ; exact issuer authorization not_before_ms
+  11: utc-millis,              ; exact issuer authorization expires_at_ms
+  12: digest                   ; A: exact fields1..22 authorization digest
+}
+; All three members carry the same catalog_id, generation, and one-based index.
+; The leaf digests are of the exact canonical field-1 body and signed field-2
+; binding, so an opening cannot be combined from different catalog entries.
+; The opening digest covers this exact complete three-field canonical map:
+; candidate-private body, full signed issuer binding, and public leaf only.
+recovery-scope-catalog-opening-v2 = {
+  1: recovery-scope-catalog-private-body-v2,
+  2: recovery-scope-catalog-completion-verifier-binding-v1,
+  3: recovery-scope-catalog-leaf-commitment-v2
+}
+; Field 8 has exactly the head field-6 count of openings. Their indices are
+; consecutive 1..N, sorted by exact canonical recovery-scope bytes, and unique.
+; Every opening matches fields 2..4; fields 5..7 equal the signed head values.
+recovery-scope-catalog-plaintext-v2 = {
+  1: 2,
+  2: identity-id,
+  3: uuid-v7,                  ; catalog_id
+  4: positive-uint,            ; generation
+  5: digest / null,            ; previous signed catalog-head digest
+  6: safe-uint,                ; exact pre-enrollment Identity Log H
+  7: digest,                   ; exact Identity Log head at H
+  8: [1*1023 recovery-scope-catalog-opening-v2]
+}
+
+; Fields 2..5 and 9..10 equal the plaintext values. Field 6 is its exact
+; opening count; field 7 is the duplicate-last binary Merkle root of the exact
+; canonical leaf commitments in index order; field 8 hashes upload field 2.
+; Fields 11..13 are the catalog-authority signer. Binding fields 14..15 equal
+; head fields 11..12 and its signature verifies under head field 13. Field 16
+; signs the exact canonical unsigned fields 1..15 with that public key.
+; Fields 14 and 15 are issued_at and expires_at with issued_at < expires_at.
+recovery-scope-catalog-head-unsigned-v2 = {
+  1: 2,
+  2: uuid-v7,                  ; catalog_id
+  3: identity-id,
+  4: positive-uint,            ; generation
+  5: digest / null,            ; previous signed catalog-head digest
+  6: catalog-count,
+  7: digest,                   ; V2 commitment Merkle root
+  8: digest,                   ; opaque ciphertext digest
+  9: safe-uint,                ; exact pre-enrollment Identity Log H
+  10: digest,                  ; exact Identity Log head at H
+  11: uuid-v7,                 ; catalog-authority device_id
+  12: uuid-v7,                 ; catalog-authority key_id
+  13: ed25519-public-key,
+  14: utc-millis,              ; issued_at
+  15: utc-millis               ; expires_at
+}
+recovery-scope-catalog-head-v2 = {
+  1: 2, 2: uuid-v7, 3: identity-id, 4: positive-uint,
+  5: digest / null, 6: catalog-count, 7: digest, 8: digest,
+  9: safe-uint, 10: digest, 11: uuid-v7, 12: uuid-v7,
+  13: ed25519-public-key, 14: utc-millis, 15: utc-millis,
+  16: signature                ; same catalog authority key signs verifier bindings
+}
+recovery-scope-catalog-upload-v2 = {
+  1: recovery-scope-catalog-head-v2,
+  2: bstr .size (1..1048576)    ; opaque encrypted catalog; digest is head field 8
+}
+; Exact maximum = map header/key bytes 3 + signed head 466 + encoded
+; bstr(1048576) 1048581 = 1049050 bytes. The independent 1065984-byte HTTP
+; decoder ceiling is defensive headroom, not a valid upload-body allowance.
+
+; Siblings are bottom-up. Validation uses one-based index and duplicate-last
+; for an odd node without a sibling at every level. Fields 2..3 select the
+; signed head; field 4 is its leaf count; field 5 is the proven 1..count index;
+; field 6 contains only the siblings needed to recompute head field 7.
+; A proof leaf is leaf-commitment-domain hash of exact canonical commitment.
+; At each level, an odd final node duplicates itself and consumes no sibling;
+; otherwise consume exactly one bottom-up sibling, then set count=ceil(count/2)
+; and index=ceil(index/2). Validation rejects surplus or missing siblings, so
+; the array length is exactly implied by count/index and never exceeds 10.
+; Count 1 consumes zero siblings; count 1023 can mathematically require all 10.
+catalog-merkle-proof-v2 = {
+  1: 2,
+  2: uuid-v7,                  ; catalog_id
+  3: positive-uint,            ; generation
+  4: catalog-count,            ; exact signed-head leaf count
+  5: catalog-count,            ; one-based leaf index, not greater than field 4
+  6: [0*10 digest]             ; bottom-up sibling digests
+}
+
+; C1b-A pre-enrollment handoff. The signed catalog-head digest in preparation
+; field 6 is the head-domain digest of the exact signed V2 head. request_id is
+; exactly the owning enrollment challenge_id. Candidate field 9 is the same
+; X25519 key as enrollment-candidate field 5 and the direct DeviceAdd
+; certificate encryption key. Field 12 is fresh, nonzero, and unique.
+; Runtime derives field 9 from the candidate protected X25519 secret and
+; requires exact equality with the verified DeviceAdd key; an arbitrary
+; caller-supplied recovery key is never accepted.
+x25519-public-key = bstr .size 32
+; Exact signed-head maximum = map header 1 + sixteen one-byte keys 16 +
+; values 449 = 466 bytes. Its enclosing bstr encoding is therefore 469 bytes.
+exact-signed-catalog-head-v2 = bstr .size (1..466)
+exact-catalog-plaintext-v2 = bstr .size (1..1048576)
+; Current IdentityLogEventV1 wire-1.1 DeviceAdd maximum is 533 deterministic-
+; CBOR bytes: its exact 1.1 wire-version is 13 bytes, its maximum certificate
+; is 296 bytes, and the remaining fixed
+; event/payload coordinates, keys, digests, timestamps, and signatures.
+exact-device-add-event-v1 = bstr .size (1..533)
+exact-provider-package-v2 = bstr .size (1..1049457)
+hpke-ciphertext-v2 = bstr .size (17..1049473)
+exact-hpke-envelope-v2 = bstr .size (1..1049517)
+exact-provider-response-v2 = bstr .size (1..1050929)
+exact-ready-status-v2 = bstr .size (1..1050986)
+
+recovery-scope-catalog-preparation-unsigned-v2 = {
+  1: 2,
+  2: uuid-v7,                  ; request_id == enrollment challenge_id
+  3: identity-id,
+  4: uuid-v7,                  ; catalog_id
+  5: positive-uint,            ; generation
+  6: digest,                   ; exact signed Catalog V2 head digest
+  7: uuid-v7,                  ; candidate device_id
+  8: ed25519-public-key,       ; candidate signing public key
+  9: x25519-public-key,        ; candidate recipient public key
+  10: safe-highwater,          ; exact pre-enrollment H
+  11: digest,                  ; exact Identity Log head at H
+  12: bstr .size 32,           ; fresh nonzero candidate nonce
+  13: digest,                  ; response-capability digest
+  14: digest,                  ; preparation Idempotency-Key digest
+  15: utc-millis,              ; issued_at
+  16: utc-millis               ; expires_at
+}
+recovery-scope-catalog-preparation-v2 = {
+  1: 2, 2: uuid-v7, 3: identity-id, 4: uuid-v7,
+  5: positive-uint, 6: digest, 7: uuid-v7,
+  8: ed25519-public-key, 9: x25519-public-key,
+  10: safe-highwater, 11: digest, 12: bstr .size 32,
+  13: digest, 14: digest, 15: utc-millis, 16: utc-millis,
+  17: signature                ; candidate signs exact fields 1..16
+}
+
+; Provider and independent authority are closed descriptors. Active-device
+; authority IDs are explicit device IDs. Root/recovery authority IDs are the
+; device-history-authority-id-domain digest of their exact public-key bytes.
+recovery-scope-catalog-provider-descriptor-v2 = {
+  1: 2,
+  2: uuid-v7,                  ; provider device_id; no key_id exists
+  3: ed25519-public-key
+}
+recovery-scope-catalog-active-authority-v2 = {
+  1: 1,
+  2: uuid-v7,
+  3: ed25519-public-key
+}
+recovery-scope-catalog-root-authority-v2 = {
+  1: 2,
+  2: digest,
+  3: ed25519-public-key
+}
+recovery-scope-catalog-recovery-authority-v2 = {
+  1: 3,
+  2: digest,
+  3: ed25519-public-key
+}
+recovery-scope-catalog-independent-authority-v2 =
+  recovery-scope-catalog-active-authority-v2 /
+  recovery-scope-catalog-root-authority-v2 /
+  recovery-scope-catalog-recovery-authority-v2
+
+; RFC9180 base mode only: KEM 0x0020 X25519/HKDF-SHA256, KDF 0x0001
+; HKDF-SHA256, AEAD 0x0003 ChaCha20Poly1305. hpke-info is the exact literal
+; declared above. Field 2 is a fresh first-accept encapsulation; exact retries
+; return the stored envelope. Runtime rejects all-zero or low-order DH output.
+recovery-scope-catalog-hpke-envelope-v2 = {
+  1: 2,
+  2: bstr .size 32,            ; enc
+  3: hpke-ciphertext-v2        ; package ciphertext including 16-byte tag
+}
+
+; The exact canonical package is at most 1049457 bytes before HPKE. This
+; handoff limit does not narrow the independent C1a Catalog plaintext type.
+; The resulting exact deterministic envelope is at most 1049517 bytes; the
+; separate 1065984-byte upload decoder ceiling is not an envelope allowance.
+; The package binds
+; the exact signed Catalog V2 head and exact decrypted Catalog V2 plaintext;
+; neither object is exposed by the HTTP contract.
+recovery-scope-catalog-provider-package-v2 = {
+  1: 2,
+  2: uuid-v7,                  ; request_id
+  3: digest,                   ; exact signed preparation digest
+  4: exact-signed-catalog-head-v2,
+  5: exact-catalog-plaintext-v2,
+  6: identity-id,
+  7: uuid-v7,                  ; catalog_id
+  8: positive-uint,            ; generation
+  9: uuid-v7,                  ; candidate device_id
+  10: x25519-public-key,       ; candidate recipient key
+  11: safe-highwater,          ; H
+  12: digest,                  ; head at H
+  13: positive-safe-successor, ; exactly H+1
+  14: digest,                  ; head at H+1
+  15: digest,                  ; exact direct DeviceAdd event digest
+  16: utc-millis,
+  17: utc-millis
+}
+
+; Public AAD contains only nonsecret coordinates, signer descriptors, exact
+; package digest, response-idempotency digest, and validity times.
+recovery-scope-catalog-provider-public-aad-v2 = {
+  1: 2,
+  2: uuid-v7,                  ; request_id
+  3: digest,                   ; signed preparation digest
+  4: identity-id,
+  5: uuid-v7,                  ; catalog_id
+  6: positive-uint,            ; generation
+  7: digest,                   ; signed catalog-head digest
+  8: uuid-v7,                  ; candidate device_id
+  9: digest,                   ; recipient-key digest
+  10: safe-highwater,          ; H
+  11: digest,                  ; head at H
+  12: positive-safe-successor, ; exactly H+1
+  13: digest,                  ; head at H+1
+  14: digest,                  ; exact direct DeviceAdd event digest
+  15: recovery-scope-catalog-provider-descriptor-v2,
+  16: recovery-scope-catalog-independent-authority-v2,
+  17: digest,                  ; decrypted package digest
+  18: digest,                  ; response Idempotency-Key digest
+  19: utc-millis,
+  20: utc-millis
+}
+
+; Both signatures cover identical exact canonical fields 1..22 under their
+; distinct signature domains. Candidate/provider/authority Ed25519 public keys
+; are pairwise different. An active authority device ID differs from candidate
+; and provider, and the provider authenticated session equals field-15.
+recovery-scope-catalog-provider-response-unsigned-v2 = {
+  1: 2,
+  2: uuid-v7,                  ; request_id
+  3: digest,                   ; signed preparation digest
+  4: identity-id,
+  5: uuid-v7,                  ; catalog_id
+  6: positive-uint,            ; generation
+  7: digest,                   ; signed catalog-head digest
+  8: uuid-v7,                  ; candidate device_id
+  9: digest,                   ; recipient-key digest
+  10: safe-highwater,          ; H
+  11: digest,                  ; head at H
+  12: positive-safe-successor, ; exactly H+1
+  13: digest,                  ; head at H+1
+  14: digest,                  ; exact direct DeviceAdd event digest
+  15: recovery-scope-catalog-provider-descriptor-v2,
+  16: recovery-scope-catalog-independent-authority-v2,
+  17: digest,                  ; decrypted package digest
+  18: digest,                  ; exact public AAD digest
+  19: digest,                  ; exact canonical HPKE envelope digest
+  20: digest,                  ; response Idempotency-Key digest
+  21: utc-millis,
+  22: utc-millis
+}
+recovery-scope-catalog-provider-response-v2 = {
+  1: 2, 2: uuid-v7, 3: digest, 4: identity-id,
+  5: uuid-v7, 6: positive-uint, 7: digest, 8: uuid-v7,
+  9: digest, 10: safe-highwater, 11: digest, 12: positive-safe-successor,
+  13: digest, 14: digest,
+  15: recovery-scope-catalog-provider-descriptor-v2,
+  16: recovery-scope-catalog-independent-authority-v2,
+  17: digest, 18: digest, 19: digest, 20: digest,
+  21: utc-millis, 22: utc-millis,
+  23: signature,               ; provider signature over fields 1..22
+  24: signature,               ; independent-authority signature over same bytes
+  25: exact-device-add-event-v1,
+  26: recovery-scope-catalog-hpke-envelope-v2
+}
+
+; Mutation receipts never change after acceptance, even if GET later reports
+; invalidated. Raw capabilities and Idempotency-Key values are never persisted.
+recovery-scope-catalog-preparation-receipt-v2 = {
+  1: 2, 2: uuid-v7, 3: digest, 4: utc-millis
+}
+recovery-scope-catalog-provider-response-receipt-v2 = {
+  1: 2, 2: uuid-v7, 3: digest, 4: utc-millis
+}
+
+; Status codes: 1 pending, 2 ready, 3 expired, 4 cancelled, 5 invalidated.
+; Field 6 is stable state_changed_at: pending uses preparation accepted_at;
+; ready uses provider accepted_at; expired uses the earliest exact expiry;
+; cancelled uses challenge cancellation time; invalidated uses the exact first
+; invalidating public event/head time. Compare exact transition timestamps and
+; choose the earliest; equal-time state priority is cancelled(4), invalidated(5),
+; expired(3). Invalidated equal-time reason priority is numeric: 1 Identity
+; head/H+2, 2 Catalog id/generation/head, 3 public Catalog authority/head,
+; 4 candidate/DeviceAdd/key, 5 provider session/key, 6 independent authority.
+; GET derives this authoritative status read-only and never creates a transition.
+; Closed invalidation reason codes are exactly 1..6 in that priority order.
+recovery-scope-catalog-status-pending-v2 = {
+  1: 2, 2: uuid-v7, 3: 1, 4: null, 5: null, 6: utc-millis
+}
+recovery-scope-catalog-status-ready-v2 = {
+  1: 2, 2: uuid-v7, 3: 2,
+  4: recovery-scope-catalog-provider-response-v2,
+  5: null, 6: utc-millis
+}
+recovery-scope-catalog-status-expired-v2 = {
+  1: 2, 2: uuid-v7, 3: 3, 4: null, 5: 1, 6: utc-millis
+}
+recovery-scope-catalog-status-cancelled-v2 = {
+  1: 2, 2: uuid-v7, 3: 4, 4: null, 5: 2, 6: utc-millis
+}
+recovery-scope-catalog-status-invalidated-v2 = {
+  1: 2, 2: uuid-v7, 3: 5, 4: null, 5: 1..6, 6: utc-millis
+}
+recovery-scope-catalog-status-v2 =
+  recovery-scope-catalog-status-pending-v2 /
+  recovery-scope-catalog-status-ready-v2 /
+  recovery-scope-catalog-status-expired-v2 /
+  recovery-scope-catalog-status-cancelled-v2 /
+  recovery-scope-catalog-status-invalidated-v2
+
+; Equality/validity matrix: preparation fields 2..11 equal the enrollment
+; challenge/candidate and frozen Catalog coordinates. Response fields 2,4..8,
+; 10..11 equal preparation fields 2..7,10..11; response field 3 is the digest
+; of exact signed preparation fields 1..17 and field 9 is the digest of the
+; exact preparation field-9 X25519 bytes. Package and public AAD repeat their
+; named response/preparation coordinates byte-exactly. Package field 4 is the
+; exact signed head whose head-domain digest equals preparation field 6,
+; response field 7, and AAD field 7. Package field 5 is exact Catalog plaintext:
+; its identity/catalog/generation/previous-head/H/head and derived count/Merkle
+; root equal the exact signed head and the repeated package/response/AAD values.
+; DeviceAdd field 25 is exact canonical Identity Log V1.1 kind DeviceAdd with
+; identity equal response field 4, sequence exactly H+1, predecessor head@H,
+; candidate device/signing/X25519 keys equal preparation fields 7..9, valid
+; certificate and event signatures, and identity-device-add-domain digest equal
+; response/package/AAD DeviceAdd digest. H is safe-highwater and H+1 is its
+; exact positive +1 successor; every repeated H/head pair is byte-equal.
+; Preparation, response, package, and AAD each require issued_at < expires_at;
+; response/package/AAD times are byte-equal, acceptance times are stored once,
+; and response validity is contained by preparation and signed-Catalog validity.
+; Candidate/provider/authority Ed25519 keys are pairwise distinct; candidate
+; signing bytes also differ from candidate recipient X25519 bytes; active
+; candidate/provider/authority device IDs are pairwise distinct.
+; The identity server validates public AAD/envelope structure and exact digests
+; and signatures only. It fences only the public signed Catalog id, generation,
+; head, root, count, authority, validity, plus current identity, candidate,
+; provider, and independent authority. It never decrypts the package, recomputes
+; package digest, validates Catalog plaintext, or sees/fences a completion-
+; verifier origin/key/epoch/descriptor tuple. After decryption the candidate
+; validates the package digest, exact signed head, Catalog plaintext, equality
+; matrix, and every verifier binding against its current origin-authenticated
+; descriptor before accepting or delivering any leaf. Before durable issuance
+; of the exact child certificate and evidence, verifier rotation invalidates
+; candidate-local outstanding work and stops completion. After that issuance,
+; routine descriptor rotation or ordinary MLS head advance is non-retroactive;
+; exact committed cache/replay remains valid, and no single-use Catalog-head
+; reservation exists. Explicit candidate, device, member, Catalog, or request
+; revocation still fences cache use and routing.
+;
+; Portable dual signatures are issuance evidence only. First admission and
+; status delivery require origin-authenticated exact Identity Log state at H+1
+; proving one direct DeviceAdd plus the current provider and authority. There
+; is no H+2 grace state and no portable checkpoint is claimed. The candidate
+; can never be the provider. Pending and ready server status invalidates on any
+; Identity head, public Catalog head/authority, candidate, provider, or authority
+; drift. Hidden verifier invalidation appears only transitively through a new or
+; invalid public Catalog head, never by inspecting a hidden verifier tuple.
+; Challenge DELETE is the sole cancellation truth; no preparation DELETE
+; exists. POST/PUT receipts stay byte-identical and immutable after later GET
+; invalidation. After successful caller authentication and static/body/signature
+; matching, a committed same operation+identity+request Idempotency-Key plus
+; identical body resolves before mutable business currentness and returns the
+; original receipt with no writes. Changed bytes, or any different key after
+; existence, conflict 409. Only first admission runs mutable gates and the one
+; final CAS; GET alone revalidates mutable currentness. Raw capabilities and raw
+; Idempotency-Key values never persist or appear in receipts/status.

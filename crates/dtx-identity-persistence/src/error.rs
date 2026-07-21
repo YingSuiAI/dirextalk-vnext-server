@@ -58,6 +58,28 @@ pub enum IdentityPersistenceError {
     KeyPackageUnavailable,
     /// A `KeyPackage` ID or opaque package digest conflicts with immutable state.
     KeyPackageConflict,
+    /// Recovery bytes were not one exact deterministic canonical-CBOR value.
+    RecoveryExactCborInvalid,
+    /// A catalog generation, predecessor, or immutable body conflicts.
+    RecoveryCatalogConflict,
+    /// The signed catalog was outside its accepted validity window.
+    RecoveryCatalogExpired,
+    /// A preparation or provider response conflicts with immutable state.
+    RecoveryPreparationConflict,
+    /// The response capability did not authenticate candidate status access.
+    RecoveryResponseCapabilityRejected,
+    /// The bounded preparation or response has expired.
+    RecoveryPreparationExpired,
+    /// The linked enrollment was cancelled, closed, or otherwise revoked.
+    RecoveryPreparationRevoked,
+    /// The selected catalog generation, head, or observed identity head changed.
+    RecoveryCatalogHeadChanged,
+    /// The selected catalog authority changed or is no longer active.
+    RecoveryAuthorityChanged,
+    /// The linked candidate identity, device, or public keys changed.
+    RecoveryCandidateKeyChanged,
+    /// A catalog/preparation fence changed after preparation.
+    RecoveryPreparationInvalidated,
     /// Stored rows did not rehydrate to one exact valid identity-log projection.
     CorruptData(&'static str),
 }
@@ -99,6 +121,19 @@ impl fmt::Display for IdentityPersistenceError {
             Self::DeviceEnrollmentChallengeApproved => "device enrollment challenge was approved",
             Self::KeyPackageUnavailable => "key package is unavailable",
             Self::KeyPackageConflict => "key package conflicts with immutable state",
+            Self::RecoveryExactCborInvalid => "recovery catalog bytes are not exact canonical CBOR",
+            Self::RecoveryCatalogConflict => "recovery catalog conflicts with immutable state",
+            Self::RecoveryCatalogExpired => "recovery catalog expired",
+            Self::RecoveryPreparationConflict => {
+                "recovery catalog preparation conflicts with immutable state"
+            }
+            Self::RecoveryResponseCapabilityRejected => "recovery response capability was rejected",
+            Self::RecoveryPreparationExpired => "recovery catalog preparation expired",
+            Self::RecoveryPreparationRevoked => "recovery catalog preparation was revoked",
+            Self::RecoveryCatalogHeadChanged => "recovery catalog head changed",
+            Self::RecoveryAuthorityChanged => "recovery catalog authority changed",
+            Self::RecoveryCandidateKeyChanged => "recovery candidate key changed",
+            Self::RecoveryPreparationInvalidated => "recovery catalog preparation invalidated",
             Self::CorruptData(_) => "identity persistence contained invalid durable data",
         })
     }
@@ -131,6 +166,17 @@ impl Error for IdentityPersistenceError {
             | Self::DeviceEnrollmentChallengeApproved
             | Self::KeyPackageUnavailable
             | Self::KeyPackageConflict
+            | Self::RecoveryExactCborInvalid
+            | Self::RecoveryCatalogConflict
+            | Self::RecoveryCatalogExpired
+            | Self::RecoveryPreparationConflict
+            | Self::RecoveryResponseCapabilityRejected
+            | Self::RecoveryPreparationExpired
+            | Self::RecoveryPreparationRevoked
+            | Self::RecoveryCatalogHeadChanged
+            | Self::RecoveryAuthorityChanged
+            | Self::RecoveryCandidateKeyChanged
+            | Self::RecoveryPreparationInvalidated
             | Self::CorruptData(_) => None,
         }
     }

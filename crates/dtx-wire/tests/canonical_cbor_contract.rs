@@ -2,7 +2,8 @@ use std::fmt::Write;
 
 use dtx_wire::{
     CanonicalCborError, CanonicalEncode, CanonicalValue, PLAN_HASH_DOMAIN,
-    encode_deterministic_cbor, plan_hash, validate_deterministic_cbor,
+    decode_deterministic_cbor, decode_deterministic_cbor_with_limit, encode_deterministic_cbor,
+    encode_deterministic_cbor_with_limit, plan_hash, validate_deterministic_cbor,
 };
 use proptest::prelude::*;
 use serde::Deserialize;
@@ -70,6 +71,38 @@ fn map_key_sorting_obeys_the_shared_encoded_byte_budget() {
 
     assert_eq!(
         encode_deterministic_cbor(&oversized_pending_keys),
+        Err(CanonicalCborError::InputTooLarge)
+    );
+}
+
+#[test]
+fn explicit_byte_limit_preserves_the_default_and_remains_hard_bounded() {
+    const CUSTOM_LIMIT: usize = 1_065_984;
+    let small = CanonicalValue::Map(vec![(
+        CanonicalValue::Unsigned(1),
+        CanonicalValue::Bytes(vec![7; 32]),
+    )]);
+    assert_eq!(
+        encode_deterministic_cbor(&small).unwrap(),
+        encode_deterministic_cbor_with_limit(&small, CUSTOM_LIMIT).unwrap()
+    );
+
+    let one_mib_payload = CanonicalValue::Bytes(vec![8; 1_048_576]);
+    assert_eq!(
+        encode_deterministic_cbor(&one_mib_payload),
+        Err(CanonicalCborError::InputTooLarge)
+    );
+    let encoded = encode_deterministic_cbor_with_limit(&one_mib_payload, CUSTOM_LIMIT).unwrap();
+    assert_eq!(
+        decode_deterministic_cbor(&encoded),
+        Err(CanonicalCborError::InputTooLarge)
+    );
+    assert_eq!(
+        decode_deterministic_cbor_with_limit(&encoded, encoded.len()).unwrap(),
+        one_mib_payload
+    );
+    assert_eq!(
+        decode_deterministic_cbor_with_limit(&encoded, encoded.len() - 1),
         Err(CanonicalCborError::InputTooLarge)
     );
 }

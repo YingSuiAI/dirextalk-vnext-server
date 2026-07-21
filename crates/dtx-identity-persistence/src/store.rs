@@ -111,6 +111,18 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
              AND has_table_privilege(current_user, 'identity.contact_delivery_outbox', 'SELECT,INSERT') \
              AND has_table_privilege(current_user, 'identity.contact_owner_commands', 'SELECT,INSERT') \
              AND has_table_privilege(current_user, 'identity.contact_rate_limits', 'SELECT,INSERT,UPDATE') \
+             AND has_table_privilege(current_user, 'identity.recovery_scope_catalogs', 'SELECT,INSERT') \
+             AND has_table_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'SELECT,INSERT') \
+             AND has_schema_privilege(current_user, 'messaging', 'USAGE') \
+             AND has_function_privilege(current_user, 'messaging.is_uuid_v7(uuid)', 'EXECUTE') \
+             AND has_column_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'provider_response_bytes', 'UPDATE') \
+             AND has_column_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'provider_response_digest', 'UPDATE') \
+             AND has_column_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'provider_device_id', 'UPDATE') \
+             AND has_column_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'provider_signing_key', 'UPDATE') \
+             AND has_column_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'provider_ciphertext_digest', 'UPDATE') \
+             AND has_column_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'provider_expires_at_ms', 'UPDATE') \
+             AND has_column_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'provider_idempotency_key_hash', 'UPDATE') \
+             AND has_column_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'provider_recorded_at_ms', 'UPDATE') \
              AND has_function_privilege( \
                  current_user, \
                  'identity.prune_expired_device_sessions(bigint, integer)', \
@@ -341,6 +353,21 @@ async fn role_has_excess_identity_privileges(
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
                         )) \
+                        OR (relation.relname = 'recovery_scope_catalogs' AND (\
+                            has_table_privilege(current_user, relation.oid, 'UPDATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
+                            OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
+                        )) \
+                        OR (relation.relname = 'recovery_scope_catalog_preparations' AND (\
+                            has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
+                            OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
+                        )) \
                         OR (relation.relname IN (\
                             'device_sessions', 'device_session_idempotency_claims', \
                             'device_session_receipts', 'key_package_publish_claims', \
@@ -380,6 +407,8 @@ async fn role_has_excess_identity_privileges(
                             'contact_invites', 'contact_requests', \
                             'contact_delivery_outbox', 'contact_owner_commands', \
                             'contact_rate_limits', \
+                            'recovery_scope_catalogs', \
+                            'recovery_scope_catalog_preparations', \
                             'fork_evidence', 'log_outbox'\
                         ) AND (\
                             has_table_privilege(current_user, relation.oid, 'SELECT') \
@@ -392,6 +421,19 @@ async fn role_has_excess_identity_privileges(
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
                         ))\
                     )\
+             ) \
+             OR EXISTS (\
+                 SELECT 1 \
+                   FROM pg_attribute AS attribute \
+                  WHERE attribute.attrelid='identity.recovery_scope_catalog_preparations'::regclass \
+                    AND attribute.attnum>0 AND NOT attribute.attisdropped \
+                    AND attribute.attname NOT IN (\
+                        'provider_response_bytes','provider_response_digest',\
+                        'provider_device_id','provider_signing_key',\
+                        'provider_ciphertext_digest','provider_expires_at_ms',\
+                        'provider_idempotency_key_hash','provider_recorded_at_ms'\
+                    ) \
+                    AND has_column_privilege(current_user,attribute.attrelid,attribute.attname,'UPDATE')\
              ) \
              OR EXISTS (\
                  SELECT 1 \

@@ -1,0 +1,341 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Recovery KeyPackage V4
+  version: 4.0.0
+  description: >-
+    Publishes and claims opaque recovery KeyPackages using only Catalog V2
+    public coordinates. V4 is byte- and state-disjoint from V2/V3. Exact
+    original publish and claim bytes are retained in immutable receipts.
+x-dirextalk-cddl-artifact: protocol/cddl/key-package/v4/key-package-v4.cddl
+x-dirextalk-strict-wire:
+  deterministic-canonical-cbor: required
+  closed-maps-and-enums: required
+  unknown-or-duplicate-map-keys: rejected
+  exact-version-discriminator: 4
+  v2-v3-v4-conversion: forbidden
+  decoder-fallback: forbidden
+  strict-ed25519-semantics: required
+  header-idempotency-digest-equals-body: required
+  raw-idempotency-key-persisted: false
+  raw-idempotency-key-returned: false
+x-dirextalk-crypto-domains:
+  publish-binding: "dirextalk.key-package.publish-binding.v4\0"
+  publish-signature: "dirextalk.key-package.publish-signature.v4\0"
+  publish-envelope: "dirextalk.key-package.publish-envelope.v4\0"
+  publish-idempotency: "dirextalk.key-package.publish-idempotency.v4\0"
+  publish-receipt: "dirextalk.key-package.publish-receipt.v4\0"
+  claim: "dirextalk.key-package.claim.v4\0"
+  claim-idempotency: "dirextalk.key-package.claim-idempotency.v4\0"
+  claim-receipt: "dirextalk.key-package.claim-receipt.v4\0"
+  opaque-package: "dirextalk.key-package.opaque-body.v4\0"
+x-dirextalk-body-ceilings:
+  publish-binding-v4: 1683
+  publish-v4: 67294
+  publish-receipt-v4: 67531
+  claim-v4: 527
+  claim-receipt-v4: 135564
+x-dirextalk-cbor-ceiling-arithmetic:
+  publish-binding-v4: >-
+    2-map-header + 25-key-bytes + (1-version + 59-identity + 152-four-uuids
+    + 238-seven-digests + 36-four-uints + 469-head + 6-two-counts + 222-leaf
+    + 405-proof + 68-two-public-keys = 1656-values-including-version) = 1683
+  publish-v4: 4-map-key-bytes + 1683-binding + 65541-encoded-body-bstr + 66-signature = 67294
+  publish-receipt-v4: 10-map-key-bytes + 1-version + 76-uuids + 34-binding-digest + 67299-encoded-publish-bstr + 102-digests + 9-time = 67531
+  claim-v4: >-
+    19-map-key-bytes + (1-version + 59-identity + 152-four-uuids
+    + 238-seven-digests + 34-public-key + 18-two-uints + 6-two-counts
+    = 508-values) = 527
+  claim-receipt-v4: 11-map-key-bytes + 1-version + 76-uuids + 67299-publish-bstr + 34-digest + 67536-publish-receipt-bstr + 34-digest + 530-claim-bstr + 34-digest + 9-time = 135564
+x-dirextalk-idempotency-key:
+  common-grammar:
+    exact-http-header-fields: 1
+    exact-parser-exposed-values: 1
+    length-octets: {minimum: 16, maximum: 128}
+    accepted-ascii-octets-inclusive: ['0x21', '0x7e']
+    schema-pattern: '^[!-~]{16,128}$'
+    obs-fold: rejected
+    whitespace-including-leading-or-trailing: rejected
+    duplicate-fields-or-values: rejected-before-idempotency-lookup
+    non-ascii-or-invalid-length: rejected-before-idempotency-lookup
+    normalization-or-re-encoding: forbidden
+    digest-input: exact-accepted-ascii-octets-after-http-field-parsing-before-storage
+    raw-key-persisted-or-returned: false
+  publish:
+    digest-domain: "dirextalk.key-package.publish-idempotency.v4\0"
+    digest-formula: SHA-256(domain-bytes || exact-accepted-ascii-octets)
+    equals-cbor-path: [1, 24]
+  claim:
+    digest-domain: "dirextalk.key-package.claim-idempotency.v4\0"
+    digest-formula: SHA-256(domain-bytes || exact-accepted-ascii-octets)
+    equals-cbor-path: [18]
+x-dirextalk-field-equalities:
+  authenticated-publish-candidate:
+    identity-id: {authenticated-value-equals-cbor-path: [1, 2], comparison: exact}
+    device-id: {authenticated-value-equals-cbor-path: [1, 3], comparison: exact}
+    current-signing-public-key: {authenticated-value-equals-cbor-path: [1, 18], comparison: exact}
+    envelope-signature-cbor-path: [3]
+    envelope-signature-key-cbor-path: [1, 18]
+  claim-to-stored-publish-binding:
+    claim-field-2: publish-binding-field-2
+    claim-field-3: publish-binding-field-3
+    claim-field-4: publish-binding-field-5
+    claim-field-5: publish-binding-field-6
+    claim-field-6: publish-binding-field-4
+    claim-field-7: publish-binding-field-7
+    claim-field-8: publish-binding-field-8
+    claim-field-9: publish-binding-field-10
+    claim-field-10: publish-binding-field-11
+    claim-field-11: publish-binding-field-12
+    claim-field-12: publish-binding-field-14
+    claim-field-13: publish-binding-field-16
+    claim-field-14: publish-binding-field-17
+    claim-field-15: publish-binding-field-19
+    claim-field-16: publish-binding-field-20
+    claim-field-17: publish-binding-field-23
+    claim-field-18: claim-idempotency-digest-of-exact-accepted-header-octets
+  authenticated-claim-controller:
+    kind: current-scope-controller
+    authenticated-identity-and-device-equal-current-authorization-subject: required
+    authorized-target-equalities:
+      recovering-identity: {claim-cbor-path: [2], comparison: exact}
+      candidate-device-id: {claim-cbor-path: [3], comparison: exact}
+      request-id: {claim-cbor-path: [4], comparison: exact}
+      signed-request-digest: {claim-cbor-path: [5], comparison: exact}
+      package-id: {claim-cbor-path: [6], comparison: exact}
+      catalog-id: {claim-cbor-path: [7], comparison: exact}
+      catalog-generation: {claim-cbor-path: [8], comparison: exact}
+      signed-catalog-head-digest: {claim-cbor-path: [9], comparison: exact}
+      catalog-count: {claim-cbor-path: [10], comparison: exact}
+      catalog-index: {claim-cbor-path: [11], comparison: exact}
+      catalog-public-leaf-digest: {claim-cbor-path: [12], comparison: exact}
+      public-leaf-issuer-epk: {claim-cbor-path: [13], comparison: exact}
+      public-leaf-authorization-digest-a: {claim-cbor-path: [14], comparison: exact}
+      direct-device-add-h-plus-1: {claim-cbor-path: [15], comparison: exact}
+      identity-log-head-at-h-plus-1: {claim-cbor-path: [16], comparison: exact}
+      opaque-package-digest: {claim-cbor-path: [17], comparison: exact}
+    candidate-fields-not-controller-identity-or-device: [2, 3]
+    scope-or-controller-identifier-in-body-or-receipt: forbidden
+  publish-receipt:
+    field-2: decoded-exact-field-5-publish-binding-field-4
+    field-3: decoded-exact-field-5-publish-binding-field-5
+    field-4: publish-binding-domain-digest-of-decoded-exact-field-5-inner-binding
+    field-5: exact-accepted-http-publish-body-octets
+    field-6: publish-envelope-domain-digest-of-exact-field-5
+    field-7:
+      - decoded-exact-field-5-publish-binding-field-23
+      - package-domain-digest-of-decoded-exact-field-5-opaque-body
+    field-8:
+      - decoded-exact-field-5-publish-binding-field-24
+      - publish-idempotency-digest-of-exact-accepted-header-octets
+  claim-receipt:
+    field-2:
+      - decoded-exact-field-4-publish-binding-field-4
+      - decoded-exact-field-6-publish-receipt-field-2
+      - decoded-exact-field-8-claim-field-6
+    field-3:
+      - decoded-exact-field-4-publish-binding-field-5
+      - decoded-exact-field-6-publish-receipt-field-3
+      - decoded-exact-field-8-claim-field-4
+    field-4:
+      - exact-original-publish-envelope-octets
+      - decoded-exact-field-6-publish-receipt-field-5-byte-for-byte
+    field-5:
+      - publish-envelope-domain-digest-of-exact-field-4
+      - decoded-exact-field-6-publish-receipt-field-6
+    field-6: exact-original-publish-receipt-octets
+    field-7: publish-receipt-domain-digest-of-exact-field-6
+    field-8: exact-accepted-http-claim-body-octets
+    field-9: claim-domain-digest-of-exact-field-8
+    decoded-field-8-to-decoded-field-4-binding: exact-claim-to-publish-mapping-above
+x-dirextalk-public-projection:
+  allowed:
+    - identity-id
+    - candidate-device-id-and-signing-key
+    - package-id-and-opaque-package-digest
+    - recovery-request-id-and-exact-digest
+    - catalog-id-generation-exact-signed-head-and-digest
+    - catalog-count-index-exact-public-leaf-digest-and-proof
+    - public-leaf-issuer-epk-and-authorization-digest-a
+    - exact-device-add-h-plus-1-and-head
+    - validity-times-and-idempotency-digest
+  forbidden:
+    - recovery-scope
+    - recovery-scope-digest
+    - scope-origin
+    - verifier-descriptor-key-id-key-or-epoch
+    - private-catalog-body
+    - full-verifier-binding
+    - membership-receipt
+    - catalog-opening
+    - hiding-nonce
+    - issuer-private-key-or-key-handle
+    - raw-idempotency-key
+x-dirextalk-store-invariants:
+  one-publish-per-full-versioned-tuple: true
+  at-most-one-claim-per-full-versioned-tuple: true
+  package-digest-global-uniqueness-across: [v2, v3, v4]
+  package-consumption-global-across: [v2, v3, v4]
+  issuer-epk-global-uniqueness-across-requests: false
+  same-issuer-epk-in-multiple-recovery-requests: allowed
+  v4-tuple:
+    - exact-version
+    - identity
+    - candidate
+    - request-id-and-digest
+    - catalog-id-generation-head-digest-count-index-leaf-digest
+    - package-id-and-package-digest
+  partial-reservation-or-consumption: forbidden
+x-dirextalk-replay-order:
+  first: authenticate-authorize-and-check-immutable-explicit-revocation
+  second: static-path-media-size-version-signature-and-idempotency-shape
+  committed-exact-replay: return-byte-identical-original-receipt-before-mutable-currentness
+  committed-conflict: reject-without-write
+  first-admission: validate-revocation-expiry-head-keys-and-proof-then-one-final-cas
+paths:
+  /v4/key-packages/{package_id}:
+    put:
+      operationId: publishRecoveryKeyPackageV4
+      x-dirextalk-authentication:
+        kind: candidate-device
+        required: true
+        exact-equalities: '#/x-dirextalk-field-equalities/authenticated-publish-candidate'
+      x-dirextalk-idempotency-key-contract: '#/x-dirextalk-idempotency-key/publish'
+      x-dirextalk-body-ceiling-bytes: 67294
+      x-dirextalk-path-coordinate-binding:
+        reject: reject-before-durable-writes
+        coordinates:
+          package_id:
+            source: signed-key-package-publish-envelope-cbor
+            cddl-rule: key-package-publish-v4
+            cbor-path: [1, 4]
+            comparison: exact
+      x-dirextalk-catalog-validation:
+        signed-head-rule: recovery-scope-catalog-head-v2
+        public-leaf-rule: recovery-scope-catalog-leaf-commitment-v2
+        proof-rule: catalog-merkle-proof-v2
+        maximum-count: 1023
+        index-base: 1
+        index-maximum-from: count
+        maximum-siblings: 10
+        sibling-count-rule: exact-owner-count-index-height
+        exact-proof-ceiling-bytes: 402
+      parameters:
+        - $ref: '#/components/parameters/PackageId'
+        - $ref: '#/components/parameters/DeviceAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.key-package-publish.v4+cbor:
+            x-dirextalk-cddl-rule: key-package-publish-v4
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/PublishReceipt'}
+        '200': {$ref: '#/components/responses/PublishReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+  /v4/key-packages/claim:
+    post:
+      operationId: claimRecoveryKeyPackageV4
+      x-dirextalk-authentication:
+        kind: current-scope-controller
+        required: true
+        scope-identifier-in-body-or-receipt: forbidden
+        exact-equalities: '#/x-dirextalk-field-equalities/authenticated-claim-controller'
+      x-dirextalk-idempotency-key-contract: '#/x-dirextalk-idempotency-key/claim'
+      x-dirextalk-body-ceiling-bytes: 527
+      parameters:
+        - $ref: '#/components/parameters/DeviceAuthorization'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.key-package-claim.v4+cbor:
+            x-dirextalk-cddl-rule: key-package-claim-v4
+            x-dirextalk-exact-cbor: true
+            schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+      responses:
+        '201': {$ref: '#/components/responses/ClaimReceipt'}
+        '200': {$ref: '#/components/responses/ClaimReceipt'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/Unavailable'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '410': {$ref: '#/components/responses/Gone'}
+        '412': {$ref: '#/components/responses/Invalidated'}
+        '422': {$ref: '#/components/responses/InvalidExactCbor'}
+components:
+  parameters:
+    PackageId:
+      name: package_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/UuidV7'}
+    DeviceAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      schema: {type: string}
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Exactly one value of 16..128 ASCII octets, each in 0x21..0x7e. Duplicate
+        fields or values, obs-fold, non-ASCII, invalid length, and any whitespace
+        including leading or trailing whitespace are rejected before lookup.
+        Accepted post-HTTP-parsing octets are neither normalized nor re-encoded;
+        the endpoint-specific domain hashes those exact octets before storage.
+        The raw value is never persisted or returned.
+      x-dirextalk-exact-field-count: 1
+      x-dirextalk-exact-value-count: 1
+      schema: {type: string, minLength: 16, maxLength: 128, pattern: '^[!-~]{16,128}$'}
+  schemas:
+    ExactCanonicalCbor:
+      type: string
+      contentEncoding: binary
+      x-dirextalk-exact-cbor: true
+    UuidV7:
+      type: string
+      pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  headers:
+    NoStore:
+      schema: {type: string, const: no-store}
+  responses:
+    PublishReceipt:
+      description: Immutable receipt containing the exact original V4 publish envelope and digest.
+      x-dirextalk-body-ceiling-bytes: 67531
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.key-package-publish-receipt.v4+cbor:
+          x-dirextalk-cddl-rule: key-package-publish-receipt-v4
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    ClaimReceipt:
+      description: Immutable receipt binding exact original publish envelope, publish receipt, and claim bytes.
+      x-dirextalk-body-ceiling-bytes: 135564
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+      content:
+        application/vnd.dirextalk.key-package-claim-receipt.v4+cbor:
+          x-dirextalk-cddl-rule: key-package-claim-receipt-v4
+          schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
+    Unauthorized:
+      description: AUTHENTICATION_REQUIRED or CURRENT_CONTROLLER_AUTHORIZATION_REQUIRED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Unavailable:
+      description: KEY_PACKAGE_UNAVAILABLE for the exact public V4 tuple.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Conflict:
+      description: KEY_PACKAGE_DIGEST_CONFLICT, GLOBAL_PACKAGE_ALREADY_CONSUMED, VERSION_CONFLICT, or IDEMPOTENCY_CONFLICT.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Gone:
+      description: HISTORY_RECOVERY_EXPIRED, HISTORY_RECOVERY_REVOKED, or DEVICE_REVOKED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    Invalidated:
+      description: IDENTITY_HEAD_CHANGED, CATALOG_HEAD_CHANGED, CANDIDATE_KEY_CHANGED, or CATALOG_LEAF_CHANGED.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}
+    InvalidExactCbor:
+      description: EXACT_CBOR_INVALID, VERSION_FALLBACK_FORBIDDEN, PUBLIC_PROOF_INVALID, FORBIDDEN_PRIVATE_DATA, or COORDINATE_MISMATCH.
+      headers: {Cache-Control: {$ref: '#/components/headers/NoStore'}}

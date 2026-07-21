@@ -138,6 +138,18 @@ Layout:
   only exact IDs, digests, authority metadata, and expiry—never an opaque offer,
   capability, session, snapshot, KeyPackage bytes, private state, or epoch
   secret.
+  `baseline/v41/manifest.json` freezes exactly twelve additive artifacts: CDDL,
+  OpenAPI, and byte-exact vectors for Recovery Scope Catalog V1, History
+  Recovery V2, KeyPackage V3, and MLS Sequencer V6. Together they bind the
+  encrypted exhaustive catalog, candidate-authorized recovery completion,
+  completion-only identity receipts, and the fenced MLS activation proof
+  without changing any V1–V40 baseline or admitting a second truth source.
+  `baseline/v42/manifest.json` freezes exactly nine disjoint current artifacts:
+  CDDL and OpenAPI for Recovery Scope Catalog V2, History Recovery V3,
+  KeyPackage V4, and MLS Sequencer V7, plus the byte-exact Catalog V2 vector.
+  These artifacts bind hidden verifier handoff, completion presentation,
+  publish/claim receipts, raw MLS Commit/Welcome ownership, and snapshot/CAS
+  currentness without rewriting any V1–V41 manifest.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

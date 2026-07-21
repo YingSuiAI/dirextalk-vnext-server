@@ -1,0 +1,211 @@
+; V41 catalog-bound public History Recovery V3 request and grant.
+digest = bstr .size 32
+signature = bstr .size 64
+uuid-v7 = tstr .size 36
+identity-id = tstr .size 57
+safe-uint = 0..9007199254740991
+safe-highwater = 0..9007199254740990
+positive-uint = 1..9007199254740991
+utc-millis = 0..9007199254740991
+
+history-recovery-leaf-set-v1 = [+ digest]
+history-recovery-manifest-v1 = {
+  1: 1,
+  2: digest,                   ; signed catalog-head digest
+  3: positive-uint,            ; catalog generation
+  4: digest,                   ; catalog Merkle root
+  5: positive-uint,            ; exhaustive catalog leaf count
+  6: digest,                   ; exact leaf-set digest
+  7: history-recovery-leaf-set-v1
+}
+
+history-recovery-request-unsigned-v3 = {
+  1: 3,
+  2: uuid-v7,
+  3: identity-id,
+  4: uuid-v7,                  ; directly added candidate device
+  5: bstr .size 32,            ; candidate signing key
+  6: bstr .size 32,            ; candidate recipient HPKE key
+  7: safe-highwater,           ; pre-enrollment Identity Log H
+  8: digest,                   ; exact head at H
+  9: positive-uint,            ; exact direct DeviceAdd H + 1
+  10: digest,                  ; exact head at H + 1
+  11: digest,                  ; exact direct candidate DeviceAdd digest
+  12: positive-uint,           ; catalog generation
+  13: digest,                  ; signed catalog-head digest
+  14: digest,                  ; catalog Merkle root
+  15: positive-uint,           ; exhaustive leaf count
+  16: digest,                  ; exact sorted leaf-set digest
+  17: digest,                  ; exact manifest digest
+  18: utc-millis,
+  19: utc-millis,
+  20: digest                   ; response-capability hash
+}
+history-recovery-request-v3 = {
+  1: 3, 2: uuid-v7, 3: identity-id, 4: uuid-v7,
+  5: bstr .size 32, 6: bstr .size 32,
+  7: safe-highwater, 8: digest, 9: positive-uint, 10: digest,
+  11: digest, 12: positive-uint, 13: digest, 14: digest,
+  15: positive-uint, 16: digest, 17: digest,
+  18: utc-millis, 19: utc-millis, 20: digest,
+  21: signature                ; candidate signs fields 1..20
+}
+history-recovery-request-receipt-v3 = {
+  1: 3, 2: uuid-v7, 3: digest, 4: digest, 5: utc-millis
+}
+history-recovery-revocation-receipt-v1 = {
+  1: 1, 2: uuid-v7, 3: digest, 4: utc-millis
+}
+
+history-snapshot-member-v1 = {
+  1: 1..3,                    ; timeline, attachment manifest, read cursor
+  2: bstr .size (1..1048576)
+}
+; MLS checkpoints, MLS private state, and epoch secrets have no member code.
+history-snapshot-plaintext-v1 = {
+  1: 1,
+  2: digest,                  ; recovery request digest
+  3: digest,                  ; catalog-head digest
+  4: digest,                  ; manifest digest
+  5: [* history-snapshot-member-v1]
+}
+history-recovery-attachment-v1 = {
+  1: tstr .size (8..512),     ; canonical HTTPS origin
+  2: uuid-v7,                 ; object id
+  3: digest,
+  4: positive-uint,           ; exact byte length
+  5: digest                   ; attachment capability digest
+}
+recipient-history-offer-v1 = {
+  1: 1,
+  2: uuid-v7,
+  3: digest,                  ; catalog-head digest
+  4: digest,                  ; exhaustive leaf-set digest
+  5: digest,                  ; manifest digest
+  6: digest,                  ; allowed snapshot plaintext digest
+  7: bstr .size (1..1048576), ; candidate-recipient HPKE ciphertext
+  8: digest,                  ; exact ciphertext digest
+  9: history-recovery-attachment-v1,
+  10: utc-millis,
+  11: digest                  ; recipient-key digest
+}
+
+history-recovery-grant-unsigned-v3 = {
+  1: 3,
+  2: identity-id,
+  3: uuid-v7,
+  4: digest,                  ; exact signed request digest
+  5: uuid-v7,                 ; candidate device
+  6: uuid-v7,                 ; active provider device
+  7: 1..3,                    ; active device, root, recovery authority
+  8: tstr .size (8..128),
+  9: digest,                  ; catalog-head digest
+  10: positive-uint,          ; catalog generation
+  11: digest,                 ; catalog Merkle root
+  12: positive-uint,          ; exhaustive leaf count
+  13: digest,                 ; leaf-set digest
+  14: digest,                 ; manifest digest
+  15: digest,                 ; exact RecipientHistoryOffer digest
+  16: digest,                 ; candidate recipient-key digest
+  17: uuid-v7,                ; mailbox id
+  18: uuid-v7,                ; envelope id
+  19: safe-highwater,         ; exact mailbox highwater H
+  20: positive-uint,          ; exact delivery H + 1
+  21: utc-millis,
+  22: utc-millis,
+  23: digest                  ; idempotency-key hash
+}
+history-recovery-grant-v3 = {
+  1: 3, 2: identity-id, 3: uuid-v7, 4: digest,
+  5: uuid-v7, 6: uuid-v7, 7: 1..3, 8: tstr .size (8..128),
+  9: digest, 10: positive-uint, 11: digest, 12: positive-uint,
+  13: digest, 14: digest, 15: digest, 16: digest,
+  17: uuid-v7, 18: uuid-v7, 19: safe-highwater, 20: positive-uint,
+  21: utc-millis, 22: utc-millis, 23: digest,
+  24: signature,               ; provider signature over fields 1..23
+  25: signature,               ; independent authority signature
+  26: recipient-history-offer-v1
+}
+history-recovery-delivery-receipt-v1 = {
+  1: 1,
+  2: uuid-v7,
+  3: uuid-v7,
+  4: positive-uint,            ; exact mailbox H + 1
+  5: utc-millis,
+  6: digest,                   ; exact full grant digest
+  7: digest                    ; exact offer digest
+}
+
+; Identity-home recovery completion. MLS activation receipts and readback
+; response bytes remain opaque to the identity service's wire contract, while
+; their exact digests and externally verified coordinates are signed here.
+https-origin = tstr .size (8..512)
+
+history-recovery-completion-key-descriptor-v1 = {
+  1: 1, 2: https-origin, 3: uuid-v7, 4: bstr .size 32,
+  5: positive-uint, 6: utc-millis, 7: utc-millis, 8: signature
+}
+
+history-recovery-completion-sequencer-descriptor-v1 = {
+  1: 1, 2: https-origin, 3: uuid-v7, 4: bstr .size 32,
+  5: positive-uint, 6: utc-millis, 7: utc-millis, 8: signature
+}
+
+history-recovery-completion-readback-coordinates-v1 = {
+  1: bstr .size (1..4096), 2: uuid-v7, 3: digest, 4: digest,
+  5: positive-uint, 6: digest, 7: digest, 8: utc-millis
+}
+
+history-recovery-completion-activation-entry-v1 = {
+  1: positive-uint, 2: digest, 3: https-origin,
+  4: bstr .size (1..4096), 5: digest,
+  6: bstr .size (1..4096), 7: digest,
+  8: bstr .size (1..4096), 9: digest,
+  10: history-recovery-completion-readback-coordinates-v1,
+  11: 0..65534, 12: [1*32 digest]
+}
+
+history-recovery-completion-mailbox-offer-envelope-v1 = {
+  1: 1, 2: uuid-v7, 3: uuid-v7, 4: positive-uint,
+  5: bstr .size (1..1048576), 6: digest, 7: digest
+}
+
+history-recovery-completion-command-v1 = {
+  1: 1, 2: uuid-v7, 3: https-origin, 4: identity-id,
+  5: uuid-v7, 6: bstr .size 32,
+  7: safe-highwater, 8: positive-uint, 9: digest,
+  10: positive-uint, 11: digest, 12: positive-uint, 13: digest,
+  14: uuid-v7, 15: digest, 16: digest, 17: digest, 18: digest,
+  19: digest, 20: digest, 21: digest,
+  22: bstr .size (1..1048576), 23: uuid-v7, 24: positive-uint,
+  25: digest, 26: positive-uint, 27: digest,
+  28: [1*65535 history-recovery-completion-activation-entry-v1],
+  29: digest, 30: signature
+}
+
+history-recovery-completion-offer-ack-v1 = {
+  1: 1, 2: uuid-v7, 3: uuid-v7, 4: positive-uint,
+  5: digest, 6: uuid-v7, 7: utc-millis
+}
+
+history-recovery-complete-v1 = {
+  1: 1, 2: identity-id, 3: uuid-v7, 4: uuid-v7,
+  5: uuid-v7, 6: digest, 7: digest, 8: digest, 9: utc-millis
+}
+
+history-recovery-completion-receipt-v1 = {
+  1: 1, 2: uuid-v7, 3: https-origin, 4: identity-id,
+  5: uuid-v7, 6: safe-highwater, 7: positive-uint, 8: digest,
+  9: positive-uint, 10: digest, 11: positive-uint, 12: digest,
+  13: uuid-v7, 14: digest, 15: digest, 16: digest, 17: digest,
+  18: digest, 19: digest, 20: digest,
+  21: uuid-v7, 22: positive-uint, 23: digest,
+  24: positive-uint, 25: digest, 26: digest,
+  27: bstr .size (1..4096), 28: digest,
+  29: bstr .size (1..4096), 30: digest, 31: utc-millis
+}
+
+signed-history-recovery-completion-receipt-v1 = {
+  1: history-recovery-completion-receipt-v1, 2: digest,
+  3: bstr .size (1..4096), 4: digest, 5: signature
+}

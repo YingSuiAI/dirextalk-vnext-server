@@ -80,7 +80,7 @@ pub enum CanonicalCborError {
 impl fmt::Display for CanonicalCborError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::InputTooLarge => "canonical CBOR exceeds the one MiB limit",
+            Self::InputTooLarge => "canonical CBOR exceeds its configured byte limit",
             Self::DepthLimit => "canonical CBOR exceeds the nesting depth limit",
             Self::ContainerTooLarge => "canonical CBOR exceeds a container or total item limit",
             Self::UnexpectedEnd => "canonical CBOR ended unexpectedly",
@@ -113,7 +113,30 @@ pub fn encode_deterministic_cbor<T>(value: &T) -> Result<Vec<u8>, CanonicalCborE
 where
     T: CanonicalEncode + ?Sized,
 {
-    let mut encoder = Encoder::default();
+    encode_deterministic_cbor_with_limit(value, MAX_ENCODED_BYTES)
+}
+
+/// Encodes a typed value with an explicit contract-specific envelope limit.
+///
+/// This preserves every deterministic-profile depth and item bound. Callers
+/// should use it only when their protocol declares a larger bounded payload;
+/// [`encode_deterministic_cbor`] remains the one-MiB default.
+///
+/// # Errors
+///
+/// Returns [`CanonicalCborError`] for a zero byte limit, duplicate keys,
+/// invalid negative values, or profile size/depth violations.
+pub fn encode_deterministic_cbor_with_limit<T>(
+    value: &T,
+    max_encoded_bytes: usize,
+) -> Result<Vec<u8>, CanonicalCborError>
+where
+    T: CanonicalEncode + ?Sized,
+{
+    if max_encoded_bytes == 0 {
+        return Err(CanonicalCborError::InputTooLarge);
+    }
+    let mut encoder = Encoder::new(max_encoded_bytes);
     encoder.encode(&value.to_canonical_value(), 0)?;
     Ok(encoder.output)
 }
@@ -138,13 +161,27 @@ pub fn validate_deterministic_cbor(input: &[u8]) -> Result<(), CanonicalCborErro
 ///
 /// Returns [`CanonicalCborError`] at the first structural or canonical violation.
 pub fn decode_deterministic_cbor(input: &[u8]) -> Result<CanonicalValue, CanonicalCborError> {
-    if input.len() > MAX_ENCODED_BYTES {
+    decode_deterministic_cbor_with_limit(input, MAX_ENCODED_BYTES)
+}
+
+/// Decodes one deterministic item with an explicit contract-specific limit.
+///
+/// # Errors
+///
+/// Returns [`CanonicalCborError`] when the limit is zero or at the first
+/// structural, canonical, depth, item-count, or configured-size violation.
+pub fn decode_deterministic_cbor_with_limit(
+    input: &[u8],
+    max_encoded_bytes: usize,
+) -> Result<CanonicalValue, CanonicalCborError> {
+    if max_encoded_bytes == 0 || input.len() > max_encoded_bytes {
         return Err(CanonicalCborError::InputTooLarge);
     }
     let mut parser = Parser {
         input,
         position: 0,
         items: 0,
+        max_encoded_bytes,
     };
     let value = parser.parse_value(0)?;
     if parser.position != input.len() {
@@ -153,13 +190,21 @@ pub fn decode_deterministic_cbor(input: &[u8]) -> Result<CanonicalValue, Canonic
     Ok(value)
 }
 
-#[derive(Default)]
 struct Encoder {
     output: Vec<u8>,
     items: usize,
+    max_encoded_bytes: usize,
 }
 
 impl Encoder {
+    const fn new(max_encoded_bytes: usize) -> Self {
+        Self {
+            output: Vec::new(),
+            items: 0,
+            max_encoded_bytes,
+        }
+    }
+
     fn encode(&mut self, value: &CanonicalValue, depth: usize) -> Result<(), CanonicalCborError> {
         if depth > MAX_DEPTH {
             return Err(CanonicalCborError::DepthLimit);
@@ -196,7 +241,7 @@ impl Encoder {
                 let mut sorted = Vec::with_capacity(entries.len());
                 let mut pending_key_bytes = 0_usize;
                 for (key, value) in entries {
-                    let mut key_encoder = Self::default();
+                    let mut key_encoder = Self::new(self.max_encoded_bytes);
                     key_encoder.encode(key, depth + 1)?;
                     self.charge_items(key_encoder.items)?;
                     pending_key_bytes = pending_key_bytes
@@ -207,7 +252,7 @@ impl Encoder {
                         .len()
                         .checked_add(pending_key_bytes)
                         .ok_or(CanonicalCborError::InputTooLarge)?;
-                    if projected_bytes > MAX_ENCODED_BYTES {
+                    if projected_bytes > self.max_encoded_bytes {
                         return Err(CanonicalCborError::InputTooLarge);
                     }
                     sorted.push((key_encoder.output, value));
@@ -278,7 +323,7 @@ impl Encoder {
             .len()
             .checked_add(bytes.len())
             .ok_or(CanonicalCborError::InputTooLarge)?;
-        if new_length > MAX_ENCODED_BYTES {
+        if new_length > self.max_encoded_bytes {
             return Err(CanonicalCborError::InputTooLarge);
         }
         self.output.extend_from_slice(bytes);
@@ -290,6 +335,7 @@ struct Parser<'a> {
     input: &'a [u8],
     position: usize,
     items: usize,
+    max_encoded_bytes: usize,
 }
 
 impl Parser<'_> {
@@ -390,7 +436,7 @@ impl Parser<'_> {
     fn read_length(&mut self, additional: u8) -> Result<usize, CanonicalCborError> {
         let length = self.read_argument(additional)?;
         let length = usize::try_from(length).map_err(|_| CanonicalCborError::LengthOutOfRange)?;
-        if length > MAX_ENCODED_BYTES {
+        if length > self.max_encoded_bytes {
             return Err(CanonicalCborError::InputTooLarge);
         }
         Ok(length)
