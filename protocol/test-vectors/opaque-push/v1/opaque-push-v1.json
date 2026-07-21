@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "baseline": 43,
+  "put_path": "/v1/devices/push-registrations/fcm",
+  "delete_path": "/v1/devices/push-registrations/fcm",
+  "provider": "fcm",
+  "put_content_type": "application/vnd.dirextalk.opaque-push-register.v1+cbor",
+  "receipt_content_type": "application/vnd.dirextalk.opaque-push-receipt.v1+cbor",
+  "device_session_header": "DTX-Device-Session",
+  "idempotency_header": "Idempotency-Key",
+  "revision_header": "If-Match",
+  "token_min_bytes": 1,
+  "token_max_bytes": 4096,
+  "first_revision": 0,
+  "ttl_seconds": 60,
+  "request_canonical_cbor_hex": "a201010245544f4b454e",
+  "receipt_active_canonical_cbor_hex": "a40101026366636d03010466616374697665",
+  "receipt_revoked_canonical_cbor_hex": "a40101026366636d030104677265766f6b6564",
+  "internal_provider_payload_json": "{\"version\":1,\"wake_delivery_id\":\"018f1f2e-7abc-7def-8abc-0123456789ab\"}",
+  "error_responses": [
+    {"status": 400, "code": "INVALID_REQUEST", "retryable": false},
+    {"status": 401, "code": "DEVICE_AUTHENTICATION_FAILED", "retryable": false},
+    {"status": 409, "code": "REVISION_OR_IDEMPOTENCY_CONFLICT", "retryable": false},
+    {"status": 410, "code": "DEVICE_SESSION_REVOKED", "retryable": false},
+    {"status": 415, "code": "UNSUPPORTED_MEDIA_TYPE", "retryable": false},
+    {"status": 422, "code": "INVALID_PUSH_REGISTRATION", "retryable": false},
+    {"status": 503, "code": "PUSH_SERVICE_UNAVAILABLE", "retryable": true}
+  ]
+}

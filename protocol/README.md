@@ -150,6 +150,11 @@ Layout:
   These artifacts bind hidden verifier handoff, completion presentation,
   publish/claim receipts, raw MLS Commit/Welcome ownership, and snapshot/CAS
   currentness without rewriting any V1–V41 manifest.
+  `baseline/v43/manifest.json` freezes the disjoint opaque FCM push preference
+  registration contract: canonical-CBOR PUT/DELETE at the fixed device endpoint,
+  session-only identity, revision and idempotency binding, token-free receipts,
+  and the exact two-field provider wake payload. Push remains a preference only;
+  durable Mailbox Pull/ACK and the account read cursor remain delivery truth.
 
 Run `dtx-protocol check-generated`, `validate`, and `check-breaking` through the
 commands in `../COMMANDS.md`. Ordinary generation never updates the frozen

@@ -7,6 +7,7 @@ mod generate;
 mod history_recovery_v3;
 mod key_package_v4;
 mod mls_sequencer_v7;
+mod opaque_push_v1;
 mod recovery_scope_catalog_v2;
 mod registry;
 
@@ -21,8 +22,7 @@ pub use registry::{
     load_error_registry, load_event_registry, parse_error_registry, parse_event_registry,
 };
 
-/// Validates every existing artifact plus the V42 Catalog V2, History Recovery V3, and Key
-/// Package V4, and MLS Sequencer V7 gates.
+/// Validates every existing artifact plus the V42 and V43 versioned gates.
 ///
 /// # Errors
 ///
@@ -32,5 +32,6 @@ pub fn validate_artifacts(root: &std::path::Path) -> Result<(), ProtocolToolErro
     recovery_scope_catalog_v2::validate(root)?;
     history_recovery_v3::validate(root)?;
     key_package_v4::validate(root)?;
-    mls_sequencer_v7::validate(root)
+    mls_sequencer_v7::validate(root)?;
+    opaque_push_v1::validate(root)
 }

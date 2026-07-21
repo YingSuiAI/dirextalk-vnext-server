@@ -1,0 +1,122 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Opaque Push Registration Contract
+  version: 1.0.0
+  description: >-
+    Device-scoped FCM preference registration. The service stores only the
+    opaque token and registration state; durable Mailbox Pull/ACK remains the
+    delivery truth.
+paths:
+  /v1/devices/push-registrations/fcm:
+    put:
+      operationId: registerFcmPush
+      summary: Register or replace the authenticated device FCM token.
+      parameters:
+        - $ref: '#/components/parameters/DeviceSession'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.opaque-push-register.v1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 4114
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201': { $ref: '#/components/responses/Receipt' }
+        '200': { $ref: '#/components/responses/Receipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Revoked' }
+        '415': { $ref: '#/components/responses/UnsupportedMedia' }
+        '422': { $ref: '#/components/responses/Invalid' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    delete:
+      operationId: revokeFcmPush
+      summary: Revoke the authenticated device FCM token preference.
+      parameters:
+        - $ref: '#/components/parameters/DeviceSession'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/Receipt' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Revoked' }
+        '422': { $ref: '#/components/responses/Invalid' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+components:
+  parameters:
+    DeviceSession:
+      name: DTX-Device-Session
+      in: header
+      required: true
+      description: Canonical authenticated device session; identity is never accepted in path or body.
+      schema:
+        type: string
+        pattern: '^DTX-Device-Session [0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+        pattern: '^[A-Za-z0-9_-]{16,128}$'
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: Expected registration revision, `0` for first create.
+      schema:
+        type: string
+        pattern: '^(0|[1-9][0-9]*)$'
+  headers:
+    CacheControl:
+      schema: { type: string, const: no-store }
+    ContentType:
+      schema: { type: string, const: application/vnd.dirextalk.opaque-push-receipt.v1+cbor }
+    Nosniff:
+      schema: { type: string, const: nosniff }
+    RequestId:
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  responses:
+    Receipt:
+      description: Canonical receipt containing only provider, revision, and state.
+      headers:
+        Cache-Control: { $ref: '#/components/headers/CacheControl' }
+        Content-Type: { $ref: '#/components/headers/ContentType' }
+        X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }
+        X-Request-Id: { $ref: '#/components/headers/RequestId' }
+      content:
+        application/vnd.dirextalk.opaque-push-receipt.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: { type: string, format: binary }
+    BadRequest:
+      description: Invalid or non-canonical request or header.
+      headers: { Cache-Control: { $ref: '#/components/headers/CacheControl' }, X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }, X-Request-Id: { $ref: '#/components/headers/RequestId' } }
+    Unauthenticated:
+      description: Missing or invalid device session (401).
+      headers: { Cache-Control: { $ref: '#/components/headers/CacheControl' }, X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }, X-Request-Id: { $ref: '#/components/headers/RequestId' } }
+    Revoked:
+      description: Device session is revoked (410).
+      headers: { Cache-Control: { $ref: '#/components/headers/CacheControl' }, X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }, X-Request-Id: { $ref: '#/components/headers/RequestId' } }
+    UnsupportedMedia:
+      description: Unsupported media type (415).
+      headers: { Cache-Control: { $ref: '#/components/headers/CacheControl' }, X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }, X-Request-Id: { $ref: '#/components/headers/RequestId' } }
+    Invalid:
+      description: Validly typed but semantically invalid request (422).
+      headers: { Cache-Control: { $ref: '#/components/headers/CacheControl' }, X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }, X-Request-Id: { $ref: '#/components/headers/RequestId' } }
+    Conflict:
+      description: Revision or idempotency binding conflict (409).
+      headers: { Cache-Control: { $ref: '#/components/headers/CacheControl' }, X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }, X-Request-Id: { $ref: '#/components/headers/RequestId' } }
+    Unavailable:
+      description: KMS or push service unavailable (503).
+      headers: { Cache-Control: { $ref: '#/components/headers/CacheControl' }, X-Content-Type-Options: { $ref: '#/components/headers/Nosniff' }, X-Request-Id: { $ref: '#/components/headers/RequestId' } }

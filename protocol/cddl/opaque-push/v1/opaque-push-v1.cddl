@@ -1,0 +1,19 @@
+; V43 opaque FCM push registration. Device identity is carried only by the
+; authenticated DTX-Device-Session header; no identity or token metadata is
+; representable in receipts.
+
+positive-safe-uint-v1 = 1..9007199254740991
+
+push-token-v1 = bstr .size (1..4096)
+
+opaque-push-register-v1 = {
+  1: 1,
+  2: push-token-v1
+}
+
+opaque-push-receipt-v1 = {
+  1: 1,
+  2: "fcm",
+  3: positive-safe-uint-v1,
+  4: "active" / "suspended" / "revoked"
+}
