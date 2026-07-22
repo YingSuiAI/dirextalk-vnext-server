@@ -5,10 +5,24 @@ WORKDIR /workspace
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/workspace/target \
-    cargo build --release --locked --package dtx-node --package dtx-opaque-push-broker --package dtx-realtime-sync-gateway \
+    rm -f \
+        /workspace/target/release/dtx-node \
+        /workspace/target/release/dtx-opaque-push-broker \
+        /workspace/target/release/dtx-realtime-sync-gateway \
+        /workspace/target/release/dtx-agent-control \
+    && \
+    cargo build --release --locked \
+        --package dtx-node \
+        --package dtx-opaque-push-broker \
+        --package dtx-realtime-sync-gateway \
     && install -D -m 0555 /workspace/target/release/dtx-node /artifacts/dtx-node \
     && install -D -m 0555 /workspace/target/release/dtx-opaque-push-broker /artifacts/dtx-opaque-push-broker \
-    && install -D -m 0555 /workspace/target/release/dtx-realtime-sync-gateway /artifacts/dtx-realtime-sync-gateway
+    && install -D -m 0555 /workspace/target/release/dtx-realtime-sync-gateway /artifacts/dtx-realtime-sync-gateway \
+    && rm -f /workspace/target/release/dtx-agent-control \
+    && cargo build --release --locked \
+        --package dtx-agent-control-bin \
+        --bin dtx-agent-control \
+    && install -D -m 0555 /workspace/target/release/dtx-agent-control /artifacts/dtx-agent-control
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
@@ -18,6 +32,7 @@ RUN useradd --system --uid 10001 --create-home --home-dir /var/lib/dirextalk dtx
 COPY --from=build /artifacts/dtx-node /usr/local/bin/dtx-node
 COPY --from=build /artifacts/dtx-opaque-push-broker /usr/local/bin/dtx-opaque-push-broker
 COPY --from=build /artifacts/dtx-realtime-sync-gateway /usr/local/bin/dtx-realtime-sync-gateway
+COPY --from=build /artifacts/dtx-agent-control /usr/local/bin/dtx-agent-control
 
 ENV DTX_NODE_LISTEN=0.0.0.0:8443
 EXPOSE 8443 9444 9448

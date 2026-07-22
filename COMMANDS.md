@@ -18,6 +18,7 @@ Run commands from this repository root.
 | testkit dependency boundary (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-testkit-boundary.ps1` |
 | build | `cargo build --workspace --locked` |
 | release-build | `cargo build --workspace --locked --release` |
+| release-image-check | `bash scripts/check-release-image.sh` |
 | regenerate contracts | `cargo run -p dtx-protocol --locked -- generate .` |
 | check generated contracts | `cargo run -p dtx-protocol --locked -- check-generated .` |
 | validate schema and vectors | `cargo run -p dtx-protocol --locked -- validate .` |

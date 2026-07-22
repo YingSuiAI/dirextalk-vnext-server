@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "source": {
+    "dockerfile": "docker/release/Dockerfile",
+    "lockfile": "Cargo.lock"
+  },
+  "artifacts": [
+    {
+      "binary": "dtx-node",
+      "package": "dtx-node",
+      "path": "/usr/local/bin/dtx-node"
+    },
+    {
+      "binary": "dtx-opaque-push-broker",
+      "package": "dtx-opaque-push-broker",
+      "path": "/usr/local/bin/dtx-opaque-push-broker"
+    },
+    {
+      "binary": "dtx-realtime-sync-gateway",
+      "package": "dtx-realtime-sync-gateway",
+      "path": "/usr/local/bin/dtx-realtime-sync-gateway"
+    },
+    {
+      "binary": "dtx-agent-control",
+      "package": "dtx-agent-control-bin",
+      "path": "/usr/local/bin/dtx-agent-control"
+    }
+  ],
+  "runtime": {
+    "file_owner": "root:root",
+    "file_mode": "0555",
+    "process_uid": 10001,
+    "process_gid": 10001,
+    "default_entrypoint": "/usr/local/bin/dtx-node"
+  }
+}

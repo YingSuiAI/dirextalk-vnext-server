@@ -1,11 +1,17 @@
 # vNext server release image
 
 `docker/release/Dockerfile` builds the production image containing the
-independent `dtx-node`, `dtx-opaque-push-broker`, and `dtx-realtime-sync-gateway` artifacts used by the
+independent `dtx-node`, `dtx-opaque-push-broker`, `dtx-realtime-sync-gateway`,
+and `dtx-agent-control` artifacts used by the
 new Rust release CLI. The default repository is `dirextalk/vent`, but the
 release manifest may select another repository. Releases use an exact SemVer
 tag and must be read back by digest after publication; no floating `latest` tag
 is produced.
+
+The exact four binaries, their Cargo packages, fixed image paths, and runtime
+permission contract are recorded in [`manifest.json`](manifest.json). Both the
+release Dockerfile and this manifest are source-controlled inputs; a release
+must not add an unlisted executable.
 
 The default entrypoint remains the unified Rust node. A separately scheduled
 Gateway container must override the entrypoint with
@@ -85,6 +91,25 @@ health checking and is never exposed. The public same-origin ingress sends only
 `PUT` and `DELETE /v1/devices/push-registrations/fcm` to this broker. Durable
 Mailbox Pull/ACK and the account read cursor remain elsewhere as delivery
 truth.
+
+## Agent Control
+
+Production schedules Agent Control as a separate non-root service beside the
+node and the other independent services. Select it only with the fixed
+entrypoint `/usr/local/bin/dtx-agent-control` and the fixed argument
+`--config /etc/dirextalk/agent-control.json`; the image default remains
+`/usr/local/bin/dtx-node`. Do not pass an arbitrary command or Agent Control
+environment interface, and do not merge this process into the node, Gateway,
+or push broker.
+
+Run it as UID/GID `10001:10001`. Mount the existing operator-owned config file
+and only the database URL, TLS, CA, and issuer files named by
+[`bins/dtx-agent-control/config.example.json`](../../bins/dtx-agent-control/config.example.json)
+and [`docs/agent-acceptance-operator.md`](../../docs/agent-acceptance-operator.md).
+No new secret, credential, listener, or public port is introduced by the
+release image; schedule and publish the configured listeners as a separate
+service according to those existing documents. This packaging does not claim
+that Agent Control is deployed or live.
 
 Dry-run the release command from `dirextalk-vnext-deployer`:
 
