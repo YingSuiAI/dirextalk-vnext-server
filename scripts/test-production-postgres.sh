@@ -83,6 +83,15 @@ run_migrator grant-roles >/dev/null
 run_migrator verify-roles >/dev/null
 
 docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
+    -c "REVOKE UPDATE ON directory.index_cache_generations FROM dtx_indexer_node;" >/dev/null
+if run_migrator verify-roles >/dev/null 2>&1; then
+    echo 'Indexer readiness unexpectedly accepted a missing cache-generation grant' >&2
+    exit 1
+fi
+run_migrator grant-roles >/dev/null
+run_migrator verify-roles >/dev/null
+
+docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
     -c "SET ROLE dtx_agent_control; SELECT count(*) FROM system.schema_versions;" >/dev/null
 if docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
     -c "SET ROLE dtx_agent_control; TRUNCATE agent.connector_control_operations;" >/dev/null 2>&1; then

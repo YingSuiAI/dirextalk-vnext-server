@@ -151,6 +151,7 @@ GRANT SELECT, INSERT, UPDATE ON directory.discussion_policy_heads,
     directory.feed_comment_threads, directory.feed_reaction_projections,
     directory.discussion_rate_limits TO dtx_public_feed_node;
 GRANT SELECT, INSERT, UPDATE ON directory.index_registrations,
-    directory.index_rate_limits, directory.index_registration_attempts
+    directory.index_rate_limits, directory.index_registration_attempts,
+    directory.index_cache_generations
     TO dtx_indexer_node;
 GRANT SELECT, INSERT ON directory.indexed_feed_entries TO dtx_indexer_node;

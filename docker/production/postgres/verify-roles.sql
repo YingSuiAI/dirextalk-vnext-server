@@ -67,10 +67,17 @@ BEGIN
         RAISE EXCEPTION 'Agent Control readiness or negative privilege check failed';
     END IF;
 
-    IF has_table_privilege('dtx_public_feed_node', 'directory.index_registrations', 'UPDATE')
+    IF NOT has_schema_privilege('dtx_indexer_node', 'directory', 'USAGE')
+       OR NOT has_table_privilege('dtx_indexer_node', 'directory.index_registrations', 'SELECT')
+       OR NOT has_table_privilege('dtx_indexer_node', 'directory.index_registrations', 'INSERT')
+       OR NOT has_table_privilege('dtx_indexer_node', 'directory.index_registrations', 'UPDATE')
+       OR NOT has_table_privilege('dtx_indexer_node', 'directory.index_cache_generations', 'SELECT')
+       OR NOT has_table_privilege('dtx_indexer_node', 'directory.index_cache_generations', 'INSERT')
+       OR NOT has_table_privilege('dtx_indexer_node', 'directory.index_cache_generations', 'UPDATE')
+       OR has_table_privilege('dtx_public_feed_node', 'directory.index_registrations', 'UPDATE')
        OR has_table_privilege('dtx_indexer_node', 'directory.public_subjects', 'UPDATE')
     THEN
-        RAISE EXCEPTION 'feed/indexer direct-grant boundary widened';
+        RAISE EXCEPTION 'feed/indexer readiness or direct-grant boundary check failed';
     END IF;
 END
 $verify$;
