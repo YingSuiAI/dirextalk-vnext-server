@@ -11,7 +11,7 @@ use dtx_agent_host_supervisor::{
     ProcessObservation, ReleaseDigest, derive_trust_digest,
 };
 use dtx_connect_registry::AdapterKind;
-use dtx_domain::Revision;
+use dtx_domain::{IdentityId, Revision};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
@@ -221,7 +221,6 @@ fn validate_plan(plan: &Plan<'_>, frame: &V2RequestFrame) -> Result<(), V2CodecE
         || [
             plan.host.tenant_id,
             plan.host.host_id,
-            plan.host.owner_id,
             plan.host.host_credential_id,
             c.instance_id,
             c.enrollment_request_id,
@@ -232,6 +231,7 @@ fn validate_plan(plan: &Plan<'_>, frame: &V2RequestFrame) -> Result<(), V2CodecE
         ]
         .iter()
         .any(|id| !is_v7(id))
+        || !is_identity_id(plan.host.owner_id)
         || !is_digest(c.handoff_digest)
         || !valid_text(c.display_name, 128)
         || !positive(c.generation)
@@ -824,6 +824,10 @@ fn is_v7(value: &str) -> bool {
         })
 }
 
+fn is_identity_id(value: &str) -> bool {
+    value.parse::<IdentityId>().is_ok()
+}
+
 fn decode_secret(raw: &str, output: &mut [u8; 32]) -> bool {
     output.fill(0);
     // RawValue includes the JSON quotes. A canonical secret has no escapes.
@@ -892,15 +896,16 @@ mod tests {
 
     const TENANT: &str = "0197f1f0-0000-7000-8000-000000000001";
     const HOST: &str = "0197f1f0-0000-7000-8000-000000000002";
+    const OWNER_ID: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
     const CONNECTOR: &str = "0197f1f0-0000-7000-8000-000000000003";
     const OPERATION: &str = "0197f1f0-0000-7000-8000-000000000005";
     const OTHER: &str = "0197f1f0-0000-7000-8000-000000000006";
     // Captured from an independent standard-library Go encoding/json program
     // using the Connector e731849 field order/types; neither value is derived
     // from serde at test runtime.
-    const GO_PLAN_CANONICAL_JSON: &[u8] = br#"{"schema":"dirextalk.connector-bootstrap-plan","schema_version":1,"state":"prepared","operation_id":"0197f1f0-0000-7000-8000-000000000005","manifest_digest":"05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f","target":"linux-amd64","connector_artifact":{"version":"1.2.3-alpha.1+build-1","digest":"a4d451ec23463726f72c43d64c710968f6b602cd653b4de8adee1b556240a829"},"host":{"tenant_id":"0197f1f0-0000-7000-8000-000000000001","host_id":"0197f1f0-0000-7000-8000-000000000002","owner_id":"0197f1f0-0000-7000-8000-000000000008","host_credential_id":"0197f1f0-0000-7000-8000-000000000009"},"connector":{"instance_id":"0197f1f0-0000-7000-8000-000000000003","adapter_kind":"codex","handoff_digest":"c21ed50aa964770b16d098c18f1845d4fd75a0eccda9c3cd791d9a86840902d3","display_name":"Connector","generation":1,"spec_revision":1,"enrollment_request_id":"0197f1f0-0000-7000-8000-000000000006","enrollment_intent_id":"0197f1f0-0000-7000-8000-000000000007","installation_id":"0197f1f0-0000-7000-8000-00000000000a","agent_device_id":"0197f1f0-0000-7000-8000-00000000000b","binding_id":"0197f1f0-0000-7000-8000-00000000000c","expires_at_millis":4000000000,"server_origin":"https://server.example","trust":{"enrollment_url":"https://enroll.example/","enrollment_server_name":"enroll.example","enrollment_root_ca_sha256":"2791bd4394efbf10623f3cd301dc57f37ff18ff2a806b2c013403e85bc62c530","control_url":"https://control.example","control_server_name":"control.example","control_server_root_ca_sha256":"0fcd568a5cb9bdb4677b69354b11ee415af8f784519cff3da49a26f84eaee7f2","connector_issuer_root_ca_sha256":"535c6f8eb511f5d966a1b0725df92ebf27514faba945cbbd698e23ac72c41757"},"runtime_profile":"safe","remote_mcp":{"mcp_server_name":"mcp_1","mcp_url":"https://mcp.example/mcp","mcp_node_id":"0197f1f0-0000-7000-8000-00000000000d","max_concurrent_runs":1,"offline_policy":"queue"}}}"#;
+    const GO_PLAN_CANONICAL_JSON: &[u8] = br#"{"schema":"dirextalk.connector-bootstrap-plan","schema_version":1,"state":"prepared","operation_id":"0197f1f0-0000-7000-8000-000000000005","manifest_digest":"05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f","target":"linux-amd64","connector_artifact":{"version":"1.2.3-alpha.1+build-1","digest":"a4d451ec23463726f72c43d64c710968f6b602cd653b4de8adee1b556240a829"},"host":{"tenant_id":"0197f1f0-0000-7000-8000-000000000001","host_id":"0197f1f0-0000-7000-8000-000000000002","owner_id":"dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la","host_credential_id":"0197f1f0-0000-7000-8000-000000000009"},"connector":{"instance_id":"0197f1f0-0000-7000-8000-000000000003","adapter_kind":"codex","handoff_digest":"c21ed50aa964770b16d098c18f1845d4fd75a0eccda9c3cd791d9a86840902d3","display_name":"Connector","generation":1,"spec_revision":1,"enrollment_request_id":"0197f1f0-0000-7000-8000-000000000006","enrollment_intent_id":"0197f1f0-0000-7000-8000-000000000007","installation_id":"0197f1f0-0000-7000-8000-00000000000a","agent_device_id":"0197f1f0-0000-7000-8000-00000000000b","binding_id":"0197f1f0-0000-7000-8000-00000000000c","expires_at_millis":4000000000,"server_origin":"https://server.example","trust":{"enrollment_url":"https://enroll.example/","enrollment_server_name":"enroll.example","enrollment_root_ca_sha256":"2791bd4394efbf10623f3cd301dc57f37ff18ff2a806b2c013403e85bc62c530","control_url":"https://control.example","control_server_name":"control.example","control_server_root_ca_sha256":"0fcd568a5cb9bdb4677b69354b11ee415af8f784519cff3da49a26f84eaee7f2","connector_issuer_root_ca_sha256":"535c6f8eb511f5d966a1b0725df92ebf27514faba945cbbd698e23ac72c41757"},"runtime_profile":"safe","remote_mcp":{"mcp_server_name":"mcp_1","mcp_url":"https://mcp.example/mcp","mcp_node_id":"0197f1f0-0000-7000-8000-00000000000d","max_concurrent_runs":1,"offline_policy":"queue"}}}"#;
     const GO_PLAN_CANONICAL_SHA256: &str =
-        "ab8d8c4c73462cd2ebf7ad324468d9ff35e9a1793b951ef31e077deaa59bdb99";
+        "792b519bcd3f7a489a1ce57d2cf9a0948565e267935568ad70b8537abff1071e";
     const CREDENTIAL_ID: &str = "0197f1f0-0000-7000-8000-000000000010";
 
     fn hex(bytes: &[u8]) -> String {
@@ -922,7 +927,7 @@ mod tests {
         let control = hex(b"control");
         let issuer = hex(b"issuer");
         let plan = format!(
-            r#"{{"schema":"dirextalk.connector-bootstrap-plan","schema_version":1,"state":"prepared","operation_id":"{OPERATION}","manifest_digest":"{}","target":"linux-amd64","connector_artifact":{{"version":"1.2.3-alpha.1+build-1","digest":"{}"}},"host":{{"tenant_id":"{TENANT}","host_id":"{HOST}","owner_id":"0197f1f0-0000-7000-8000-000000000008","host_credential_id":"0197f1f0-0000-7000-8000-000000000009"}},"connector":{{"instance_id":"{CONNECTOR}","adapter_kind":"codex","handoff_digest":"{}","display_name":"Connector","generation":1,"spec_revision":1,"enrollment_request_id":"{OTHER}","enrollment_intent_id":"0197f1f0-0000-7000-8000-000000000007","installation_id":"0197f1f0-0000-7000-8000-00000000000a","agent_device_id":"0197f1f0-0000-7000-8000-00000000000b","binding_id":"0197f1f0-0000-7000-8000-00000000000c","expires_at_millis":4000000000,"server_origin":"https://server.example","trust":{{"enrollment_url":"https://enroll.example/","enrollment_server_name":"enroll.example","enrollment_root_ca_sha256":"{enrollment}","control_url":"https://control.example","control_server_name":"control.example","control_server_root_ca_sha256":"{control}","connector_issuer_root_ca_sha256":"{issuer}"}},"runtime_profile":"safe","remote_mcp":{{"mcp_server_name":"mcp_1","mcp_url":"https://mcp.example/mcp","mcp_node_id":"0197f1f0-0000-7000-8000-00000000000d","max_concurrent_runs":1,"offline_policy":"queue"}}}}}}"#,
+            r#"{{"schema":"dirextalk.connector-bootstrap-plan","schema_version":1,"state":"prepared","operation_id":"{OPERATION}","manifest_digest":"{}","target":"linux-amd64","connector_artifact":{{"version":"1.2.3-alpha.1+build-1","digest":"{}"}},"host":{{"tenant_id":"{TENANT}","host_id":"{HOST}","owner_id":"{OWNER_ID}","host_credential_id":"0197f1f0-0000-7000-8000-000000000009"}},"connector":{{"instance_id":"{CONNECTOR}","adapter_kind":"codex","handoff_digest":"{}","display_name":"Connector","generation":1,"spec_revision":1,"enrollment_request_id":"{OTHER}","enrollment_intent_id":"0197f1f0-0000-7000-8000-000000000007","installation_id":"0197f1f0-0000-7000-8000-00000000000a","agent_device_id":"0197f1f0-0000-7000-8000-00000000000b","binding_id":"0197f1f0-0000-7000-8000-00000000000c","expires_at_millis":4000000000,"server_origin":"https://server.example","trust":{{"enrollment_url":"https://enroll.example/","enrollment_server_name":"enroll.example","enrollment_root_ca_sha256":"{enrollment}","control_url":"https://control.example","control_server_name":"control.example","control_server_root_ca_sha256":"{control}","connector_issuer_root_ca_sha256":"{issuer}"}},"runtime_profile":"safe","remote_mcp":{{"mcp_server_name":"mcp_1","mcp_url":"https://mcp.example/mcp","mcp_node_id":"0197f1f0-0000-7000-8000-00000000000d","max_concurrent_runs":1,"offline_policy":"queue"}}}}}}"#,
             hex(b"manifest"),
             hex(b"release"),
             hex(handoff.as_bytes())
@@ -972,7 +977,7 @@ mod tests {
         credential_revision: u64,
     ) -> Vec<u8> {
         format!(
-            r#"{{"schema":"dirextalk.connector-bootstrap-receipt","schema_version":1,"state":"prepared","plan_digest":"{GO_PLAN_CANONICAL_SHA256}","operation_id":"{OPERATION}","manifest_digest":"{}","target":"linux-amd64","connector_artifact_version":"1.2.3-alpha.1+build-1","connector_artifact_digest":"{}","tenant_id":"{TENANT}","host_id":"{HOST}","owner_id":"0197f1f0-0000-7000-8000-000000000008","host_credential_id":"0197f1f0-0000-7000-8000-000000000009","instance_id":"{CONNECTOR}","adapter_kind":"codex","handoff_digest":"{}","generation":1,"spec_revision":1,"enrollment_request_id":"{OTHER}","enrollment_intent_id":"0197f1f0-0000-7000-8000-000000000007","installation_id":"0197f1f0-0000-7000-8000-00000000000a","agent_device_id":"0197f1f0-0000-7000-8000-00000000000b","binding_id":"0197f1f0-0000-7000-8000-00000000000c","credential_id":"{CREDENTIAL_ID}","credential_generation":{credential_generation},"credential_revision":{credential_revision},"leaf_fingerprint_sha256":"{}"}}"#,
+            r#"{{"schema":"dirextalk.connector-bootstrap-receipt","schema_version":1,"state":"prepared","plan_digest":"{GO_PLAN_CANONICAL_SHA256}","operation_id":"{OPERATION}","manifest_digest":"{}","target":"linux-amd64","connector_artifact_version":"1.2.3-alpha.1+build-1","connector_artifact_digest":"{}","tenant_id":"{TENANT}","host_id":"{HOST}","owner_id":"{OWNER_ID}","host_credential_id":"0197f1f0-0000-7000-8000-000000000009","instance_id":"{CONNECTOR}","adapter_kind":"codex","handoff_digest":"{}","generation":1,"spec_revision":1,"enrollment_request_id":"{OTHER}","enrollment_intent_id":"0197f1f0-0000-7000-8000-000000000007","installation_id":"0197f1f0-0000-7000-8000-00000000000a","agent_device_id":"0197f1f0-0000-7000-8000-00000000000b","binding_id":"0197f1f0-0000-7000-8000-00000000000c","credential_id":"{CREDENTIAL_ID}","credential_generation":{credential_generation},"credential_revision":{credential_revision},"leaf_fingerprint_sha256":"{}"}}"#,
             hex(b"manifest"),
             hex(b"release"),
             hex(frame.material.as_ref().expect("material").handoff_json()),
@@ -1045,6 +1050,25 @@ mod tests {
         let mut bad = fixture();
         bad.header.control_ca_sha256 = Some(hex(b"wrong"));
         assert!(ValidatedBootstrapRequest::parse(bad).is_err());
+    }
+
+    #[test]
+    fn owner_id_requires_canonical_identity_id() {
+        assert!(is_identity_id(OWNER_ID));
+        for legacy in [
+            "0197f1f0-0000-7000-8000-000000000008",
+            "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4lb",
+            "dtxi1ECI4TBB6KK5WK4VWV5CKEKIFWQTXY7BDD5VBMD7VAC45R5XWU4LA",
+        ] {
+            assert!(!is_identity_id(legacy));
+            let frame = fixture();
+            let plan = replace_once(
+                frame.material.as_ref().expect("material").plan_json(),
+                OWNER_ID,
+                legacy,
+            );
+            assert!(ValidatedBootstrapRequest::parse(with_plan(frame, plan)).is_err());
+        }
     }
 
     #[test]

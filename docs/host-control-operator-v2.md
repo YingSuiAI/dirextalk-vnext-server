@@ -132,5 +132,8 @@ then commits the Host, Connector, enrollment intent, and issuance fence in one
 tenant transaction. The durable row stores only redacted JSON and digests. A
 post-commit atomic rewrite publishes the `ready` handoff and canonical
 `dirextalk.connector-bootstrap-plan` v1 accepted by this Host V2 boundary.
+The plan's `host.owner_id` is the stable `IdentityId` text form (`dtxi1` plus
+52 lowercase RFC 4648 Base32 characters); tenant, host, credential, Connector,
+and operation identifiers remain UUIDv7 values.
 Missing or changed handoff material after a durable row exists returns
 `HANDOFF_UNAVAILABLE`/conflict and never remints secrets.
