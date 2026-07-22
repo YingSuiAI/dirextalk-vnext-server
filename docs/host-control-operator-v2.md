@@ -96,11 +96,13 @@ facts and material. A different envelope under the same Host operation ID,
 another pending Host operation, stale fence, mismatched receipt, release,
 identity, or metadata fails closed.
 
-For an expired pending prepare, the adapter first performs a read-only scan of
-every fixed filesystem footprint, before process observation or any privileged
-effect. `ExpiredUnclaimed` is returned only when all paths are absent and the
-missing paths have safe existing ancestors; this neither requires nor creates
-the service user. A securely typed and permissioned present footprint re-enters
+For an expired prepare, the core persists and routes the exact material to the
+adapter rather than rejecting it before footprint recovery. The adapter first
+performs a read-only scan of every fixed filesystem footprint, before process
+observation or any privileged effect. `ExpiredUnclaimed` is returned only when
+all paths are absent and the missing paths have safe existing ancestors; this
+neither requires nor creates the service user. A securely typed and
+permissioned present footprint re-enters
 the Connector's exact expired-claim recovery through the same fixed Host
 ensure, exact-material staging, verified-descriptor invocation, receipt
 binding, and credential adoption path. This covers a durable Connector pending

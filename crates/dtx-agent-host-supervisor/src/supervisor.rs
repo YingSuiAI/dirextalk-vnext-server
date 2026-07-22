@@ -264,7 +264,7 @@ impl HostSupervisor {
         journal: &mut J,
         catalog: &mut R,
         material: &mut M,
-        now_millis: u64,
+        _now_millis: u64,
     ) -> Result<CommandResult, SupervisorError>
     where
         J: Journal,
@@ -291,15 +291,8 @@ impl HostSupervisor {
                 }
             }
         }
-        if facts.tenant_id() != self.tenant_id
-            || facts.host_id() != self.host_id
-            || (!retrying && facts.expiry_millis() <= now_millis)
-        {
-            return Err(if !retrying && facts.expiry_millis() <= now_millis {
-                SupervisorError::InstallExpired
-            } else {
-                SupervisorError::HostBoundaryMismatch
-            });
+        if facts.tenant_id() != self.tenant_id || facts.host_id() != self.host_id {
+            return Err(SupervisorError::HostBoundaryMismatch);
         }
         let existing = self.instances.get(&facts.connector_id());
         if let Some(existing) = existing {

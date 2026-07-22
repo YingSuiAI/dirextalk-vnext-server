@@ -521,7 +521,7 @@ fn install_facts(
 }
 
 #[test]
-fn expired_new_prepare_persists_no_intent() {
+fn expired_new_prepare_routes_to_the_provider_and_records_expired_unclaimed() {
     let host = active_host();
     let mut supervisor = HostSupervisor::new(&host).unwrap();
     let approved = release(AdapterKind::Codex, 77, ResourceProfile::Standard);
@@ -534,15 +534,26 @@ fn expired_new_prepare_persists_no_intent() {
     let mut catalog = FakeCatalog::default();
     catalog.approve(approved);
     let mut journal = FakeJournal::default();
-    let mut material = FakeMaterial::default();
+    let mut material = FakeMaterial {
+        expired: true,
+        ..Default::default()
+    };
+    let predecessor = supervisor.snapshot();
+    let result = supervisor
+        .prepare_connector_material(&envelope, &mut journal, &mut catalog, &mut material, 101)
+        .unwrap();
     assert_eq!(
-        supervisor
-            .prepare_connector_material(&envelope, &mut journal, &mut catalog, &mut material, 101)
-            .unwrap_err(),
-        SupervisorError::InstallExpired
+        result.outcome().disposition,
+        CommandDisposition::ExpiredUnclaimed
     );
-    assert!(journal.records.0.borrow().is_empty());
-    assert_eq!(material.calls, 0);
+    assert_eq!(supervisor.snapshot(), predecessor);
+    assert_eq!(material.calls, 1);
+    assert!(matches!(
+        journal
+            .lookup(supervisor.host_id(), envelope.operation_id())
+            .unwrap(),
+        Some(JournalRecord::Completed { .. })
+    ));
 }
 
 #[test]
