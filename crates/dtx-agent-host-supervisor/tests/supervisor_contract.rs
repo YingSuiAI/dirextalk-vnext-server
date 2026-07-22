@@ -655,6 +655,11 @@ fn installed_connector_rejects_v1_credential_rotation_without_poisoning_start_or
             credential_ref: CredentialArtifactRef::from_bytes([42; 32]),
         },
     );
+    let snapshot_before = supervisor.snapshot();
+    let credential_before = supervisor
+        .instance(facts.connector_id())
+        .unwrap()
+        .credential_ref;
     let records_before = journal.records.0.borrow().len();
     assert_eq!(
         supervisor.execute(
@@ -667,6 +672,14 @@ fn installed_connector_rejects_v1_credential_rotation_without_poisoning_start_or
         Err(SupervisorError::InstallLifecycleConflict)
     );
     assert_eq!(journal.records.0.borrow().len(), records_before);
+    assert_eq!(supervisor.snapshot(), snapshot_before);
+    assert_eq!(
+        supervisor
+            .instance(facts.connector_id())
+            .unwrap()
+            .credential_ref,
+        credential_before
+    );
     assert!(credentials.requested.is_empty());
     assert!(controller.calls.is_empty());
 
@@ -697,6 +710,123 @@ fn installed_connector_rejects_v1_credential_rotation_without_poisoning_start_or
         &mut controller,
     );
     assert_eq!(controller.restore_calls.len(), 2);
+}
+
+#[test]
+fn uninstalled_connector_retains_v1_credential_rotation_behavior() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 84, ResourceProfile::Standard);
+    let connector_id = ConnectorId::new();
+    let credential_ref = CredentialArtifactRef::from_bytes([84; 32]);
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    let mut journal = FakeJournal::default();
+    let mut credentials = FakeCredentials::with_journal(journal.records.clone());
+    let mut controller = FakeProcessController::with_journal(journal.records.clone());
+    execute(
+        &mut supervisor,
+        HostCommand::Ensure {
+            connector_id,
+            adapter_kind: AdapterKind::Codex,
+            release_digest: approved.digest(),
+        },
+        &mut journal,
+        &mut catalog,
+        &mut credentials,
+        &mut controller,
+    );
+
+    let result = execute(
+        &mut supervisor,
+        HostCommand::RotateCredential {
+            connector_id,
+            credential_ref,
+        },
+        &mut journal,
+        &mut catalog,
+        &mut credentials,
+        &mut controller,
+    );
+
+    assert_eq!(result.application(), CommandApplication::Applied);
+    assert_eq!(
+        supervisor.instance(connector_id).unwrap().credential_ref,
+        Some(credential_ref)
+    );
+    assert_eq!(credentials.requested.len(), 1);
+}
+
+#[test]
+fn historical_v1_rotation_replays_after_later_install_without_effects() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 85, ResourceProfile::Standard);
+    let connector_id = ConnectorId::new();
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    let mut journal = FakeJournal::default();
+    let mut credentials = FakeCredentials::with_journal(journal.records.clone());
+    let mut controller = FakeProcessController::with_journal(journal.records.clone());
+    execute(
+        &mut supervisor,
+        HostCommand::Ensure {
+            connector_id,
+            adapter_kind: AdapterKind::Codex,
+            release_digest: approved.digest(),
+        },
+        &mut journal,
+        &mut catalog,
+        &mut credentials,
+        &mut controller,
+    );
+    let rotation = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::RotateCredential {
+            connector_id,
+            credential_ref: CredentialArtifactRef::from_bytes([85; 32]),
+        },
+    );
+    let rotated = supervisor
+        .execute(
+            &rotation,
+            &mut journal,
+            &mut catalog,
+            &mut credentials,
+            &mut controller,
+        )
+        .unwrap();
+
+    let facts = install_facts(&supervisor, connector_id, approved);
+    let prepare = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    let mut material = FakeMaterial::default();
+    supervisor
+        .prepare_connector_material(&prepare, &mut journal, &mut catalog, &mut material, 10)
+        .unwrap();
+    let snapshot_before_replay = supervisor.snapshot();
+    let credential_calls_before_replay = credentials.requested.len();
+    let process_calls_before_replay = controller.calls.len();
+
+    let replay = supervisor
+        .execute(
+            &rotation,
+            &mut journal,
+            &mut catalog,
+            &mut credentials,
+            &mut controller,
+        )
+        .unwrap();
+
+    assert_eq!(replay.application(), CommandApplication::Replayed);
+    assert_eq!(replay.outcome(), rotated.outcome());
+    assert_eq!(supervisor.snapshot(), snapshot_before_replay);
+    assert_eq!(credentials.requested.len(), credential_calls_before_replay);
+    assert_eq!(controller.calls.len(), process_calls_before_replay);
 }
 
 #[test]

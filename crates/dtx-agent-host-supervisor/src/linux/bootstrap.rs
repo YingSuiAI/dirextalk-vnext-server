@@ -209,11 +209,14 @@ impl LinuxBootstrapCommand {
 
     #[cfg(test)]
     fn for_test(executable: &Path, plan: &Path, deadline: Duration) -> Self {
+        // Tests exercise the production descriptor-verification and runner
+        // path; this helper supplies only a disposable fixed artifact.
+        let digest = crate::ReleaseDigest::from_bytes(
+            Sha256::digest(fs::read(executable).expect("test executable reads")).into(),
+        );
         Self {
-            executable: File::from(
-                rfs::open(executable, OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty())
-                    .expect("test executable opens"),
-            ),
+            executable: open_verified_release(executable, digest)
+                .expect("test executable verifies as a descriptor capability"),
             plan: plan.as_os_str().to_os_string(),
             deadline,
         }

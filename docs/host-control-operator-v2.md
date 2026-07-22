@@ -96,15 +96,20 @@ facts and material. A different envelope under the same Host operation ID,
 another pending Host operation, stale fence, mismatched receipt, release,
 identity, or metadata fails closed.
 
-For an expired pending prepare, the adapter first observes the exact fixed
-systemd unit and performs a read-only scan of every fixed filesystem footprint.
-`ExpiredUnclaimed` is returned only when the unit and all paths are absent and
-the missing paths have safe existing ancestors; this neither requires nor
-creates the service user. A present unit or securely typed and permissioned
-footprint proceeds to exact Connector-claim recovery. Any symlink, special
-file, unsafe ancestor, owner/group/mode/link mismatch, partial ambiguous state,
-or lookup failure is rejected. Expiry never authorizes a new claim or inferred
-reinstall.
+For an expired pending prepare, the adapter first performs a read-only scan of
+every fixed filesystem footprint, before process observation or any privileged
+effect. `ExpiredUnclaimed` is returned only when all paths are absent and the
+missing paths have safe existing ancestors; this neither requires nor creates
+the service user. A securely typed and permissioned present footprint re-enters
+the Connector's exact expired-claim recovery through the same fixed Host
+ensure, exact-material staging, verified-descriptor invocation, receipt
+binding, and credential adoption path. This covers a durable Connector pending
+claim before its receipt and a rebooted/absent Host process after its receipt;
+the Connector rejects any attempt to create a new expired claim. The recovered
+process must remain exactly stopped until the separate finalize workflow. Any
+symlink, special file, unsafe ancestor, owner/group/mode/link mismatch,
+partial ambiguous state, missing or mismatched receipt, or lookup failure is
+rejected. Expiry never authorizes a new claim or inferred reinstall.
 
 The v2 response is a separate sanitized projection: protocol, success/reject
 status, operation, application (`applied` or `replayed`), disposition,

@@ -1120,6 +1120,16 @@ impl HostSupervisor {
                 | DurableHostCommand::FinalizeConnectorMaterial { .. } => Ok(()),
             };
         }
+        // V1 rotation materializes an independent credential artifact. Once
+        // the connector has adopted install-lifecycle state, only the fenced
+        // reissue lifecycle may replace that material. Historical completed
+        // intents return above without effects; current and pending intents
+        // remain fenced even when reached by reconciliation.
+        if matches!(command, DurableHostCommand::RotateCredential { .. })
+            && self.install_states.contains_key(&target.connector_id())
+        {
+            return Err(SupervisorError::InstallLifecycleConflict);
+        }
         let instance = self.instances.get(&target.connector_id());
         if at_expected {
             validate_durable_command_precondition(instance, command)?;

@@ -2634,8 +2634,14 @@ mod tests {
                 "schema" => value["schema"] = Value::from("unrecognized"),
                 "version" => value["version"] = Value::from(VERSION + 1),
                 "generation" => value["generation"] = Value::from(1),
-                "genesis_anchor" => value["genesis_anchor"][0] = Value::from(255_u64),
-                "chain_tip" => value["chain_tip"][0] = Value::from(255_u64),
+                "genesis_anchor" => {
+                    let byte = value["genesis_anchor"][0].as_u64().unwrap();
+                    value["genesis_anchor"][0] = Value::from(if byte == 255 { 0 } else { 255 });
+                }
+                "chain_tip" => {
+                    let byte = value["chain_tip"][0].as_u64().unwrap();
+                    value["chain_tip"][0] = Value::from(if byte == 255 { 0 } else { 255 });
+                }
                 "host" => value["host_id"] = Value::from(HostId::new().to_string()),
                 "snapshot_host" => {
                     value["snapshot"]["host_id"] = Value::from(HostId::new().to_string());

@@ -385,27 +385,28 @@ impl LinuxBootstrapProvider {
             .then_some(())
             .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))
     }
-}
 
-impl BootstrapMaterialProvider for LinuxBootstrapProvider {
-    fn prepare(
+    /// Re-enters the Connector's exact-claim recovery through the same closed
+    /// Host ensure, material, descriptor, and adoption capabilities as
+    /// prepare. The Connector owns the durable claim/pending decision and
+    /// rejects creation of a new expired claim.
+    fn recover_expired_prepare(
         &mut self,
         operation_id: HostOperationId,
         facts: ConnectorLifecycleFacts,
         release: CatalogRelease,
+        store: &LinuxMaterialStore,
     ) -> Result<PrepareMaterialResult, PortError> {
-        self.request_matches(&facts)?;
-        let store = LinuxMaterialStore::for_lifecycle(facts, operation_id);
-        // An expired, never-claimed request must leave no process, staging, or
-        // filesystem effect.  A present footprint is deliberately allowed to
-        // proceed: the Connector's immutable claim remains the exact recovery
-        // authority.
-        if facts.expiry_millis() <= self.now_millis {
-            let process = self.process.observe_lifecycle(facts)?;
-            if expired_prepare_is_unclaimed(process, store.inspect_prepare_footprint()?)? {
-                return Ok(PrepareMaterialResult::ExpiredUnclaimed);
-            }
-        }
+        self.complete_prepare(operation_id, facts, release, store)
+    }
+
+    fn complete_prepare(
+        &mut self,
+        operation_id: HostOperationId,
+        facts: ConnectorLifecycleFacts,
+        release: CatalogRelease,
+        store: &LinuxMaterialStore,
+    ) -> Result<PrepareMaterialResult, PortError> {
         if self.process.ensure_lifecycle(
             ProcessMutationId::requested(operation_id),
             facts,
@@ -459,6 +460,33 @@ impl BootstrapMaterialProvider for LinuxBootstrapProvider {
             credentials,
             observation: ProcessObservation::Stopped,
         }))
+    }
+}
+
+impl BootstrapMaterialProvider for LinuxBootstrapProvider {
+    fn prepare(
+        &mut self,
+        operation_id: HostOperationId,
+        facts: ConnectorLifecycleFacts,
+        release: CatalogRelease,
+    ) -> Result<PrepareMaterialResult, PortError> {
+        self.request_matches(&facts)?;
+        let store = LinuxMaterialStore::for_lifecycle(facts, operation_id);
+        // Expiry recovery deliberately scans the fixed footprint before even a
+        // process observation.  An expired request may never create a fresh
+        // claim: absence is terminal, ambiguity is rejected, and a present
+        // footprint must prove the Connector's exact durable claim below.
+        if facts.expiry_millis() <= self.now_millis {
+            match expired_prepare_route(store.inspect_prepare_footprint()?)? {
+                ExpiredPrepareRoute::Unclaimed => {
+                    return Ok(PrepareMaterialResult::ExpiredUnclaimed);
+                }
+                ExpiredPrepareRoute::RecoverClaim => {
+                    return self.recover_expired_prepare(operation_id, facts, release, &store);
+                }
+            }
+        }
+        self.complete_prepare(operation_id, facts, release, &store)
     }
 
     fn finalize(
@@ -515,16 +543,19 @@ impl BootstrapMaterialProvider for LinuxBootstrapProvider {
     }
 }
 
-fn expired_prepare_is_unclaimed(
-    process: ProcessObservation,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpiredPrepareRoute {
+    Unclaimed,
+    RecoverClaim,
+}
+
+fn expired_prepare_route(
     footprint: LinuxPrepareFootprint,
-) -> Result<bool, PortError> {
-    match (process, footprint) {
-        (_, LinuxPrepareFootprint::Ambiguous) => {
-            Err(PortError::new(PortErrorKind::InvalidArtifact))
-        }
-        (ProcessObservation::Absent, LinuxPrepareFootprint::AllAbsent) => Ok(true),
-        _ => Ok(false),
+) -> Result<ExpiredPrepareRoute, PortError> {
+    match footprint {
+        LinuxPrepareFootprint::AllAbsent => Ok(ExpiredPrepareRoute::Unclaimed),
+        LinuxPrepareFootprint::Present => Ok(ExpiredPrepareRoute::RecoverClaim),
+        LinuxPrepareFootprint::Ambiguous => Err(PortError::new(PortErrorKind::InvalidArtifact)),
     }
 }
 
@@ -1234,37 +1265,40 @@ mod tests {
     }
 
     #[test]
-    fn expired_unclaimed_requires_both_absent_unit_and_absent_fixed_paths() {
-        assert!(
-            expired_prepare_is_unclaimed(
-                ProcessObservation::Absent,
-                LinuxPrepareFootprint::AllAbsent,
-            )
-            .unwrap()
-        );
-        for process in [
-            ProcessObservation::Stopped,
-            ProcessObservation::Starting,
-            ProcessObservation::Running,
-            ProcessObservation::Failed,
-        ] {
-            assert!(
-                !expired_prepare_is_unclaimed(process, LinuxPrepareFootprint::AllAbsent).unwrap()
-            );
-        }
-        assert!(
-            !expired_prepare_is_unclaimed(
-                ProcessObservation::Absent,
-                LinuxPrepareFootprint::Present,
-            )
-            .unwrap()
+    fn expired_prepare_footprint_policy_is_effect_free_before_claim_recovery() {
+        assert_eq!(
+            expired_prepare_route(LinuxPrepareFootprint::AllAbsent),
+            Ok(ExpiredPrepareRoute::Unclaimed)
         );
         assert_eq!(
-            expired_prepare_is_unclaimed(
-                ProcessObservation::Absent,
-                LinuxPrepareFootprint::Ambiguous,
-            ),
+            expired_prepare_route(LinuxPrepareFootprint::Present),
+            Ok(ExpiredPrepareRoute::RecoverClaim)
+        );
+        assert_eq!(
+            expired_prepare_route(LinuxPrepareFootprint::Ambiguous),
             Err(PortError::new(PortErrorKind::InvalidArtifact))
+        );
+    }
+
+    #[test]
+    fn expired_present_pending_claim_before_receipt_reenters_connector_recovery() {
+        // The footprint gate intentionally has no receipt or process input:
+        // the Connector's fixed bootstrap verb is the only authority that can
+        // distinguish its durable pending claim from a completed claim.
+        assert_eq!(
+            expired_prepare_route(LinuxPrepareFootprint::Present),
+            Ok(ExpiredPrepareRoute::RecoverClaim)
+        );
+    }
+
+    #[test]
+    fn expired_present_receipt_after_host_reboot_reenters_connector_recovery() {
+        // A reboot can make the Host unit Absent after the Connector writes a
+        // receipt. Present still follows the exact recovery capability, which
+        // re-ensures the fixed stopped unit before adoption.
+        assert_eq!(
+            expired_prepare_route(LinuxPrepareFootprint::Present),
+            Ok(ExpiredPrepareRoute::RecoverClaim)
         );
     }
 
