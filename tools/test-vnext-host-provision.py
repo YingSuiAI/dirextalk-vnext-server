@@ -22,7 +22,8 @@ except mod.ContractError: pass
 else: raise AssertionError('accepted duplicate keys')
 source=(ROOT/'docker/production/docker-compose.yml').read_text(); rendered=mod.transform_compose(source)
 assert rendered.count('network_mode: service:agent-control')==2
-caddy=mod.caddyfile(v['domain']); assert 'reverse_proxy @mcp http://127.0.0.1:9081' in caddy and '@node path /v1/*' in caddy and 'agent-control:9081' not in caddy
+caddy=mod.caddyfile(v['domain']); assert 'reverse_proxy @mcp http://127.0.0.1:9081' in caddy and '@node path /v1/*' in caddy and '@health path /healthz' in caddy and 'agent-control:9081' not in caddy
+agent=json.loads(mod.agent_config(v)); assert agent['owner_api']['listen']=='127.0.0.1:9081' and agent['control']['listen']=='0.0.0.0:9444' and agent['connector_issuer']['response_intermediate_bundle_pem'].startswith('/run/dtx-agent-control-tls/')
 try: mod.transform_compose(source.replace('"80:80"','"81:80"',1))
 except mod.ContractError: pass
 else: raise AssertionError('accepted altered compose template')

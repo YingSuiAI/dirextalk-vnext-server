@@ -62,9 +62,15 @@ def mkdir(p, mode, gid=0):
     p.mkdir(parents=True,exist_ok=True); os.chown(p,0,gid); os.chmod(p,mode)
 def write(path, data, mode, gid=0):
     path.parent.mkdir(parents=True,exist_ok=True)
-    fd=os.open(path, os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_CLOEXEC, mode)
-    try: os.write(fd, data); os.fchmod(fd,mode); os.fchown(fd,0,gid)
+    temporary=path.with_name('.'+path.name+'.tmp')
+    fd=os.open(temporary, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC, mode)
+    try:
+        os.write(fd, data); os.fchmod(fd,mode); os.fchown(fd,0,gid); os.fsync(fd)
     finally: os.close(fd)
+    os.replace(temporary,path)
+    parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+    try: os.fsync(parent)
+    finally: os.close(parent)
 def run(*args, cwd=None): subprocess.run(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 AGENT_PORTS='''    ports:\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9443:9443"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9444:9444"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9445:9445"'''
@@ -76,9 +82,10 @@ def transform_compose(source):
     if source.count('network_mode: service:agent-control') != 2: raise ContractError('compose transformation count invalid')
     return source
 def caddyfile(domain):
-    return f'''{domain} {{\n    @realtime path /v1/realtime-sync*\n    reverse_proxy @realtime https://realtime-gateway:9444 {{\n        transport http {{\n            tls_trust_pool file /data/caddy/private-ca.pem\n            tls_server_name {domain}\n        }}\n    }}\n    @mcp path /mcp*\n    reverse_proxy @mcp http://127.0.0.1:9081\n    @node path /v1/*\n    reverse_proxy @node https://dtx-node:8443 {{\n        transport http {{\n            tls_trust_pool file /data/caddy/private-ca.pem\n            tls_server_name {domain}\n        }}\n    }}\n}}\n'''
+    return f'''{domain} {{\n    @health path /healthz\n    handle @health {{\n        rewrite * /local-health\n        reverse_proxy https://dtx-node:8443 {{\n            transport http {{\n                tls_trust_pool file /data/caddy/private-ca.pem\n                tls_server_name {domain}\n            }}\n        }}\n    }}\n    @realtime path /v1/realtime-sync*\n    reverse_proxy @realtime https://realtime-gateway:9444 {{\n        transport http {{\n            tls_trust_pool file /data/caddy/private-ca.pem\n            tls_server_name {domain}\n        }}\n    }}\n    @mcp path /mcp*\n    reverse_proxy @mcp http://127.0.0.1:9081\n    @node path /v1/*\n    reverse_proxy @node https://dtx-node:8443 {{\n        transport http {{\n            tls_trust_pool file /data/caddy/private-ca.pem\n            tls_server_name {domain}\n        }}\n    }}\n}}\n'''
 def agent_config(v):
-    return canonical({'database_url_file':'../secrets/agent-control/database-url','max_database_connections':16,'health':{'listen':'127.0.0.1:9080'},'owner_api':{'listen':'127.0.0.1:9081','tenant_id':v['tenant_id']},'enrollment':{'listen':v['private_ipv4']+':9443','certificate_chain_pem':'../tls/enrollment-chain.pem','private_key_pkcs8_pem':'../secrets/agent-control/enrollment-key.pem'},'control':{'listen':v['private_ipv4']+':9444','certificate_chain_pem':'../tls/control-chain.pem','private_key_pkcs8_pem':'../secrets/agent-control/control-key.pem','client_ca_bundle_pem':'../tls/connector-client-roots.pem'},'legacy_gateway':{'listen':v['private_ipv4']+':9445','certificate_chain_pem':'../tls/legacy-gateway-server-chain.pem','private_key_pkcs8_pem':'../secrets/agent-control/legacy-gateway-server-key.pem','client_ca_bundle_pem':'../tls/internal-service-client-roots.pem'},'connector_issuer':{'certificate_pem':'../tls/connector-issuer.pem','private_key_pkcs8_pem':'../secrets/agent-control/connector-issuer-key.pem'}})
+    s='/run/dtx-agent-control-secrets/'; t='/run/dtx-agent-control-tls/'
+    return canonical({'database_url_file':s+'database-url','max_database_connections':16,'health':{'listen':'127.0.0.1:9080'},'owner_api':{'listen':'127.0.0.1:9081','tenant_id':v['tenant_id']},'enrollment':{'listen':'0.0.0.0:9443','certificate_chain_pem':t+'enrollment-chain.pem','private_key_pkcs8_pem':s+'enrollment-key.pem'},'control':{'listen':'0.0.0.0:9444','certificate_chain_pem':t+'control-chain.pem','private_key_pkcs8_pem':s+'control-key.pem','client_ca_bundle_pem':t+'connector-client-roots.pem'},'legacy_gateway':{'listen':'0.0.0.0:9445','certificate_chain_pem':t+'legacy-gateway-server-chain.pem','private_key_pkcs8_pem':s+'legacy-gateway-server-key.pem','client_ca_bundle_pem':t+'internal-service-client-roots.pem'},'connector_issuer':{'certificate_pem':t+'connector-issuer.pem','private_key_pkcs8_pem':s+'connector-issuer-key.pem','response_intermediate_bundle_pem':t+'connector-response-intermediates.pem'}})
 def make_tls(v):
     mkdir(TLS,0o750,10001); mkdir(SECRETS/'agent-control',0o750,10001)
     ca=TLS/'private-ca.pem'; cak=SECRETS/'private-ca-key.pem'
@@ -87,15 +94,15 @@ def make_tls(v):
     for name, keyname, certname in [('node','node-key.pem','node-cert.pem'),('gateway','gateway-key.pem','gateway-cert.pem'),('server','server-key.pem','server-cert.pem'),('enrollment','enrollment-key.pem','enrollment-chain.pem'),('control','control-key.pem','control-chain.pem'),('legacy','legacy-gateway-server-key.pem','legacy-gateway-server-chain.pem')]:
         key=(SECRETS/'agent-control'/keyname) if name in ('enrollment','control','legacy') else TLS/keyname
         run('openssl','genpkey','-algorithm','ED25519','-out',str(key)); os.chmod(key,0o440); os.chown(key,0,10001)
-        csr=Path(str(key)+'.csr'); run('openssl','req','-new','-key',str(key),'-out',str(csr),'-subj','/CN='+v['domain']); cert=TLS/certname; run('openssl','x509','-req','-in',str(csr),'-CA',str(ca),'-CAkey',str(cak),'-CAcreateserial','-out',str(cert),'-days','825'); cert.write_bytes(cert.read_bytes()+ca.read_bytes()); os.chmod(cert,0o444); csr.unlink(missing_ok=True)
-    run('openssl','genpkey','-algorithm','ED25519','-out',str(TLS/'mls-sequencer-key.pem')); os.chmod(TLS/'mls-sequencer-key.pem',0o440); os.chown(TLS/'mls-sequencer-key.pem',0,10001)
+        csr=Path(str(key)+'.csr'); ext=Path(str(key)+'.ext'); write(ext,('subjectAltName=DNS:'+v['domain']+'\n').encode(),0o600); run('openssl','req','-new','-key',str(key),'-out',str(csr),'-subj','/CN='+v['domain']); cert=TLS/certname; run('openssl','x509','-req','-in',str(csr),'-CA',str(ca),'-CAkey',str(cak),'-CAcreateserial','-extfile',str(ext),'-out',str(cert),'-days','825'); write(cert,cert.read_bytes()+ca.read_bytes(),0o444); csr.unlink(missing_ok=True); ext.unlink(missing_ok=True)
+    write(TLS/'mls-sequencer-key.pem',os.urandom(32),0o400,10001)
     issuerk=SECRETS/'agent-control/connector-issuer-key.pem'; issuer=TLS/'connector-issuer.pem'; run('openssl','genpkey','-algorithm','ED25519','-out',str(issuerk)); os.chmod(issuerk,0o440); os.chown(issuerk,0,10001); run('openssl','req','-x509','-new','-key',str(issuerk),'-out',str(issuer),'-subj','/CN=connector-issuer.'+v['domain'],'-days','3650'); os.chmod(issuer,0o444)
     for n in ('connector-client-roots.pem','connector-response-intermediates.pem','internal-service-client-roots.pem'): write(TLS/n,issuer.read_bytes(),0o444)
 def material(v, release):
     for p,m,g in ((CONFIG,0o755,0),(SECRETS,0o750,10001),(SECRETS/'role-passwords',0o700,0),(TLS,0o750,10001)): mkdir(p,m,g)
     write(CONFIG/'production-compose.yml',transform_compose((release/'docker/production/docker-compose.yml').read_text()).encode(),0o644)
     write(CONFIG/'Caddyfile',caddyfile(v['domain']).encode(),0o644); write(CONFIG/'agent-control.json',agent_config(v),0o644)
-    env='\n'.join([f'DTX_SERVER_IMAGE={v["server_image"]}',f'DTX_MIGRATOR_IMAGE={v["migrator_image"]}',f'DTX_POSTGRES_IMAGE={v["postgres_image"]}',f'DTX_CADDY_IMAGE={v["caddy_image"]}',f'DTX_PROBE_IMAGE={v["probe_image"]}',f'DTX_NODE_HOSTNAME={v["domain"]}',f'DTX_NODE_PUBLIC_ORIGIN=https://{v["domain"]}',f'DTX_NODE_TENANT_ID={v["tenant_id"]}',f'DTX_NODE_INDEXER_ID={v["indexer_id"]}',f'DTX_AGENT_CONTROL_BIND={v["private_ipv4"]}',f'DTX_CONFIG_ROOT={CONFIG}',f'DTX_SECRET_ROOT={SECRETS}',f'DTX_TLS_ROOT={TLS}',''])
+    env='\n'.join([f'DTX_SERVER_IMAGE={v["server_image"]}',f'DTX_MIGRATOR_IMAGE={v["migrator_image"]}',f'DTX_POSTGRES_IMAGE={v["postgres_image"]}',f'DTX_CADDY_IMAGE={v["caddy_image"]}',f'DTX_PROBE_IMAGE={v["probe_image"]}',f'DTX_RELEASE_VERSION={v["release_version"]}','DTX_ROLLBACK_COMPATIBILITY=forward-schema-compatible-v1',f'DTX_NODE_HOSTNAME={v["domain"]}',f'DTX_NODE_PUBLIC_ORIGIN=https://{v["domain"]}',f'DTX_NODE_TENANT_ID={v["tenant_id"]}',f'DTX_NODE_INDEXER_ID={v["indexer_id"]}',f'DTX_AGENT_CONTROL_BIND={v["private_ipv4"]}',f'DTX_CONFIG_ROOT={CONFIG}',f'DTX_SECRET_ROOT={SECRETS}',f'DTX_TLS_ROOT={TLS}',''])
     write(CONFIG/'production.env',env.encode(),0o644)
     admin=os.urandom(32).hex(); write(SECRETS/'postgres-admin-password',(admin+'\n').encode(),0o400); write(SECRETS/'admin-database-url',('postgresql://dtx_admin:'+admin+'@postgres/dtx_node\n').encode(),0o400)
     roles=['dtx_identity_node','dtx_group_node','dtx_mailbox_node','dtx_push_registration','dtx_push_identity_auth','dtx_realtime_sync_gateway','dtx_push_broker','dtx_public_feed_node','dtx_indexer_node','dtx_agent_control']
@@ -105,15 +112,34 @@ def material(v, release):
         role={'realtime':'dtx_realtime_sync_gateway'}.get(name,'dtx_'+name.replace('-','_')+'_node')
         write(SECRETS/(name+'-database-url'),('postgresql://'+role+':'+passwords[role]+'@postgres/dtx_node\n').encode(),0o440,10001)
     write(SECRETS/'agent-control/database-url',('postgresql://dtx_agent_control:'+passwords['dtx_agent_control']+'@postgres/dtx_node\n').encode(),0o440,10001)
-    write(SECRETS/'mls-seed',os.urandom(32),0o400)
     make_tls(v)
 def ready(v, reqsha):
     body={'schema':RECEIPT_SCHEMA,'schema_version':1,'state':'ready','request_sha256':reqsha,'target':v['target'],'domain':v['domain'],'tenant_id':v['tenant_id'],'indexer_id':v['indexer_id'],'release_version':v['release_version'],'bundle_sha256':v['bundle_sha256'],'compose_sha256':v['compose_sha256']}; body['receipt_sha256']=sha(canonical(body)); return canonical(body)
+def validate_release(v, release):
+    try: manifest=json.loads(secure(release/'manifest.json',0o444,1024*1024),object_pairs_hook=pairs)
+    except Exception as e: raise ContractError('installed release manifest invalid') from e
+    if not isinstance(manifest,dict) or manifest.get('schema')!='dirextalk.vnext-stack-bundle' or manifest.get('version')!=v['release_version'] or manifest.get('server_image')!=v['server_image'] or manifest.get('migrator_image')!=v['migrator_image']: raise ContractError('installed release manifest does not bind request')
+    try: receipt=json.loads(secure(Path('/var/lib/dirextalk-vnext/receipts/current.json'),0o600),object_pairs_hook=pairs)
+    except Exception as e: raise ContractError('installed release receipt invalid') from e
+    if receipt.get('state')!='installed' or receipt.get('version')!=v['release_version'] or receipt.get('bundle_sha256')!=v['bundle_sha256'] or receipt.get('server_image')!=v['server_image'] or receipt.get('migrator_image')!=v['migrator_image']: raise ContractError('installed release receipt does not bind request')
+    contract={}
+    for line in (release/'docker/production/examples'/(v['target']+'.env.example')).read_text().splitlines():
+        if line.startswith('DTX_') and '=' in line: key,value=line.split('=',1); contract[key]=value
+    bindings={'server_image':'DTX_SERVER_IMAGE','migrator_image':'DTX_MIGRATOR_IMAGE','postgres_image':'DTX_POSTGRES_IMAGE','caddy_image':'DTX_CADDY_IMAGE','probe_image':'DTX_PROBE_IMAGE'}
+    if any(contract.get(env)!=v[key] for key,env in bindings.items()): raise ContractError('request image is outside installed production contract')
+def public_verify(v, release):
+    env=CONFIG/'production.env'; compose=CONFIG/'production-compose.yml'
+    common=('docker','compose','--project-name','dirextalk-vnext-production','--env-file',str(env),'-f',str(compose),'run','--rm','--no-deps','probe','--fail','--silent','--show-error')
+    run(*common,'https://'+v['domain']+'/healthz',cwd=release)
+    try: run(*common,'https://'+v['domain']+'/mcp',cwd=release)
+    except subprocess.CalledProcessError: return
+    raise ContractError('unauthenticated MCP probe unexpectedly succeeded')
 def main():
     if len(sys.argv)!=1: return 2
     if os.geteuid()!=0: raise ContractError('root required')
     raw=secure(REQUEST,0o400); v=parse(raw); reqsha=sha(raw); release=RELEASES/v['bundle_sha256']
     if not release.is_dir() or sha((release/'docker/production/docker-compose.yml').read_bytes()) != v['compose_sha256']: raise ContractError('release compose digest mismatch')
+    validate_release(v,release)
     run('docker','compose','version'); run('openssl','version')
     mkdir(STATE,0o700); lock=os.open(STATE/'lock',os.O_RDWR|os.O_CREAT,0o600)
     try:
@@ -128,7 +154,7 @@ def main():
         if secure(staged,0o600)!=reqsha.encode()+b'\n': raise ContractError('staged material digest invalid')
       else:
         material(v,release); write(staged,reqsha.encode()+b'\n',0o600)
-      run(str(release/'scripts/production-stack/bootstrap.sh'),cwd=release); run(str(release/'scripts/production-stack/verify.sh'),cwd=release); write(receipt,ready(v,reqsha),0o600)
+      run(str(release/'scripts/production-stack/bootstrap.sh'),cwd=release); run(str(release/'scripts/production-stack/verify.sh'),cwd=release); public_verify(v,release); write(receipt,ready(v,reqsha),0o600)
     finally: os.close(lock)
     return 0
 if __name__=='__main__':
