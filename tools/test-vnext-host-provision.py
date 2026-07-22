@@ -28,6 +28,19 @@ assert versioned_matcher
 versioned_api=re.compile(versioned_matcher.group(1))
 assert versioned_api.fullmatch('/v2/key-packages/claim') and versioned_api.fullmatch('/v12/future-route')
 assert not versioned_api.fullmatch('/v0/key-packages/claim') and not versioned_api.fullmatch('/v01/key-packages/claim') and not versioned_api.fullmatch('/key-packages/claim')
+public_feed_matcher=re.search(r'@public_feed path_regexp public_feed (\S+)',caddy)
+assert public_feed_matcher and 'reverse_proxy @public_feed https://dtx-node:8443' in caddy
+public_feed_api=re.compile(public_feed_matcher.group(1))
+assert public_feed_api.fullmatch('/.well-known/dirextalk/public/v1/dtxc123/feed') and public_feed_api.fullmatch('/.well-known/dirextalk/public/v1/dtxa456/posts/hash/comments')
+for path in ('/.well-known/dirextalk/public/v1', '/.well-known/dirextalk/public/v1/', '/.well-known/dirextalk/public/v1//feed', '/.well-known/dirextalk/public/v0/dtxc123/feed', '/.well-known/dirextalk/public/v00/dtxc123/feed', '/.well-known/public/v1/dtxc123/feed', '/public/v1/dtxc123/feed'):
+ assert not public_feed_api.fullmatch(path), path
+static_caddy=(ROOT/'docker/production/Caddyfile').read_text()
+static_public_feed_matcher=re.search(r'@public_feed path_regexp public_feed (\S+)',static_caddy)
+assert static_public_feed_matcher and 'reverse_proxy @public_feed https://dtx-node:8443' in static_caddy
+static_public_feed_api=re.compile(static_public_feed_matcher.group(1))
+assert static_public_feed_api.fullmatch('/.well-known/dirextalk/public/v1/dtxc123/feed')
+for path in ('/.well-known/dirextalk/public/v1', '/.well-known/dirextalk/public/v1/', '/.well-known/dirextalk/public/v1//feed', '/.well-known/dirextalk/public/v0/dtxc123/feed', '/.well-known/dirextalk/public/v00/dtxc123/feed', '/.well-known/public/v1/dtxc123/feed', '/public/v1/dtxc123/feed'):
+ assert not static_public_feed_api.fullmatch(path), path
 agent=json.loads(mod.agent_config(v)); assert agent['owner_api']['listen']=='127.0.0.1:9081' and agent['control']['listen']=='0.0.0.0:9444' and agent['connector_issuer']['response_intermediate_bundle_pem'].startswith('/run/dtx-agent-control-tls/')
 try: mod.transform_compose(source.replace('"80:80"','"81:80"',1))
 except mod.ContractError: pass
