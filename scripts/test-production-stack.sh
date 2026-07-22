@@ -9,16 +9,53 @@ grep -q 'condition: service_completed_successfully' "$compose"
 grep -q 'postgres-data:' "$compose"
 grep -q 'entrypoint: \["/usr/local/bin/dtx-agent-control"\]' "$compose"
 grep -q 'entrypoint: \["/usr/local/bin/dtx-realtime-sync-gateway"\]' "$compose"
-grep -q 'profiles: \["opaque-push"\]' "$compose"
+! grep -q '^  opaque-push:' "$compose"
+grep -q 'command: \["verify-roles"\]' "$compose"
+grep -q 'dtx_agent_control' "$root/docker/production/postgres/verify-roles.sql"
+grep -q 'directory.index_registrations.*UPDATE' "$root/docker/production/postgres/verify-roles.sql"
 grep -q 'DTX_.*DATABASE_URL_FILE' "$compose"
+grep -q 'DTX_AGENT_CONTROL_BIND.*:9443:9443' "$compose"
+grep -q 'network_mode: service:agent-control' "$compose"
+grep -q 'https://.*:8443/local-health' "$compose"
+grep -q 'https://.*:9444/local/ready' "$compose"
 grep -q 'reverse_proxy @realtime https://realtime-gateway:9444' "$root/docker/production/Caddyfile"
 grep -q 'reverse_proxy @node https://dtx-node:8443' "$root/docker/production/Caddyfile"
 grep -q 'tls_trust_pool file /data/caddy/private-ca.pem' "$root/docker/production/Caddyfile"
 ! grep -q 'agent-control:944' "$root/docker/production/Caddyfile"
 ! grep -Eq 'DTX_(DATABASE_URL|ADMIN_DATABASE_URL)=' "$compose"
 ! grep -Eq 'image:[[:space:]]+[^$[:space:]]+:(latest|dev)(@|[[:space:]]|$)' "$compose"
+! grep -q 'kill -0 1' "$compose"
 ! grep -Eq 'docker compose.*(exec|run)[[:space:]]' "$root/scripts/production-stack"/*.sh
-for script in "$root"/scripts/production-stack/{install,bootstrap,update,verify,down,cleanup-cache}.sh; do
+grep -q 'O_NOFOLLOW' "$root/bins/dtx-production-migrate/src/main.rs"
+grep -q 'validate_root_ancestor_chain' "$root/bins/dtx-production-migrate/src/main.rs"
+grep -q 'preload_role_passwords' "$root/bins/dtx-production-migrate/src/main.rs"
+grep -q '\.commit()' "$root/bins/dtx-production-migrate/src/main.rs"
+grep -q 'prior.env' "$root/scripts/production-stack/update.sh"
+grep -q 'compose.sha256' "$root/scripts/production-stack/update.sh"
+grep -q 'status=rolled_back' "$root/scripts/production-stack/update.sh"
+grep -q 'cross-version production update is not implemented' "$root/scripts/production-stack/update.sh"
+grep -q 'request rejected before mutation' "$root/scripts/production-stack/host/install-vnext"
+grep -q 'force-recreate --no-deps --abort-on-container-failure' "$root/scripts/production-stack/verify.sh"
+grep -q 'last-successful-operation' "$root/scripts/production-stack/cleanup-cache.sh"
+grep -q '440:0:10001' "$root/scripts/production-stack/validate-files.sh"
+grep -q '400:0:0' "$root/scripts/production-stack/validate-files.sh"
+grep -q '444:0:0' "$root/scripts/production-stack/validate-files.sh"
+grep -q 'opaque push is fail-closed disabled\|Opaque push is fail-closed disabled' "$root/docker/production/README.md"
+grep -q 'dirextalk.vnext-stack-bundle' "$root/tools/vnext-stack-bundle.py"
+grep -q 'dirextalk.vnext-install-request' "$root/scripts/production-stack/host/install-vnext"
+grep -q 'dirextalk.vnext-installed-release' "$root/scripts/production-stack/host/read-vnext-receipt"
+grep -q 'BUNDLE_UPLOAD = Path("/home/ubuntu/dirextalk-vnext.bundle")' "$root/scripts/production-stack/host/install-vnext"
+grep -q 'REQUEST_UPLOAD = Path("/home/ubuntu/dirextalk-vnext.request")' "$root/scripts/production-stack/host/install-vnext"
+grep -q 'dirextalk/vnet-server@sha256:' "$root/scripts/production-stack/host/install-vnext"
+! grep -q 'dirextalk/vnet-server:latest' "$root/scripts/production-stack/host/install-vnext"
+python3 "$root/tools/validate-production-images.py" --self-test
+for example in "$root"/docker/production/examples/x{6,7,8}.env.example; do
+    python3 "$root/tools/validate-production-images.py" "$example"
+done
+for script in "$root"/scripts/production-stack/{install,bootstrap,update,verify,down,cleanup-cache,validate-images,validate-files}.sh; do
     test -x "$script" || { echo "not executable: $script" >&2; exit 1; }
+done
+for helper in "$root"/scripts/production-stack/host/{install-vnext,read-vnext-receipt}; do
+    test -x "$helper" || { echo "not executable: $helper" >&2; exit 1; }
 done
 echo 'production stack structural/negative checks passed'

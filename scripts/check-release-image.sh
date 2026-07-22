@@ -308,7 +308,34 @@ for required in (
     "/usr/local/bin/dtx-agent-control",
     "--config /etc/dirextalk/agent-control.json",
     "UID/GID " + chr(96) + "10001:10001" + chr(96),
+    "dirextalk/vnet-server@sha256:<64>",
 ):
     if required not in readme:
         fail(f"release README contract missing: {required}")
+PY
+python3 tools/production-release.py self-test --repository-root .
+bash -n scripts/publish-production-release.sh scripts/cleanup-production-release.sh
+for script in scripts/publish-production-release.sh scripts/cleanup-production-release.sh tools/production-release.py; do
+    test -x "$script" || { echo "release helper is not executable: $script" >&2; exit 1; }
+done
+grep -q 'dirextalk.vnet-server-release-input' docker/release/production-release.json
+grep -q -- '--platform linux/amd64' scripts/publish-production-release.sh
+grep -q -- '--file docker/release/Dockerfile' scripts/publish-production-release.sh
+grep -q -- '--file docker/production/Dockerfile.migrate' scripts/publish-production-release.sh
+grep -q 'runtime_version_tag=.*repository.*version' scripts/publish-production-release.sh
+grep -q 'migrator_version_tag=.*repository:migrate-.*version' scripts/publish-production-release.sh
+grep -q 'verified-digest' scripts/publish-production-release.sh
+grep -q 'latest is a runtime discovery pointer only' scripts/publish-production-release.sh
+grep -q 'buildx imagetools create' scripts/publish-production-release.sh
+grep -q 'buildx rm --force' scripts/cleanup-production-release.sh
+! grep -Eq 'docker (image|volume|system) (rm|prune)' scripts/{publish,cleanup}-production-release.sh
+python3 - <<'PY'
+from pathlib import Path
+
+script = Path("scripts/publish-production-release.sh").read_text()
+migrator_readback = script.index('    --metadata "$state/migrator-metadata.json"')
+latest_move = script.index("# latest is a runtime discovery pointer only")
+facts = script.index("python3 tools/production-release.py emit-facts")
+if not migrator_readback < latest_move < facts:
+    raise SystemExit("latest discovery pointer is not ordered after both immutable read-backs")
 PY

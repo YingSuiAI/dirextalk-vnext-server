@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 dtx-storage = { path = "../../crates/dtx-storage" }
+libc.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 zeroize.workspace = true

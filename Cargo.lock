@@ -1363,6 +1363,7 @@ name = "dtx-production-migrate"
 version = "0.1.0"
 dependencies = [
  "dtx-storage",
+ "libc",
  "sqlx",
  "tokio",
  "zeroize",

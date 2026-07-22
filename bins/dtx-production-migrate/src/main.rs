@@ -8,7 +8,8 @@
 
 use std::{
     env, fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
     process::ExitCode,
     str::FromStr,
@@ -27,16 +28,66 @@ const ROLE_PASSWORD_DIR: &str = "/run/dtx-production/role-passwords";
 const MAX_URL_BYTES: u64 = 8 * 1024;
 const MAX_PASSWORD_BYTES: u64 = 512;
 
-const RUNTIME_ROLES: &[&str] = &[
-    "dtx_identity_node",
-    "dtx_group_node",
-    "dtx_mailbox_node",
-    "dtx_push_registration",
-    "dtx_push_identity_auth",
-    "dtx_realtime_sync_gateway",
-    "dtx_push_broker",
-    "dtx_public_feed_node",
-    "dtx_indexer_node",
+#[derive(Clone, Copy)]
+struct RoleSpec {
+    login: &'static str,
+    membership: &'static str,
+    inherit: bool,
+}
+
+const ROLE_SPECS: &[RoleSpec] = &[
+    RoleSpec {
+        login: "dtx_identity_node",
+        membership: "dtx_identity_runtime",
+        inherit: true,
+    },
+    RoleSpec {
+        login: "dtx_group_node",
+        membership: "dtx_group_runtime",
+        inherit: true,
+    },
+    RoleSpec {
+        login: "dtx_mailbox_node",
+        membership: "dtx_mailbox_runtime",
+        inherit: true,
+    },
+    RoleSpec {
+        login: "dtx_push_registration",
+        membership: "dtx_push_registration_runtime",
+        inherit: true,
+    },
+    RoleSpec {
+        login: "dtx_push_identity_auth",
+        membership: "dtx_push_identity_auth_runtime",
+        inherit: true,
+    },
+    RoleSpec {
+        login: "dtx_realtime_sync_gateway",
+        membership: "dtx_realtime_sync_runtime",
+        inherit: true,
+    },
+    RoleSpec {
+        login: "dtx_push_broker",
+        membership: "dtx_push_broker_runtime",
+        inherit: true,
+    },
+    // These two logins receive distinct direct grants. Membership is only the
+    // RLS authorization marker, so PostgreSQL inheritance must remain off.
+    RoleSpec {
+        login: "dtx_public_feed_node",
+        membership: "dtx_public_feed_runtime",
+        inherit: false,
+    },
+    RoleSpec {
+        login: "dtx_indexer_node",
+        membership: "dtx_public_feed_runtime",
+        inherit: false,
+    },
+    RoleSpec {
+        login: "dtx_agent_control",
+        membership: "dtx_agent_runtime",
+        inherit: true,
+    },
 ];
 
 #[tokio::main]
@@ -77,6 +128,12 @@ async fn operation() -> Result<(), &'static str> {
             pool.close().await;
             Ok(())
         }
+        "verify-roles" => {
+            let pool = connect_file(ADMIN_DATABASE_URL_FILE_ENV).await?;
+            verify_roles(&pool).await?;
+            pool.close().await;
+            Ok(())
+        }
         // Teardown is deliberately non-destructive: it revokes login access,
         // but never drops roles or owned objects. A separate reviewed process
         // is required for irreversible role removal.
@@ -85,12 +142,17 @@ async fn operation() -> Result<(), &'static str> {
                 == Ok("I_UNDERSTAND_PRODUCTION_ROLE_TEARDOWN") =>
         {
             let pool = connect_file(ADMIN_DATABASE_URL_FILE_ENV).await?;
-            for role in RUNTIME_ROLES {
-                sqlx::query(AssertSqlSafe(format!("ALTER ROLE {role} NOLOGIN")))
-                    .execute(&pool)
+            let mut transaction = pool.begin().await.map_err(|_| "role teardown failed")?;
+            for spec in ROLE_SPECS {
+                sqlx::query(AssertSqlSafe(format!("ALTER ROLE {} NOLOGIN", spec.login)))
+                    .execute(&mut *transaction)
                     .await
                     .map_err(|_| "role teardown failed")?;
             }
+            transaction
+                .commit()
+                .await
+                .map_err(|_| "role teardown failed")?;
             pool.close().await;
             Ok(())
         }
@@ -110,17 +172,7 @@ async fn connect_file(variable: &str) -> Result<PgPool, &'static str> {
 }
 
 fn read_url_file(path: &Path) -> Result<PgConnectOptions, &'static str> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| "database URL file is invalid")?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.uid() != 0
-        || metadata.len() == 0
-        || metadata.len() > MAX_URL_BYTES
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err("database URL file is invalid");
-    }
-    let bytes = Zeroizing::new(fs::read(path).map_err(|_| "database URL file is invalid")?);
+    let bytes = read_root_secret(path, MAX_URL_BYTES, "database URL file is invalid")?;
     let value = Zeroizing::new(
         String::from_utf8(bytes.to_vec())
             .map_err(|_| "database URL file is invalid")?
@@ -134,50 +186,124 @@ fn read_url_file(path: &Path) -> Result<PgConnectOptions, &'static str> {
 }
 
 async fn create_roles(pool: &PgPool) -> Result<(), &'static str> {
-    for role in RUNTIME_ROLES {
-        let membership = format!("{role}_runtime");
-        sqlx::raw_sql(AssertSqlSafe(format!(
-            "DO $$ BEGIN IF to_regrole('{membership}') IS NULL THEN CREATE ROLE {membership} NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END $$;\
-             DO $$ BEGIN IF to_regrole('{role}') IS NULL THEN CREATE ROLE {role} LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION; END IF; END $$;\
+    // Read every secret before the first database mutation. A missing or
+    // malformed later password therefore leaves the entire role set unchanged.
+    let passwords = preload_role_passwords()?;
+    let mut transaction = pool.begin().await.map_err(|_| "role bootstrap failed")?;
+    for (spec, password) in passwords {
+        let inheritance = if spec.inherit { "INHERIT" } else { "NOINHERIT" };
+        let membership = spec.membership;
+        let role = spec.login;
+        if let Err(error) = sqlx::raw_sql(AssertSqlSafe(format!(
+            "DO $$ BEGIN IF to_regrole('{membership}') IS NULL THEN CREATE ROLE {membership}; END IF; END $$;\
+             DO $$ BEGIN IF to_regrole('{role}') IS NULL THEN CREATE ROLE {role}; END IF; END $$;\
+             ALTER ROLE {membership} NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;\
+             ALTER ROLE {role} LOGIN {inheritance} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION;\
+             DO $membership$ DECLARE extra name; BEGIN FOR extra IN \
+               SELECT granted.rolname FROM pg_auth_members edges \
+               JOIN pg_roles granted ON granted.oid = edges.roleid \
+               JOIN pg_roles member ON member.oid = edges.member \
+               WHERE member.rolname = '{role}' AND granted.rolname <> '{membership}' \
+             LOOP EXECUTE format('REVOKE %I FROM {role}', extra); END LOOP; END $membership$;\
+             DO $membership$ DECLARE extra name; BEGIN FOR extra IN \
+               SELECT granted.rolname FROM pg_auth_members edges \
+               JOIN pg_roles granted ON granted.oid = edges.roleid \
+               JOIN pg_roles member ON member.oid = edges.member \
+               WHERE member.rolname = '{membership}' \
+             LOOP EXECUTE format('REVOKE %I FROM {membership}', extra); END LOOP; END $membership$;\
              GRANT {membership} TO {role};"
-        ))).execute(pool).await.map_err(|_| "role bootstrap failed")?;
-        let password_path = Path::new(ROLE_PASSWORD_DIR).join(role);
-        let password = read_password_file(&password_path)?;
-        let escaped_password = password.replace('\'', "''");
-        sqlx::raw_sql(AssertSqlSafe(format!(
-            "ALTER ROLE {role} PASSWORD '{escaped_password}'"
         )))
-        .execute(pool)
+        .execute(&mut *transaction)
+        .await
+        {
+            eprintln!("dtx-production-migrate: role normalization failed for {role}: {error}");
+            return Err("role bootstrap failed");
+        }
+        let escaped_password = Zeroizing::new(password.replace('\'', "''"));
+        if sqlx::raw_sql(AssertSqlSafe(format!(
+            "ALTER ROLE {role} PASSWORD '{}'",
+            escaped_password.as_str()
+        )))
+        .execute(&mut *transaction)
+        .await
+        .is_err()
+        {
+            eprintln!("dtx-production-migrate: password update failed for {role}");
+            return Err("role bootstrap failed");
+        }
+    }
+    transaction
+        .commit()
         .await
         .map_err(|_| "role bootstrap failed")?;
-    }
     Ok(())
 }
 
 async fn grant_roles(pool: &PgPool) -> Result<(), &'static str> {
     // The grant matrix is source-controlled and intentionally explicit. It is
     // executed only after migrations and never through a shell command.
+    let mut transaction = pool.begin().await.map_err(|_| "grant bootstrap failed")?;
     sqlx::raw_sql(include_str!(
         "../../../docker/local/postgres/20-local-runtime-grants.sql"
     ))
-    .execute(pool)
+    .execute(&mut *transaction)
     .await
     .map_err(|_| "grant bootstrap failed")?;
+    sqlx::raw_sql(include_str!(
+        "../../../docker/production/postgres/agent-control-grants.sql"
+    ))
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "grant bootstrap failed")?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| "grant bootstrap failed")?;
     Ok(())
 }
 
-fn read_password_file(path: &Path) -> Result<Zeroizing<String>, &'static str> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| "role password file is invalid")?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.uid() != 0
-        || metadata.len() == 0
-        || metadata.len() > MAX_PASSWORD_BYTES
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err("role password file is invalid");
+async fn verify_roles(pool: &PgPool) -> Result<(), &'static str> {
+    let mut transaction = pool.begin().await.map_err(|_| "role verification failed")?;
+    sqlx::raw_sql(include_str!(
+        "../../../docker/production/postgres/verify-roles.sql"
+    ))
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| "role verification failed")?;
+    // Exercise the same role DDL transaction boundary and prove rollback
+    // preserves the live login before declaring PostgreSQL ready.
+    sqlx::query("ALTER ROLE dtx_agent_control NOLOGIN")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| "role verification failed")?;
+    transaction
+        .rollback()
+        .await
+        .map_err(|_| "role verification failed")?;
+    let login_enabled: bool =
+        sqlx::query_scalar("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'dtx_agent_control'")
+            .fetch_one(pool)
+            .await
+            .map_err(|_| "role verification failed")?;
+    if !login_enabled {
+        return Err("role transaction rollback verification failed");
     }
-    let bytes = Zeroizing::new(fs::read(path).map_err(|_| "role password file is invalid")?);
+    Ok(())
+}
+
+fn preload_role_passwords() -> Result<Vec<(RoleSpec, Zeroizing<String>)>, &'static str> {
+    ROLE_SPECS
+        .iter()
+        .copied()
+        .map(|spec| {
+            let path = Path::new(ROLE_PASSWORD_DIR).join(spec.login);
+            read_password_file(&path).map(|password| (spec, password))
+        })
+        .collect()
+}
+
+fn read_password_file(path: &Path) -> Result<Zeroizing<String>, &'static str> {
+    let bytes = read_root_secret(path, MAX_PASSWORD_BYTES, "role password file is invalid")?;
     let password = Zeroizing::new(
         String::from_utf8(bytes.to_vec())
             .map_err(|_| "role password file is invalid")?
@@ -188,4 +314,61 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>, &'static str> {
         return Err("role password file is invalid");
     }
     Ok(password)
+}
+
+fn read_root_secret(
+    path: &Path,
+    maximum: u64,
+    error: &'static str,
+) -> Result<Zeroizing<Vec<u8>>, &'static str> {
+    validate_root_ancestor_chain(path).map_err(|()| error)?;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| error)?;
+    let before = file.metadata().map_err(|_| error)?;
+    let permissions = before.permissions().mode() & 0o777;
+    if !before.is_file()
+        || before.uid() != 0
+        || before.len() == 0
+        || before.len() > maximum
+        || permissions & !0o440 != 0
+        || permissions & 0o400 == 0
+    {
+        return Err(error);
+    }
+    let capacity = usize::try_from(before.len()).map_err(|_| error)?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
+    (&mut file)
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| error)?;
+    let after = file.metadata().map_err(|_| error)?;
+    if bytes.is_empty()
+        || bytes.len() as u64 > maximum
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+    {
+        return Err(error);
+    }
+    Ok(bytes)
+}
+
+fn validate_root_ancestor_chain(path: &Path) -> Result<(), ()> {
+    if !path.is_absolute() {
+        return Err(());
+    }
+    for ancestor in path.parent().ok_or(())?.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|_| ())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(());
+        }
+    }
+    Ok(())
 }

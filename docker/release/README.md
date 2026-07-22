@@ -3,10 +3,11 @@
 `docker/release/Dockerfile` builds the production image containing the
 independent `dtx-node`, `dtx-opaque-push-broker`, `dtx-realtime-sync-gateway`,
 and `dtx-agent-control` artifacts used by the
-new Rust release CLI. The default repository is `dirextalk/vent`, but the
-release manifest may select another repository. Releases use an exact SemVer
-tag and must be read back by digest after publication; no floating `latest` tag
-is produced.
+new Rust release CLI. The production repository is exactly
+`dirextalk/vnet-server`. Releases use an immutable version/commit tag and must
+be read back by digest after publication. A `latest` discovery pointer may be
+updated, but deployment execution accepts only the read-back
+`dirextalk/vnet-server@sha256:<64>` reference.
 
 The exact four binaries, their Cargo packages, fixed image paths, and runtime
 permission contract are recorded in [`manifest.json`](manifest.json). Both the
@@ -116,6 +117,53 @@ Dry-run the release command from `dirextalk-vnext-deployer`:
 ```powershell
 cargo run --locked -- plan --manifest release.example.json
 ```
+
+## Executable publication contract
+
+`production-release.json` is the canonical authoritative input. It fixes schema
+version 1, the only authorized repository `dirextalk/vnet-server`, platform
+`linux/amd64`, both Dockerfiles, the workspace SemVer, and the decision to
+maintain a runtime-only `latest` discovery pointer. Update the workspace and
+input versions together, commit them, and publish only from a clean worktree:
+
+```text
+bash scripts/publish-production-release.sh
+```
+
+The no-argument publisher creates a unique disposable Buildx builder and first
+proves all four immutable tags absent. It publishes the runtime Dockerfile as
+`dirextalk/vnet-server:<semver>` and `:git-<40hex>`, and the production migrator
+as `:migrate-<semver>` and `:migrate-git-<40hex>`. Both builds target only
+`linux/amd64`. It independently reads the registry manifest digest back for
+each immutable tag and requires each pair to match its Buildx push metadata.
+Only after both products pass that check does it repoint
+`dirextalk/vnet-server:latest` to the runtime digest and read that pointer back.
+The migrator is never published as or selected through `latest`.
+
+On success, canonical digest facts are written to
+`target/production-release/release-facts.json`. Runtime execution uses only its
+`server_image` and `migrator_image` repository-at-digest values. The bundle
+builder consumes those facts directly:
+
+```text
+python3 tools/vnext-stack-bundle.py build --source-root . \
+  --release-facts target/production-release/release-facts.json \
+  --output target/production-release/dirextalk-vnext.bundle
+```
+
+The publisher always removes its own disposable builder and dedicated cache;
+it never deletes registry tags, local tagged images, containers, or volumes.
+If the process is interrupted before its trap runs, the bounded cleanup command
+reads the exact recorded builder name and removes only that builder/cache:
+
+```text
+bash scripts/cleanup-production-release.sh
+```
+
+An immutable runtime tag may remain when a later migrator step fails. This is
+intentional evidence, not cleanup debris; `latest` is left unchanged and the
+same immutable tag is never overwritten. Publication therefore requires an
+exclusive publisher for the repository in addition to the preflight checks.
 
 The generated Buildx plan uses the Dockerfile above, exact platforms, source
 revision labels, and an immutable version tag.

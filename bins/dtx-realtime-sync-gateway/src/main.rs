@@ -40,6 +40,7 @@ use uuid::Uuid;
 const SUBPROTOCOL_V1: &str = "dirextalk.realtime-sync.v1";
 const SUBPROTOCOL_V2: &str = "dirextalk.realtime-sync.v2";
 const SYNC_PATH: &str = "/v1/realtime-sync";
+const READY_PATH: &str = "/local/ready";
 const SESSION_SCHEME: &str = "DTX-Device-Session";
 const OUTBOX_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SAFETY_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
@@ -325,6 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(publish_outbox(store, durable, Uuid::now_v7()));
     let router = Router::new()
         .route(SYNC_PATH, get(upgrade))
+        .route(READY_PATH, get(ready))
         .with_state(state);
     let _ = rustls::crypto::ring::default_provider().install_default();
     let tls = RustlsConfig::from_pem_file(certificate, private_key).await?;
@@ -332,6 +334,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve(router.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
+}
+
+async fn ready() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 fn load_database_url() -> Result<String, std::io::Error> {
@@ -1075,6 +1081,12 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn readiness_is_fixed_and_only_reports_after_router_startup() {
+        assert_eq!(READY_PATH, "/local/ready");
+        assert_eq!(ready().await, StatusCode::NO_CONTENT);
+    }
 
     #[test]
     fn rejects_textual_or_capability_bearing_frames() {

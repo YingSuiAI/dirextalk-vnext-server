@@ -63,6 +63,7 @@ ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast
 futures-core = "0.3.32"
 futures-util = "0.3.32"
 httpdate = "1.0.3"
+libc = "0.2.183"
 getrandom = "0.4.3"
 hpke = { version = "0.14.0", default-features = false, features = ["alloc", "x25519", "chacha"] }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
