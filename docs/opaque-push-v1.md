@@ -30,6 +30,10 @@ Tokio, database pools, provider HTTP, and listeners start only after the drop is
 verified. The readiness listener is loopback-only and reports ready only after
 the pools, broker, and bound listeners are initialized.
 
-V43 code completion does not imply live activation. Container/release service
-wiring, Firebase project material, client platform token/cold-start handling,
-and device acceptance remain separate deployment and client stages.
+V43 packaging includes the standalone broker binary in the local and release
+images. Local broker services are an inert `opaque-push` profile that require
+an operator-provisioned external root-only secret volume; release scheduling is
+separate from `dtx-node` and Gateway, publishes only TLS `9448`, and keeps
+readiness on internal loopback `9488`. This packaging does not claim
+Firebase project/provider activation, deployment, live token/provider
+acceptance, or device acceptance.

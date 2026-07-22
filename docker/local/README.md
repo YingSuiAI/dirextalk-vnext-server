@@ -78,3 +78,36 @@ MLS commit reconciliation, contact acceptance, and client integration are
 still unfinished; the stack does not claim those end-to-end product paths are
 available. The local CA is development-only and must never be deployed or
 added to a user/system trust store.
+
+## Opt-in opaque push diagnostics
+
+The `opaque-push` Compose profile is inert unless explicitly selected and is
+not part of default local-cluster acceptance. It starts separate A/B/C
+`dtx-opaque-push-broker` containers only when an operator explicitly runs
+Compose with `--profile opaque-push`; default Compose has no broker services.
+
+Before selecting the profile, an operator must provision the external Docker
+volume `dtx-local-opaque-push-secrets`. Compose never creates or populates it,
+and it is not a bind mount or Compose file-backed secret. The volume must have
+these root-owned, regular mode `0400` files in each node directory:
+
+| Node directory | Required files |
+| --- | --- |
+| `a/` | `identity-database-url`, `registration-database-url`, `broker-database-url`, `root-key`, `fcm-service-account.json`, `tls-certificate.pem`, `tls-private-key.pem` |
+| `b/` | `identity-database-url`, `registration-database-url`, `broker-database-url`, `root-key`, `fcm-service-account.json`, `tls-certificate.pem`, `tls-private-key.pem` |
+| `c/` | `identity-database-url`, `registration-database-url`, `broker-database-url`, `root-key`, `fcm-service-account.json`, `tls-certificate.pem`, `tls-private-key.pem` |
+
+Each broker mounts the volume read-only at `/run/dtx-opaque-push-secrets` and
+uses only its matching `a/`, `b/`, or `c/` paths. It runs as container `0:0`
+solely to read those files, then clears groups and drops to UID/GID `10001`.
+The three URL files must contain distinct local database URLs using the
+explicit `DTX_PUSH_IDENTITY_LOGIN=dtx_push_identity_auth`,
+`DTX_PUSH_REGISTRATION_LOGIN=dtx_push_registration`, and
+`DTX_PUSH_BROKER_LOGIN=dtx_push_broker` selectors. Real FCM service account
+material is required; no placeholder is provided.
+
+The profile publishes only broker TLS ports on host loopback: A `19448`, B
+`19449`, C `19450`, each mapped to container `9448`. Its readiness listener is
+container-loopback `127.0.0.1:9488`, used only by the health check and never
+published. These separate loopback ports are diagnostics, not the public
+same-origin contract.
