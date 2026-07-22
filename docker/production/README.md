@@ -36,8 +36,11 @@ remain `root:root` mode `0400`. Public certificates/CA bundles are
 `root:root` mode `0444`; private keys are never world-readable. Non-secret
 configuration is `0644` and root-owned. Populate one password file per fixed
 role, including `dtx_agent_control`, under `secrets/role-passwords/`; the
-migrator never emits them. Caddy routes
-node HTTPS/MCP and realtime WSS only. Agent Control remains on its dedicated
+migrator never emits them. Caddy normally routes node HTTPS/MCP and realtime
+WSS only. The fixed fresh-host provisioner is the sole exception: it runs Caddy
+in Agent Control's network namespace, publishes 80/443 there, and routes only
+`/mcp*` to loopback `127.0.0.1:9081`; no other owner route is public. Agent
+Control remains on its dedicated
 native TLS/mTLS listeners and is not terminated by Caddy.
 
 Set `DTX_AGENT_CONTROL_BIND` to the EC2 private/VPC address. Docker publishes

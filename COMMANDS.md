@@ -21,6 +21,7 @@ Run commands from this repository root.
 | release-build | `cargo build --workspace --locked --release` |
 | release-image-check | `bash scripts/check-release-image.sh` |
 | production-stack structural gate | `bash scripts/check-production-stack.sh` |
+| vNext fixed host provisioner contract | `python3 tools/test-vnext-host-provision.py` |
 | production PostgreSQL role/readiness gate | `bash scripts/test-production-postgres.sh` |
 | publish production images | `bash scripts/publish-production-release.sh` |
 | clean interrupted release builder/cache | `bash scripts/cleanup-production-release.sh` |
