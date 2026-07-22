@@ -664,11 +664,42 @@ fn valid_origin(v: &str) -> bool {
     matches!(https_parts(v), Some((_, "")))
 }
 fn valid_endpoint(v: &str, name: &str) -> bool {
-    matches!(https_parts(v), Some((host, "" | "/")) if host == name && name == name.trim() && dns(name))
+    matches!(
+        https_endpoint_parts(v),
+        Some((host, "" | "/"))
+            if host == name && name == name.trim() && dns(name)
+    )
 }
 fn valid_mcp_url(v: &str) -> bool {
     matches!(https_parts(v), Some((_, "/mcp")))
 }
+
+fn https_endpoint_parts(v: &str) -> Option<(&str, &str)> {
+    let rest = v.strip_prefix("https://")?;
+    if rest.contains(['@', '#', '?']) {
+        return None;
+    }
+    let slash = rest.find('/');
+    let (authority, path) = slash.map_or((rest, ""), |index| (&rest[..index], &rest[index..]));
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    if host.is_empty() || !dns(host) {
+        return None;
+    }
+    if let Some(port) = port {
+        if port.is_empty()
+            || port == "443"
+            || port.starts_with('0')
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().ok().is_none()
+        {
+            return None;
+        }
+    }
+    Some((host, path))
+}
+
 fn valid_mcp_name(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 64
@@ -1233,6 +1264,15 @@ mod tests {
 
     #[test]
     fn connector_url_and_semver_validators_match_closed_shapes() {
+        for (url, name) in [
+            ("https://host:1", "host"),
+            ("https://host:8443/", "host"),
+            ("https://host:9443", "host"),
+            ("https://host:9444/", "host"),
+            ("https://host:65535", "host"),
+        ] {
+            assert!(valid_endpoint(url, name), "{url}");
+        }
         for invalid in [
             "https://host/",
             "https://u@host",
@@ -1250,6 +1290,17 @@ mod tests {
             "https://host/#x",
         ] {
             assert!(!valid_endpoint(invalid, "host"));
+        }
+        for invalid in [
+            "https://host:443",
+            "https://host:0",
+            "https://host:01",
+            "https://host:0001",
+            "https://host:65536",
+            "https://host:9443x",
+            "https://other:9443",
+        ] {
+            assert!(!valid_endpoint(invalid, "host"), "{invalid}");
         }
         for invalid in [
             "https://host/mcp/",

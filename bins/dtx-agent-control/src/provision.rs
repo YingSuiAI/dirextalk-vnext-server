@@ -2211,7 +2211,13 @@ fn is_semver(value: &str) -> bool {
 }
 
 fn is_canonical_endpoint(value: &str, server_name: &str) -> bool {
-    matches!(bootstrap_https_parts(value), Some((host, "" | "/")) if host == server_name && server_name == server_name.trim() && bootstrap_dns_name(server_name))
+    matches!(
+        bootstrap_endpoint_parts(value),
+        Some((host, "" | "/"))
+            if host == server_name
+                && server_name == server_name.trim()
+                && bootstrap_dns_name(server_name)
+    )
 }
 
 fn is_canonical_mcp_name(value: &str) -> bool {
@@ -2240,6 +2246,32 @@ fn bootstrap_https_parts(value: &str) -> Option<(&str, &str)> {
     let (host, path) = slash.map_or((rest, ""), |index| (&rest[..index], &rest[index..]));
     if host.is_empty() || host.contains(':') || !bootstrap_dns_name(host) {
         return None;
+    }
+    Some((host, path))
+}
+
+fn bootstrap_endpoint_parts(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix("https://")?;
+    if rest.contains(['@', '#', '?']) {
+        return None;
+    }
+    let slash = rest.find('/');
+    let (authority, path) = slash.map_or((rest, ""), |index| (&rest[..index], &rest[index..]));
+    let (host, port) = authority
+        .split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    if host.is_empty() || !bootstrap_dns_name(host) {
+        return None;
+    }
+    if let Some(port) = port {
+        if port.is_empty()
+            || port == "443"
+            || port.starts_with('0')
+            || !port.bytes().all(|byte| byte.is_ascii_digit())
+            || port.parse::<u16>().ok().is_none()
+        {
+            return None;
+        }
     }
     Some((host, path))
 }
@@ -4697,6 +4729,33 @@ mod tests {
             let secret = handoff_json[field].as_str().unwrap();
             assert!(!report_json.contains(secret));
             assert!(!report_json.contains(field));
+        }
+    }
+
+    #[test]
+    fn bootstrap_issuer_accepts_canonical_control_ports_and_rejects_noncanonical_ports() {
+        let mut request = bootstrap_issue_request();
+        request.connector.trust.enrollment_url = "https://enroll.example:9443/".to_owned();
+        request.connector.trust.control_url = "https://control.example:9444".to_owned();
+        validate_bootstrap_issue_request(&mut request, 3_999_700_000).unwrap();
+
+        for port in ["443", "0", "01", "0001", "65536", "9443x"] {
+            assert!(
+                !is_canonical_endpoint(
+                    &format!("https://control.example:{port}"),
+                    "control.example"
+                ),
+                "port {port} must not be accepted"
+            );
+        }
+        for port in ["1", "8443", "9443", "9444", "65535"] {
+            assert!(
+                is_canonical_endpoint(
+                    &format!("https://control.example:{port}"),
+                    "control.example"
+                ),
+                "port {port} must be accepted"
+            );
         }
     }
 
