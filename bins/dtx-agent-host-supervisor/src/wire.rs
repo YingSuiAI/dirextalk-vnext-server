@@ -1,4 +1,7 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+
+#[cfg(test)]
+use std::io::Read;
 
 use dtx_domain::{ConnectorId, HostId, RequestId, TenantId};
 use serde::{Deserialize, Serialize};
@@ -6,10 +9,10 @@ use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 pub const PROTOCOL: &str = "dirextalk.host-control.operator.v1";
-const MAGIC: &[u8; 8] = b"DTXHC01\0";
+pub const MAGIC: &[u8; 8] = b"DTXHC01\0";
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 pub const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
-const MAX_FRAME_BYTES: usize = MAGIC.len() + 4 + MAX_HEADER_BYTES + 4 + MAX_CREDENTIAL_BYTES;
+pub const MAX_FRAME_BYTES: usize = MAGIC.len() + 4 + MAX_HEADER_BYTES + 4 + MAX_CREDENTIAL_BYTES;
 
 pub struct RequestFrame {
     pub request: OperatorRequest,
@@ -205,6 +208,7 @@ impl OperatorFailure {
     }
 }
 
+#[cfg(test)]
 pub fn read_frame(mut reader: impl Read) -> Result<RequestFrame, OperatorFailure> {
     let mut input = Zeroizing::new(Vec::new());
     reader
@@ -212,13 +216,20 @@ pub fn read_frame(mut reader: impl Read) -> Result<RequestFrame, OperatorFailure
         .take(u64::try_from(MAX_FRAME_BYTES + 1).expect("frame limit fits u64"))
         .read_to_end(&mut input)
         .map_err(|_| OperatorFailure::new("REQUEST_UNAVAILABLE"))?;
+    decode_frame(&input)
+}
+
+/// Decodes a v1 frame that was already read by the top-level version
+/// dispatcher. Keeping this separate ensures stdin is consumed exactly once
+/// even while the v1 byte contract remains frozen.
+pub fn decode_frame(input: &[u8]) -> Result<RequestFrame, OperatorFailure> {
     if input.len() > MAX_FRAME_BYTES
         || input.len() < MAGIC.len() + 8
         || &input[..MAGIC.len()] != MAGIC
     {
         return Err(OperatorFailure::new("INVALID_FRAME"));
     }
-    let header_length = read_u32(&input, MAGIC.len())?;
+    let header_length = read_u32(input, MAGIC.len())?;
     if header_length == 0 || header_length > MAX_HEADER_BYTES {
         return Err(OperatorFailure::new("INVALID_FRAME"));
     }
@@ -230,7 +241,7 @@ pub fn read_frame(mut reader: impl Read) -> Result<RequestFrame, OperatorFailure
     let payload_start = payload_length_offset
         .checked_add(4)
         .ok_or_else(|| OperatorFailure::new("INVALID_FRAME"))?;
-    let payload_length = read_u32(&input, payload_length_offset)?;
+    let payload_length = read_u32(input, payload_length_offset)?;
     if payload_length > MAX_CREDENTIAL_BYTES
         || payload_start.checked_add(payload_length) != Some(input.len())
     {

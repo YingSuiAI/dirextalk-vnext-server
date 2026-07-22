@@ -11,13 +11,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
+use crate::InstallStateJournal;
 use crate::supervisor::validate_durable_command_precondition;
+use crate::types::InstallProof;
 use crate::{
-    CatalogRelease, CommandDigest, CommandDisposition, CommandOutcome, ConnectorTarget,
-    CredentialArtifactRef, DurableHostCommand, HostOperationId, HostRevisionFence, Journal,
-    JournalRecord, ManagedConnectorDesiredState, ManagedConnectorSnapshot, OperationIntent,
-    OperationReceipt, PortError, PortErrorKind, ProcessObservation, ReleaseDigest, ResourceProfile,
-    SupervisorSnapshot,
+    BootstrapCredentialFacts, CatalogRelease, CommandDigest, CommandDisposition, CommandOutcome,
+    ConfigDigest, ConnectorLifecycleFacts, ConnectorLifecycleOperationId, ConnectorTarget,
+    CredentialArtifactRef, DurableHostCommand, FinalizedReceiptDigest, HandoffDigest,
+    HostOperationId, HostRevisionFence, Journal, JournalRecord, ManagedConnectorDesiredState,
+    ManagedConnectorSnapshot, MaterialDigest, McpBearerRef, OperationIntent, OperationReceipt,
+    PlanDigest, PlatformTarget, PortError, PortErrorKind, PreparedReceiptDigest,
+    ProcessObservation, ReleaseDigest, ResourceProfile, SupervisorSnapshot, TrustDigest,
 };
 
 const PRODUCTION_ROOT: &str = "/var/lib/dirextalk/host-supervisor/journals";
@@ -287,6 +291,7 @@ impl Journal for FileJournal {
                             receipt.operation_id(),
                             receipt.command_digest(),
                             receipt.outcome(),
+                            receipt.install_proof(),
                         )
                         .is_err()
                     {
@@ -348,6 +353,63 @@ impl Journal for FileJournal {
     }
 }
 
+impl InstallStateJournal for FileJournal {
+    fn load_install_state(
+        &mut self,
+        host_id: HostId,
+        connector_id: ConnectorId,
+    ) -> Result<Option<crate::InstallState>, PortError> {
+        if host_id != self.host_id {
+            return Err(conflict());
+        }
+        self.with_lock(|journal| {
+            let mut state = None;
+            for record in &journal.records {
+                let JournalRecord::Completed { receipt, .. } =
+                    record.rehydrate().map_err(|()| invalid())?
+                else {
+                    continue;
+                };
+                let Some(proof) = receipt.install_proof() else {
+                    continue;
+                };
+                match proof {
+                    InstallProof::Prepared {
+                        facts,
+                        prepared_receipt,
+                        credentials,
+                        observation,
+                    } if facts.connector_id() == connector_id => {
+                        state = Some(crate::InstallState::Prepared {
+                            facts,
+                            prepared_receipt,
+                            credentials,
+                            observation,
+                        });
+                    }
+                    InstallProof::Finalized {
+                        facts,
+                        prepared_receipt,
+                        finalized_receipt,
+                        credentials,
+                        observation,
+                    } if facts.connector_id() == connector_id => {
+                        state = Some(crate::InstallState::Finalized {
+                            facts,
+                            prepared_receipt,
+                            finalized_receipt,
+                            credentials,
+                            observation,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(state)
+        })
+    }
+}
+
 // The production file and its directory are root-owned. This unkeyed SHA-256
 // chain detects stale or incomplete truncation, reordering, renumbering, and
 // partial rewrites that do not also rebuild the chain. Without an external
@@ -368,6 +430,7 @@ struct JournalFile {
     records: Vec<Record>,
 }
 
+#[allow(clippy::too_many_lines)]
 impl JournalFile {
     fn empty(host_id: HostId) -> Self {
         let genesis_anchor = journal_genesis_anchor(host_id);
@@ -427,6 +490,7 @@ impl JournalFile {
         let mut pending_seen = false;
         let mut prior_resulting = None;
         let mut prior_resulting_snapshot = None;
+        let mut prepared_credentials = std::collections::BTreeMap::new();
         let mut expected_previous_record_digest = self.genesis_anchor;
         for (index, record) in self.records.iter().enumerate() {
             let expected_sequence = record_sequence(index)?;
@@ -484,6 +548,59 @@ impl JournalFile {
                     }
                     let resulting = resulting_wire.rehydrate()?;
                     validate_snapshot_transition(&predecessor, &resulting, intent, *receipt)?;
+                    match receipt.install_proof() {
+                        Some(InstallProof::Prepared {
+                            facts, credentials, ..
+                        }) => {
+                            if !matches!(
+                                intent.command(),
+                                DurableHostCommand::PrepareConnectorMaterial { .. }
+                            ) {
+                                return Err(());
+                            }
+                            if let InstallProof::Prepared {
+                                prepared_receipt, ..
+                            } = receipt.install_proof().ok_or(())?
+                            {
+                                prepared_credentials.insert(
+                                    facts.connector_id(),
+                                    (facts, prepared_receipt, credentials),
+                                );
+                            }
+                        }
+                        Some(InstallProof::Finalized {
+                            facts,
+                            prepared_receipt,
+                            credentials,
+                            ..
+                        }) => {
+                            let Some((prepared_facts, prepared_receipt_digest, prepared)) =
+                                prepared_credentials.get(&facts.connector_id())
+                            else {
+                                return Err(());
+                            };
+                            if !matches!(
+                                intent.command(),
+                                DurableHostCommand::FinalizeConnectorMaterial { .. }
+                            ) || *prepared_facts != facts
+                                || *prepared != credentials
+                                || *prepared_receipt_digest != prepared_receipt
+                            {
+                                return Err(());
+                            }
+                        }
+                        None => {
+                            if matches!(
+                                intent.command(),
+                                DurableHostCommand::PrepareConnectorMaterial { .. }
+                                    | DurableHostCommand::FinalizeConnectorMaterial { .. }
+                            ) && receipt.outcome().disposition
+                                != CommandDisposition::ExpiredUnclaimed
+                            {
+                                return Err(());
+                            }
+                        }
+                    }
                     prior_resulting_snapshot = Some(resulting_wire.clone());
                 }
             }
@@ -504,6 +621,7 @@ impl JournalFile {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 enum Record {
     Pending {
         sequence: u64,
@@ -729,8 +847,93 @@ enum CommandWire {
     RemoveRetainingData {
         target: TargetWire,
     },
+    PrepareConnectorMaterial {
+        facts: LifecycleFactsWire,
+    },
+    FinalizeConnectorMaterial {
+        facts: LifecycleFactsWire,
+        prepared_receipt: [u8; 32],
+    },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleFactsWire {
+    lifecycle_operation_id: RequestId,
+    platform_target: PlatformWire,
+    adapter_kind: AdapterWire,
+    release_digest: [u8; 32],
+    tenant_id: TenantId,
+    host_id: HostId,
+    connector_id: ConnectorId,
+    expiry_millis: u64,
+    plan_digest: [u8; 32],
+    handoff_digest: [u8; 32],
+    config_digest: [u8; 32],
+    trust_digest: [u8; 32],
+    material_digest: [u8; 32],
+}
+
+#[allow(clippy::large_types_passed_by_value, clippy::unnecessary_wraps)]
+impl LifecycleFactsWire {
+    const fn from_facts(f: ConnectorLifecycleFacts) -> Self {
+        Self {
+            lifecycle_operation_id: f.lifecycle_operation_id().as_request_id(),
+            platform_target: PlatformWire::from_target(f.platform_target()),
+            adapter_kind: AdapterWire::from_adapter(f.adapter_kind()),
+            release_digest: f.release_digest().as_bytes(),
+            tenant_id: f.tenant_id(),
+            host_id: f.host_id(),
+            connector_id: f.connector_id(),
+            expiry_millis: f.expiry_millis(),
+            plan_digest: f.plan_digest().as_bytes(),
+            handoff_digest: f.handoff_digest().as_bytes(),
+            config_digest: f.config_digest().as_bytes(),
+            trust_digest: f.trust_digest().as_bytes(),
+            material_digest: f.material_digest().as_bytes(),
+        }
+    }
+    fn rehydrate(self) -> Result<ConnectorLifecycleFacts, ()> {
+        Ok(ConnectorLifecycleFacts::new(
+            ConnectorLifecycleOperationId::from_request_id(self.lifecycle_operation_id),
+            self.platform_target.into_target(),
+            self.adapter_kind.into_adapter(),
+            ReleaseDigest::from_bytes(self.release_digest),
+            self.tenant_id,
+            self.host_id,
+            self.connector_id,
+            self.expiry_millis,
+            PlanDigest::from_bytes(self.plan_digest),
+            HandoffDigest::from_bytes(self.handoff_digest),
+            ConfigDigest::from_bytes(self.config_digest),
+            TrustDigest::from_bytes(self.trust_digest),
+            MaterialDigest::from_bytes(self.material_digest),
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PlatformWire {
+    LinuxAmd64,
+    LinuxArm64,
+}
+impl PlatformWire {
+    const fn from_target(v: PlatformTarget) -> Self {
+        match v {
+            PlatformTarget::LinuxAmd64 => Self::LinuxAmd64,
+            PlatformTarget::LinuxArm64 => Self::LinuxArm64,
+        }
+    }
+    const fn into_target(self) -> PlatformTarget {
+        match self {
+            Self::LinuxAmd64 => PlatformTarget::LinuxAmd64,
+            Self::LinuxArm64 => PlatformTarget::LinuxArm64,
+        }
+    }
+}
+
+#[allow(clippy::large_types_passed_by_value)]
 impl CommandWire {
     fn from_command(command: DurableHostCommand) -> Self {
         match command {
@@ -776,6 +979,18 @@ impl CommandWire {
             },
             DurableHostCommand::RemoveRetainingData { target } => Self::RemoveRetainingData {
                 target: TargetWire::from_target(target),
+            },
+            DurableHostCommand::PrepareConnectorMaterial { facts } => {
+                Self::PrepareConnectorMaterial {
+                    facts: LifecycleFactsWire::from_facts(facts),
+                }
+            }
+            DurableHostCommand::FinalizeConnectorMaterial {
+                facts,
+                prepared_receipt,
+            } => Self::FinalizeConnectorMaterial {
+                facts: LifecycleFactsWire::from_facts(facts),
+                prepared_receipt: prepared_receipt.as_bytes(),
             },
         }
     }
@@ -824,6 +1039,18 @@ impl CommandWire {
             },
             Self::RemoveRetainingData { target } => DurableHostCommand::RemoveRetainingData {
                 target: target.rehydrate(),
+            },
+            Self::PrepareConnectorMaterial { facts } => {
+                DurableHostCommand::PrepareConnectorMaterial {
+                    facts: facts.rehydrate()?,
+                }
+            }
+            Self::FinalizeConnectorMaterial {
+                facts,
+                prepared_receipt,
+            } => DurableHostCommand::FinalizeConnectorMaterial {
+                facts: facts.rehydrate()?,
+                prepared_receipt: PreparedReceiptDigest::from_bytes(*prepared_receipt),
             },
         })
     }
@@ -1076,14 +1303,64 @@ struct ReceiptWire {
     operation_id: RequestId,
     command_digest: [u8; 32],
     outcome: OutcomeWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    install_proof: Option<InstallProofWire>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum InstallProofWire {
+    Prepared {
+        facts: LifecycleFactsWire,
+        prepared_receipt: [u8; 32],
+        credentials: CredentialFactsWire,
+        observation: ObservationWire,
+    },
+    Finalized {
+        facts: LifecycleFactsWire,
+        prepared_receipt: [u8; 32],
+        finalized_receipt: [u8; 32],
+        credentials: CredentialFactsWire,
+        observation: ObservationWire,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialFactsWire {
+    generation: u64,
+    revision: u64,
+    credential_ref: [u8; 32],
+    mcp_bearer_ref: [u8; 32],
+}
+
+impl CredentialFactsWire {
+    fn from_facts(v: BootstrapCredentialFacts) -> Self {
+        Self {
+            generation: v.generation,
+            revision: v.revision.get(),
+            credential_ref: v.credential_ref.as_bytes(),
+            mcp_bearer_ref: v.mcp_bearer_ref.as_bytes(),
+        }
+    }
+    fn rehydrate(self) -> Result<BootstrapCredentialFacts, ()> {
+        Ok(BootstrapCredentialFacts {
+            generation: self.generation,
+            revision: Revision::new(self.revision).map_err(|_| ())?,
+            credential_ref: CredentialArtifactRef::from_bytes(self.credential_ref),
+            mcp_bearer_ref: McpBearerRef::from_bytes(self.mcp_bearer_ref),
+        })
+    }
+}
+
+#[allow(clippy::large_types_passed_by_value)]
 impl ReceiptWire {
-    const fn from_receipt(receipt: OperationReceipt) -> Self {
+    fn from_receipt(receipt: OperationReceipt) -> Self {
         Self {
             operation_id: receipt.operation_id().as_request_id(),
             command_digest: receipt.command_digest().as_bytes(),
             outcome: OutcomeWire::from_outcome(receipt.outcome()),
+            install_proof: receipt.install_proof().map(InstallProofWire::from_proof),
         }
     }
 
@@ -1093,7 +1370,71 @@ impl ReceiptWire {
             HostOperationId::from_request_id(self.operation_id),
             CommandDigest::from_bytes(self.command_digest),
             self.outcome.rehydrate()?,
+            self.install_proof
+                .as_ref()
+                .map(InstallProofWire::rehydrate)
+                .transpose()?,
         )
+    }
+}
+
+#[allow(clippy::large_types_passed_by_value)]
+impl InstallProofWire {
+    fn from_proof(v: InstallProof) -> Self {
+        match v {
+            InstallProof::Prepared {
+                facts,
+                prepared_receipt,
+                credentials,
+                observation,
+            } => Self::Prepared {
+                facts: LifecycleFactsWire::from_facts(facts),
+                prepared_receipt: prepared_receipt.as_bytes(),
+                credentials: CredentialFactsWire::from_facts(credentials),
+                observation: ObservationWire::from_observation(observation),
+            },
+            InstallProof::Finalized {
+                facts,
+                prepared_receipt,
+                finalized_receipt,
+                credentials,
+                observation,
+            } => Self::Finalized {
+                facts: LifecycleFactsWire::from_facts(facts),
+                prepared_receipt: prepared_receipt.as_bytes(),
+                finalized_receipt: finalized_receipt.as_bytes(),
+                credentials: CredentialFactsWire::from_facts(credentials),
+                observation: ObservationWire::from_observation(observation),
+            },
+        }
+    }
+    fn rehydrate(&self) -> Result<InstallProof, ()> {
+        Ok(match self {
+            Self::Prepared {
+                facts,
+                prepared_receipt,
+                credentials,
+                observation,
+            } => InstallProof::Prepared {
+                facts: facts.rehydrate()?,
+                prepared_receipt: PreparedReceiptDigest::from_bytes(*prepared_receipt),
+                credentials: credentials.rehydrate()?,
+                observation: observation.into_observation(),
+            },
+            Self::Finalized {
+                facts,
+                prepared_receipt,
+                finalized_receipt,
+                credentials,
+                observation,
+            } => InstallProof::Finalized {
+                facts: facts.rehydrate()?,
+                prepared_receipt: PreparedReceiptDigest::from_bytes(*prepared_receipt),
+                finalized_receipt: FinalizedReceiptDigest::from_bytes(*finalized_receipt),
+                credentials: credentials.rehydrate()?,
+                observation: observation.into_observation(),
+            },
+        })
     }
 }
 
@@ -1137,6 +1478,7 @@ impl OutcomeWire {
 enum DispositionWire {
     Applied,
     PolicyBlocked,
+    ExpiredUnclaimed,
 }
 
 impl DispositionWire {
@@ -1144,6 +1486,7 @@ impl DispositionWire {
         match value {
             CommandDisposition::Applied => Self::Applied,
             CommandDisposition::PolicyBlocked => Self::PolicyBlocked,
+            CommandDisposition::ExpiredUnclaimed => Self::ExpiredUnclaimed,
         }
     }
 
@@ -1151,6 +1494,7 @@ impl DispositionWire {
         match self {
             Self::Applied => CommandDisposition::Applied,
             Self::PolicyBlocked => CommandDisposition::PolicyBlocked,
+            Self::ExpiredUnclaimed => CommandDisposition::ExpiredUnclaimed,
         }
     }
 }
@@ -1224,6 +1568,13 @@ fn validate_predecessor_command(
     predecessor: &SupervisorSnapshot,
     intent: &OperationIntent,
 ) -> Result<(), ()> {
+    if matches!(
+        intent.command(),
+        DurableHostCommand::PrepareConnectorMaterial { .. }
+            | DurableHostCommand::FinalizeConnectorMaterial { .. }
+    ) {
+        return Ok(());
+    }
     let target = intent.command().target();
     let existing = predecessor
         .instances
@@ -1232,6 +1583,7 @@ fn validate_predecessor_command(
     validate_durable_command_precondition(existing, intent.command()).map_err(|_| ())
 }
 
+#[allow(clippy::large_types_passed_by_value, clippy::too_many_lines)]
 fn validate_snapshot_transition(
     predecessor: &SupervisorSnapshot,
     resulting: &SupervisorSnapshot,
@@ -1243,11 +1595,23 @@ fn validate_snapshot_transition(
         || predecessor.tenant_id != intent.tenant_id()
         || predecessor.host_id != intent.host_id()
         || snapshot_fence(predecessor) != Some(intent.expected())
-        || snapshot_fence(resulting) != Some(intent.resulting())
+        || (receipt.outcome().disposition != CommandDisposition::ExpiredUnclaimed
+            && snapshot_fence(resulting) != Some(intent.resulting()))
     {
         return Err(());
     }
     let target = intent.command().target();
+    if receipt.outcome().disposition == CommandDisposition::ExpiredUnclaimed {
+        if !matches!(
+            intent.command(),
+            DurableHostCommand::PrepareConnectorMaterial { .. }
+        ) || receipt.outcome().revisions != intent.expected()
+            || predecessor != resulting
+        {
+            return Err(());
+        }
+        return Ok(());
+    }
     let before = predecessor
         .instances
         .iter()
@@ -1335,10 +1699,13 @@ fn validate_snapshot_transition(
                 return Err(());
             }
         }
+        DurableHostCommand::PrepareConnectorMaterial { .. }
+        | DurableHostCommand::FinalizeConnectorMaterial { .. } => {}
     }
     Ok(())
 }
 
+#[allow(clippy::large_types_passed_by_value, clippy::match_same_arms)]
 fn validate_lifecycle_transition(
     before: Option<&ManagedConnectorSnapshot>,
     after: &ManagedConnectorSnapshot,
@@ -1369,6 +1736,17 @@ fn validate_lifecycle_transition(
         (DurableHostCommand::RemoveRetainingData { .. }, CommandDisposition::Applied) => {
             ManagedConnectorDesiredState::RemovedRetainingData
         }
+        (DurableHostCommand::PrepareConnectorMaterial { .. }, CommandDisposition::Applied) => {
+            ManagedConnectorDesiredState::EnsuredStopped
+        }
+        (DurableHostCommand::FinalizeConnectorMaterial { .. }, CommandDisposition::Applied) => {
+            ManagedConnectorDesiredState::Running
+        }
+        (
+            DurableHostCommand::PrepareConnectorMaterial { .. },
+            CommandDisposition::ExpiredUnclaimed,
+        ) => return Ok(()),
+        (_, CommandDisposition::ExpiredUnclaimed) => return Err(()),
     };
     if after.desired_state != expected_desired_state {
         return Err(());
@@ -1402,6 +1780,7 @@ fn validate_unchanged_siblings(
     Ok(())
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn validate_completed_snapshot_projection(
     snapshot: &SupervisorSnapshot,
     intent: &OperationIntent,
@@ -1456,11 +1835,15 @@ fn validate_completed_snapshot_projection(
                 return Err(());
             }
         }
-        DurableHostCommand::Stop { .. } | DurableHostCommand::RemoveRetainingData { .. } => {}
+        DurableHostCommand::Stop { .. }
+        | DurableHostCommand::RemoveRetainingData { .. }
+        | DurableHostCommand::PrepareConnectorMaterial { .. }
+        | DurableHostCommand::FinalizeConnectorMaterial { .. } => {}
     }
     Ok(())
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn validate_snapshot_outcome(
     snapshot: &SupervisorSnapshot,
     receipt: OperationReceipt,
@@ -1671,7 +2054,7 @@ mod tests {
     use dtx_domain::{ConnectorId, HostId, Revision, TenantId};
     use serde_json::Value;
 
-    use super::{FileJournal, JOURNAL_FILE, VERSION, validate_snapshot_transition};
+    use super::{FileJournal, JOURNAL_FILE, JournalFile, VERSION, validate_snapshot_transition};
     use crate::{
         CatalogRelease, CommandDisposition, CommandOutcome, ConnectorTarget, CredentialArtifactRef,
         DurableHostCommand, HostCommand, HostCommandEnvelope, HostOperationId, HostRevisionFence,
@@ -1715,6 +2098,40 @@ mod tests {
         Restart,
         Rotate,
         Remove,
+    }
+
+    #[test]
+    fn pre_install_proof_v4_records_retain_their_exact_hash_input() {
+        for fixture in [
+            include_bytes!("fixtures/pre_install_proof_v4_completed.json").as_slice(),
+            include_bytes!("fixtures/pre_install_proof_v4_completed_pending.json").as_slice(),
+        ] {
+            // `apply_patch` terminates text fixtures; the base v4 writer did
+            // not.  Compare the exact writer bytes, not that source newline.
+            let fixture = fixture.strip_suffix(b"\n").unwrap_or(fixture);
+            let decoded: JournalFile = serde_json::from_slice(fixture).unwrap();
+            let host_id = decoded.host_id;
+            let operation_id = decoded.records[0].operation_id();
+            assert_eq!(serde_json::to_vec(&decoded).unwrap(), fixture);
+
+            let root = TempRoot::new();
+            let path = root.journal_path(host_id);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, fixture).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&path, {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::Permissions::from_mode(0o600)
+            })
+            .unwrap();
+            let mut journal = FileJournal::for_test_root(root.path(), host_id);
+            assert!(journal.load_snapshot(host_id).unwrap().is_some());
+            assert!(matches!(
+                journal.lookup(host_id, operation_id).unwrap(),
+                Some(JournalRecord::Completed { .. })
+            ));
+            assert_eq!(fs::read(path).unwrap(), fixture);
+        }
     }
 
     #[test]
@@ -2364,6 +2781,7 @@ mod tests {
         resulting
     }
 
+    #[allow(clippy::large_types_passed_by_value)]
     fn intent_for(
         predecessor: &SupervisorSnapshot,
         requested: HostCommand,

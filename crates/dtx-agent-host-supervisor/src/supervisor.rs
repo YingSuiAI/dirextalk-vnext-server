@@ -4,12 +4,17 @@ use dtx_agent_host::{AgentHost, HostLifecycle};
 use dtx_domain::{ConnectorId, HostId, Revision, TenantId};
 
 use crate::{
-    CatalogRelease, CommandApplication, CommandDisposition, CommandOutcome, CommandResult,
-    ConnectorTarget, CredentialArtifactProvider, DurableHostCommand, HostCommand,
-    HostCommandEnvelope, HostRevisionFence, Journal, JournalRecord, ManagedConnectorDesiredState,
-    ManagedConnectorSnapshot, OperationIntent, OperationReceipt, PortError, ProcessController,
-    ProcessMutationId, ProcessObservation, ReleaseCatalog, RemovalPolicy, SupervisorSnapshot,
-    types::validate_snapshot_ids,
+    BootstrapMaterialProvider, CatalogRelease, CommandApplication, CommandDisposition,
+    CommandOutcome, CommandResult, ConnectorTarget, CredentialArtifactProvider, DurableHostCommand,
+    FinalizedMaterialProof, HostCommand, HostCommandEnvelope, HostRevisionFence,
+    InstallStateJournal, Journal, JournalRecord, ManagedConnectorDesiredState,
+    ManagedConnectorSnapshot, OperationIntent, OperationReceipt, PortError, PortErrorKind,
+    PrepareMaterialResult, PreparedMaterialProof, ProcessController, ProcessMutationId,
+    ProcessObservation, ReleaseCatalog, RemovalPolicy, SupervisorSnapshot,
+    types::{
+        ConnectorLifecycleFacts, InstallProof, InstallState, PreparedReceiptDigest,
+        validate_snapshot_ids,
+    },
 };
 
 /// Pure host-local desired/observed state coordinator.
@@ -19,6 +24,7 @@ pub struct HostSupervisor {
     host_id: HostId,
     revisions: HostRevisionFence,
     instances: BTreeMap<ConnectorId, ManagedConnectorSnapshot>,
+    install_states: BTreeMap<ConnectorId, InstallState>,
 }
 
 #[derive(Clone, Copy)]
@@ -36,6 +42,7 @@ pub(crate) enum DurableCommandPreconditionError {
     CredentialUnchanged,
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 pub(crate) fn validate_durable_command_precondition(
     existing: Option<&ManagedConnectorSnapshot>,
     command: DurableHostCommand,
@@ -84,6 +91,16 @@ impl From<DurableCommandPreconditionError> for SupervisorError {
     }
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::match_same_arms,
+    clippy::collapsible_if,
+    clippy::missing_errors_doc,
+    clippy::manual_let_else,
+    clippy::needless_pass_by_value
+)]
 impl HostSupervisor {
     /// Creates a supervisor bound to one enrolled active Host.
     ///
@@ -105,6 +122,7 @@ impl HostSupervisor {
             host_id: host.host_id(),
             revisions,
             instances: BTreeMap::new(),
+            install_states: BTreeMap::new(),
         })
     }
 
@@ -165,6 +183,7 @@ impl HostSupervisor {
             host_id: snapshot.host_id,
             revisions,
             instances,
+            install_states: BTreeMap::new(),
         })
     }
 
@@ -198,6 +217,427 @@ impl HostSupervisor {
     #[must_use]
     pub fn instance(&self, connector_id: ConnectorId) -> Option<&ManagedConnectorSnapshot> {
         self.instances.get(&connector_id)
+    }
+
+    #[must_use]
+    pub fn install_state(&self, connector_id: ConnectorId) -> Option<InstallState> {
+        self.install_states.get(&connector_id).copied()
+    }
+
+    #[must_use]
+    pub fn adopted_mcp_bearer_ref(&self, connector_id: ConnectorId) -> Option<crate::McpBearerRef> {
+        self.install_states
+            .get(&connector_id)
+            .map(|state| match *state {
+                InstallState::Prepared { credentials, .. }
+                | InstallState::Finalized { credentials, .. } => credentials.mcp_bearer_ref,
+            })
+    }
+
+    /// Rehydrates install state from the journal's optional v1-compatible
+    /// extension. Legacy journals simply return no install state.
+    pub fn rehydrate_install_state<J: Journal + InstallStateJournal>(
+        &mut self,
+        journal: &mut J,
+        connector_id: ConnectorId,
+    ) -> Result<(), SupervisorError> {
+        if let Some(state) = journal
+            .load_install_state(self.host_id, connector_id)
+            .map_err(SupervisorError::Journal)?
+        {
+            if state.facts().host_id() != self.host_id
+                || state.facts().tenant_id() != self.tenant_id
+                || state.facts().connector_id() != connector_id
+            {
+                return Err(SupervisorError::SnapshotDiverged);
+            }
+            self.install_states.insert(connector_id, state);
+        }
+        Ok(())
+    }
+
+    /// Runs the install-material prepare lifecycle. The durable intent is
+    /// persisted before the material provider is called.
+    pub fn prepare_connector_material<J, R, M>(
+        &mut self,
+        envelope: &HostCommandEnvelope,
+        journal: &mut J,
+        catalog: &mut R,
+        material: &mut M,
+        now_millis: u64,
+    ) -> Result<CommandResult, SupervisorError>
+    where
+        J: Journal,
+        R: ReleaseCatalog,
+        M: BootstrapMaterialProvider,
+    {
+        self.ensure_envelope_boundary(*envelope)?;
+        let HostCommand::PrepareConnectorMaterial { facts } = envelope.command() else {
+            return Err(SupervisorError::InstallCommandRequired);
+        };
+        let mut retrying = false;
+        if let Some(record) = journal
+            .lookup(self.host_id, envelope.operation_id())
+            .map_err(SupervisorError::Journal)?
+        {
+            match record {
+                JournalRecord::Completed { intent, receipt } => {
+                    Self::validate_intent_for_envelope(&intent, *envelope)?;
+                    return self.restore_install_completed(intent, receipt);
+                }
+                JournalRecord::Pending(intent) => {
+                    Self::validate_intent_for_envelope(&intent, *envelope)?;
+                    retrying = true;
+                }
+            }
+        }
+        if facts.tenant_id() != self.tenant_id
+            || facts.host_id() != self.host_id
+            || (!retrying && facts.expiry_millis() <= now_millis)
+        {
+            return Err(if !retrying && facts.expiry_millis() <= now_millis {
+                SupervisorError::InstallExpired
+            } else {
+                SupervisorError::HostBoundaryMismatch
+            });
+        }
+        let existing = self.instances.get(&facts.connector_id());
+        if let Some(existing) = existing {
+            if existing.desired_state == ManagedConnectorDesiredState::RemovedRetainingData
+                || existing.desired_state == ManagedConnectorDesiredState::Running
+                || existing.adapter_kind != facts.adapter_kind()
+                || existing.release.digest() != facts.release_digest()
+            {
+                return Err(SupervisorError::InstallLifecycleConflict);
+            }
+        }
+        if let Some(state) = self.install_states.get(&facts.connector_id()) {
+            let _ = state;
+            return Err(SupervisorError::InstallLifecycleConflict);
+        }
+        let release = catalog
+            .resolve_runnable(facts.adapter_kind(), facts.release_digest())
+            .or_else(|error| {
+                if retrying && error.kind() == PortErrorKind::NotApproved {
+                    catalog.resolve_known(facts.adapter_kind(), facts.release_digest())
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(SupervisorError::ReleaseCatalog)?;
+        if release.digest() != facts.release_digest()
+            || release.adapter_kind() != facts.adapter_kind()
+        {
+            return Err(SupervisorError::ReleaseCapabilityMismatch);
+        }
+        let resulting = self
+            .revisions
+            .advance_and_acknowledge()
+            .ok_or(SupervisorError::RevisionExhausted)?;
+        let command = DurableHostCommand::PrepareConnectorMaterial { facts };
+        let intent = OperationIntent::new(*envelope, resulting, command);
+        let predecessor = self.snapshot();
+        journal
+            .persist_intent(intent.clone(), &predecessor)
+            .map_err(SupervisorError::Journal)?;
+        match material
+            .prepare(intent.operation_id(), facts, release)
+            .map_err(SupervisorError::BootstrapMaterial)?
+        {
+            PrepareMaterialResult::ExpiredUnclaimed => {
+                let outcome = CommandOutcome {
+                    connector_id: facts.connector_id(),
+                    revisions: intent.expected(),
+                    disposition: CommandDisposition::ExpiredUnclaimed,
+                    desired_state: existing
+                        .map_or(ManagedConnectorDesiredState::EnsuredStopped, |i| {
+                            i.desired_state
+                        }),
+                    observation: existing.map_or(ProcessObservation::Absent, |i| i.observation),
+                    credential_generation: existing.map_or(0, |i| i.credential_generation),
+                };
+                journal
+                    .complete(
+                        OperationReceipt::new(
+                            intent.operation_id(),
+                            intent.command_digest(),
+                            outcome,
+                        ),
+                        &predecessor,
+                    )
+                    .map_err(SupervisorError::Journal)?;
+                Ok(CommandResult::new(CommandApplication::Applied, outcome))
+            }
+            PrepareMaterialResult::Prepared(proof) => {
+                validate_prepared_proof(&proof, facts, self.host_id)?;
+                let mut staged = self.clone();
+                let generation = existing.map_or(1, |i| i.credential_generation);
+                if proof.credentials.generation != generation
+                    || (existing.is_none() && generation != 1)
+                {
+                    return Err(SupervisorError::InstallProofInvalid);
+                }
+                if proof.observation != ProcessObservation::Stopped {
+                    return Err(SupervisorError::InvalidProcessObservation);
+                }
+                let target = self.target(facts.connector_id(), facts.adapter_kind());
+                let instance = ManagedConnectorSnapshot {
+                    connector_id: target.connector_id(),
+                    adapter_kind: target.adapter_kind(),
+                    release,
+                    desired_state: ManagedConnectorDesiredState::EnsuredStopped,
+                    observation: ProcessObservation::Stopped,
+                    credential_generation: generation,
+                    credential_ref: Some(proof.credentials.credential_ref),
+                    credential_operation_id: Some(intent.operation_id()),
+                };
+                staged.instances.insert(target.connector_id(), instance);
+                staged.install_states.insert(
+                    target.connector_id(),
+                    InstallState::Prepared {
+                        facts,
+                        prepared_receipt: proof.prepared_receipt,
+                        credentials: proof.credentials,
+                        observation: proof.observation,
+                    },
+                );
+                staged.revisions = intent.resulting();
+                let outcome = staged.current_outcome(target.connector_id())?;
+                journal
+                    .complete(
+                        OperationReceipt::with_install_proof(
+                            intent.operation_id(),
+                            intent.command_digest(),
+                            outcome,
+                            InstallProof::Prepared {
+                                facts,
+                                prepared_receipt: proof.prepared_receipt,
+                                credentials: proof.credentials,
+                                observation: proof.observation,
+                            },
+                        ),
+                        &staged.snapshot(),
+                    )
+                    .map_err(SupervisorError::Journal)?;
+                *self = staged;
+                Ok(CommandResult::new(CommandApplication::Applied, outcome))
+            }
+        }
+    }
+
+    /// Finalizes a previously prepared install only after local observation is
+    /// exactly Running. Readiness is never supplied by the caller.
+    pub fn finalize_connector_material<J, R, M, P, A>(
+        &mut self,
+        envelope: &HostCommandEnvelope,
+        journal: &mut J,
+        catalog: &mut R,
+        material: &mut M,
+        process: &mut P,
+    ) -> Result<CommandResult, SupervisorError>
+    where
+        J: Journal,
+        R: ReleaseCatalog,
+        M: BootstrapMaterialProvider,
+        P: ProcessController<A>,
+        A: 'static,
+    {
+        self.ensure_envelope_boundary(*envelope)?;
+        let HostCommand::FinalizeConnectorMaterial {
+            facts,
+            prepared_receipt,
+        } = envelope.command()
+        else {
+            return Err(SupervisorError::InstallCommandRequired);
+        };
+        if let Some(record) = journal
+            .lookup(self.host_id, envelope.operation_id())
+            .map_err(SupervisorError::Journal)?
+        {
+            match record {
+                JournalRecord::Completed { intent, receipt } => {
+                    Self::validate_intent_for_envelope(&intent, *envelope)?;
+                    return self.restore_install_completed(intent, receipt);
+                }
+                JournalRecord::Pending(intent) => {
+                    Self::validate_intent_for_envelope(&intent, *envelope)?;
+                }
+            }
+        }
+        let Some(InstallState::Prepared {
+            facts: stored,
+            prepared_receipt: stored_receipt,
+            ..
+        }) = self.install_states.get(&facts.connector_id()).copied()
+        else {
+            return Err(SupervisorError::InstallNotPrepared);
+        };
+        if stored != facts || stored_receipt != prepared_receipt {
+            return Err(SupervisorError::InstallDigestMismatch);
+        }
+        let instance = self
+            .instances
+            .get(&facts.connector_id())
+            .ok_or(SupervisorError::ConnectorNotFound)?;
+        if instance.desired_state != ManagedConnectorDesiredState::Running {
+            return Err(SupervisorError::InstallNotRunning);
+        }
+        let target = self.target(facts.connector_id(), facts.adapter_kind());
+        if process.observe(target).map_err(SupervisorError::Process)? != ProcessObservation::Running
+        {
+            return Err(SupervisorError::InstallNotRunning);
+        }
+        let release = catalog
+            .resolve_known(facts.adapter_kind(), facts.release_digest())
+            .map_err(SupervisorError::ReleaseCatalog)?;
+        if release.digest() != facts.release_digest() {
+            return Err(SupervisorError::ReleaseCapabilityMismatch);
+        }
+        let resulting = self
+            .revisions
+            .advance_and_acknowledge()
+            .ok_or(SupervisorError::RevisionExhausted)?;
+        let intent = OperationIntent::new(
+            *envelope,
+            resulting,
+            DurableHostCommand::FinalizeConnectorMaterial {
+                facts,
+                prepared_receipt,
+            },
+        );
+        let predecessor = self.snapshot();
+        journal
+            .persist_intent(intent.clone(), &predecessor)
+            .map_err(SupervisorError::Journal)?;
+        let proof = material
+            .finalize(intent.operation_id(), facts, prepared_receipt, release)
+            .map_err(SupervisorError::BootstrapMaterial)?;
+        let expected_credentials = match self.install_states.get(&facts.connector_id()).copied() {
+            Some(InstallState::Prepared { credentials, .. }) => credentials,
+            _ => return Err(SupervisorError::InstallNotPrepared),
+        };
+        validate_finalized_proof(&proof, facts, prepared_receipt, expected_credentials)?;
+        if proof.observation != ProcessObservation::Running {
+            return Err(SupervisorError::InvalidProcessObservation);
+        }
+        let mut staged = self.clone();
+        staged.revisions = resulting;
+        staged.install_states.insert(
+            facts.connector_id(),
+            InstallState::Finalized {
+                facts,
+                prepared_receipt,
+                finalized_receipt: proof.finalized_receipt,
+                credentials: proof.credentials,
+                observation: proof.observation,
+            },
+        );
+        let outcome = staged.current_outcome(target.connector_id())?;
+        journal
+            .complete(
+                OperationReceipt::with_install_proof(
+                    intent.operation_id(),
+                    intent.command_digest(),
+                    outcome,
+                    InstallProof::Finalized {
+                        facts,
+                        prepared_receipt,
+                        finalized_receipt: proof.finalized_receipt,
+                        credentials: proof.credentials,
+                        observation: proof.observation,
+                    },
+                ),
+                &staged.snapshot(),
+            )
+            .map_err(SupervisorError::Journal)?;
+        *self = staged;
+        Ok(CommandResult::new(CommandApplication::Applied, outcome))
+    }
+
+    fn restore_install_completed(
+        &mut self,
+        intent: OperationIntent,
+        receipt: OperationReceipt,
+    ) -> Result<CommandResult, SupervisorError> {
+        if receipt.operation_id() != intent.operation_id()
+            || receipt.command_digest() != intent.command_digest()
+            || !command_outcome_is_valid(intent.command(), receipt.outcome())
+        {
+            return Err(SupervisorError::SnapshotDiverged);
+        }
+        match (
+            intent.command(),
+            receipt.outcome().disposition,
+            receipt.install_proof(),
+        ) {
+            (
+                DurableHostCommand::PrepareConnectorMaterial { facts },
+                CommandDisposition::Applied,
+                Some(InstallProof::Prepared {
+                    facts: proof_facts, ..
+                }),
+            ) if facts == proof_facts => {}
+            (
+                DurableHostCommand::PrepareConnectorMaterial { .. },
+                CommandDisposition::ExpiredUnclaimed,
+                None,
+            ) => {}
+            (
+                DurableHostCommand::FinalizeConnectorMaterial {
+                    facts,
+                    prepared_receipt,
+                },
+                CommandDisposition::Applied,
+                Some(InstallProof::Finalized {
+                    facts: proof_facts,
+                    prepared_receipt: proof_receipt,
+                    ..
+                }),
+            ) if facts == proof_facts && prepared_receipt == proof_receipt => {}
+            _ => return Err(SupervisorError::SnapshotDiverged),
+        }
+        if let Some(proof) = receipt.install_proof() {
+            match proof {
+                InstallProof::Prepared {
+                    facts,
+                    prepared_receipt,
+                    credentials,
+                    observation,
+                } => {
+                    self.install_states.insert(
+                        facts.connector_id(),
+                        InstallState::Prepared {
+                            facts,
+                            prepared_receipt,
+                            credentials,
+                            observation,
+                        },
+                    );
+                }
+                InstallProof::Finalized {
+                    facts,
+                    prepared_receipt,
+                    finalized_receipt,
+                    credentials,
+                    observation,
+                } => {
+                    self.install_states.insert(
+                        facts.connector_id(),
+                        InstallState::Finalized {
+                            facts,
+                            prepared_receipt,
+                            finalized_receipt,
+                            credentials,
+                            observation,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(CommandResult::new(
+            CommandApplication::Replayed,
+            receipt.outcome(),
+        ))
     }
 
     /// Reads one known Connector's current process state without creating an
@@ -357,7 +797,9 @@ impl HostSupervisor {
             DurableHostCommand::Ensure { .. }
             | DurableHostCommand::Stop { .. }
             | DurableHostCommand::RotateCredential { .. }
-            | DurableHostCommand::RemoveRetainingData { .. } => return Ok(false),
+            | DurableHostCommand::RemoveRetainingData { .. }
+            | DurableHostCommand::PrepareConnectorMaterial { .. }
+            | DurableHostCommand::FinalizeConnectorMaterial { .. } => return Ok(false),
         };
         match catalog.resolve_runnable(release.adapter_kind(), release.digest()) {
             Ok(current) if current == release => Ok(false),
@@ -432,6 +874,12 @@ impl HostSupervisor {
                 adapter_kind,
                 release_digest,
             } => {
+                if let Some(state) = self.install_states.get(&connector_id)
+                    && (state.facts().adapter_kind() != adapter_kind
+                        || state.facts().release_digest() != release_digest)
+                {
+                    return Err(SupervisorError::InstallLifecycleConflict);
+                }
                 if let Some(existing) = self.instances.get(&connector_id) {
                     if existing.desired_state == ManagedConnectorDesiredState::RemovedRetainingData
                     {
@@ -497,6 +945,9 @@ impl HostSupervisor {
                 connector_id,
                 credential_ref,
             } => {
+                if self.install_states.contains_key(&connector_id) {
+                    return Err(SupervisorError::InstallLifecycleConflict);
+                }
                 let instance = self.usable_instance(connector_id)?;
                 Self::ensure_release_runnable(instance.release, catalog)?;
                 if instance.credential_ref == Some(credential_ref) {
@@ -523,6 +974,16 @@ impl HostSupervisor {
                     target: self.target(connector_id, instance.adapter_kind),
                 })
             }
+            HostCommand::PrepareConnectorMaterial { facts } => {
+                Ok(DurableHostCommand::PrepareConnectorMaterial { facts })
+            }
+            HostCommand::FinalizeConnectorMaterial {
+                facts,
+                prepared_receipt,
+            } => Ok(DurableHostCommand::FinalizeConnectorMaterial {
+                facts,
+                prepared_receipt,
+            }),
         }
     }
 
@@ -654,7 +1115,9 @@ impl HostSupervisor {
                     Self::validate_release(release, catalog, release_validation)
                 }
                 DurableHostCommand::Stop { .. }
-                | DurableHostCommand::RemoveRetainingData { .. } => Ok(()),
+                | DurableHostCommand::RemoveRetainingData { .. }
+                | DurableHostCommand::PrepareConnectorMaterial { .. }
+                | DurableHostCommand::FinalizeConnectorMaterial { .. } => Ok(()),
             };
         }
         let instance = self.instances.get(&target.connector_id());
@@ -728,6 +1191,11 @@ impl HostSupervisor {
                 {
                     return Err(SupervisorError::SnapshotDiverged);
                 }
+                if let DurableHostCommand::Start { credential_ref, .. }
+                | DurableHostCommand::Restart { credential_ref, .. } = command
+                {
+                    self.validate_installed_runtime_target(target, release, credential_ref)?;
+                }
             }
             DurableHostCommand::Stop { .. } | DurableHostCommand::RemoveRetainingData { .. } => {
                 let existing = instance.ok_or(SupervisorError::SnapshotDiverged)?;
@@ -740,6 +1208,8 @@ impl HostSupervisor {
                     return Err(SupervisorError::ConnectorRemoved);
                 }
             }
+            DurableHostCommand::PrepareConnectorMaterial { .. }
+            | DurableHostCommand::FinalizeConnectorMaterial { .. } => {}
         }
         Ok(())
     }
@@ -810,13 +1280,21 @@ impl HostSupervisor {
     ) -> Result<CommandResult, SupervisorError> {
         if receipt.operation_id() != intent.operation_id()
             || receipt.command_digest() != intent.command_digest()
-            || receipt.outcome().revisions != intent.resulting()
+            || (receipt.outcome().revisions != intent.resulting()
+                && !(receipt.outcome().disposition == CommandDisposition::ExpiredUnclaimed
+                    && receipt.outcome().revisions == intent.expected()))
             || receipt.outcome().connector_id != intent.command().target().connector_id()
             || !command_outcome_is_valid(intent.command(), receipt.outcome())
         {
             return Err(SupervisorError::SnapshotDiverged);
         }
         self.validate_intent(intent, catalog, ReleaseValidation::Known)?;
+        if receipt.outcome().disposition == CommandDisposition::ExpiredUnclaimed {
+            return Ok(CommandResult::new(
+                CommandApplication::Replayed,
+                receipt.outcome(),
+            ));
+        }
         if self.revisions.desired() > intent.resulting().desired() {
             return Ok(CommandResult::new(
                 CommandApplication::Replayed,
@@ -878,9 +1356,18 @@ impl HostSupervisor {
                 release,
                 credential_ref,
                 ..
-            } => process
-                .start(mutation_id, target, release, credential_ref)
-                .map_err(SupervisorError::Process)?,
+            } => {
+                self.restore_installed_runtime_if_needed(
+                    process,
+                    mutation_id,
+                    target,
+                    release,
+                    credential_ref,
+                )?;
+                process
+                    .start(mutation_id, target, release, credential_ref)
+                    .map_err(SupervisorError::Process)?
+            }
             DurableHostCommand::Stop { target } => process
                 .stop(mutation_id, target)
                 .map_err(SupervisorError::Process)?,
@@ -889,9 +1376,18 @@ impl HostSupervisor {
                 release,
                 credential_ref,
                 ..
-            } => process
-                .restart(mutation_id, target, release, credential_ref)
-                .map_err(SupervisorError::Process)?,
+            } => {
+                self.restore_installed_runtime_if_needed(
+                    process,
+                    mutation_id,
+                    target,
+                    release,
+                    credential_ref,
+                )?;
+                process
+                    .restart(mutation_id, target, release, credential_ref)
+                    .map_err(SupervisorError::Process)?
+            }
             DurableHostCommand::RotateCredential {
                 target,
                 credential_ref,
@@ -907,12 +1403,71 @@ impl HostSupervisor {
             DurableHostCommand::RemoveRetainingData { target } => process
                 .remove_retaining_data(mutation_id, target)
                 .map_err(SupervisorError::Process)?,
+            DurableHostCommand::PrepareConnectorMaterial { .. }
+            | DurableHostCommand::FinalizeConnectorMaterial { .. } => {
+                return Err(SupervisorError::InstallCommandRequired);
+            }
         };
         if self.observation_is_valid(command, observation) {
             Ok(observation)
         } else {
             Err(SupervisorError::InvalidProcessObservation)
         }
+    }
+
+    fn restore_installed_runtime_if_needed<P, A>(
+        &self,
+        process: &mut P,
+        mutation_id: ProcessMutationId,
+        target: ConnectorTarget,
+        release: CatalogRelease,
+        credential_ref: crate::CredentialArtifactRef,
+    ) -> Result<(), SupervisorError>
+    where
+        P: ProcessController<A>,
+    {
+        let Some(state) = self.install_states.get(&target.connector_id()) else {
+            return Ok(());
+        };
+        let credentials = match *state {
+            InstallState::Prepared { credentials, .. }
+            | InstallState::Finalized { credentials, .. } => credentials,
+        };
+        self.validate_installed_runtime_target(target, release, credential_ref)?;
+        process
+            .restore_installed_runtime(
+                mutation_id,
+                target,
+                credential_ref,
+                credentials.mcp_bearer_ref,
+            )
+            .map_err(SupervisorError::Process)
+    }
+
+    fn validate_installed_runtime_target(
+        &self,
+        target: ConnectorTarget,
+        release: CatalogRelease,
+        credential_ref: crate::CredentialArtifactRef,
+    ) -> Result<(), SupervisorError> {
+        let Some(state) = self.install_states.get(&target.connector_id()) else {
+            return Ok(());
+        };
+        let facts = state.facts();
+        let credentials = match *state {
+            InstallState::Prepared { credentials, .. }
+            | InstallState::Finalized { credentials, .. } => credentials,
+        };
+        if facts.tenant_id() != self.tenant_id
+            || facts.host_id() != self.host_id
+            || facts.connector_id() != target.connector_id()
+            || facts.adapter_kind() != target.adapter_kind()
+            || facts.release_digest() != release.digest()
+            || credentials.credential_ref != credential_ref
+        {
+            return Err(SupervisorError::InstallLifecycleConflict);
+        }
+        Ok(())
     }
 
     fn observation_is_valid(
@@ -948,6 +1503,12 @@ impl HostSupervisor {
                 }),
             DurableHostCommand::RemoveRetainingData { .. } => {
                 observation == ProcessObservation::Absent
+            }
+            DurableHostCommand::PrepareConnectorMaterial { .. } => {
+                observation == ProcessObservation::Stopped
+            }
+            DurableHostCommand::FinalizeConnectorMaterial { .. } => {
+                observation == ProcessObservation::Running
             }
         }
     }
@@ -1015,6 +1576,10 @@ impl HostSupervisor {
                 instance.desired_state = ManagedConnectorDesiredState::RemovedRetainingData;
                 instance.observation = observation;
             }
+            DurableHostCommand::PrepareConnectorMaterial { .. }
+            | DurableHostCommand::FinalizeConnectorMaterial { .. } => {
+                return Err(SupervisorError::InstallCommandRequired);
+            }
         }
         Ok(())
     }
@@ -1071,6 +1636,40 @@ impl HostSupervisor {
     }
 }
 
+#[allow(clippy::large_types_passed_by_value)]
+fn validate_prepared_proof(
+    proof: &PreparedMaterialProof,
+    facts: ConnectorLifecycleFacts,
+    host_id: HostId,
+) -> Result<(), SupervisorError> {
+    if proof.facts != facts
+        || facts.host_id() != host_id
+        || proof.credentials.generation == 0
+        || proof.credentials.revision.get() == 0
+    {
+        return Err(SupervisorError::InstallProofInvalid);
+    }
+    Ok(())
+}
+
+#[allow(clippy::large_types_passed_by_value)]
+fn validate_finalized_proof(
+    proof: &FinalizedMaterialProof,
+    facts: ConnectorLifecycleFacts,
+    prepared_receipt: PreparedReceiptDigest,
+    expected_credentials: crate::BootstrapCredentialFacts,
+) -> Result<(), SupervisorError> {
+    if proof.facts != facts
+        || proof.prepared_receipt != prepared_receipt
+        || proof.credentials.generation == 0
+        || proof.credentials.revision.get() == 0
+        || proof.credentials != expected_credentials
+    {
+        return Err(SupervisorError::InstallProofInvalid);
+    }
+    Ok(())
+}
+
 const fn snapshot_observation_is_valid(instance: ManagedConnectorSnapshot) -> bool {
     matches!(
         (instance.desired_state, instance.observation),
@@ -1087,6 +1686,7 @@ const fn snapshot_observation_is_valid(instance: ManagedConnectorSnapshot) -> bo
     )
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn durable_command_matches(command: DurableHostCommand, requested: HostCommand) -> bool {
     match (command, requested) {
         (
@@ -1128,11 +1728,26 @@ fn durable_command_matches(command: DurableHostCommand, requested: HostCommand) 
                 policy: RemovalPolicy::RetainData,
             },
         ) => target.connector_id() == connector_id,
+        (
+            DurableHostCommand::PrepareConnectorMaterial { facts: durable },
+            HostCommand::PrepareConnectorMaterial { facts: requested },
+        ) => durable == requested,
+        (
+            DurableHostCommand::FinalizeConnectorMaterial {
+                facts: durable,
+                prepared_receipt: durable_receipt,
+            },
+            HostCommand::FinalizeConnectorMaterial {
+                facts: requested,
+                prepared_receipt: requested_receipt,
+            },
+        ) => durable == requested && durable_receipt == requested_receipt,
         _ => false,
     }
 }
 
-const fn command_outcome_is_valid(command: DurableHostCommand, outcome: CommandOutcome) -> bool {
+#[allow(clippy::large_types_passed_by_value)]
+fn command_outcome_is_valid(command: DurableHostCommand, outcome: CommandOutcome) -> bool {
     if matches!(outcome.disposition, CommandDisposition::PolicyBlocked) {
         return matches!(
             command,
@@ -1144,6 +1759,9 @@ const fn command_outcome_is_valid(command: DurableHostCommand, outcome: CommandO
                 ProcessObservation::Stopped
             )
         );
+    }
+    if matches!(outcome.disposition, CommandDisposition::ExpiredUnclaimed) {
+        return matches!(command, DurableHostCommand::PrepareConnectorMaterial { .. });
     }
     match command {
         DurableHostCommand::Ensure { .. } => {
@@ -1199,6 +1817,16 @@ const fn command_outcome_is_valid(command: DurableHostCommand, outcome: CommandO
                 )
             )
         }
+        DurableHostCommand::PrepareConnectorMaterial { .. } => true,
+        DurableHostCommand::FinalizeConnectorMaterial { .. } => {
+            matches!(
+                (outcome.desired_state, outcome.observation),
+                (
+                    ManagedConnectorDesiredState::Running,
+                    ProcessObservation::Running
+                )
+            )
+        }
     }
 }
 
@@ -1243,7 +1871,15 @@ pub enum SupervisorError {
     Journal(PortError),
     ReleaseCatalog(PortError),
     CredentialArtifact(PortError),
+    BootstrapMaterial(PortError),
     Process(PortError),
+    InstallCommandRequired,
+    InstallExpired,
+    InstallLifecycleConflict,
+    InstallNotPrepared,
+    InstallDigestMismatch,
+    InstallNotRunning,
+    InstallProofInvalid,
 }
 
 impl fmt::Display for SupervisorError {
@@ -1258,6 +1894,7 @@ impl Error for SupervisorError {
             Self::Journal(error)
             | Self::ReleaseCatalog(error)
             | Self::CredentialArtifact(error)
+            | Self::BootstrapMaterial(error)
             | Self::Process(error) => Some(error),
             Self::HostBoundaryMismatch
             | Self::StaleRevision { .. }
@@ -1273,7 +1910,14 @@ impl Error for SupervisorError {
             | Self::CredentialRequired
             | Self::CredentialUnchanged
             | Self::SnapshotDiverged
-            | Self::InvalidProcessObservation => None,
+            | Self::InvalidProcessObservation
+            | Self::InstallCommandRequired
+            | Self::InstallExpired
+            | Self::InstallLifecycleConflict
+            | Self::InstallNotPrepared
+            | Self::InstallDigestMismatch
+            | Self::InstallNotRunning
+            | Self::InstallProofInvalid => None,
         }
     }
 }

@@ -7,12 +7,13 @@ use std::{
 
 use dtx_agent_host::AgentHost;
 use dtx_agent_host_supervisor::{
-    CommandApplication, CommandDisposition, ConnectorTarget, CredentialArtifactProvider,
-    CredentialArtifactRef, FileJournal, HostCommand, HostCommandEnvelope, HostOperationId,
-    HostRevisionFence, HostSupervisor, Journal, JournalRecord, LinuxCredentialArtifact,
-    LinuxProcessController, ManagedConnectorDesiredState, ManagedConnectorSnapshot, PortError,
-    PortErrorKind, ProcessObservation, ReleaseDigest, RemovalPolicy, SupervisorError,
-    SupervisorSnapshot,
+    BootstrapMaterialProvider, CatalogRelease, CommandApplication, CommandDisposition,
+    ConnectorLifecycleFacts, ConnectorTarget, CredentialArtifactProvider, CredentialArtifactRef,
+    FileJournal, FinalizedMaterialProof, HostCommand, HostCommandEnvelope, HostOperationId,
+    HostRevisionFence, HostSupervisor, InstallState, Journal, JournalRecord,
+    LinuxCredentialArtifact, LinuxProcessController, ManagedConnectorDesiredState,
+    ManagedConnectorSnapshot, PortError, PortErrorKind, PrepareMaterialResult, ProcessController,
+    ProcessObservation, ReleaseDigest, RemovalPolicy, SupervisorError, SupervisorSnapshot,
 };
 use dtx_connect_registry::AdapterKind;
 use dtx_domain::{HostCredentialId, IdentityId, Revision, TenantId};
@@ -27,6 +28,10 @@ use crate::{
         OperatorResponse, OperatorResult, RequestBody, RequestFrame, RevisionProjection,
         decode_sha256, encode_sha256,
     },
+};
+use crate::{
+    production_v2,
+    wire_v2::{V2Application, V2Header, V2Operation, V2RequestFrame, V2Response, V2Result},
 };
 
 const CONFIG_DIRECTORY: &str = "/etc/dirextalk/host-supervisor";
@@ -45,11 +50,275 @@ struct HostConfigWire {
     host_credential_id: HostCredentialId,
 }
 
+struct ReplayOnlyProvider;
+
+impl BootstrapMaterialProvider for ReplayOnlyProvider {
+    fn prepare(
+        &mut self,
+        _: HostOperationId,
+        _: ConnectorLifecycleFacts,
+        _: CatalogRelease,
+    ) -> Result<PrepareMaterialResult, PortError> {
+        Err(PortError::new(PortErrorKind::Conflict))
+    }
+
+    fn finalize(
+        &mut self,
+        _: HostOperationId,
+        _: ConnectorLifecycleFacts,
+        _: dtx_agent_host_supervisor::PreparedReceiptDigest,
+        _: CatalogRelease,
+    ) -> Result<FinalizedMaterialProof, PortError> {
+        Err(PortError::new(PortErrorKind::Conflict))
+    }
+}
+
 pub fn handle(frame: RequestFrame) -> OperatorResponse {
     match handle_inner(frame) {
         Ok(result) => OperatorResponse::completed(result),
         Err(error) => OperatorResponse::rejected(error),
     }
+}
+
+pub fn handle_v2(frame: V2RequestFrame) -> V2Response {
+    match handle_v2_inner(frame) {
+        Ok(response) => response,
+        Err(code) => V2Response::rejected(code),
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one bounded production dispatch boundary"
+)]
+fn handle_v2_inner(frame: V2RequestFrame) -> Result<V2Response, &'static str> {
+    verify_root_boundary().map_err(|_| "HOST_UNAVAILABLE")?;
+    let config: HostConfigWire = serde_json::from_slice(
+        &read_secure_file(Path::new(HOST_CONFIG), MAX_HOST_CONFIG_BYTES)
+            .map_err(|_| "HOST_UNAVAILABLE")?,
+    )
+    .map_err(|_| "INVALID_HOST_CONFIG")?;
+    if config.schema_version != 1
+        || frame.header.tenant_id != config.tenant_id
+        || frame.header.host_id != config.host_id
+    {
+        return Err("HOST_BOUNDARY_MISMATCH");
+    }
+    let mut catalog = StaticReleaseCatalog::from_slice(
+        &read_secure_file(Path::new(RELEASE_CATALOG), MAX_RELEASE_CATALOG_BYTES)
+            .map_err(|_| "HOST_UNAVAILABLE")?,
+    )
+    .map_err(|_| "INVALID_RELEASE_CATALOG")?;
+    let mut host = AgentHost::register(config.tenant_id, config.host_id, config.owner_id);
+    host.enroll(Revision::INITIAL, config.host_credential_id)
+        .map_err(|_| "INVALID_HOST_CONFIG")?;
+    let mut journal = FileJournal::for_host(config.host_id);
+    let mut supervisor = match journal
+        .load_snapshot(config.host_id)
+        .map_err(|_| "STATE_UNAVAILABLE")?
+    {
+        Some(s) => HostSupervisor::try_from_snapshot(&host, s, &mut catalog)
+            .map_err(|_| "INVALID_SUPERVISOR_STATE")?,
+        None => HostSupervisor::new(&host).map_err(|_| "INVALID_SUPERVISOR_STATE")?,
+    };
+    rehydrate_all_install_states(&mut supervisor, &mut journal)
+        .map_err(|_| "INVALID_SUPERVISOR_STATE")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|v| u64::try_from(v.as_millis()).ok())
+        .ok_or("TIME_UNAVAILABLE")?;
+    let mut process = LinuxProcessController::new();
+    if frame.material.is_none() {
+        let mut replay = ReplayOnlyProvider;
+        dispatch_v2_lifecycle(
+            &mut supervisor,
+            &mut journal,
+            &mut catalog,
+            &frame.header,
+            false,
+            &mut replay,
+            &mut process,
+            now,
+        )
+    } else {
+        let request = production_v2::ValidatedBootstrapRequest::parse(frame)
+            .map_err(|_| "INVALID_MATERIAL")?;
+        let header = request.frame.header.clone();
+        let mut provider = production_v2::LinuxBootstrapProvider::new(request, now);
+        dispatch_v2_lifecycle(
+            &mut supervisor,
+            &mut journal,
+            &mut catalog,
+            &header,
+            true,
+            &mut provider,
+            &mut process,
+            now,
+        )
+    }
+}
+
+/// Dispatches one already boundary-validated lifecycle frame through the
+/// supervisor core. Material parsing is intentionally performed by the caller
+/// before a provider is constructed, so invalid material cannot persist an
+/// intent or invoke a provider.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the injectable lifecycle seam keeps each privileged capability explicit"
+)]
+pub(crate) fn dispatch_v2_lifecycle<J, R, M, P, A>(
+    supervisor: &mut HostSupervisor,
+    journal: &mut J,
+    catalog: &mut R,
+    header: &V2Header,
+    material_present: bool,
+    material: &mut M,
+    process: &mut P,
+    now_millis: u64,
+) -> Result<V2Response, &'static str>
+where
+    J: Journal,
+    R: dtx_agent_host_supervisor::ReleaseCatalog,
+    M: BootstrapMaterialProvider,
+    P: ProcessController<A>,
+    A: 'static,
+{
+    let op = HostOperationId::from_request_id(header.host_operation_id);
+    if !material_present
+        && !matches!(
+            journal
+                .lookup(supervisor.host_id(), op)
+                .map_err(|_| "STATE_UNAVAILABLE")?,
+            Some(JournalRecord::Completed { .. })
+        )
+    {
+        return Err("MATERIAL_REQUIRED");
+    }
+    let facts = production_v2::lifecycle_facts_header(header).map_err(|_| "INVALID_MATERIAL")?;
+    let command = v2_command(header, &facts)?;
+    let fence = HostRevisionFence::new(
+        header.expected_desired_revision,
+        header.expected_observed_revision,
+    )
+    .map_err(|_| "INVALID_REVISION")?;
+    let envelope = HostCommandEnvelope::new(
+        supervisor.tenant_id(),
+        supervisor.host_id(),
+        op,
+        fence,
+        command,
+    );
+    let result =
+        match envelope.command() {
+            HostCommand::PrepareConnectorMaterial { .. } => supervisor
+                .prepare_connector_material(&envelope, journal, catalog, material, now_millis),
+            HostCommand::FinalizeConnectorMaterial { .. } => supervisor
+                .finalize_connector_material(&envelope, journal, catalog, material, process),
+            _ => unreachable!(),
+        }
+        .map_err(|_| "OPERATION_REJECTED")?;
+    let state = supervisor.install_state(result.outcome().connector_id);
+    let projection = project_v2_result(header.operation, result, state.as_ref())?;
+    Ok(V2Response::succeeded(projection))
+}
+
+fn project_v2_result(
+    operation: V2Operation,
+    result: dtx_agent_host_supervisor::CommandResult,
+    state: Option<&InstallState>,
+) -> Result<V2Result, &'static str> {
+    let outcome = result.outcome();
+    let application = match result.application() {
+        dtx_agent_host_supervisor::CommandApplication::Applied => V2Application::Applied,
+        dtx_agent_host_supervisor::CommandApplication::Replayed => V2Application::Replayed,
+        dtx_agent_host_supervisor::CommandApplication::Reconciled => {
+            return Err("OPERATION_REJECTED");
+        }
+    };
+    let (lifecycle_state, prepared, finalized) = match (operation, outcome.disposition, state) {
+        (V2Operation::PrepareConnectorMaterial, CommandDisposition::ExpiredUnclaimed, None) => {
+            ("expired_unclaimed", None, None)
+        }
+        (
+            V2Operation::PrepareConnectorMaterial,
+            CommandDisposition::Applied,
+            Some(InstallState::Prepared {
+                facts,
+                prepared_receipt,
+                ..
+            }),
+        ) if facts.connector_id() == outcome.connector_id => (
+            "prepared",
+            Some(hex_digest(prepared_receipt.as_bytes())),
+            None,
+        ),
+        (
+            V2Operation::FinalizeConnectorMaterial,
+            CommandDisposition::Applied,
+            Some(InstallState::Finalized {
+                facts,
+                prepared_receipt,
+                finalized_receipt,
+                ..
+            }),
+        ) if facts.connector_id() == outcome.connector_id => (
+            "finalized",
+            Some(hex_digest(prepared_receipt.as_bytes())),
+            Some(hex_digest(finalized_receipt.as_bytes())),
+        ),
+        _ => return Err("INVALID_SUPERVISOR_STATE"),
+    };
+    Ok(V2Result {
+        operation: match operation {
+            V2Operation::PrepareConnectorMaterial => "prepare_connector_material",
+            V2Operation::FinalizeConnectorMaterial => "finalize_connector_material",
+        },
+        application,
+        disposition: match outcome.disposition {
+            CommandDisposition::Applied => "applied",
+            CommandDisposition::ExpiredUnclaimed => "expired_unclaimed",
+            CommandDisposition::PolicyBlocked => return Err("OPERATION_REJECTED"),
+        },
+        desired_revision: outcome.revisions.desired().get(),
+        observed_revision: outcome.revisions.observed().map(dtx_domain::Revision::get),
+        connector_id: outcome.connector_id.to_string(),
+        lifecycle_state,
+        prepared_receipt_sha256: prepared,
+        finalized_receipt_sha256: finalized,
+    })
+}
+
+fn hex_digest(bytes: [u8; 32]) -> String {
+    let mut text = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+fn v2_command(
+    header: &V2Header,
+    facts: &ConnectorLifecycleFacts,
+) -> Result<HostCommand, &'static str> {
+    Ok(match header.operation {
+        V2Operation::PrepareConnectorMaterial => {
+            HostCommand::PrepareConnectorMaterial { facts: *facts }
+        }
+        V2Operation::FinalizeConnectorMaterial => HostCommand::FinalizeConnectorMaterial {
+            facts: *facts,
+            prepared_receipt: dtx_agent_host_supervisor::PreparedReceiptDigest::from_bytes(
+                crate::wire_v2::decode_digest(
+                    header
+                        .prepared_receipt_sha256
+                        .as_deref()
+                        .ok_or("INVALID_MATERIAL")?,
+                )
+                .map_err(|_| "INVALID_MATERIAL")?,
+            ),
+        },
+    })
 }
 
 fn handle_inner(frame: RequestFrame) -> Result<OperatorResult, OperatorFailure> {
@@ -88,7 +357,19 @@ fn handle_inner(frame: RequestFrame) -> Result<OperatorResult, OperatorFailure> 
         None => HostSupervisor::new(&host)
             .map_err(|_| OperatorFailure::new("INVALID_SUPERVISOR_STATE"))?,
     };
+    rehydrate_all_install_states(&mut supervisor, &mut journal)
+        .map_err(|_| OperatorFailure::new("INVALID_SUPERVISOR_STATE"))?;
     dispatch(&mut supervisor, &mut journal, &mut catalog, frame)
+}
+
+fn rehydrate_all_install_states(
+    supervisor: &mut HostSupervisor,
+    journal: &mut FileJournal,
+) -> Result<(), SupervisorError> {
+    for instance in supervisor.snapshot().instances {
+        supervisor.rehydrate_install_state(journal, instance.connector_id)?;
+    }
+    Ok(())
 }
 
 fn dispatch(
@@ -431,6 +712,7 @@ const fn disposition_name(disposition: CommandDisposition) -> &'static str {
     match disposition {
         CommandDisposition::Applied => "applied",
         CommandDisposition::PolicyBlocked => "policy_blocked",
+        CommandDisposition::ExpiredUnclaimed => "expired_unclaimed",
     }
 }
 
@@ -481,6 +763,13 @@ fn map_supervisor(error: SupervisorError) -> OperatorFailure {
                 "INVALID_CREDENTIAL_ARTIFACT"
             }
         }),
+        SupervisorError::BootstrapMaterial(error) => OperatorFailure::new(match error.kind() {
+            PortErrorKind::Unavailable => "BOOTSTRAP_MATERIAL_UNAVAILABLE",
+            PortErrorKind::Conflict => "BOOTSTRAP_MATERIAL_CONFLICT",
+            PortErrorKind::NotApproved | PortErrorKind::InvalidArtifact => {
+                "INVALID_BOOTSTRAP_MATERIAL"
+            }
+        }),
         SupervisorError::Process(error) => OperatorFailure::new(match error.kind() {
             PortErrorKind::Unavailable => "PROCESS_UNAVAILABLE",
             PortErrorKind::Conflict => "PROCESS_CONFLICT",
@@ -488,7 +777,398 @@ fn map_supervisor(error: SupervisorError) -> OperatorFailure {
                 "INVALID_PROCESS_ARTIFACT"
             }
         }),
+        SupervisorError::InstallCommandRequired => OperatorFailure::new("INSTALL_COMMAND_REQUIRED"),
+        SupervisorError::InstallExpired => OperatorFailure::new("INSTALL_EXPIRED"),
+        SupervisorError::InstallLifecycleConflict => {
+            OperatorFailure::new("INSTALL_LIFECYCLE_CONFLICT")
+        }
+        SupervisorError::InstallNotPrepared => OperatorFailure::new("INSTALL_NOT_PREPARED"),
+        SupervisorError::InstallDigestMismatch => OperatorFailure::new("INSTALL_DIGEST_MISMATCH"),
+        SupervisorError::InstallNotRunning => OperatorFailure::new("INSTALL_NOT_RUNNING"),
+        SupervisorError::InstallProofInvalid => OperatorFailure::new("INVALID_INSTALL_PROOF"),
     }
 }
 
 const _: fn(AdapterWire) -> AdapterKind = AdapterWire::into_domain;
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc, str::FromStr};
+
+    use super::*;
+    use crate::wire_v2::{
+        AdapterV2, BootstrapMaterialV1, PROTOCOL_V2, PlatformTarget, V2Header, V2Operation,
+    };
+    use dtx_agent_host::AgentHost;
+    use dtx_agent_host_supervisor::{OperationIntent, OperationReceipt, PreparedMaterialProof};
+    use dtx_domain::{HostCredentialId, HostId, IdentityId, Revision, TenantId};
+
+    const TENANT: &str = "0197f1f0-0000-7000-8000-000000000001";
+    const HOST: &str = "0197f1f0-0000-7000-8000-000000000002";
+    const CONNECTOR: &str = "0197f1f0-0000-7000-8000-000000000003";
+    const HOST_OP: &str = "0197f1f0-0000-7000-8000-000000000004";
+    const LIFE_OP: &str = "0197f1f0-0000-7000-8000-000000000005";
+    const OWNER: &str = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la";
+
+    fn id<T: std::str::FromStr>(value: &str) -> T {
+        value.parse().ok().expect("uuidv7")
+    }
+    fn hex(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+    fn supervisor() -> HostSupervisor {
+        let mut host = AgentHost::register(
+            id::<TenantId>(TENANT),
+            id::<HostId>(HOST),
+            IdentityId::from_str(OWNER).expect("owner"),
+        );
+        host.enroll(Revision::INITIAL, HostCredentialId::new())
+            .expect("enroll");
+        HostSupervisor::new(&host).expect("active supervisor")
+    }
+
+    #[derive(Clone, Default)]
+    struct JournalStore(Rc<RefCell<BTreeMap<HostOperationId, JournalRecord>>>);
+    impl Journal for JournalStore {
+        fn lookup(
+            &mut self,
+            _: HostId,
+            operation_id: HostOperationId,
+        ) -> Result<Option<JournalRecord>, PortError> {
+            Ok(self.0.borrow().get(&operation_id).cloned())
+        }
+        fn load_snapshot(&mut self, _: HostId) -> Result<Option<SupervisorSnapshot>, PortError> {
+            Ok(None)
+        }
+        fn persist_intent(
+            &mut self,
+            intent: OperationIntent,
+            _: &SupervisorSnapshot,
+        ) -> Result<(), PortError> {
+            if self.0.borrow().contains_key(&intent.operation_id()) {
+                return Err(PortError::new(PortErrorKind::Conflict));
+            }
+            self.0
+                .borrow_mut()
+                .insert(intent.operation_id(), JournalRecord::Pending(intent));
+            Ok(())
+        }
+        fn complete(
+            &mut self,
+            receipt: OperationReceipt,
+            _: &SupervisorSnapshot,
+        ) -> Result<(), PortError> {
+            let mut records = self.0.borrow_mut();
+            let Some(JournalRecord::Pending(intent)) = records.remove(&receipt.operation_id())
+            else {
+                return Err(PortError::new(PortErrorKind::Conflict));
+            };
+            records.insert(
+                receipt.operation_id(),
+                JournalRecord::Completed { intent, receipt },
+            );
+            Ok(())
+        }
+        fn pending(&mut self, _: HostId) -> Result<Vec<OperationIntent>, PortError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct Catalog;
+    impl dtx_agent_host_supervisor::ReleaseCatalog for Catalog {
+        fn resolve_known(
+            &mut self,
+            adapter: AdapterKind,
+            digest: ReleaseDigest,
+        ) -> Result<CatalogRelease, PortError> {
+            Ok(CatalogRelease::approved(
+                adapter,
+                digest,
+                dtx_agent_host_supervisor::ResourceProfile::Standard,
+                Revision::INITIAL,
+            ))
+        }
+        fn resolve_runnable(
+            &mut self,
+            adapter: AdapterKind,
+            digest: ReleaseDigest,
+        ) -> Result<CatalogRelease, PortError> {
+            self.resolve_known(adapter, digest)
+        }
+    }
+
+    #[derive(Default)]
+    struct Material {
+        calls: usize,
+        fail: bool,
+    }
+    impl BootstrapMaterialProvider for Material {
+        fn prepare(
+            &mut self,
+            _: HostOperationId,
+            facts: ConnectorLifecycleFacts,
+            _: CatalogRelease,
+        ) -> Result<PrepareMaterialResult, PortError> {
+            self.calls += 1;
+            if self.fail {
+                return Err(PortError::new(PortErrorKind::Unavailable));
+            }
+            Ok(PrepareMaterialResult::Prepared(PreparedMaterialProof {
+                facts,
+                prepared_receipt: dtx_agent_host_supervisor::PreparedReceiptDigest::from_bytes(
+                    [9; 32],
+                ),
+                credentials: dtx_agent_host_supervisor::BootstrapCredentialFacts {
+                    generation: 1,
+                    revision: Revision::INITIAL,
+                    credential_ref: CredentialArtifactRef::from_bytes([7; 32]),
+                    mcp_bearer_ref: dtx_agent_host_supervisor::McpBearerRef::from_bytes([8; 32]),
+                },
+                observation: ProcessObservation::Stopped,
+            }))
+        }
+        fn finalize(
+            &mut self,
+            _: HostOperationId,
+            _: ConnectorLifecycleFacts,
+            _: dtx_agent_host_supervisor::PreparedReceiptDigest,
+            _: CatalogRelease,
+        ) -> Result<FinalizedMaterialProof, PortError> {
+            self.calls += 1;
+            Err(PortError::new(PortErrorKind::Conflict))
+        }
+    }
+
+    #[derive(Default)]
+    struct Process;
+    impl dtx_agent_host_supervisor::ProcessController<()> for Process {
+        fn ensure(
+            &mut self,
+            _: dtx_agent_host_supervisor::ProcessMutationId,
+            _: ConnectorTarget,
+            _: CatalogRelease,
+        ) -> Result<ProcessObservation, PortError> {
+            Ok(ProcessObservation::Stopped)
+        }
+        fn start(
+            &mut self,
+            _: dtx_agent_host_supervisor::ProcessMutationId,
+            _: ConnectorTarget,
+            _: CatalogRelease,
+            _: CredentialArtifactRef,
+        ) -> Result<ProcessObservation, PortError> {
+            Ok(ProcessObservation::Running)
+        }
+        fn stop(
+            &mut self,
+            _: dtx_agent_host_supervisor::ProcessMutationId,
+            _: ConnectorTarget,
+        ) -> Result<ProcessObservation, PortError> {
+            Ok(ProcessObservation::Stopped)
+        }
+        fn restart(
+            &mut self,
+            _: dtx_agent_host_supervisor::ProcessMutationId,
+            _: ConnectorTarget,
+            _: CatalogRelease,
+            _: CredentialArtifactRef,
+        ) -> Result<ProcessObservation, PortError> {
+            Ok(ProcessObservation::Running)
+        }
+        fn restore_installed_runtime(
+            &mut self,
+            _: dtx_agent_host_supervisor::ProcessMutationId,
+            _: ConnectorTarget,
+            _: CredentialArtifactRef,
+            _: dtx_agent_host_supervisor::McpBearerRef,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn rotate_credential(
+            &mut self,
+            _: dtx_agent_host_supervisor::ProcessMutationId,
+            _: ConnectorTarget,
+            _: CredentialArtifactRef,
+            (): &(),
+        ) -> Result<ProcessObservation, PortError> {
+            Ok(ProcessObservation::Running)
+        }
+        fn remove_retaining_data(
+            &mut self,
+            _: dtx_agent_host_supervisor::ProcessMutationId,
+            _: ConnectorTarget,
+        ) -> Result<ProcessObservation, PortError> {
+            Ok(ProcessObservation::Absent)
+        }
+        fn observe(&mut self, _: ConnectorTarget) -> Result<ProcessObservation, PortError> {
+            Ok(ProcessObservation::Running)
+        }
+    }
+
+    fn frame(material: bool) -> V2RequestFrame {
+        V2RequestFrame {
+            header: V2Header {
+                protocol: PROTOCOL_V2.into(),
+                tenant_id: id(TENANT),
+                host_id: id(HOST),
+                host_operation_id: id(HOST_OP),
+                expected_desired_revision: 1,
+                expected_observed_revision: Some(1),
+                connector_id: id(CONNECTOR),
+                adapter: AdapterV2::Codex,
+                approved_release_sha256: hex(7),
+                lifecycle_operation_id: id(LIFE_OP),
+                platform_target: PlatformTarget::executing().expect("linux"),
+                expiry_millis: 4_000_000_000,
+                plan_sha256: hex(1),
+                handoff_sha256: hex(2),
+                config_sha256: Some(hex(3)),
+                enrollment_ca_sha256: Some(hex(4)),
+                control_ca_sha256: Some(hex(5)),
+                issuer_ca_sha256: Some(hex(6)),
+                lifecycle_material_sha256: hex(8),
+                payload_sha256: hex(8),
+                prepared_receipt_sha256: None,
+                operation: V2Operation::PrepareConnectorMaterial,
+            },
+            material: material.then(|| {
+                BootstrapMaterialV1::new(
+                    b"config".to_vec(),
+                    b"enrollment".to_vec(),
+                    b"control".to_vec(),
+                    b"issuer".to_vec(),
+                    b"plan".to_vec(),
+                    b"handoff".to_vec(),
+                )
+            }),
+        }
+    }
+
+    #[test]
+    fn full_prepare_reaches_core_and_returns_sanitized_projection() {
+        let mut sup = supervisor();
+        let mut journal = JournalStore::default();
+        let mut catalog = Catalog;
+        let mut material = Material::default();
+        let mut process = Process;
+        let frame = frame(true);
+        let response = dispatch_v2_lifecycle(
+            &mut sup,
+            &mut journal,
+            &mut catalog,
+            &frame.header,
+            true,
+            &mut material,
+            &mut process,
+            10,
+        )
+        .expect("prepare dispatch");
+        assert_eq!(material.calls, 1);
+        let value = serde_json::to_value(response).expect("json");
+        assert_eq!(value["result"]["lifecycle_state"], "prepared");
+        assert_eq!(value["result"]["prepared_receipt_sha256"], hex(9));
+    }
+
+    #[test]
+    fn completed_header_only_replays_without_provider_and_new_or_pending_reject() {
+        let mut sup = supervisor();
+        let mut journal = JournalStore::default();
+        let mut catalog = Catalog;
+        let mut material = Material::default();
+        let mut process = Process;
+        let full = frame(true);
+        dispatch_v2_lifecycle(
+            &mut sup,
+            &mut journal,
+            &mut catalog,
+            &full.header,
+            true,
+            &mut material,
+            &mut process,
+            10,
+        )
+        .expect("prepare");
+        let calls = material.calls;
+        let header_only = frame(false);
+        let replay = dispatch_v2_lifecycle(
+            &mut sup,
+            &mut journal,
+            &mut catalog,
+            &header_only.header,
+            false,
+            &mut ReplayOnlyProvider,
+            &mut process,
+            10,
+        )
+        .expect("completed replay");
+        assert_eq!(material.calls, calls);
+        assert_eq!(
+            serde_json::to_value(replay).expect("json")["result"]["application"],
+            "replayed"
+        );
+
+        let mut fresh_supervisor = supervisor();
+        let mut fresh_journal = JournalStore::default();
+        let mut fresh_catalog = Catalog;
+        let mut fresh_material = Material::default();
+        assert_eq!(
+            dispatch_v2_lifecycle(
+                &mut fresh_supervisor,
+                &mut fresh_journal,
+                &mut fresh_catalog,
+                &header_only.header,
+                false,
+                &mut fresh_material,
+                &mut process,
+                10,
+            )
+            .err()
+            .expect("new header-only rejected"),
+            "MATERIAL_REQUIRED"
+        );
+        assert_eq!(fresh_material.calls, 0);
+
+        fresh_material.fail = true;
+        let _ = dispatch_v2_lifecycle(
+            &mut fresh_supervisor,
+            &mut fresh_journal,
+            &mut fresh_catalog,
+            &full.header,
+            true,
+            &mut fresh_material,
+            &mut process,
+            10,
+        );
+        let pending_calls = fresh_material.calls;
+        assert_eq!(
+            dispatch_v2_lifecycle(
+                &mut fresh_supervisor,
+                &mut fresh_journal,
+                &mut fresh_catalog,
+                &header_only.header,
+                false,
+                &mut ReplayOnlyProvider,
+                &mut process,
+                10,
+            )
+            .err()
+            .expect("pending header-only rejected"),
+            "MATERIAL_REQUIRED"
+        );
+        assert_eq!(fresh_material.calls, pending_calls);
+    }
+
+    #[test]
+    fn invalid_material_fails_before_provider_seam() {
+        let mut invalid = frame(true);
+        invalid.material = Some(BootstrapMaterialV1::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            b"not-json".to_vec(),
+            b"not-json".to_vec(),
+        ));
+        assert!(production_v2::ValidatedBootstrapRequest::parse(invalid).is_err());
+    }
+}

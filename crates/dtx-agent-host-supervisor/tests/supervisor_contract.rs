@@ -2,10 +2,12 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc, str::FromStr};
 
 use dtx_agent_host::{AgentHost, ReportedHealth};
 use dtx_agent_host_supervisor::{
-    CatalogRelease, CommandApplication, CommandDisposition, CommandResult, ConnectorProcessState,
-    CredentialArtifactProvider, CredentialArtifactRef, HostCommand, HostCommandEnvelope,
-    HostOperationId, HostRevisionFence, HostSupervisor, Journal, JournalRecord,
-    ManagedConnectorDesiredState, OperationIntent, OperationReceipt, PortError, PortErrorKind,
+    BootstrapCredentialFacts, BootstrapMaterialProvider, CatalogRelease, CommandApplication,
+    CommandDisposition, CommandResult, ConnectorLifecycleFacts, ConnectorProcessState,
+    CredentialArtifactProvider, CredentialArtifactRef, FinalizedMaterialProof, HostCommand,
+    HostCommandEnvelope, HostOperationId, HostRevisionFence, HostSupervisor, InstallState,
+    InstallStateJournal, Journal, JournalRecord, ManagedConnectorDesiredState, OperationIntent,
+    OperationReceipt, PortError, PortErrorKind, PrepareMaterialResult, PreparedMaterialProof,
     ProcessController, ProcessMutationId, ProcessMutationPhase, ProcessObservation, ReleaseCatalog,
     ReleaseDigest, RemovalPolicy, ResourceProfile, SupervisorError, SupervisorSnapshot,
     SupervisorSnapshotError,
@@ -25,6 +27,72 @@ struct SharedSnapshot(Rc<RefCell<Option<SupervisorSnapshot>>>);
 struct FakeJournal {
     records: SharedJournal,
     snapshot: SharedSnapshot,
+    install_state: Option<InstallState>,
+}
+
+#[derive(Default)]
+struct FakeMaterial {
+    calls: usize,
+    expired: bool,
+    fail: bool,
+    wrong: bool,
+    credential_revision: Option<Revision>,
+}
+impl BootstrapMaterialProvider for FakeMaterial {
+    fn prepare(
+        &mut self,
+        _operation_id: HostOperationId,
+        facts: ConnectorLifecycleFacts,
+        _release: CatalogRelease,
+    ) -> Result<PrepareMaterialResult, PortError> {
+        self.calls += 1;
+        if self.fail {
+            return Err(PortError::new(PortErrorKind::Unavailable));
+        }
+        if self.expired {
+            return Ok(PrepareMaterialResult::ExpiredUnclaimed);
+        }
+        Ok(PrepareMaterialResult::Prepared(PreparedMaterialProof {
+            facts,
+            prepared_receipt: dtx_agent_host_supervisor::PreparedReceiptDigest::from_bytes([9; 32]),
+            credentials: BootstrapCredentialFacts {
+                generation: 1,
+                revision: self
+                    .credential_revision
+                    .unwrap_or(Revision::new(2).unwrap()),
+                credential_ref: CredentialArtifactRef::from_bytes([7; 32]),
+                mcp_bearer_ref: dtx_agent_host_supervisor::McpBearerRef::from_bytes([8; 32]),
+            },
+            observation: ProcessObservation::Stopped,
+        }))
+    }
+    fn finalize(
+        &mut self,
+        _operation_id: HostOperationId,
+        facts: ConnectorLifecycleFacts,
+        prepared_receipt: dtx_agent_host_supervisor::PreparedReceiptDigest,
+        _release: CatalogRelease,
+    ) -> Result<FinalizedMaterialProof, PortError> {
+        self.calls += 1;
+        Ok(FinalizedMaterialProof {
+            facts,
+            prepared_receipt,
+            finalized_receipt: dtx_agent_host_supervisor::FinalizedReceiptDigest::from_bytes(
+                [10; 32],
+            ),
+            credentials: BootstrapCredentialFacts {
+                generation: 1,
+                revision: Revision::new(2).unwrap(),
+                credential_ref: CredentialArtifactRef::from_bytes(if self.wrong {
+                    [6; 32]
+                } else {
+                    [7; 32]
+                }),
+                mcp_bearer_ref: dtx_agent_host_supervisor::McpBearerRef::from_bytes([8; 32]),
+            },
+            observation: ProcessObservation::Running,
+        })
+    }
 }
 
 impl Journal for FakeJournal {
@@ -107,6 +175,16 @@ impl Journal for FakeJournal {
                 JournalRecord::Pending(_) | JournalRecord::Completed { .. } => None,
             })
             .collect())
+    }
+}
+
+impl InstallStateJournal for FakeJournal {
+    fn load_install_state(
+        &mut self,
+        _host_id: HostId,
+        _connector_id: ConnectorId,
+    ) -> Result<Option<InstallState>, PortError> {
+        Ok(self.install_state)
     }
 }
 
@@ -203,6 +281,7 @@ struct FakeProcessController {
     ensured_releases: BTreeMap<ConnectorId, CatalogRelease>,
     fail_once: Option<ProcessMutationId>,
     observe_calls: Vec<ConnectorId>,
+    restore_calls: Vec<(ProcessMutationId, ConnectorId)>,
 }
 
 impl FakeProcessController {
@@ -305,6 +384,22 @@ impl ProcessController<FakeCredentialArtifact> for FakeProcessController {
         )
     }
 
+    fn restore_installed_runtime(
+        &mut self,
+        mutation_id: ProcessMutationId,
+        target: dtx_agent_host_supervisor::ConnectorTarget,
+        _credential_ref: CredentialArtifactRef,
+        _bearer_ref: dtx_agent_host_supervisor::McpBearerRef,
+    ) -> Result<(), PortError> {
+        assert!(matches!(
+            self.journal.0.borrow().get(&mutation_id.operation_id()),
+            Some(JournalRecord::Pending(_))
+        ));
+        self.restore_calls
+            .push((mutation_id, target.connector_id()));
+        Ok(())
+    }
+
     fn rotate_credential(
         &mut self,
         mutation_id: ProcessMutationId,
@@ -388,6 +483,7 @@ fn release(adapter_kind: AdapterKind, byte: u8, profile: ResourceProfile) -> Cat
     )
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn envelope(
     supervisor: &HostSupervisor,
     operation_id: HostOperationId,
@@ -400,6 +496,429 @@ fn envelope(
         supervisor.revision_fence(),
         command,
     )
+}
+
+fn install_facts(
+    supervisor: &HostSupervisor,
+    connector_id: ConnectorId,
+    release: CatalogRelease,
+) -> ConnectorLifecycleFacts {
+    ConnectorLifecycleFacts::new(
+        dtx_agent_host_supervisor::ConnectorLifecycleOperationId::new(),
+        dtx_agent_host_supervisor::PlatformTarget::LinuxAmd64,
+        release.adapter_kind(),
+        release.digest(),
+        supervisor.tenant_id(),
+        supervisor.host_id(),
+        connector_id,
+        100,
+        dtx_agent_host_supervisor::PlanDigest::from_bytes([1; 32]),
+        dtx_agent_host_supervisor::HandoffDigest::from_bytes([2; 32]),
+        dtx_agent_host_supervisor::ConfigDigest::from_bytes([3; 32]),
+        dtx_agent_host_supervisor::TrustDigest::from_bytes([4; 32]),
+        dtx_agent_host_supervisor::MaterialDigest::from_bytes([5; 32]),
+    )
+}
+
+#[test]
+fn expired_new_prepare_persists_no_intent() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 77, ResourceProfile::Standard);
+    let facts = install_facts(&supervisor, ConnectorId::new(), approved);
+    let envelope = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    let mut journal = FakeJournal::default();
+    let mut material = FakeMaterial::default();
+    assert_eq!(
+        supervisor
+            .prepare_connector_material(&envelope, &mut journal, &mut catalog, &mut material, 101)
+            .unwrap_err(),
+        SupervisorError::InstallExpired
+    );
+    assert!(journal.records.0.borrow().is_empty());
+    assert_eq!(material.calls, 0);
+}
+
+#[test]
+fn pending_prepare_expiry_completes_unchanged_and_replays_without_provider() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 78, ResourceProfile::Standard);
+    let facts = install_facts(&supervisor, ConnectorId::new(), approved);
+    let command = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    let mut journal = FakeJournal::default();
+    let mut material = FakeMaterial {
+        fail: true,
+        ..Default::default()
+    };
+    assert!(
+        supervisor
+            .prepare_connector_material(&command, &mut journal, &mut catalog, &mut material, 10)
+            .is_err()
+    );
+    let predecessor = supervisor.snapshot();
+    material.fail = false;
+    material.expired = true;
+    let terminal = supervisor
+        .prepare_connector_material(&command, &mut journal, &mut catalog, &mut material, 101)
+        .unwrap();
+    assert_eq!(
+        terminal.outcome().disposition,
+        CommandDisposition::ExpiredUnclaimed
+    );
+    assert_eq!(supervisor.snapshot(), predecessor);
+    let calls = material.calls;
+    let replay = supervisor
+        .prepare_connector_material(&command, &mut journal, &mut catalog, &mut material, 101)
+        .unwrap();
+    assert_eq!(replay.application(), CommandApplication::Replayed);
+    assert_eq!(material.calls, calls);
+}
+
+#[test]
+fn successful_prepare_replay_is_exact_and_adopts_opaque_refs() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 79, ResourceProfile::Standard);
+    let facts = install_facts(&supervisor, ConnectorId::new(), approved);
+    let command = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    let mut journal = FakeJournal::default();
+    let mut material = FakeMaterial::default();
+    let applied = supervisor
+        .prepare_connector_material(&command, &mut journal, &mut catalog, &mut material, 10)
+        .unwrap();
+    assert_eq!(applied.application(), CommandApplication::Applied);
+    assert!(
+        supervisor
+            .install_state(facts.connector_id())
+            .unwrap()
+            .is_prepared()
+    );
+    let calls = material.calls;
+    let replay = supervisor
+        .prepare_connector_material(&command, &mut journal, &mut catalog, &mut material, 10)
+        .unwrap();
+    assert_eq!(replay.application(), CommandApplication::Replayed);
+    assert_eq!(material.calls, calls);
+    assert_eq!(
+        supervisor
+            .adopted_mcp_bearer_ref(facts.connector_id())
+            .unwrap()
+            .as_bytes(),
+        [8; 32]
+    );
+}
+
+#[test]
+fn installed_connector_rejects_v1_credential_rotation_without_poisoning_start_or_restart() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 83, ResourceProfile::Standard);
+    let facts = install_facts(&supervisor, ConnectorId::new(), approved);
+    let prepare = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    let mut journal = FakeJournal::default();
+    let mut material = FakeMaterial::default();
+    supervisor
+        .prepare_connector_material(&prepare, &mut journal, &mut catalog, &mut material, 10)
+        .unwrap();
+    let mut credentials = FakeCredentials::with_journal(journal.records.clone());
+    let mut controller = FakeProcessController::with_journal(journal.records.clone());
+    let rejected = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::RotateCredential {
+            connector_id: facts.connector_id(),
+            credential_ref: CredentialArtifactRef::from_bytes([42; 32]),
+        },
+    );
+    let records_before = journal.records.0.borrow().len();
+    assert_eq!(
+        supervisor.execute(
+            &rejected,
+            &mut journal,
+            &mut catalog,
+            &mut credentials,
+            &mut controller,
+        ),
+        Err(SupervisorError::InstallLifecycleConflict)
+    );
+    assert_eq!(journal.records.0.borrow().len(), records_before);
+    assert!(credentials.requested.is_empty());
+    assert!(controller.calls.is_empty());
+
+    journal.install_state = supervisor.install_state(facts.connector_id());
+    let mut reloaded =
+        HostSupervisor::try_from_snapshot(&host, supervisor.snapshot(), &mut catalog).unwrap();
+    reloaded
+        .rehydrate_install_state(&mut journal, facts.connector_id())
+        .unwrap();
+    execute(
+        &mut reloaded,
+        HostCommand::Start {
+            connector_id: facts.connector_id(),
+        },
+        &mut journal,
+        &mut catalog,
+        &mut credentials,
+        &mut controller,
+    );
+    execute(
+        &mut reloaded,
+        HostCommand::Restart {
+            connector_id: facts.connector_id(),
+        },
+        &mut journal,
+        &mut catalog,
+        &mut credentials,
+        &mut controller,
+    );
+    assert_eq!(controller.restore_calls.len(), 2);
+}
+
+#[test]
+fn installed_connector_fences_ensure_release_drift_but_accepts_the_exact_release() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 84, ResourceProfile::Standard);
+    let replacement = release(AdapterKind::Codex, 85, ResourceProfile::Compute);
+    let facts = install_facts(&supervisor, ConnectorId::new(), approved);
+    let prepare = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    catalog.approve(replacement);
+    let mut journal = FakeJournal::default();
+    let mut material = FakeMaterial::default();
+    supervisor
+        .prepare_connector_material(&prepare, &mut journal, &mut catalog, &mut material, 10)
+        .unwrap();
+    let mut credentials = FakeCredentials::with_journal(journal.records.clone());
+    let mut controller = FakeProcessController::with_journal(journal.records.clone());
+    let drift = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::Ensure {
+            connector_id: facts.connector_id(),
+            adapter_kind: AdapterKind::Codex,
+            release_digest: replacement.digest(),
+        },
+    );
+    let records_before = journal.records.0.borrow().len();
+    assert_eq!(
+        supervisor.execute(
+            &drift,
+            &mut journal,
+            &mut catalog,
+            &mut credentials,
+            &mut controller,
+        ),
+        Err(SupervisorError::InstallLifecycleConflict)
+    );
+    assert_eq!(journal.records.0.borrow().len(), records_before);
+    assert!(controller.calls.is_empty());
+    execute(
+        &mut supervisor,
+        HostCommand::Ensure {
+            connector_id: facts.connector_id(),
+            adapter_kind: AdapterKind::Codex,
+            release_digest: approved.digest(),
+        },
+        &mut journal,
+        &mut catalog,
+        &mut credentials,
+        &mut controller,
+    );
+}
+
+#[test]
+fn new_prepare_operation_after_prepared_conflicts_without_provider_call() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 81, ResourceProfile::Standard);
+    let facts = install_facts(&supervisor, ConnectorId::new(), approved);
+    let first = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    let mut journal = FakeJournal::default();
+    let mut material = FakeMaterial::default();
+    supervisor
+        .prepare_connector_material(&first, &mut journal, &mut catalog, &mut material, 10)
+        .unwrap();
+    let calls = material.calls;
+    let second = HostCommandEnvelope::new(
+        supervisor.tenant_id(),
+        supervisor.host_id(),
+        HostOperationId::new(),
+        supervisor.revision_fence(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    assert_eq!(
+        supervisor
+            .prepare_connector_material(&second, &mut journal, &mut catalog, &mut material, 10)
+            .unwrap_err(),
+        SupervisorError::InstallLifecycleConflict
+    );
+    assert_eq!(material.calls, calls);
+}
+
+#[test]
+fn revoked_pending_prepare_uses_known_release_and_accepts_independent_credential_revision() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 82, ResourceProfile::Standard);
+    let facts = install_facts(&supervisor, ConnectorId::new(), approved);
+    let command = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    let mut journal = FakeJournal::default();
+    let mut material = FakeMaterial {
+        fail: true,
+        credential_revision: Some(Revision::new(99).unwrap()),
+        ..Default::default()
+    };
+    assert!(
+        supervisor
+            .prepare_connector_material(&command, &mut journal, &mut catalog, &mut material, 10)
+            .is_err()
+    );
+    catalog.revoke(approved);
+    material.fail = false;
+    let result = supervisor
+        .prepare_connector_material(&command, &mut journal, &mut catalog, &mut material, 10)
+        .unwrap();
+    assert_eq!(result.application(), CommandApplication::Applied);
+    assert_eq!(
+        supervisor
+            .install_state(facts.connector_id())
+            .unwrap()
+            .facts(),
+        facts
+    );
+}
+
+#[test]
+fn finalize_requires_running_and_replays_without_provider() {
+    let host = active_host();
+    let mut supervisor = HostSupervisor::new(&host).unwrap();
+    let approved = release(AdapterKind::Codex, 80, ResourceProfile::Standard);
+    let facts = install_facts(&supervisor, ConnectorId::new(), approved);
+    let prepare = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::PrepareConnectorMaterial { facts },
+    );
+    let mut catalog = FakeCatalog::default();
+    catalog.approve(approved);
+    let mut journal = FakeJournal::default();
+    let mut material = FakeMaterial::default();
+    supervisor
+        .prepare_connector_material(&prepare, &mut journal, &mut catalog, &mut material, 10)
+        .unwrap();
+    let finalize = envelope(
+        &supervisor,
+        HostOperationId::new(),
+        HostCommand::FinalizeConnectorMaterial {
+            facts,
+            prepared_receipt: dtx_agent_host_supervisor::PreparedReceiptDigest::from_bytes([9; 32]),
+        },
+    );
+    let mut controller = FakeProcessController::with_journal(journal.records.clone());
+    assert_eq!(
+        supervisor
+            .finalize_connector_material(
+                &finalize,
+                &mut journal,
+                &mut catalog,
+                &mut material,
+                &mut controller
+            )
+            .unwrap_err(),
+        SupervisorError::InstallNotRunning
+    );
+    let mut credentials = FakeCredentials::with_journal(journal.records.clone());
+    execute(
+        &mut supervisor,
+        HostCommand::Start {
+            connector_id: facts.connector_id(),
+        },
+        &mut journal,
+        &mut catalog,
+        &mut credentials,
+        &mut controller,
+    );
+    assert_eq!(controller.restore_calls.len(), 1);
+    assert_eq!(controller.restore_calls[0].1, facts.connector_id());
+    material.wrong = true;
+    assert_eq!(
+        supervisor
+            .finalize_connector_material(
+                &finalize,
+                &mut journal,
+                &mut catalog,
+                &mut material,
+                &mut controller,
+            )
+            .unwrap_err(),
+        SupervisorError::InstallProofInvalid
+    );
+    material.wrong = false;
+    let completed = supervisor
+        .finalize_connector_material(
+            &finalize,
+            &mut journal,
+            &mut catalog,
+            &mut material,
+            &mut controller,
+        )
+        .unwrap();
+    assert_eq!(completed.application(), CommandApplication::Applied);
+    let calls = material.calls;
+    let replay = supervisor
+        .finalize_connector_material(
+            &finalize,
+            &mut journal,
+            &mut catalog,
+            &mut material,
+            &mut controller,
+        )
+        .unwrap();
+    assert_eq!(replay.application(), CommandApplication::Replayed);
+    assert_eq!(material.calls, calls);
 }
 
 #[test]
@@ -1384,6 +1903,7 @@ fn snapshot_rehydration_rejects_wrong_host_duplicates_and_unapproved_release() {
     ));
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn execute(
     supervisor: &mut HostSupervisor,
     command: HostCommand,

@@ -13,19 +13,25 @@ mod types;
 
 #[cfg(target_os = "linux")]
 pub use linux::{
-    FileJournal, LinuxCredentialArtifact, LinuxHostNetworkBoundary, LinuxProcessController,
-    LinuxReconcileObservation, LinuxReconcileStatus, LinuxResourceLimits,
+    FileJournal, LinuxBootstrapCommand, LinuxCredentialArtifact, LinuxHostNetworkBoundary,
+    LinuxMaterial, LinuxMaterialStore, LinuxPlanCapability, LinuxPrepareFootprint,
+    LinuxProcessController, LinuxReconcileObservation, LinuxReconcileStatus, LinuxResourceLimits,
+    derive_trust_digest,
 };
 pub use ports::{
-    CredentialArtifactProvider, Journal, PortError, PortErrorKind, ProcessController,
-    ReleaseCatalog,
+    BootstrapMaterialProvider, CredentialArtifactProvider, FinalizedMaterialProof,
+    InstallStateJournal, Journal, PortError, PortErrorKind, PrepareMaterialResult,
+    PreparedMaterialProof, ProcessController, ReleaseCatalog,
 };
 pub use supervisor::{HostSupervisor, SupervisorError, SupervisorSnapshotError};
 pub use types::{
-    CatalogRelease, CommandApplication, CommandDigest, CommandDisposition, CommandOutcome,
-    CommandResult, ConnectorProcessState, ConnectorTarget, CredentialArtifactRef,
-    DurableHostCommand, HostCommand, HostCommandEnvelope, HostOperationId, HostRevisionError,
-    HostRevisionFence, JournalRecord, ManagedConnectorDesiredState, ManagedConnectorSnapshot,
-    OperationIntent, OperationReceipt, ProcessMutationId, ProcessMutationPhase, ProcessObservation,
-    ReleaseDigest, RemovalPolicy, ResourceProfile, SupervisorSnapshot,
+    BootstrapCredentialFacts, CatalogRelease, CommandApplication, CommandDigest,
+    CommandDisposition, CommandOutcome, CommandResult, ConfigDigest, ConnectorLifecycleFacts,
+    ConnectorLifecycleOperationId, ConnectorProcessState, ConnectorTarget, CredentialArtifactRef,
+    DurableHostCommand, FinalizedReceiptDigest, HandoffDigest, HostCommand, HostCommandEnvelope,
+    HostOperationId, HostRevisionError, HostRevisionFence, InstallState, JournalRecord,
+    ManagedConnectorDesiredState, ManagedConnectorSnapshot, MaterialDigest, McpBearerRef,
+    OperationIntent, OperationReceipt, PlanDigest, PlatformTarget, PreparedReceiptDigest,
+    ProcessMutationId, ProcessMutationPhase, ProcessObservation, ReleaseDigest, RemovalPolicy,
+    ResourceProfile, SupervisorSnapshot, TrustDigest,
 };

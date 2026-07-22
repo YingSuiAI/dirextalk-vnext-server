@@ -3,6 +3,10 @@ use std::{error::Error, fmt};
 use dtx_connect_registry::AdapterKind;
 use dtx_domain::HostId;
 
+use crate::types::{
+    BootstrapCredentialFacts, ConnectorLifecycleFacts, FinalizedReceiptDigest, InstallState,
+    McpBearerRef, PreparedReceiptDigest,
+};
 use crate::{
     CatalogRelease, ConnectorTarget, CredentialArtifactRef, HostOperationId, JournalRecord,
     OperationIntent, OperationReceipt, ProcessMutationId, ProcessObservation, ReleaseDigest,
@@ -141,6 +145,65 @@ pub trait CredentialArtifactProvider {
     ) -> Result<Self::Artifact, PortError>;
 }
 
+/// Typed result of claiming bootstrap material. No material bytes cross this
+/// boundary; the production adapter owns all payload availability and claims.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedMaterialProof {
+    pub facts: ConnectorLifecycleFacts,
+    pub prepared_receipt: PreparedReceiptDigest,
+    pub credentials: BootstrapCredentialFacts,
+    pub observation: ProcessObservation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum PrepareMaterialResult {
+    Prepared(PreparedMaterialProof),
+    ExpiredUnclaimed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinalizedMaterialProof {
+    pub facts: ConnectorLifecycleFacts,
+    pub prepared_receipt: PreparedReceiptDigest,
+    pub finalized_receipt: FinalizedReceiptDigest,
+    pub credentials: BootstrapCredentialFacts,
+    pub observation: ProcessObservation,
+}
+
+/// Dedicated bootstrap material capability. It intentionally has no path,
+/// command, byte, URL, or credential-value API.
+#[allow(clippy::missing_errors_doc)]
+pub trait BootstrapMaterialProvider {
+    fn prepare(
+        &mut self,
+        operation_id: HostOperationId,
+        facts: ConnectorLifecycleFacts,
+        release: CatalogRelease,
+    ) -> Result<PrepareMaterialResult, PortError>;
+
+    fn finalize(
+        &mut self,
+        operation_id: HostOperationId,
+        facts: ConnectorLifecycleFacts,
+        prepared_receipt: PreparedReceiptDigest,
+        release: CatalogRelease,
+    ) -> Result<FinalizedMaterialProof, PortError>;
+}
+
+/// Optional journal extension used to rehydrate install lifecycle state while
+/// keeping legacy v1 snapshots structurally unchanged.
+#[allow(clippy::missing_errors_doc)]
+pub trait InstallStateJournal {
+    fn load_install_state(
+        &mut self,
+        _host_id: HostId,
+        _connector_id: dtx_domain::ConnectorId,
+    ) -> Result<Option<InstallState>, PortError> {
+        Ok(None)
+    }
+}
+
 /// Closed process-control capability. Every mutation must be idempotent by
 /// [`ProcessMutationId`] and derive service/layout details internally from
 /// [`ConnectorTarget`]. The mutation identity retains the durable Host
@@ -195,6 +258,20 @@ pub trait ProcessController<Artifact> {
         release: CatalogRelease,
         credential_ref: CredentialArtifactRef,
     ) -> Result<ProcessObservation, PortError>;
+
+    /// Rehydrates installed runtime credentials from the controller's fixed
+    /// durable store. The references are opaque bindings, never material.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized controller failure.
+    fn restore_installed_runtime(
+        &mut self,
+        mutation_id: ProcessMutationId,
+        target: ConnectorTarget,
+        credential_ref: CredentialArtifactRef,
+        bearer_ref: McpBearerRef,
+    ) -> Result<(), PortError>;
 
     /// Installs one materialized credential and verifies process state.
     ///

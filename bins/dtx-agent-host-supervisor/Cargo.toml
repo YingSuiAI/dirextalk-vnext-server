@@ -15,7 +15,7 @@ dtx-agent-host-supervisor = { path = "../../crates/dtx-agent-host-supervisor" }
 dtx-connect-registry = { path = "../../crates/dtx-connect-registry" }
 dtx-domain = { path = "../../crates/dtx-domain" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 zeroize.workspace = true
 

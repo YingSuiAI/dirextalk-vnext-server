@@ -12,6 +12,8 @@ dtx-domain = { path = "../dtx-domain" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 uuid.workspace = true
 
 [lints]

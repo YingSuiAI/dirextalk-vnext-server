@@ -5,9 +5,71 @@ use dtx_domain::{ConnectorId, HostId, RequestId, Revision, TenantId};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+macro_rules! sha256_newtype {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name([u8; 32]);
+        impl $name {
+            #[must_use]
+            pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+            #[must_use]
+            pub const fn as_bytes(self) -> [u8; 32] {
+                self.0
+            }
+        }
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(stringify!($name))
+            }
+        }
+    };
+}
+
+sha256_newtype!(PlanDigest);
+sha256_newtype!(HandoffDigest);
+sha256_newtype!(MaterialDigest);
+sha256_newtype!(ConfigDigest);
+sha256_newtype!(TrustDigest);
+sha256_newtype!(PreparedReceiptDigest);
+sha256_newtype!(FinalizedReceiptDigest);
+
 /// Idempotency identity for one host-local operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HostOperationId(RequestId);
+
+/// Connector lifecycle identity.  This is deliberately distinct from the
+/// Host operation identity: a lifecycle receipt/plan is Connector-owned while
+/// the Host journal and process mutation are Host-owned.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConnectorLifecycleOperationId(RequestId);
+
+impl ConnectorLifecycleOperationId {
+    /// Generates a new UUIDv7-backed lifecycle identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(RequestId::new())
+    }
+
+    /// Wraps an already validated request identity during rehydration.
+    #[must_use]
+    pub const fn from_request_id(value: RequestId) -> Self {
+        Self(value)
+    }
+
+    /// Returns the underlying durable request identity.
+    #[must_use]
+    pub const fn as_request_id(self) -> RequestId {
+        self.0
+    }
+}
+
+impl Default for ConnectorLifecycleOperationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl HostOperationId {
     /// Generates a new UUIDv7-backed operation identity.
@@ -126,6 +188,180 @@ impl CredentialArtifactRef {
     #[must_use]
     pub const fn as_bytes(self) -> [u8; 32] {
         self.0
+    }
+}
+
+/// Opaque reference to an adopted MCP bearer. The bearer itself never crosses
+/// the supervisor core boundary.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct McpBearerRef([u8; 32]);
+impl McpBearerRef {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+impl fmt::Debug for McpBearerRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("McpBearerRef([redacted])")
+    }
+}
+
+/// Closed platform target selected by the release/control plane.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PlatformTarget {
+    LinuxAmd64,
+    LinuxArm64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConnectorLifecycleFacts {
+    lifecycle_operation_id: ConnectorLifecycleOperationId,
+    platform_target: PlatformTarget,
+    adapter_kind: AdapterKind,
+    release_digest: ReleaseDigest,
+    tenant_id: TenantId,
+    host_id: HostId,
+    connector_id: ConnectorId,
+    expiry_millis: u64,
+    plan_digest: PlanDigest,
+    handoff_digest: HandoffDigest,
+    config_digest: ConfigDigest,
+    trust_digest: TrustDigest,
+    material_digest: MaterialDigest,
+}
+
+impl ConnectorLifecycleFacts {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        lifecycle_operation_id: ConnectorLifecycleOperationId,
+        platform_target: PlatformTarget,
+        adapter_kind: AdapterKind,
+        release_digest: ReleaseDigest,
+        tenant_id: TenantId,
+        host_id: HostId,
+        connector_id: ConnectorId,
+        expiry_millis: u64,
+        plan_digest: PlanDigest,
+        handoff_digest: HandoffDigest,
+        config_digest: ConfigDigest,
+        trust_digest: TrustDigest,
+        material_digest: MaterialDigest,
+    ) -> Self {
+        Self {
+            lifecycle_operation_id,
+            platform_target,
+            adapter_kind,
+            release_digest,
+            tenant_id,
+            host_id,
+            connector_id,
+            expiry_millis,
+            plan_digest,
+            handoff_digest,
+            config_digest,
+            trust_digest,
+            material_digest,
+        }
+    }
+    #[must_use]
+    pub const fn lifecycle_operation_id(self) -> ConnectorLifecycleOperationId {
+        self.lifecycle_operation_id
+    }
+    #[must_use]
+    pub const fn platform_target(self) -> PlatformTarget {
+        self.platform_target
+    }
+    #[must_use]
+    pub const fn adapter_kind(self) -> AdapterKind {
+        self.adapter_kind
+    }
+    #[must_use]
+    pub const fn release_digest(self) -> ReleaseDigest {
+        self.release_digest
+    }
+    #[must_use]
+    pub const fn host_id(self) -> HostId {
+        self.host_id
+    }
+    #[must_use]
+    pub const fn tenant_id(self) -> TenantId {
+        self.tenant_id
+    }
+    #[must_use]
+    pub const fn connector_id(self) -> ConnectorId {
+        self.connector_id
+    }
+    #[must_use]
+    pub const fn expiry_millis(self) -> u64 {
+        self.expiry_millis
+    }
+    #[must_use]
+    pub const fn plan_digest(self) -> PlanDigest {
+        self.plan_digest
+    }
+    #[must_use]
+    pub const fn handoff_digest(self) -> HandoffDigest {
+        self.handoff_digest
+    }
+    #[must_use]
+    pub const fn config_digest(self) -> ConfigDigest {
+        self.config_digest
+    }
+    #[must_use]
+    pub const fn trust_digest(self) -> TrustDigest {
+        self.trust_digest
+    }
+    #[must_use]
+    pub const fn material_digest(self) -> MaterialDigest {
+        self.material_digest
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BootstrapCredentialFacts {
+    pub generation: u64,
+    pub revision: Revision,
+    pub credential_ref: CredentialArtifactRef,
+    pub mcp_bearer_ref: McpBearerRef,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum InstallState {
+    Prepared {
+        facts: ConnectorLifecycleFacts,
+        prepared_receipt: PreparedReceiptDigest,
+        credentials: BootstrapCredentialFacts,
+        observation: ProcessObservation,
+    },
+    Finalized {
+        facts: ConnectorLifecycleFacts,
+        prepared_receipt: PreparedReceiptDigest,
+        finalized_receipt: FinalizedReceiptDigest,
+        credentials: BootstrapCredentialFacts,
+        observation: ProcessObservation,
+    },
+}
+
+impl InstallState {
+    #[must_use]
+    pub const fn facts(self) -> ConnectorLifecycleFacts {
+        match self {
+            Self::Prepared { facts, .. } | Self::Finalized { facts, .. } => facts,
+        }
+    }
+    #[must_use]
+    pub const fn is_prepared(self) -> bool {
+        matches!(self, Self::Prepared { .. })
+    }
+    #[must_use]
+    pub const fn is_finalized(self) -> bool {
+        matches!(self, Self::Finalized { .. })
     }
 }
 
@@ -295,6 +531,13 @@ pub enum HostCommand {
         connector_id: ConnectorId,
         policy: RemovalPolicy,
     },
+    PrepareConnectorMaterial {
+        facts: ConnectorLifecycleFacts,
+    },
+    FinalizeConnectorMaterial {
+        facts: ConnectorLifecycleFacts,
+        prepared_receipt: PreparedReceiptDigest,
+    },
 }
 
 impl HostCommand {
@@ -307,6 +550,8 @@ impl HostCommand {
             | Self::Restart { connector_id }
             | Self::RotateCredential { connector_id, .. }
             | Self::Remove { connector_id, .. } => connector_id,
+            Self::PrepareConnectorMaterial { facts }
+            | Self::FinalizeConnectorMaterial { facts, .. } => facts.connector_id(),
         }
     }
 }
@@ -356,6 +601,44 @@ impl HostCommandEnvelope {
             command,
             command_digest,
         }
+    }
+
+    #[must_use]
+    pub fn prepare_connector_material(
+        tenant_id: TenantId,
+        host_id: HostId,
+        operation_id: HostOperationId,
+        expected: HostRevisionFence,
+        facts: ConnectorLifecycleFacts,
+    ) -> Self {
+        Self::new(
+            tenant_id,
+            host_id,
+            operation_id,
+            expected,
+            HostCommand::PrepareConnectorMaterial { facts },
+        )
+    }
+
+    #[must_use]
+    pub fn finalize_connector_material(
+        tenant_id: TenantId,
+        host_id: HostId,
+        operation_id: HostOperationId,
+        expected: HostRevisionFence,
+        facts: ConnectorLifecycleFacts,
+        prepared_receipt: PreparedReceiptDigest,
+    ) -> Self {
+        Self::new(
+            tenant_id,
+            host_id,
+            operation_id,
+            expected,
+            HostCommand::FinalizeConnectorMaterial {
+                facts,
+                prepared_receipt,
+            },
+        )
     }
 
     #[must_use]
@@ -520,6 +803,13 @@ pub enum DurableHostCommand {
     RemoveRetainingData {
         target: ConnectorTarget,
     },
+    PrepareConnectorMaterial {
+        facts: ConnectorLifecycleFacts,
+    },
+    FinalizeConnectorMaterial {
+        facts: ConnectorLifecycleFacts,
+        prepared_receipt: PreparedReceiptDigest,
+    },
 }
 
 impl DurableHostCommand {
@@ -532,6 +822,13 @@ impl DurableHostCommand {
             | Self::Restart { target, .. }
             | Self::RotateCredential { target, .. }
             | Self::RemoveRetainingData { target } => target,
+            Self::PrepareConnectorMaterial { facts }
+            | Self::FinalizeConnectorMaterial { facts, .. } => ConnectorTarget::new(
+                facts.tenant_id(),
+                facts.host_id(),
+                facts.connector_id(),
+                facts.adapter_kind(),
+            ),
         }
     }
 }
@@ -548,6 +845,7 @@ pub struct OperationIntent {
     command: DurableHostCommand,
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 impl OperationIntent {
     pub(crate) const fn new(
         envelope: HostCommandEnvelope,
@@ -655,6 +953,7 @@ pub struct CommandOutcome {
 pub enum CommandDisposition {
     Applied,
     PolicyBlocked,
+    ExpiredUnclaimed,
 }
 
 /// Completed journal record.
@@ -663,8 +962,27 @@ pub struct OperationReceipt {
     operation_id: HostOperationId,
     command_digest: CommandDigest,
     outcome: CommandOutcome,
+    install_proof: Option<InstallProof>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallProof {
+    Prepared {
+        facts: ConnectorLifecycleFacts,
+        prepared_receipt: PreparedReceiptDigest,
+        credentials: BootstrapCredentialFacts,
+        observation: ProcessObservation,
+    },
+    Finalized {
+        facts: ConnectorLifecycleFacts,
+        prepared_receipt: PreparedReceiptDigest,
+        finalized_receipt: FinalizedReceiptDigest,
+        credentials: BootstrapCredentialFacts,
+        observation: ProcessObservation,
+    },
+}
+
+#[allow(clippy::large_types_passed_by_value)]
 impl OperationReceipt {
     pub(crate) const fn new(
         operation_id: HostOperationId,
@@ -675,6 +993,21 @@ impl OperationReceipt {
             operation_id,
             command_digest,
             outcome,
+            install_proof: None,
+        }
+    }
+
+    pub(crate) const fn with_install_proof(
+        operation_id: HostOperationId,
+        command_digest: CommandDigest,
+        outcome: CommandOutcome,
+        install_proof: InstallProof,
+    ) -> Self {
+        Self {
+            operation_id,
+            command_digest,
+            outcome,
+            install_proof: Some(install_proof),
         }
     }
 
@@ -684,13 +1017,17 @@ impl OperationReceipt {
         operation_id: HostOperationId,
         command_digest: CommandDigest,
         outcome: CommandOutcome,
+        install_proof: Option<InstallProof>,
     ) -> Result<Self, ()> {
         if operation_id != intent.operation_id()
             || command_digest != intent.command_digest()
-            || outcome.revisions != intent.resulting()
+            || (outcome.revisions != intent.resulting()
+                && !(outcome.disposition == CommandDisposition::ExpiredUnclaimed
+                    && outcome.revisions == intent.expected()))
             || outcome.connector_id != intent.command().target().connector_id()
             || outcome.credential_generation > Revision::MAX
             || !durable_outcome_is_valid(intent.command(), outcome)
+            || !install_proof_is_valid(intent.command(), outcome, install_proof)
         {
             return Err(());
         }
@@ -698,6 +1035,7 @@ impl OperationReceipt {
             operation_id,
             command_digest,
             outcome,
+            install_proof,
         })
     }
 
@@ -715,10 +1053,65 @@ impl OperationReceipt {
     pub const fn outcome(self) -> CommandOutcome {
         self.outcome
     }
+
+    #[must_use]
+    pub const fn install_proof(self) -> Option<InstallProof> {
+        self.install_proof
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[allow(clippy::large_types_passed_by_value, clippy::match_same_arms)]
+fn install_proof_is_valid(
+    command: DurableHostCommand,
+    outcome: CommandOutcome,
+    proof: Option<InstallProof>,
+) -> bool {
+    match (command, outcome.disposition, proof) {
+        (
+            DurableHostCommand::PrepareConnectorMaterial { facts },
+            CommandDisposition::Applied,
+            Some(InstallProof::Prepared {
+                facts: pf,
+                observation,
+                ..
+            }),
+        ) => pf == facts && observation == ProcessObservation::Stopped,
+        (
+            DurableHostCommand::PrepareConnectorMaterial { .. },
+            CommandDisposition::ExpiredUnclaimed,
+            None,
+        ) => true,
+        (
+            DurableHostCommand::FinalizeConnectorMaterial {
+                facts,
+                prepared_receipt,
+            },
+            CommandDisposition::Applied,
+            Some(InstallProof::Finalized {
+                facts: pf,
+                prepared_receipt: pr,
+                observation,
+                ..
+            }),
+        ) => pf == facts && pr == prepared_receipt && observation == ProcessObservation::Running,
+        (
+            DurableHostCommand::Ensure { .. }
+            | DurableHostCommand::Start { .. }
+            | DurableHostCommand::Stop { .. }
+            | DurableHostCommand::Restart { .. }
+            | DurableHostCommand::RotateCredential { .. }
+            | DurableHostCommand::RemoveRetainingData { .. },
+            _,
+            None,
+        ) => true,
+        _ => false,
+    }
 }
 
 /// Journal lookup result.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum JournalRecord {
     Pending(OperationIntent),
     Completed {
@@ -774,6 +1167,7 @@ pub(crate) fn validate_snapshot_ids(instances: &[ManagedConnectorSnapshot]) -> R
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[allow(clippy::large_types_passed_by_value)]
 fn durable_command_shape_is_valid(command: DurableHostCommand) -> bool {
     match command {
         DurableHostCommand::Ensure { target, release }
@@ -794,10 +1188,13 @@ fn durable_command_shape_is_valid(command: DurableHostCommand) -> bool {
                 && resulting_generation <= Revision::MAX
         }
         DurableHostCommand::Stop { .. } | DurableHostCommand::RemoveRetainingData { .. } => true,
+        DurableHostCommand::PrepareConnectorMaterial { facts }
+        | DurableHostCommand::FinalizeConnectorMaterial { facts, .. } => facts.expiry_millis() > 0,
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[allow(clippy::large_types_passed_by_value)]
 const fn durable_request_command(command: DurableHostCommand) -> HostCommand {
     match command {
         DurableHostCommand::Ensure { target, release } => HostCommand::Ensure {
@@ -826,10 +1223,21 @@ const fn durable_request_command(command: DurableHostCommand) -> HostCommand {
             connector_id: target.connector_id(),
             policy: RemovalPolicy::RetainData,
         },
+        DurableHostCommand::PrepareConnectorMaterial { facts } => {
+            HostCommand::PrepareConnectorMaterial { facts }
+        }
+        DurableHostCommand::FinalizeConnectorMaterial {
+            facts,
+            prepared_receipt,
+        } => HostCommand::FinalizeConnectorMaterial {
+            facts,
+            prepared_receipt,
+        },
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
+#[allow(clippy::large_types_passed_by_value)]
 fn durable_outcome_is_valid(command: DurableHostCommand, outcome: CommandOutcome) -> bool {
     if outcome.disposition == CommandDisposition::PolicyBlocked {
         return matches!(
@@ -884,9 +1292,26 @@ fn durable_outcome_is_valid(command: DurableHostCommand, outcome: CommandOutcome
                 ProcessObservation::Absent
             )
         ),
+        DurableHostCommand::PrepareConnectorMaterial { .. } => {
+            matches!(
+                (outcome.desired_state, outcome.observation),
+                (
+                    ManagedConnectorDesiredState::EnsuredStopped,
+                    ProcessObservation::Stopped
+                )
+            ) || outcome.disposition == CommandDisposition::ExpiredUnclaimed
+        }
+        DurableHostCommand::FinalizeConnectorMaterial { .. } => matches!(
+            (outcome.desired_state, outcome.observation),
+            (
+                ManagedConnectorDesiredState::Running,
+                ProcessObservation::Running
+            )
+        ),
     }
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn digest_command(
     tenant_id: TenantId,
     host_id: HostId,
@@ -921,11 +1346,22 @@ fn digest_command(
         HostCommand::Remove { policy, .. } => digest.update([match policy {
             RemovalPolicy::RetainData => 1,
         }]),
+        HostCommand::PrepareConnectorMaterial { facts } => {
+            digest.update(lifecycle_facts_bytes(facts));
+        }
+        HostCommand::FinalizeConnectorMaterial {
+            facts,
+            prepared_receipt,
+        } => {
+            digest.update(lifecycle_facts_bytes(facts));
+            digest.update(prepared_receipt.as_bytes());
+        }
         HostCommand::Start { .. } | HostCommand::Stop { .. } | HostCommand::Restart { .. } => {}
     }
     CommandDigest(digest.finalize().into())
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 const fn command_tag(command: HostCommand) -> u8 {
     match command {
         HostCommand::Ensure { .. } => 1,
@@ -934,7 +1370,31 @@ const fn command_tag(command: HostCommand) -> u8 {
         HostCommand::Restart { .. } => 4,
         HostCommand::RotateCredential { .. } => 5,
         HostCommand::Remove { .. } => 6,
+        HostCommand::PrepareConnectorMaterial { .. } => 7,
+        HostCommand::FinalizeConnectorMaterial { .. } => 8,
     }
+}
+
+#[allow(clippy::large_types_passed_by_value)]
+fn lifecycle_facts_bytes(facts: ConnectorLifecycleFacts) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(Uuid::from(facts.lifecycle_operation_id().as_request_id()).as_bytes());
+    bytes.push(match facts.platform_target() {
+        PlatformTarget::LinuxAmd64 => 1,
+        PlatformTarget::LinuxArm64 => 2,
+    });
+    bytes.push(adapter_tag(facts.adapter_kind()));
+    bytes.extend_from_slice(&facts.release_digest().as_bytes());
+    bytes.extend_from_slice(Uuid::from(facts.tenant_id()).as_bytes());
+    bytes.extend_from_slice(Uuid::from(facts.host_id()).as_bytes());
+    bytes.extend_from_slice(Uuid::from(facts.connector_id()).as_bytes());
+    bytes.extend_from_slice(&facts.expiry_millis().to_be_bytes());
+    bytes.extend_from_slice(&facts.plan_digest().as_bytes());
+    bytes.extend_from_slice(&facts.handoff_digest().as_bytes());
+    bytes.extend_from_slice(&facts.config_digest().as_bytes());
+    bytes.extend_from_slice(&facts.trust_digest().as_bytes());
+    bytes.extend_from_slice(&facts.material_digest().as_bytes());
+    bytes
 }
 
 const fn adapter_tag(adapter: AdapterKind) -> u8 {

@@ -5,8 +5,8 @@ use dtx_domain::ConnectorId;
 use uuid::Uuid;
 
 use crate::{
-    CatalogRelease, ConnectorTarget, HostOperationId, ProcessMutationId, ReleaseDigest,
-    ResourceProfile,
+    CatalogRelease, ConnectorLifecycleOperationId, ConnectorTarget, HostOperationId,
+    ProcessMutationId, ReleaseDigest, ResourceProfile,
 };
 
 pub(super) const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
@@ -65,6 +65,68 @@ impl ConnectorLayout {
         ))
     }
 
+    pub(super) fn config(&self) -> PathBuf {
+        self.config_dir().join("config.toml")
+    }
+
+    pub(super) fn trust_dir(&self) -> PathBuf {
+        self.config_dir().join("trust")
+    }
+
+    pub(super) fn enrollment_root_ca(&self) -> PathBuf {
+        self.trust_dir().join("enrollment-root-ca.pem")
+    }
+
+    pub(super) fn control_server_root_ca(&self) -> PathBuf {
+        self.trust_dir().join("control-server-root-ca.pem")
+    }
+
+    pub(super) fn connector_issuer_root_ca(&self) -> PathBuf {
+        self.trust_dir().join("connector-issuer-root-ca.pem")
+    }
+
+    pub(super) fn lifecycle_plan(&self, operation_id: ConnectorLifecycleOperationId) -> PathBuf {
+        self.config_dir()
+            .join("operations")
+            .join(format!("{}.lifecycle.plan", operation_id.as_request_id()))
+    }
+
+    pub(super) fn durable_credential_dir(&self) -> PathBuf {
+        self.rooted(&format!(
+            "/var/lib/dirextalk/connect/instances/{}/credentials",
+            self.target.connector_id()
+        ))
+    }
+
+    pub(super) fn durable_credential(&self) -> PathBuf {
+        self.durable_credential_dir().join("control.credential")
+    }
+
+    pub(super) fn durable_bearer(&self) -> PathBuf {
+        self.durable_credential_dir().join("mcp.bearer")
+    }
+
+    pub(super) fn durable_pending(&self) -> PathBuf {
+        self.durable_credential_dir()
+            .join("control.credential.bootstrap.pending")
+    }
+    pub(super) fn durable_claim(&self) -> PathBuf {
+        self.durable_credential_dir()
+            .join("control.credential.bootstrap.claim")
+    }
+    pub(super) fn durable_receipt(&self, operation_id: ConnectorLifecycleOperationId) -> PathBuf {
+        self.durable_credential_dir().join(format!(
+            "control.credential.bootstrap.receipt.{}",
+            operation_id.as_request_id()
+        ))
+    }
+    pub(super) fn durable_finalized(&self, operation_id: ConnectorLifecycleOperationId) -> PathBuf {
+        self.durable_credential_dir().join(format!(
+            "control.credential.bootstrap.receipt.{}.finalized",
+            operation_id.as_request_id()
+        ))
+    }
+
     pub(super) fn release_manifest(&self) -> PathBuf {
         self.config_dir().join("release.manifest")
     }
@@ -110,6 +172,10 @@ impl ConnectorLayout {
         self.credential_dir().join("control.credential")
     }
 
+    pub(super) fn active_bearer(&self) -> PathBuf {
+        self.credential_dir().join("mcp.bearer")
+    }
+
     pub(super) fn active_credential_record(&self) -> PathBuf {
         self.credential_dir().join("control.credential.meta")
     }
@@ -118,6 +184,20 @@ impl ConnectorLayout {
         self.credential_dir()
             .join("staged")
             .join(format!("{}.credential", operation_id.as_request_id()))
+    }
+
+    pub(super) fn staged_bearer(&self, operation_id: HostOperationId) -> PathBuf {
+        self.credential_dir()
+            .join("staged")
+            .join(format!("{}.mcp.bearer", operation_id.as_request_id()))
+    }
+
+    pub(super) fn ready_bearer(&self, mutation_id: ProcessMutationId) -> PathBuf {
+        self.credential_dir().join("staged").join(format!(
+            "{}.{}.mcp.bearer.ready",
+            mutation_id.operation_id().as_request_id(),
+            mutation_id.phase().idempotency_label()
+        ))
     }
 
     pub(super) fn ready_credential(&self, mutation_id: ProcessMutationId) -> PathBuf {
@@ -163,9 +243,10 @@ impl ConnectorLayout {
         self.rooted(&format!("/proc/{pid}/exe"))
     }
 
-    pub(super) fn directories(&self) -> [PathBuf; 9] {
+    pub(super) fn directories(&self) -> [PathBuf; 11] {
         [
             self.config_dir(),
+            self.trust_dir(),
             self.config_dir().join("operations"),
             self.data_dir(),
             self.workspace_dir(),
@@ -173,6 +254,7 @@ impl ConnectorLayout {
             self.worker_runtime_dir(),
             self.credential_dir(),
             self.credential_dir().join("staged"),
+            self.durable_credential_dir(),
             self.log_dir(),
         ]
     }
@@ -274,6 +356,24 @@ mod tests {
             layout
                 .executable(release)
                 .ends_with(format!("{}/dirextalk-connect", "ab".repeat(32)))
+        );
+
+        let host_operation = HostOperationId::new();
+        let lifecycle_operation = ConnectorLifecycleOperationId::new();
+        assert_ne!(
+            layout.staged_credential(host_operation),
+            layout.lifecycle_plan(lifecycle_operation)
+        );
+        let expected_finalized = format!(
+            "control.credential.bootstrap.receipt.{}.finalized",
+            lifecycle_operation.as_request_id()
+        );
+        assert_eq!(
+            layout
+                .durable_finalized(lifecycle_operation)
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some(expected_finalized.as_str())
         );
     }
 }

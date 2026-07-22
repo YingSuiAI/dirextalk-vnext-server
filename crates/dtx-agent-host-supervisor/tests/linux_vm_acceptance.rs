@@ -415,6 +415,7 @@ fn two_connectors_are_isolated_and_recover_an_intent_after_supervisor_crash() {
     );
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn execute(
     supervisor: &mut HostSupervisor,
     command: HostCommand,
@@ -452,6 +453,7 @@ fn unit_diagnostics(connector_id: ConnectorId) -> String {
     )
 }
 
+#[allow(clippy::large_types_passed_by_value)]
 fn envelope(supervisor: &HostSupervisor, command: HostCommand) -> HostCommandEnvelope {
     HostCommandEnvelope::new(
         supervisor.tenant_id(),

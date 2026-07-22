@@ -19,6 +19,7 @@ use crate::{
 };
 
 use super::{
+    bootstrap::LinuxMaterialStore,
     command::{FixedCommand, FixedCommandOutput, FixedCommandRunner, StdCommandRunner},
     credential::{
         CredentialFileProof, LinuxCredentialArtifact, hash_active_credential,
@@ -123,6 +124,60 @@ pub struct LinuxProcessController {
 }
 
 impl LinuxProcessController {
+    /// Lifecycle-only fixed target wrappers avoid exposing a caller-constructible
+    /// process target at the production bootstrap boundary.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn ensure_lifecycle(
+        &mut self,
+        mutation_id: ProcessMutationId,
+        facts: crate::ConnectorLifecycleFacts,
+        release: CatalogRelease,
+    ) -> Result<ProcessObservation, PortError> {
+        self.ensure(
+            mutation_id,
+            ConnectorTarget::new(
+                facts.tenant_id(),
+                facts.host_id(),
+                facts.connector_id(),
+                facts.adapter_kind(),
+            ),
+            release,
+        )
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn observe_lifecycle(
+        &mut self,
+        facts: crate::ConnectorLifecycleFacts,
+    ) -> Result<ProcessObservation, PortError> {
+        self.observe(ConnectorTarget::new(
+            facts.tenant_id(),
+            facts.host_id(),
+            facts.connector_id(),
+            facts.adapter_kind(),
+        ))
+    }
+
+    #[allow(clippy::missing_errors_doc)]
+    pub fn adopt_lifecycle_bootstrap_artifacts(
+        &mut self,
+        mutation_id: ProcessMutationId,
+        facts: crate::ConnectorLifecycleFacts,
+        credential_ref: CredentialArtifactRef,
+        bearer_ref: crate::McpBearerRef,
+    ) -> Result<(), PortError> {
+        self.adopt_bootstrap_artifacts(
+            mutation_id,
+            ConnectorTarget::new(
+                facts.tenant_id(),
+                facts.host_id(),
+                facts.connector_id(),
+                facts.adapter_kind(),
+            ),
+            credential_ref,
+            bearer_ref,
+        )
+    }
     /// Uses the fixed production filesystem layout and direct absolute command
     /// capabilities.
     #[must_use]
@@ -252,6 +307,38 @@ impl LinuxProcessController {
             });
         }
         Ok(observations)
+    }
+
+    /// Adopts fixed bootstrap artifacts for one already-ensured Connector.
+    /// The store only stages opaque material; control credential activation is
+    /// deliberately routed through `rotate_credential` to bind its metadata.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn adopt_bootstrap_artifacts(
+        &mut self,
+        mutation_id: ProcessMutationId,
+        target: ConnectorTarget,
+        credential_ref: CredentialArtifactRef,
+        bearer_ref: crate::McpBearerRef,
+    ) -> Result<(), PortError> {
+        let operation_id = require_requested_mutation(mutation_id)?;
+        self.verify_host_runtime()?;
+        let layout = self.layout(target);
+        Self::validate_privileged_layout(&layout)?;
+        let material = LinuxMaterialStore::for_runtime_adoption(target, operation_id);
+        match self.observe_internal(&layout)? {
+            ProcessObservation::Running => {
+                Self::verify_active_credential(&layout, credential_ref)?;
+                material.verify_active_bearer(bearer_ref)
+            }
+            ProcessObservation::Starting => Err(PortError::new(PortErrorKind::Unavailable)),
+            ProcessObservation::Absent
+            | ProcessObservation::Stopped
+            | ProcessObservation::Failed => {
+                let artifact = material.materialize_durable(credential_ref, bearer_ref)?;
+                self.rotate_credential(mutation_id, target, credential_ref, &artifact)?;
+                material.activate_staged_bearer(bearer_ref)
+            }
+        }
     }
 
     /// Restages and atomically activates the snapshot's current opaque
@@ -408,11 +495,13 @@ impl LinuxProcessController {
             let is_operations = directory.ends_with("operations");
             let is_staged = directory.ends_with("staged");
             let is_config = directory == layout.config_dir();
+            let is_trust = directory == layout.trust_dir();
             let is_credentials = directory == layout.credential_dir();
+            let is_durable_credentials = directory == layout.durable_credential_dir();
             let is_runtime_root = directory == layout.runtime_dir();
-            let (owner, group, mode) = if is_operations || is_staged {
+            let (owner, group, mode) = if is_operations || is_staged || is_durable_credentials {
                 ("root", "root", "0700")
-            } else if is_config || is_credentials || is_runtime_root {
+            } else if is_config || is_trust || is_credentials || is_runtime_root {
                 ("root", user.as_str(), "0750")
             } else {
                 (user.as_str(), user.as_str(), "0700")
@@ -1286,6 +1375,16 @@ impl ProcessController<LinuxCredentialArtifact> for LinuxProcessController {
         Ok(ProcessObservation::Running)
     }
 
+    fn restore_installed_runtime(
+        &mut self,
+        mutation_id: ProcessMutationId,
+        target: ConnectorTarget,
+        credential_ref: CredentialArtifactRef,
+        bearer_ref: crate::McpBearerRef,
+    ) -> Result<(), PortError> {
+        self.adopt_bootstrap_artifacts(mutation_id, target, credential_ref, bearer_ref)
+    }
+
     fn rotate_credential(
         &mut self,
         mutation_id: ProcessMutationId,
@@ -1593,12 +1692,15 @@ fn parse_stdout(output: &FixedCommandOutput) -> Result<String, PortError> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct UnixUserIdentity {
-    uid: u32,
-    gid: u32,
+pub(super) struct UnixUserIdentity {
+    pub(super) uid: u32,
+    pub(super) gid: u32,
 }
 
-fn lookup_user(path: &Path, username: &str) -> Result<Option<UnixUserIdentity>, PortError> {
+pub(super) fn lookup_user(
+    path: &Path,
+    username: &str,
+) -> Result<Option<UnixUserIdentity>, PortError> {
     let value = match fs::read_to_string(path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1796,6 +1898,7 @@ fn verify_directory_ownership(
     {
         let UnixUserIdentity { uid, gid } = connector_identity;
         verify_owned_directory(&layout.config_dir(), 0, gid, 0o750)?;
+        verify_owned_directory(&layout.trust_dir(), 0, gid, 0o750)?;
         verify_owned_directory(&layout.config_dir().join("operations"), 0, 0, 0o700)?;
         verify_owned_directory(&layout.data_dir(), uid, gid, 0o700)?;
         verify_owned_directory(&layout.workspace_dir(), uid, gid, 0o700)?;
@@ -1803,6 +1906,7 @@ fn verify_directory_ownership(
         verify_owned_directory(&layout.worker_runtime_dir(), uid, gid, 0o700)?;
         verify_owned_directory(&layout.credential_dir(), 0, gid, 0o750)?;
         verify_owned_directory(&layout.credential_dir().join("staged"), 0, 0, 0o700)?;
+        verify_owned_directory(&layout.durable_credential_dir(), 0, 0, 0o700)?;
         verify_owned_directory(&layout.log_dir(), uid, gid, 0o700)?;
         verify_owned_file(&layout.release_manifest(), 0, 0o600)?;
         verify_owned_file(&layout.network_policy(), 0, 0o600)?;
