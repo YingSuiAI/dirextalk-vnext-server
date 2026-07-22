@@ -4,6 +4,7 @@ members = [
     "bins/dtx-agent-host-supervisor",
     "bins/dtx-dev-local-tls",
     "bins/dtx-dev-migrate",
+    "bins/dtx-production-migrate",
     "bins/dtx-group-node",
     "bins/dtx-identity-node",
     "bins/dtx-indexer-node",

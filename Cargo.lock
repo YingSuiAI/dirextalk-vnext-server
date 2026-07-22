@@ -1359,6 +1359,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-production-migrate"
+version = "0.1.0"
+dependencies = [
+ "dtx-storage",
+ "sqlx",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "dtx-protocol"
 version = "0.1.0"
 dependencies = [

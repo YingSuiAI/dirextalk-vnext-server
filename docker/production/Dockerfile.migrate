@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+FROM rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 AS build
+WORKDIR /workspace
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/workspace/target \
+    cargo build --release --locked --package dtx-production-migrate \
+    && install -D -m 0555 /workspace/target/release/dtx-production-migrate /artifacts/dtx-production-migrate
+
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /artifacts/dtx-production-migrate /usr/local/bin/dtx-production-migrate
+USER 0:0
+ENTRYPOINT ["/usr/local/bin/dtx-production-migrate"]

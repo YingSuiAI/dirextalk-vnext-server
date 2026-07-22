@@ -1,0 +1,10 @@
+{
+  "database_url_file": "/run/dtx-agent-control-secrets/database-url",
+  "max_database_connections": 16,
+  "health": {"listen": "127.0.0.1:9080"},
+  "owner_api": {"listen": "127.0.0.1:9081", "tenant_id": "0190f2a5-7b1c-7abc-8def-0123456789a0"},
+  "enrollment": {"listen": "0.0.0.0:9443", "certificate_chain_pem": "/run/dtx-agent-control-tls/enrollment-chain.pem", "private_key_pkcs8_pem": "/run/dtx-agent-control-secrets/enrollment-key.pem"},
+  "control": {"listen": "0.0.0.0:9444", "certificate_chain_pem": "/run/dtx-agent-control-tls/control-chain.pem", "private_key_pkcs8_pem": "/run/dtx-agent-control-secrets/control-key.pem", "client_ca_bundle_pem": "/run/dtx-agent-control-tls/connector-client-roots.pem"},
+  "legacy_gateway": {"listen": "0.0.0.0:9445", "certificate_chain_pem": "/run/dtx-agent-control-tls/legacy-gateway-server-chain.pem", "private_key_pkcs8_pem": "/run/dtx-agent-control-secrets/legacy-gateway-server-key.pem", "client_ca_bundle_pem": "/run/dtx-agent-control-tls/internal-service-client-roots.pem"},
+  "connector_issuer": {"certificate_pem": "/run/dtx-agent-control-tls/connector-issuer.pem", "private_key_pkcs8_pem": "/run/dtx-agent-control-secrets/connector-issuer-key.pem", "response_intermediate_bundle_pem": "/run/dtx-agent-control-tls/connector-response-intermediates.pem"}
+}
