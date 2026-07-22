@@ -11,6 +11,7 @@ Run commands from this repository root.
 | test | `cargo test --workspace --locked` |
 | persistence migrations | `cargo test -p dtx-storage --test migrations --locked` |
 | persistence contracts | `cargo test -p dtx-storage --test persistence_contract --locked` |
+| root-only Connector bootstrap issuance | `dtx-agent-provision bootstrap-issue --database-url-file <0600-file> --request-file <root-0600-json> --handoff-file <root-0600-json> [--plan-file <redacted-json>]` |
 | Host Supervisor VM acceptance (destructive; isolated disposable Linux VM only) | `sudo DTX_DISPOSABLE_VM_ACCEPTANCE=1 bash scripts/test-host-supervisor-vm.sh` |
 | SQLx migration/prepare gate (Ubuntu/WSL) | `bash scripts/sqlx-prepare.sh` |
 | SQLx migration/prepare gate (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sqlx-prepare.ps1` |

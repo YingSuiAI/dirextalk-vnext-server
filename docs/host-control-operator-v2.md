@@ -112,3 +112,25 @@ revisions, Connector ID, lifecycle state, and prepared/finalized receipt
 digests. Rejections use a fixed allowlisted code. Material, credentials,
 bearers, paths, commands, URLs, raw receipts, subprocess output, and diagnostic
 text never cross the response boundary.
+
+## Root-only issuance boundary
+
+The server-side issuer is the one-shot root-only command:
+
+```text
+dtx-agent-provision bootstrap-issue \
+  --database-url-file <0600-file> \
+  --request-file <root-owned-0600-json> \
+  --handoff-file <root-owned-0600-json> \
+  [--plan-file <redacted-json>]
+```
+
+`dirextalk.connector-bootstrap-issuance-request` v1 is strict and contains
+all non-secret plan facts. The operator generates independent enrollment and
+MCP bearer secrets, stages them in a fixed operation-scoped `0600` handoff,
+then commits the Host, Connector, enrollment intent, and issuance fence in one
+tenant transaction. The durable row stores only redacted JSON and digests. A
+post-commit atomic rewrite publishes the `ready` handoff and canonical
+`dirextalk.connector-bootstrap-plan` v1 accepted by this Host V2 boundary.
+Missing or changed handoff material after a durable row exists returns
+`HANDOFF_UNAVAILABLE`/conflict and never remints secrets.
