@@ -909,12 +909,15 @@ fn decode_secret(raw: &str, output: &mut [u8; 32]) -> bool {
         let packed = value.to_be_bytes();
         decoded[group * 3..group * 3 + 3].copy_from_slice(&packed[1..]);
     }
-    let mut tail = 0_u16;
+    // Three Base64URL characters contain 18 bits. Keep all of them until the
+    // final two unused bits are checked; a `u16` would discard byte 30's top
+    // two bits and reject otherwise canonical random credentials.
+    let mut tail = 0_u32;
     for byte in &bytes[41..44] {
         let Some(index) = BASE64URL.iter().position(|candidate| candidate == byte) else {
             return false;
         };
-        tail = (tail << 6) | u16::try_from(index).expect("base64 index fits");
+        tail = (tail << 6) | u32::try_from(index).expect("base64 index fits");
     }
     // A 32-byte RawURL value has 43 sextets: only the final two low bits are
     // unused.  The canonical re-encoding below is kept as a second boundary.
@@ -922,7 +925,7 @@ fn decode_secret(raw: &str, output: &mut [u8; 32]) -> bool {
         return false;
     }
     let tail_bytes = (tail >> 2).to_be_bytes();
-    decoded[30..].copy_from_slice(&tail_bytes);
+    decoded[30..].copy_from_slice(&tail_bytes[2..]);
     // Re-encode without allocating a secret String; this rejects non-zero
     // unused bits and any otherwise equivalent spelling.
     let mut canonical = Zeroizing::new([0_u8; 43]);
@@ -1092,37 +1095,40 @@ mod tests {
 
     #[test]
     fn secret_decoder_accepts_all_canonical_tail_classes_and_rejects_unused_bits() {
-        for last in [0_u8, 1, 2, 3] {
-            let mut value = [0_u8; 32];
-            value[31] = last;
-            let mut encoded = [b'A'; 43];
-            for group in 0..10 {
-                let word = (u32::from(value[group * 3]) << 16)
-                    | (u32::from(value[group * 3 + 1]) << 8)
-                    | u32::from(value[group * 3 + 2]);
-                for offset in 0..4 {
-                    encoded[group * 4 + offset] =
-                        BASE64URL[((word >> (18 - offset * 6)) & 63) as usize];
+        for high_bits in [0_u8, 0x40, 0x80, 0xc0] {
+            for last in [0_u8, 1, 2, 3] {
+                let mut value = [0_u8; 32];
+                value[30] = high_bits;
+                value[31] = last;
+                let mut encoded = [b'A'; 43];
+                for group in 0..10 {
+                    let word = (u32::from(value[group * 3]) << 16)
+                        | (u32::from(value[group * 3 + 1]) << 8)
+                        | u32::from(value[group * 3 + 2]);
+                    for offset in 0..4 {
+                        encoded[group * 4 + offset] =
+                            BASE64URL[((word >> (18 - offset * 6)) & 63) as usize];
+                    }
                 }
+                let word = (u32::from(value[30]) << 16) | (u32::from(value[31]) << 8);
+                for offset in 0..3 {
+                    encoded[40 + offset] = BASE64URL[((word >> (18 - offset * 6)) & 63) as usize];
+                }
+                let raw = format!("\"{}\"", std::str::from_utf8(&encoded).expect("ascii"));
+                let mut output = [9; 32];
+                assert!(decode_secret(&raw, &mut output));
+                assert_eq!(output, value);
+                let mut noncanonical = encoded;
+                noncanonical[42] = BASE64URL[(BASE64URL
+                    .iter()
+                    .position(|v| *v == noncanonical[42])
+                    .expect("alphabet")
+                    | 1)
+                    & 63];
+                let raw = format!("\"{}\"", std::str::from_utf8(&noncanonical).expect("ascii"));
+                assert!(!decode_secret(&raw, &mut output));
+                assert_eq!(output, [0; 32]);
             }
-            let word = (u32::from(value[30]) << 16) | (u32::from(value[31]) << 8);
-            for offset in 0..3 {
-                encoded[40 + offset] = BASE64URL[((word >> (18 - offset * 6)) & 63) as usize];
-            }
-            let raw = format!("\"{}\"", std::str::from_utf8(&encoded).expect("ascii"));
-            let mut output = [9; 32];
-            assert!(decode_secret(&raw, &mut output));
-            assert_eq!(output, value);
-            let mut noncanonical = encoded;
-            noncanonical[42] = BASE64URL[(BASE64URL
-                .iter()
-                .position(|v| *v == noncanonical[42])
-                .expect("alphabet")
-                | 1)
-                & 63];
-            let raw = format!("\"{}\"", std::str::from_utf8(&noncanonical).expect("ascii"));
-            assert!(!decode_secret(&raw, &mut output));
-            assert_eq!(output, [0; 32]);
         }
     }
 
