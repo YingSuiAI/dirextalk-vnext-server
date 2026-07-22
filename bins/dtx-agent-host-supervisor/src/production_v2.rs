@@ -906,6 +906,10 @@ mod tests {
     const GO_PLAN_CANONICAL_JSON: &[u8] = br#"{"schema":"dirextalk.connector-bootstrap-plan","schema_version":1,"state":"prepared","operation_id":"0197f1f0-0000-7000-8000-000000000005","manifest_digest":"05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f","target":"linux-amd64","connector_artifact":{"version":"1.2.3-alpha.1+build-1","digest":"a4d451ec23463726f72c43d64c710968f6b602cd653b4de8adee1b556240a829"},"host":{"tenant_id":"0197f1f0-0000-7000-8000-000000000001","host_id":"0197f1f0-0000-7000-8000-000000000002","owner_id":"dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la","host_credential_id":"0197f1f0-0000-7000-8000-000000000009"},"connector":{"instance_id":"0197f1f0-0000-7000-8000-000000000003","adapter_kind":"codex","handoff_digest":"c21ed50aa964770b16d098c18f1845d4fd75a0eccda9c3cd791d9a86840902d3","display_name":"Connector","generation":1,"spec_revision":1,"enrollment_request_id":"0197f1f0-0000-7000-8000-000000000006","enrollment_intent_id":"0197f1f0-0000-7000-8000-000000000007","installation_id":"0197f1f0-0000-7000-8000-00000000000a","agent_device_id":"0197f1f0-0000-7000-8000-00000000000b","binding_id":"0197f1f0-0000-7000-8000-00000000000c","expires_at_millis":4000000000,"server_origin":"https://server.example","trust":{"enrollment_url":"https://enroll.example/","enrollment_server_name":"enroll.example","enrollment_root_ca_sha256":"2791bd4394efbf10623f3cd301dc57f37ff18ff2a806b2c013403e85bc62c530","control_url":"https://control.example","control_server_name":"control.example","control_server_root_ca_sha256":"0fcd568a5cb9bdb4677b69354b11ee415af8f784519cff3da49a26f84eaee7f2","connector_issuer_root_ca_sha256":"535c6f8eb511f5d966a1b0725df92ebf27514faba945cbbd698e23ac72c41757"},"runtime_profile":"safe","remote_mcp":{"mcp_server_name":"mcp_1","mcp_url":"https://mcp.example/mcp","mcp_node_id":"0197f1f0-0000-7000-8000-00000000000d","max_concurrent_runs":1,"offline_policy":"queue"}}}"#;
     const GO_PLAN_CANONICAL_SHA256: &str =
         "792b519bcd3f7a489a1ce57d2cf9a0948565e267935568ad70b8537abff1071e";
+    const SHARED_CANONICAL_PLAN: &str =
+        include_str!("../../../test-vectors/connector-bootstrap-v1/canonical-plan.json");
+    const SHARED_INVALID_FIELDS: &str =
+        include_str!("../../../test-vectors/connector-bootstrap-v1/invalid-fields.json");
     const CREDENTIAL_ID: &str = "0197f1f0-0000-7000-8000-000000000010";
 
     fn hex(bytes: &[u8]) -> String {
@@ -1076,6 +1080,7 @@ mod tests {
         let frame = fixture();
         let raw = frame.material.as_ref().expect("material").plan_json();
         assert_eq!(raw, GO_PLAN_CANONICAL_JSON);
+        assert_eq!(raw, SHARED_CANONICAL_PLAN.trim_end().as_bytes());
         let mut decoder = serde_json::Deserializer::from_slice(raw);
         let plan = Plan::deserialize(&mut decoder).expect("plan");
         decoder.end().expect("one plan value");
@@ -1087,6 +1092,25 @@ mod tests {
             canonical_plan_digest(&plan).expect("digest"),
             decode_digest(GO_PLAN_CANONICAL_SHA256).expect("hex")
         );
+    }
+
+    #[test]
+    fn shared_negative_fields_are_rejected_by_host_v2() {
+        let invalid: serde_json::Value =
+            serde_json::from_str(SHARED_INVALID_FIELDS).expect("shared invalid fields");
+        for (from, field) in [
+            ("safe", "runtime_profile"),
+            ("https://server.example", "server_origin"),
+            ("1.2.3-alpha.1+build-1", "version"),
+        ] {
+            let frame = fixture();
+            let plan = replace_once(
+                frame.material.as_ref().expect("material").plan_json(),
+                from,
+                invalid[field].as_str().expect("invalid string"),
+            );
+            assert!(ValidatedBootstrapRequest::parse(with_plan(frame, plan)).is_err());
+        }
     }
 
     #[test]

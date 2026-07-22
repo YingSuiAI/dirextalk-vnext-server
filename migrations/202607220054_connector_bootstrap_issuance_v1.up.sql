@@ -15,6 +15,8 @@ CREATE TABLE agent.connector_bootstrap_issuances (
     handoff_digest bytea NOT NULL,
     enrollment_token_digest bytea NOT NULL,
     mcp_bearer_digest bytea NOT NULL,
+    handoff_path text NOT NULL,
+    plan_path text NOT NULL,
     request_json jsonb NOT NULL,
     plan_json jsonb NOT NULL,
     state text NOT NULL,
@@ -35,6 +37,12 @@ CREATE TABLE agent.connector_bootstrap_issuances (
         octet_length(request_digest)=32 AND octet_length(plan_digest)=32
         AND octet_length(handoff_digest)=32 AND octet_length(enrollment_token_digest)=32
         AND octet_length(mcp_bearer_digest)=32
+    ),
+    CONSTRAINT connector_bootstrap_issuances_paths_valid CHECK (
+        handoff_path LIKE '/%' AND plan_path LIKE '/%'
+        AND octet_length(handoff_path) BETWEEN 2 AND 4096
+        AND octet_length(plan_path) BETWEEN 2 AND 4096
+        AND handoff_path <> plan_path
     ),
     CONSTRAINT connector_bootstrap_issuances_state_valid CHECK (state='ready'),
     CONSTRAINT connector_bootstrap_issuances_fence_positive

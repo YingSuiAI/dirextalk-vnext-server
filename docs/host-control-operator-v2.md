@@ -121,8 +121,8 @@ The server-side issuer is the one-shot root-only command:
 dtx-agent-provision bootstrap-issue \
   --database-url-file <0600-file> \
   --request-file <root-owned-0600-json> \
-  --handoff-file <root-owned-0600-json> \
-  [--plan-file <redacted-json>]
+  --handoff-file <tenant-operation.handoff.json> \
+  --plan-file <tenant-operation.plan.json>
 ```
 
 `dirextalk.connector-bootstrap-issuance-request` v1 is strict and contains
@@ -132,6 +132,13 @@ then commits the Host, Connector, enrollment intent, and issuance fence in one
 tenant transaction. The durable row stores only redacted JSON and digests. A
 post-commit atomic rewrite publishes the `ready` handoff and canonical
 `dirextalk.connector-bootstrap-plan` v1 accepted by this Host V2 boundary.
+Both output parents are root-owned `0700` directories. Their exact canonical
+paths use `<tenant>-<operation>.handoff.json` and
+`<tenant>-<operation>.plan.json`, are durably bound to the issuance row, and
+are serialized across alternate paths by the root-owned operation lock below
+`/run/dirextalk/bootstrap-issuance-locks`. The `0600` lock file binds those
+canonical paths before any handoff inspection or secret generation, so a
+pre-transaction crash cannot authorize an alternate-path re-mint.
 The plan's `host.owner_id` is the stable `IdentityId` text form (`dtxi1` plus
 52 lowercase RFC 4648 Base32 characters); tenant, host, credential, Connector,
 and operation identifiers remain UUIDv7 values.

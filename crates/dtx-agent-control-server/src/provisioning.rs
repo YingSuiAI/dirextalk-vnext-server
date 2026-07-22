@@ -44,6 +44,8 @@ pub struct ConnectorBootstrapIssuance {
     pub handoff_digest: Sha256Digest,
     pub enrollment_token_digest: Sha256Digest,
     pub mcp_bearer_digest: Sha256Digest,
+    pub handoff_path: String,
+    pub plan_path: String,
     pub request_json: Value,
     pub plan_json: Value,
     pub expires_at_millis: i64,
@@ -82,8 +84,9 @@ pub async fn ensure_connector_bootstrap_issuance(
                  enrollment_request_id, enrollment_intent_id,
                  connector_generation, spec_revision, request_digest, plan_digest,
                  handoff_digest, enrollment_token_digest, mcp_bearer_digest,
-                 request_json, plan_json, state, expires_at_ms, created_at_ms
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'ready',$16,$17)
+                 handoff_path, plan_path, request_json, plan_json, state,
+                 expires_at_ms, created_at_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'ready',$18,$19)
              ON CONFLICT (tenant_id, operation_id) DO NOTHING",
         )
         .bind(Uuid::from(issuance.tenant_id))
@@ -105,6 +108,8 @@ pub async fn ensure_connector_bootstrap_issuance(
         .bind(issuance.handoff_digest.as_bytes().to_vec())
         .bind(issuance.enrollment_token_digest.as_bytes().to_vec())
         .bind(issuance.mcp_bearer_digest.as_bytes().to_vec())
+        .bind(&issuance.handoff_path)
+        .bind(&issuance.plan_path)
         .bind(issuance.request_json.clone())
         .bind(issuance.plan_json.clone())
         .bind(issuance.expires_at_millis)
@@ -116,7 +121,8 @@ pub async fn ensure_connector_bootstrap_issuance(
                 "SELECT connector_id, host_id, enrollment_request_id, enrollment_intent_id,
                         connector_generation, spec_revision, request_digest, plan_digest,
                         handoff_digest, enrollment_token_digest, mcp_bearer_digest,
-                        request_json, plan_json, expires_at_ms, created_at_ms
+                        handoff_path, plan_path, request_json, plan_json,
+                        expires_at_ms, created_at_ms
                    FROM agent.connector_bootstrap_issuances
                   WHERE tenant_id=$1 AND operation_id=$2",
             )
@@ -146,6 +152,8 @@ pub async fn ensure_connector_bootstrap_issuance(
                     == issuance.enrollment_token_digest.as_bytes()
                 && row.try_get::<Vec<u8>, _>("mcp_bearer_digest")?
                     == issuance.mcp_bearer_digest.as_bytes()
+                && row.try_get::<String, _>("handoff_path")? == issuance.handoff_path
+                && row.try_get::<String, _>("plan_path")? == issuance.plan_path
                 && row.try_get::<Value, _>("request_json")? == issuance.request_json
                 && row.try_get::<Value, _>("plan_json")? == issuance.plan_json
                 && row.try_get::<i64, _>("expires_at_ms")? == issuance.expires_at_millis

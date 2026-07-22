@@ -198,6 +198,8 @@ const OPAQUE_PUSH_V1_UP: &str =
     include_str!("../../../migrations/202607220053_opaque_push_v1.up.sql");
 const CONNECTOR_BOOTSTRAP_ISSUANCE_V1_DOWN: &str =
     include_str!("../../../migrations/202607220054_connector_bootstrap_issuance_v1.down.sql");
+const CONNECTOR_BOOTSTRAP_ISSUANCE_V1_UP: &str =
+    include_str!("../../../migrations/202607220054_connector_bootstrap_issuance_v1.up.sql");
 const LOCAL_RUNTIME_GRANTS: &str =
     include_str!("../../../docker/local/postgres/20-local-runtime-grants.sql");
 
@@ -996,6 +998,89 @@ async fn opaque_push_v43_prune_waits_for_commit_session_fence()
         .fetch_one(h.admin_pool())
         .await?
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn connector_bootstrap_issuance_v1_is_reversible_when_empty()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(CONNECTOR_BOOTSTRAP_ISSUANCE_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    let removed: (bool, bool) = sqlx::query_as(
+        "SELECT to_regclass('agent.connector_bootstrap_issuances') IS NULL,
+                to_regprocedure('agent.enforce_connector_bootstrap_issuance_fence()') IS NULL",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(removed, (true, true));
+    sqlx::raw_sql(CONNECTOR_BOOTSTRAP_ISSUANCE_V1_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    let restored: (bool, bool) = sqlx::query_as(
+        "SELECT to_regclass('agent.connector_bootstrap_issuances') IS NOT NULL,
+                to_regprocedure('agent.enforce_connector_bootstrap_issuance_fence()') IS NOT NULL",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(restored, (true, true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn connector_bootstrap_issuance_down_refuses_populated_state_before_ddl()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    let mut connection = harness.admin_pool().acquire().await?;
+    sqlx::raw_sql(
+        "SET session_replication_role=replica;
+         INSERT INTO agent.connector_bootstrap_issuances (
+             tenant_id, operation_id, connector_id, host_id,
+             enrollment_request_id, enrollment_intent_id,
+             connector_generation, spec_revision, request_digest, plan_digest,
+             handoff_digest, enrollment_token_digest, mcp_bearer_digest,
+             handoff_path, plan_path, request_json, plan_json, state,
+             expires_at_ms, created_at_ms
+         ) VALUES (
+             '0197f1f0-0000-7000-8000-000000000001',
+             '0197f1f0-0000-7000-8000-000000000005',
+             '0197f1f0-0000-7000-8000-000000000003',
+             '0197f1f0-0000-7000-8000-000000000002',
+             '0197f1f0-0000-7000-8000-000000000006',
+             '0197f1f0-0000-7000-8000-000000000007',
+             1, 1,
+             decode(repeat('11',32),'hex'), decode(repeat('22',32),'hex'),
+             decode(repeat('33',32),'hex'), decode(repeat('44',32),'hex'),
+             decode(repeat('55',32),'hex'),
+             '/root/bootstrap/issuance.handoff.json',
+             '/root/bootstrap/issuance.plan.json',
+             '{}'::jsonb, '{}'::jsonb, 'ready', 4000000000, 3999400000
+         );
+         SET session_replication_role=origin;",
+    )
+    .execute(&mut *connection)
+    .await?;
+
+    let error = sqlx::raw_sql(CONNECTOR_BOOTSTRAP_ISSUANCE_V1_DOWN)
+        .execute(&mut *connection)
+        .await
+        .expect_err("populated immutable issuance table must refuse downgrade");
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref(),
+        Some("55000")
+    );
+    let preserved: (bool, bool, i64) = sqlx::query_as(
+        "SELECT to_regclass('agent.connector_bootstrap_issuances') IS NOT NULL,
+                to_regprocedure('agent.enforce_connector_bootstrap_issuance_fence()') IS NOT NULL,
+                count(*) FROM agent.connector_bootstrap_issuances",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    assert_eq!(preserved, (true, true, 1));
     Ok(())
 }
 

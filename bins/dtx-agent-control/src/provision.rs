@@ -8,7 +8,7 @@ use std::{
     ffi::OsString,
     fmt, fs,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -71,6 +71,7 @@ const MAX_DATABASE_URL_BYTES: u64 = 4_096;
 const MAX_PEM_BUNDLE_BYTES: u64 = 1_048_576;
 const MAX_IDENTITY_HEAD_SEQUENCE: u64 = (1_u64 << 53) - 1;
 const MAX_ENROLLMENT_TTL_MILLIS: i64 = dtx_agent_control::MAX_ENROLLMENT_TTL_MILLIS;
+const BOOTSTRAP_ISSUANCE_LOCK_ROOT: &str = "/run/dirextalk/bootstrap-issuance-locks";
 
 const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("system.schema_versions", "SELECT"),
@@ -233,6 +234,9 @@ async fn run_bootstrap_issue() -> Result<(), BootstrapIssueError> {
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(BootstrapIssueError::RootRequired);
     }
+    #[cfg(not(unix))]
+    return Err(BootstrapIssueError::RootRequired);
+
     let arguments = BootstrapIssueArguments::parse(env::args_os())?;
     let mut request = parse_bootstrap_issue_request(&read_root_request_bounded(
         &arguments.request_file,
@@ -240,11 +244,23 @@ async fn run_bootstrap_issue() -> Result<(), BootstrapIssueError> {
     )?)?;
     let now = now_millis().map_err(|_| BootstrapIssueError::Time)?;
     validate_bootstrap_issue_request(&mut request, now)?;
+    let paths = BootstrapIssuePaths::canonicalize(&arguments, &request)?;
     let request_json = serde_json::to_vec(&request).map_err(|_| BootstrapIssueError::Request)?;
     let request_digest = domain_digest(
         b"dirextalk.connector-bootstrap-issuance-request.v1",
         &request_json,
     );
+    // This fixed operation lock is independent of the caller-selected artifact paths.
+    // It therefore serializes alternate-path retries before any durable lookup, target
+    // inspection, or secret generation can occur.
+    let operation_lock = BootstrapOperationLock::acquire(
+        request.host.tenant_id,
+        request.operation_id,
+        &paths,
+        now,
+        i64::try_from(request.connector.expires_at_millis)
+            .map_err(|_| BootstrapIssueError::Request)?,
+    )?;
 
     let database_url = Zeroizing::new(read_regular_bounded(
         &arguments.database_url_file,
@@ -269,17 +285,30 @@ async fn run_bootstrap_issue() -> Result<(), BootstrapIssueError> {
     {
         return Err(BootstrapIssueError::Database);
     }
-    if bootstrap_issuance_exists(&store, request.host.tenant_id, request.operation_id).await?
-        && !handoff_path_exists(&arguments.handoff_file)?
+    let recovery =
+        load_bootstrap_issuance(&store, request.host.tenant_id, request.operation_id).await?;
+    let request_value =
+        serde_json::from_slice(&request_json).map_err(|_| BootstrapIssueError::Request)?;
+    if let Some(recovery) = recovery.as_ref()
+        && !recovery.matches_request(request_digest, &request_value, &paths)
     {
-        return Err(BootstrapIssueError::HandoffUnavailable);
+        return Err(BootstrapIssueError::HandoffConflict);
     }
+    if recovery.is_none() && destination_exists(&paths.plan)? {
+        return Err(BootstrapIssueError::Plan);
+    }
+    let created_at_millis = operation_lock.created_at_millis;
     let ttl_millis = i64::try_from(request.connector.expires_at_millis)
         .map_err(|_| BootstrapIssueError::Request)?
-        .checked_sub(now)
+        .checked_sub(created_at_millis)
         .ok_or(BootstrapIssueError::Request)?;
-    let mut handoff =
-        LockedBootstrapHandoff::acquire(&request, ttl_millis, &arguments.handoff_file)?;
+    let mut handoff = LockedBootstrapHandoff::acquire(
+        &request,
+        created_at_millis,
+        ttl_millis,
+        &paths.handoff,
+        recovery.is_some(),
+    )?;
     handoff.handoff.state = HandoffState::Ready;
     let handoff_json =
         serde_json::to_vec(&handoff.handoff).map_err(|_| BootstrapIssueError::Handoff)?;
@@ -289,18 +318,22 @@ async fn run_bootstrap_issue() -> Result<(), BootstrapIssueError> {
     let plan_digest = plain_digest(&plan_json);
     let token_digest = handoff.handoff.enrollment_token.domain_token().digest();
     let mcp_digest = handoff.handoff.mcp_bearer.sha256_digest();
-    if !bootstrap_issuance_secret_facts_match(
-        &store,
-        request.host.tenant_id,
-        request.operation_id,
-        handoff_digest,
-        token_digest,
-        mcp_digest,
-    )
-    .await?
-    {
+    let plan_value = serde_json::from_slice(&plan_json).map_err(|_| BootstrapIssueError::Plan)?;
+    if recovery.as_ref().is_some_and(|recovery| {
+        !recovery.matches_material(
+            &plan_value,
+            plan_digest,
+            handoff_digest,
+            token_digest,
+            mcp_digest,
+            handoff.handoff.enrollment_intent_id,
+            created_at_millis,
+            i64::try_from(request.connector.expires_at_millis).unwrap_or_default(),
+        )
+    }) {
         return Err(BootstrapIssueError::HandoffUnavailable);
     }
+    validate_existing_plan(&paths.plan, &plan_json)?;
     let provisioning = HostProvisioningRequest::new(
         request.operation_id,
         request.host.tenant_id,
@@ -308,7 +341,7 @@ async fn run_bootstrap_issue() -> Result<(), BootstrapIssueError> {
         request.host.owner_id,
         request.host.host_credential_id,
         request_digest,
-        handoff.created_at_millis,
+        created_at_millis,
         vec![
             HostProvisioningConnectorRequest::new(
                 request.connector.instance_id,
@@ -338,12 +371,13 @@ async fn run_bootstrap_issue() -> Result<(), BootstrapIssueError> {
         handoff_digest,
         enrollment_token_digest: token_digest,
         mcp_bearer_digest: mcp_digest,
-        request_json: serde_json::from_slice(&request_json)
-            .map_err(|_| BootstrapIssueError::Request)?,
-        plan_json: serde_json::from_slice(&plan_json).map_err(|_| BootstrapIssueError::Plan)?,
+        handoff_path: paths.handoff_text.clone(),
+        plan_path: paths.plan_text.clone(),
+        request_json: request_value,
+        plan_json: plan_value,
         expires_at_millis: i64::try_from(request.connector.expires_at_millis)
             .map_err(|_| BootstrapIssueError::Request)?,
-        created_at_millis: handoff.created_at_millis,
+        created_at_millis,
     };
     let result = ensure_connector_bootstrap_issuance(&store, provisioning, issuance)
         .await
@@ -352,9 +386,7 @@ async fn run_bootstrap_issue() -> Result<(), BootstrapIssueError> {
         return Err(BootstrapIssueError::Provisioning);
     }
     handoff.publish_ready()?;
-    if let Some(path) = arguments.plan_file.as_deref() {
-        write_redacted_plan(path, &plan)?;
-    }
+    publish_redacted_plan(&paths.plan, &plan_json)?;
     report_bootstrap_issue(&plan, handoff.was_new)
 }
 
@@ -1464,7 +1496,7 @@ struct BootstrapIssueArguments {
     database_url_file: PathBuf,
     request_file: PathBuf,
     handoff_file: PathBuf,
-    plan_file: Option<PathBuf>,
+    plan_file: PathBuf,
 }
 
 impl BootstrapIssueArguments {
@@ -1500,27 +1532,152 @@ impl BootstrapIssueArguments {
             database_url_file: database_url_file.ok_or(BootstrapIssueError::Usage)?,
             request_file: request_file.ok_or(BootstrapIssueError::Usage)?,
             handoff_file: handoff_file.ok_or(BootstrapIssueError::Usage)?,
-            plan_file,
+            plan_file: plan_file.ok_or(BootstrapIssueError::Usage)?,
         })
     }
+}
+
+struct BootstrapIssuePaths {
+    handoff: PathBuf,
+    plan: PathBuf,
+    handoff_text: String,
+    plan_text: String,
+}
+
+impl BootstrapIssuePaths {
+    fn canonicalize(
+        arguments: &BootstrapIssueArguments,
+        request: &BootstrapIssueRequest,
+    ) -> Result<Self, BootstrapIssueError> {
+        let expected_prefix = format!("{}-{}", request.host.tenant_id, request.operation_id);
+        let handoff = canonical_bootstrap_artifact_path(
+            &arguments.handoff_file,
+            &format!("{expected_prefix}.handoff.json"),
+        )?;
+        let plan = canonical_bootstrap_artifact_path(
+            &arguments.plan_file,
+            &format!("{expected_prefix}.plan.json"),
+        )?;
+        if handoff == plan {
+            return Err(BootstrapIssueError::Usage);
+        }
+        let handoff_text = handoff
+            .to_str()
+            .filter(|value| value.len() <= 4096)
+            .ok_or(BootstrapIssueError::Usage)?
+            .to_owned();
+        let plan_text = plan
+            .to_str()
+            .filter(|value| value.len() <= 4096)
+            .ok_or(BootstrapIssueError::Usage)?
+            .to_owned();
+        Ok(Self {
+            handoff,
+            plan,
+            handoff_text,
+            plan_text,
+        })
+    }
+}
+
+fn canonical_bootstrap_artifact_path(
+    path: &Path,
+    expected_name: &str,
+) -> Result<PathBuf, BootstrapIssueError> {
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name) {
+        return Err(BootstrapIssueError::Usage);
+    }
+    let parent = path.parent().ok_or(BootstrapIssueError::Usage)?;
+    let parent = fs::canonicalize(parent).map_err(|_| BootstrapIssueError::FilePermissions)?;
+    validate_handoff_parent(&parent).map_err(BootstrapIssueError::from)?;
+    Ok(parent.join(expected_name))
+}
+
+/// A fixed tenant/operation lock independent of the selected handoff and plan paths.
+/// The root-only command owns both the lock directory and each 0600 lock file.
+struct BootstrapOperationLock {
+    _file: File,
+    created_at_millis: i64,
+}
+
+impl BootstrapOperationLock {
+    fn acquire(
+        tenant_id: TenantId,
+        operation_id: RequestId,
+        paths: &BootstrapIssuePaths,
+        created_at_millis: i64,
+        expires_at_millis: i64,
+    ) -> Result<Self, BootstrapIssueError> {
+        Self::acquire_at(
+            Path::new(BOOTSTRAP_ISSUANCE_LOCK_ROOT),
+            tenant_id,
+            operation_id,
+            &paths.handoff_text,
+            &paths.plan_text,
+            created_at_millis,
+            expires_at_millis,
+        )
+    }
+
+    fn acquire_at(
+        root: &Path,
+        tenant_id: TenantId,
+        operation_id: RequestId,
+        handoff_path: &str,
+        plan_path: &str,
+        proposed_created_at_millis: i64,
+        expires_at_millis: i64,
+    ) -> Result<Self, BootstrapIssueError> {
+        ensure_bootstrap_lock_root(root)?;
+        let path = root.join(format!("{tenant_id}-{operation_id}.lock"));
+        let mut file = open_or_create_bootstrap_lock(&path)?;
+        file.lock().map_err(|_| BootstrapIssueError::File)?;
+        validate_bootstrap_lock_file(&file)?;
+        let created_at_millis = bind_bootstrap_lock_file(
+            &mut file,
+            tenant_id,
+            operation_id,
+            handoff_path,
+            plan_path,
+            proposed_created_at_millis,
+            expires_at_millis,
+        )?;
+        Ok(Self {
+            _file: file,
+            created_at_millis,
+        })
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapIssueLockBinding {
+    schema: String,
+    schema_version: u8,
+    tenant_id: TenantId,
+    operation_id: RequestId,
+    handoff_path: String,
+    plan_path: String,
+    created_at_millis: i64,
 }
 
 struct LockedBootstrapHandoff {
     _lock: HandoffParentLock,
     path: PathBuf,
     handoff: BootstrapIssueHandoff,
-    created_at_millis: i64,
     was_new: bool,
 }
 
 impl LockedBootstrapHandoff {
     fn acquire(
         request: &BootstrapIssueRequest,
+        created_at_millis: i64,
         ttl_millis: i64,
         path: &Path,
+        require_existing: bool,
     ) -> Result<Self, BootstrapIssueError> {
         let lock = HandoffParentLock::acquire(path).map_err(BootstrapIssueError::from)?;
-        let (handoff, was_new, created_at_millis) = match fs::symlink_metadata(path) {
+        let (handoff, was_new) = match fs::symlink_metadata(path) {
             Ok(_) => {
                 let bytes = Zeroizing::new(
                     read_regular_bounded(path, MAX_JSON_BYTES, true)
@@ -1528,14 +1685,12 @@ impl LockedBootstrapHandoff {
                 );
                 let handoff: BootstrapIssueHandoff =
                     serde_json::from_slice(&bytes).map_err(|_| BootstrapIssueError::Handoff)?;
-                let created = i64::try_from(handoff.expires_at_millis)
-                    .ok()
-                    .and_then(|expiry| expiry.checked_sub(ttl_millis))
-                    .ok_or(BootstrapIssueError::Handoff)?;
-                (handoff, false, created)
+                (handoff, false)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && require_existing => {
+                return Err(BootstrapIssueError::HandoffUnavailable);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let created = now_millis().map_err(|_| BootstrapIssueError::Time)?;
                 let handoff = BootstrapIssueHandoff {
                     schema: "dirextalk.connector-bootstrap-handoff".to_owned(),
                     schema_version: 1,
@@ -1550,17 +1705,12 @@ impl LockedBootstrapHandoff {
                     enrollment_intent_id: EnrollmentIntentId::new(),
                     generation: request.connector.generation,
                     spec_revision: request.connector.spec_revision,
-                    expires_at_millis: u64::try_from(
-                        created
-                            .checked_add(ttl_millis)
-                            .ok_or(BootstrapIssueError::Time)?,
-                    )
-                    .map_err(|_| BootstrapIssueError::Time)?,
+                    expires_at_millis: request.connector.expires_at_millis,
                     enrollment_token: SecretToken::generate().map_err(BootstrapIssueError::from)?,
                     mcp_bearer: SecretToken::generate().map_err(BootstrapIssueError::from)?,
                 };
                 atomic_create_handoff(path, &handoff).map_err(BootstrapIssueError::from)?;
-                (handoff, true, created)
+                (handoff, true)
             }
             Err(_) => return Err(BootstrapIssueError::Handoff),
         };
@@ -1569,7 +1719,6 @@ impl LockedBootstrapHandoff {
             _lock: lock,
             path: path.to_owned(),
             handoff,
-            created_at_millis,
             was_new,
         })
     }
@@ -1629,6 +1778,220 @@ impl HandoffParentLock {
         validate_handoff_parent(parent)?;
         Ok(Self { _file: file })
     }
+}
+
+#[cfg(unix)]
+fn ensure_bootstrap_lock_root(root: &Path) -> Result<(), BootstrapIssueError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    let parent = root.parent().ok_or(BootstrapIssueError::FilePermissions)?;
+    if let Err(error) = fs::symlink_metadata(parent) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(BootstrapIssueError::FilePermissions);
+        }
+        let grandparent = parent
+            .parent()
+            .ok_or(BootstrapIssueError::FilePermissions)?;
+        validate_bootstrap_lock_parent(grandparent)?;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o755);
+        match builder.create(parent) {
+            Ok(()) => sync_parent(grandparent).map_err(BootstrapIssueError::from)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(BootstrapIssueError::FilePermissions),
+        }
+    }
+    validate_bootstrap_lock_parent(parent)?;
+    if let Err(error) = fs::symlink_metadata(root) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(BootstrapIssueError::FilePermissions);
+        }
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(root) {
+            Ok(()) => sync_parent(parent).map_err(BootstrapIssueError::from)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(BootstrapIssueError::FilePermissions),
+        }
+    }
+    let metadata = fs::symlink_metadata(root).map_err(|_| BootstrapIssueError::FilePermissions)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(BootstrapIssueError::FilePermissions);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_bootstrap_lock_parent(parent: &Path) -> Result<(), BootstrapIssueError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata =
+        fs::symlink_metadata(parent).map_err(|_| BootstrapIssueError::FilePermissions)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o022 != 0
+    {
+        Err(BootstrapIssueError::FilePermissions)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn open_or_create_bootstrap_lock(path: &Path) -> Result<File, BootstrapIssueError> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let created = open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    );
+    let file = match created {
+        Ok(file) => {
+            let file = File::from(file);
+            file.sync_all().map_err(|_| BootstrapIssueError::File)?;
+            let parent = path.parent().ok_or(BootstrapIssueError::File)?;
+            sync_parent(parent).map_err(BootstrapIssueError::from)?;
+            file
+        }
+        Err(rustix::io::Errno::EXIST) => open(
+            path,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|_| BootstrapIssueError::FilePermissions)?,
+        Err(_) => return Err(BootstrapIssueError::File),
+    };
+    validate_bootstrap_lock_file(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_bootstrap_lock_file(file: &File) -> Result<(), BootstrapIssueError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| BootstrapIssueError::FilePermissions)?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        Err(BootstrapIssueError::FilePermissions)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn bind_bootstrap_lock_file(
+    file: &mut File,
+    tenant_id: TenantId,
+    operation_id: RequestId,
+    handoff_path: &str,
+    plan_path: &str,
+    proposed_created_at_millis: i64,
+    expires_at_millis: i64,
+) -> Result<i64, BootstrapIssueError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| BootstrapIssueError::File)?;
+    let mut existing = Vec::new();
+    (&mut *file)
+        .take(MAX_JSON_BYTES + 1)
+        .read_to_end(&mut existing)
+        .map_err(|_| BootstrapIssueError::File)?;
+    let binding = if existing.is_empty() {
+        let binding = BootstrapIssueLockBinding {
+            schema: "dirextalk.connector-bootstrap-issuance-lock".to_owned(),
+            schema_version: 1,
+            tenant_id,
+            operation_id,
+            handoff_path: handoff_path.to_owned(),
+            plan_path: plan_path.to_owned(),
+            created_at_millis: proposed_created_at_millis,
+        };
+        let encoded = serde_json::to_vec(&binding).map_err(|_| BootstrapIssueError::File)?;
+        if encoded.is_empty()
+            || encoded.len() > usize::try_from(MAX_JSON_BYTES).unwrap_or(usize::MAX)
+        {
+            return Err(BootstrapIssueError::File);
+        }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| BootstrapIssueError::File)?;
+        file.write_all(&encoded)
+            .map_err(|_| BootstrapIssueError::File)?;
+        file.sync_all().map_err(|_| BootstrapIssueError::File)?;
+        binding
+    } else {
+        let binding: BootstrapIssueLockBinding =
+            serde_json::from_slice(&existing).map_err(|_| BootstrapIssueError::HandoffConflict)?;
+        if serde_json::to_vec(&binding).map_err(|_| BootstrapIssueError::File)? != existing {
+            return Err(BootstrapIssueError::HandoffConflict);
+        }
+        binding
+    };
+    let ttl_millis = expires_at_millis
+        .checked_sub(binding.created_at_millis)
+        .ok_or(BootstrapIssueError::HandoffConflict)?;
+    if binding.schema != "dirextalk.connector-bootstrap-issuance-lock"
+        || binding.schema_version != 1
+        || binding.tenant_id != tenant_id
+        || binding.operation_id != operation_id
+        || binding.handoff_path != handoff_path
+        || binding.plan_path != plan_path
+        || !(MIN_PROVISIONING_ENROLLMENT_TTL_MILLIS..=MAX_ENROLLMENT_TTL_MILLIS)
+            .contains(&ttl_millis)
+    {
+        return Err(BootstrapIssueError::HandoffConflict);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| BootstrapIssueError::File)?;
+    let mut verified = Vec::new();
+    (&mut *file)
+        .take(MAX_JSON_BYTES + 1)
+        .read_to_end(&mut verified)
+        .map_err(|_| BootstrapIssueError::File)?;
+    let expected = serde_json::to_vec(&binding).map_err(|_| BootstrapIssueError::File)?;
+    if verified == expected {
+        Ok(binding.created_at_millis)
+    } else {
+        Err(BootstrapIssueError::File)
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_bootstrap_lock_root(_: &Path) -> Result<(), BootstrapIssueError> {
+    Err(BootstrapIssueError::RootRequired)
+}
+
+#[cfg(not(unix))]
+fn open_or_create_bootstrap_lock(_: &Path) -> Result<File, BootstrapIssueError> {
+    Err(BootstrapIssueError::RootRequired)
+}
+
+#[cfg(not(unix))]
+fn validate_bootstrap_lock_file(_: &File) -> Result<(), BootstrapIssueError> {
+    Err(BootstrapIssueError::RootRequired)
+}
+
+#[cfg(not(unix))]
+fn bind_bootstrap_lock_file(
+    _: &mut File,
+    _: TenantId,
+    _: RequestId,
+    _: &str,
+    _: &str,
+    _: i64,
+    _: i64,
+) -> Result<i64, BootstrapIssueError> {
+    Err(BootstrapIssueError::RootRequired)
 }
 
 struct SecretToken([u8; 32]);
@@ -1696,6 +2059,9 @@ fn parse_plan(bytes: &[u8]) -> Result<ProvisioningPlan, ProvisionError> {
 fn parse_bootstrap_issue_request(
     bytes: &[u8],
 ) -> Result<BootstrapIssueRequest, BootstrapIssueError> {
+    if bytes.contains(&b'\\') {
+        return Err(BootstrapIssueError::Request);
+    }
     serde_json::from_slice(bytes).map_err(|_| BootstrapIssueError::Request)
 }
 
@@ -1703,21 +2069,20 @@ fn validate_bootstrap_issue_request(
     request: &mut BootstrapIssueRequest,
     now: i64,
 ) -> Result<(), BootstrapIssueError> {
+    let expires_at_millis = i64::try_from(request.connector.expires_at_millis)
+        .map_err(|_| BootstrapIssueError::Request)?;
+    let ttl_millis = expires_at_millis
+        .checked_sub(now)
+        .ok_or(BootstrapIssueError::Request)?;
     if request.schema != "dirextalk.connector-bootstrap-issuance-request"
         || request.schema_version != 1
-        || request.manifest_digest.bytes() == [0; 32]
-        || !matches!(
-            request.target.as_str(),
-            "linux-amd64" | "linux-arm64" | "windows-amd64"
-        )
+        || !matches!(request.target.as_str(), "linux-amd64" | "linux-arm64")
         || request.connector.generation != 1
         || request.connector.spec_revision != 1
-        || request.connector.expires_at_millis <= u64::try_from(now).unwrap_or(u64::MAX)
-        || request.connector.expires_at_millis
-            > u64::try_from(now.saturating_add(MAX_ENROLLMENT_TTL_MILLIS)).unwrap_or(u64::MAX)
+        || !(MIN_PROVISIONING_ENROLLMENT_TTL_MILLIS..=MAX_ENROLLMENT_TTL_MILLIS)
+            .contains(&ttl_millis)
         || !is_semver(&request.connector_artifact.version)
-        || request.connector_artifact.digest.bytes() == [0; 32]
-        || !is_canonical_https_origin(&request.connector.server_origin)
+        || !bootstrap_valid_origin(&request.connector.server_origin)
         || !is_canonical_endpoint(
             &request.connector.trust.enrollment_url,
             &request.connector.trust.enrollment_server_name,
@@ -1726,28 +2091,20 @@ fn validate_bootstrap_issue_request(
             &request.connector.trust.control_url,
             &request.connector.trust.control_server_name,
         )
-        || !is_canonical_server_name(&request.connector.trust.enrollment_server_name)
-        || !is_canonical_server_name(&request.connector.trust.control_server_name)
-        || request.connector.trust.enrollment_root_ca_sha256.bytes() == [0; 32]
-        || request
-            .connector
-            .trust
-            .control_server_root_ca_sha256
-            .bytes()
-            == [0; 32]
-        || request
-            .connector
-            .trust
-            .connector_issuer_root_ca_sha256
-            .bytes()
-            == [0; 32]
         || !is_canonical_mcp_name(&request.connector.remote_mcp.mcp_server_name)
         || !is_canonical_mcp_url(&request.connector.remote_mcp.mcp_url)
         || request.connector.remote_mcp.max_concurrent_runs == 0
         || request.connector.remote_mcp.max_concurrent_runs > 4096
         || request.connector.remote_mcp.offline_policy != "queue"
+        || !matches!(
+            request.connector.runtime_profile.as_str(),
+            "default" | "safe"
+        )
         || request.connector.display_name.is_empty()
         || request.connector.display_name.len() > 128
+        || bootstrap_request_strings(request)
+            .iter()
+            .any(|value| value.contains(['<', '>', '&', '\u{2028}', '\u{2029}']))
     {
         return Err(BootstrapIssueError::Request);
     }
@@ -1827,27 +2184,34 @@ fn bootstrap_issue_plan(
 }
 
 fn is_semver(value: &str) -> bool {
-    let cut = value.find(['-', '+']).unwrap_or(value.len());
-    let (core, suffix) = value.split_at(cut);
-    let parts = core.split('.').collect::<Vec<_>>();
-    parts.len() == 3
-        && parts.iter().all(|part| {
+    let (without_build, build) = match value.split_once('+') {
+        Some((head, tail)) if !tail.contains('+') => (head, Some(tail)),
+        Some(_) => return false,
+        None => (value, None),
+    };
+    let (main, prerelease) = match without_build.split_once('-') {
+        Some((head, tail)) => (head, Some(tail)),
+        None => (without_build, None),
+    };
+    main.split('.').count() == 3
+        && main.split('.').all(|part| {
             !part.is_empty()
-                && (part == &"0" || !part.starts_with('0'))
-                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part == "0"
+                    || (!part.starts_with('0') && part.bytes().all(|byte| byte.is_ascii_digit())))
         })
-        && (suffix.is_empty()
-            || suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')))
+        && [prerelease, build].into_iter().flatten().all(|suffix| {
+            !suffix.is_empty()
+                && suffix.split('.').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+        })
 }
 
 fn is_canonical_endpoint(value: &str, server_name: &str) -> bool {
-    let Some(authority) = value.strip_prefix("https://") else {
-        return false;
-    };
-    let authority = authority.strip_suffix('/').unwrap_or(authority);
-    authority == server_name && is_canonical_server_name(server_name)
+    matches!(bootstrap_https_parts(value), Some((host, "" | "/")) if host == server_name && server_name == server_name.trim() && bootstrap_dns_name(server_name))
 }
 
 fn is_canonical_mcp_name(value: &str) -> bool {
@@ -1856,14 +2220,60 @@ fn is_canonical_mcp_name(value: &str) -> bool {
         && value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
         })
-        && value.as_bytes()[0].is_ascii_lowercase()
+        && (value.as_bytes()[0].is_ascii_lowercase() || value.as_bytes()[0].is_ascii_digit())
 }
 
 fn is_canonical_mcp_url(value: &str) -> bool {
-    value.strip_prefix("https://").is_some_and(|rest| {
-        let rest = rest.strip_suffix("/mcp").unwrap_or("");
-        !rest.is_empty() && is_canonical_server_name(rest)
-    })
+    matches!(bootstrap_https_parts(value), Some((_, "/mcp")))
+}
+
+fn bootstrap_valid_origin(value: &str) -> bool {
+    matches!(bootstrap_https_parts(value), Some((_, "")))
+}
+
+fn bootstrap_https_parts(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix("https://")?;
+    if rest.contains(['@', '#', '?']) {
+        return None;
+    }
+    let slash = rest.find('/');
+    let (host, path) = slash.map_or((rest, ""), |index| (&rest[..index], &rest[index..]));
+    if host.is_empty() || host.contains(':') || !bootstrap_dns_name(host) {
+        return None;
+    }
+    Some((host, path))
+}
+
+fn bootstrap_dns_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+        })
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+fn bootstrap_request_strings(request: &BootstrapIssueRequest) -> [&str; 13] {
+    [
+        &request.schema,
+        &request.target,
+        &request.connector_artifact.version,
+        &request.connector.display_name,
+        &request.connector.server_origin,
+        &request.connector.runtime_profile,
+        &request.connector.trust.enrollment_url,
+        &request.connector.trust.enrollment_server_name,
+        &request.connector.trust.control_url,
+        &request.connector.trust.control_server_name,
+        &request.connector.remote_mcp.mcp_server_name,
+        &request.connector.remote_mcp.mcp_url,
+        &request.connector.remote_mcp.offline_policy,
+    ]
 }
 
 fn parse_handoff(bytes: &[u8]) -> Result<ProvisioningHandoff, ProvisionError> {
@@ -2852,11 +3262,11 @@ fn read_root_request_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, Boots
     }
 }
 
-fn handoff_path_exists(path: &Path) -> Result<bool, BootstrapIssueError> {
+fn destination_exists(path: &Path) -> Result<bool, BootstrapIssueError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
-                Err(BootstrapIssueError::Handoff)
+                Err(BootstrapIssueError::File)
             } else {
                 Ok(true)
             }
@@ -2866,44 +3276,72 @@ fn handoff_path_exists(path: &Path) -> Result<bool, BootstrapIssueError> {
     }
 }
 
-async fn bootstrap_issuance_exists(
-    store: &PgStore,
-    tenant_id: TenantId,
-    operation_id: RequestId,
-) -> Result<bool, BootstrapIssueError> {
-    let mut session = store
-        .begin_tenant(tenant_id)
-        .await
-        .map_err(|_| BootstrapIssueError::Database)?;
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM agent.connector_bootstrap_issuances WHERE tenant_id=$1 AND operation_id=$2)",
-    )
-    .bind(tenant_id.as_uuid())
-    .bind(operation_id.as_uuid())
-    .fetch_one(session.connection())
-    .await
-    .map_err(|_| BootstrapIssueError::Database)?;
-    session
-        .commit()
-        .await
-        .map_err(|_| BootstrapIssueError::Database)?;
-    Ok(exists)
+struct BootstrapIssuanceRecovery {
+    request_digest: Vec<u8>,
+    plan_digest: Vec<u8>,
+    handoff_digest: Vec<u8>,
+    enrollment_token_digest: Vec<u8>,
+    mcp_bearer_digest: Vec<u8>,
+    handoff_path: String,
+    plan_path: String,
+    request_json: serde_json::Value,
+    plan_json: serde_json::Value,
+    enrollment_intent_id: String,
+    expires_at_millis: i64,
+    created_at_millis: i64,
 }
 
-async fn bootstrap_issuance_secret_facts_match(
+impl BootstrapIssuanceRecovery {
+    fn matches_request(
+        &self,
+        request_digest: Sha256Digest,
+        request_json: &serde_json::Value,
+        paths: &BootstrapIssuePaths,
+    ) -> bool {
+        self.request_digest == request_digest.as_bytes()
+            && self.request_json == *request_json
+            && self.handoff_path == paths.handoff_text
+            && self.plan_path == paths.plan_text
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matches_material(
+        &self,
+        plan_json: &serde_json::Value,
+        plan_digest: Sha256Digest,
+        handoff_digest: Sha256Digest,
+        enrollment_token_digest: Sha256Digest,
+        mcp_bearer_digest: Sha256Digest,
+        enrollment_intent_id: EnrollmentIntentId,
+        created_at_millis: i64,
+        expires_at_millis: i64,
+    ) -> bool {
+        self.plan_json == *plan_json
+            && self.plan_digest == plan_digest.as_bytes()
+            && self.handoff_digest == handoff_digest.as_bytes()
+            && self.enrollment_token_digest == enrollment_token_digest.as_bytes()
+            && self.mcp_bearer_digest == mcp_bearer_digest.as_bytes()
+            && self.enrollment_intent_id == enrollment_intent_id.to_string()
+            && self.created_at_millis == created_at_millis
+            && self.expires_at_millis == expires_at_millis
+    }
+}
+
+async fn load_bootstrap_issuance(
     store: &PgStore,
     tenant_id: TenantId,
     operation_id: RequestId,
-    handoff_digest: Sha256Digest,
-    enrollment_token_digest: Sha256Digest,
-    mcp_bearer_digest: Sha256Digest,
-) -> Result<bool, BootstrapIssueError> {
+) -> Result<Option<BootstrapIssuanceRecovery>, BootstrapIssueError> {
     let mut session = store
         .begin_tenant(tenant_id)
         .await
         .map_err(|_| BootstrapIssueError::Database)?;
     let row = sqlx::query(
-        "SELECT handoff_digest, enrollment_token_digest, mcp_bearer_digest
+        "SELECT request_digest, plan_digest, handoff_digest,
+                enrollment_token_digest, mcp_bearer_digest,
+                handoff_path, plan_path, request_json, plan_json,
+                enrollment_intent_id::text AS enrollment_intent_id,
+                expires_at_ms, created_at_ms
            FROM agent.connector_bootstrap_issuances
           WHERE tenant_id=$1 AND operation_id=$2",
     )
@@ -2912,27 +3350,28 @@ async fn bootstrap_issuance_secret_facts_match(
     .fetch_optional(session.connection())
     .await
     .map_err(|_| BootstrapIssueError::Database)?;
-    let matches = match row {
-        Some(row) => {
-            row.try_get::<Vec<u8>, _>("handoff_digest")
-                .map_err(|_| BootstrapIssueError::Database)?
-                == handoff_digest.as_bytes()
-                && row
-                    .try_get::<Vec<u8>, _>("enrollment_token_digest")
-                    .map_err(|_| BootstrapIssueError::Database)?
-                    == enrollment_token_digest.as_bytes()
-                && row
-                    .try_get::<Vec<u8>, _>("mcp_bearer_digest")
-                    .map_err(|_| BootstrapIssueError::Database)?
-                    == mcp_bearer_digest.as_bytes()
-        }
-        None => true,
-    };
     session
         .commit()
         .await
         .map_err(|_| BootstrapIssueError::Database)?;
-    Ok(matches)
+    row.map(|row| {
+        Ok(BootstrapIssuanceRecovery {
+            request_digest: row.try_get("request_digest")?,
+            plan_digest: row.try_get("plan_digest")?,
+            handoff_digest: row.try_get("handoff_digest")?,
+            enrollment_token_digest: row.try_get("enrollment_token_digest")?,
+            mcp_bearer_digest: row.try_get("mcp_bearer_digest")?,
+            handoff_path: row.try_get("handoff_path")?,
+            plan_path: row.try_get("plan_path")?,
+            request_json: row.try_get("request_json")?,
+            plan_json: row.try_get("plan_json")?,
+            enrollment_intent_id: row.try_get("enrollment_intent_id")?,
+            expires_at_millis: row.try_get("expires_at_ms")?,
+            created_at_millis: row.try_get("created_at_ms")?,
+        })
+    })
+    .transpose()
+    .map_err(|_: sqlx::Error| BootstrapIssueError::Database)
 }
 
 fn read_service_secret_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, AcceptanceError> {
@@ -3383,28 +3822,56 @@ struct BootstrapIssueReport {
     handoff_created: bool,
 }
 
-fn write_redacted_plan(path: &Path, plan: &BootstrapIssuePlan) -> Result<(), BootstrapIssueError> {
-    let bytes = serde_json::to_vec(plan).map_err(|_| BootstrapIssueError::Plan)?;
+fn validate_existing_plan(path: &Path, bytes: &[u8]) -> Result<bool, BootstrapIssueError> {
     if bytes.len() > usize::try_from(MAX_JSON_BYTES).unwrap_or(usize::MAX) {
         return Err(BootstrapIssueError::Plan);
     }
     let parent = path.parent().ok_or(BootstrapIssueError::Plan)?;
-    let parent_metadata = fs::symlink_metadata(parent).map_err(|_| BootstrapIssueError::File)?;
-    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
-        return Err(BootstrapIssueError::File);
+    validate_handoff_parent(parent).map_err(BootstrapIssueError::from)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(BootstrapIssueError::Plan);
+            }
+            let existing = read_regular_bounded(path, MAX_JSON_BYTES, true)
+                .map_err(BootstrapIssueError::from)?;
+            if existing != bytes {
+                return Err(BootstrapIssueError::Plan);
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(BootstrapIssueError::File),
     }
+}
+
+fn publish_redacted_plan(path: &Path, bytes: &[u8]) -> Result<(), BootstrapIssueError> {
+    if validate_existing_plan(path, bytes)? {
+        return Ok(());
+    }
+    let parent = path.parent().ok_or(BootstrapIssueError::Plan)?;
     let temp = temporary_path(parent).map_err(BootstrapIssueError::from)?;
     let result = (|| {
         let mut file = create_secret_file(&temp).map_err(BootstrapIssueError::from)?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .map_err(|_| BootstrapIssueError::File)?;
         file.sync_all().map_err(|_| BootstrapIssueError::File)?;
         drop(file);
-        fs::rename(&temp, path).map_err(|_| BootstrapIssueError::File)?;
-        sync_parent(parent).map_err(BootstrapIssueError::from)
+        match fs::hard_link(&temp, path) {
+            Ok(()) => {
+                fs::remove_file(&temp).map_err(|_| BootstrapIssueError::File)?;
+                sync_parent(parent).map_err(BootstrapIssueError::from)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                fs::remove_file(&temp).map_err(|_| BootstrapIssueError::File)?;
+            }
+            Err(_) => return Err(BootstrapIssueError::File),
+        }
+        validate_existing_plan(path, bytes)
+            .and_then(|published| published.then_some(()).ok_or(BootstrapIssueError::Plan))
     })();
     if result.is_err() {
-        let _ = fs::remove_file(temp);
+        let _ = fs::remove_file(&temp);
     }
     result
 }
@@ -3413,8 +3880,21 @@ fn report_bootstrap_issue(
     plan: &BootstrapIssuePlan,
     handoff_created: bool,
 ) -> Result<(), BootstrapIssueError> {
+    let report = bootstrap_issue_report(plan, handoff_created)?;
+    let mut output = io::stdout().lock();
+    serde_json::to_writer(&mut output, &report).map_err(|_| BootstrapIssueError::Output)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| BootstrapIssueError::Output)?;
+    output.flush().map_err(|_| BootstrapIssueError::Output)
+}
+
+fn bootstrap_issue_report(
+    plan: &BootstrapIssuePlan,
+    handoff_created: bool,
+) -> Result<BootstrapIssueReport, BootstrapIssueError> {
     let plan_json = serde_json::to_vec(plan).map_err(|_| BootstrapIssueError::Plan)?;
-    let report = BootstrapIssueReport {
+    Ok(BootstrapIssueReport {
         schema: "dirextalk.connector-bootstrap-issuance-result",
         schema_version: 1,
         state: "ready",
@@ -3429,13 +3909,7 @@ fn report_bootstrap_issue(
         expires_at_millis: plan.connector.expires_at_millis,
         plan_published: true,
         handoff_created,
-    };
-    let mut output = io::stdout().lock();
-    serde_json::to_writer(&mut output, &report).map_err(|_| BootstrapIssueError::Output)?;
-    output
-        .write_all(b"\n")
-        .map_err(|_| BootstrapIssueError::Output)?;
-    output.flush().map_err(|_| BootstrapIssueError::Output)
+    })
 }
 
 #[derive(Serialize)]
@@ -3869,7 +4343,7 @@ impl From<ProvisionError> for BootstrapIssueError {
 impl fmt::Display for BootstrapIssueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Usage => "usage: dtx-agent-provision bootstrap-issue --database-url-file <0600-file> --request-file <0600-json> --handoff-file <0600-json> [--plan-file <json>]",
+            Self::Usage => "usage: dtx-agent-provision bootstrap-issue --database-url-file <0600-file> --request-file <0600-json> --handoff-file <tenant-operation.handoff.json> --plan-file <tenant-operation.plan.json>",
             Self::RootRequired => "bootstrap issuance is root-only",
             Self::Request => "Connector bootstrap issuance request is invalid",
             Self::Plan => "Connector bootstrap plan is invalid",
@@ -3966,6 +4440,99 @@ mod tests {
       "enrollment_server_name":"enroll.dirextalk.ai",
       "enrollment_root_ca_sha256":"2222222222222222222222222222222222222222222222222222222222222222"
     }"#;
+
+    const SHARED_CANONICAL_BOOTSTRAP_PLAN: &str =
+        include_str!("../../../test-vectors/connector-bootstrap-v1/canonical-plan.json");
+    const SHARED_INVALID_BOOTSTRAP_FIELDS: &str =
+        include_str!("../../../test-vectors/connector-bootstrap-v1/invalid-fields.json");
+
+    fn bootstrap_digest(value: &[u8]) -> Digest32 {
+        Digest32(plain_digest(value).as_bytes())
+    }
+
+    fn bootstrap_issue_request() -> BootstrapIssueRequest {
+        BootstrapIssueRequest {
+            schema: "dirextalk.connector-bootstrap-issuance-request".to_owned(),
+            schema_version: 1,
+            operation_id: RequestId::from_str("0197f1f0-0000-7000-8000-000000000005").unwrap(),
+            manifest_digest: bootstrap_digest(b"manifest"),
+            target: "linux-amd64".to_owned(),
+            connector_artifact: BootstrapArtifact {
+                version: "1.2.3-alpha.1+build-1".to_owned(),
+                digest: bootstrap_digest(b"release"),
+            },
+            host: BootstrapHost {
+                tenant_id: TenantId::from_str("0197f1f0-0000-7000-8000-000000000001").unwrap(),
+                host_id: HostId::from_str("0197f1f0-0000-7000-8000-000000000002").unwrap(),
+                owner_id: IdentityId::from_str(
+                    "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la",
+                )
+                .unwrap(),
+                host_credential_id: HostCredentialId::from_str(
+                    "0197f1f0-0000-7000-8000-000000000009",
+                )
+                .unwrap(),
+            },
+            connector: BootstrapRequestConnector {
+                instance_id: ConnectorId::from_str("0197f1f0-0000-7000-8000-000000000003").unwrap(),
+                adapter_kind: AdapterCode::Codex,
+                display_name: "Connector".to_owned(),
+                generation: 1,
+                spec_revision: 1,
+                enrollment_request_id: RequestId::from_str("0197f1f0-0000-7000-8000-000000000006")
+                    .unwrap(),
+                installation_id: InstallationId::from_str("0197f1f0-0000-7000-8000-00000000000a")
+                    .unwrap(),
+                agent_device_id: AgentDeviceId::from_str("0197f1f0-0000-7000-8000-00000000000b")
+                    .unwrap(),
+                binding_id: BindingId::from_str("0197f1f0-0000-7000-8000-00000000000c").unwrap(),
+                expires_at_millis: 4_000_000_000,
+                server_origin: "https://server.example".to_owned(),
+                trust: BootstrapTrust {
+                    enrollment_url: "https://enroll.example/".to_owned(),
+                    enrollment_server_name: "enroll.example".to_owned(),
+                    enrollment_root_ca_sha256: bootstrap_digest(b"enrollment"),
+                    control_url: "https://control.example".to_owned(),
+                    control_server_name: "control.example".to_owned(),
+                    control_server_root_ca_sha256: bootstrap_digest(b"control"),
+                    connector_issuer_root_ca_sha256: bootstrap_digest(b"issuer"),
+                },
+                runtime_profile: "safe".to_owned(),
+                remote_mcp: BootstrapRemoteMcp {
+                    mcp_server_name: "mcp_1".to_owned(),
+                    mcp_url: "https://mcp.example/mcp".to_owned(),
+                    mcp_node_id: RequestId::from_str("0197f1f0-0000-7000-8000-00000000000d")
+                        .unwrap(),
+                    max_concurrent_runs: 1,
+                    offline_policy: "queue".to_owned(),
+                },
+            },
+        }
+    }
+
+    fn bootstrap_issue_handoff(request: &BootstrapIssueRequest) -> BootstrapIssueHandoff {
+        BootstrapIssueHandoff {
+            schema: "dirextalk.connector-bootstrap-handoff".to_owned(),
+            schema_version: 1,
+            state: HandoffState::Ready,
+            operation_id: request.operation_id,
+            manifest_digest: request.manifest_digest,
+            target: request.target.clone(),
+            tenant_id: request.host.tenant_id,
+            host_id: request.host.host_id,
+            instance_id: request.connector.instance_id,
+            enrollment_request_id: request.connector.enrollment_request_id,
+            enrollment_intent_id: EnrollmentIntentId::from_str(
+                "0197f1f0-0000-7000-8000-000000000007",
+            )
+            .unwrap(),
+            generation: 1,
+            spec_revision: 1,
+            expires_at_millis: request.connector.expires_at_millis,
+            enrollment_token: SecretToken([0x11; 32]),
+            mcp_bearer: SecretToken([0x22; 32]),
+        }
+    }
 
     fn credential_reissue_plan() -> CredentialReissuePlan {
         let mut plan = parse_credential_reissue_plan(CREDENTIAL_REISSUE_PLAN.as_bytes()).unwrap();
@@ -4102,6 +4669,386 @@ mod tests {
                 credential_fingerprint: Base64Digest32([0x61 + u8::try_from(index).unwrap(); 32]),
             })
             .collect()
+    }
+
+    #[test]
+    fn bootstrap_issuer_accepts_the_exact_shared_host_connector_contract() {
+        let mut request = bootstrap_issue_request();
+        validate_bootstrap_issue_request(&mut request, 3_999_700_000).unwrap();
+        let handoff = bootstrap_issue_handoff(&request);
+        let handoff_digest: Digest32 = serde_json::from_str(
+            "\"c21ed50aa964770b16d098c18f1845d4fd75a0eccda9c3cd791d9a86840902d3\"",
+        )
+        .unwrap();
+        let plan = bootstrap_issue_plan(
+            &request,
+            &handoff,
+            Sha256Digest::from_bytes(handoff_digest.bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&plan).unwrap(),
+            SHARED_CANONICAL_BOOTSTRAP_PLAN.trim_end().as_bytes()
+        );
+        let handoff_json = serde_json::to_value(&handoff).unwrap();
+        let report_json =
+            serde_json::to_string(&bootstrap_issue_report(&plan, true).unwrap()).unwrap();
+        for field in ["enrollment_token", "mcp_bearer"] {
+            let secret = handoff_json[field].as_str().unwrap();
+            assert!(!report_json.contains(secret));
+            assert!(!report_json.contains(field));
+        }
+    }
+
+    #[test]
+    fn bootstrap_issuer_rejects_every_frozen_intersection_boundary() {
+        let invalid: serde_json::Value =
+            serde_json::from_str(SHARED_INVALID_BOOTSTRAP_FIELDS).unwrap();
+        for mutation in 0..12 {
+            let mut request = bootstrap_issue_request();
+            match mutation {
+                0 => {
+                    request.connector.runtime_profile =
+                        invalid["runtime_profile"].as_str().unwrap().to_owned();
+                }
+                1 => {
+                    request.connector.server_origin =
+                        invalid["server_origin"].as_str().unwrap().to_owned();
+                }
+                2 => {
+                    request.connector_artifact.version =
+                        invalid["version"].as_str().unwrap().to_owned();
+                }
+                3 => request.target = "windows-amd64".to_owned(),
+                4 => {
+                    request.connector.trust.enrollment_url =
+                        "https://enroll.example/path".to_owned();
+                }
+                5 => {
+                    let name = format!(
+                        "{}.{}.{}.{}",
+                        "a".repeat(63),
+                        "b".repeat(63),
+                        "c".repeat(63),
+                        "d".repeat(62)
+                    );
+                    request.connector.trust.control_url = format!("https://{name}");
+                    request.connector.trust.control_server_name = name;
+                }
+                6 => request.connector.remote_mcp.mcp_url = "https://mcp.example/mcp/".to_owned(),
+                7 => request.connector.remote_mcp.mcp_server_name = "Mcp".to_owned(),
+                8 => request.connector.display_name = "unsafe<name".to_owned(),
+                9 => request.connector.remote_mcp.offline_policy = "drop".to_owned(),
+                10 => request.connector.generation = 2,
+                11 => request.connector.remote_mcp.max_concurrent_runs = 4097,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                validate_bootstrap_issue_request(&mut request, 3_999_700_000),
+                Err(BootstrapIssueError::Request),
+                "mutation {mutation} must fail closed"
+            );
+        }
+
+        for version in ["1.2", "01.2.3", "1.02.3", "1.2.03", "1.2.3+", "1.2.3++x"] {
+            assert!(!is_semver(version), "{version}");
+        }
+        assert!(!bootstrap_dns_name(&format!("{}.example", "a".repeat(64))));
+        assert!(!bootstrap_dns_name(&format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        )));
+        for adapter in [
+            "codex",
+            "openclaw_acp",
+            "eino",
+            "rig",
+            "claude_code",
+            "custom_acp",
+            "hermes_acp",
+        ] {
+            let encoded = serde_json::to_string(&bootstrap_issue_request())
+                .unwrap()
+                .replacen("\"codex\"", &format!("\"{adapter}\""), 1);
+            let mut parsed = parse_bootstrap_issue_request(encoded.as_bytes()).unwrap();
+            validate_bootstrap_issue_request(&mut parsed, 3_999_700_000).unwrap();
+        }
+        let mut minimum = bootstrap_issue_request();
+        validate_bootstrap_issue_request(&mut minimum, 3_999_940_000).unwrap();
+        let mut maximum = bootstrap_issue_request();
+        validate_bootstrap_issue_request(&mut maximum, 3_999_400_000).unwrap();
+        let mut too_short = bootstrap_issue_request();
+        assert_eq!(
+            validate_bootstrap_issue_request(&mut too_short, 3_999_940_001),
+            Err(BootstrapIssueError::Request)
+        );
+        let mut too_long = bootstrap_issue_request();
+        assert_eq!(
+            validate_bootstrap_issue_request(&mut too_long, 3_999_399_999),
+            Err(BootstrapIssueError::Request)
+        );
+
+        let encoded = serde_json::to_vec(&bootstrap_issue_request()).unwrap();
+        let escaped =
+            String::from_utf8(encoded)
+                .unwrap()
+                .replacen("Connector", "Connector\\u003c", 1);
+        assert_eq!(
+            parse_bootstrap_issue_request(escaped.as_bytes()).err(),
+            Some(BootstrapIssueError::Request)
+        );
+        let unknown_adapter = serde_json::to_string(&bootstrap_issue_request())
+            .unwrap()
+            .replacen("\"codex\"", "\"unknown\"", 1);
+        assert_eq!(
+            parse_bootstrap_issue_request(unknown_adapter.as_bytes()).err(),
+            Some(BootstrapIssueError::Request)
+        );
+        let uppercase_digest = serde_json::to_string(&bootstrap_issue_request())
+            .unwrap()
+            .replacen(
+                "05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                "05B3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+                1,
+            );
+        assert_eq!(
+            parse_bootstrap_issue_request(uppercase_digest.as_bytes()).err(),
+            Some(BootstrapIssueError::Request)
+        );
+    }
+
+    #[test]
+    fn bootstrap_issue_parser_requires_both_fixed_artifact_paths() {
+        let base = [
+            OsString::from("dtx-agent-provision"),
+            OsString::from("bootstrap-issue"),
+            OsString::from("--database-url-file"),
+            OsString::from("database-url"),
+            OsString::from("--request-file"),
+            OsString::from("request.json"),
+            OsString::from("--handoff-file"),
+            OsString::from("handoff.json"),
+        ];
+        assert!(matches!(
+            BootstrapIssueArguments::parse(base),
+            Err(BootstrapIssueError::Usage)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_operation_lock_is_cross_path_and_operation_scoped() {
+        let directory = TemporaryDirectory::new(0o700);
+        let root = directory.path.join("locks");
+        let request = bootstrap_issue_request();
+        let lock = BootstrapOperationLock::acquire_at(
+            &root,
+            request.host.tenant_id,
+            request.operation_id,
+            "/root/a/issuance.handoff.json",
+            "/root/a/issuance.plan.json",
+            3_999_700_000,
+            4_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(lock.created_at_millis, 3_999_700_000);
+        let path = root.join(format!(
+            "{}-{}.lock",
+            request.host.tenant_id, request.operation_id
+        ));
+        let second = File::open(path).unwrap();
+        assert!(matches!(
+            second.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(
+            second.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(second);
+        drop(lock);
+        let replay = BootstrapOperationLock::acquire_at(
+            &root,
+            request.host.tenant_id,
+            request.operation_id,
+            "/root/a/issuance.handoff.json",
+            "/root/a/issuance.plan.json",
+            3_999_700_001,
+            4_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(replay.created_at_millis, 3_999_700_000);
+        drop(replay);
+        assert!(matches!(
+            BootstrapOperationLock::acquire_at(
+                &root,
+                request.host.tenant_id,
+                request.operation_id,
+                "/root/b/issuance.handoff.json",
+                "/root/b/issuance.plan.json",
+                3_999_700_001,
+                4_000_000_000,
+            ),
+            Err(BootstrapIssueError::HandoffConflict)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_operation_lock_child() {
+        let Some(root) = env::var_os("DTX_TEST_BOOTSTRAP_LOCK_ROOT") else {
+            return;
+        };
+        let ready = PathBuf::from(env::var_os("DTX_TEST_BOOTSTRAP_LOCK_READY").unwrap());
+        let release = PathBuf::from(env::var_os("DTX_TEST_BOOTSTRAP_LOCK_RELEASE").unwrap());
+        let request = bootstrap_issue_request();
+        let _lock = BootstrapOperationLock::acquire_at(
+            Path::new(&root),
+            request.host.tenant_id,
+            request.operation_id,
+            "/root/a/issuance.handoff.json",
+            "/root/a/issuance.plan.json",
+            3_999_700_000,
+            4_000_000_000,
+        )
+        .unwrap();
+        fs::write(&ready, b"ready").unwrap();
+        for _ in 0..500 {
+            if release.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("parent did not release lock child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_operation_lock_excludes_a_distinct_path_process() {
+        let directory = TemporaryDirectory::new(0o700);
+        let root = directory.path.join("locks");
+        let ready = directory.path.join("ready");
+        let release = directory.path.join("release");
+        let mut child = std::process::Command::new(env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::bootstrap_operation_lock_child")
+            .env("DTX_TEST_BOOTSTRAP_LOCK_ROOT", &root)
+            .env("DTX_TEST_BOOTSTRAP_LOCK_READY", &ready)
+            .env("DTX_TEST_BOOTSTRAP_LOCK_RELEASE", &release)
+            .spawn()
+            .unwrap();
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("lock child failed to acquire the operation lock");
+        }
+        let request = bootstrap_issue_request();
+        let lock_path = root.join(format!(
+            "{}-{}.lock",
+            request.host.tenant_id, request.operation_id
+        ));
+        let second = File::open(lock_path).unwrap();
+        let blocked = matches!(second.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+        fs::write(&release, b"release").unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert!(
+            blocked,
+            "alternate artifact paths must share one process lock"
+        );
+        assert!(matches!(
+            BootstrapOperationLock::acquire_at(
+                &root,
+                request.host.tenant_id,
+                request.operation_id,
+                "/root/b/issuance.handoff.json",
+                "/root/b/issuance.plan.json",
+                3_999_700_001,
+                4_000_000_000,
+            ),
+            Err(BootstrapIssueError::HandoffConflict)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_pending_handoff_and_plan_publish_recover_exactly() {
+        let directory = TemporaryDirectory::new(0o700);
+        let request = bootstrap_issue_request();
+        let prefix = format!("{}-{}", request.host.tenant_id, request.operation_id);
+        let handoff_path = directory.path.join(format!("{prefix}.handoff.json"));
+        let plan_path = directory.path.join(format!("{prefix}.plan.json"));
+        let missing_path = directory
+            .path
+            .join(format!("missing-{prefix}.handoff.json"));
+        let created_at = 3_999_400_000;
+        assert!(matches!(
+            LockedBootstrapHandoff::acquire(&request, created_at, 600_000, &missing_path, true,),
+            Err(BootstrapIssueError::HandoffUnavailable)
+        ));
+        assert!(
+            !missing_path.exists(),
+            "durable recovery must never re-mint"
+        );
+        let first =
+            LockedBootstrapHandoff::acquire(&request, created_at, 600_000, &handoff_path, false)
+                .unwrap();
+        let token_digest = first.handoff.enrollment_token.domain_token().digest();
+        let mcp_digest = first.handoff.mcp_bearer.sha256_digest();
+        let intent_id = first.handoff.enrollment_intent_id;
+        drop(first);
+        assert_eq!(
+            fs::metadata(&handoff_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let recovered =
+            LockedBootstrapHandoff::acquire(&request, created_at, 600_000, &handoff_path, true)
+                .unwrap();
+        assert!(!recovered.was_new);
+        assert_eq!(
+            recovered.handoff.enrollment_token.domain_token().digest(),
+            token_digest
+        );
+        assert_eq!(recovered.handoff.mcp_bearer.sha256_digest(), mcp_digest);
+        assert_eq!(recovered.handoff.enrollment_intent_id, intent_id);
+        drop(recovered);
+
+        let canonical = SHARED_CANONICAL_BOOTSTRAP_PLAN.trim_end().as_bytes();
+        publish_redacted_plan(&plan_path, canonical).unwrap();
+        publish_redacted_plan(&plan_path, canonical).unwrap();
+        assert_eq!(fs::read(&plan_path).unwrap(), canonical);
+        assert_eq!(
+            fs::metadata(&plan_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            publish_redacted_plan(&plan_path, b"different"),
+            Err(BootstrapIssueError::Plan)
+        );
+        fs::set_permissions(&plan_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            publish_redacted_plan(&plan_path, canonical),
+            Err(BootstrapIssueError::FilePermissions)
+        );
+        fs::set_permissions(&plan_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let symlink_path = directory.path.join("plan-link.json");
+        std::os::unix::fs::symlink(&plan_path, &symlink_path).unwrap();
+        assert_eq!(
+            publish_redacted_plan(&symlink_path, canonical),
+            Err(BootstrapIssueError::Plan)
+        );
     }
 
     #[test]

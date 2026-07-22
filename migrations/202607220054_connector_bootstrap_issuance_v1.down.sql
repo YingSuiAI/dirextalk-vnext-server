@@ -1,3 +1,11 @@
+DO $guard$ BEGIN
+  LOCK TABLE agent.connector_bootstrap_issuances IN SHARE ROW EXCLUSIVE MODE;
+  IF EXISTS (SELECT 1 FROM agent.connector_bootstrap_issuances) THEN
+    RAISE EXCEPTION 'cannot downgrade Connector bootstrap issuance v1 while durable issuance facts exist'
+      USING ERRCODE='55000';
+  END IF;
+END $guard$;
+
 DO $grant$ BEGIN
   IF to_regrole('dtx_agent_runtime') IS NOT NULL THEN
     REVOKE ALL ON agent.connector_bootstrap_issuances FROM dtx_agent_runtime;
