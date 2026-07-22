@@ -1074,6 +1074,22 @@ mod tests {
         frame
     }
 
+    fn fixture_with_explicit_trust_ports() -> V2RequestFrame {
+        let frame = fixture();
+        let plan = frame.material.as_ref().expect("material").plan_json();
+        let plan = replace_once(
+            plan,
+            "https://enroll.example/",
+            "https://enroll.example:8443/",
+        );
+        let plan = replace_once(
+            &plan,
+            "https://control.example",
+            "https://control.example:9443",
+        );
+        with_plan(frame, plan)
+    }
+
     #[test]
     fn secret_decoder_accepts_all_canonical_tail_classes_and_rejects_unused_bits() {
         for last in [0_u8, 1, 2, 3] {
@@ -1113,6 +1129,7 @@ mod tests {
     #[test]
     fn connector_fixture_parses_and_header_trust_is_bound() {
         assert!(ValidatedBootstrapRequest::parse(fixture()).is_ok());
+        assert!(ValidatedBootstrapRequest::parse(fixture_with_explicit_trust_ports()).is_ok());
         let mut bad = fixture();
         bad.header.control_ca_sha256 = Some(hex(b"wrong"));
         assert!(ValidatedBootstrapRequest::parse(bad).is_err());
