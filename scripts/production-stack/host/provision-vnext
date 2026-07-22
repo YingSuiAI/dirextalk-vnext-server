@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import fcntl, hashlib, ipaddress, json, os, re, stat, subprocess, sys, tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REQUEST = Path('/home/ubuntu/dirextalk-vnext.provision')
 STATE = Path('/var/lib/dirextalk-vnext/host-provision')
@@ -18,7 +18,13 @@ UUID7 = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9
 SEMVER = re.compile(r'(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z')
 DOMAIN = re.compile(r'(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z')
 IMAGE = re.compile(r'[^@\s]+@sha256:[0-9a-f]{64}\Z')
+VNET_IMAGE = re.compile(r'dirextalk/vnet-server@sha256:[0-9a-f]{64}\Z')
+HEX40 = re.compile(r'[0-9a-f]{40}\Z')
 KEYS = {'schema','schema_version','target','domain','tenant_id','indexer_id','private_ipv4','release_version','bundle_sha256','compose_sha256','server_image','migrator_image','postgres_image','caddy_image','probe_image'}
+MANIFEST_KEYS = {'schema','schema_version','version','source_commit','target','server_image','migrator_image','installer_sha256','files'}
+FILE_KEYS = {'path','sha256','mode'}
+RECEIPT_KEYS = {'schema','schema_version','target','domain','version','source_commit','bundle_sha256','manifest_sha256','server_image','migrator_image','previous_receipt_sha256','state','installed_at_ms','receipt_sha256'}
+CURRENT_RECEIPT = Path('/var/lib/dirextalk-vnext/receipts/current.json')
 
 class ContractError(RuntimeError): pass
 def canonical(v): return (json.dumps(v, sort_keys=True, separators=(',', ':'))+'\n').encode()
@@ -128,18 +134,57 @@ def material(v, release):
     make_tls(v)
 def ready(v, reqsha):
     body={'schema':RECEIPT_SCHEMA,'schema_version':1,'state':'ready','request_sha256':reqsha,'target':v['target'],'domain':v['domain'],'tenant_id':v['tenant_id'],'indexer_id':v['indexer_id'],'release_version':v['release_version'],'bundle_sha256':v['bundle_sha256'],'compose_sha256':v['compose_sha256']}; body['receipt_sha256']=sha(canonical(body)); return canonical(body)
-def validate_release(v, release):
-    try: manifest=json.loads(secure(release/'manifest.json',0o444,1024*1024),object_pairs_hook=pairs)
+def manifest_contract(raw):
+    try: manifest=json.loads(raw,object_pairs_hook=pairs)
     except Exception as e: raise ContractError('installed release manifest invalid') from e
-    if not isinstance(manifest,dict) or manifest.get('schema')!='dirextalk.vnext-stack-bundle' or manifest.get('version')!=v['release_version'] or manifest.get('server_image')!=v['server_image'] or manifest.get('migrator_image')!=v['migrator_image']: raise ContractError('installed release manifest does not bind request')
-    try: receipt=json.loads(secure(Path('/var/lib/dirextalk-vnext/receipts/current.json'),0o600),object_pairs_hook=pairs)
+    if not isinstance(manifest,dict) or set(manifest)!=MANIFEST_KEYS or raw!=canonical(manifest): raise ContractError('installed release manifest is not exact canonical JSON')
+    if manifest['schema']!='dirextalk.vnext-stack-bundle' or manifest['schema_version']!=1 or manifest['target']!='linux-amd64': raise ContractError('installed release manifest schema invalid')
+    if not isinstance(manifest['version'],str) or not SEMVER.fullmatch(manifest['version']) or not isinstance(manifest['source_commit'],str) or not HEX40.fullmatch(manifest['source_commit']): raise ContractError('installed release manifest version invalid')
+    if any(not isinstance(manifest[k],str) or not VNET_IMAGE.fullmatch(manifest[k]) for k in ('server_image','migrator_image')) or not isinstance(manifest['installer_sha256'],str) or not HEX64.fullmatch(manifest['installer_sha256']): raise ContractError('installed release manifest image or installer invalid')
+    records=manifest['files']
+    if not isinstance(records,list) or not records: raise ContractError('installed release manifest files invalid')
+    paths=[]
+    for record in records:
+        if not isinstance(record,dict) or set(record)!=FILE_KEYS: raise ContractError('installed release file record invalid')
+        path=record['path']; parsed=PurePosixPath(path) if isinstance(path,str) else None
+        if parsed is None or parsed.is_absolute() or '..' in parsed.parts or str(parsed)!=path or record['mode'] not in ('0444','0555') or not isinstance(record['sha256'],str) or not HEX64.fullmatch(record['sha256']): raise ContractError('installed release file record unsafe')
+        paths.append(path)
+    if paths!=sorted(paths) or len(paths)!=len(set(paths)): raise ContractError('installed release file records not sorted unique')
+    installer=next((r for r in records if r['path']=='scripts/production-stack/install.sh'),None)
+    if installer is None or installer['sha256']!=manifest['installer_sha256']: raise ContractError('installed release manifest installer binding invalid')
+    return manifest
+def release_documents(v, manifest_raw, receipt_raw, payloads):
+    manifest=manifest_contract(manifest_raw); records={r['path']:r for r in manifest['files']}
+    if set(payloads)!=set(records) or any(sha(payloads[p])!=records[p]['sha256'] for p in records): raise ContractError('installed release payload differs from manifest')
+    try: receipt=json.loads(receipt_raw,object_pairs_hook=pairs)
     except Exception as e: raise ContractError('installed release receipt invalid') from e
-    if receipt.get('state')!='installed' or receipt.get('version')!=v['release_version'] or receipt.get('bundle_sha256')!=v['bundle_sha256'] or receipt.get('server_image')!=v['server_image'] or receipt.get('migrator_image')!=v['migrator_image']: raise ContractError('installed release receipt does not bind request')
+    if not isinstance(receipt,dict) or set(receipt)!=RECEIPT_KEYS or receipt_raw!=canonical(receipt): raise ContractError('installed release receipt is not exact canonical JSON')
+    body=dict(receipt); receipt_hash=body.pop('receipt_sha256',None)
+    previous=receipt.get('previous_receipt_sha256'); installed_at=receipt.get('installed_at_ms')
+    if receipt.get('schema')!='dirextalk.vnext-installed-release' or receipt.get('schema_version')!=1 or receipt.get('target')!='linux-amd64' or receipt.get('state')!='installed' or not isinstance(receipt_hash,str) or not HEX64.fullmatch(receipt_hash) or sha(canonical(body))!=receipt_hash: raise ContractError('installed release receipt schema or self-hash invalid')
+    if isinstance(installed_at,bool) or not isinstance(installed_at,int) or installed_at<0 or previous is not None and (not isinstance(previous,str) or not HEX64.fullmatch(previous)): raise ContractError('installed release receipt chain invalid')
+    if receipt.get('domain')!=v['domain'] or receipt.get('version')!=v['release_version'] or receipt.get('bundle_sha256')!=v['bundle_sha256'] or receipt.get('manifest_sha256')!=sha(manifest_raw): raise ContractError('installed release receipt identity mismatch')
+    for key in ('version','source_commit','server_image','migrator_image'):
+        if receipt.get(key)!=manifest.get(key): raise ContractError('installed release receipt differs from manifest')
+    if manifest['server_image']!=v['server_image'] or manifest['migrator_image']!=v['migrator_image']: raise ContractError('installed release images differ from request')
+    compose='docker/production/docker-compose.yml'; example=f'docker/production/examples/{v["target"]}.env.example'
+    if compose not in payloads or example not in payloads or sha(payloads[compose])!=v['compose_sha256']: raise ContractError('installed release compose or target example invalid')
     contract={}
-    for line in (release/'docker/production/examples'/(v['target']+'.env.example')).read_text().splitlines():
-        if line.startswith('DTX_') and '=' in line: key,value=line.split('=',1); contract[key]=value
+    try: lines=payloads[example].decode().splitlines()
+    except UnicodeError as e: raise ContractError('installed target example invalid') from e
+    for line in lines:
+        if line.startswith('DTX_') and '=' in line:
+            key,value=line.split('=',1)
+            if key in contract: raise ContractError('installed target example duplicates a key')
+            contract[key]=value
     bindings={'postgres_image':'DTX_POSTGRES_IMAGE','caddy_image':'DTX_CADDY_IMAGE','probe_image':'DTX_PROBE_IMAGE'}
-    if any(contract.get(env)!=v[key] for key,env in bindings.items()): raise ContractError('request image is outside installed production contract')
+    if any(contract.get(env)!=v[key] for key,env in bindings.items()): raise ContractError('request dependency image is outside installed production contract')
+def validate_release(v, release):
+    metadata=release.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=0 or metadata.st_gid!=0 or stat.S_IMODE(metadata.st_mode)!=0o555: raise ContractError('installed release directory unsafe')
+    manifest_raw=secure(release/'manifest.json',0o444,1024*1024); manifest=manifest_contract(manifest_raw); payloads={}
+    for record in manifest['files']: payloads[record['path']]=secure(release/record['path'],int(record['mode'],8),32*1024*1024)
+    release_documents(v,manifest_raw,secure(CURRENT_RECEIPT,0o600),payloads)
 def public_verify(v, release):
     health=('curl','--fail','--silent','--show-error','--retry','30','--retry-all-errors','--retry-delay','2','https://'+v['domain']+'/healthz')
     run(*health,cwd=release)

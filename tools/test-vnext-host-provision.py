@@ -37,4 +37,33 @@ with tempfile.TemporaryDirectory() as temporary:
  try: mod.write(Path(temporary)/'short',b'abc',0o600,identity,identity)
  finally: os.write=original
  assert (Path(temporary)/'short').read_bytes()==b'abc' and not list(Path(temporary).glob('.short.*'))
+ compose=b'compose'; v['compose_sha256']=mod.sha(compose); example=b'DTX_POSTGRES_IMAGE='+v['postgres_image'].encode()+b'\nDTX_CADDY_IMAGE='+v['caddy_image'].encode()+b'\nDTX_PROBE_IMAGE='+v['probe_image'].encode()+b'\n'; installer=b'installer'
+ payloads={'docker/production/docker-compose.yml':compose,'docker/production/examples/x6.env.example':example,'scripts/production-stack/install.sh':installer}
+ records=[{'path':path,'sha256':mod.sha(data),'mode':'0555' if path.endswith('.sh') else '0444'} for path,data in sorted(payloads.items())]
+ manifest={'schema':'dirextalk.vnext-stack-bundle','schema_version':1,'version':v['release_version'],'source_commit':'a'*40,'target':'linux-amd64','server_image':v['server_image'],'migrator_image':v['migrator_image'],'installer_sha256':mod.sha(installer),'files':records}; manifest_raw=mod.canonical(manifest)
+ body={'schema':'dirextalk.vnext-installed-release','schema_version':1,'target':'linux-amd64','domain':v['domain'],'version':v['release_version'],'source_commit':'a'*40,'bundle_sha256':v['bundle_sha256'],'manifest_sha256':mod.sha(manifest_raw),'server_image':v['server_image'],'migrator_image':v['migrator_image'],'previous_receipt_sha256':None,'state':'installed','installed_at_ms':1}; receipt=dict(body); receipt['receipt_sha256']=mod.sha(mod.canonical(body)); mod.release_documents(v,manifest_raw,mod.canonical(receipt),payloads)
+ bad=dict(receipt); bad['domain']='other.example.com'; badbody={k:x for k,x in bad.items() if k!='receipt_sha256'}; bad['receipt_sha256']=mod.sha(mod.canonical(badbody))
+ try: mod.release_documents(v,manifest_raw,mod.canonical(bad),payloads)
+ except mod.ContractError: pass
+ else: raise AssertionError('accepted receipt for another domain')
+ badrequest=dict(v); badrequest['probe_image']='curlimages/curl@sha256:'+'9'*64
+ try: mod.release_documents(badrequest,manifest_raw,mod.canonical(receipt),payloads)
+ except mod.ContractError: pass
+ else: raise AssertionError('accepted mismatched dependency contract')
+ original_run=mod.run; original_subprocess_run=mod.subprocess.run; calls=[]
+ class Result:
+  returncode=0; stdout='401'
+ mod.run=lambda *args,**kwargs: calls.append(args)
+ mod.subprocess.run=lambda *args,**kwargs: Result()
+ try: mod.public_verify(v,ROOT)
+ finally: mod.run=original_run; mod.subprocess.run=original_subprocess_run
+ assert calls and calls[0][0]=='curl' and calls[0][-1].endswith('/healthz')
+ class BadResult:
+  returncode=0; stdout='500'
+ mod.run=lambda *args,**kwargs: None; mod.subprocess.run=lambda *args,**kwargs: BadResult()
+ try:
+  try: mod.public_verify(v,ROOT)
+  except mod.ContractError: pass
+  else: raise AssertionError('accepted non-401 MCP response')
+ finally: mod.run=original_run; mod.subprocess.run=original_subprocess_run
 print('vNext host provision focused contract checks passed')
