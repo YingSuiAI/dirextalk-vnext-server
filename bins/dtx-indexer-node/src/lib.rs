@@ -296,7 +296,7 @@ impl IndexerPgStore {
             .max_connections(max.max(1))
             .connect_with(options)
             .await?;
-        let allowed:bool=sqlx::query_scalar("SELECT directory.public_feed_runtime_authorized() AND NOT r.rolsuper AND NOT r.rolbypassrls AND current_user<>pg_get_userbyid(n.nspowner) AND has_table_privilege(current_user,'directory.index_registrations','SELECT,INSERT,UPDATE') AND has_table_privilege(current_user,'directory.index_cache_generations','SELECT,INSERT,UPDATE') FROM pg_roles r JOIN pg_namespace n ON n.nspname='directory' WHERE r.rolname=current_user").fetch_one(&pool).await?;
+        let allowed:bool=sqlx::query_scalar("SELECT directory.public_feed_runtime_authorized() AND NOT r.rolsuper AND NOT r.rolbypassrls AND current_user<>pg_get_userbyid(n.nspowner) AND has_function_privilege(current_user,'system.is_uuid_v7(uuid)','EXECUTE') AND has_table_privilege(current_user,'directory.index_registrations','SELECT,INSERT,UPDATE') AND has_table_privilege(current_user,'directory.index_cache_generations','SELECT,INSERT,UPDATE') FROM pg_roles r JOIN pg_namespace n ON n.nspname='directory' WHERE r.rolname=current_user").fetch_one(&pool).await?;
         if !allowed {
             pool.close().await;
             return Err(NodeError::UnauthorizedDatabaseRole);

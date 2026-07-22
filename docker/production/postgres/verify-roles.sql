@@ -71,6 +71,12 @@ BEGIN
     END IF;
 
     IF NOT has_schema_privilege('dtx_indexer_node', 'directory', 'USAGE')
+       OR NOT has_function_privilege('dtx_indexer_node', 'system.is_uuid_v7(uuid)', 'EXECUTE')
+       OR NOT has_function_privilege('dtx_public_feed_node', 'system.is_uuid_v7(uuid)', 'EXECUTE')
+       OR has_function_privilege('dtx_indexer_node', 'system.current_tenant_id()', 'EXECUTE')
+       OR has_function_privilege('dtx_public_feed_node', 'system.current_tenant_id()', 'EXECUTE')
+       OR has_function_privilege('dtx_indexer_node', 'system.is_stable_code(text,integer)', 'EXECUTE')
+       OR has_function_privilege('dtx_public_feed_node', 'system.is_stable_code(text,integer)', 'EXECUTE')
        OR NOT has_table_privilege('dtx_indexer_node', 'directory.index_registrations', 'SELECT')
        OR NOT has_table_privilege('dtx_indexer_node', 'directory.index_registrations', 'INSERT')
        OR NOT has_table_privilege('dtx_indexer_node', 'directory.index_registrations', 'UPDATE')

@@ -82,6 +82,17 @@ run_migrator migrate >/dev/null
 run_migrator grant-roles >/dev/null
 run_migrator verify-roles >/dev/null
 
+for role in dtx_indexer_node dtx_public_feed_node; do
+    docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
+        -c "REVOKE EXECUTE ON FUNCTION system.is_uuid_v7(uuid) FROM $role;" >/dev/null
+    if run_migrator verify-roles >/dev/null 2>&1; then
+        echo "$role readiness unexpectedly accepted a missing UUIDv7 validator grant" >&2
+        exit 1
+    fi
+    run_migrator grant-roles >/dev/null
+    run_migrator verify-roles >/dev/null
+done
+
 docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
     -c "REVOKE UPDATE ON directory.index_cache_generations FROM dtx_indexer_node;" >/dev/null
 if run_migrator verify-roles >/dev/null 2>&1; then

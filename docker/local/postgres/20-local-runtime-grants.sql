@@ -134,6 +134,11 @@ GRANT EXECUTE ON FUNCTION messaging.claim_opaque_push_deliveries(uuid,integer),
 -- in dtx_public_feed_runtime is only the RLS authorization marker and does not
 -- let either service reach the other one's mutable tables.
 GRANT USAGE ON SCHEMA directory TO dtx_public_feed_node, dtx_indexer_node;
+-- Directory writes evaluate UUIDv7 CHECK constraints in the system schema.
+-- These NOINHERIT logins need this one direct function privilege; do not grant
+-- schema usage or any broader system capability.
+GRANT EXECUTE ON FUNCTION system.is_uuid_v7(uuid)
+    TO dtx_public_feed_node, dtx_indexer_node;
 GRANT EXECUTE ON FUNCTION directory.public_feed_runtime_authorized()
     TO dtx_public_feed_node, dtx_indexer_node;
 GRANT EXECUTE ON FUNCTION directory.public_feed_owner_authorized()

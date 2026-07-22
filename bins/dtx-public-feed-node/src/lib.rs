@@ -82,6 +82,7 @@ impl PublicFeedPgStore {
                     AND NOT r.rolbypassrls
                     AND current_user <> pg_get_userbyid(n.nspowner)
                     AND has_schema_privilege(current_user, 'directory', 'USAGE')
+                    AND has_function_privilege(current_user, 'system.is_uuid_v7(uuid)', 'EXECUTE')
                     AND has_table_privilege(current_user, 'directory.public_subjects', 'SELECT,INSERT,UPDATE')
                     AND has_table_privilege(current_user, 'directory.descriptor_versions', 'SELECT,INSERT')
                     AND has_table_privilege(current_user, 'directory.feed_entries', 'SELECT,INSERT')
