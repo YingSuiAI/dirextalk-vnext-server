@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Focused contract tests; subprocesses and host paths are never live."""
 from __future__ import annotations
-import importlib.machinery, importlib.util, json, os, stat, sys, tempfile
+import importlib.machinery, importlib.util, json, os, re, stat, sys, tempfile
 from pathlib import Path
 sys.dont_write_bytecode=True
 ROOT=Path(__file__).resolve().parent.parent
@@ -22,7 +22,12 @@ except mod.ContractError: pass
 else: raise AssertionError('accepted duplicate keys')
 source=(ROOT/'docker/production/docker-compose.yml').read_text(); rendered=mod.transform_compose(source)
 assert rendered.count('network_mode: service:agent-control')==2
-caddy=mod.caddyfile(v['domain']); assert 'reverse_proxy @mcp http://127.0.0.1:9081' in caddy and '@node path /v1/*' in caddy and '@health path /healthz' in caddy and 'agent-control:9081' not in caddy
+caddy=mod.caddyfile(v['domain']); assert 'reverse_proxy @mcp http://127.0.0.1:9081' in caddy and '@node path_regexp versioned_api ^/v[1-9][0-9]*/.*$' in caddy and '@health path /healthz' in caddy and 'agent-control:9081' not in caddy
+versioned_matcher=re.search(r'@node path_regexp versioned_api (\S+)',caddy)
+assert versioned_matcher
+versioned_api=re.compile(versioned_matcher.group(1))
+assert versioned_api.fullmatch('/v2/key-packages/claim') and versioned_api.fullmatch('/v12/future-route')
+assert not versioned_api.fullmatch('/v0/key-packages/claim') and not versioned_api.fullmatch('/v01/key-packages/claim') and not versioned_api.fullmatch('/key-packages/claim')
 agent=json.loads(mod.agent_config(v)); assert agent['owner_api']['listen']=='127.0.0.1:9081' and agent['control']['listen']=='0.0.0.0:9444' and agent['connector_issuer']['response_intermediate_bundle_pem'].startswith('/run/dtx-agent-control-tls/')
 try: mod.transform_compose(source.replace('"80:80"','"81:80"',1))
 except mod.ContractError: pass
