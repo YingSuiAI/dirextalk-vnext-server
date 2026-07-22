@@ -59,9 +59,12 @@ BEGIN
     IF NOT has_schema_privilege('dtx_agent_control', 'agent', 'USAGE')
        OR NOT has_table_privilege('dtx_agent_control', 'agent.connector_control_operations', 'SELECT')
        OR NOT has_table_privilege('dtx_agent_control', 'agent.connector_control_operations', 'INSERT')
+       OR NOT has_table_privilege('dtx_agent_control', 'agent.connector_bootstrap_issuances', 'SELECT')
+       OR NOT has_table_privilege('dtx_agent_control', 'agent.connector_bootstrap_issuances', 'INSERT')
        OR NOT has_table_privilege('dtx_agent_control', 'system.schema_versions', 'SELECT')
        OR has_schema_privilege('dtx_agent_control', 'agent', 'CREATE')
        OR has_table_privilege('dtx_agent_control', 'agent.connector_control_operations', 'TRUNCATE')
+       OR has_table_privilege('dtx_agent_control', 'agent.connector_bootstrap_issuances', 'UPDATE')
        OR has_table_privilege('dtx_agent_control', 'directory.index_registrations', 'UPDATE')
     THEN
         RAISE EXCEPTION 'Agent Control readiness or negative privilege check failed';

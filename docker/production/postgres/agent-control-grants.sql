@@ -51,7 +51,8 @@ GRANT SELECT, INSERT ON agent.agent_definitions, agent.agent_identity_approvals,
     agent.conversation_grant_cloud_connections, agent.agent_run_candidates,
     agent.agent_run_checkpoints, agent.agent_run_outputs, agent.agent_run_terminals,
     agent.agent_run_cancellation_intents, agent.conversation_grant_owner_operations,
-    agent.connector_binding_state_owner_operations TO dtx_agent_runtime;
+    agent.connector_binding_state_owner_operations,
+    agent.connector_bootstrap_issuances TO dtx_agent_runtime;
 
 GRANT SELECT, INSERT, UPDATE ON agent.agent_provisioning_recipients,
     agent.agent_provisioning_deliveries, agent.agent_provisioning_outbox TO dtx_agent_runtime;
