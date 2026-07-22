@@ -604,7 +604,19 @@ impl JournalFile {
                     prior_resulting_snapshot = Some(resulting_wire.clone());
                 }
             }
-            prior_resulting = Some(intent.resulting());
+            // A completed ExpiredUnclaimed prepare is intentionally a durable
+            // no-effect receipt: its intent reserves the next fence, but its
+            // receipt and resulting snapshot remain at the predecessor fence.
+            // Chain the following intent from the actual completed outcome,
+            // while pending and all effectful records retain intent.resulting.
+            prior_resulting = Some(match &rehydrated {
+                JournalRecord::Completed { receipt, .. }
+                    if receipt.outcome().disposition == CommandDisposition::ExpiredUnclaimed =>
+                {
+                    receipt.outcome().revisions
+                }
+                _ => intent.resulting(),
+            });
             expected_previous_record_digest = record_digest(record)?;
         }
         if snapshot_wire != prior_resulting_snapshot.as_ref()
@@ -2056,11 +2068,13 @@ mod tests {
 
     use super::{FileJournal, JOURNAL_FILE, JournalFile, VERSION, validate_snapshot_transition};
     use crate::{
-        CatalogRelease, CommandDisposition, CommandOutcome, ConnectorTarget, CredentialArtifactRef,
-        DurableHostCommand, HostCommand, HostCommandEnvelope, HostOperationId, HostRevisionFence,
+        CatalogRelease, CommandDisposition, CommandOutcome, ConfigDigest, ConnectorLifecycleFacts,
+        ConnectorLifecycleOperationId, ConnectorTarget, CredentialArtifactRef, DurableHostCommand,
+        HandoffDigest, HostCommand, HostCommandEnvelope, HostOperationId, HostRevisionFence,
         Journal, JournalRecord, ManagedConnectorDesiredState, ManagedConnectorSnapshot,
-        OperationIntent, OperationReceipt, PortErrorKind, ProcessObservation, ReleaseDigest,
-        RemovalPolicy, ResourceProfile, SupervisorSnapshot,
+        MaterialDigest, OperationIntent, OperationReceipt, PlanDigest, PlatformTarget,
+        PortErrorKind, ProcessObservation, ReleaseDigest, RemovalPolicy, ResourceProfile,
+        SupervisorSnapshot, TrustDigest,
     };
 
     struct TempRoot(PathBuf);
@@ -2212,6 +2226,54 @@ mod tests {
             pending_predecessor
         );
         assert_ne!(completed["chain_tip"], pending_tip);
+    }
+
+    #[test]
+    fn sequential_expired_unclaimed_prepares_chain_at_the_unchanged_fence_and_rehydrate() {
+        let root = TempRoot::new();
+        let tenant_id = TenantId::new();
+        let host_id = HostId::new();
+        let predecessor = initial_snapshot(tenant_id, host_id);
+        let (first_intent, first_receipt) =
+            expired_unclaimed_prepare(&predecessor, ConnectorId::new());
+        let (second_intent, second_receipt) =
+            expired_unclaimed_prepare(&predecessor, ConnectorId::new());
+        let mut journal = FileJournal::for_test_root(root.path(), host_id);
+
+        journal
+            .persist_intent(first_intent.clone(), &predecessor)
+            .unwrap();
+        journal.complete(first_receipt, &predecessor).unwrap();
+        journal
+            .persist_intent(second_intent.clone(), &predecessor)
+            .unwrap();
+        journal.complete(second_receipt, &predecessor).unwrap();
+
+        assert_eq!(
+            journal.load_snapshot(host_id).unwrap(),
+            Some(predecessor.clone())
+        );
+        assert!(matches!(
+            journal
+                .lookup(host_id, first_intent.operation_id())
+                .unwrap(),
+            Some(JournalRecord::Completed { .. })
+        ));
+        assert!(matches!(
+            journal
+                .lookup(host_id, second_intent.operation_id())
+                .unwrap(),
+            Some(JournalRecord::Completed { .. })
+        ));
+
+        let path = root.journal_path(host_id);
+        let mut tampered: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        tampered["records"][1]["resulting_snapshot"]["desired_revision"] = Value::from(2_u64);
+        fs::write(&path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+        assert_eq!(
+            journal.load_snapshot(host_id).unwrap_err().kind(),
+            PortErrorKind::InvalidArtifact
+        );
     }
 
     #[test]
@@ -2775,6 +2837,58 @@ mod tests {
             observed_revision: Some(Revision::INITIAL),
             instances: Vec::new(),
         }
+    }
+
+    fn expired_unclaimed_prepare(
+        predecessor: &SupervisorSnapshot,
+        connector_id: ConnectorId,
+    ) -> (OperationIntent, OperationReceipt) {
+        let expected = HostRevisionFence::from_revisions(
+            predecessor.desired_revision,
+            predecessor.observed_revision,
+        )
+        .unwrap();
+        let release = ReleaseDigest::from_bytes([7; 32]);
+        let facts = ConnectorLifecycleFacts::new(
+            ConnectorLifecycleOperationId::new(),
+            PlatformTarget::LinuxAmd64,
+            AdapterKind::Codex,
+            release,
+            predecessor.tenant_id,
+            predecessor.host_id,
+            connector_id,
+            1,
+            PlanDigest::from_bytes([1; 32]),
+            HandoffDigest::from_bytes([2; 32]),
+            ConfigDigest::from_bytes([3; 32]),
+            TrustDigest::from_bytes([4; 32]),
+            MaterialDigest::from_bytes([5; 32]),
+        );
+        let envelope = HostCommandEnvelope::new(
+            predecessor.tenant_id,
+            predecessor.host_id,
+            HostOperationId::new(),
+            expected,
+            HostCommand::PrepareConnectorMaterial { facts },
+        );
+        let intent = OperationIntent::new(
+            envelope,
+            expected.advance_and_acknowledge().unwrap(),
+            DurableHostCommand::PrepareConnectorMaterial { facts },
+        );
+        let receipt = OperationReceipt::new(
+            intent.operation_id(),
+            intent.command_digest(),
+            CommandOutcome {
+                connector_id,
+                revisions: expected,
+                disposition: CommandDisposition::ExpiredUnclaimed,
+                desired_state: ManagedConnectorDesiredState::EnsuredStopped,
+                observation: ProcessObservation::Absent,
+                credential_generation: 0,
+            },
+        );
+        (intent, receipt)
     }
 
     fn apply_valid_operation(
