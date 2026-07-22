@@ -53,7 +53,7 @@ impl ConnectorLayout {
 
     pub(super) fn executable(&self, release: CatalogRelease) -> PathBuf {
         self.rooted(&format!(
-            "/opt/dirextalk/connect/versions/{}/dirextalk-connect",
+            "/opt/dirextalk/connect/versions/{}/dirextalk-agent-connector",
             digest_hex(release.digest())
         ))
     }
@@ -67,6 +67,14 @@ impl ConnectorLayout {
 
     pub(super) fn config(&self) -> PathBuf {
         self.config_dir().join("config.toml")
+    }
+
+    pub(super) fn current_user_profile(&self) -> PathBuf {
+        self.rooted("/etc/dirextalk/connect/current-user.profile")
+    }
+
+    pub(super) fn service_profile_binding(&self) -> PathBuf {
+        self.config_dir().join("service-profile.binding")
     }
 
     pub(super) fn trust_dir(&self) -> PathBuf {
@@ -355,7 +363,7 @@ mod tests {
         assert!(
             layout
                 .executable(release)
-                .ends_with(format!("{}/dirextalk-connect", "ab".repeat(32)))
+                .ends_with(format!("{}/dirextalk-agent-connector", "ab".repeat(32)))
         );
 
         let host_operation = HostOperationId::new();

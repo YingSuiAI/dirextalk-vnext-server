@@ -236,8 +236,8 @@ impl LinuxProcessController {
             }
             let status = match instance.desired_state {
                 ManagedConnectorDesiredState::Running => {
-                    self.ensure_user(&layout)?;
-                    self.ensure_directories(&layout)?;
+                    let identity = self.ensure_user(&layout)?;
+                    self.ensure_directories(&layout, identity)?;
                     Self::verify_prepared(&layout, instance.release)?;
                     if Self::crash_loop_is_blocked(&layout, instance.release)? {
                         self.restore_stopped(&layout)?;
@@ -290,8 +290,8 @@ impl LinuxProcessController {
                 }
                 ManagedConnectorDesiredState::EnsuredStopped
                 | ManagedConnectorDesiredState::Stopped => {
-                    self.ensure_user(&layout)?;
-                    self.ensure_directories(&layout)?;
+                    let identity = self.ensure_user(&layout)?;
+                    self.ensure_directories(&layout, identity)?;
                     Self::verify_prepared(&layout, instance.release)?;
                     let observed = self.restore_stopped(&layout)?;
                     self.replace_network_policy(&layout)?;
@@ -388,8 +388,8 @@ impl LinuxProcessController {
         );
         let layout = self.layout(target);
         Self::validate_privileged_layout(&layout)?;
-        self.ensure_user(&layout)?;
-        self.ensure_directories(&layout)?;
+        let identity = self.ensure_user(&layout)?;
+        self.ensure_directories(&layout, identity)?;
         Self::verify_prepared(&layout, instance.release)?;
         self.restore_stopped(&layout)?;
         self.replace_network_policy(&layout)?;
@@ -467,6 +467,9 @@ impl LinuxProcessController {
     }
 
     fn ensure_user(&mut self, layout: &ConnectorLayout) -> Result<UnixUserIdentity, PortError> {
+        if let Some(profile) = current_user_profile(layout)? {
+            return Ok(profile.identity);
+        }
         if let Some(identity) = lookup_user(&layout.passwd(), &layout.user())? {
             return Ok(identity);
         }
@@ -488,8 +491,16 @@ impl LinuxProcessController {
             .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))
     }
 
-    fn ensure_directories(&mut self, layout: &ConnectorLayout) -> Result<(), PortError> {
-        let user = layout.user();
+    fn ensure_directories(
+        &mut self,
+        layout: &ConnectorLayout,
+        identity: UnixUserIdentity,
+    ) -> Result<(), PortError> {
+        let current_user = current_user_profile(layout)?;
+        let (user, group) = current_user.map_or_else(
+            || (layout.user(), layout.user()),
+            |_| (identity.uid.to_string(), identity.gid.to_string()),
+        );
         for directory in layout.directories() {
             ensure_plain_directory(&directory)?;
             let is_operations = directory.ends_with("operations");
@@ -502,9 +513,9 @@ impl LinuxProcessController {
             let (owner, group, mode) = if is_operations || is_staged || is_durable_credentials {
                 ("root", "root", "0700")
             } else if is_config || is_trust || is_credentials || is_runtime_root {
-                ("root", user.as_str(), "0750")
+                ("root", group.as_str(), "0750")
             } else {
-                (user.as_str(), user.as_str(), "0700")
+                (user.as_str(), group.as_str(), "0700")
             };
             self.run_required(&FixedCommand::new(
                 INSTALL,
@@ -564,7 +575,26 @@ impl LinuxProcessController {
     ) -> Result<(), PortError> {
         Self::verify_release(layout, release)?;
         let identity = self.ensure_user(layout)?;
-        self.ensure_directories(layout)?;
+        self.ensure_directories(layout, identity)?;
+        if let Some(profile) = current_user_profile(layout)? {
+            let binding = layout.service_profile_binding();
+            let was_missing = !binding
+                .try_exists()
+                .map_err(|_| PortError::new(PortErrorKind::Unavailable))?;
+            verify_or_write_profile_binding(layout, &profile, true)?;
+            if was_missing {
+                self.run_required(&FixedCommand::new(
+                    CHOWN,
+                    vec![
+                        "--no-dereference".into(),
+                        format!("root:{}", profile.identity.gid).into(),
+                        "--".into(),
+                        binding.into_os_string(),
+                    ],
+                ))?;
+            }
+            verify_or_write_profile_binding(layout, &profile, false)?;
+        }
         Self::write_release_manifest(layout, release)?;
         Self::write_network_policy(layout, identity)?;
         Self::verify_prepared(layout, release)
@@ -576,8 +606,7 @@ impl LinuxProcessController {
         for directory in layout.directories() {
             validate_plain_directory(&directory)?;
         }
-        let identity = lookup_user(&layout.passwd(), &layout.user())?
-            .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+        let identity = selected_identity(layout)?;
         Self::verify_network_policy_file(layout, identity)?;
         verify_directory_ownership(layout, identity)?;
         Ok(())
@@ -624,8 +653,7 @@ impl LinuxProcessController {
     }
 
     fn verify_network_policy(&mut self, layout: &ConnectorLayout) -> Result<(), PortError> {
-        let identity = lookup_user(&layout.passwd(), &layout.user())?
-            .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+        let identity = selected_identity(layout)?;
         Self::verify_network_policy_file(layout, identity)?;
         let output = self
             .runner
@@ -637,8 +665,7 @@ impl LinuxProcessController {
     }
 
     fn replace_network_policy(&mut self, layout: &ConnectorLayout) -> Result<(), PortError> {
-        let identity = lookup_user(&layout.passwd(), &layout.user())?
-            .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+        let identity = selected_identity(layout)?;
         Self::verify_network_policy_file(layout, identity)?;
         self.run_required(&FixedCommand::new(
             NFT,
@@ -718,17 +745,33 @@ impl LinuxProcessController {
         }
     }
 
-    fn start_command(layout: &ConnectorLayout, release: CatalogRelease) -> FixedCommand {
+    fn start_command(
+        layout: &ConnectorLayout,
+        release: CatalogRelease,
+    ) -> Result<FixedCommand, PortError> {
         let limits = LinuxResourceLimits::for_profile(release.resource_profile());
+        let profile = current_user_profile(layout)?;
+        let identity = selected_identity(layout)?;
+        let user = profile
+            .as_ref()
+            .map_or_else(|| layout.user(), |value| value.name.clone());
         let mut arguments = vec![
             format!("--unit={}", layout.unit()).into(),
             "--service-type=exec".into(),
-            format!("--uid={}", layout.user()).into(),
+            format!("--uid={}", identity.uid).into(),
+            format!("--gid={}", identity.gid).into(),
             property("NoNewPrivileges", "yes"),
             property("ProtectSystem", "strict"),
             property("PrivateTmp", "yes"),
             property("PrivateDevices", "yes"),
-            property("ProtectHome", "yes"),
+            property(
+                "ProtectHome",
+                if profile.is_some() {
+                    "read-only"
+                } else {
+                    "yes"
+                },
+            ),
             property("ProtectKernelTunables", "yes"),
             property("ProtectKernelModules", "yes"),
             property("ProtectControlGroups", "yes"),
@@ -783,8 +826,31 @@ impl LinuxProcessController {
             "--credential-file".into(),
             layout.active_credential().into_os_string(),
         ];
+        let home = profile
+            .as_ref()
+            .map_or("/nonexistent", |value| value.home.as_str());
+        let mut current_user_properties = vec![property(
+            "Environment",
+            &format!(
+                "HOME={home} USER={user} LOGNAME={user} PATH={home}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+        )];
+        if let Some(profile) = profile.as_ref() {
+            current_user_properties.push(property_path("ReadWritePaths", Path::new(&profile.home)));
+            if let Some(codex_home) = profile.codex_home.as_deref() {
+                current_user_properties
+                    .push(property("Environment", &format!("CODEX_HOME={codex_home}")));
+                current_user_properties
+                    .push(property_path("ReadWritePaths", Path::new(codex_home)));
+            }
+        }
+        let separator = arguments
+            .iter()
+            .position(|value| value == "--")
+            .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+        arguments.splice(separator..separator, current_user_properties);
         arguments.shrink_to_fit();
-        FixedCommand::new(SYSTEMD_RUN, arguments)
+        Ok(FixedCommand::new(SYSTEMD_RUN, arguments))
     }
 
     fn systemctl(
@@ -866,14 +932,13 @@ impl LinuxProcessController {
         let user = self
             .show(layout, "User")?
             .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
-        if user != layout.user() {
+        let identity = selected_identity(layout)?;
+        if user != selected_user(layout)? && user != identity.uid.to_string() {
             return Err(PortError::new(PortErrorKind::InvalidArtifact));
         }
-        let expected_uid = lookup_user(&layout.passwd(), &user)?
-            .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
         let status = fs::read_to_string(layout.proc_status(pid))
             .map_err(|_| PortError::new(PortErrorKind::InvalidArtifact))?;
-        if parse_process_uid(&status) != Some(expected_uid.uid) {
+        if parse_process_uid(&status) != Some(identity.uid) {
             return Err(PortError::new(PortErrorKind::InvalidArtifact));
         }
         let control_group = self
@@ -931,7 +996,7 @@ impl LinuxProcessController {
         release: CatalogRelease,
         exec_start: &str,
     ) -> Result<(), PortError> {
-        let command = Self::start_command(layout, release);
+        let command = Self::start_command(layout, release)?;
         let separator = command
             .arguments
             .iter()
@@ -957,24 +1022,40 @@ impl LinuxProcessController {
             ResourceProfile::Compute => "3s",
             ResourceProfile::LowLatency => "2s",
         };
-        let read_write_paths = [
+        let profile = current_user_profile(layout)?;
+        let mut read_write_paths = vec![
             layout.config_dir(),
             layout.data_dir(),
             layout.workspace_dir(),
             layout.worker_runtime_dir(),
             layout.log_dir(),
-        ]
-        .iter()
-        .map(|path| path.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ");
+        ];
+        if let Some(profile) = profile.as_ref() {
+            read_write_paths.push(PathBuf::from(&profile.home));
+            if let Some(codex_home) = profile.codex_home.as_deref() {
+                read_write_paths.push(PathBuf::from(codex_home));
+            }
+        }
+        let read_write_paths = read_write_paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
         for (property_name, expected) in [
             ("Type", "exec".to_owned()),
             ("NoNewPrivileges", "yes".to_owned()),
             ("ProtectSystem", "strict".to_owned()),
             ("PrivateTmp", "yes".to_owned()),
             ("PrivateDevices", "yes".to_owned()),
-            ("ProtectHome", "yes".to_owned()),
+            (
+                "ProtectHome",
+                if profile.is_some() {
+                    "read-only"
+                } else {
+                    "yes"
+                }
+                .to_owned(),
+            ),
             ("ProtectKernelTunables", "yes".to_owned()),
             ("ProtectKernelModules", "yes".to_owned()),
             ("ProtectControlGroups", "yes".to_owned()),
@@ -1061,7 +1142,7 @@ impl LinuxProcessController {
     ) -> Result<ProcessObservation, PortError> {
         Self::verify_active_credential(layout, credential_ref)?;
         self.verify_network_policy(layout)?;
-        self.run_required(&Self::start_command(layout, release))?;
+        self.run_required(&Self::start_command(layout, release)?)?;
         let observed = self.observe_internal(layout)?;
         if observed == ProcessObservation::Running {
             self.verify_running_release(layout, release)?;
@@ -1075,8 +1156,7 @@ impl LinuxProcessController {
         layout: &ConnectorLayout,
         credential_ref: CredentialArtifactRef,
     ) -> Result<(), PortError> {
-        let identity = lookup_user(&layout.passwd(), &layout.user())?
-            .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+        let identity = selected_identity(layout)?;
         let record = read_credential_activation_record(&layout.active_credential_record())?;
         if record.reference == credential_ref
             && hash_active_credential(&layout.active_credential(), identity.gid)? == record.proof
@@ -1118,7 +1198,7 @@ impl LinuxProcessController {
             CHOWN,
             vec![
                 "--no-dereference".into(),
-                format!("root:{}", layout.user()).into(),
+                format!("root:{}", identity.gid).into(),
                 "--".into(),
                 ready.clone().into_os_string(),
             ],
@@ -1403,8 +1483,7 @@ impl ProcessController<LinuxCredentialArtifact> for LinuxProcessController {
         }
         let staged = layout.staged_credential(operation_id);
         let active = layout.active_credential();
-        let identity = lookup_user(&layout.passwd(), &layout.user())?
-            .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+        let identity = selected_identity(&layout)?;
         let already_active = hash_active_credential(&active, identity.gid)
             .is_ok_and(|proof| proof == artifact.proof());
         if !already_active {
@@ -1695,6 +1774,286 @@ fn parse_stdout(output: &FixedCommandOutput) -> Result<String, PortError> {
 pub(super) struct UnixUserIdentity {
     pub(super) uid: u32,
     pub(super) gid: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CurrentUserProfile {
+    name: String,
+    identity: UnixUserIdentity,
+    home: String,
+    codex_home: Option<String>,
+}
+
+/// Reads the one root-managed profile without consulting any user-controlled
+/// runtime state. Absence deliberately selects the legacy per-instance user.
+fn current_user_profile(layout: &ConnectorLayout) -> Result<Option<CurrentUserProfile>, PortError> {
+    let binding = layout.service_profile_binding();
+    let (path, bound) = match fs::symlink_metadata(&binding) {
+        Ok(_) => (binding, true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            (layout.current_user_profile(), false)
+        }
+        Err(_) => return Err(PortError::new(PortErrorKind::InvalidArtifact)),
+    };
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(PortError::new(PortErrorKind::InvalidArtifact)),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024
+    {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    }
+    #[cfg(all(target_os = "linux", not(test)))]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.uid() != 0
+            || metadata.permissions().mode() & 0o777 != if bound { 0o440 } else { 0o600 }
+        {
+            return Err(PortError::new(PortErrorKind::InvalidArtifact));
+        }
+    }
+    let bytes = fs::read(&path).map_err(|_| PortError::new(PortErrorKind::InvalidArtifact))?;
+    if bytes.len() > 1024 || !bytes.ends_with(b"\n") {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    }
+    let marker = b"sha256=";
+    let Some(digest_offset) = bytes
+        .windows(marker.len())
+        .rposition(|value| value == marker)
+    else {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    };
+    let field_lines = bytes[..digest_offset]
+        .iter()
+        .filter(|&&byte| byte == b'\n')
+        .count();
+    if digest_offset == 0 || !matches!(field_lines, 5 | 6) {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    }
+    let digest = std::str::from_utf8(&bytes[digest_offset + marker.len()..bytes.len() - 1])
+        .ok()
+        .and_then(decode_32)
+        .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+    if Sha256::digest(&bytes[..digest_offset]).as_slice() != digest {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    }
+    let text = std::str::from_utf8(&bytes[..digest_offset])
+        .map_err(|_| PortError::new(PortErrorKind::InvalidArtifact))?;
+    let fields = text.split_terminator('\n').collect::<Vec<_>>();
+    let (name, uid, gid, home, codex_home) = match fields.as_slice() {
+        ["v1", name, uid, gid, home] => (*name, *uid, *gid, *home, None),
+        ["v1", name, uid, gid, home, codex_home] => (*name, *uid, *gid, *home, Some(*codex_home)),
+        _ => return Err(PortError::new(PortErrorKind::InvalidArtifact)),
+    };
+    let name = name
+        .strip_prefix("name=")
+        .filter(|value| safe_name(value))
+        .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?
+        .to_owned();
+    let uid = uid
+        .strip_prefix("uid=")
+        .and_then(canonical_decimal)
+        .filter(|&value| value != 0)
+        .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+    let gid = gid
+        .strip_prefix("gid=")
+        .and_then(canonical_decimal)
+        .filter(|&value| value != 0)
+        .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+    let home = home
+        .strip_prefix("home=")
+        .filter(|value| safe_absolute_path(value))
+        .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?
+        .to_owned();
+    let codex_home = match codex_home {
+        None => None,
+        Some(value) => value
+            .strip_prefix("codex_home=")
+            .filter(|value| safe_absolute_path(value))
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?,
+    };
+    let profile = CurrentUserProfile {
+        name,
+        identity: UnixUserIdentity { uid, gid },
+        home,
+        codex_home,
+    };
+    if bytes != canonical_profile_bytes(&profile) {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    }
+    verify_profile_passwd(layout, &profile)?;
+    verify_profile_state_paths(&profile)?;
+    #[cfg(all(target_os = "linux", not(test)))]
+    if bound {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.gid() != profile.identity.gid {
+            return Err(PortError::new(PortErrorKind::InvalidArtifact));
+        }
+    }
+    if bound {
+        match fs::read(layout.current_user_profile()) {
+            Ok(global) if global == bytes => {}
+            Ok(_) => return Err(PortError::new(PortErrorKind::InvalidArtifact)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PortError::new(PortErrorKind::InvalidArtifact)),
+        }
+    }
+    Ok(Some(profile))
+}
+
+#[cfg_attr(
+    not(all(target_os = "linux", not(test))),
+    allow(clippy::unnecessary_wraps)
+)]
+fn verify_profile_state_paths(profile: &CurrentUserProfile) -> Result<(), PortError> {
+    #[cfg(all(target_os = "linux", not(test)))]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        for path in std::iter::once(profile.home.as_str()).chain(profile.codex_home.as_deref()) {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|_| PortError::new(PortErrorKind::InvalidArtifact))?;
+            if !metadata.file_type().is_dir()
+                || metadata.file_type().is_symlink()
+                || metadata.uid() != profile.identity.uid
+                || metadata.permissions().mode() & 0o200 == 0
+            {
+                return Err(PortError::new(PortErrorKind::InvalidArtifact));
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(test))))]
+    let _ = profile;
+    Ok(())
+}
+
+fn safe_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn safe_absolute_path(value: &str) -> bool {
+    value.starts_with('/')
+        && value != "/"
+        && value.len() <= 512
+        && !value.contains('\0')
+        && !value.contains('=')
+        && value
+            .split('/')
+            .skip(1)
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn canonical_decimal(value: &str) -> Option<u32> {
+    (!value.is_empty() && !value.starts_with('0'))
+        .then(|| value.parse::<u32>().ok())
+        .flatten()
+}
+
+fn canonical_profile_bytes(profile: &CurrentUserProfile) -> Vec<u8> {
+    let mut prefix = format!(
+        "v1\nname={}\nuid={}\ngid={}\nhome={}\n",
+        profile.name, profile.identity.uid, profile.identity.gid, profile.home
+    );
+    if let Some(codex_home) = profile.codex_home.as_deref() {
+        prefix.push_str("codex_home=");
+        prefix.push_str(codex_home);
+        prefix.push('\n');
+    }
+    format!(
+        "{prefix}sha256={}\n",
+        encode_32(Sha256::digest(prefix.as_bytes()).into())
+    )
+    .into_bytes()
+}
+
+fn verify_profile_passwd(
+    layout: &ConnectorLayout,
+    profile: &CurrentUserProfile,
+) -> Result<(), PortError> {
+    let passwd = fs::read_to_string(layout.passwd())
+        .map_err(|_| PortError::new(PortErrorKind::InvalidArtifact))?;
+    let mut matches = passwd
+        .lines()
+        .filter(|line| line.split(':').next() == Some(profile.name.as_str()));
+    let Some(line) = matches.next() else {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    };
+    if matches.next().is_some() {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    }
+    let fields = line.split(':').collect::<Vec<_>>();
+    if fields.len() != 7
+        || fields[2] != profile.identity.uid.to_string()
+        || fields[3] != profile.identity.gid.to_string()
+        || fields[5] != profile.home
+    {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    }
+    Ok(())
+}
+
+pub(super) fn selected_identity(layout: &ConnectorLayout) -> Result<UnixUserIdentity, PortError> {
+    if let Some(profile) = current_user_profile(layout)? {
+        verify_or_write_profile_binding(layout, &profile, false)?;
+        Ok(profile.identity)
+    } else {
+        lookup_user(&layout.passwd(), &layout.user())?
+            .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))
+    }
+}
+
+fn selected_user(layout: &ConnectorLayout) -> Result<String, PortError> {
+    Ok(current_user_profile(layout)?.map_or_else(|| layout.user(), |profile| profile.name))
+}
+
+fn verify_or_write_profile_binding(
+    layout: &ConnectorLayout,
+    profile: &CurrentUserProfile,
+    create: bool,
+) -> Result<(), PortError> {
+    #[cfg(not(all(target_os = "linux", not(test))))]
+    let _ = profile;
+    let binding = layout.service_profile_binding();
+    let source = match fs::read(layout.current_user_profile()) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::read(&binding).map_err(|_| PortError::new(PortErrorKind::InvalidArtifact))?
+        }
+        Err(_) => return Err(PortError::new(PortErrorKind::InvalidArtifact)),
+    };
+    let created = match fs::read(&binding) {
+        Ok(existing) if existing == source => false,
+        Ok(_) => return Err(PortError::new(PortErrorKind::InvalidArtifact)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
+            atomic_write(&binding, &source, 0o440)?;
+            true
+        }
+        Err(_) => return Err(PortError::new(PortErrorKind::InvalidArtifact)),
+    };
+    #[cfg(not(all(target_os = "linux", not(test))))]
+    let _ = created;
+    let metadata = fs::symlink_metadata(&binding)
+        .map_err(|_| PortError::new(PortErrorKind::InvalidArtifact))?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(PortError::new(PortErrorKind::InvalidArtifact));
+    }
+    #[cfg(all(target_os = "linux", not(test)))]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if metadata.uid() != 0
+            || (!created && metadata.gid() != profile.identity.gid)
+            || metadata.permissions().mode() & 0o777 != 0o440
+        {
+            return Err(PortError::new(PortErrorKind::InvalidArtifact));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn lookup_user(
@@ -2646,6 +3005,108 @@ mod tests {
                 .iter()
                 .all(|argument| !argument.contains(&sibling_id))
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn registered_current_user_binds_exact_profile_and_uses_numeric_identity() {
+        let (root, target, release, state, mut controller) = fixture();
+        let layout = ConnectorLayout::for_test(root.clone(), target);
+        let profile_prefix = b"v1\nname=codex\nuid=24001\ngid=24002\nhome=/home/codex\ncodex_home=/home/codex/.codex\n";
+        let profile = format!(
+            "{}sha256={}\n",
+            String::from_utf8_lossy(profile_prefix),
+            encode_32(Sha256::digest(profile_prefix).into())
+        );
+        fs::create_dir_all(layout.current_user_profile().parent().unwrap()).unwrap();
+        fs::write(layout.current_user_profile(), profile.as_bytes()).unwrap();
+        fs::create_dir_all(layout.passwd().parent().unwrap()).unwrap();
+        fs::write(
+            layout.passwd(),
+            format!("codex:x:24001:24002::/home/codex:{NOLOGIN}\n"),
+        )
+        .unwrap();
+
+        let noncanonical_prefix = b"v1\nname=codex\nuid=024001\ngid=24002\nhome=/home/codex\ncodex_home=/home/codex/.codex\n";
+        let noncanonical = format!(
+            "{}sha256={}\n",
+            String::from_utf8_lossy(noncanonical_prefix),
+            encode_32(Sha256::digest(noncanonical_prefix).into())
+        );
+        fs::write(layout.current_user_profile(), noncanonical).unwrap();
+        assert!(current_user_profile(&layout).is_err());
+        fs::write(layout.current_user_profile(), profile.as_bytes()).unwrap();
+
+        controller.ensure(new_requested(), target, release).unwrap();
+        let binding = fs::read(layout.service_profile_binding()).unwrap();
+        assert_eq!(binding, profile.as_bytes());
+        fs::write(layout.current_user_profile(), b"mismatch\n").unwrap();
+        assert!(LinuxProcessController::start_command(&layout, release).is_err());
+        fs::write(layout.current_user_profile(), profile.as_bytes()).unwrap();
+        fs::remove_file(layout.current_user_profile()).unwrap();
+        let start = LinuxProcessController::start_command(&layout, release).unwrap();
+        let args = start
+            .arguments
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.contains(&"--uid=24001".to_owned()));
+        assert!(args.contains(&"--gid=24002".to_owned()));
+        assert!(args.contains(&"--property=ProtectHome=read-only".to_owned()));
+        assert!(
+            args.iter()
+                .any(|value| value == "--property=Environment=CODEX_HOME=/home/codex/.codex")
+        );
+        assert!(
+            !state
+                .borrow()
+                .commands
+                .iter()
+                .any(|command| command.program == USERADD)
+        );
+        {
+            let state = state.borrow();
+            let commands = &state.commands;
+            for (path, owner, group) in [
+                (layout.config_dir(), "root", "24002"),
+                (layout.runtime_dir(), "root", "24002"),
+                (layout.data_dir(), "24001", "24002"),
+                (layout.credential_dir(), "root", "24002"),
+            ] {
+                assert!(
+                    commands.iter().any(|command| {
+                        command.program == INSTALL
+                            && command.arguments.iter().any(|value| value == "-o")
+                            && command
+                                .arguments
+                                .windows(2)
+                                .any(|pair| pair[0] == "-o" && pair[1] == owner)
+                            && command
+                                .arguments
+                                .windows(2)
+                                .any(|pair| pair[0] == "-g" && pair[1] == group)
+                            && command
+                                .arguments
+                                .last()
+                                .is_some_and(|value| value == path.as_os_str())
+                    }),
+                    "current-user install must use numeric profile identity for {}",
+                    path.display()
+                );
+            }
+        }
+        let _credential_ref = provision_test_credential(&mut controller, &root, target);
+        assert!(state.borrow().commands.iter().any(|command| {
+            command.program == CHOWN
+                && command
+                    .arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "--no-dereference" && pair[1] == "root:24002")
+                && command
+                    .arguments
+                    .last()
+                    .is_some_and(|value| value.to_string_lossy().ends_with(".ready"))
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 

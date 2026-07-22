@@ -47,7 +47,19 @@ The namespace is not a DNS discovery mechanism. Trust comes from the deployment-
 
 Linux uses fixed `dirextalk-connect@<connector-id>.service` identities during migration. Each service is pinned to `system.slice` and has `NoNewPrivileges`, a read-only system view, private temporary storage, SUID/SGID restrictions, control-group kill semantics, allowlisted CPU/memory/PID/IO limits, journal output, a persistent per-instance log directory under `/var/lib`, and an explicit IMDS network deny. PID 1, unified cgroup v2 controllers, the exact unit argv/properties, process UID, executable digest, and cgroup membership are read back before success. The deny is enforced twice: systemd cgroup-BPF `IPAddressDeny` properties and a root-owned, exact-read-back nftables policy derived only from the Connector UUID and its allocated UID. The nftables policy uses fixed IPv4/IPv6 `drop` rules, is loaded as one atomic batch before process start, removed with the Connector runtime, and cannot accept an arbitrary table, rule, file, address, or action from control input. The Host Supervisor has a separate fixed cgroup-scoped nftables deny and exact read-back. Workers cannot read sibling state or the Supervisor management boundary.
 
-The existing Go `dirextalk-connect` remains the runtime adapter and gains a single-instance Supervisor mode. This ADR does not require rewriting working Go runtime adapters in Rust. Connector outbound enrollment/control streaming is MC2b; routing and Run leases remain owned by Agent Control.
+The existing Go Connector runtime gains a single-instance Supervisor mode. This
+ADR does not require rewriting working Go runtime adapters in Rust. Connector
+outbound enrollment/control streaming is MC2b; routing and Run leases remain
+owned by Agent Control.
+
+An explicitly registered current-user profile is a deliberate product boundary:
+all Connector instances on that host may directly use that one trusted local
+profile (including its optional Codex state). It therefore does not provide
+per-Connector Unix-user filesystem isolation. Instances remain separately
+fenced by their fixed process/unit, protocol identity, durable state paths,
+credentials and network policy. Hosts without the registration retain the
+legacy no-home synthetic user per Connector, which keeps the OS-user isolation
+mode for explicit isolation requirements.
 
 ## Alternatives considered
 

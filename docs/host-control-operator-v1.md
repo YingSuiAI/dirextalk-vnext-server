@@ -16,6 +16,13 @@ the same `HostSupervisor` core and durable journal.
 - Journal and Connector process layout remain owned by
   `dtx-agent-host-supervisor`; the operator never accepts a command, path,
   service, image, environment map, Unix user, or release URL.
+- Immutable releases execute only `dirextalk-agent-connector`. A legacy
+  `dirextalk-connect` basename is not a valid release entrypoint.
+- When `/etc/dirextalk/connect/current-user.profile` is installed as the
+  root-owned canonical registration, every instance persists an exact
+  `service-profile.binding` before bootstrap and runs as that numeric UID/GID
+  through the root-managed transient system service. Absent registration keeps
+  the legacy isolated no-home service user for compatibility.
 - The caller sends one bounded binary frame on stdin and receives one sanitized
   JSON response on stdout. Secrets are accepted only as the optional credential
   payload of `rotate_credential`, never in the JSON header or response.

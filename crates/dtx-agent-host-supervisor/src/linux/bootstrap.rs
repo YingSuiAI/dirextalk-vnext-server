@@ -33,7 +33,7 @@ use crate::{
 use dtx_domain::Revision;
 
 #[cfg(not(test))]
-use super::process::lookup_user;
+use super::process::selected_identity;
 use super::{
     credential::{LinuxCredentialArtifact, MAX_CREDENTIAL_BYTES},
     layout::ConnectorLayout,
@@ -772,8 +772,7 @@ impl LinuxMaterialStore {
         }
         #[cfg(not(test))]
         {
-            let identity = lookup_user(&self.layout.passwd(), &self.layout.user())?
-                .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+            let identity = selected_identity(&self.layout)?;
             if identity.gid == 0 {
                 return invalid();
             }
@@ -792,8 +791,7 @@ impl LinuxMaterialStore {
         }
         #[cfg(not(test))]
         {
-            let identity = lookup_user(&self.layout.passwd(), &self.layout.user())?
-                .ok_or_else(|| PortError::new(PortErrorKind::InvalidArtifact))?;
+            let identity = selected_identity(&self.layout)?;
             if identity.gid == 0 {
                 return invalid();
             }

@@ -74,7 +74,7 @@ fn two_connectors_are_isolated_and_recover_an_intent_after_supervisor_crash() {
     );
     let release_digest = ReleaseDigest::from_bytes(Sha256::digest(&fixture_bytes).into());
     let release_directory = release_directory(release_digest);
-    let fixture_target = release_directory.join("dirextalk-connect");
+    let fixture_target = release_directory.join("dirextalk-agent-connector");
     let host_id = parse::<HostId>(HOST_ID);
     let codex_id = parse::<ConnectorId>(CODEX_ID);
     let openclaw_id = parse::<ConnectorId>(OPENCLAW_ID);
