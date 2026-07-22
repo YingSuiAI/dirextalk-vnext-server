@@ -19,12 +19,12 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use config::BootstrapConfig;
 use dtx_agent_control::{CredentialReissueToken, EnrollmentToken, Sha256Digest};
 use dtx_agent_control_server::{
-    ConnectorCertificateAuthority, ConnectorCredentialAuthorizationIndex,
-    CreateConnectorEnrollmentRequest, CreatedConnectorEnrollment, HostProvisioningConnectorRequest,
-    HostProvisioningRequest, HostProvisioningResult, MAX_PROVISIONING_CONNECTORS,
-    MIN_PROVISIONING_ENROLLMENT_TTL_MILLIS, PostgresConnectorControlApplication,
-    PrepareConnectorCredentialReissueRequest, ProtobufDurableCommandDecoder,
-    ensure_host_provisioning,
+    ConnectorBootstrapIssuance, ConnectorCertificateAuthority,
+    ConnectorCredentialAuthorizationIndex, CreateConnectorEnrollmentRequest,
+    CreatedConnectorEnrollment, HostProvisioningConnectorRequest, HostProvisioningRequest,
+    HostProvisioningResult, MAX_PROVISIONING_CONNECTORS, MIN_PROVISIONING_ENROLLMENT_TTL_MILLIS,
+    PostgresConnectorControlApplication, PrepareConnectorCredentialReissueRequest,
+    ProtobufDurableCommandDecoder, ensure_connector_bootstrap_issuance, ensure_host_provisioning,
 };
 use dtx_agent_host::{AgentHost, HostLifecycle};
 use dtx_agent_persistence::{
@@ -50,7 +50,7 @@ use dtx_storage::PgStore;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, pem::PemObject};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, postgres::PgConnectOptions};
+use sqlx::{PgConnection, Row, postgres::PgConnectOptions};
 use zeroize::{Zeroize, Zeroizing};
 
 const PLAN_SCHEMA: &str = "dirextalk.host-provisioning-plan";
@@ -145,6 +145,27 @@ const ACCEPTANCE_FINALIZE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.connector_bindings", "INSERT"),
     ("agent.connector_bindings", "UPDATE"),
 ];
+const BOOTSTRAP_ISSUE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
+    ("system.schema_versions", "SELECT"),
+    ("system.tenant_stream_heads", "SELECT"),
+    ("system.tenant_stream_heads", "INSERT"),
+    ("agent.host_provisioning_operations", "SELECT"),
+    ("agent.host_provisioning_operations", "INSERT"),
+    ("agent.hosts", "SELECT"),
+    ("agent.hosts", "INSERT"),
+    ("agent.host_credentials", "SELECT"),
+    ("agent.host_credentials", "INSERT"),
+    ("agent.connector_instances", "SELECT"),
+    ("agent.connector_instances", "INSERT"),
+    ("agent.connector_revisions", "SELECT"),
+    ("agent.connector_revisions", "INSERT"),
+    ("agent.connector_control_operations", "SELECT"),
+    ("agent.connector_control_operations", "INSERT"),
+    ("agent.connector_enrollment_intents", "SELECT"),
+    ("agent.connector_enrollment_intents", "INSERT"),
+    ("agent.connector_bootstrap_issuances", "SELECT"),
+    ("agent.connector_bootstrap_issuances", "INSERT"),
+];
 const CREDENTIAL_REISSUE_PREPARE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.connector_instances", "SELECT"),
     ("agent.connector_revisions", "SELECT"),
@@ -175,6 +196,15 @@ async fn main() -> ExitCode {
             }
         };
     }
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("bootstrap-issue")) {
+        return match run_bootstrap_issue().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("dtx-agent-provision: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if matches!(
         env::args_os().nth(1).as_deref(),
         Some(command)
@@ -196,6 +226,136 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn run_bootstrap_issue() -> Result<(), BootstrapIssueError> {
+    #[cfg(unix)]
+    if rustix::process::geteuid().as_raw() != 0 {
+        return Err(BootstrapIssueError::RootRequired);
+    }
+    let arguments = BootstrapIssueArguments::parse(env::args_os())?;
+    let mut request = parse_bootstrap_issue_request(&read_root_request_bounded(
+        &arguments.request_file,
+        MAX_JSON_BYTES,
+    )?)?;
+    let now = now_millis().map_err(|_| BootstrapIssueError::Time)?;
+    validate_bootstrap_issue_request(&mut request, now)?;
+    let request_json = serde_json::to_vec(&request).map_err(|_| BootstrapIssueError::Request)?;
+    let request_digest = domain_digest(
+        b"dirextalk.connector-bootstrap-issuance-request.v1",
+        &request_json,
+    );
+
+    let database_url = Zeroizing::new(read_regular_bounded(
+        &arguments.database_url_file,
+        MAX_DATABASE_URL_BYTES,
+        true,
+    )?);
+    let database_options = std::str::from_utf8(&database_url)
+        .map_err(|_| BootstrapIssueError::DatabaseConfig)?
+        .trim()
+        .parse::<PgConnectOptions>()
+        .map_err(|_| BootstrapIssueError::DatabaseConfig)?;
+    let store = PgStore::connect(database_options, 2)
+        .await
+        .map_err(|_| BootstrapIssueError::Database)?;
+    if !store
+        .readiness_check(
+            BOOTSTRAP_ISSUE_TABLE_PRIVILEGES,
+            REQUIRED_FUNCTION_PRIVILEGES,
+        )
+        .await
+        .map_err(|_| BootstrapIssueError::Database)?
+    {
+        return Err(BootstrapIssueError::Database);
+    }
+    if bootstrap_issuance_exists(&store, request.host.tenant_id, request.operation_id).await?
+        && !handoff_path_exists(&arguments.handoff_file)?
+    {
+        return Err(BootstrapIssueError::HandoffUnavailable);
+    }
+    let ttl_millis = i64::try_from(request.connector.expires_at_millis)
+        .map_err(|_| BootstrapIssueError::Request)?
+        .checked_sub(now)
+        .ok_or(BootstrapIssueError::Request)?;
+    let mut handoff =
+        LockedBootstrapHandoff::acquire(&request, ttl_millis, &arguments.handoff_file)?;
+    handoff.handoff.state = HandoffState::Ready;
+    let handoff_json =
+        serde_json::to_vec(&handoff.handoff).map_err(|_| BootstrapIssueError::Handoff)?;
+    let handoff_digest = plain_digest(&handoff_json);
+    let plan = bootstrap_issue_plan(&request, &handoff.handoff, handoff_digest)?;
+    let plan_json = serde_json::to_vec(&plan).map_err(|_| BootstrapIssueError::Plan)?;
+    let plan_digest = plain_digest(&plan_json);
+    let token_digest = handoff.handoff.enrollment_token.domain_token().digest();
+    let mcp_digest = handoff.handoff.mcp_bearer.sha256_digest();
+    if !bootstrap_issuance_secret_facts_match(
+        &store,
+        request.host.tenant_id,
+        request.operation_id,
+        handoff_digest,
+        token_digest,
+        mcp_digest,
+    )
+    .await?
+    {
+        return Err(BootstrapIssueError::HandoffUnavailable);
+    }
+    let provisioning = HostProvisioningRequest::new(
+        request.operation_id,
+        request.host.tenant_id,
+        request.host.host_id,
+        request.host.owner_id,
+        request.host.host_credential_id,
+        request_digest,
+        handoff.created_at_millis,
+        vec![
+            HostProvisioningConnectorRequest::new(
+                request.connector.instance_id,
+                request.connector.adapter_kind.domain(),
+                request.connector.enrollment_request_id,
+                handoff.handoff.enrollment_intent_id,
+                1,
+                ttl_millis,
+                handoff.handoff.enrollment_token.domain_token(),
+            )
+            .map_err(|_| BootstrapIssueError::Request)?,
+        ],
+    )
+    .map_err(|_| BootstrapIssueError::Request)?;
+    let issuance = ConnectorBootstrapIssuance {
+        operation_id: request.operation_id,
+        tenant_id: request.host.tenant_id,
+        connector_id: request.connector.instance_id,
+        host_id: request.host.host_id,
+        enrollment_request_id: request.connector.enrollment_request_id,
+        enrollment_intent_id: handoff.handoff.enrollment_intent_id,
+        connector_generation: request.connector.generation,
+        spec_revision: Revision::new(request.connector.spec_revision)
+            .map_err(|_| BootstrapIssueError::Request)?,
+        request_digest,
+        plan_digest,
+        handoff_digest,
+        enrollment_token_digest: token_digest,
+        mcp_bearer_digest: mcp_digest,
+        request_json: serde_json::from_slice(&request_json)
+            .map_err(|_| BootstrapIssueError::Request)?,
+        plan_json: serde_json::from_slice(&plan_json).map_err(|_| BootstrapIssueError::Plan)?,
+        expires_at_millis: i64::try_from(request.connector.expires_at_millis)
+            .map_err(|_| BootstrapIssueError::Request)?,
+        created_at_millis: handoff.created_at_millis,
+    };
+    let result = ensure_connector_bootstrap_issuance(&store, provisioning, issuance)
+        .await
+        .map_err(|_| BootstrapIssueError::Provisioning)?;
+    if result.connectors.len() != 1 {
+        return Err(BootstrapIssueError::Provisioning);
+    }
+    handoff.publish_ready()?;
+    if let Some(path) = arguments.plan_file.as_deref() {
+        write_redacted_plan(path, &plan)?;
+    }
+    report_bootstrap_issue(&plan, handoff.was_new)
 }
 
 async fn run() -> Result<(), ProvisionError> {
@@ -739,6 +899,111 @@ struct ProvisioningPlan {
     connectors: Vec<PlanConnector>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapIssueRequest {
+    schema: String,
+    schema_version: u8,
+    operation_id: RequestId,
+    manifest_digest: Digest32,
+    target: String,
+    connector_artifact: BootstrapArtifact,
+    host: BootstrapHost,
+    connector: BootstrapRequestConnector,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapArtifact {
+    version: String,
+    digest: Digest32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapHost {
+    tenant_id: TenantId,
+    host_id: HostId,
+    owner_id: IdentityId,
+    host_credential_id: HostCredentialId,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapRequestConnector {
+    instance_id: ConnectorId,
+    adapter_kind: AdapterCode,
+    display_name: String,
+    generation: u64,
+    spec_revision: u64,
+    enrollment_request_id: RequestId,
+    installation_id: InstallationId,
+    agent_device_id: AgentDeviceId,
+    binding_id: BindingId,
+    expires_at_millis: u64,
+    server_origin: String,
+    trust: BootstrapTrust,
+    runtime_profile: String,
+    remote_mcp: BootstrapRemoteMcp,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapTrust {
+    enrollment_url: String,
+    enrollment_server_name: String,
+    enrollment_root_ca_sha256: Digest32,
+    control_url: String,
+    control_server_name: String,
+    control_server_root_ca_sha256: Digest32,
+    connector_issuer_root_ca_sha256: Digest32,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapRemoteMcp {
+    mcp_server_name: String,
+    mcp_url: String,
+    mcp_node_id: RequestId,
+    max_concurrent_runs: u64,
+    offline_policy: String,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapIssuePlan {
+    schema: &'static str,
+    schema_version: u8,
+    state: &'static str,
+    operation_id: RequestId,
+    manifest_digest: Digest32,
+    target: String,
+    connector_artifact: BootstrapArtifact,
+    host: BootstrapHost,
+    connector: BootstrapPlanConnector,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapPlanConnector {
+    instance_id: ConnectorId,
+    adapter_kind: AdapterCode,
+    handoff_digest: Digest32,
+    display_name: String,
+    generation: u64,
+    spec_revision: u64,
+    enrollment_request_id: RequestId,
+    enrollment_intent_id: EnrollmentIntentId,
+    installation_id: InstallationId,
+    agent_device_id: AgentDeviceId,
+    binding_id: BindingId,
+    expires_at_millis: u64,
+    server_origin: String,
+    trust: BootstrapTrust,
+    runtime_profile: String,
+    remote_mcp: BootstrapRemoteMcp,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(
@@ -954,6 +1219,27 @@ struct ProvisioningHandoff {
     owner_id: IdentityId,
     host_credential_id: HostCredentialId,
     connectors: Vec<HandoffConnector>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapIssueHandoff {
+    schema: String,
+    schema_version: u8,
+    state: HandoffState,
+    operation_id: RequestId,
+    manifest_digest: Digest32,
+    target: String,
+    tenant_id: TenantId,
+    host_id: HostId,
+    instance_id: ConnectorId,
+    enrollment_request_id: RequestId,
+    enrollment_intent_id: EnrollmentIntentId,
+    generation: u64,
+    spec_revision: u64,
+    expires_at_millis: u64,
+    enrollment_token: SecretToken,
+    mcp_bearer: SecretToken,
 }
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -1174,6 +1460,126 @@ struct LockedHandoff {
     was_new: bool,
 }
 
+struct BootstrapIssueArguments {
+    database_url_file: PathBuf,
+    request_file: PathBuf,
+    handoff_file: PathBuf,
+    plan_file: Option<PathBuf>,
+}
+
+impl BootstrapIssueArguments {
+    fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, BootstrapIssueError> {
+        let mut arguments = arguments.into_iter();
+        let _program = arguments.next();
+        if arguments.next().as_deref() != Some(std::ffi::OsStr::new("bootstrap-issue")) {
+            return Err(BootstrapIssueError::Usage);
+        }
+        let mut database_url_file = None;
+        let mut request_file = None;
+        let mut handoff_file = None;
+        let mut plan_file = None;
+        while let Some(flag) = arguments.next() {
+            let value = arguments.next().ok_or(BootstrapIssueError::Usage)?;
+            match flag.to_str() {
+                Some("--database-url-file") if database_url_file.is_none() => {
+                    database_url_file = Some(PathBuf::from(value));
+                }
+                Some("--request-file") if request_file.is_none() => {
+                    request_file = Some(PathBuf::from(value));
+                }
+                Some("--handoff-file") if handoff_file.is_none() => {
+                    handoff_file = Some(PathBuf::from(value));
+                }
+                Some("--plan-file") if plan_file.is_none() => {
+                    plan_file = Some(PathBuf::from(value));
+                }
+                _ => return Err(BootstrapIssueError::Usage),
+            }
+        }
+        Ok(Self {
+            database_url_file: database_url_file.ok_or(BootstrapIssueError::Usage)?,
+            request_file: request_file.ok_or(BootstrapIssueError::Usage)?,
+            handoff_file: handoff_file.ok_or(BootstrapIssueError::Usage)?,
+            plan_file,
+        })
+    }
+}
+
+struct LockedBootstrapHandoff {
+    _lock: HandoffParentLock,
+    path: PathBuf,
+    handoff: BootstrapIssueHandoff,
+    created_at_millis: i64,
+    was_new: bool,
+}
+
+impl LockedBootstrapHandoff {
+    fn acquire(
+        request: &BootstrapIssueRequest,
+        ttl_millis: i64,
+        path: &Path,
+    ) -> Result<Self, BootstrapIssueError> {
+        let lock = HandoffParentLock::acquire(path).map_err(BootstrapIssueError::from)?;
+        let (handoff, was_new, created_at_millis) = match fs::symlink_metadata(path) {
+            Ok(_) => {
+                let bytes = Zeroizing::new(
+                    read_regular_bounded(path, MAX_JSON_BYTES, true)
+                        .map_err(BootstrapIssueError::from)?,
+                );
+                let handoff: BootstrapIssueHandoff =
+                    serde_json::from_slice(&bytes).map_err(|_| BootstrapIssueError::Handoff)?;
+                let created = i64::try_from(handoff.expires_at_millis)
+                    .ok()
+                    .and_then(|expiry| expiry.checked_sub(ttl_millis))
+                    .ok_or(BootstrapIssueError::Handoff)?;
+                (handoff, false, created)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let created = now_millis().map_err(|_| BootstrapIssueError::Time)?;
+                let handoff = BootstrapIssueHandoff {
+                    schema: "dirextalk.connector-bootstrap-handoff".to_owned(),
+                    schema_version: 1,
+                    state: HandoffState::Pending,
+                    operation_id: request.operation_id,
+                    manifest_digest: request.manifest_digest,
+                    target: request.target.clone(),
+                    tenant_id: request.host.tenant_id,
+                    host_id: request.host.host_id,
+                    instance_id: request.connector.instance_id,
+                    enrollment_request_id: request.connector.enrollment_request_id,
+                    enrollment_intent_id: EnrollmentIntentId::new(),
+                    generation: request.connector.generation,
+                    spec_revision: request.connector.spec_revision,
+                    expires_at_millis: u64::try_from(
+                        created
+                            .checked_add(ttl_millis)
+                            .ok_or(BootstrapIssueError::Time)?,
+                    )
+                    .map_err(|_| BootstrapIssueError::Time)?,
+                    enrollment_token: SecretToken::generate().map_err(BootstrapIssueError::from)?,
+                    mcp_bearer: SecretToken::generate().map_err(BootstrapIssueError::from)?,
+                };
+                atomic_create_handoff(path, &handoff).map_err(BootstrapIssueError::from)?;
+                (handoff, true, created)
+            }
+            Err(_) => return Err(BootstrapIssueError::Handoff),
+        };
+        validate_bootstrap_issue_handoff(&handoff, request, created_at_millis, ttl_millis)?;
+        Ok(Self {
+            _lock: lock,
+            path: path.to_owned(),
+            handoff,
+            created_at_millis,
+            was_new,
+        })
+    }
+
+    fn publish_ready(&mut self) -> Result<(), BootstrapIssueError> {
+        self.handoff.state = HandoffState::Ready;
+        atomic_replace_handoff(&self.path, &self.handoff).map_err(BootstrapIssueError::from)
+    }
+}
+
 impl LockedHandoff {
     fn acquire(plan: &ProvisioningPlan, path: &Path) -> Result<Self, ProvisionError> {
         let lock = HandoffParentLock::acquire(path)?;
@@ -1241,6 +1647,10 @@ impl SecretToken {
     fn domain_reissue_token(&self) -> CredentialReissueToken {
         CredentialReissueToken::from_bytes(self.0)
     }
+
+    fn sha256_digest(&self) -> Sha256Digest {
+        Sha256Digest::from_bytes(Sha256::digest(self.0).into())
+    }
 }
 
 impl Drop for SecretToken {
@@ -1281,6 +1691,179 @@ impl<'de> Deserialize<'de> for SecretToken {
 
 fn parse_plan(bytes: &[u8]) -> Result<ProvisioningPlan, ProvisionError> {
     serde_json::from_slice(bytes).map_err(|_| ProvisionError::Plan)
+}
+
+fn parse_bootstrap_issue_request(
+    bytes: &[u8],
+) -> Result<BootstrapIssueRequest, BootstrapIssueError> {
+    serde_json::from_slice(bytes).map_err(|_| BootstrapIssueError::Request)
+}
+
+fn validate_bootstrap_issue_request(
+    request: &mut BootstrapIssueRequest,
+    now: i64,
+) -> Result<(), BootstrapIssueError> {
+    if request.schema != "dirextalk.connector-bootstrap-issuance-request"
+        || request.schema_version != 1
+        || request.manifest_digest.bytes() == [0; 32]
+        || !matches!(
+            request.target.as_str(),
+            "linux-amd64" | "linux-arm64" | "windows-amd64"
+        )
+        || request.connector.generation != 1
+        || request.connector.spec_revision != 1
+        || request.connector.expires_at_millis <= u64::try_from(now).unwrap_or(u64::MAX)
+        || request.connector.expires_at_millis
+            > u64::try_from(now.saturating_add(MAX_ENROLLMENT_TTL_MILLIS)).unwrap_or(u64::MAX)
+        || !is_semver(&request.connector_artifact.version)
+        || request.connector_artifact.digest.bytes() == [0; 32]
+        || !is_canonical_https_origin(&request.connector.server_origin)
+        || !is_canonical_endpoint(
+            &request.connector.trust.enrollment_url,
+            &request.connector.trust.enrollment_server_name,
+        )
+        || !is_canonical_endpoint(
+            &request.connector.trust.control_url,
+            &request.connector.trust.control_server_name,
+        )
+        || !is_canonical_server_name(&request.connector.trust.enrollment_server_name)
+        || !is_canonical_server_name(&request.connector.trust.control_server_name)
+        || request.connector.trust.enrollment_root_ca_sha256.bytes() == [0; 32]
+        || request
+            .connector
+            .trust
+            .control_server_root_ca_sha256
+            .bytes()
+            == [0; 32]
+        || request
+            .connector
+            .trust
+            .connector_issuer_root_ca_sha256
+            .bytes()
+            == [0; 32]
+        || !is_canonical_mcp_name(&request.connector.remote_mcp.mcp_server_name)
+        || !is_canonical_mcp_url(&request.connector.remote_mcp.mcp_url)
+        || request.connector.remote_mcp.max_concurrent_runs == 0
+        || request.connector.remote_mcp.max_concurrent_runs > 4096
+        || request.connector.remote_mcp.offline_policy != "queue"
+        || request.connector.display_name.is_empty()
+        || request.connector.display_name.len() > 128
+    {
+        return Err(BootstrapIssueError::Request);
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_issue_handoff(
+    handoff: &BootstrapIssueHandoff,
+    request: &BootstrapIssueRequest,
+    created_at_millis: i64,
+    ttl_millis: i64,
+) -> Result<(), BootstrapIssueError> {
+    if handoff.schema != "dirextalk.connector-bootstrap-handoff"
+        || handoff.schema_version != 1
+        || handoff.operation_id != request.operation_id
+        || handoff.manifest_digest != request.manifest_digest
+        || handoff.target != request.target
+        || handoff.tenant_id != request.host.tenant_id
+        || handoff.host_id != request.host.host_id
+        || handoff.instance_id != request.connector.instance_id
+        || handoff.enrollment_request_id != request.connector.enrollment_request_id
+        || handoff.generation != request.connector.generation
+        || handoff.spec_revision != request.connector.spec_revision
+        || handoff.expires_at_millis != request.connector.expires_at_millis
+        || created_at_millis < 0
+        || handoff.expires_at_millis
+            != u64::try_from(
+                created_at_millis
+                    .checked_add(ttl_millis)
+                    .ok_or(BootstrapIssueError::Time)?,
+            )
+            .map_err(|_| BootstrapIssueError::Time)?
+    {
+        return Err(BootstrapIssueError::HandoffConflict);
+    }
+    if handoff.enrollment_token.domain_token().digest().as_bytes()
+        == handoff.mcp_bearer.sha256_digest().as_bytes()
+    {
+        return Err(BootstrapIssueError::HandoffConflict);
+    }
+    Ok(())
+}
+
+fn bootstrap_issue_plan(
+    request: &BootstrapIssueRequest,
+    handoff: &BootstrapIssueHandoff,
+    handoff_digest: Sha256Digest,
+) -> Result<BootstrapIssuePlan, BootstrapIssueError> {
+    Ok(BootstrapIssuePlan {
+        schema: "dirextalk.connector-bootstrap-plan",
+        schema_version: 1,
+        state: "prepared",
+        operation_id: request.operation_id,
+        manifest_digest: request.manifest_digest,
+        target: request.target.clone(),
+        connector_artifact: request.connector_artifact.clone(),
+        host: request.host.clone(),
+        connector: BootstrapPlanConnector {
+            instance_id: request.connector.instance_id,
+            adapter_kind: request.connector.adapter_kind,
+            handoff_digest: Digest32(handoff_digest.as_bytes()),
+            display_name: request.connector.display_name.clone(),
+            generation: request.connector.generation,
+            spec_revision: request.connector.spec_revision,
+            enrollment_request_id: request.connector.enrollment_request_id,
+            enrollment_intent_id: handoff.enrollment_intent_id,
+            installation_id: request.connector.installation_id,
+            agent_device_id: request.connector.agent_device_id,
+            binding_id: request.connector.binding_id,
+            expires_at_millis: request.connector.expires_at_millis,
+            server_origin: request.connector.server_origin.clone(),
+            trust: request.connector.trust.clone(),
+            runtime_profile: request.connector.runtime_profile.clone(),
+            remote_mcp: request.connector.remote_mcp.clone(),
+        },
+    })
+}
+
+fn is_semver(value: &str) -> bool {
+    let cut = value.find(['-', '+']).unwrap_or(value.len());
+    let (core, suffix) = value.split_at(cut);
+    let parts = core.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && (part == &"0" || !part.starts_with('0'))
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        && (suffix.is_empty()
+            || suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+')))
+}
+
+fn is_canonical_endpoint(value: &str, server_name: &str) -> bool {
+    let Some(authority) = value.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    authority == server_name && is_canonical_server_name(server_name)
+}
+
+fn is_canonical_mcp_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+        })
+        && value.as_bytes()[0].is_ascii_lowercase()
+}
+
+fn is_canonical_mcp_url(value: &str) -> bool {
+    value.strip_prefix("https://").is_some_and(|rest| {
+        let rest = rest.strip_suffix("/mcp").unwrap_or("");
+        !rest.is_empty() && is_canonical_server_name(rest)
+    })
 }
 
 fn parse_handoff(bytes: &[u8]) -> Result<ProvisioningHandoff, ProvisionError> {
@@ -2199,6 +2782,10 @@ fn domain_digest(domain: &[u8], normalized_plan: &[u8]) -> Sha256Digest {
     Sha256Digest::from_bytes(hasher.finalize().into())
 }
 
+fn plain_digest(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::from_bytes(Sha256::digest(bytes).into())
+}
+
 fn now_millis() -> Result<i64, ProvisionError> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2233,6 +2820,119 @@ fn read_regular_bounded(
         return Err(ProvisionError::File);
     }
     Ok(bytes)
+}
+
+fn read_root_request_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, BootstrapIssueError> {
+    let before = fs::symlink_metadata(path).map_err(|_| BootstrapIssueError::File)?;
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || before.len() == 0
+        || before.len() > maximum
+    {
+        return Err(BootstrapIssueError::File);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.uid() != 0 || before.mode() & 0o777 != 0o600 {
+            return Err(BootstrapIssueError::FilePermissions);
+        }
+    }
+    let file = open_read_no_follow(path).map_err(BootstrapIssueError::from)?;
+    let after = file.metadata().map_err(|_| BootstrapIssueError::File)?;
+    validate_same_file(&before, &after).map_err(BootstrapIssueError::from)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(after.len()).unwrap_or(0));
+    file.take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| BootstrapIssueError::File)?;
+    if bytes.is_empty() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum {
+        Err(BootstrapIssueError::File)
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn handoff_path_exists(path: &Path) -> Result<bool, BootstrapIssueError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                Err(BootstrapIssueError::Handoff)
+            } else {
+                Ok(true)
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(BootstrapIssueError::File),
+    }
+}
+
+async fn bootstrap_issuance_exists(
+    store: &PgStore,
+    tenant_id: TenantId,
+    operation_id: RequestId,
+) -> Result<bool, BootstrapIssueError> {
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| BootstrapIssueError::Database)?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM agent.connector_bootstrap_issuances WHERE tenant_id=$1 AND operation_id=$2)",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(operation_id.as_uuid())
+    .fetch_one(session.connection())
+    .await
+    .map_err(|_| BootstrapIssueError::Database)?;
+    session
+        .commit()
+        .await
+        .map_err(|_| BootstrapIssueError::Database)?;
+    Ok(exists)
+}
+
+async fn bootstrap_issuance_secret_facts_match(
+    store: &PgStore,
+    tenant_id: TenantId,
+    operation_id: RequestId,
+    handoff_digest: Sha256Digest,
+    enrollment_token_digest: Sha256Digest,
+    mcp_bearer_digest: Sha256Digest,
+) -> Result<bool, BootstrapIssueError> {
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| BootstrapIssueError::Database)?;
+    let row = sqlx::query(
+        "SELECT handoff_digest, enrollment_token_digest, mcp_bearer_digest
+           FROM agent.connector_bootstrap_issuances
+          WHERE tenant_id=$1 AND operation_id=$2",
+    )
+    .bind(tenant_id.as_uuid())
+    .bind(operation_id.as_uuid())
+    .fetch_optional(session.connection())
+    .await
+    .map_err(|_| BootstrapIssueError::Database)?;
+    let matches = match row {
+        Some(row) => {
+            row.try_get::<Vec<u8>, _>("handoff_digest")
+                .map_err(|_| BootstrapIssueError::Database)?
+                == handoff_digest.as_bytes()
+                && row
+                    .try_get::<Vec<u8>, _>("enrollment_token_digest")
+                    .map_err(|_| BootstrapIssueError::Database)?
+                    == enrollment_token_digest.as_bytes()
+                && row
+                    .try_get::<Vec<u8>, _>("mcp_bearer_digest")
+                    .map_err(|_| BootstrapIssueError::Database)?
+                    == mcp_bearer_digest.as_bytes()
+        }
+        None => true,
+    };
+    session
+        .commit()
+        .await
+        .map_err(|_| BootstrapIssueError::Database)?;
+    Ok(matches)
 }
 
 fn read_service_secret_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, AcceptanceError> {
@@ -2666,6 +3366,79 @@ fn report_success(
 }
 
 #[derive(Serialize)]
+struct BootstrapIssueReport {
+    schema: &'static str,
+    schema_version: u8,
+    state: &'static str,
+    operation_id: RequestId,
+    manifest_digest: Digest32,
+    plan_digest: Digest32,
+    handoff_digest: Digest32,
+    tenant_id: TenantId,
+    host_id: HostId,
+    connector_id: ConnectorId,
+    enrollment_intent_id: EnrollmentIntentId,
+    expires_at_millis: u64,
+    plan_published: bool,
+    handoff_created: bool,
+}
+
+fn write_redacted_plan(path: &Path, plan: &BootstrapIssuePlan) -> Result<(), BootstrapIssueError> {
+    let bytes = serde_json::to_vec(plan).map_err(|_| BootstrapIssueError::Plan)?;
+    if bytes.len() > usize::try_from(MAX_JSON_BYTES).unwrap_or(usize::MAX) {
+        return Err(BootstrapIssueError::Plan);
+    }
+    let parent = path.parent().ok_or(BootstrapIssueError::Plan)?;
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|_| BootstrapIssueError::File)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(BootstrapIssueError::File);
+    }
+    let temp = temporary_path(parent).map_err(BootstrapIssueError::from)?;
+    let result = (|| {
+        let mut file = create_secret_file(&temp).map_err(BootstrapIssueError::from)?;
+        file.write_all(&bytes)
+            .map_err(|_| BootstrapIssueError::File)?;
+        file.sync_all().map_err(|_| BootstrapIssueError::File)?;
+        drop(file);
+        fs::rename(&temp, path).map_err(|_| BootstrapIssueError::File)?;
+        sync_parent(parent).map_err(BootstrapIssueError::from)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
+}
+
+fn report_bootstrap_issue(
+    plan: &BootstrapIssuePlan,
+    handoff_created: bool,
+) -> Result<(), BootstrapIssueError> {
+    let plan_json = serde_json::to_vec(plan).map_err(|_| BootstrapIssueError::Plan)?;
+    let report = BootstrapIssueReport {
+        schema: "dirextalk.connector-bootstrap-issuance-result",
+        schema_version: 1,
+        state: "ready",
+        operation_id: plan.operation_id,
+        manifest_digest: plan.manifest_digest,
+        plan_digest: Digest32(plain_digest(&plan_json).as_bytes()),
+        handoff_digest: plan.connector.handoff_digest,
+        tenant_id: plan.host.tenant_id,
+        host_id: plan.host.host_id,
+        connector_id: plan.connector.instance_id,
+        enrollment_intent_id: plan.connector.enrollment_intent_id,
+        expires_at_millis: plan.connector.expires_at_millis,
+        plan_published: true,
+        handoff_created,
+    };
+    let mut output = io::stdout().lock();
+    serde_json::to_writer(&mut output, &report).map_err(|_| BootstrapIssueError::Output)?;
+    output
+        .write_all(b"\n")
+        .map_err(|_| BootstrapIssueError::Output)?;
+    output.flush().map_err(|_| BootstrapIssueError::Output)
+}
+
+#[derive(Serialize)]
 struct AcceptanceReport {
     schema: &'static str,
     version: u8,
@@ -3052,6 +3825,70 @@ enum ProvisionError {
     Time,
     Output,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootstrapIssueError {
+    Usage,
+    RootRequired,
+    Request,
+    Plan,
+    Handoff,
+    HandoffConflict,
+    HandoffUnavailable,
+    File,
+    FilePermissions,
+    DatabaseConfig,
+    Database,
+    Provisioning,
+    Random,
+    Time,
+    Output,
+}
+
+impl From<ProvisionError> for BootstrapIssueError {
+    fn from(error: ProvisionError) -> Self {
+        match error {
+            ProvisionError::Usage => Self::Usage,
+            ProvisionError::Plan => Self::Plan,
+            ProvisionError::Handoff => Self::Handoff,
+            ProvisionError::HandoffConflict | ProvisionError::HandoffExpired => {
+                Self::HandoffConflict
+            }
+            ProvisionError::File => Self::File,
+            ProvisionError::FilePermissions => Self::FilePermissions,
+            ProvisionError::DatabaseConfig => Self::DatabaseConfig,
+            ProvisionError::Database => Self::Database,
+            ProvisionError::Provisioning => Self::Provisioning,
+            ProvisionError::Random => Self::Random,
+            ProvisionError::Time => Self::Time,
+            ProvisionError::Output => Self::Output,
+        }
+    }
+}
+
+impl fmt::Display for BootstrapIssueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Usage => "usage: dtx-agent-provision bootstrap-issue --database-url-file <0600-file> --request-file <0600-json> --handoff-file <0600-json> [--plan-file <json>]",
+            Self::RootRequired => "bootstrap issuance is root-only",
+            Self::Request => "Connector bootstrap issuance request is invalid",
+            Self::Plan => "Connector bootstrap plan is invalid",
+            Self::Handoff => "Connector bootstrap handoff is invalid",
+            Self::HandoffConflict => "Connector bootstrap handoff conflicts with the request",
+            Self::HandoffUnavailable => "HANDOFF_UNAVAILABLE: exact protected handoff is missing",
+            Self::File => "a required file could not be read or written safely",
+            Self::FilePermissions => "request or handoff file ownership or permissions are unsafe",
+            Self::DatabaseConfig => "database connection configuration is invalid",
+            Self::Database => "database runtime boundary is unavailable",
+            Self::Provisioning => "Connector bootstrap issuance could not be committed or replayed",
+            Self::Random => "secure random generation failed",
+            Self::Time => "system time is outside the supported range",
+            Self::Output => "redacted Connector bootstrap report could not be written",
+        })
+    }
+}
+
+impl std::error::Error for BootstrapIssueError {}
 
 impl fmt::Display for ProvisionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

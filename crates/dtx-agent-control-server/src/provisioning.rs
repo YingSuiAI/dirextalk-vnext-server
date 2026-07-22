@@ -20,11 +20,156 @@ use dtx_domain::{
     TenantId,
 };
 use dtx_storage::{PgStore, StorageError};
-use sqlx::PgConnection;
+use serde_json::Value;
+use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 pub const MIN_PROVISIONING_ENROLLMENT_TTL_MILLIS: i64 = 60_000;
 pub const MAX_PROVISIONING_CONNECTORS: usize = 16;
+
+/// Non-secret immutable facts and digests for one Connector bootstrap issuance.
+/// The caller must have generated and durably staged the protected handoff before
+/// entering the transaction; only digests and redacted JSON are persisted here.
+pub struct ConnectorBootstrapIssuance {
+    pub operation_id: RequestId,
+    pub tenant_id: TenantId,
+    pub connector_id: ConnectorId,
+    pub host_id: HostId,
+    pub enrollment_request_id: RequestId,
+    pub enrollment_intent_id: EnrollmentIntentId,
+    pub connector_generation: u64,
+    pub spec_revision: Revision,
+    pub request_digest: Sha256Digest,
+    pub plan_digest: Sha256Digest,
+    pub handoff_digest: Sha256Digest,
+    pub enrollment_token_digest: Sha256Digest,
+    pub mcp_bearer_digest: Sha256Digest,
+    pub request_json: Value,
+    pub plan_json: Value,
+    pub expires_at_millis: i64,
+    pub created_at_millis: i64,
+}
+
+/// Atomically ensures the Host/Connector/enrollment intent and records the
+/// exact redacted bootstrap issuance. Existing rows are accepted only when all
+/// immutable facts and digests match; changed replays fail closed.
+pub async fn ensure_connector_bootstrap_issuance(
+    store: &PgStore,
+    provisioning: HostProvisioningRequest,
+    issuance: ConnectorBootstrapIssuance,
+) -> Result<HostProvisioningResult, HostProvisioningError> {
+    let mut session = store.begin_tenant(issuance.tenant_id).await?;
+    let result = async {
+        let result = ensure_in_transaction(session.connection(), provisioning).await?;
+        let connector = result
+            .connectors
+            .first()
+            .ok_or(HostProvisioningError::InvalidPlan)?;
+        if connector.connector_id != issuance.connector_id
+            || connector.request_id != issuance.enrollment_request_id
+            || connector.intent_id != issuance.enrollment_intent_id
+            || connector.generation != issuance.connector_generation
+            || connector.spec_revision != issuance.spec_revision
+            || connector.expires_at_millis != issuance.expires_at_millis
+        {
+            return Err(HostProvisioningError::Persistence(
+                AgentPersistenceError::ImmutableConflict("Connector bootstrap fence"),
+            ));
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO agent.connector_bootstrap_issuances (
+                 tenant_id, operation_id, connector_id, host_id,
+                 enrollment_request_id, enrollment_intent_id,
+                 connector_generation, spec_revision, request_digest, plan_digest,
+                 handoff_digest, enrollment_token_digest, mcp_bearer_digest,
+                 request_json, plan_json, state, expires_at_ms, created_at_ms
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'ready',$16,$17)
+             ON CONFLICT (tenant_id, operation_id) DO NOTHING",
+        )
+        .bind(Uuid::from(issuance.tenant_id))
+        .bind(Uuid::from(issuance.operation_id))
+        .bind(Uuid::from(issuance.connector_id))
+        .bind(Uuid::from(issuance.host_id))
+        .bind(Uuid::from(issuance.enrollment_request_id))
+        .bind(Uuid::from(issuance.enrollment_intent_id))
+        .bind(
+            i64::try_from(issuance.connector_generation)
+                .map_err(|_| HostProvisioningError::InvalidPlan)?,
+        )
+        .bind(
+            i64::try_from(issuance.spec_revision.get())
+                .map_err(|_| HostProvisioningError::InvalidPlan)?,
+        )
+        .bind(issuance.request_digest.as_bytes().to_vec())
+        .bind(issuance.plan_digest.as_bytes().to_vec())
+        .bind(issuance.handoff_digest.as_bytes().to_vec())
+        .bind(issuance.enrollment_token_digest.as_bytes().to_vec())
+        .bind(issuance.mcp_bearer_digest.as_bytes().to_vec())
+        .bind(issuance.request_json.clone())
+        .bind(issuance.plan_json.clone())
+        .bind(issuance.expires_at_millis)
+        .bind(issuance.created_at_millis)
+        .execute(session.connection())
+        .await?;
+        if inserted.rows_affected() == 0 {
+            let row = sqlx::query(
+                "SELECT connector_id, host_id, enrollment_request_id, enrollment_intent_id,
+                        connector_generation, spec_revision, request_digest, plan_digest,
+                        handoff_digest, enrollment_token_digest, mcp_bearer_digest,
+                        request_json, plan_json, expires_at_ms, created_at_ms
+                   FROM agent.connector_bootstrap_issuances
+                  WHERE tenant_id=$1 AND operation_id=$2",
+            )
+            .bind(Uuid::from(issuance.tenant_id))
+            .bind(Uuid::from(issuance.operation_id))
+            .fetch_optional(session.connection())
+            .await?
+            .ok_or(HostProvisioningError::Persistence(
+                AgentPersistenceError::CorruptData("Connector bootstrap issuance disappeared"),
+            ))?;
+            let same = row.try_get::<Uuid, _>("connector_id")? == Uuid::from(issuance.connector_id)
+                && row.try_get::<Uuid, _>("host_id")? == Uuid::from(issuance.host_id)
+                && row.try_get::<Uuid, _>("enrollment_request_id")?
+                    == Uuid::from(issuance.enrollment_request_id)
+                && row.try_get::<Uuid, _>("enrollment_intent_id")?
+                    == Uuid::from(issuance.enrollment_intent_id)
+                && row.try_get::<i64, _>("connector_generation")?
+                    == i64::try_from(issuance.connector_generation).unwrap_or_default()
+                && row.try_get::<i64, _>("spec_revision")?
+                    == i64::try_from(issuance.spec_revision.get()).unwrap_or_default()
+                && row.try_get::<Vec<u8>, _>("request_digest")?
+                    == issuance.request_digest.as_bytes()
+                && row.try_get::<Vec<u8>, _>("plan_digest")? == issuance.plan_digest.as_bytes()
+                && row.try_get::<Vec<u8>, _>("handoff_digest")?
+                    == issuance.handoff_digest.as_bytes()
+                && row.try_get::<Vec<u8>, _>("enrollment_token_digest")?
+                    == issuance.enrollment_token_digest.as_bytes()
+                && row.try_get::<Vec<u8>, _>("mcp_bearer_digest")?
+                    == issuance.mcp_bearer_digest.as_bytes()
+                && row.try_get::<Value, _>("request_json")? == issuance.request_json
+                && row.try_get::<Value, _>("plan_json")? == issuance.plan_json
+                && row.try_get::<i64, _>("expires_at_ms")? == issuance.expires_at_millis
+                && row.try_get::<i64, _>("created_at_ms")? == issuance.created_at_millis;
+            if !same {
+                return Err(HostProvisioningError::Persistence(
+                    AgentPersistenceError::ImmutableConflict("Connector bootstrap issuance"),
+                ));
+            }
+        }
+        Ok(result)
+    }
+    .await;
+    match result {
+        Ok(result) => {
+            session.commit().await?;
+            Ok(result)
+        }
+        Err(error) => {
+            session.rollback().await?;
+            Err(error)
+        }
+    }
+}
 
 /// One already-generated secret enrollment intent in an offline Host provisioning request.
 pub struct HostProvisioningConnectorRequest {
