@@ -505,6 +505,7 @@ def atomic_write(path: Path, raw: bytes) -> None:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+            descriptor = -1
     finally:
         if descriptor >= 0:
             os.close(descriptor)

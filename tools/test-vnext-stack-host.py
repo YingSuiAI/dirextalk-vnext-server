@@ -47,6 +47,17 @@ def main() -> int:
     image = "dirextalk/vnet-server@sha256:" + "1" * 64
     migrator_image = "dirextalk/vnet-server@sha256:" + "2" * 64
     with tempfile.TemporaryDirectory() as temporary:
+        atomic_path = Path(temporary) / "atomic-receipt.json"
+        original_fchown = installer.os.fchown
+        installer.os.fchown = lambda _descriptor, _uid, _gid: None
+        try:
+            installer.atomic_write(atomic_path, b"first\n")
+            installer.atomic_write(atomic_path, b"second\n")
+        finally:
+            installer.os.fchown = original_fchown
+        assert atomic_path.read_bytes() == b"second\n"
+        assert atomic_path.stat().st_mode & 0o777 == 0o600
+
         bundle = Path(temporary) / "dirextalk-vnext.bundle"
         builder.build(REPOSITORY, bundle, "1.2.3", "a" * 40, image, migrator_image)
         bundle_raw = bundle.read_bytes()
