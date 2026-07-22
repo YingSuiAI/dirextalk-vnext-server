@@ -57,7 +57,8 @@ const MAILBOX_RETAINED_QUOTA_GC_V1_MIGRATION_VERSION: i64 = 202_607_200_050;
 const FEDERATED_MLS_V5_AUTHORIZATION_V1_MIGRATION_VERSION: i64 = 202_607_200_051;
 const RECOVERY_SCOPE_CATALOG_V1_MIGRATION_VERSION: i64 = 202_607_210_052;
 const OPAQUE_PUSH_V1_MIGRATION_VERSION: i64 = 202_607_220_053;
-const EXPECTED_MIGRATION_COUNT: i64 = 53;
+const CONNECTOR_BOOTSTRAP_ISSUANCE_V1_MIGRATION_VERSION: i64 = 202_607_220_054;
+const EXPECTED_MIGRATION_COUNT: i64 = 54;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -195,6 +196,8 @@ const OPAQUE_PUSH_V1_DOWN: &str =
     include_str!("../../../migrations/202607220053_opaque_push_v1.down.sql");
 const OPAQUE_PUSH_V1_UP: &str =
     include_str!("../../../migrations/202607220053_opaque_push_v1.up.sql");
+const CONNECTOR_BOOTSTRAP_ISSUANCE_V1_DOWN: &str =
+    include_str!("../../../migrations/202607220054_connector_bootstrap_issuance_v1.down.sql");
 const LOCAL_RUNTIME_GRANTS: &str =
     include_str!("../../../docker/local/postgres/20-local-runtime-grants.sql");
 
@@ -3630,7 +3633,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -3685,8 +3688,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(FEDERATED_MLS_V5_AUTHORIZATION_V1_MIGRATION_VERSION)
     .bind(RECOVERY_SCOPE_CATALOG_V1_MIGRATION_VERSION)
     .bind(OPAQUE_PUSH_V1_MIGRATION_VERSION)
+    .bind(CONNECTOR_BOOTSTRAP_ISSUANCE_V1_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(CONNECTOR_BOOTSTRAP_ISSUANCE_V1_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(OPAQUE_PUSH_V1_DOWN)
         .execute(harness.admin_pool())
         .await?;
