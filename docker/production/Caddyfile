@@ -35,7 +35,10 @@
         }
     }
 
-    @mcp path /mcp*
+    @mcp {
+        method POST
+        path_regexp mcp ^/mcp$
+    }
     reverse_proxy @mcp https://dtx-node:8443 {
         transport http {
             tls_trust_pool file /data/caddy/private-ca.pem
@@ -43,6 +46,9 @@
         }
     }
 
-    # Agent Control is deliberately absent: its native TLS/mTLS listeners on
-    # 9443/9444/9445 are private and are never HTTP-terminated by Caddy.
+    # This shared template cannot reach Agent Control's loopback Owner listener.
+    # The provisioned-host template adds its separate explicit Owner allowlist
+    # only after Caddy shares Agent Control's network namespace. Agent Control's
+    # native TLS/mTLS listeners on 9443/9444/9445 stay private and are never
+    # HTTP-terminated by Caddy.
 }

@@ -23,6 +23,27 @@ else: raise AssertionError('accepted duplicate keys')
 source=(ROOT/'docker/production/docker-compose.yml').read_text(); rendered=mod.transform_compose(source)
 assert rendered.count('network_mode: service:agent-control')==2
 caddy=mod.caddyfile(v['domain']); assert 'reverse_proxy @mcp http://127.0.0.1:9081' in caddy and '@node path_regexp versioned_api ^/v[1-9][0-9]*/.*$' in caddy and '@health path /healthz' in caddy and 'agent-control:9081' not in caddy
+assert caddy.index('@owner_connectors') < caddy.index('@node path_regexp')
+assert caddy.count('http://127.0.0.1:9081') == 20
+owner_matchers={name:(method,re.compile(pattern)) for name,method,pattern in re.findall(r'@(owner_[a-z_]+) \{\n        method (GET|POST|PUT|DELETE)\n        path_regexp \1 (\S+)\n    \}',caddy)}
+assert len(owner_matchers)==19
+assert {name:method for name,(method,_) in owner_matchers.items()} == {
+ 'owner_connectors':'GET', 'owner_connector_drain':'POST', 'owner_connector_restart':'POST', 'owner_connector_rotate':'POST',
+ 'owner_binding_enable':'POST', 'owner_binding_disable':'POST', 'owner_conversation_grant_put':'PUT', 'owner_conversation_grant_delete':'DELETE',
+ 'owner_agent_route_run':'POST', 'owner_route_bootstrap_create':'POST', 'owner_route_bootstrap_get':'GET', 'owner_route_bootstrap_delivery':'PUT',
+ 'owner_identity_approval_create':'POST', 'owner_identity_approval_get':'GET', 'owner_provisioning_target':'GET', 'owner_agent_route_target':'GET',
+ 'owner_provisioning_delivery_create':'POST', 'owner_provisioning_delivery_get':'GET', 'owner_revocation':'POST',
+}
+for name,method,path,allowed in (
+ ('owner_connectors','GET','/v1/connectors',True), ('owner_connectors','POST','/v1/connectors',False),
+ ('owner_connector_drain','POST','/v1/connectors/a/drain',True), ('owner_connector_drain','POST','/v1/connectors/a/drain/x',False),
+ ('owner_conversation_grant_put','PUT','/v1/conversations/a/agent-grants/b',True), ('owner_conversation_grant_delete','DELETE','/v1/conversations/a/agent-grants/b',True),
+ ('owner_agent_route_run','POST','/v1/conversations/a/agent-routes/b/runs',True), ('owner_route_bootstrap_delivery','PUT','/v1/agent-route-bootstraps/a/deliveries/b',True),
+ ('owner_identity_approval_get','GET','/v1/agent-installations/a/identity-approvals/b',True), ('owner_provisioning_delivery_get','GET','/v1/agent-installations/a/provisioning-deliveries/b',True),
+ ('owner_revocation','POST','/v1/agent-installations/a/revocations',True), ('owner_revocation','GET','/v1/agent-installations/a/revocations',False),
+):
+ actual_method,matcher=owner_matchers[name]; assert (actual_method==method and bool(matcher.fullmatch(path))) == allowed, (name,method,path)
+assert re.search(r'@mcp \{\n        method POST\n        path_regexp mcp (\S+)\n',caddy).group(1) == '^/mcp$'
 versioned_matcher=re.search(r'@node path_regexp versioned_api (\S+)',caddy)
 assert versioned_matcher
 versioned_api=re.compile(versioned_matcher.group(1))
@@ -35,6 +56,8 @@ assert public_feed_api.fullmatch('/.well-known/dirextalk/public/v1/dtxc123/feed'
 for path in ('/.well-known/dirextalk/public/v1', '/.well-known/dirextalk/public/v1/', '/.well-known/dirextalk/public/v1//feed', '/.well-known/dirextalk/public/v0/dtxc123/feed', '/.well-known/dirextalk/public/v00/dtxc123/feed', '/.well-known/public/v1/dtxc123/feed', '/public/v1/dtxc123/feed'):
  assert not public_feed_api.fullmatch(path), path
 static_caddy=(ROOT/'docker/production/Caddyfile').read_text()
+assert '@mcp {\n        method POST\n        path_regexp mcp ^/mcp$\n    }' in static_caddy
+assert '127.0.0.1:9081' not in static_caddy and '@owner_' not in static_caddy
 static_public_feed_matcher=re.search(r'@public_feed path_regexp public_feed (\S+)',static_caddy)
 assert static_public_feed_matcher and 'reverse_proxy @public_feed https://dtx-node:8443' in static_caddy
 static_public_feed_api=re.compile(static_public_feed_matcher.group(1))

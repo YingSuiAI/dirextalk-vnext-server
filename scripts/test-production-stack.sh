@@ -29,7 +29,7 @@ grep -q 'reverse_proxy @node https://dtx-node:8443' "$root/docker/production/Cad
 grep -q '@node path_regexp versioned_api \^/v\[1-9\]\[0-9\]\*/\.\*\$' "$root/docker/production/Caddyfile"
 grep -qF '@public_feed path_regexp public_feed ^/\.well-known/dirextalk/public/v1/[^/]+(/.*)?$' "$root/docker/production/Caddyfile"
 grep -q 'reverse_proxy @public_feed https://dtx-node:8443' "$root/docker/production/Caddyfile"
-grep -q '@mcp path /mcp\*' "$root/docker/production/Caddyfile"
+grep -q 'path_regexp mcp \^/mcp\$' "$root/docker/production/Caddyfile"
 grep -q 'reverse_proxy @mcp https://dtx-node:8443' "$root/docker/production/Caddyfile"
 grep -q 'tls_trust_pool file /data/caddy/private-ca.pem' "$root/docker/production/Caddyfile"
 ! grep -q 'agent-control:944' "$root/docker/production/Caddyfile"

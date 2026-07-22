@@ -100,8 +100,149 @@ def transform_compose(source):
     source=source.replace(CADDY_PORTS, '    network_mode: service:agent-control', 1)
     if source.count('network_mode: service:agent-control') != 2: raise ContractError('compose transformation count invalid')
     return source
+def owner_routes():
+    return '''    # Owner API is an explicit authenticated allowlist. Caddy shares Agent
+    # Control's network namespace in this provisioned topology, so it can reach
+    # the loopback Owner listener; keep these matchers before @node.
+    @owner_connectors {
+        method GET
+        path_regexp owner_connectors ^/v1/connectors$
+    }
+    reverse_proxy @owner_connectors http://127.0.0.1:9081
+    @owner_connector_drain {
+        method POST
+        path_regexp owner_connector_drain ^/v1/connectors/[^/]+/drain$
+    }
+    reverse_proxy @owner_connector_drain http://127.0.0.1:9081
+    @owner_connector_restart {
+        method POST
+        path_regexp owner_connector_restart ^/v1/connectors/[^/]+/restart$
+    }
+    reverse_proxy @owner_connector_restart http://127.0.0.1:9081
+    @owner_connector_rotate {
+        method POST
+        path_regexp owner_connector_rotate ^/v1/connectors/[^/]+/rotate-credential$
+    }
+    reverse_proxy @owner_connector_rotate http://127.0.0.1:9081
+    @owner_binding_enable {
+        method POST
+        path_regexp owner_binding_enable ^/v1/connector-bindings/[^/]+/enable$
+    }
+    reverse_proxy @owner_binding_enable http://127.0.0.1:9081
+    @owner_binding_disable {
+        method POST
+        path_regexp owner_binding_disable ^/v1/connector-bindings/[^/]+/disable$
+    }
+    reverse_proxy @owner_binding_disable http://127.0.0.1:9081
+    @owner_conversation_grant_put {
+        method PUT
+        path_regexp owner_conversation_grant_put ^/v1/conversations/[^/]+/agent-grants/[^/]+$
+    }
+    reverse_proxy @owner_conversation_grant_put http://127.0.0.1:9081
+    @owner_conversation_grant_delete {
+        method DELETE
+        path_regexp owner_conversation_grant_delete ^/v1/conversations/[^/]+/agent-grants/[^/]+$
+    }
+    reverse_proxy @owner_conversation_grant_delete http://127.0.0.1:9081
+    @owner_agent_route_run {
+        method POST
+        path_regexp owner_agent_route_run ^/v1/conversations/[^/]+/agent-routes/[^/]+/runs$
+    }
+    reverse_proxy @owner_agent_route_run http://127.0.0.1:9081
+    @owner_route_bootstrap_create {
+        method POST
+        path_regexp owner_route_bootstrap_create ^/v1/agent-route-bootstraps$
+    }
+    reverse_proxy @owner_route_bootstrap_create http://127.0.0.1:9081
+    @owner_route_bootstrap_get {
+        method GET
+        path_regexp owner_route_bootstrap_get ^/v1/agent-route-bootstraps/[^/]+$
+    }
+    reverse_proxy @owner_route_bootstrap_get http://127.0.0.1:9081
+    @owner_route_bootstrap_delivery {
+        method PUT
+        path_regexp owner_route_bootstrap_delivery ^/v1/agent-route-bootstraps/[^/]+/deliveries/[^/]+$
+    }
+    reverse_proxy @owner_route_bootstrap_delivery http://127.0.0.1:9081
+    @owner_identity_approval_create {
+        method POST
+        path_regexp owner_identity_approval_create ^/v1/agent-installations/[^/]+/identity-approvals$
+    }
+    reverse_proxy @owner_identity_approval_create http://127.0.0.1:9081
+    @owner_identity_approval_get {
+        method GET
+        path_regexp owner_identity_approval_get ^/v1/agent-installations/[^/]+/identity-approvals/[^/]+$
+    }
+    reverse_proxy @owner_identity_approval_get http://127.0.0.1:9081
+    @owner_provisioning_target {
+        method GET
+        path_regexp owner_provisioning_target ^/v1/agent-installations/[^/]+/provisioning-target$
+    }
+    reverse_proxy @owner_provisioning_target http://127.0.0.1:9081
+    @owner_agent_route_target {
+        method GET
+        path_regexp owner_agent_route_target ^/v1/agent-installations/[^/]+/agent-route-target$
+    }
+    reverse_proxy @owner_agent_route_target http://127.0.0.1:9081
+    @owner_provisioning_delivery_create {
+        method POST
+        path_regexp owner_provisioning_delivery_create ^/v1/agent-installations/[^/]+/provisioning-deliveries$
+    }
+    reverse_proxy @owner_provisioning_delivery_create http://127.0.0.1:9081
+    @owner_provisioning_delivery_get {
+        method GET
+        path_regexp owner_provisioning_delivery_get ^/v1/agent-installations/[^/]+/provisioning-deliveries/[^/]+$
+    }
+    reverse_proxy @owner_provisioning_delivery_get http://127.0.0.1:9081
+    @owner_revocation {
+        method POST
+        path_regexp owner_revocation ^/v1/agent-installations/[^/]+/revocations$
+    }
+    reverse_proxy @owner_revocation http://127.0.0.1:9081
+'''
+
 def caddyfile(domain):
-    return f'''{domain} {{\n    @health path /healthz\n    handle @health {{\n        rewrite * /local-health\n        reverse_proxy https://dtx-node:8443 {{\n            transport http {{\n                tls_trust_pool file /data/caddy/private-ca.pem\n                tls_server_name {domain}\n            }}\n        }}\n    }}\n    @realtime path /v1/realtime-sync*\n    reverse_proxy @realtime https://realtime-gateway:9444 {{\n        transport http {{\n            tls_trust_pool file /data/caddy/private-ca.pem\n            tls_server_name {domain}\n        }}\n    }}\n    @mcp path /mcp*\n    reverse_proxy @mcp http://127.0.0.1:9081\n    # Canonical public API routes use a positive, non-zero decimal version.\n    @node path_regexp versioned_api ^/v[1-9][0-9]*/.*$\n    reverse_proxy @node https://dtx-node:8443 {{\n        transport http {{\n            tls_trust_pool file /data/caddy/private-ca.pem\n            tls_server_name {domain}\n        }}\n    }}\n    @public_feed path_regexp public_feed ^/\\.well-known/dirextalk/public/v1/[^/]+(/.*)?$\n    reverse_proxy @public_feed https://dtx-node:8443 {{\n        transport http {{\n            tls_trust_pool file /data/caddy/private-ca.pem\n            tls_server_name {domain}\n        }}\n    }}\n}}\n'''
+    return f'''{domain} {{
+    @health path /healthz
+    handle @health {{
+        rewrite * /local-health
+        reverse_proxy https://dtx-node:8443 {{
+            transport http {{
+                tls_trust_pool file /data/caddy/private-ca.pem
+                tls_server_name {domain}
+            }}
+        }}
+    }}
+    @realtime path /v1/realtime-sync*
+    reverse_proxy @realtime https://realtime-gateway:9444 {{
+        transport http {{
+            tls_trust_pool file /data/caddy/private-ca.pem
+            tls_server_name {domain}
+        }}
+    }}
+    @mcp {{
+        method POST
+        path_regexp mcp ^/mcp$
+    }}
+    reverse_proxy @mcp http://127.0.0.1:9081
+{owner_routes()}    # Canonical public API routes use a positive, non-zero decimal version.
+    @node path_regexp versioned_api ^/v[1-9][0-9]*/.*$
+    reverse_proxy @node https://dtx-node:8443 {{
+        transport http {{
+            tls_trust_pool file /data/caddy/private-ca.pem
+            tls_server_name {domain}
+        }}
+    }}
+    @public_feed path_regexp public_feed ^/\\.well-known/dirextalk/public/v1/[^/]+(/.*)?$
+    reverse_proxy @public_feed https://dtx-node:8443 {{
+        transport http {{
+            tls_trust_pool file /data/caddy/private-ca.pem
+            tls_server_name {domain}
+        }}
+    }}
+}}
+'''
+
 def agent_config(v):
     s='/run/dtx-agent-control-secrets/'; t='/run/dtx-agent-control-tls/'
     return canonical({'database_url_file':s+'database-url','max_database_connections':16,'health':{'listen':'127.0.0.1:9080'},'owner_api':{'listen':'127.0.0.1:9081','tenant_id':v['tenant_id']},'enrollment':{'listen':'0.0.0.0:9443','certificate_chain_pem':t+'enrollment-chain.pem','private_key_pkcs8_pem':s+'enrollment-key.pem'},'control':{'listen':'0.0.0.0:9444','certificate_chain_pem':t+'control-chain.pem','private_key_pkcs8_pem':s+'control-key.pem','client_ca_bundle_pem':t+'connector-client-roots.pem'},'legacy_gateway':{'listen':'0.0.0.0:9445','certificate_chain_pem':t+'legacy-gateway-server-chain.pem','private_key_pkcs8_pem':s+'legacy-gateway-server-key.pem','client_ca_bundle_pem':t+'internal-service-client-roots.pem'},'connector_issuer':{'certificate_pem':t+'connector-issuer.pem','private_key_pkcs8_pem':s+'connector-issuer-key.pem','response_intermediate_bundle_pem':t+'connector-response-intermediates.pem'}})
