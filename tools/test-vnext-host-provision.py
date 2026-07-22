@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Focused contract tests; subprocesses and host paths are never live."""
 from __future__ import annotations
-import importlib.machinery, importlib.util, json, sys
+import importlib.machinery, importlib.util, json, os, stat, sys, tempfile
 from pathlib import Path
 sys.dont_write_bytecode=True
 ROOT=Path(__file__).resolve().parent.parent
@@ -29,4 +29,12 @@ except mod.ContractError: pass
 else: raise AssertionError('accepted altered compose template')
 receipt=mod.ready(v,mod.sha(mod.canonical(v))); parsed=json.loads(receipt); assert parsed['receipt_sha256']==mod.sha(mod.canonical({k:x for k,x in parsed.items() if k!='receipt_sha256'}))
 assert b'postgresql://' not in receipt and b'password' not in receipt
+with tempfile.TemporaryDirectory() as temporary:
+ path=Path(temporary)/'key'; identity=os.getuid(); mod.write(path,b'x'*32,0o400,identity,identity); metadata=path.stat(); assert path.read_bytes()==b'x'*32 and stat.S_IMODE(metadata.st_mode)==0o400 and metadata.st_uid==identity and metadata.st_gid==identity
+ original=os.write; calls=[]
+ def short(fd,data): calls.append(len(data)); return original(fd,data[:1])
+ os.write=short
+ try: mod.write(Path(temporary)/'short',b'abc',0o600,identity,identity)
+ finally: os.write=original
+ assert (Path(temporary)/'short').read_bytes()==b'abc' and not list(Path(temporary).glob('.short.*'))
 print('vNext host provision focused contract checks passed')

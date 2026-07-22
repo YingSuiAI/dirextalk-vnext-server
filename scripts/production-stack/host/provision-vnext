@@ -2,7 +2,7 @@
 """Fixed, replay-safe fresh-host materializer for a released vNext stack."""
 from __future__ import annotations
 
-import fcntl, hashlib, ipaddress, json, os, re, stat, subprocess, sys
+import fcntl, hashlib, ipaddress, json, os, re, stat, subprocess, sys, tempfile
 from pathlib import Path
 
 REQUEST = Path('/home/ubuntu/dirextalk-vnext.provision')
@@ -36,9 +36,15 @@ def secure(path, mode, limit=65536):
     try:
         opened=os.fstat(fd)
         if (opened.st_dev,opened.st_ino,opened.st_size)!=(s.st_dev,s.st_ino,s.st_size): raise ContractError('required root file changed')
-        data=os.read(fd,limit+1)
-        if len(data)>limit or os.fstat(fd).st_size != opened.st_size: raise ContractError('required root file changed')
-        return data
+        parts=[]; size=0
+        while True:
+            chunk=os.read(fd,min(65536,limit+1-size))
+            if not chunk: break
+            size+=len(chunk)
+            if size>limit: raise ContractError('required root file exceeds bound')
+            parts.append(chunk)
+        if os.fstat(fd).st_size != opened.st_size: raise ContractError('required root file changed')
+        return b''.join(parts)
     finally: os.close(fd)
 def parse(raw):
     try: v=json.loads(raw, object_pairs_hook=pairs)
@@ -60,17 +66,24 @@ def parse(raw):
     return v
 def mkdir(p, mode, gid=0):
     p.mkdir(parents=True,exist_ok=True); os.chown(p,0,gid); os.chmod(p,mode)
-def write(path, data, mode, gid=0):
+def write(path, data, mode, gid=0, uid=0):
     path.parent.mkdir(parents=True,exist_ok=True)
-    temporary=path.with_name('.'+path.name+'.tmp')
-    fd=os.open(temporary, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC, mode)
+    fd,temporary=tempfile.mkstemp(prefix='.'+path.name+'.',dir=path.parent)
     try:
-        os.write(fd, data); os.fchmod(fd,mode); os.fchown(fd,0,gid); os.fsync(fd)
-    finally: os.close(fd)
-    os.replace(temporary,path)
-    parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
-    try: os.fsync(parent)
-    finally: os.close(parent)
+        view=memoryview(data)
+        while view:
+            wrote=os.write(fd,view)
+            if wrote<=0: raise OSError('short write')
+            view=view[wrote:]
+        os.fchmod(fd,mode); os.fchown(fd,uid,gid); os.fsync(fd); os.close(fd); fd=-1
+        os.replace(temporary,path)
+        parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_CLOEXEC)
+        try: os.fsync(parent)
+        finally: os.close(parent)
+    finally:
+        if fd>=0: os.close(fd)
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
 def run(*args, cwd=None): subprocess.run(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 AGENT_PORTS='''    ports:\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9443:9443"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9444:9444"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9445:9445"'''
@@ -95,7 +108,7 @@ def make_tls(v):
         key=(SECRETS/'agent-control'/keyname) if name in ('enrollment','control','legacy') else TLS/keyname
         run('openssl','genpkey','-algorithm','ED25519','-out',str(key)); os.chmod(key,0o440); os.chown(key,0,10001)
         csr=Path(str(key)+'.csr'); ext=Path(str(key)+'.ext'); write(ext,('subjectAltName=DNS:'+v['domain']+'\n').encode(),0o600); run('openssl','req','-new','-key',str(key),'-out',str(csr),'-subj','/CN='+v['domain']); cert=TLS/certname; run('openssl','x509','-req','-in',str(csr),'-CA',str(ca),'-CAkey',str(cak),'-CAcreateserial','-extfile',str(ext),'-out',str(cert),'-days','825'); write(cert,cert.read_bytes()+ca.read_bytes(),0o444); csr.unlink(missing_ok=True); ext.unlink(missing_ok=True)
-    write(TLS/'mls-sequencer-key.pem',os.urandom(32),0o400,10001)
+    write(TLS/'mls-sequencer-key.pem',os.urandom(32),0o400,10001,10001)
     issuerk=SECRETS/'agent-control/connector-issuer-key.pem'; issuer=TLS/'connector-issuer.pem'; run('openssl','genpkey','-algorithm','ED25519','-out',str(issuerk)); os.chmod(issuerk,0o440); os.chown(issuerk,0,10001); run('openssl','req','-x509','-new','-key',str(issuerk),'-out',str(issuer),'-subj','/CN=connector-issuer.'+v['domain'],'-days','3650'); os.chmod(issuer,0o444)
     for n in ('connector-client-roots.pem','connector-response-intermediates.pem','internal-service-client-roots.pem'): write(TLS/n,issuer.read_bytes(),0o444)
 def material(v, release):
@@ -125,15 +138,13 @@ def validate_release(v, release):
     contract={}
     for line in (release/'docker/production/examples'/(v['target']+'.env.example')).read_text().splitlines():
         if line.startswith('DTX_') and '=' in line: key,value=line.split('=',1); contract[key]=value
-    bindings={'server_image':'DTX_SERVER_IMAGE','migrator_image':'DTX_MIGRATOR_IMAGE','postgres_image':'DTX_POSTGRES_IMAGE','caddy_image':'DTX_CADDY_IMAGE','probe_image':'DTX_PROBE_IMAGE'}
+    bindings={'postgres_image':'DTX_POSTGRES_IMAGE','caddy_image':'DTX_CADDY_IMAGE','probe_image':'DTX_PROBE_IMAGE'}
     if any(contract.get(env)!=v[key] for key,env in bindings.items()): raise ContractError('request image is outside installed production contract')
 def public_verify(v, release):
-    env=CONFIG/'production.env'; compose=CONFIG/'production-compose.yml'
-    common=('docker','compose','--project-name','dirextalk-vnext-production','--env-file',str(env),'-f',str(compose),'run','--rm','--no-deps','probe','--fail','--silent','--show-error')
-    run(*common,'https://'+v['domain']+'/healthz',cwd=release)
-    try: run(*common,'https://'+v['domain']+'/mcp',cwd=release)
-    except subprocess.CalledProcessError: return
-    raise ContractError('unauthenticated MCP probe unexpectedly succeeded')
+    health=('curl','--fail','--silent','--show-error','--retry','30','--retry-all-errors','--retry-delay','2','https://'+v['domain']+'/healthz')
+    run(*health,cwd=release)
+    result=subprocess.run(('curl','--silent','--show-error','--output','/dev/null','--write-out','%{http_code}','--request','POST','--header','Content-Type: application/json','--data','{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"host-provision","version":"1"}}}','https://'+v['domain']+'/mcp'),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,check=False,text=True)
+    if result.returncode != 0 or result.stdout != '401': raise ContractError('unauthenticated MCP probe must return HTTP 401')
 def main():
     if len(sys.argv)!=1: return 2
     if os.geteuid()!=0: raise ContractError('root required')
@@ -147,7 +158,7 @@ def main():
       if journal.exists() and secure(journal,0o600)!=raw: raise ContractError('changed request rejected')
       if not journal.exists(): write(journal,raw,0o600)
       if receipt.exists():
-        if secure(receipt,0o600)==ready(v,reqsha): run(str(release/'scripts/production-stack/verify.sh'),cwd=release); return 0
+        if secure(receipt,0o600)==ready(v,reqsha): run(str(release/'scripts/production-stack/verify.sh'),cwd=release); public_verify(v,release); return 0
         raise ContractError('ready receipt invalid')
       staged=STATE/'materialized'
       if staged.exists():
