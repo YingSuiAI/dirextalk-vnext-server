@@ -50,14 +50,15 @@ with tempfile.TemporaryDirectory() as temporary:
  try: mod.release_documents(badrequest,manifest_raw,mod.canonical(receipt),payloads)
  except mod.ContractError: pass
  else: raise AssertionError('accepted mismatched dependency contract')
- original_run=mod.run; original_subprocess_run=mod.subprocess.run; calls=[]
+ original_run=mod.run; original_subprocess_run=mod.subprocess.run; calls=[]; subprocess_calls=[]
  class Result:
   returncode=0; stdout='401'
  mod.run=lambda *args,**kwargs: calls.append(args)
- mod.subprocess.run=lambda *args,**kwargs: Result()
+ mod.subprocess.run=lambda *args,**kwargs: (subprocess_calls.append(args[0]) or Result())
  try: mod.public_verify(v,ROOT)
  finally: mod.run=original_run; mod.subprocess.run=original_subprocess_run
  assert calls and calls[0][0]=='curl' and calls[0][-1].endswith('/healthz')
+ assert subprocess_calls and 'Accept: application/json, text/event-stream' in subprocess_calls[0]
  class BadResult:
   returncode=0; stdout='500'
  mod.run=lambda *args,**kwargs: None; mod.subprocess.run=lambda *args,**kwargs: BadResult()

@@ -139,7 +139,7 @@ def main() -> int:
         facts_path = Path(temporary) / "release-facts.json"
         facts_path.write_bytes(release.canonical(facts))
         assert builder.load_release_facts(facts_path) == (
-            "0.1.0",
+            release_input["version"],
             "a" * 40,
             image,
             migrator_image,
