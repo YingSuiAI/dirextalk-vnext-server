@@ -185,6 +185,28 @@ grep -q -- '--runtime-image dirextalk/vnet-server@sha256:<64-hex> --migrator-ima
 grep -q 'docker export --output' "$root/scripts/check-release-image.sh"
 grep -q 'scripts/check-release-image.sh' "$root/scripts/publish-production-release.sh"
 grep -q 'bash scripts/test-production-cross-version-postgres.sh' "$root/scripts/publish-production-release.sh"
+grep -q 'DTX_PUBLICATION_SOURCE_COMMIT="\$source_commit"' \
+    "$root/scripts/publish-production-release.sh"
+grep -q "candidate_commit=.*rev-parse --verify 'HEAD" \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+! grep -q 'candidate_commit=b5c24a1277ee5b65268c601f43b634cd2943c004' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+! grep -q '202607230055_agent_identity_reader_rls_fix' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+grep -q 'diff --name-status --no-renames' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+grep -q 'candidate-migrations.expected' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+grep -q 'candidate_migration_count=.*candidate_migrations' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+grep -q 'secrets.token_hex(8)' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+grep -q 'retained_container_id=.*docker run -d' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+grep -q 'docker logs "\$retained_container_id"' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+! grep -q 'docker run -d --rm --name "\$retained_container"' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
 grep -q -- '--runtime-image "\$repository@\$runtime_digest"' "$root/scripts/publish-production-release.sh"
 grep -q -- '--migrator-image "\$repository@\$migrator_digest"' "$root/scripts/publish-production-release.sh"
 test -x "$root/tools/test-client-binding-release-artifacts.py"

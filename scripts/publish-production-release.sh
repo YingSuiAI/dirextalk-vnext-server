@@ -90,7 +90,8 @@ tag_must_be_absent "$migrator_commit_tag" migrator-commit
 
 # Cross-version compatibility is a mandatory preflight. It must complete before
 # creating a builder or pushing either immutable image to the registry.
-bash scripts/test-production-cross-version-postgres.sh
+DTX_PUBLICATION_SOURCE_COMMIT="$source_commit" \
+    bash scripts/test-production-cross-version-postgres.sh
 
 builder="dtx-vnet-release-$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
 printf '%s\n' "$builder" >"$active"
