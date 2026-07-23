@@ -35,8 +35,11 @@ admin password, the admin URL, and role-password inputs are root-loaded and
 remain `root:root` mode `0400`. Public certificates/CA bundles are
 `root:root` mode `0444`; private keys are never world-readable. Non-secret
 configuration is `0644` and root-owned. Populate one password file per fixed
-role, including `dtx_agent_control`, under `secrets/role-passwords/`; the
-migrator never emits them. Caddy normally routes node HTTPS/MCP and realtime
+login role, including `dtx_agent_control`, under `secrets/role-passwords/`; the
+migrator never emits them. `dtx_agent_peer_admin` is instead a passwordless
+`NOLOGIN NOINHERIT` capability role: it has no runtime membership or table
+access and receives only `agent` schema usage plus the two exact MCP credential
+digest register/revoke functions. Caddy normally routes node HTTPS/MCP and realtime
 WSS only, and accepts MCP only as `POST /mcp`. The fixed fresh-host provisioner
 is the sole exception: it runs Caddy in Agent Control's network namespace,
 publishes 80/443 there, and forwards to loopback `127.0.0.1:9081` only the

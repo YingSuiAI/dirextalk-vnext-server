@@ -47,6 +47,12 @@ run_migrator() {
         -e DTX_DATABASE_URL_FILE=/run/dtx-production/admin-url \
         "$runtime" /usr/local/bin/dtx-production-migrate "$1"
 }
+# Model an already-migrated installation from before peer administration was
+# bootstrapped. Migration 38's conditional grant must leave no optional role or
+# ACL behind when the role did not yet exist.
+run_migrator migrate >/dev/null
+docker exec "$database" psql -Atq -U postgres -d dtx_node \
+    -c "SELECT to_regrole('dtx_agent_peer_admin') IS NULL AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE coalesce(array_to_string(nspacl, ','), '') LIKE '%dtx_agent_peer_admin%') AND NOT EXISTS (SELECT 1 FROM pg_proc WHERE coalesce(array_to_string(proacl, ','), '') LIKE '%dtx_agent_peer_admin%') AND NOT EXISTS (SELECT 1 FROM pg_class WHERE coalesce(array_to_string(relacl, ','), '') LIKE '%dtx_agent_peer_admin%')" | grep -qx t
 if docker run --rm --network "$network" \
     -v "$root/target/debug/dtx-production-migrate:/usr/local/bin/dtx-production-migrate:ro" \
     "$runtime" /bin/sh -ec '
@@ -78,7 +84,31 @@ docker run --rm -v "$secrets:/run/dtx-production" "$runtime" /bin/sh -ec '
   rm /run/dtx-production/role-passwords/dtx_agent_control
   mv /run/dtx-production/role-passwords/agent-control-target /run/dtx-production/role-passwords/dtx_agent_control'
 run_migrator bootstrap-roles >/dev/null
-run_migrator migrate >/dev/null
+docker exec "$database" psql -Atq -U postgres -d dtx_node \
+    -c "SELECT NOT rolcanlogin AND NOT rolinherit AND NOT rolsuper AND NOT rolbypassrls AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication FROM pg_roles WHERE rolname = 'dtx_agent_peer_admin'" | grep -qx t
+docker exec "$database" psql -Atq -U postgres -d dtx_node \
+    -c "SELECT rolpassword IS NULL FROM pg_authid WHERE rolname = 'dtx_agent_peer_admin'" | grep -qx t
+run_migrator grant-roles >/dev/null
+run_migrator verify-roles >/dev/null
+run_migrator bootstrap-roles >/dev/null
+run_migrator grant-roles >/dev/null
+run_migrator verify-roles >/dev/null
+
+docker exec "$database" psql -Atq -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
+    -c "SET ROLE dtx_agent_peer_admin; SELECT has_function_privilege(current_user, 'agent.register_mcp_credential_digest(uuid,uuid,bytea,uuid,uuid,uuid,text,uuid,text,bigint,bigint)', 'EXECUTE') AND has_function_privilege(current_user, 'agent.revoke_mcp_credential_digest(uuid,uuid,bytea,bigint)', 'EXECUTE');" | grep -qx t
+docker exec "$database" psql -Atq -U postgres -d dtx_node \
+    -c "SELECT (SELECT count(*) FROM pg_namespace WHERE nspname IN ('system', 'agent', 'identity', 'groups', 'directory') AND has_schema_privilege('dtx_agent_peer_admin', oid, 'USAGE')) = 1 AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname IN ('system', 'agent', 'identity', 'groups', 'directory') AND has_schema_privilege('dtx_agent_peer_admin', oid, 'CREATE')) AND (SELECT count(*) FROM pg_proc JOIN pg_namespace ON pg_namespace.oid = pg_proc.pronamespace WHERE nspname IN ('system', 'agent', 'identity', 'groups', 'directory') AND has_function_privilege('dtx_agent_peer_admin', pg_proc.oid, 'EXECUTE')) = 2 AND NOT EXISTS (SELECT 1 FROM pg_class JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace WHERE nspname IN ('system', 'agent', 'identity', 'groups', 'directory') AND relkind IN ('r', 'p', 'v', 'm', 'f') AND (has_table_privilege('dtx_agent_peer_admin', pg_class.oid, 'SELECT') OR has_table_privilege('dtx_agent_peer_admin', pg_class.oid, 'INSERT') OR has_table_privilege('dtx_agent_peer_admin', pg_class.oid, 'UPDATE') OR has_table_privilege('dtx_agent_peer_admin', pg_class.oid, 'DELETE') OR has_table_privilege('dtx_agent_peer_admin', pg_class.oid, 'TRUNCATE') OR has_table_privilege('dtx_agent_peer_admin', pg_class.oid, 'REFERENCES') OR has_table_privilege('dtx_agent_peer_admin', pg_class.oid, 'TRIGGER')))" | grep -qx t
+if docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
+    -c "SET ROLE dtx_agent_peer_admin; SELECT count(*) FROM agent.mcp_credentials;" >/dev/null 2>&1; then
+    echo 'Agent peer admin acquired forbidden table privilege' >&2
+    exit 1
+fi
+docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
+    -c "REVOKE EXECUTE ON FUNCTION agent.revoke_mcp_credential_digest(uuid, uuid, bytea, bigint) FROM dtx_agent_peer_admin;" >/dev/null
+if run_migrator verify-roles >/dev/null 2>&1; then
+    echo 'Agent peer admin readiness unexpectedly accepted a missing digest-revoke grant' >&2
+    exit 1
+fi
 run_migrator grant-roles >/dev/null
 run_migrator verify-roles >/dev/null
 
@@ -112,7 +142,7 @@ fi
 
 # Existing dangerous attributes and memberships are stripped on reconciliation.
 docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
-    -c "CREATE ROLE dtx_unapproved; ALTER ROLE dtx_agent_control SUPERUSER BYPASSRLS CREATEROLE; GRANT dtx_unapproved TO dtx_agent_control;" >/dev/null
+    -c "CREATE ROLE dtx_unapproved; ALTER ROLE dtx_agent_control SUPERUSER BYPASSRLS CREATEROLE; GRANT dtx_unapproved TO dtx_agent_control; ALTER ROLE dtx_agent_peer_admin LOGIN INHERIT SUPERUSER BYPASSRLS CREATEROLE PASSWORD 'synthetic-peer-admin-password'; GRANT dtx_unapproved TO dtx_agent_peer_admin;" >/dev/null
 run_migrator bootstrap-roles >/dev/null
 run_migrator verify-roles >/dev/null
 echo 'production PostgreSQL role/readiness/rollback checks passed'

@@ -56,6 +56,72 @@ BEGIN
         END IF;
     END LOOP;
 
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_roles
+         WHERE rolname = 'dtx_agent_peer_admin'
+           AND NOT rolcanlogin AND NOT rolinherit AND NOT rolsuper AND NOT rolbypassrls
+           AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication
+    ) OR EXISTS (
+        SELECT 1
+          FROM pg_auth_members edges
+          JOIN pg_roles member ON member.oid = edges.member
+         WHERE member.rolname = 'dtx_agent_peer_admin'
+    ) THEN
+        RAISE EXCEPTION 'Agent peer admin role attributes or memberships are not exact';
+    END IF;
+
+    IF NOT has_schema_privilege('dtx_agent_peer_admin', 'agent', 'USAGE')
+       OR has_schema_privilege('dtx_agent_peer_admin', 'agent', 'CREATE')
+       OR EXISTS (
+            SELECT 1 FROM pg_namespace namespace
+             WHERE namespace.nspname IN ('system', 'agent', 'identity', 'groups', 'directory')
+               AND namespace.nspname <> 'agent'
+               AND has_schema_privilege('dtx_agent_peer_admin', namespace.oid, 'USAGE')
+       )
+       OR EXISTS (
+            SELECT 1 FROM pg_namespace namespace
+             WHERE namespace.nspname IN ('system', 'agent', 'identity', 'groups', 'directory')
+               AND has_schema_privilege('dtx_agent_peer_admin', namespace.oid, 'CREATE')
+       )
+       OR NOT has_function_privilege(
+            'dtx_agent_peer_admin',
+            'agent.register_mcp_credential_digest(uuid,uuid,bytea,uuid,uuid,uuid,text,uuid,text,bigint,bigint)',
+            'EXECUTE'
+       )
+       OR NOT has_function_privilege(
+            'dtx_agent_peer_admin',
+            'agent.revoke_mcp_credential_digest(uuid,uuid,bytea,bigint)',
+            'EXECUTE'
+       )
+       OR EXISTS (
+            SELECT 1 FROM pg_proc procedure
+            JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+             WHERE namespace.nspname IN ('system', 'agent', 'identity', 'groups', 'directory')
+               AND has_function_privilege('dtx_agent_peer_admin', procedure.oid, 'EXECUTE')
+               AND procedure.oid NOT IN (
+                   'agent.register_mcp_credential_digest(uuid,uuid,bytea,uuid,uuid,uuid,text,uuid,text,bigint,bigint)'::regprocedure,
+                   'agent.revoke_mcp_credential_digest(uuid,uuid,bytea,bigint)'::regprocedure
+               )
+       )
+       OR EXISTS (
+            SELECT 1 FROM pg_class relation
+            JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname IN ('system', 'agent', 'identity', 'groups', 'directory')
+               AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+               AND (
+                   has_table_privilege('dtx_agent_peer_admin', relation.oid, 'SELECT')
+                   OR has_table_privilege('dtx_agent_peer_admin', relation.oid, 'INSERT')
+                   OR has_table_privilege('dtx_agent_peer_admin', relation.oid, 'UPDATE')
+                   OR has_table_privilege('dtx_agent_peer_admin', relation.oid, 'DELETE')
+                   OR has_table_privilege('dtx_agent_peer_admin', relation.oid, 'TRUNCATE')
+                   OR has_table_privilege('dtx_agent_peer_admin', relation.oid, 'REFERENCES')
+                   OR has_table_privilege('dtx_agent_peer_admin', relation.oid, 'TRIGGER')
+               )
+       )
+    THEN
+        RAISE EXCEPTION 'Agent peer admin privilege boundary check failed';
+    END IF;
+
     IF NOT has_schema_privilege('dtx_agent_control', 'agent', 'USAGE')
        OR NOT has_table_privilege('dtx_agent_control', 'agent.connector_control_operations', 'SELECT')
        OR NOT has_table_privilege('dtx_agent_control', 'agent.connector_control_operations', 'INSERT')

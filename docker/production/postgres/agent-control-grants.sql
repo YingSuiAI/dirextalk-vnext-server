@@ -71,3 +71,29 @@ GRANT EXECUTE ON FUNCTION identity.identity_agent_reader_authorized(),
 REVOKE CREATE ON SCHEMA system, agent, identity, groups, directory FROM dtx_agent_runtime;
 REVOKE TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA system, agent, identity, groups, directory
     FROM dtx_agent_runtime;
+
+-- PostgreSQL grants EXECUTE to PUBLIC for newly-created functions by default.
+-- Production roles use the explicit allowlists below, so leave no PUBLIC
+-- fallback that could widen peer-admin's effective function capability.
+REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA agent FROM PUBLIC;
+
+-- Peer administration is deliberately a capability-only NOLOGIN role. It has
+-- no runtime membership, table rights, or broad schema/function surface.
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA system, agent, identity, groups, directory
+    FROM dtx_agent_peer_admin;
+REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA system, agent, identity, groups, directory
+    FROM dtx_agent_peer_admin;
+REVOKE ALL PRIVILEGES ON SCHEMA system, agent, identity, groups, directory
+    FROM dtx_agent_peer_admin;
+
+GRANT USAGE ON SCHEMA agent TO dtx_agent_peer_admin;
+GRANT EXECUTE ON FUNCTION
+    agent.register_mcp_credential_digest(
+        uuid, uuid, bytea, uuid, uuid, uuid, text, uuid, text, bigint, bigint
+    ),
+    agent.revoke_mcp_credential_digest(uuid, uuid, bytea, bigint)
+    TO dtx_agent_peer_admin;
+
+REVOKE CREATE ON SCHEMA system, agent, identity, groups, directory FROM dtx_agent_peer_admin;
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA system, agent, identity, groups, directory
+    FROM dtx_agent_peer_admin;

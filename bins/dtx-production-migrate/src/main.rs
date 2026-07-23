@@ -27,6 +27,7 @@ const ADMIN_DATABASE_URL_FILE_ENV: &str = "DTX_ADMIN_DATABASE_URL_FILE";
 const ROLE_PASSWORD_DIR: &str = "/run/dtx-production/role-passwords";
 const MAX_URL_BYTES: u64 = 8 * 1024;
 const MAX_PASSWORD_BYTES: u64 = 512;
+const AGENT_PEER_ADMIN_ROLE: &str = "dtx_agent_peer_admin";
 
 #[derive(Clone, Copy)]
 struct RoleSpec {
@@ -231,6 +232,25 @@ async fn create_roles(pool: &PgPool) -> Result<(), &'static str> {
             eprintln!("dtx-production-migrate: password update failed for {role}");
             return Err("role bootstrap failed");
         }
+    }
+    // This role is an authorization boundary for a local peer administration
+    // path, not a database principal. It must never receive a credential or
+    // inherit either runtime capabilities or arbitrary memberships.
+    if let Err(error) = sqlx::raw_sql(AssertSqlSafe(format!(
+        "DO $$ BEGIN IF to_regrole('{AGENT_PEER_ADMIN_ROLE}') IS NULL THEN CREATE ROLE {AGENT_PEER_ADMIN_ROLE}; END IF; END $$;\
+         ALTER ROLE {AGENT_PEER_ADMIN_ROLE} NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD NULL;\
+         DO $peer_admin$ DECLARE extra name; BEGIN FOR extra IN \
+           SELECT granted.rolname FROM pg_auth_members edges \
+           JOIN pg_roles granted ON granted.oid = edges.roleid \
+           JOIN pg_roles member ON member.oid = edges.member \
+           WHERE member.rolname = '{AGENT_PEER_ADMIN_ROLE}' \
+         LOOP EXECUTE format('REVOKE %I FROM {AGENT_PEER_ADMIN_ROLE}', extra); END LOOP; END $peer_admin$;"
+    )))
+    .execute(&mut *transaction)
+    .await
+    {
+        eprintln!("dtx-production-migrate: role normalization failed for {AGENT_PEER_ADMIN_ROLE}: {error}");
+        return Err("role bootstrap failed");
     }
     transaction
         .commit()
