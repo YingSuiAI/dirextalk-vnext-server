@@ -122,7 +122,44 @@ text never cross the response boundary.
 
 ## Root-only issuance boundary
 
-The server-side issuer is the one-shot root-only command:
+For direct current-user Connector bootstrap, first create the protected offline
+binding and generated issuance request, then use the bound issuer (not the
+legacy opaque compatibility command):
+
+```text
+dtx-agent-provision bootstrap-binding-create \
+  --input-file <root-owned-0600-binding-input.json> \
+  --artifact-file <root-owned-0555-or-0755-connector> \
+  --binding-file <new-root-0600-binding.json> \
+  --request-file <new-root-0600-request.json>
+
+dtx-agent-provision bootstrap-issue-bound \
+  --database-url-file <0600-file> \
+  --binding-file <root-owned-0600-binding.json> \
+  --request-file <root-owned-0600-request.json> \
+  --handoff-file <tenant-operation.handoff.json> \
+  --plan-file <tenant-operation.plan.json>
+```
+
+`dirextalk.connector-direct-bootstrap-binding` v1 is strict and contains all
+issuance facts except `manifest_digest`. Its canonical bytes are the declared
+field-order JSON serialization, and its manifest digest is raw SHA-256 lowercase
+hex. The producer reads (never executes) a root-owned, nofollow, single-link
+0555/0755 artifact up to 32 MiB and requires its actual digest. It atomically
+creates both 0600 outputs without replacement. The request is the pre-commit
+artifact and the binding is the commit marker: an exact request-only retry
+recovers by publishing its binding, exact pairs replay successfully, and a
+binding-only or conflicting pair fails closed. If a process stops after the
+atomic link but before removing its deterministic staging name, the next
+same-operation run recovers only that exact protected linked pair. The bound issuer re-reads the
+canonical binding and requires exact request digest and field equality before
+any lock, database connection, random generation, token minting, or output.
+Keep binding and request beside the operation handoff/plan; never place them in
+global Host evidence or a deployment manifest. `bootstrap-issue` remains only
+for explicit legacy compatibility.
+
+The legacy opaque compatibility issuer (do not use for direct current-user
+bootstrap) remains available only for already-authorized legacy operations:
 
 ```text
 dtx-agent-provision bootstrap-issue \

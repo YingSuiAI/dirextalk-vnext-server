@@ -67,6 +67,7 @@ const CREDENTIAL_REISSUE_RESULT_SCHEMA: &str = "dirextalk.connector-credential-r
 const CREDENTIAL_REISSUE_PLAN_DIGEST_DOMAIN: &[u8] =
     b"dirextalk.connector-credential-reissue-plan.v1";
 const MAX_JSON_BYTES: u64 = 65_536;
+const MAX_BOOTSTRAP_ARTIFACT_BYTES: u64 = 32 * 1_024 * 1_024;
 const MAX_DATABASE_URL_BYTES: u64 = 4_096;
 const MAX_PEM_BUNDLE_BYTES: u64 = 1_048_576;
 const MAX_IDENTITY_HEAD_SEQUENCE: u64 = (1_u64 << 53) - 1;
@@ -197,8 +198,18 @@ async fn main() -> ExitCode {
             }
         };
     }
-    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("bootstrap-issue")) {
+    if matches!(env::args_os().nth(1).as_deref(), Some(command) if command == std::ffi::OsStr::new("bootstrap-issue") || command == std::ffi::OsStr::new("bootstrap-issue-bound"))
+    {
         return match run_bootstrap_issue().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("dtx-agent-provision: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("bootstrap-binding-create")) {
+        return match run_bootstrap_binding_create() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("dtx-agent-provision: {error}");
@@ -244,6 +255,18 @@ async fn run_bootstrap_issue() -> Result<(), BootstrapIssueError> {
     )?)?;
     let now = now_millis().map_err(|_| BootstrapIssueError::Time)?;
     validate_bootstrap_issue_request(&mut request, now)?;
+    if let Some(binding_file) = arguments.binding_file.as_deref() {
+        let binding_bytes = read_root_request_bounded(binding_file, MAX_JSON_BYTES)?;
+        let binding = parse_bootstrap_binding(&binding_bytes)?;
+        validate_bootstrap_binding(&binding, now)?;
+        let canonical = canonical_bootstrap_binding(&binding)?;
+        if canonical != binding_bytes
+            || plain_digest(&canonical).as_bytes() != request.manifest_digest.0
+            || bootstrap_binding_request(&binding)? != request
+        {
+            return Err(BootstrapIssueError::BindingConflict);
+        }
+    }
     let paths = BootstrapIssuePaths::canonicalize(&arguments, &request)?;
     let request_json = serde_json::to_vec(&request).map_err(|_| BootstrapIssueError::Request)?;
     let request_digest = domain_digest(
@@ -931,7 +954,7 @@ struct ProvisioningPlan {
     connectors: Vec<PlanConnector>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapIssueRequest {
     schema: String,
@@ -944,14 +967,14 @@ struct BootstrapIssueRequest {
     connector: BootstrapRequestConnector,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapArtifact {
     version: String,
     digest: Digest32,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapHost {
     tenant_id: TenantId,
@@ -960,7 +983,7 @@ struct BootstrapHost {
     host_credential_id: HostCredentialId,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapRequestConnector {
     instance_id: ConnectorId,
@@ -979,7 +1002,7 @@ struct BootstrapRequestConnector {
     remote_mcp: BootstrapRemoteMcp,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapTrust {
     enrollment_url: String,
@@ -991,7 +1014,7 @@ struct BootstrapTrust {
     connector_issuer_root_ca_sha256: Digest32,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapRemoteMcp {
     mcp_server_name: String,
@@ -999,6 +1022,19 @@ struct BootstrapRemoteMcp {
     mcp_node_id: RequestId,
     max_concurrent_runs: u64,
     offline_policy: String,
+}
+
+/// Offline, non-secret direct-bootstrap facts. Declaration order is the v1 canonical JSON order.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapBinding {
+    schema: String,
+    schema_version: u8,
+    operation_id: RequestId,
+    target: String,
+    connector_artifact: BootstrapArtifact,
+    host: BootstrapHost,
+    connector: BootstrapRequestConnector,
 }
 
 #[derive(Serialize)]
@@ -1496,6 +1532,7 @@ struct LockedHandoff {
 struct BootstrapIssueArguments {
     database_url_file: PathBuf,
     request_file: PathBuf,
+    binding_file: Option<PathBuf>,
     handoff_file: PathBuf,
     plan_file: PathBuf,
 }
@@ -1504,11 +1541,14 @@ impl BootstrapIssueArguments {
     fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, BootstrapIssueError> {
         let mut arguments = arguments.into_iter();
         let _program = arguments.next();
-        if arguments.next().as_deref() != Some(std::ffi::OsStr::new("bootstrap-issue")) {
-            return Err(BootstrapIssueError::Usage);
-        }
+        let bound = match arguments.next().as_deref() {
+            Some(command) if command == std::ffi::OsStr::new("bootstrap-issue") => false,
+            Some(command) if command == std::ffi::OsStr::new("bootstrap-issue-bound") => true,
+            _ => return Err(BootstrapIssueError::Usage),
+        };
         let mut database_url_file = None;
         let mut request_file = None;
+        let mut binding_file = None;
         let mut handoff_file = None;
         let mut plan_file = None;
         while let Some(flag) = arguments.next() {
@@ -1519,6 +1559,9 @@ impl BootstrapIssueArguments {
                 }
                 Some("--request-file") if request_file.is_none() => {
                     request_file = Some(PathBuf::from(value));
+                }
+                Some("--binding-file") if bound && binding_file.is_none() => {
+                    binding_file = Some(PathBuf::from(value));
                 }
                 Some("--handoff-file") if handoff_file.is_none() => {
                     handoff_file = Some(PathBuf::from(value));
@@ -1532,10 +1575,101 @@ impl BootstrapIssueArguments {
         Ok(Self {
             database_url_file: database_url_file.ok_or(BootstrapIssueError::Usage)?,
             request_file: request_file.ok_or(BootstrapIssueError::Usage)?,
+            binding_file: if bound {
+                Some(binding_file.ok_or(BootstrapIssueError::Usage)?)
+            } else {
+                None
+            },
             handoff_file: handoff_file.ok_or(BootstrapIssueError::Usage)?,
             plan_file: plan_file.ok_or(BootstrapIssueError::Usage)?,
         })
     }
+}
+
+struct BootstrapBindingCreateArguments {
+    input_file: PathBuf,
+    artifact_file: PathBuf,
+    binding_file: PathBuf,
+    request_file: PathBuf,
+}
+
+impl BootstrapBindingCreateArguments {
+    fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Self, BootstrapIssueError> {
+        let mut arguments = arguments.into_iter();
+        let _program = arguments.next();
+        if arguments.next().as_deref() != Some(std::ffi::OsStr::new("bootstrap-binding-create")) {
+            return Err(BootstrapIssueError::Usage);
+        }
+        let mut input_file = None;
+        let mut artifact_file = None;
+        let mut binding_file = None;
+        let mut request_file = None;
+        while let Some(flag) = arguments.next() {
+            let value = arguments.next().ok_or(BootstrapIssueError::Usage)?;
+            match flag.to_str() {
+                Some("--input-file") if input_file.is_none() => {
+                    input_file = Some(PathBuf::from(value))
+                }
+                Some("--artifact-file") if artifact_file.is_none() => {
+                    artifact_file = Some(PathBuf::from(value))
+                }
+                Some("--binding-file") if binding_file.is_none() => {
+                    binding_file = Some(PathBuf::from(value))
+                }
+                Some("--request-file") if request_file.is_none() => {
+                    request_file = Some(PathBuf::from(value))
+                }
+                _ => return Err(BootstrapIssueError::Usage),
+            }
+        }
+        Ok(Self {
+            input_file: input_file.ok_or(BootstrapIssueError::Usage)?,
+            artifact_file: artifact_file.ok_or(BootstrapIssueError::Usage)?,
+            binding_file: binding_file.ok_or(BootstrapIssueError::Usage)?,
+            request_file: request_file.ok_or(BootstrapIssueError::Usage)?,
+        })
+    }
+}
+
+fn run_bootstrap_binding_create() -> Result<(), BootstrapIssueError> {
+    #[cfg(unix)]
+    if rustix::process::geteuid().as_raw() != 0 {
+        return Err(BootstrapIssueError::RootRequired);
+    }
+    #[cfg(not(unix))]
+    return Err(BootstrapIssueError::RootRequired);
+    let arguments = BootstrapBindingCreateArguments::parse(env::args_os())?;
+    let binding = parse_bootstrap_binding(&read_root_request_bounded(
+        &arguments.input_file,
+        MAX_JSON_BYTES,
+    )?)?;
+    let now = now_millis().map_err(|_| BootstrapIssueError::Time)?;
+    validate_bootstrap_binding(&binding, now)?;
+    let canonical = canonical_bootstrap_binding(&binding)?;
+    let artifact_digest = read_bootstrap_artifact_digest(&arguments.artifact_file)?;
+    if artifact_digest != binding.connector_artifact.digest {
+        return Err(BootstrapIssueError::Artifact);
+    }
+    let request = bootstrap_binding_request(&binding)?;
+    let request_bytes = serde_json::to_vec(&request).map_err(|_| BootstrapIssueError::Request)?;
+    publish_bootstrap_binding_pair(
+        &arguments.binding_file,
+        &canonical,
+        &arguments.request_file,
+        &request_bytes,
+    )?;
+    let report = BootstrapBindingReport {
+        schema: "dirextalk.connector-direct-bootstrap-binding-report",
+        schema_version: 1,
+        operation_id: binding.operation_id,
+        manifest_digest: Digest32(plain_digest(&canonical).as_bytes()),
+        tenant_id: binding.host.tenant_id,
+        host_id: binding.host.host_id,
+        connector_id: binding.connector.instance_id,
+    };
+    serde_json::to_writer(io::stdout().lock(), &report).map_err(|_| BootstrapIssueError::Output)?;
+    println!();
+    Ok(())
 }
 
 struct BootstrapIssuePaths {
@@ -2064,6 +2198,45 @@ fn parse_bootstrap_issue_request(
         return Err(BootstrapIssueError::Request);
     }
     serde_json::from_slice(bytes).map_err(|_| BootstrapIssueError::Request)
+}
+
+fn parse_bootstrap_binding(bytes: &[u8]) -> Result<BootstrapBinding, BootstrapIssueError> {
+    if bytes.contains(&b'\\') {
+        return Err(BootstrapIssueError::Request);
+    }
+    serde_json::from_slice(bytes).map_err(|_| BootstrapIssueError::Request)
+}
+
+fn canonical_bootstrap_binding(binding: &BootstrapBinding) -> Result<Vec<u8>, BootstrapIssueError> {
+    serde_json::to_vec(binding).map_err(|_| BootstrapIssueError::Request)
+}
+
+fn bootstrap_binding_request(
+    binding: &BootstrapBinding,
+) -> Result<BootstrapIssueRequest, BootstrapIssueError> {
+    Ok(BootstrapIssueRequest {
+        schema: "dirextalk.connector-bootstrap-issuance-request".to_owned(),
+        schema_version: 1,
+        operation_id: binding.operation_id,
+        manifest_digest: Digest32(plain_digest(&canonical_bootstrap_binding(binding)?).as_bytes()),
+        target: binding.target.clone(),
+        connector_artifact: binding.connector_artifact.clone(),
+        host: binding.host.clone(),
+        connector: binding.connector.clone(),
+    })
+}
+
+fn validate_bootstrap_binding(
+    binding: &BootstrapBinding,
+    now: i64,
+) -> Result<(), BootstrapIssueError> {
+    if binding.schema != "dirextalk.connector-direct-bootstrap-binding"
+        || binding.schema_version != 1
+    {
+        return Err(BootstrapIssueError::Request);
+    }
+    let mut request = bootstrap_binding_request(binding)?;
+    validate_bootstrap_issue_request(&mut request, now)
 }
 
 fn validate_bootstrap_issue_request(
@@ -3302,6 +3475,243 @@ fn read_root_request_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, Boots
     }
 }
 
+fn read_bootstrap_artifact_digest(path: &Path) -> Result<Digest32, BootstrapIssueError> {
+    let before = fs::symlink_metadata(path).map_err(|_| BootstrapIssueError::File)?;
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || before.len() == 0
+        || before.len() > MAX_BOOTSTRAP_ARTIFACT_BYTES
+    {
+        return Err(BootstrapIssueError::File);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.uid() != 0
+            || before.nlink() != 1
+            || !matches!(before.mode() & 0o777, 0o555 | 0o755)
+        {
+            return Err(BootstrapIssueError::FilePermissions);
+        }
+    }
+    let mut file = open_read_no_follow(path).map_err(BootstrapIssueError::from)?;
+    let after = file.metadata().map_err(|_| BootstrapIssueError::File)?;
+    validate_same_file(&before, &after).map_err(BootstrapIssueError::from)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.uid() != 0 || after.nlink() != 1 || !matches!(after.mode() & 0o777, 0o555 | 0o755)
+        {
+            return Err(BootstrapIssueError::FilePermissions);
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| BootstrapIssueError::File)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(u64::try_from(read).map_err(|_| BootstrapIssueError::File)?)
+            .ok_or(BootstrapIssueError::File)?;
+        if total > MAX_BOOTSTRAP_ARTIFACT_BYTES {
+            return Err(BootstrapIssueError::File);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(Digest32(hasher.finalize().into()))
+}
+
+fn publish_bootstrap_binding_pair(
+    binding_path: &Path,
+    binding_bytes: &[u8],
+    request_path: &Path,
+    request_bytes: &[u8],
+) -> Result<(), BootstrapIssueError> {
+    let binding_parent = fs::canonicalize(
+        binding_path
+            .parent()
+            .ok_or(BootstrapIssueError::FilePermissions)?,
+    )
+    .map_err(|_| BootstrapIssueError::FilePermissions)?;
+    let request_parent = fs::canonicalize(
+        request_path
+            .parent()
+            .ok_or(BootstrapIssueError::FilePermissions)?,
+    )
+    .map_err(|_| BootstrapIssueError::FilePermissions)?;
+    validate_handoff_parent(&binding_parent).map_err(BootstrapIssueError::from)?;
+    let binding_path =
+        binding_parent.join(binding_path.file_name().ok_or(BootstrapIssueError::Usage)?);
+    let request_path =
+        binding_parent.join(request_path.file_name().ok_or(BootstrapIssueError::Usage)?);
+    if binding_parent != request_parent || binding_path == request_path {
+        return Err(BootstrapIssueError::Usage);
+    }
+    let _lock = HandoffParentLock::acquire(&binding_path).map_err(BootstrapIssueError::from)?;
+    recover_deterministic_root_output(&request_path, request_bytes, b"request")?;
+    recover_deterministic_root_output(&binding_path, binding_bytes, b"binding")?;
+    let binding_exists = exact_root_output(&binding_path, binding_bytes)?;
+    let request_exists = exact_root_output(&request_path, request_bytes)?;
+    match (binding_exists, request_exists) {
+        (true, true) => sync_parent(&binding_parent).map_err(BootstrapIssueError::from),
+        (true, false) => Err(BootstrapIssueError::BindingConflict),
+        (false, true) => {
+            publish_deterministic_root_output(&binding_path, binding_bytes, b"binding")
+        }
+        (false, false) => {
+            publish_deterministic_root_output(&request_path, request_bytes, b"request")?;
+            publish_deterministic_root_output(&binding_path, binding_bytes, b"binding")
+        }
+    }
+}
+
+fn exact_root_output(path: &Path, expected: &[u8]) -> Result<bool, BootstrapIssueError> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(BootstrapIssueError::File),
+    };
+    if before.file_type().is_symlink() || !before.is_file() || before.len() > MAX_JSON_BYTES {
+        return Err(BootstrapIssueError::File);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.uid() != rustix::process::geteuid().as_raw()
+            || before.mode() & 0o777 != 0o600
+            || before.nlink() != 1
+        {
+            return Err(BootstrapIssueError::FilePermissions);
+        }
+    }
+    let file = open_read_no_follow(path).map_err(BootstrapIssueError::from)?;
+    let after = file.metadata().map_err(|_| BootstrapIssueError::File)?;
+    validate_same_file(&before, &after).map_err(BootstrapIssueError::from)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| BootstrapIssueError::File)?;
+    if bytes != expected {
+        return Err(BootstrapIssueError::BindingConflict);
+    }
+    Ok(true)
+}
+
+fn publish_deterministic_root_output(
+    path: &Path,
+    bytes: &[u8],
+    label: &[u8],
+) -> Result<(), BootstrapIssueError> {
+    let parent = path.parent().ok_or(BootstrapIssueError::FilePermissions)?;
+    let temp = deterministic_root_temp(path, label)?;
+    recover_deterministic_root_output(path, bytes, label)?;
+    let result = (|| {
+        let mut file = create_secret_file(&temp).map_err(BootstrapIssueError::from)?;
+        file.write_all(bytes)
+            .map_err(|_| BootstrapIssueError::File)?;
+        file.sync_all().map_err(|_| BootstrapIssueError::File)?;
+        drop(file);
+        fs::hard_link(&temp, path).map_err(|_| BootstrapIssueError::File)?;
+        fs::remove_file(&temp).map_err(|_| BootstrapIssueError::File)?;
+        sync_parent(parent).map_err(BootstrapIssueError::from)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn deterministic_root_temp(path: &Path, label: &[u8]) -> Result<PathBuf, BootstrapIssueError> {
+    let parent = path.parent().ok_or(BootstrapIssueError::FilePermissions)?;
+    let mut hasher = Sha256::new();
+    hasher.update(label);
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    Ok(parent.join(format!(
+        ".dtx-bootstrap-{}.tmp",
+        Base64UrlUnpadded::encode_string(&hasher.finalize())
+    )))
+}
+
+fn recover_deterministic_root_output(
+    final_path: &Path,
+    expected: &[u8],
+    label: &[u8],
+) -> Result<(), BootstrapIssueError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    let temp = deterministic_root_temp(final_path, label)?;
+    let metadata = match fs::symlink_metadata(&temp) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(BootstrapIssueError::File),
+    };
+    #[cfg(unix)]
+    {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o777 != 0o600
+            || !(1..=2).contains(&metadata.nlink())
+        {
+            return Err(BootstrapIssueError::FilePermissions);
+        }
+    }
+    #[cfg(unix)]
+    if metadata.nlink() == 1 {
+        match fs::symlink_metadata(final_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(BootstrapIssueError::FilePermissions),
+        }
+        return fs::remove_file(&temp).map_err(|_| BootstrapIssueError::File);
+    }
+    #[cfg(unix)]
+    {
+        if metadata.nlink() != 2 {
+            return Err(BootstrapIssueError::FilePermissions);
+        }
+        let final_metadata =
+            fs::symlink_metadata(final_path).map_err(|_| BootstrapIssueError::FilePermissions)?;
+        if final_metadata.file_type().is_symlink()
+            || !final_metadata.is_file()
+            || final_metadata.uid() != rustix::process::geteuid().as_raw()
+            || final_metadata.mode() & 0o777 != 0o600
+            || final_metadata.nlink() != 2
+            || final_metadata.dev() != metadata.dev()
+            || final_metadata.ino() != metadata.ino()
+        {
+            return Err(BootstrapIssueError::FilePermissions);
+        }
+    }
+    let temp_bytes = read_exact_root_output(&temp)?;
+    if temp_bytes != expected {
+        return Err(BootstrapIssueError::BindingConflict);
+    }
+    fs::remove_file(&temp).map_err(|_| BootstrapIssueError::File)?;
+    let parent = final_path
+        .parent()
+        .ok_or(BootstrapIssueError::FilePermissions)?;
+    sync_parent(parent).map_err(BootstrapIssueError::from)?;
+    exact_root_output(final_path, expected)
+        .and_then(|exists| exists.then_some(()).ok_or(BootstrapIssueError::File))
+}
+
+fn read_exact_root_output(path: &Path) -> Result<Vec<u8>, BootstrapIssueError> {
+    let file = open_read_no_follow(path).map_err(BootstrapIssueError::from)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| BootstrapIssueError::File)?;
+    if bytes.len() > usize::try_from(MAX_JSON_BYTES).unwrap_or(usize::MAX) {
+        return Err(BootstrapIssueError::File);
+    }
+    Ok(bytes)
+}
+
 fn destination_exists(path: &Path) -> Result<bool, BootstrapIssueError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -3862,6 +4272,17 @@ struct BootstrapIssueReport {
     handoff_created: bool,
 }
 
+#[derive(Serialize)]
+struct BootstrapBindingReport {
+    schema: &'static str,
+    schema_version: u8,
+    operation_id: RequestId,
+    manifest_digest: Digest32,
+    tenant_id: TenantId,
+    host_id: HostId,
+    connector_id: ConnectorId,
+}
+
 fn validate_existing_plan(path: &Path, bytes: &[u8]) -> Result<bool, BootstrapIssueError> {
     if bytes.len() > usize::try_from(MAX_JSON_BYTES).unwrap_or(usize::MAX) {
         return Err(BootstrapIssueError::Plan);
@@ -4353,6 +4774,8 @@ enum BootstrapIssueError {
     Handoff,
     HandoffConflict,
     HandoffUnavailable,
+    BindingConflict,
+    Artifact,
     File,
     FilePermissions,
     DatabaseConfig,
@@ -4387,13 +4810,15 @@ impl From<ProvisionError> for BootstrapIssueError {
 impl fmt::Display for BootstrapIssueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Usage => "usage: dtx-agent-provision bootstrap-issue --database-url-file <0600-file> --request-file <0600-json> --handoff-file <tenant-operation.handoff.json> --plan-file <tenant-operation.plan.json>",
+            Self::Usage => "usage: dtx-agent-provision bootstrap-issue|bootstrap-issue-bound --database-url-file <0600-file> --request-file <0600-json> [--binding-file <0600-json>] --handoff-file <tenant-operation.handoff.json> --plan-file <tenant-operation.plan.json> | bootstrap-binding-create --input-file <0600-json> --artifact-file <root-0555|0755-file> --binding-file <new-0600-json> --request-file <new-0600-json>",
             Self::RootRequired => "bootstrap issuance is root-only",
             Self::Request => "Connector bootstrap issuance request is invalid",
             Self::Plan => "Connector bootstrap plan is invalid",
             Self::Handoff => "Connector bootstrap handoff is invalid",
             Self::HandoffConflict => "Connector bootstrap handoff conflicts with the request",
             Self::HandoffUnavailable => "HANDOFF_UNAVAILABLE: exact protected handoff is missing",
+            Self::BindingConflict => "Connector bootstrap request is not exactly bound to the canonical direct-bootstrap binding",
+            Self::Artifact => "Connector artifact digest does not match the direct-bootstrap binding",
             Self::File => "a required file could not be read or written safely",
             Self::FilePermissions => "request or handoff file ownership or permissions are unsafe",
             Self::DatabaseConfig => "database connection configuration is invalid",
@@ -4439,7 +4864,7 @@ mod tests {
 
     #[cfg(unix)]
     use std::{
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{MetadataExt, PermissionsExt},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -5685,6 +6110,148 @@ mod tests {
             Some(CredentialReissueError::FilePermissions)
         );
         assert!(!handoff_path.exists());
+    }
+
+    #[test]
+    fn direct_bootstrap_binding_is_strict_canonical_and_deterministic() {
+        let request = bootstrap_issue_request();
+        let binding = BootstrapBinding {
+            schema: "dirextalk.connector-direct-bootstrap-binding".to_owned(),
+            schema_version: 1,
+            operation_id: request.operation_id,
+            target: request.target.clone(),
+            connector_artifact: request.connector_artifact.clone(),
+            host: request.host.clone(),
+            connector: request.connector.clone(),
+        };
+        validate_bootstrap_binding(&binding, 3_999_700_000).unwrap();
+        let canonical = canonical_bootstrap_binding(&binding).unwrap();
+        assert_eq!(canonical, canonical_bootstrap_binding(&binding).unwrap());
+        assert!(parse_bootstrap_binding(&canonical).unwrap() == binding);
+        let mut noncanonical = canonical.clone();
+        noncanonical.insert(0, b' ');
+        assert_ne!(canonical, noncanonical);
+        assert!(serde_json::from_slice::<BootstrapBinding>(br#"{"schema":"dirextalk.connector-direct-bootstrap-binding","schema_version":1,"operation_id":"0197f1f0-0000-7000-8000-000000000005","target":"linux-amd64","connector_artifact":{"version":"1.2.3","digest":"1111111111111111111111111111111111111111111111111111111111111111"},"host":{"tenant_id":"0197f1f0-0000-7000-8000-000000000001","host_id":"0197f1f0-0000-7000-8000-000000000002","owner_id":"dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la","host_credential_id":"0197f1f0-0000-7000-8000-000000000009"},"connector":{"unexpected":true}}"#).is_err());
+    }
+
+    #[test]
+    fn direct_bootstrap_binding_request_mismatch_fails_closed() {
+        let request = bootstrap_issue_request();
+        let binding = BootstrapBinding {
+            schema: "dirextalk.connector-direct-bootstrap-binding".to_owned(),
+            schema_version: 1,
+            operation_id: request.operation_id,
+            target: request.target.clone(),
+            connector_artifact: request.connector_artifact.clone(),
+            host: request.host.clone(),
+            connector: request.connector.clone(),
+        };
+        let mut bound = bootstrap_binding_request(&binding).unwrap();
+        bound.connector.display_name = "different".to_owned();
+        assert!(bootstrap_binding_request(&binding).unwrap() != bound);
+        assert_ne!(
+            plain_digest(&canonical_bootstrap_binding(&binding).unwrap()).as_bytes(),
+            request.manifest_digest.0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_bootstrap_outputs_recover_exactly_and_artifacts_are_mode_checked() {
+        let directory = TemporaryDirectory::new(0o700);
+        let binding = directory.path.join("binding.json");
+        let request = directory.path.join("request.json");
+        publish_bootstrap_binding_pair(&binding, b"binding", &request, b"request").unwrap();
+        assert_eq!(fs::read(&binding).unwrap(), b"binding");
+        assert_eq!(fs::read(&request).unwrap(), b"request");
+        assert_eq!(
+            fs::metadata(&binding).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            !deterministic_root_temp(&binding, b"binding")
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            !deterministic_root_temp(&request, b"request")
+                .unwrap()
+                .exists()
+        );
+        publish_bootstrap_binding_pair(&binding, b"binding", &request, b"request").unwrap();
+        assert!(
+            publish_bootstrap_binding_pair(&binding, b"different", &request, b"request").is_err()
+        );
+        fs::remove_file(&binding).unwrap();
+        publish_bootstrap_binding_pair(&binding, b"binding", &request, b"request").unwrap();
+        fs::remove_file(&request).unwrap();
+        assert!(
+            publish_bootstrap_binding_pair(&binding, b"binding", &request, b"request").is_err()
+        );
+
+        let artifact = directory.path.join("connector");
+        fs::write(&artifact, b"artifact").unwrap();
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            read_bootstrap_artifact_digest(&artifact).err()
+                == Some(BootstrapIssueError::FilePermissions)
+        );
+        let link = directory.path.join("link.json");
+        std::os::unix::fs::symlink(&binding, &link).unwrap();
+        assert!(publish_bootstrap_binding_pair(&link, b"no", &request, b"request").is_err());
+        let other = TemporaryDirectory::new(0o700);
+        assert!(
+            publish_bootstrap_binding_pair(
+                &binding,
+                b"binding",
+                &other.path.join("request.json"),
+                b"request"
+            )
+            .is_err()
+        );
+        assert!(
+            publish_bootstrap_binding_pair(&binding, b"binding", &binding, b"request").is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_bootstrap_recovers_only_exact_linked_staging_files() {
+        let directory = TemporaryDirectory::new(0o700);
+        let binding = directory.path.join("binding.json");
+        let request = directory.path.join("request.json");
+        for (final_path, bytes, label) in [
+            (&request, b"request".as_slice(), b"request".as_slice()),
+            (&binding, b"binding".as_slice(), b"binding".as_slice()),
+        ] {
+            if final_path == &binding {
+                publish_deterministic_root_output(&request, b"request", b"request").unwrap();
+            }
+            let temp = deterministic_root_temp(final_path, label).unwrap();
+            let mut file = create_secret_file(&temp).unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            fs::hard_link(&temp, final_path).unwrap();
+            publish_bootstrap_binding_pair(&binding, b"binding", &request, b"request").unwrap();
+            assert!(!temp.exists());
+            assert_eq!(fs::metadata(final_path).unwrap().nlink(), 1);
+            fs::remove_file(final_path).unwrap();
+            if request.exists() {
+                fs::remove_file(&request).unwrap();
+            }
+            if binding.exists() {
+                fs::remove_file(&binding).unwrap();
+            }
+        }
+        let temp = deterministic_root_temp(&request, b"request").unwrap();
+        let mut file = create_secret_file(&temp).unwrap();
+        file.write_all(b"wrong").unwrap();
+        drop(file);
+        fs::hard_link(&temp, &request).unwrap();
+        assert!(
+            publish_bootstrap_binding_pair(&binding, b"binding", &request, b"request").is_err()
+        );
     }
 
     #[cfg(unix)]
