@@ -642,6 +642,20 @@ def request_matches_receipt(request: dict[str, object], receipt: dict[str, objec
     )) and request["previous_receipt_sha256"] == receipt["previous_receipt_sha256"]
 
 
+def potentially_matches_request(
+    request: dict[str, object],
+    value: object,
+) -> bool:
+    keys = (
+        "target", "domain", "version", "source_commit", "bundle_sha256",
+        "manifest_sha256", "server_image", "migrator_image",
+        "previous_receipt_sha256",
+    )
+    return isinstance(value, dict) and all(
+        key in value and request[key] == value[key] for key in keys
+    )
+
+
 def fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
@@ -672,6 +686,7 @@ def maintain_receipt_storage(
         if isinstance(value, str)
     }
     records: dict[str, tuple[Path, dict[str, object], int]] = {}
+    invalid_records: dict[str, tuple[Path, dict[str, object] | None]] = {}
     garbage: list[Path] = []
     for path in sorted(RECEIPT_ROOT.iterdir()):
         if path == CURRENT_RECEIPT:
@@ -693,37 +708,80 @@ def maintain_receipt_storage(
                 raise ContractError("recovery-referenced receipt exceeds its size bound")
             garbage.append(path)
             continue
+        raw: bytes | None = None
         try:
             raw = read_secure(path, 0o600, MAX_RECEIPT_BYTES)
             receipt = validate_receipt(raw)
             if receipt["receipt_sha256"] != receipt_hash:
                 raise ContractError("receipt history filename differs from its self-hash")
         except ContractError:
-            if receipt_hash in explicit:
-                raise
+            candidate: dict[str, object] | None = None
+            if raw is not None:
+                try:
+                    decoded = decode_json(raw, "invalid receipt history")
+                    if isinstance(decoded, dict):
+                        candidate = decoded
+                except ContractError:
+                    pass
+            invalid_records[receipt_hash] = (path, candidate)
             garbage.append(path)
             continue
         records[receipt_hash] = (path, receipt, len(raw))
-    for path in garbage:
-        remove_receipt_file(path)
-    if garbage:
-        fsync_directory(RECEIPT_ROOT)
 
-    protected = set(explicit)
-    recovery_bases = set(explicit)
-    for receipt_hash, (_path, receipt, _size) in records.items():
-        if (
-            receipt["state"] == "installed"
-            and (
-                request_matches_receipt(request, receipt)
-                or receipt["previous_receipt_sha256"] in recovery_bases
-            )
-        ):
+    # Resolve the complete authenticated reference graph before unlinking even
+    # stale or malformed entries. Roots are current/request references; valid
+    # installed descendants are crash-recoverable candidates. Every selected
+    # receipt contributes its predecessor recursively.
+    protected: set[str] = set()
+    pending = list(explicit)
+    while True:
+        while pending:
+            receipt_hash = pending.pop()
+            if receipt_hash in protected:
+                continue
+            if receipt_hash in invalid_records:
+                raise ContractError("an authoritative receipt history is corrupt")
+            record = records.get(receipt_hash)
+            if record is None:
+                raise ContractError("an authoritative receipt history is missing")
+            receipt = record[1]
+            if (
+                current is not None
+                and receipt_hash == current["receipt_sha256"]
+                and receipt != current
+            ):
+                raise ContractError("current receipt differs from its authoritative history")
             protected.add(receipt_hash)
             previous = receipt["previous_receipt_sha256"]
             if isinstance(previous, str):
-                protected.add(previous)
-    protected.intersection_update(records)
+                pending.append(previous)
+
+        for receipt_hash, (_path, receipt, _size) in records.items():
+            if (
+                receipt_hash not in protected
+                and receipt["state"] == "installed"
+                and (
+                    request_matches_receipt(request, receipt)
+                    or receipt["previous_receipt_sha256"] in protected
+                )
+            ):
+                pending.append(receipt_hash)
+        for receipt_hash, (_path, candidate) in invalid_records.items():
+            if receipt_hash in protected:
+                raise ContractError("an authoritative receipt history is corrupt")
+            previous = (
+                None
+                if candidate is None
+                else candidate.get("previous_receipt_sha256")
+            )
+            if (
+                potentially_matches_request(request, candidate)
+                or (isinstance(previous, str) and previous in protected)
+            ):
+                raise ContractError("a recovery-referenced receipt history is corrupt")
+        if not pending:
+            break
+
     protected_release_digests = {str(request["bundle_sha256"])}
     required_release_digests: set[str] = set()
     if current is not None:
@@ -747,6 +805,10 @@ def maintain_receipt_storage(
         or protected_size + current_size > bytes_limit
     ):
         raise ContractError("recovery-referenced receipts exceed the bounded storage quota")
+    for path in garbage:
+        remove_receipt_file(path)
+    if garbage:
+        fsync_directory(RECEIPT_ROOT)
     unprotected = sorted(
         (
             (receipt["installed_at_ms"], receipt_hash, path, size)

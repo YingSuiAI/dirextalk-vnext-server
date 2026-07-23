@@ -156,12 +156,21 @@ def main() -> int:
         release_root = base / "releases"
         secret_root = base / "secrets"
         volume_root = base / "volumes"
+        archive_root = base / "update-archives"
+        legacy_build_root = base / "legacy-build"
+        cache_root = base / "cache"
         receipt_root.mkdir(parents=True)
         release_root.mkdir()
         secret_root.mkdir()
         volume_root.mkdir()
+        archive_root.mkdir()
+        legacy_build_root.mkdir()
+        cache_root.mkdir()
         (secret_root / "operator-secret").write_text("preserve\n")
         (volume_root / "database").write_text("preserve\n")
+        (archive_root / "attempt").write_text("preserve\n")
+        (legacy_build_root / "compiler-output").write_text("preserve\n")
+        (cache_root / "docker-cache").write_text("preserve\n")
         os.chmod(state_root, 0o700)
         os.chmod(receipt_root, 0o700)
         os.chmod(release_root, 0o700)
@@ -199,17 +208,24 @@ def main() -> int:
             os.chmod(path, 0o600)
             return receipt_value, raw
 
+        grandprior_bundle = "f" * 64
         prior_bundle = "a" * 64
         current_bundle = "b" * 64
         candidate_bundle = "c" * 64
         alternate_candidate_bundle = "d" * 64
-        prior_receipt, _ = history(receipt_facts(prior_bundle, "1"), None)
+        grandprior_receipt, grandprior_raw = history(
+            receipt_facts(grandprior_bundle, "f"), None
+        )
+        prior_receipt, prior_raw = history(
+            receipt_facts(prior_bundle, "1"),
+            str(grandprior_receipt["receipt_sha256"]),
+        )
         current_receipt, current_raw = history(
             receipt_facts(current_bundle, "2"), str(prior_receipt["receipt_sha256"])
         )
         candidate_request = receipt_facts(candidate_bundle, "3")
         candidate_request["previous_receipt_sha256"] = current_receipt["receipt_sha256"]
-        candidate_receipt, _ = history(
+        candidate_receipt, candidate_raw = history(
             candidate_request, str(current_receipt["receipt_sha256"])
         )
         alternate_candidate_receipt, _ = history(
@@ -223,6 +239,7 @@ def main() -> int:
         stale_receipt.write_text("stale\n")
         os.chmod(stale_receipt, 0o600)
         for bundle_sha256 in (
+            grandprior_bundle,
             prior_bundle,
             current_bundle,
             candidate_bundle,
@@ -280,10 +297,88 @@ def main() -> int:
             installer.MIN_STATE_FREE_BYTES = 1
             installer.disk_free_bytes = lambda _path: 1024 * 1024 * 1024
 
+            def inventory(path: Path) -> list[str]:
+                return sorted(str(entry.relative_to(path)) for entry in path.rglob("*"))
+
+            prior_path = receipt_root / f"{prior_receipt['receipt_sha256']}.json"
+            grandprior_path = (
+                receipt_root / f"{grandprior_receipt['receipt_sha256']}.json"
+            )
+            candidate_history = (
+                receipt_root / f"{candidate_receipt['receipt_sha256']}.json"
+            )
+            prior_path.unlink()
+            missing_receipts = inventory(receipt_root)
+            missing_releases = inventory(release_root)
+            must_reject(
+                lambda: installer.maintain_host_storage(
+                    candidate_request, current_receipt, installer.MAX_BUNDLE_BYTES
+                ),
+                "missing authoritative predecessor receipt",
+            )
+            assert inventory(receipt_root) == missing_receipts
+            assert inventory(release_root) == missing_releases
+            assert stale_receipt.exists() and stale_release.exists()
+            assert (release_root / prior_bundle).is_dir()
+            assert (archive_root / "attempt").read_text() == "preserve\n"
+            assert (legacy_build_root / "compiler-output").read_text() == "preserve\n"
+            assert (cache_root / "docker-cache").read_text() == "preserve\n"
+
+            prior_path.write_bytes(prior_raw)
+            os.chmod(prior_path, 0o600)
+            grandprior_path.write_bytes(
+                grandprior_raw.replace(
+                    b'"state":"installed"', b'"state":"rolled_back"'
+                )
+            )
+            os.chmod(grandprior_path, 0o600)
+            corrupt_receipts = inventory(receipt_root)
+            corrupt_releases = inventory(release_root)
+            corrupt_grandprior = grandprior_path.read_bytes()
+            must_reject(
+                lambda: installer.maintain_host_storage(
+                    candidate_request, current_receipt, installer.MAX_BUNDLE_BYTES
+                ),
+                "corrupt transitive authoritative predecessor receipt",
+            )
+            assert inventory(receipt_root) == corrupt_receipts
+            assert inventory(release_root) == corrupt_releases
+            assert grandprior_path.read_bytes() == corrupt_grandprior
+            assert stale_receipt.exists() and stale_release.exists()
+            assert (release_root / grandprior_bundle).is_dir()
+
+            grandprior_path.write_bytes(grandprior_raw)
+            os.chmod(grandprior_path, 0o600)
+            candidate_history.write_bytes(
+                candidate_raw.replace(b'"state":"installed"', b'"state":"rolled_back"')
+            )
+            os.chmod(candidate_history, 0o600)
+            recovery_corrupt_receipts = inventory(receipt_root)
+            recovery_corrupt_releases = inventory(release_root)
+            must_reject(
+                lambda: installer.maintain_host_storage(
+                    candidate_request, current_receipt, installer.MAX_BUNDLE_BYTES
+                ),
+                "corrupt recovery-candidate receipt",
+            )
+            assert inventory(receipt_root) == recovery_corrupt_receipts
+            assert inventory(release_root) == recovery_corrupt_releases
+            assert candidate_history.read_bytes() != candidate_raw
+            assert stale_receipt.exists() and stale_release.exists()
+            assert (release_root / candidate_bundle).is_dir()
+            assert (secret_root / "operator-secret").read_text() == "preserve\n"
+            assert (volume_root / "database").read_text() == "preserve\n"
+            assert (archive_root / "attempt").read_text() == "preserve\n"
+            assert (legacy_build_root / "compiler-output").read_text() == "preserve\n"
+            assert (cache_root / "docker-cache").read_text() == "preserve\n"
+            candidate_history.write_bytes(candidate_raw)
+            os.chmod(candidate_history, 0o600)
+
             installer.maintain_host_storage(
                 candidate_request, current_receipt, installer.MAX_BUNDLE_BYTES
             )
             protected_receipts = {
+                str(grandprior_receipt["receipt_sha256"]),
                 str(prior_receipt["receipt_sha256"]),
                 str(current_receipt["receipt_sha256"]),
                 str(candidate_receipt["receipt_sha256"]),
@@ -295,6 +390,7 @@ def main() -> int:
             assert not stale_receipt.exists()
             assert not stale_release.exists()
             for bundle_sha256 in (
+                grandprior_bundle,
                 prior_bundle,
                 current_bundle,
                 candidate_bundle,
@@ -306,7 +402,7 @@ def main() -> int:
             ]
             remaining_releases = list(release_root.iterdir())
             assert len(remaining_receipts) <= 5
-            assert len(remaining_releases) <= 5
+            assert len(remaining_releases) <= 6
             assert sum(
                 (receipt_root / f"{value}.json").exists() for value in garbage_receipts
             ) <= 1

@@ -212,8 +212,11 @@ the current release, directly prior release, request candidate, and every
 release referenced by a crash-recoverable candidate receipt, plus the newest
 two unreferenced releases. Receipt history is bounded to 64 files/4 MiB and
 reserves an 8 MiB free-space floor plus three receipt-sized atomic-write
-slots; it preserves current, directly prior, and all recovery-candidate
-receipts plus the newest sixteen unreferenced receipts. Only validated
+slots. Before deleting anything, the installer validates the complete
+authenticated predecessor closure from current/request roots and every
+crash-recoverable candidate; a missing or corrupt referenced receipt fails
+closed with all receipt and release artifacts untouched. Retention preserves
+that closure plus the newest sixteen unreferenced receipts. Only validated
 root-owned release trees, receipt histories, and stale installer temporaries
 inside those exact roots can be removed. Volumes, images, containers,
 configuration, TLS, and secrets are never part of this retention pass.
