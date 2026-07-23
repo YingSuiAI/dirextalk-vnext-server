@@ -35,6 +35,13 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), ProvisionError> {
     ensure_root()?;
+    let command = env::args_os().nth(1);
+    if command.as_deref() == Some(std::ffi::OsStr::new("client-binding-revoke")) {
+        return run_revoke().await;
+    }
+    if command.as_deref() == Some(std::ffi::OsStr::new("client-binding-expire")) {
+        return run_expire().await;
+    }
     let arguments = Arguments::parse(env::args_os())?;
     let request_bytes = read_root_file(&arguments.request_file, MAX_REQUEST_BYTES)?;
     let request: IssueRequest =
@@ -43,7 +50,10 @@ async fn run() -> Result<(), ProvisionError> {
         return Err(ProvisionError::Request);
     }
     request.validate()?;
-    let ca_bytes = read_root_file(&request.identity_tls_root_ca_file, MAX_CA_BYTES)?;
+    let ca_bytes = Zeroizing::new(read_root_file(
+        &request.identity_tls_root_ca_file,
+        MAX_CA_BYTES,
+    )?);
     if ca_bytes.is_empty() || ca_bytes.len() > MAX_CA_BYTES || !ca_bytes.is_ascii() {
         return Err(ProvisionError::Request);
     }
@@ -92,7 +102,7 @@ async fn run() -> Result<(), ProvisionError> {
                 deployment_operation_id: request.deployment_operation_id,
                 tenant_id: request.tenant_id,
                 server_origin: request.server_origin.clone(),
-                identity_tls_root_ca_pem: String::from_utf8(ca_bytes)
+                identity_tls_root_ca_pem: String::from_utf8(ca_bytes.to_vec())
                     .map_err(|_| ProvisionError::Request)?,
                 identity_tls_root_ca_sha256: ca_digest.to_string(),
                 expires_at_unix_ms: expires,
@@ -101,6 +111,7 @@ async fn run() -> Result<(), ProvisionError> {
             let bytes = serde_json::to_vec(&output).map_err(|_| ProvisionError::Output)?;
             (binding, issued, expires, raw, bytes)
         };
+    let output_bytes = Zeroizing::new(output_bytes);
     if output_bytes.len() > MAX_REQUEST_BYTES {
         return Err(ProvisionError::Output);
     }
@@ -136,8 +147,10 @@ async fn run() -> Result<(), ProvisionError> {
         .await;
     let result = result.map_err(|_| ProvisionError::Database)?;
     if result.replayed {
-        let existing = read_root_file(&arguments.output_file, MAX_REQUEST_BYTES)
-            .map_err(|_| ProvisionError::ArtifactLost)?;
+        let existing = Zeroizing::new(
+            read_root_file(&arguments.output_file, MAX_REQUEST_BYTES)
+                .map_err(|_| ProvisionError::ArtifactLost)?,
+        );
         if Sha256Digest::from_bytes(Sha256::digest(&existing).into()) != result.artifact_digest {
             return Err(ProvisionError::ArtifactLost);
         }
@@ -145,6 +158,41 @@ async fn run() -> Result<(), ProvisionError> {
     }
     write_new_root_file(&arguments.output_file, &output_bytes)?;
     Ok(())
+}
+
+async fn open_store(path: &Path) -> Result<IdentityPgStore, ProvisionError> {
+    let database_url = read_root_file(path, 8 * 1024)?;
+    let database_url =
+        Zeroizing::new(String::from_utf8(database_url).map_err(|_| ProvisionError::Database)?);
+    let options = database_url
+        .trim()
+        .parse::<PgConnectOptions>()
+        .map_err(|_| ProvisionError::Database)?;
+    IdentityPgStore::connect(options, 2)
+        .await
+        .map_err(|_| ProvisionError::Database)
+}
+
+async fn run_revoke() -> Result<(), ProvisionError> {
+    let args = FixedActionArguments::parse(env::args_os(), "client-binding-revoke")?;
+    let binding_id = Uuid::parse_str(&args.binding_id).map_err(|_| ProvisionError::Request)?;
+    ClientBindingRepository::default()
+        .revoke(
+            &open_store(&args.database_url_file).await?,
+            binding_id,
+            now_ms()?,
+        )
+        .await
+        .map_err(|_| ProvisionError::Database)
+}
+
+async fn run_expire() -> Result<(), ProvisionError> {
+    let args = FixedActionArguments::parse(env::args_os(), "client-binding-expire")?;
+    ClientBindingRepository::default()
+        .expire(&open_store(&args.database_url_file).await?, now_ms()?)
+        .await
+        .map(|_| ())
+        .map_err(|_| ProvisionError::Database)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -167,7 +215,11 @@ impl IssueRequest {
             || self.tenant_id.get_version_num() != 7
             || self.server_origin.len() <= 8
             || !self.server_origin.starts_with("https://")
-            || self.server_origin[8..].contains(['/', '?', '#', '@'])
+            || self.server_origin[8..].contains(['/', '?', '#', '@', ':'])
+            || self.server_origin[8..]
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace())
+            || self.server_origin.ends_with('.')
             || self.server_origin != self.server_origin.to_ascii_lowercase()
             || !(1..=900_000).contains(&self.ttl_millis)
         {
@@ -210,6 +262,37 @@ struct Arguments {
     database_url_file: PathBuf,
     request_file: PathBuf,
     output_file: PathBuf,
+}
+
+struct FixedActionArguments {
+    database_url_file: PathBuf,
+    binding_id: String,
+}
+
+impl FixedActionArguments {
+    fn parse(
+        mut args: impl Iterator<Item = std::ffi::OsString>,
+        command: &str,
+    ) -> Result<Self, ProvisionError> {
+        let _ = args.next();
+        if args.next().as_deref() != Some(std::ffi::OsStr::new(command)) {
+            return Err(ProvisionError::Usage);
+        }
+        let mut database_url_file = None;
+        let mut binding_id = None;
+        while let Some(flag) = args.next() {
+            let value = args.next().ok_or(ProvisionError::Usage)?;
+            match flag.to_str() {
+                Some("--database-url-file") => database_url_file = Some(PathBuf::from(value)),
+                Some("--binding-id") => binding_id = Some(value.to_string_lossy().into_owned()),
+                _ => return Err(ProvisionError::Usage),
+            }
+        }
+        Ok(Self {
+            database_url_file: database_url_file.ok_or(ProvisionError::Usage)?,
+            binding_id: binding_id.unwrap_or_default(),
+        })
+    }
 }
 
 impl Arguments {
@@ -293,11 +376,28 @@ fn write_new_root_file(path: &Path, bytes: &[u8]) -> Result<(), ProvisionError> 
     if path.exists() {
         return Err(ProvisionError::ArtifactLost);
     }
+    let parent = path.parent().ok_or(ProvisionError::Output)?;
+    let name = path
+        .file_name()
+        .ok_or(ProvisionError::Output)?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::now_v7()));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
-    let mut file = options.open(path).map_err(|_| ProvisionError::Output)?;
-    io::Write::write_all(&mut file, bytes).map_err(|_| ProvisionError::Output)?;
-    file.sync_all().map_err(|_| ProvisionError::Output)
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| ProvisionError::Output)?;
+    if io::Write::write_all(&mut file, bytes).is_err() || file.sync_all().is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(ProvisionError::Output);
+    }
+    if fs::hard_link(&temporary, path).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(ProvisionError::ArtifactLost);
+    }
+    let directory = fs::File::open(parent).map_err(|_| ProvisionError::Output)?;
+    directory.sync_all().map_err(|_| ProvisionError::Output)?;
+    fs::remove_file(&temporary).map_err(|_| ProvisionError::Output)
 }
 
 #[cfg(not(unix))]

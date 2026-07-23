@@ -181,7 +181,11 @@ impl ClientBindingRepository {
         if command.expires_at_ms <= command.issued_at_ms
             || command.expires_at_ms > command.issued_at_ms.saturating_add(900_000)
             || !command.server_origin.starts_with("https://")
-            || command.server_origin[8..].contains(['/', '?', '#', '@'])
+            || command.server_origin[8..].contains(['/', '?', '#', '@', ':'])
+            || command.server_origin[8..]
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace())
+            || command.server_origin.ends_with('.')
             || command.server_origin != command.server_origin.to_ascii_lowercase()
         {
             return Err(ClientBindingWorkflowError::Invalid);
@@ -675,9 +679,13 @@ impl ClientBindingImport {
         let deployment_operation_id = canonical_v7(&wire.deployment_operation_id)?;
         let tenant_id = canonical_v7(&wire.tenant_id)?;
         let digest = hex_digest(&wire.identity_tls_root_ca_sha256)?;
-        let (_, pem) = parse_x509_pem(wire.identity_tls_root_ca_pem.as_bytes())
+        let (remainder, pem) = parse_x509_pem(wire.identity_tls_root_ca_pem.as_bytes())
             .map_err(|_| ClientBindingImportError)?;
-        if pem.parse_x509().is_err() {
+        if !remainder.is_empty() {
+            return Err(ClientBindingImportError);
+        }
+        let certificate = pem.parse_x509().map_err(|_| ClientBindingImportError)?;
+        if !certificate.is_ca() {
             return Err(ClientBindingImportError);
         }
         use sha2::{Digest, Sha256};
@@ -717,10 +725,14 @@ fn canonical_v7(value: &str) -> Result<Uuid, ClientBindingImportError> {
     }
 }
 fn canonical_origin(value: &str) -> bool {
-    value.starts_with("https://")
-        && value.len() > 8
-        && !value[8..].contains(['/', '?', '#', '@'])
-        && value == value.to_ascii_lowercase()
+    let authority = value.strip_prefix("https://");
+    authority.is_some_and(|authority| {
+        !authority.is_empty()
+            && !authority.bytes().any(|byte| byte.is_ascii_whitespace())
+            && !authority.contains(['/', '?', '#', '@', ':'])
+            && value == value.to_ascii_lowercase()
+            && !authority.ends_with('.')
+    })
 }
 fn hex_digest(value: &str) -> Result<Sha256Digest, ClientBindingImportError> {
     if value.len() != 64

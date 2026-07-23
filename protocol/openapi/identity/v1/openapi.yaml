@@ -40,7 +40,7 @@ paths:
           application/vnd.dirextalk.identity-log.v1.1+cbor:
             x-dirextalk-exact-cbor: true
             x-dirextalk-max-body-bytes: 1048576
-            schema: { $ref: '#/components/schemas/ExactIdentityLogGenesisV1_1' }
+            schema: { $ref: '#/components/schemas/ExactInitialDeviceV1_1' }
       responses:
         '201': { $ref: '#/components/responses/IdentityBootstrapCommitted' }
         '200': { $ref: '#/components/responses/IdentityBootstrapReplayed' }
@@ -177,6 +177,10 @@ components:
       type: string
       format: binary
       description: Exact canonical CBOR bytes of a signed identity-log V1.1 genesis event.
+    ExactInitialDeviceV1_1:
+      type: string
+      format: binary
+      description: Exact canonical CBOR bytes of a signed sequence-two DeviceAdd event whose predecessor is the quoted genesis hash.
     IdentityAppendReceiptCborV1:
       type: string
       format: binary
