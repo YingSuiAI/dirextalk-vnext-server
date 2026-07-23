@@ -69,8 +69,9 @@ shape:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "installation_id": "01900000-0000-7000-8000-000000000001",
+  "agent_id": "dtxa1...",
   "server_origin": "https://x3.dirextalk.ai",
   "agent_identity_id": "dtxi1...",
   "identity_device_id": "01900000-0000-7000-8000-000000000002",
@@ -80,7 +81,7 @@ shape:
 }
 ```
 
-Unknown fields, non-canonical Base64URL, duplicate identities/devices,
+Unknown fields, missing or malformed `agent_id`, non-canonical Base64URL, duplicate identities/devices,
 zero-valued digests, an Owner identity/device reuse, an Installation/origin
 mismatch, or unsafe file permissions are rejected. The credential fingerprint
 must be produced from the real root-signed Agent `DeviceCertificateV1` using
@@ -109,7 +110,7 @@ Definition, owner-approval-pending Installation, active Agent Device, and
 enabled exclusive Binding. The client's signed Owner approval remains the
 only operation allowed to bind the Agent identity to its Installation.
 Finalize requires exactly one facts file per selected plan entry, matched by
-the exact Installation ID and canonical origin. A `{codex}` plan therefore
+the exact Installation ID, typed `agent_id`, and canonical origin. A `{codex}` plan therefore
 requires only its Codex facts file; it must not fabricate an OpenClaw or Hermes
 fact from another Host. Finalize also requires the exact prepared Host and
 Connectors; it never silently creates a missing foundation. Repeating the exact

@@ -1091,11 +1091,12 @@ struct AcceptanceAgentPlan {
     binding_max_concurrency: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcceptanceFacts {
     schema_version: u8,
     installation_id: InstallationId,
+    agent_id: AgentId,
     server_origin: String,
     agent_identity_id: IdentityId,
     identity_device_id: DeviceId,
@@ -2435,8 +2436,9 @@ fn validate_and_sort_acceptance_facts(
     let mut expected = plan.agents.iter().collect::<Vec<_>>();
     expected.sort_by_key(|agent| agent.installation_id);
     for (actual, expected) in facts.iter().zip(expected) {
-        if actual.schema_version != 1
+        if actual.schema_version != 2
             || actual.installation_id != expected.installation_id
+            || actual.agent_id != expected.agent_id
             || actual.server_origin != expected.server_origin
             || !is_canonical_https_origin(&actual.server_origin)
             || !(1..=MAX_IDENTITY_HEAD_SEQUENCE).contains(&actual.identity_head_sequence)
@@ -2866,6 +2868,12 @@ async fn finalize_acceptance_topology(
     facts: &[AcceptanceFacts],
     stored_at_millis: i64,
 ) -> Result<bool, AcceptanceError> {
+    // Keep the facts/plan binding outside the transaction so an invalid or
+    // stale native handoff cannot even begin topology work. `run_acceptance`
+    // performs the same preflight before opening the database connection;
+    // repeating it here protects this operator boundary for direct callers.
+    let mut validated_facts = facts.to_vec();
+    validate_and_sort_acceptance_facts(&mut validated_facts, plan)?;
     let mut session = store
         .begin_tenant(plan.tenant_id)
         .await
@@ -2873,7 +2881,7 @@ async fn finalize_acceptance_topology(
     let result = finalize_acceptance_topology_in_transaction(
         session.connection(),
         plan,
-        facts,
+        &validated_facts,
         stored_at_millis,
     )
     .await;
@@ -4293,8 +4301,12 @@ impl fmt::Display for AcceptanceError {
             }
             Self::Config => "Agent Control service configuration is invalid",
             Self::Plan => "acceptance plan is invalid",
-            Self::Facts => "Agent acceptance facts are invalid",
-            Self::FactsConflict => "Agent acceptance facts conflict with the normalized plan",
+            Self::Facts => {
+                "Agent acceptance facts are invalid; re-run native prepare and regenerate the plan"
+            }
+            Self::FactsConflict => {
+                "Agent acceptance facts conflict with the normalized plan; re-run native prepare and regenerate the plan"
+            }
             Self::TenantMismatch => "acceptance plan tenant does not match Agent Control",
             Self::Handoff => "secret acceptance handoff is invalid",
             Self::HandoffConflict => "secret acceptance handoff conflicts with the plan",
@@ -4686,8 +4698,9 @@ mod tests {
             .zip(keys)
             .enumerate()
             .map(|(index, (agent, key))| AcceptanceFacts {
-                schema_version: 1,
+                schema_version: 2,
                 installation_id: agent.installation_id,
+                agent_id: agent.agent_id,
                 server_origin: agent.server_origin.clone(),
                 agent_identity_id: IdentityId::derive(&key),
                 identity_device_id: DeviceId::from_str(if index == 0 {
@@ -5261,8 +5274,8 @@ mod tests {
             facts[0].credential_fingerprint
         );
         let unknown_facts = String::from_utf8(encoded_facts).unwrap().replacen(
-            "\"schema_version\":1,",
-            "\"schema_version\":1,\"extra\":true,",
+            "\"schema_version\":2,",
+            "\"schema_version\":2,\"extra\":true,",
             1,
         );
         assert_eq!(
@@ -5283,6 +5296,51 @@ mod tests {
         assert_eq!(
             parse_acceptance_plan(unknown.as_bytes()).err(),
             Some(AcceptanceError::Plan)
+        );
+    }
+
+    #[test]
+    fn acceptance_facts_require_v2_agent_binding_before_finalize() {
+        let mut plan = acceptance_plan();
+        validate_and_sort_acceptance_plan(&mut plan, 1_800_000_000_000).unwrap();
+        let facts = acceptance_facts(&plan);
+
+        let mut legacy = serde_json::to_value(&facts[0]).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        let legacy = parse_acceptance_facts(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut legacy_facts = vec![legacy];
+        let mut legacy_plan = acceptance_plan();
+        validate_and_sort_acceptance_plan(&mut legacy_plan, 1_800_000_000_000).unwrap();
+        legacy_plan.agents.remove(1);
+        assert_eq!(
+            validate_and_sort_acceptance_facts(&mut legacy_facts, &legacy_plan),
+            Err(AcceptanceError::FactsConflict)
+        );
+
+        let mut missing = serde_json::to_value(&facts[0]).unwrap();
+        missing.as_object_mut().unwrap().remove("agent_id");
+        assert_eq!(
+            parse_acceptance_facts(&serde_json::to_vec(&missing).unwrap()).err(),
+            Some(AcceptanceError::Facts)
+        );
+
+        let mut malformed = serde_json::to_value(&facts[0]).unwrap();
+        malformed["agent_id"] = serde_json::json!("not-an-agent-id");
+        assert_eq!(
+            parse_acceptance_facts(&serde_json::to_vec(&malformed).unwrap()).err(),
+            Some(AcceptanceError::Facts)
+        );
+
+        let mut mismatch = facts;
+        mismatch[0].agent_id = plan.agents[1].agent_id;
+        assert_eq!(
+            validate_and_sort_acceptance_facts(&mut mismatch, &plan),
+            Err(AcceptanceError::FactsConflict)
+        );
+        assert!(
+            AcceptanceError::FactsConflict
+                .to_string()
+                .contains("re-run native prepare and regenerate the plan")
         );
     }
 
