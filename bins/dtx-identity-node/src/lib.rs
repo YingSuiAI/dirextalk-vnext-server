@@ -1150,7 +1150,7 @@ impl IdentityBootstrapState {
         }
         let now = self
             .committed_at()
-            .map_err(|_| ClientBindingFailure::Unavailable)?;
+            .map_err(|()| ClientBindingFailure::Unavailable)?;
         match self
             .client_bindings
             .deployment_bootstrap(
@@ -1172,7 +1172,7 @@ impl IdentityBootstrapState {
                 exact_receipt_bytes: receipt.exact_bytes().to_vec(),
             }),
             Ok(IdentityAppendOutcome::Forked { .. }) => Err(ClientBindingFailure::Conflict),
-            Err(error) => Err(map_client_binding_error(error)),
+            Err(error) => Err(map_client_binding_error(&error)),
         }
     }
 
@@ -1198,7 +1198,7 @@ impl IdentityBootstrapState {
         }
         let now = self
             .committed_at()
-            .map_err(|_| ClientBindingFailure::Unavailable)?;
+            .map_err(|()| ClientBindingFailure::Unavailable)?;
         match self
             .client_bindings
             .initial_device(
@@ -1221,7 +1221,7 @@ impl IdentityBootstrapState {
                 exact_receipt_bytes: receipt.exact_bytes().to_vec(),
             }),
             Ok(IdentityAppendOutcome::Forked { .. }) => Err(ClientBindingFailure::Conflict),
-            Err(error) => Err(map_client_binding_error(error)),
+            Err(error) => Err(map_client_binding_error(&error)),
         }
     }
 
@@ -2060,7 +2060,7 @@ fn idempotency_key_hash_binding(
 
 fn client_binding_id(headers: &HeaderMap) -> Result<uuid::Uuid, ClientBindingFailure> {
     let value = single_graphic_header(headers, CLIENT_BINDING_HEADER, 36, 36)
-        .map_err(|_| ClientBindingFailure::Invalid)?;
+        .map_err(|()| ClientBindingFailure::Invalid)?;
     let id = uuid::Uuid::parse_str(value).map_err(|_| ClientBindingFailure::Invalid)?;
     if id.to_string() != value || id.get_version_num() != 7 {
         return Err(ClientBindingFailure::Invalid);
@@ -2072,7 +2072,7 @@ fn client_binding_authorization(
     headers: &HeaderMap,
 ) -> Result<ClientBindingAuthorization, ClientBindingFailure> {
     let value = single_graphic_header(headers, header::AUTHORIZATION.as_str(), 61, 80)
-        .map_err(|_| ClientBindingFailure::Invalid)?;
+        .map_err(|()| ClientBindingFailure::Invalid)?;
     let raw = value
         .strip_prefix(CLIENT_BINDING_AUTHORIZATION_SCHEME)
         .and_then(|rest| rest.strip_prefix(' '))
@@ -3745,7 +3745,7 @@ enum ClientBindingFailure {
     Unavailable,
 }
 
-fn map_client_binding_error(error: ClientBindingWorkflowError) -> ClientBindingFailure {
+fn map_client_binding_error(error: &ClientBindingWorkflowError) -> ClientBindingFailure {
     match error {
         ClientBindingWorkflowError::Invalid | ClientBindingWorkflowError::Corrupt => {
             ClientBindingFailure::Invalid
@@ -4167,12 +4167,6 @@ enum ClientBindingErrorCode {
     Invalid,
     #[serde(rename = "CLIENT_BINDING_CONFLICT")]
     Conflict,
-    #[serde(rename = "CLIENT_BINDING_INVALID")]
-    Unauthorized,
-    #[serde(rename = "CLIENT_BINDING_INVALID")]
-    Expired,
-    #[serde(rename = "CLIENT_BINDING_INVALID")]
-    Revoked,
     #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
     Unavailable,
 }

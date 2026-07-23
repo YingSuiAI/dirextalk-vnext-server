@@ -2,6 +2,7 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_identity_log::{IdentityLogEventPayloadV1, IdentityLogEventV1};
 use dtx_wire::{Sha256Digest, UtcMillis};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
@@ -17,6 +18,11 @@ pub const CLIENT_BINDING_AUTHORIZATION_HASH_DOMAIN: &[u8] =
 const MAX_IMPORT_BYTES: usize = 24 * 1024;
 const MAX_CA_BYTES: usize = 12 * 1024;
 
+/// Domain separator reserved for the durable issuance request digest contract.
+#[allow(
+    dead_code,
+    reason = "exported protocol domain is reserved for the issuance request wire"
+)]
 pub const CLIENT_BINDING_ISSUE_HASH_DOMAIN: &[u8] = b"dirextalk.client-binding-issue-request.v1\0";
 pub const CLIENT_BINDING_BOOTSTRAP_HASH_DOMAIN: &[u8] =
     b"dirextalk.client-binding-bootstrap-request.v1\0";
@@ -31,6 +37,11 @@ impl Drop for ClientBindingAuthorization {
     }
 }
 impl ClientBindingAuthorization {
+    /// Parses the canonical unpadded base64url bearer value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is not exactly 32 decoded bytes.
     pub fn parse(value: &str) -> Result<Self, ClientBindingImportError> {
         if value.len() != 43 {
             return Err(ClientBindingImportError);
@@ -95,16 +106,6 @@ pub enum ClientBindingState {
 }
 
 impl ClientBindingState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Issued => "issued",
-            Self::IdentityBound => "identity_bound",
-            Self::Consumed => "consumed",
-            Self::Expired => "expired",
-            Self::Revoked => "revoked",
-        }
-    }
-
     fn parse(value: &str) -> Result<Self, ClientBindingWorkflowError> {
         match value {
             "issued" => Ok(Self::Issued),
@@ -182,6 +183,16 @@ impl std::error::Error for ClientBindingWorkflowError {}
 pub struct ClientBindingRepository;
 
 impl ClientBindingRepository {
+    /// Issues one durable binding, replaying an exact live operation request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workflow error when validation, persistence, or idempotency
+    /// checks fail.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "transactional issuance keeps fence and rollback together"
+    )]
     pub async fn issue(
         self,
         store: &IdentityPgStore,
@@ -276,10 +287,7 @@ impl ClientBindingRepository {
         .await;
         match result {
             Ok(value) => {
-                session
-                    .commit()
-                    .await
-                    .map_err(IdentityPersistenceError::from)?;
+                session.commit().await?;
                 Ok(value)
             }
             Err(error) => {
@@ -289,6 +297,12 @@ impl ClientBindingRepository {
         }
     }
 
+    /// Revokes an issued or identity-bound binding before expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workflow error when the binding is absent, inactive, or the
+    /// transaction cannot commit.
     pub async fn revoke(
         self,
         store: &IdentityPgStore,
@@ -315,13 +329,15 @@ impl ClientBindingRepository {
             let _ = session.rollback().await;
             return Err(ClientBindingWorkflowError::Conflict);
         }
-        session
-            .commit()
-            .await
-            .map_err(IdentityPersistenceError::from)?;
+        session.commit().await?;
         Ok(())
     }
 
+    /// Marks all currently live bindings at or past expiry as expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workflow error when the transaction cannot complete.
     pub async fn expire(
         self,
         store: &IdentityPgStore,
@@ -340,13 +356,16 @@ impl ClientBindingRepository {
         .await
         .map_err(|e| ClientBindingWorkflowError::Persistence(e.into()))?
         .rows_affected();
-        session
-            .commit()
-            .await
-            .map_err(IdentityPersistenceError::from)?;
+        session.commit().await?;
         Ok(result)
     }
 
+    /// Appends the exact genesis event authorized by a live binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workflow error when authorization, event shape, idempotency,
+    /// or persistence checks fail.
     pub async fn deployment_bootstrap(
         self,
         store: &IdentityPgStore,
@@ -392,20 +411,18 @@ impl ClientBindingRepository {
             if matches!(
                 state,
                 ClientBindingState::IdentityBound | ClientBindingState::Consumed
-            ) {
-                if row
-                    .try_get::<Option<Vec<u8>>, _>("identity_request_digest")
+            ) && (row
+                .try_get::<Option<Vec<u8>>, _>("identity_request_digest")
+                .map_err(|_| ClientBindingWorkflowError::Corrupt)?
+                .as_deref()
+                != Some(request_digest.as_bytes())
+                || row
+                    .try_get::<Option<Vec<u8>>, _>("identity_idempotency_key_hash")
                     .map_err(|_| ClientBindingWorkflowError::Corrupt)?
                     .as_deref()
-                    != Some(request_digest.as_bytes())
-                    || row
-                        .try_get::<Option<Vec<u8>>, _>("identity_idempotency_key_hash")
-                        .map_err(|_| ClientBindingWorkflowError::Corrupt)?
-                        .as_deref()
-                        != Some(idempotency_key_hash.as_bytes())
-                {
-                    return Err(ClientBindingWorkflowError::Conflict);
-                }
+                    != Some(idempotency_key_hash.as_bytes()))
+            {
+                return Err(ClientBindingWorkflowError::Conflict);
             }
             let command = IdentityAppendCommand::new(idempotency_key_hash, None, exact_event_bytes)
                 .map_err(ClientBindingWorkflowError::from)?;
@@ -437,10 +454,7 @@ impl ClientBindingRepository {
         .await;
         match result {
             Ok(value) => {
-                session
-                    .commit()
-                    .await
-                    .map_err(IdentityPersistenceError::from)?;
+                session.commit().await?;
                 Ok(value)
             }
             Err(error) => {
@@ -450,6 +464,17 @@ impl ClientBindingRepository {
         }
     }
 
+    /// Appends and consumes the exact first-device event for a bound identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a workflow error when authorization, chain continuity,
+    /// idempotency, or persistence checks fail.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "transactional chain append keeps authorization and consume atomic"
+    )]
     pub async fn initial_device(
         self,
         store: &IdentityPgStore,
@@ -509,8 +534,8 @@ impl ClientBindingRepository {
                 &exact_event_bytes,
                 idempotency_key_hash,
             );
-            if state == ClientBindingState::Consumed {
-                if row
+            if state == ClientBindingState::Consumed
+                && (row
                     .try_get::<Option<Vec<u8>>, _>("consume_request_digest")
                     .map_err(|_| ClientBindingWorkflowError::Corrupt)?
                     .as_deref()
@@ -519,10 +544,9 @@ impl ClientBindingRepository {
                         .try_get::<Option<Vec<u8>>, _>("consume_idempotency_key_hash")
                         .map_err(|_| ClientBindingWorkflowError::Corrupt)?
                         .as_deref()
-                        != Some(idempotency_key_hash.as_bytes())
-                {
-                    return Err(ClientBindingWorkflowError::Conflict);
-                }
+                        != Some(idempotency_key_hash.as_bytes()))
+            {
+                return Err(ClientBindingWorkflowError::Conflict);
             }
             let previous =
                 dtx_wire::SafeUint::new(1).map_err(|_| ClientBindingWorkflowError::Invalid)?;
@@ -562,10 +586,7 @@ impl ClientBindingRepository {
         .await;
         match result {
             Ok(value) => {
-                session
-                    .commit()
-                    .await
-                    .map_err(IdentityPersistenceError::from)?;
+                session.commit().await?;
                 Ok(value)
             }
             Err(error) => {
@@ -680,11 +701,17 @@ fn extract_device_id(event: &IdentityLogEventV1) -> Option<Uuid> {
     }
 }
 impl ClientBindingImport {
+    /// Parses the exact canonical client-binding import artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the artifact is non-canonical, malformed, or its
+    /// CA and authorization values fail validation.
     pub fn parse_exact(bytes: &[u8]) -> Result<Self, ClientBindingImportError> {
         if bytes.is_empty() || bytes.len() > MAX_IMPORT_BYTES || std::str::from_utf8(bytes).is_err()
         {
             return Err(ClientBindingImportError);
-        };
+        }
         let mut wire: ImportWire =
             serde_json::from_slice(bytes).map_err(|_| ClientBindingImportError)?;
         let canonical =
@@ -712,7 +739,6 @@ impl ClientBindingImport {
         if !certificate.is_ca() {
             return Err(ClientBindingImportError);
         }
-        use sha2::{Digest, Sha256};
         let actual = Sha256::digest(wire.identity_tls_root_ca_pem.as_bytes());
         if actual.as_slice() != digest.as_bytes() {
             return Err(ClientBindingImportError);

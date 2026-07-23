@@ -100,6 +100,10 @@ async fn binding_state(pool: &PgPool, binding_id: Uuid) -> Result<String, sqlx::
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one integration flow keeps exact replay and atomic rollback assertions together"
+)]
 async fn client_binding_bootstrap_and_consume_are_exactly_replayable_and_atomic()
 -> Result<(), Box<dyn Error>> {
     let harness = support::PostgresHarness::start().await?;

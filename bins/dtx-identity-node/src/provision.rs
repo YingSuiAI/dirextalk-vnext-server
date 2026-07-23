@@ -34,6 +34,10 @@ async fn main() -> ExitCode {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one CLI transaction keeps artifact and database replay checks together"
+)]
 async fn run() -> Result<(), ProvisionError> {
     ensure_root()?;
     let command = env::args_os().nth(1);
@@ -123,9 +127,7 @@ async fn run() -> Result<(), ProvisionError> {
         issued_at_ms,
         expires_at_ms,
     };
-    let result = ClientBindingRepository::default()
-        .issue(&store, &command)
-        .await;
+    let result = ClientBindingRepository.issue(&store, &command).await;
     let result = result.map_err(|_| ProvisionError::Database)?;
     if result.replayed {
         let existing = Zeroizing::new(
@@ -141,12 +143,14 @@ async fn run() -> Result<(), ProvisionError> {
     Ok(())
 }
 
+type ExistingArtifactAuthorization = (Uuid, i64, i64, Zeroizing<[u8; 32]>);
+
 fn validate_existing_artifact(
     bytes: &[u8],
     request: &IssueRequest,
     ca_digest: Sha256Digest,
     now: i64,
-) -> Result<(Uuid, i64, i64, Zeroizing<[u8; 32]>), ProvisionError> {
+) -> Result<ExistingArtifactAuthorization, ProvisionError> {
     let existing: ImportOutputOwned =
         serde_json::from_slice(bytes).map_err(|_| ProvisionError::ArtifactLost)?;
     let canonical = Zeroizing::new(
@@ -230,7 +234,7 @@ async fn run_revoke() -> Result<(), ProvisionError> {
     };
     let binding_id =
         Uuid::parse_str(binding_id_text.trim()).map_err(|_| ProvisionError::Request)?;
-    ClientBindingRepository::default()
+    ClientBindingRepository
         .revoke(
             &open_store(&args.database_url_file).await?,
             binding_id,
@@ -242,7 +246,7 @@ async fn run_revoke() -> Result<(), ProvisionError> {
 
 async fn run_expire() -> Result<(), ProvisionError> {
     let args = FixedActionArguments::parse(env::args_os(), "client-binding-expire")?;
-    ClientBindingRepository::default()
+    ClientBindingRepository
         .expire(&open_store(&args.database_url_file).await?, now_ms()?)
         .await
         .map_err(|_| ProvisionError::Database)
@@ -327,6 +331,7 @@ impl Drop for ImportOutputOwned {
     }
 }
 
+#[allow(clippy::struct_field_names)]
 struct Arguments {
     database_url_file: PathBuf,
     request_file: PathBuf,
