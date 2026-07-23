@@ -40,6 +40,8 @@ PRODUCTION_COMPOSE = PRODUCTION_CONFIG_ROOT / "production-compose.yml"
 PRODUCTION_INSTALL_ROOT = Path("/usr/local/lib/dirextalk")
 CURRENT_ENV = Path("/var/lib/dirextalk/vnext/current.env")
 VERIFY_PATH = "scripts/production-stack/verify.sh"
+UPDATE_PATH = "scripts/production-stack/update.sh"
+RUNTIME_ATTESTATION = STATE_ROOT / "runtime-attestation.json"
 MAX_BUNDLE_BYTES = 32 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -96,6 +98,13 @@ REQUEST_KEYS = {
     "previous_receipt_sha256",
 }
 RECEIPT_KEYS = REQUEST_KEYS | {"state", "installed_at_ms", "receipt_sha256"}
+RUNTIME_ATTESTATION_KEYS = {
+    "schema", "schema_version", "bundle_sha256", "version", "server_image",
+    "migrator_image", "production_env_sha256", "compose_sha256", "caddy_sha256",
+    "running_services_sha256", "client_binding_binary_sha256",
+    "attestation_sha256",
+}
+RUNTIME_ATTESTATION_SCHEMA = "dirextalk.vnext-runtime-attestation"
 
 
 class ContractError(RuntimeError):
@@ -1040,6 +1049,361 @@ def install_code_only_rollback(release: Path, manifest: dict[str, object]) -> No
     )
 
 
+def replace_runtime_identity(manifest: dict[str, object]) -> bytes:
+    """Select an authenticated release without disturbing operator-owned env."""
+    try:
+        env_raw = read_secure(PRODUCTION_ENV, 0o644, MAX_BUNDLE_BYTES).decode()
+    except (UnicodeDecodeError, ContractError) as error:
+        raise ContractError("production environment is unavailable for activation") from error
+    replacements = {
+        "DTX_SERVER_IMAGE": str(manifest["server_image"]),
+        "DTX_MIGRATOR_IMAGE": str(manifest["migrator_image"]),
+        "DTX_RELEASE_VERSION": str(manifest["version"]),
+    }
+    lines: list[str] = []
+    replaced: set[str] = set()
+    for line in env_raw.splitlines(keepends=True):
+        key, separator, _value = line.partition("=")
+        if separator and key in replacements:
+            if key in replaced:
+                raise ContractError("production environment duplicates an activation identity field")
+            line = f"{key}={replacements[key]}" + ("\n" if line.endswith("\n") else "")
+            replaced.add(key)
+        lines.append(line)
+    if replaced != set(replacements):
+        raise ContractError("production environment is missing an activation identity field")
+    result = "".join(lines).encode()
+    atomic_replace(PRODUCTION_ENV, result, 0o644)
+    return result
+
+
+AGENT_PORTS='''    ports:\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9443:9443"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9444:9444"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9445:9445"'''
+CADDY_PORTS='''    ports:\n      - "443:443"\n      - "80:80"'''
+# This is a mechanically copied, self-contained rendering contract from
+# provision-vnext.  Recovery bundles can predate that provisioner.
+def transform_compose(source):
+    if source.count(AGENT_PORTS)!=1 or source.count(CADDY_PORTS)!=1: raise ContractError('unexpected compose port template')
+    source=source.replace(AGENT_PORTS, AGENT_PORTS+'\n      - "80:80"\n      - "443:443"', 1)
+    source=source.replace(CADDY_PORTS, '    network_mode: service:agent-control', 1)
+    if source.count('network_mode: service:agent-control') != 2: raise ContractError('compose transformation count invalid')
+    return source
+def owner_routes():
+    return '''    # Owner API is an explicit authenticated allowlist. Caddy shares Agent
+    # Control's network namespace in this provisioned topology, so it can reach
+    # the loopback Owner listener; keep these matchers before @node.
+    @owner_connectors {
+        method GET
+        path_regexp owner_connectors ^/v1/connectors$
+    }
+    reverse_proxy @owner_connectors http://127.0.0.1:9081
+    @owner_connector_drain {
+        method POST
+        path_regexp owner_connector_drain ^/v1/connectors/[^/]+/drain$
+    }
+    reverse_proxy @owner_connector_drain http://127.0.0.1:9081
+    @owner_connector_restart {
+        method POST
+        path_regexp owner_connector_restart ^/v1/connectors/[^/]+/restart$
+    }
+    reverse_proxy @owner_connector_restart http://127.0.0.1:9081
+    @owner_connector_rotate {
+        method POST
+        path_regexp owner_connector_rotate ^/v1/connectors/[^/]+/rotate-credential$
+    }
+    reverse_proxy @owner_connector_rotate http://127.0.0.1:9081
+    @owner_binding_enable {
+        method POST
+        path_regexp owner_binding_enable ^/v1/connector-bindings/[^/]+/enable$
+    }
+    reverse_proxy @owner_binding_enable http://127.0.0.1:9081
+    @owner_binding_disable {
+        method POST
+        path_regexp owner_binding_disable ^/v1/connector-bindings/[^/]+/disable$
+    }
+    reverse_proxy @owner_binding_disable http://127.0.0.1:9081
+    @owner_conversation_grant_put {
+        method PUT
+        path_regexp owner_conversation_grant_put ^/v1/conversations/[^/]+/agent-grants/[^/]+$
+    }
+    reverse_proxy @owner_conversation_grant_put http://127.0.0.1:9081
+    @owner_conversation_grant_delete {
+        method DELETE
+        path_regexp owner_conversation_grant_delete ^/v1/conversations/[^/]+/agent-grants/[^/]+$
+    }
+    reverse_proxy @owner_conversation_grant_delete http://127.0.0.1:9081
+    @owner_agent_route_run {
+        method POST
+        path_regexp owner_agent_route_run ^/v1/conversations/[^/]+/agent-routes/[^/]+/runs$
+    }
+    reverse_proxy @owner_agent_route_run http://127.0.0.1:9081
+    @owner_route_bootstrap_create {
+        method POST
+        path_regexp owner_route_bootstrap_create ^/v1/agent-route-bootstraps$
+    }
+    reverse_proxy @owner_route_bootstrap_create http://127.0.0.1:9081
+    @owner_route_bootstrap_get {
+        method GET
+        path_regexp owner_route_bootstrap_get ^/v1/agent-route-bootstraps/[^/]+$
+    }
+    reverse_proxy @owner_route_bootstrap_get http://127.0.0.1:9081
+    @owner_route_bootstrap_delivery {
+        method PUT
+        path_regexp owner_route_bootstrap_delivery ^/v1/agent-route-bootstraps/[^/]+/deliveries/[^/]+$
+    }
+    reverse_proxy @owner_route_bootstrap_delivery http://127.0.0.1:9081
+    @owner_identity_approval_create {
+        method POST
+        path_regexp owner_identity_approval_create ^/v1/agent-installations/[^/]+/identity-approvals$
+    }
+    reverse_proxy @owner_identity_approval_create http://127.0.0.1:9081
+    @owner_identity_approval_get {
+        method GET
+        path_regexp owner_identity_approval_get ^/v1/agent-installations/[^/]+/identity-approvals/[^/]+$
+    }
+    reverse_proxy @owner_identity_approval_get http://127.0.0.1:9081
+    @owner_provisioning_target {
+        method GET
+        path_regexp owner_provisioning_target ^/v1/agent-installations/[^/]+/provisioning-target$
+    }
+    reverse_proxy @owner_provisioning_target http://127.0.0.1:9081
+    @owner_agent_route_target {
+        method GET
+        path_regexp owner_agent_route_target ^/v1/agent-installations/[^/]+/agent-route-target$
+    }
+    reverse_proxy @owner_agent_route_target http://127.0.0.1:9081
+    @owner_provisioning_delivery_create {
+        method POST
+        path_regexp owner_provisioning_delivery_create ^/v1/agent-installations/[^/]+/provisioning-deliveries$
+    }
+    reverse_proxy @owner_provisioning_delivery_create http://127.0.0.1:9081
+    @owner_provisioning_delivery_get {
+        method GET
+        path_regexp owner_provisioning_delivery_get ^/v1/agent-installations/[^/]+/provisioning-deliveries/[^/]+$
+    }
+    reverse_proxy @owner_provisioning_delivery_get http://127.0.0.1:9081
+    @owner_revocation {
+        method POST
+        path_regexp owner_revocation ^/v1/agent-installations/[^/]+/revocations$
+    }
+    reverse_proxy @owner_revocation http://127.0.0.1:9081
+'''
+
+def caddyfile(domain):
+    return f'''{domain} {{
+    @health path /healthz
+    handle @health {{
+        rewrite * /local-health
+        reverse_proxy https://dtx-node:8443 {{
+            transport http {{
+                tls_trust_pool file /data/caddy/private-ca.pem
+                tls_server_name {domain}
+            }}
+        }}
+    }}
+    @realtime path /v1/realtime-sync*
+    reverse_proxy @realtime https://realtime-gateway:9444 {{
+        transport http {{
+            tls_trust_pool file /data/caddy/private-ca.pem
+            tls_server_name {domain}
+        }}
+    }}
+    @mcp {{
+        method POST
+        path_regexp mcp ^/mcp$
+    }}
+    reverse_proxy @mcp http://127.0.0.1:9081
+{owner_routes()}    # Canonical public API routes use a positive, non-zero decimal version.
+    @node path_regexp versioned_api ^/v[1-9][0-9]*/.*$
+    reverse_proxy @node https://dtx-node:8443 {{
+        transport http {{
+            tls_trust_pool file /data/caddy/private-ca.pem
+            tls_server_name {domain}
+        }}
+    }}
+    @public_feed path_regexp public_feed ^/\\.well-known/dirextalk/public/v1/[^/]+(/.*)?$
+    reverse_proxy @public_feed https://dtx-node:8443 {{
+        transport http {{
+            tls_trust_pool file /data/caddy/private-ca.pem
+            tls_server_name {domain}
+        }}
+    }}
+}}
+'''
+
+
+def provisioned_host_material(release: Path, domain: str) -> tuple[bytes, bytes]:
+    raw_compose = read_secure(release / "docker/production/docker-compose.yml", 0o444, MAX_BUNDLE_BYTES)
+    raw_caddy = read_secure(release / "docker/production/Caddyfile", 0o444, MAX_BUNDLE_BYTES)
+    if not raw_caddy:
+        raise ContractError("candidate Caddy material is empty")
+    try:
+        return transform_compose(raw_compose.decode()).encode(), caddyfile(domain).encode()
+    except UnicodeDecodeError as error:
+        raise ContractError("candidate host material is not UTF-8") from error
+
+
+def stage_provisioned_host_material(release: Path, domain: str) -> None:
+    compose, caddy = provisioned_host_material(release, domain)
+    atomic_replace(PRODUCTION_COMPOSE, compose, 0o644)
+    atomic_replace(PRODUCTION_CONFIG_ROOT / "Caddyfile", caddy, 0o644)
+
+
+def stage_candidate_validator(release: Path) -> None:
+    """Install only the candidate validator authenticated by its release tree."""
+    validator = release / "tools/validate-production-images.py"
+    data = read_secure(validator, 0o555, MAX_BUNDLE_BYTES)
+    atomic_replace(PRODUCTION_INSTALL_ROOT / "validate-production-images.py", data, 0o555)
+
+
+def runtime_attestation(
+    release: Path, manifest: dict[str, object], domain: str,
+    running_services_sha256: str = "0" * 64, client_binding_binary_sha256: str = "0" * 64,
+) -> tuple[dict[str, object], bytes]:
+    """Prove only sanitized, durable material selected by a ready runtime."""
+    rendered_compose, rendered_caddy = provisioned_host_material(release, domain)
+    expected = {"compose": (rendered_compose, PRODUCTION_COMPOSE),
+                "caddy": (rendered_caddy, PRODUCTION_CONFIG_ROOT / "Caddyfile")}
+    hashes: dict[str, str] = {}
+    for name, (source, installed) in expected.items():
+        actual = read_secure(installed, 0o644, MAX_BUNDLE_BYTES)
+        if actual != source:
+            raise ContractError("production runtime material differs from authenticated provisioned host material")
+        hashes[name] = digest(actual)
+    env_raw = read_secure(PRODUCTION_ENV, 0o644, MAX_BUNDLE_BYTES)
+    current_raw = read_secure(CURRENT_ENV, 0o600, MAX_BUNDLE_BYTES)
+    if current_raw != env_raw:
+        raise ContractError("current runtime environment differs from desired production environment")
+    try:
+        env_text = env_raw.decode()
+    except UnicodeDecodeError as error:
+        raise ContractError("production environment is not UTF-8") from error
+    identity = {
+        line.partition("=")[0]: line.partition("=")[2]
+        for line in env_text.splitlines() if "=" in line
+    }
+    for key, value in (
+        ("DTX_SERVER_IMAGE", manifest["server_image"]),
+        ("DTX_MIGRATOR_IMAGE", manifest["migrator_image"]),
+        ("DTX_RELEASE_VERSION", manifest["version"]),
+    ):
+        if identity.get(key) != value:
+            raise ContractError("production runtime identity differs from the authenticated release")
+    body = {
+        "schema": RUNTIME_ATTESTATION_SCHEMA,
+        "schema_version": 1,
+        "bundle_sha256": release.name,
+        "version": manifest["version"],
+        "server_image": manifest["server_image"],
+        "migrator_image": manifest["migrator_image"],
+        "production_env_sha256": digest(env_raw),
+        "compose_sha256": hashes["compose"],
+        "caddy_sha256": hashes["caddy"],
+        "running_services_sha256": running_services_sha256,
+        "client_binding_binary_sha256": client_binding_binary_sha256,
+    }
+    value = dict(body)
+    value["attestation_sha256"] = digest(canonical(body))
+    raw = canonical(value)
+    return value, raw
+
+
+def validate_runtime_attestation(raw: bytes, receipt: dict[str, object]) -> dict[str, object]:
+    value = decode_json(raw, "runtime attestation")
+    if not isinstance(value, dict) or set(value) != RUNTIME_ATTESTATION_KEYS:
+        raise ContractError("runtime attestation keys are not exact")
+    if value.get("schema") != RUNTIME_ATTESTATION_SCHEMA or value.get("schema_version") != 1:
+        raise ContractError("runtime attestation schema is invalid")
+    body = dict(value)
+    claimed = body.pop("attestation_sha256", None)
+    if not isinstance(claimed, str) or HEX64.fullmatch(claimed) is None or raw != canonical(value):
+        raise ContractError("runtime attestation is not canonical")
+    if digest(canonical(body)) != claimed:
+        raise ContractError("runtime attestation authentication failed")
+    for key in ("bundle_sha256", "version", "server_image", "migrator_image"):
+        if value.get(key) != receipt[key]:
+            raise ContractError("runtime attestation differs from receipt")
+    for key in ("production_env_sha256", "compose_sha256", "caddy_sha256",
+                "running_services_sha256", "client_binding_binary_sha256"):
+        if not isinstance(value.get(key), str) or HEX64.fullmatch(value[key]) is None:
+            raise ContractError("runtime attestation digest is invalid")
+    return value
+
+
+def prove_live_runtime(manifest: dict[str, object], migrations_present: bool) -> tuple[str, str]:
+    environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+    result = subprocess.run(
+        ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
+         str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE), "ps", "--format", "json"],
+        env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        check=True, timeout=120,
+    )
+    try:
+        records = json.loads(result.stdout)
+        if not isinstance(records, list):
+            raise ValueError
+        images = {record.get("Service"): record.get("Image") for record in records if isinstance(record, dict)}
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ContractError("running service image attestation is invalid") from error
+    required = {"dtx-node", "realtime-gateway", "agent-control"}
+    if set(images) & required != required or any(images[name] != manifest["server_image"] for name in required):
+        raise ContractError("running candidate service image differs from authenticated release")
+    subprocess.run(
+        ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
+         str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE), "exec", "-T", "dtx-node",
+         "test", "-x", "/usr/local/bin/dtx-identity-provision"],
+        env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        check=True, timeout=120,
+    )
+    expected = "= 3" if migrations_present else "= 0"
+    migrations = subprocess.run(
+        ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
+         str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE), "exec", "-T", "postgres", "sh", "-ec",
+         "psql -U postgres -d \"$POSTGRES_DB\" -At -c \"SELECT CASE WHEN count(*) "
+         f"{expected} THEN 'ok' ELSE 'not-ok' END FROM public._sqlx_migrations WHERE success "
+         "AND version IN (202607230056,202607230057,202607230058)\""],
+        env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        check=True, timeout=120,
+    )
+    if migrations.stdout != b"ok\n":
+        raise ContractError("fixed migration runtime proof failed")
+    return digest(canonical({name: images[name] for name in sorted(required)})), digest(
+        str(manifest["server_image"]).encode() + b"\0dtx-identity-provision\0client-binding-issue"
+    )
+
+
+def attest_runtime(release: Path, manifest: dict[str, object], domain: str) -> None:
+    services, binding = prove_live_runtime(manifest, True)
+    _value, raw = runtime_attestation(release, manifest, domain, services, binding)
+    atomic_write(RUNTIME_ATTESTATION, raw)
+
+
+def runtime_is_attested(release: Path, manifest: dict[str, object], receipt: dict[str, object]) -> bool:
+    raw = read_secure(RUNTIME_ATTESTATION, 0o600, MAX_RECEIPT_BYTES)
+    recorded = validate_runtime_attestation(raw, receipt)
+    services, binding = prove_live_runtime(manifest, True)
+    current, _expected = runtime_attestation(release, manifest, str(receipt["domain"]))
+    return all(recorded[key] == current[key] for key in (
+        "production_env_sha256", "compose_sha256", "caddy_sha256",
+    )) and recorded["running_services_sha256"] == services and recorded["client_binding_binary_sha256"] == binding
+
+
+def invoke_candidate_update(release: Path) -> None:
+    updater = release / UPDATE_PATH
+    read_secure(updater, 0o555, MAX_BUNDLE_BYTES)
+    environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+    subprocess.run([str(updater)], cwd=release, env=environment, stdin=subprocess.DEVNULL,
+                   check=True, timeout=900)
+
+
+def activate_candidate(release: Path, manifest: dict[str, object], domain: str) -> None:
+    """Select a candidate without re-running first-install materialization."""
+    stage_provisioned_host_material(release, domain)
+    stage_candidate_validator(release)
+    replace_runtime_identity(manifest)
+    invoke_candidate_update(release)
+    attest_runtime(release, manifest, domain)
+
+
 def invoke_fixed_installer(release: Path, manifest: dict[str, object]) -> None:
     installer = release / INSTALLER_PATH
     installer_data = read_secure(installer, 0o555, MAX_BUNDLE_BYTES)
@@ -1054,6 +1418,54 @@ def invoke_fixed_installer(release: Path, manifest: dict[str, object]) -> None:
         check=True,
         timeout=600,
     )
+
+
+def prove_known_false_runtime(prior_release: Path, prior_manifest: dict[str, object], candidate_release: Path) -> None:
+    """Accept only the recorded raw-candidate/old-runtime incident shape."""
+    for relative, installed in (
+        ("docker/production/docker-compose.yml", PRODUCTION_COMPOSE),
+        ("docker/production/Caddyfile", PRODUCTION_CONFIG_ROOT / "Caddyfile"),
+    ):
+        candidate_raw = read_secure(candidate_release / relative, 0o444, MAX_BUNDLE_BYTES)
+        if read_secure(installed, 0o644, MAX_BUNDLE_BYTES) != candidate_raw:
+            raise ContractError("false-runtime recovery does not have the exact raw candidate host shape")
+    env_raw = read_secure(PRODUCTION_ENV, 0o644, MAX_BUNDLE_BYTES)
+    if read_secure(CURRENT_ENV, 0o600, MAX_BUNDLE_BYTES) != env_raw:
+        raise ContractError("false-runtime recovery current environment differs from production environment")
+    try:
+        identity = {line.partition("=")[0]: line.partition("=")[2]
+                    for line in env_raw.decode().splitlines() if "=" in line}
+    except UnicodeDecodeError as error:
+        raise ContractError("false-runtime recovery environment is not UTF-8") from error
+    for key, value in (("DTX_SERVER_IMAGE", prior_manifest["server_image"]),
+                       ("DTX_MIGRATOR_IMAGE", prior_manifest["migrator_image"]),
+                       ("DTX_RELEASE_VERSION", prior_manifest["version"])):
+        if identity.get(key) != value:
+            raise ContractError("false-runtime recovery runtime identity is not exactly 0.1.1")
+    prove_live_runtime(prior_manifest, False)
+
+
+def attest_candidate_runtime_once() -> None:
+    """Refresh only the sanitized proof for the fixed ready 0.1.4 candidate."""
+    current, current_raw = read_current_receipt()
+    if current is None or current_raw is None or current["state"] != "installed" or current["version"] != "0.1.4":
+        raise ContractError("candidate runtime attestation requires the current installed 0.1.4 receipt")
+    history = RECEIPT_ROOT / f"{current['receipt_sha256']}.json"
+    if read_secure(history, 0o600, MAX_RECEIPT_BYTES) != current_raw:
+        raise ContractError("candidate runtime attestation current receipt differs from receipt history")
+    previous = current["previous_receipt_sha256"]
+    if not isinstance(previous, str):
+        raise ContractError("candidate runtime attestation requires the retained 0.1.1 receipt")
+    prior = validate_receipt(read_secure(RECEIPT_ROOT / f"{previous}.json", 0o600, MAX_RECEIPT_BYTES))
+    if prior["receipt_sha256"] != previous or prior["state"] != "installed" or prior["version"] != "0.1.1" or \
+            prior["target"] != current["target"] or prior["domain"] != current["domain"]:
+        raise ContractError("candidate runtime attestation receipt chain is not exactly 0.1.1 to 0.1.4")
+    release, manifest = load_retained_release(current)
+    if not compatible(release):
+        raise ContractError("candidate runtime attestation release lacks forward compatibility")
+    # This is intentionally the only write: attest_runtime first proves every
+    # installed file and live runtime fact, then atomically replaces the proof.
+    attest_runtime(release, manifest, str(current["domain"]))
 
 
 def consume_uploads(incoming: Path) -> tuple[Path, Path]:
@@ -1091,7 +1503,9 @@ def install_once() -> None:
         )
         expected_previous = None if current is None else current["receipt_sha256"]
         if replay:
-            load_retained_release(current)
+            replay_release, replay_manifest = load_retained_release(current)
+            if not runtime_is_attested(replay_release, replay_manifest, current):
+                raise ContractError("candidate receipt has no exact ready runtime attestation")
             return
         recovered_candidate = find_candidate_receipt(request)
         if recovered_candidate is not None and (
@@ -1103,7 +1517,9 @@ def install_once() -> None:
             )
         ):
             recovered_receipt, recovered_raw = recovered_candidate
-            load_retained_release(recovered_receipt)
+            recovered_release, recovered_manifest = load_retained_release(recovered_receipt)
+            if not runtime_is_attested(recovered_release, recovered_manifest, recovered_receipt):
+                raise ContractError("recovered candidate receipt has no exact ready runtime attestation")
             atomic_write(CURRENT_RECEIPT, recovered_raw)
             return
         if current is not None and not recovered_rollback and request["previous_receipt_sha256"] != expected_previous:
@@ -1129,7 +1545,11 @@ def install_once() -> None:
         if not compatible(release):
             raise ContractError("candidate release has no authenticated forward migration compatibility marker")
         try:
-            invoke_fixed_installer(release, manifest)
+            if current is None:
+                # Only a first install may materialize directories and baseline
+                # configuration through the authenticated install.sh.
+                invoke_fixed_installer(release, manifest)
+            activate_candidate(release, manifest, str(request["domain"]))
         except (ContractError, OSError, subprocess.SubprocessError) as install_error:
             if current is None:
                 raise ContractError("candidate installer failed and no prior release exists") from install_error
@@ -1140,8 +1560,7 @@ def install_once() -> None:
                 raise ContractError(
                     "candidate failed and retained prior services did not become ready; recovery remains nonterminal"
                 ) from rollback_error
-            publish_receipt(current, "rolled_back", str(rollback_previous))
-            raise ContractError("candidate installer failed; prior compatible release restored") from install_error
+            raise ContractError("candidate activation failed; prior compatible release restored") from install_error
         publish_receipt(
             request,
             "installed",
@@ -1149,6 +1568,49 @@ def install_once() -> None:
         )
     finally:
         shutil.rmtree(incoming)
+
+
+def recover_false_runtime_once() -> None:
+    """Activate only the known 0.1.1 -> 0.1.4 false-receipt incident.
+
+    This intentionally has no arguments: an operator cannot select a release,
+    image, or receipt chain through this emergency entry point.
+    """
+    current, current_raw = read_current_receipt()
+    if current is None or current_raw is None:
+        raise ContractError("false-runtime recovery requires a current candidate receipt")
+    if current["state"] != "installed" or current["version"] != "0.1.4":
+        raise ContractError("false-runtime recovery accepts only the 0.1.4 installed receipt")
+    previous = current["previous_receipt_sha256"]
+    if not isinstance(previous, str):
+        raise ContractError("false-runtime recovery requires the retained 0.1.1 receipt")
+    history = RECEIPT_ROOT / f"{previous}.json"
+    prior_raw = read_secure(history, 0o600, MAX_RECEIPT_BYTES)
+    prior = validate_receipt(prior_raw)
+    if prior["receipt_sha256"] != previous or prior["state"] != "installed" or prior["version"] != "0.1.1":
+        raise ContractError("false-runtime recovery receipt chain is not exactly 0.1.1 to 0.1.4")
+    for key in ("target", "domain"):
+        if prior[key] != current[key]:
+            raise ContractError("false-runtime recovery receipt chain is mixed")
+    current_history = RECEIPT_ROOT / f"{current['receipt_sha256']}.json"
+    if read_secure(current_history, 0o600, MAX_RECEIPT_BYTES) != current_raw:
+        raise ContractError("current candidate receipt differs from receipt history")
+    candidate_release, candidate_manifest = load_retained_release(current)
+    prior_release, prior_manifest = load_retained_release(prior)
+    if not compatible(candidate_release) or not compatible(prior_release):
+        raise ContractError("false-runtime recovery release lacks forward compatibility")
+    # A genuine candidate-ready replay performs no mutation.  Otherwise prove
+    # every retained runtime file and identity belongs to 0.1.1 before any
+    # candidate material is selected.
+    try:
+        if runtime_is_attested(candidate_release, candidate_manifest, current):
+            return
+    except (ContractError, OSError):
+        pass
+    prove_known_false_runtime(prior_release, prior_manifest, candidate_release)
+    activate_candidate(candidate_release, candidate_manifest, str(current["domain"]))
+    if not runtime_is_attested(candidate_release, candidate_manifest, current):
+        raise ContractError("candidate activation did not produce an exact ready runtime attestation")
 
 
 def open_lock() -> int:
@@ -1183,7 +1645,13 @@ def main() -> int:
         lock = open_lock()
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            install_once()
+            basename = Path(sys.argv[0]).name
+            if basename == "recover-vnext-011-to-014":
+                recover_false_runtime_once()
+            elif basename == "attest-vnext-011-to-014":
+                attest_candidate_runtime_once()
+            else:
+                install_once()
         finally:
             os.close(lock)
     except (ContractError, OSError, tarfile.TarError) as error:

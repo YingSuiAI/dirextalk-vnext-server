@@ -192,7 +192,7 @@ scripts/production-stack/host/read-vnext-receipt
   -> /usr/local/libexec/dirextalk/read-vnext-receipt
 ```
 
-Both accept no arguments. The installer exclusively consumes root-owned mode
+These programs accept no arguments. The installer exclusively consumes root-owned mode
 `0400` regular files `/home/ubuntu/dirextalk-vnext.bundle` and
 `/home/ubuntu/dirextalk-vnext.request`. The canonical request schema is
 `dirextalk.vnext-install-request` version 1 with exact fields `target`,
@@ -200,9 +200,25 @@ Both accept no arguments. The installer exclusively consumes root-owned mode
 `server_image`, `migrator_image`, and nullable
 `previous_receipt_sha256`. It rechecks every archive and manifest invariant,
 materializes only `/opt/dirextalk-vnext/releases/<bundle_sha256>/`, invokes
-only that release's digest-bound `scripts/production-stack/install.sh`, and
-atomically writes root-owned mode `0600`
-`/var/lib/dirextalk-vnext/receipts/current.json`.
+only that release's digest-bound `scripts/production-stack/install.sh`, then
+selects only its server image, migrator image, and release version while
+preserving operator environment fields. It runs that same authenticated
+release's `update.sh` forward migration/readiness state machine and requires a
+canonical sanitized runtime attestation before atomically writing root-owned
+mode `0600` `/var/lib/dirextalk-vnext/receipts/current.json`.
+
+The same hash-pinned `install-vnext` artifact is a root-only no-argument fixed
+incident helper when it is staged and invoked with the exact basename
+`recover-vnext-011-to-014`.
+When staged under `attest-vnext-011-to-014`, the same bytes perform only a
+fresh candidate-runtime proof and atomically refresh its sanitized attestation;
+they never recover or change the configured runtime.
+It accepts only a current `0.1.4` receipt directly chained to retained `0.1.1`,
+proves exact retained runtime material before mutation, and reuses the retained
+candidate's `update.sh`; it needs neither a new bundle nor a request upload.
+A matching candidate-ready attestation is a no-op. Mixed, forged, incomplete,
+or runtime-mismatched receipt/release/env/compose material fails before
+mutation. It never rewrites receipt history or performs a down migration.
 
 Host installation performs retention and free-space admission while holding
 the same exclusive install lock. Every bundle and materialized release remains
@@ -226,7 +242,8 @@ It repeats the request facts, adds `state` (`installed` or `rolled_back`),
 `installed_at_ms`, and `receipt_sha256`; the receipt digest is SHA-256 of the
 canonical object with `receipt_sha256` omitted. Every request must chain from
 the current receipt. A failed candidate restores only the retained fixed
-release, only when both releases contain the exact compatibility marker, then
-writes a chained `rolled_back` receipt and still exits unsuccessfully. The
+release, only when both releases contain the exact compatibility marker, and
+exits unsuccessfully without rewriting receipt history or claiming the
+candidate. The
 reader validates type, owner, mode, canonical encoding, exact keys, immutable
 image references, and the self-hash before emitting only the receipt bytes.

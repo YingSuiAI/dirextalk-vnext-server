@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULE = importlib.machinery.SourceFileLoader(
     "install_vnext_contract", str(ROOT / "scripts/production-stack/host/install-vnext")
 ).load_module()
+PROVISION = importlib.machinery.SourceFileLoader(
+    "provision_vnext_renderer", str(ROOT / "scripts/production-stack/host/provision-vnext")
+).load_module()
 
 
 def facts(version: str) -> dict[str, object]:
@@ -30,6 +33,12 @@ def facts(version: str) -> dict[str, object]:
 
 
 def main() -> None:
+    # Recovery embeds, rather than imports, the provisioned-host renderer.  Any
+    # drift in compose, owner allowlist, or Caddy/TLS semantics is a failure.
+    source = (ROOT / "docker/production/docker-compose.yml").read_text()
+    assert MODULE.transform_compose(source) == PROVISION.transform_compose(source)
+    assert MODULE.owner_routes() == PROVISION.owner_routes()
+    assert MODULE.caddyfile("node.example.invalid") == PROVISION.caddyfile("node.example.invalid")
     # Strictly-forward admission accepts the frozen release transition and
     # rejects replay, downgrade, and malformed ordering.
     assert MODULE.strictly_forward("0.1.1", "0.1.4")
@@ -184,6 +193,154 @@ def main() -> None:
         MODULE.subprocess.run = original_run
         MODULE.read_secure = original_read
         MODULE.os.fchown = original_fchown
+
+    # Candidate activation changes only the three authenticated runtime
+    # identity fields.  It cannot overwrite tenant/operator settings, and its
+    # resulting attestation is canonical and rejects forged receipt facts.
+    original_env = MODULE.PRODUCTION_ENV
+    original_compose = MODULE.PRODUCTION_COMPOSE
+    original_config = MODULE.PRODUCTION_CONFIG_ROOT
+    original_current_env = MODULE.CURRENT_ENV
+    original_attestation = MODULE.RUNTIME_ATTESTATION
+    original_read = MODULE.read_secure
+    original_fchown = MODULE.os.fchown
+    original_render = MODULE.provisioned_host_material
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            release = base / ("c" * 64)
+            config = base / "config"
+            (release / "docker/production").mkdir(parents=True)
+            config.mkdir()
+            compose = "services: {}\n"
+            caddy = "example.invalid { respond 200 }\n"
+            (release / "docker/production/docker-compose.yml").write_text(compose)
+            (release / "docker/production/Caddyfile").write_text(caddy)
+            env = "\n".join((
+                "DTX_SERVER_IMAGE=dirextalk/vnet-server@sha256:" + "1" * 64,
+                "DTX_MIGRATOR_IMAGE=dirextalk/vnet-server@sha256:" + "2" * 64,
+                "DTX_RELEASE_VERSION=0.1.1",
+                "DTX_TENANT_OPERATOR_FIELD=preserve-me",
+                "",
+            ))
+            (config / "production.env").write_text(env)
+            (config / "production-compose.yml").write_text(compose)
+            (config / "Caddyfile").write_text(caddy)
+            current_env = base / "current.env"
+            candidate_manifest = {
+                **request,
+                "server_image": "dirextalk/vnet-server@sha256:" + "3" * 64,
+                "migrator_image": "dirextalk/vnet-server@sha256:" + "4" * 64,
+                "version": "0.1.4",
+            }
+            MODULE.PRODUCTION_CONFIG_ROOT = config
+            MODULE.PRODUCTION_ENV = config / "production.env"
+            MODULE.PRODUCTION_COMPOSE = config / "production-compose.yml"
+            MODULE.CURRENT_ENV = current_env
+            MODULE.RUNTIME_ATTESTATION = base / "runtime-attestation.json"
+            MODULE.os.fchown = lambda _descriptor, _uid, _gid: None
+            MODULE.read_secure = lambda path, _mode, _limit: Path(path).read_bytes()
+            MODULE.provisioned_host_material = lambda _release, _domain: (compose.encode(), caddy.encode())
+            selected = MODULE.replace_runtime_identity(candidate_manifest)
+            current_env.write_bytes(selected)
+            assert b"DTX_TENANT_OPERATOR_FIELD=preserve-me" in selected
+            assert b"DTX_RELEASE_VERSION=0.1.4" in selected
+            value, raw = MODULE.runtime_attestation(release, candidate_manifest, "node.example.invalid")
+            receipt, _receipt_raw = MODULE.make_receipt(candidate_manifest, "installed", "e" * 64)
+            assert MODULE.validate_runtime_attestation(raw, receipt) == value
+            forged = dict(receipt)
+            forged["version"] = "0.1.1"
+            try:
+                MODULE.validate_runtime_attestation(raw, forged)
+            except MODULE.ContractError:
+                pass
+            else:
+                raise AssertionError("forged/mixed receipt was accepted by runtime attestation")
+    finally:
+        MODULE.PRODUCTION_ENV = original_env
+        MODULE.PRODUCTION_COMPOSE = original_compose
+        MODULE.PRODUCTION_CONFIG_ROOT = original_config
+        MODULE.CURRENT_ENV = original_current_env
+        MODULE.RUNTIME_ATTESTATION = original_attestation
+        MODULE.read_secure = original_read
+        MODULE.os.fchown = original_fchown
+        MODULE.provisioned_host_material = original_render
+
+    # The emergency basename accepts only the exact chained receipt shape and
+    # reaches activation only after the old-runtime proof.  A forged chain has
+    # no side effects.
+    original_receipt_root = MODULE.RECEIPT_ROOT
+    original_current_reader = MODULE.read_current_receipt
+    original_load = MODULE.load_retained_release
+    original_compatible = MODULE.compatible
+    original_attested = MODULE.runtime_is_attested
+    original_prove_false = MODULE.prove_known_false_runtime
+    original_activate = MODULE.activate_candidate
+    original_attest_runtime = MODULE.attest_runtime
+    original_runtime_attestation = MODULE.RUNTIME_ATTESTATION
+    original_read = MODULE.read_secure
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            MODULE.RECEIPT_ROOT = base
+            old, old_raw = MODULE.make_receipt(prior, "installed", None)
+            candidate_request = dict(request)
+            candidate_request["previous_receipt_sha256"] = old["receipt_sha256"]
+            candidate, candidate_raw = MODULE.make_receipt(
+                candidate_request, "installed", old["receipt_sha256"]
+            )
+            (base / f"{old['receipt_sha256']}.json").write_bytes(old_raw)
+            (base / f"{candidate['receipt_sha256']}.json").write_bytes(candidate_raw)
+            candidate_release, prior_release = base / "candidate", base / "prior"
+            candidate_release.mkdir(); prior_release.mkdir()
+            MODULE.read_current_receipt = lambda: (candidate, candidate_raw)
+            MODULE.read_secure = lambda path, _mode, _limit: Path(path).read_bytes()
+            MODULE.load_retained_release = lambda receipt: (
+                (candidate_release, request) if receipt["version"] == "0.1.4" else (prior_release, prior)
+            )
+            MODULE.compatible = lambda _release: True
+            calls: list[str] = []
+            attested = iter((False, True))
+            MODULE.runtime_is_attested = lambda *_args: next(attested)
+            MODULE.prove_known_false_runtime = lambda *_args: calls.append("old-proof")
+            MODULE.activate_candidate = lambda *_args: calls.append("activate")
+            MODULE.recover_false_runtime_once()
+            assert calls == ["old-proof", "activate"]
+            forged = dict(candidate); forged["previous_receipt_sha256"] = "f" * 64
+            MODULE.read_current_receipt = lambda: (forged, candidate_raw)
+            calls.clear()
+            try:
+                MODULE.recover_false_runtime_once()
+            except (MODULE.ContractError, FileNotFoundError):
+                pass
+            else:
+                raise AssertionError("forged recovery chain was accepted")
+            assert not calls
+            # The attester sees the same false/old runtime as a proof failure;
+            # it never falls through to recovery or alters its old attestation.
+            MODULE.read_current_receipt = lambda: (candidate, candidate_raw)
+            preserved = base / "runtime-attestation.json"
+            preserved.write_text("old-proof\n")
+            MODULE.RUNTIME_ATTESTATION = preserved
+            MODULE.attest_runtime = lambda *_args: (_ for _ in ()).throw(MODULE.ContractError("old runtime"))
+            try:
+                MODULE.attest_candidate_runtime_once()
+            except MODULE.ContractError:
+                pass
+            else:
+                raise AssertionError("false old runtime was attested")
+            assert preserved.read_text() == "old-proof\n" and calls == []
+    finally:
+        MODULE.RECEIPT_ROOT = original_receipt_root
+        MODULE.read_current_receipt = original_current_reader
+        MODULE.load_retained_release = original_load
+        MODULE.compatible = original_compatible
+        MODULE.runtime_is_attested = original_attested
+        MODULE.prove_known_false_runtime = original_prove_false
+        MODULE.activate_candidate = original_activate
+        MODULE.attest_runtime = original_attest_runtime
+        MODULE.RUNTIME_ATTESTATION = original_runtime_attestation
+        MODULE.read_secure = original_read
 
     print("production cross-version crash/replay/receipt/rollback checks passed")
 
