@@ -287,11 +287,15 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$DTX_TEST_DOCKER_LOG"
 case "$1" in
   pull) exit 0 ;;
-  create) printf 'synthetic-container-%s\n' "$$" ;;
+  create) printf '%s\n' "$2" ;;
   export)
     shift
     [[ "$1" == --output ]]
-    tar -cf "$2" -C "$DTX_TEST_ROOTFS" .
+    if [[ "$3" == debian:* ]]; then
+      tar -cf "$2" -C "$DTX_TEST_BASE_ROOTFS" .
+    else
+      tar -cf "$2" -C "$DTX_TEST_ROOTFS" .
+    fi
     ;;
   rm)
     [[ ${DTX_TEST_DOCKER_RM_FAIL:-0} != 1 ]]
@@ -308,8 +312,14 @@ def test_image_gate_cleanup(base: Path) -> None:
     fake_bin.mkdir()
     fake_image_docker(fake_bin / "docker")
     rootfs = base / "rootfs"
+    base_rootfs = base / "base-rootfs"
     (rootfs / "usr/bin").mkdir(parents=True)
+    (base_rootfs / "usr/lib").mkdir(parents=True)
     (rootfs / "usr/bin/runtime").write_bytes(b"runtime")
+    inherited = b'-----BEGIN PRIVATE KEY-----\nsynthetic\n'
+    (base_rootfs / "usr/lib/base-material").write_bytes(inherited)
+    (rootfs / "usr/lib").mkdir()
+    (rootfs / "usr/lib/base-material").write_bytes(inherited)
     log = base / "image-docker.log"
     digest_a = "dirextalk/vnet-server@sha256:" + "1" * 64
     digest_b = "dirextalk/vnet-server@sha256:" + "2" * 64
@@ -318,6 +328,7 @@ def test_image_gate_cleanup(base: Path) -> None:
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "DTX_TEST_DOCKER_LOG": str(log),
         "DTX_TEST_ROOTFS": str(rootfs),
+        "DTX_TEST_BASE_ROOTFS": str(base_rootfs),
     }
     success = subprocess.run(
         [
@@ -336,8 +347,27 @@ def test_image_gate_cleanup(base: Path) -> None:
     )
     assert_success(success, "runtime and migrator image scans")
     log_text = log.read_text()
-    if log_text.count("pull ") != 2 or log_text.count("export ") != 2 or log_text.count("rm ") != 2:
+    if log_text.count("pull ") != 3 or log_text.count("export ") != 3 or log_text.count("rm ") != 3:
         raise AssertionError("both immutable images were not exported and cleaned")
+
+    def reject_changed_artifact(label: str) -> None:
+        rejected = subprocess.run(
+            ["bash", str(IMAGE_GATE), "--runtime-image", digest_a],
+            cwd=REPOSITORY,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if rejected.returncode == 0 or "sensitive-content" not in rejected.stdout:
+            raise AssertionError(f"{label} secret artifact did not fail the image gate")
+
+    (rootfs / "usr/bin/runtime").write_bytes(inherited)
+    reject_changed_artifact("added")
+    (rootfs / "usr/bin/runtime").write_bytes(b"runtime")
+    (rootfs / "usr/lib/base-material").write_bytes(inherited + b"changed")
+    reject_changed_artifact("changed")
+    (rootfs / "usr/lib/base-material").write_bytes(inherited)
 
     failure_env = {**env, "DTX_TEST_DOCKER_RM_FAIL": "1"}
     failure = subprocess.run(

@@ -39,6 +39,9 @@ CLIENT_BINDING_SCHEMA_RULE = re.compile(
 CLIENT_BINDING_AUTHORIZATION_RULE = re.compile(
     rb'"authorization"\s*:\s*"[A-Za-z0-9_-]{43}"'
 )
+MAX_REGULAR_FILE_SIZE = 128 * 1024 * 1024
+MAX_REGULAR_FILE_COUNT = 100_000
+MAX_REGULAR_FILE_BYTES = 1024 * 1024 * 1024
 
 
 def suspicious(name: str, content: bytes) -> str | None:
@@ -55,10 +58,95 @@ def suspicious(name: str, content: bytes) -> str | None:
     return None
 
 
-def scan_directory(root: Path) -> list[tuple[str, str]]:
+def safe_member_name(value: str) -> str:
+    path = PurePosixPath(value.rstrip("/"))
+    if not value or path.is_absolute() or ".." in path.parts:
+        raise ValueError("tar export contains an unsafe member")
+    result = str(path)
+    if result == ".":
+        return ""
+    return result
+
+
+def safe_link_target(member_name: str, target: str, is_symlink: bool) -> str:
+    target_path = PurePosixPath(target)
+    if not target or (target_path.is_absolute() and not is_symlink):
+        raise ValueError("tar export contains an unsafe link")
+    parts = [] if target_path.is_absolute() else (list(PurePosixPath(member_name).parent.parts) if is_symlink else [])
+    for part in target_path.parts:
+        if part == ".":
+            continue
+        if part == "..":
+            if not parts:
+                raise ValueError("tar export contains an unsafe link")
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts)
+
+
+def tar_regular_files(path: Path) -> dict[str, bytes]:
+    """Read a safe export, rejecting ambiguity before its bytes are trusted."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("tar export must be a regular file")
+    files: dict[str, bytes] = {}
+    hardlinks: dict[str, str] = {}
+    total_bytes = 0
+    try:
+        with tarfile.open(path, "r:*") as archive:
+            seen: set[str] = set()
+            for member in archive:
+                name = safe_member_name(member.name)
+                if name in seen:
+                    raise ValueError("tar export contains an unsafe member")
+                seen.add(name)
+                if member.isdir():
+                    continue
+                if member.issym() or member.islnk():
+                    target = safe_link_target(name, member.linkname, member.issym())
+                    if member.islnk():
+                        if len(files) + len(hardlinks) >= MAX_REGULAR_FILE_COUNT:
+                            raise ValueError("tar export exceeds scan limits")
+                        hardlinks[name] = target
+                    continue
+                if not member.isfile() or member.size < 0 or member.size > MAX_REGULAR_FILE_SIZE:
+                    raise ValueError("tar export contains an unsupported member")
+                total_bytes += member.size
+                if len(files) + len(hardlinks) >= MAX_REGULAR_FILE_COUNT or total_bytes > MAX_REGULAR_FILE_BYTES:
+                    raise ValueError("tar export exceeds scan limits")
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise ValueError("tar export contains an unreadable file")
+                content = stream.read(member.size + 1)
+                if len(content) != member.size:
+                    raise ValueError("tar export contains an unreadable file")
+                if stream.read(1):
+                    raise ValueError("tar export contains an unsafe file")
+                files[name] = content
+    except (OSError, tarfile.TarError) as error:
+        raise ValueError("tar export cannot be read") from error
+    def resolve_hardlink(name: str, resolving: set[str]) -> bytes:
+        if name in files:
+            return files[name]
+        if name in resolving or name not in hardlinks:
+            raise ValueError("tar export contains an unsafe hard link")
+        resolving.add(name)
+        content = resolve_hardlink(hardlinks[name], resolving)
+        resolving.remove(name)
+        files[name] = content
+        return content
+
+    for name in hardlinks:
+        resolve_hardlink(name, set())
+    return files
+
+
+def scan_directory(root: Path, base: dict[str, bytes] | None = None) -> list[tuple[str, str]]:
     if root.is_symlink() or not root.is_dir():
         raise ValueError("root export must be a regular directory")
     findings: list[tuple[str, str]] = []
+    total_bytes = 0
+    regular_files = 0
     try:
         paths = list(root.rglob("*"))
     except OSError as error:
@@ -72,43 +160,28 @@ def scan_directory(root: Path) -> list[tuple[str, str]]:
             except OSError as error:
                 raise ValueError("root export contains an unreadable file") from error
             relative = path.relative_to(root).as_posix()
+            if len(content) > MAX_REGULAR_FILE_SIZE:
+                raise ValueError("root export contains an unsupported file")
+            regular_files += 1
+            total_bytes += len(content)
+            if regular_files > MAX_REGULAR_FILE_COUNT or total_bytes > MAX_REGULAR_FILE_BYTES:
+                raise ValueError("root export exceeds scan limits")
+            if base is not None and base.get(relative) == content:
+                continue
             rule = suspicious(relative, content)
             if rule:
                 findings.append((relative, rule))
     return findings
 
 
-def scan_tar(path: Path) -> list[tuple[str, str]]:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError("tar export must be a regular file")
+def scan_tar(path: Path, base: dict[str, bytes] | None = None) -> list[tuple[str, str]]:
     findings: list[tuple[str, str]] = []
-    try:
-        with tarfile.open(path, "r:*") as archive:
-            seen: set[str] = set()
-            for member in archive:
-                name = member.name.rstrip("/")
-                relative = PurePosixPath(name)
-                if not name or relative.is_absolute() or ".." in relative.parts or name in seen:
-                    raise ValueError("tar export contains an unsafe member")
-                seen.add(name)
-                if member.isdir():
-                    continue
-                if member.issym() or member.islnk():
-                    target = PurePosixPath(member.linkname)
-                    if ".." in target.parts or not member.linkname:
-                        raise ValueError("tar export contains an unsafe link")
-                    continue
-                if not member.isfile():
-                    raise ValueError("tar export contains an unsupported member")
-                stream = archive.extractfile(member)
-                if stream is None:
-                    raise ValueError("tar export contains an unreadable file")
-                content = stream.read()
-                rule = suspicious(name, content)
-                if rule:
-                    findings.append((name, rule))
-    except (OSError, tarfile.TarError) as error:
-        raise ValueError("tar export cannot be read") from error
+    for name, content in tar_regular_files(path).items():
+        if base is not None and base.get(name) == content:
+            continue
+        rule = suspicious(name, content)
+        if rule:
+            findings.append((name, rule))
     return findings
 
 
@@ -145,21 +218,50 @@ def self_test() -> int:
             safe_link.type = tarfile.SYMTYPE
             safe_link.linkname = "blob-a"
             archive.addfile(safe_link)
-            absolute_link = tarfile.TarInfo("absolute-link")
-            absolute_link.type = tarfile.SYMTYPE
-            absolute_link.linkname = "/usr/bin/dtx-node"
-            archive.addfile(absolute_link)
             safe_hardlink = tarfile.TarInfo("safe-hardlink")
             safe_hardlink.type = tarfile.LNKTYPE
             safe_hardlink.linkname = "blob-a"
             archive.addfile(safe_hardlink)
         if len(scan_tar(archive_path)) < len(fixtures):
             return 1
+        base_path = root / "base.tar"
+        with tarfile.open(base_path, "w") as archive:
+            for name, content in fixtures.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+            safe_hardlink = tarfile.TarInfo("safe-hardlink")
+            safe_hardlink.type = tarfile.LNKTYPE
+            safe_hardlink.linkname = "blob-a"
+            archive.addfile(safe_hardlink)
+        base = tar_regular_files(base_path)
+        if scan_tar(archive_path, base):
+            return 1
+        changed_path = root / "changed.tar"
+        with tarfile.open(changed_path, "w") as archive:
+            for name, content in fixtures.items():
+                altered = content + b"changed" if name == "blob-a" else content
+                info = tarfile.TarInfo(name)
+                info.size = len(altered)
+                archive.addfile(info, io.BytesIO(altered))
+        if not scan_tar(changed_path, base):
+            return 1
         unsafe_path = root / "unsafe.tar"
         with tarfile.open(unsafe_path, "w") as archive:
             info = tarfile.TarInfo("unsafe-link")
-            info.type = tarfile.SYMTYPE
+            info.type = tarfile.LNKTYPE
             info.linkname = "../../etc/passwd"
+            archive.addfile(info)
+        try:
+            scan_tar(unsafe_path)
+        except ValueError:
+            pass
+        else:
+            return 1
+        with tarfile.open(unsafe_path, "w") as archive:
+            info = tarfile.TarInfo("unsafe-link")
+            info.type = tarfile.LNKTYPE
+            info.linkname = "/etc/passwd"
             archive.addfile(info)
         try:
             scan_tar(unsafe_path)
@@ -179,11 +281,15 @@ def main() -> int:
     group.add_argument("--root", type=Path)
     group.add_argument("--tar", type=Path)
     group.add_argument("--self-test", action="store_true")
+    parser.add_argument("--base-tar", type=Path)
     args = parser.parse_args()
     if args.self_test:
         return self_test()
     try:
-        findings = scan_directory(args.root) if args.root else scan_tar(args.tar)
+        base = None
+        if args.base_tar:
+            base = tar_regular_files(args.base_tar)
+        findings = scan_directory(args.root, base) if args.root else scan_tar(args.tar, base)
     except (OSError, ValueError):
         print("runtime secret-artifact gate: rejected unreadable or unsupported export")
         return 2

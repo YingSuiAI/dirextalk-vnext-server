@@ -10,6 +10,7 @@ usage() {
 
 runtime_image=
 migrator_image=
+runtime_base_image='debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818'
 while (( $# > 0 )); do
     case "$1" in
         -h|--help)
@@ -48,9 +49,19 @@ fi
 cd -- "$repository_root"
 if [[ -n "$runtime_image" || -n "$migrator_image" ]]; then
     command -v docker >/dev/null 2>&1 || { echo 'docker is required for release image export scanning' >&2; exit 1; }
+    grep -Fqx "FROM $runtime_base_image AS runtime" docker/release/Dockerfile || {
+        echo 'runtime secret-artifact base is not the pinned runtime Dockerfile base' >&2
+        exit 1
+    }
+    grep -Fqx "FROM $runtime_base_image" docker/production/Dockerfile.migrate || {
+        echo 'migrator secret-artifact base is not the pinned migrator Dockerfile base' >&2
+        exit 1
+    }
     export_tar=
     container=
-    cleanup_export() {
+    base_export_tar=
+    base_container=
+    cleanup_target_export() {
         local failed=0
         if [[ -n "$container" ]]; then
             if docker rm "$container" >/dev/null 2>&1; then
@@ -59,9 +70,20 @@ if [[ -n "$runtime_image" || -n "$migrator_image" ]]; then
                 failed=1
             fi
         fi
-        if [[ -n "$export_tar" && ( -e "$export_tar" || -L "$export_tar" ) ]]; then
-            if rm -f -- "$export_tar"; then
-                export_tar=
+        return "$failed"
+    }
+    cleanup_base_export() {
+        local failed=0
+        if [[ -n "$base_container" ]]; then
+            if docker rm "$base_container" >/dev/null 2>&1; then
+                base_container=
+            else
+                failed=1
+            fi
+        fi
+        if [[ -n "$base_export_tar" && ( -e "$base_export_tar" || -L "$base_export_tar" ) ]]; then
+            if rm -f -- "$base_export_tar"; then
+                base_export_tar=
             else
                 failed=1
             fi
@@ -70,10 +92,11 @@ if [[ -n "$runtime_image" || -n "$migrator_image" ]]; then
     }
     finish_export() {
         local status=$?
+        local cleanup_failed=0
         trap - EXIT
-        if ! cleanup_export; then
-            status=1
-        fi
+        cleanup_target_export || cleanup_failed=1
+        cleanup_base_export || cleanup_failed=1
+        (( cleanup_failed == 0 )) || status=1
         exit "$status"
     }
     scan_image() {
@@ -83,15 +106,24 @@ if [[ -n "$runtime_image" || -n "$migrator_image" ]]; then
         container=$(docker create "$image")
         [[ -n "$container" ]] || { echo 'release image container creation returned no id' >&2; return 1; }
         docker export --output "$export_tar" "$container"
-        python3 tools/check-runtime-secret-artifacts.py --tar "$export_tar"
-        if ! cleanup_export; then
+        python3 tools/check-runtime-secret-artifacts.py --tar "$export_tar" --base-tar "$base_export_tar"
+        if ! cleanup_target_export; then
             echo 'release image export cleanup failed' >&2
             return 1
         fi
     }
     trap finish_export EXIT
+    base_export_tar=$(mktemp)
+    docker pull "$runtime_base_image" >/dev/null
+    base_container=$(docker create "$runtime_base_image")
+    [[ -n "$base_container" ]] || { echo 'runtime base container creation returned no id' >&2; exit 1; }
+    docker export --output "$base_export_tar" "$base_container"
     [[ -z "$runtime_image" ]] || scan_image "$runtime_image"
     [[ -z "$migrator_image" ]] || scan_image "$migrator_image"
+    if ! cleanup_base_export; then
+        echo 'release image export cleanup failed' >&2
+        exit 1
+    fi
     trap - EXIT
 else
     python3 tools/check-runtime-secret-artifacts.py --self-test
