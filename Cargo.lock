@@ -797,7 +797,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dtx-agent-control"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-connect-registry",
  "dtx-domain",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-agent-control-bin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64ct",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-agent-control-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures-core",
  "prost",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-agent-control-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64ct",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-agent-host"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "proptest",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-agent-host-supervisor"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-agent-host",
  "dtx-connect-registry",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-agent-host-supervisor-bin"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-agent-host",
  "dtx-agent-host-supervisor",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-agent-persistence"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-agent-control",
  "dtx-agent-host",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-agent-registry"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "proptest",
@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-agent-router"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-connect-registry",
  "dtx-domain",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-connect-registry"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-agent-host",
  "dtx-agent-registry",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-contact"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "dtx-identity-persistence",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-dev-local-tls"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rcgen",
  "time",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-dev-migrate"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-storage",
  "sqlx",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-domain"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "ed25519-dalek",
  "serde",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-federated-identity"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64ct",
  "dtx-domain",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-group-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64ct",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-group-persistence"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "dtx-group-policy",
@@ -1089,14 +1089,14 @@ dependencies = [
 
 [[package]]
 name = "dtx-group-policy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
 ]
 
 [[package]]
 name = "dtx-http-cache"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "sha2 0.11.0",
  "tokio",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-identity-log"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "dtx-wire",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-identity-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64ct",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-identity-persistence"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64ct",
  "dtx-domain",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-indexer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64ct",
  "dtx-domain",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-indexer-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "dtx-domain",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-mailbox"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "dtx-identity-log",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-mailbox-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64ct",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-membership-command"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "dtx-group-policy",
@@ -1251,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-opaque-push"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chacha20poly1305",
  "dtx-domain",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-opaque-push-broker"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-opaque-push-fcm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "bytes",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-opaque-push-postgres"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "dtx-identity-log",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-production-migrate"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-storage",
  "libc",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64ct",
  "cddl-cat",
@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-public-descriptor"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "dtx-wire",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-public-discussion"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64ct",
  "dtx-domain",
@@ -1412,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-public-feed"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64ct",
  "dtx-domain",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-public-feed-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "base64ct",
@@ -1448,7 +1448,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-realtime-sync"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "dtx-identity-persistence",
@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-realtime-sync-gateway"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-security"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chacha20poly1305",
  "dtx-domain",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dtx-domain",
  "dtx-wire",
@@ -1506,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-testkit"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64ct",
  "dtx-domain",
@@ -1522,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "dtx-wire"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64ct",
  "dtx-domain",

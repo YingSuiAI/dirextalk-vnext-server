@@ -58,7 +58,8 @@ const FEDERATED_MLS_V5_AUTHORIZATION_V1_MIGRATION_VERSION: i64 = 202_607_200_051
 const RECOVERY_SCOPE_CATALOG_V1_MIGRATION_VERSION: i64 = 202_607_210_052;
 const OPAQUE_PUSH_V1_MIGRATION_VERSION: i64 = 202_607_220_053;
 const CONNECTOR_BOOTSTRAP_ISSUANCE_V1_MIGRATION_VERSION: i64 = 202_607_220_054;
-const EXPECTED_MIGRATION_COUNT: i64 = 54;
+const AGENT_IDENTITY_READER_RLS_FIX_MIGRATION_VERSION: i64 = 202_607_230_055;
+const EXPECTED_MIGRATION_COUNT: i64 = 55;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -200,6 +201,10 @@ const CONNECTOR_BOOTSTRAP_ISSUANCE_V1_DOWN: &str =
     include_str!("../../../migrations/202607220054_connector_bootstrap_issuance_v1.down.sql");
 const CONNECTOR_BOOTSTRAP_ISSUANCE_V1_UP: &str =
     include_str!("../../../migrations/202607220054_connector_bootstrap_issuance_v1.up.sql");
+const AGENT_IDENTITY_READER_RLS_FIX_DOWN: &str =
+    include_str!("../../../migrations/202607230055_agent_identity_reader_rls_fix.down.sql");
+const AGENT_IDENTITY_READER_RLS_FIX_UP: &str =
+    include_str!("../../../migrations/202607230055_agent_identity_reader_rls_fix.up.sql");
 const LOCAL_RUNTIME_GRANTS: &str =
     include_str!("../../../docker/local/postgres/20-local-runtime-grants.sql");
 
@@ -325,6 +330,116 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(applied, EXPECTED_MIGRATION_COUNT);
     assert_eq!(visible, applied);
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_identity_reader_rls_fix_restores_read_only_agent_branch_and_exact_down_policy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    sqlx::raw_sql(
+        "DO $role$
+         BEGIN
+             IF to_regrole('dtx_agent_runtime') IS NULL THEN
+                 CREATE ROLE dtx_agent_runtime NOLOGIN NOSUPERUSER NOBYPASSRLS
+                     NOCREATEDB NOCREATEROLE NOREPLICATION;
+             END IF;
+         END
+         $role$;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    // Migration 019 established these grants before this forward-only policy
+    // repair.  The harness creates the production role after initial migration
+    // application, so model the already-deployed role surface explicitly.
+    sqlx::raw_sql(
+        "GRANT USAGE ON SCHEMA identity TO dtx_agent_runtime;
+         GRANT EXECUTE ON FUNCTION identity.identity_agent_reader_authorized()
+             TO dtx_agent_runtime;
+         GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
+             TO dtx_agent_runtime;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::raw_sql(AGENT_IDENTITY_READER_RLS_FIX_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(AGENT_IDENTITY_READER_RLS_FIX_UP)
+        .execute(harness.admin_pool())
+        .await?;
+    let seeded_session = insert_group_reader_identity_fixture(
+        &harness,
+        "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la",
+    )
+    .await?;
+
+    let privileges: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT has_function_privilege('dtx_agent_runtime', 'identity.identity_agent_reader_authorized()', 'EXECUTE'),
+                has_table_privilege('dtx_agent_runtime', 'identity.log_heads', 'SELECT'),
+                has_table_privilege('dtx_agent_runtime', 'identity.log_entries', 'SELECT'),
+                has_table_privilege('dtx_agent_runtime', 'identity.device_sessions', 'SELECT'),
+                NOT has_table_privilege('dtx_agent_runtime', 'identity.log_heads', 'INSERT'),
+                NOT has_table_privilege('dtx_agent_runtime', 'identity.log_entries', 'UPDATE'),
+                NOT has_table_privilege('dtx_agent_runtime', 'identity.device_sessions', 'DELETE')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(privileges, (true, true, true, true, true, true, true));
+
+    let mut agent_role = harness.admin_pool().begin().await?;
+    sqlx::query("SET LOCAL ROLE dtx_agent_runtime")
+        .execute(&mut *agent_role)
+        .await?;
+    let authorized: bool = sqlx::query_scalar("SELECT identity.identity_agent_reader_authorized()")
+        .fetch_one(&mut *agent_role)
+        .await?;
+    assert!(authorized);
+    let visible_session: Option<Uuid> =
+        sqlx::query_scalar("SELECT session_id FROM identity.device_sessions WHERE session_id=$1")
+            .bind(seeded_session)
+            .fetch_optional(&mut *agent_role)
+            .await?;
+    assert_eq!(visible_session, Some(seeded_session));
+    let write =
+        sqlx::query("UPDATE identity.device_sessions SET expires_at_ms=199 WHERE session_id=$1")
+            .bind(seeded_session)
+            .execute(&mut *agent_role)
+            .await
+            .expect_err("Agent runtime must not write identity device sessions");
+    assert_eq!(sqlstate(&write).as_deref(), Some("42501"));
+    agent_role.rollback().await?;
+
+    let policy: (String, String) = sqlx::query_as(
+        "SELECT qual, with_check
+           FROM pg_policies
+          WHERE schemaname='identity'
+            AND tablename='device_sessions'
+            AND policyname='identity_runtime_only'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(policy.0.contains("dtx_agent_runtime"));
+    assert!(policy.0.contains("identity_agent_reader_authorized"));
+    assert!(policy.0.contains("dtx_group_runtime"));
+    assert!(policy.0.contains("dtx_realtime_sync_runtime"));
+    assert!(!policy.1.contains("dtx_agent_runtime"));
+
+    sqlx::raw_sql(AGENT_IDENTITY_READER_RLS_FIX_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    let restored: (String, String) = sqlx::query_as(
+        "SELECT qual, with_check
+           FROM pg_policies
+          WHERE schemaname='identity'
+            AND tablename='device_sessions'
+            AND policyname='identity_runtime_only'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!restored.0.contains("dtx_agent_runtime"));
+    assert!(restored.0.contains("dtx_group_runtime"));
+    assert!(restored.0.contains("dtx_realtime_sync_runtime"));
+    assert_eq!(restored.1, policy.1);
     Ok(())
 }
 
@@ -3718,7 +3833,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -3774,8 +3889,12 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(RECOVERY_SCOPE_CATALOG_V1_MIGRATION_VERSION)
     .bind(OPAQUE_PUSH_V1_MIGRATION_VERSION)
     .bind(CONNECTOR_BOOTSTRAP_ISSUANCE_V1_MIGRATION_VERSION)
+    .bind(AGENT_IDENTITY_READER_RLS_FIX_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(AGENT_IDENTITY_READER_RLS_FIX_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(CONNECTOR_BOOTSTRAP_ISSUANCE_V1_DOWN)
         .execute(harness.admin_pool())
         .await?;
