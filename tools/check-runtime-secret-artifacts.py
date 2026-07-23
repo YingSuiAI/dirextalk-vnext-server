@@ -153,7 +153,11 @@ def scan_directory(root: Path, base: dict[str, bytes] | None = None) -> list[tup
         raise ValueError("root export cannot be enumerated") from error
     for path in paths:
         if path.is_symlink():
+            raise ValueError("root export contains a link")
+        if path.is_dir():
             continue
+        if not path.is_file():
+            raise ValueError("root export contains an unsupported member")
         if path.is_file():
             try:
                 content = path.read_bytes()
@@ -265,6 +269,13 @@ def self_test() -> int:
             archive.addfile(info)
         try:
             scan_tar(unsafe_path)
+        except ValueError:
+            pass
+        else:
+            return 1
+        (root / "unsafe-root-link").symlink_to("usr/bin/dtx-node")
+        try:
+            scan_directory(root)
         except ValueError:
             pass
         else:

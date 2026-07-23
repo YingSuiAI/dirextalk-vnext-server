@@ -61,6 +61,18 @@ if [[ -n "$runtime_image" || -n "$migrator_image" ]]; then
     container=
     base_export_tar=
     base_container=
+    remove_export_tar() {
+        local path=$1
+        local owner
+        [[ -n "$path" ]] || return 0
+        if [[ ! -e "$path" && ! -L "$path" ]]; then
+            return 0
+        fi
+        owner=$(stat -c '%F:%u' -- "$path") || return 1
+        [[ "$owner" == "regular file:$(id -u)" ]] || return 1
+        rm -- "$path" || return 1
+        [[ ! -e "$path" && ! -L "$path" ]]
+    }
     cleanup_target_export() {
         local failed=0
         if [[ -n "$container" ]]; then
@@ -69,6 +81,11 @@ if [[ -n "$runtime_image" || -n "$migrator_image" ]]; then
             else
                 failed=1
             fi
+        fi
+        if remove_export_tar "$export_tar"; then
+            export_tar=
+        else
+            failed=1
         fi
         return "$failed"
     }
@@ -81,12 +98,10 @@ if [[ -n "$runtime_image" || -n "$migrator_image" ]]; then
                 failed=1
             fi
         fi
-        if [[ -n "$base_export_tar" && ( -e "$base_export_tar" || -L "$base_export_tar" ) ]]; then
-            if rm -f -- "$base_export_tar"; then
-                base_export_tar=
-            else
-                failed=1
-            fi
+        if remove_export_tar "$base_export_tar"; then
+            base_export_tar=
+        else
+            failed=1
         fi
         return "$failed"
     }

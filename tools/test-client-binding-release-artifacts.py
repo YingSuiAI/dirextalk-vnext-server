@@ -291,6 +291,7 @@ case "$1" in
   export)
     shift
     [[ "$1" == --output ]]
+    printf '%s\n' "$2" >>"$DTX_TEST_EXPORT_LOG"
     if [[ "$3" == debian:* ]]; then
       tar -cf "$2" -C "$DTX_TEST_BASE_ROOTFS" .
     else
@@ -321,12 +322,14 @@ def test_image_gate_cleanup(base: Path) -> None:
     (rootfs / "usr/lib").mkdir()
     (rootfs / "usr/lib/base-material").write_bytes(inherited)
     log = base / "image-docker.log"
+    export_log = base / "image-export.log"
     digest_a = "dirextalk/vnet-server@sha256:" + "1" * 64
     digest_b = "dirextalk/vnet-server@sha256:" + "2" * 64
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "DTX_TEST_DOCKER_LOG": str(log),
+        "DTX_TEST_EXPORT_LOG": str(export_log),
         "DTX_TEST_ROOTFS": str(rootfs),
         "DTX_TEST_BASE_ROOTFS": str(base_rootfs),
     }
@@ -349,8 +352,11 @@ def test_image_gate_cleanup(base: Path) -> None:
     log_text = log.read_text()
     if log_text.count("pull ") != 3 or log_text.count("export ") != 3 or log_text.count("rm ") != 3:
         raise AssertionError("both immutable images were not exported and cleaned")
+    if any(Path(path).exists() for path in export_log.read_text().splitlines()):
+        raise AssertionError("successful image scan left an export tar behind")
 
     def reject_changed_artifact(label: str) -> None:
+        prior_exports = export_log.read_text().splitlines()
         rejected = subprocess.run(
             ["bash", str(IMAGE_GATE), "--runtime-image", digest_a],
             cwd=REPOSITORY,
@@ -361,6 +367,9 @@ def test_image_gate_cleanup(base: Path) -> None:
         )
         if rejected.returncode == 0 or "sensitive-content" not in rejected.stdout:
             raise AssertionError(f"{label} secret artifact did not fail the image gate")
+        new_exports = export_log.read_text().splitlines()[len(prior_exports):]
+        if not new_exports or any(Path(path).exists() for path in new_exports):
+            raise AssertionError(f"{label} failed image scan left an export tar behind")
 
     (rootfs / "usr/bin/runtime").write_bytes(inherited)
     reject_changed_artifact("added")
