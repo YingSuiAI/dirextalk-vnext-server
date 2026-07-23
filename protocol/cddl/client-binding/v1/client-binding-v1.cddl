@@ -1,0 +1,13 @@
+; Dirextalk Client Binding V1. Raw authorization is never durable.
+client-binding-import-v1 = {
+  "schema": "dirextalk.client-binding",
+  "schema_version": 1,
+  "binding_id": tstr,
+  "deployment_operation_id": tstr,
+  "tenant_id": tstr,
+  "server_origin": tstr,
+  "identity_tls_root_ca_pem": tstr,
+  "identity_tls_root_ca_sha256": tstr .size 64,
+  "expires_at_unix_ms": int,
+  "authorization": tstr .size 43
+}

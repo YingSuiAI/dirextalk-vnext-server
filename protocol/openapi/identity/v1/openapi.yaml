@@ -4,6 +4,49 @@ info:
   version: 1.0.0
   description: Self-authenticated bootstrap for a new self-certifying identity.
 paths:
+  /v1/identity/deployment-bootstrap:
+    post:
+      operationId: deploymentBootstrapIdentity
+      summary: Commit genesis authorized by a short-lived deployment client binding.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/ClientBindingId'
+        - $ref: '#/components/parameters/ClientBindingAuthorization'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.identity-log.v1.1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 1048576
+            schema: { $ref: '#/components/schemas/ExactIdentityLogGenesisV1_1' }
+      responses:
+        '201': { $ref: '#/components/responses/IdentityBootstrapCommitted' }
+        '200': { $ref: '#/components/responses/IdentityBootstrapReplayed' }
+        '409': { $ref: '#/components/responses/IdentityBootstrapConflict' }
+        '422': { $ref: '#/components/responses/IdentityBootstrapInvalid' }
+        '503': { $ref: '#/components/responses/IdentityBootstrapUnavailable' }
+  /v1/identity/deployment-bootstrap/initial-device:
+    post:
+      operationId: deploymentInitialDevice
+      summary: Commit the root-authorized initial device under a client binding.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/ClientBindingId'
+        - $ref: '#/components/parameters/ClientBindingAuthorization'
+        - $ref: '#/components/parameters/GenesisIfMatch'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.identity-log.v1.1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 1048576
+            schema: { $ref: '#/components/schemas/ExactIdentityLogGenesisV1_1' }
+      responses:
+        '201': { $ref: '#/components/responses/IdentityBootstrapCommitted' }
+        '200': { $ref: '#/components/responses/IdentityBootstrapReplayed' }
+        '409': { $ref: '#/components/responses/IdentityBootstrapConflict' }
+        '422': { $ref: '#/components/responses/IdentityBootstrapInvalid' }
+        '503': { $ref: '#/components/responses/IdentityBootstrapUnavailable' }
   /v1/identity/bootstrap:
     post:
       operationId: bootstrapIdentity
@@ -36,6 +79,22 @@ paths:
           $ref: '#/components/responses/IdentityBootstrapUnavailable'
 components:
   parameters:
+    ClientBindingId:
+      name: X-Dirextalk-Client-Binding
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    ClientBindingAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      description: Exactly one DTX-Client-Binding bearer value; raw authorization is never echoed.
+      schema:
+        type: string
+        pattern: '^DTX-Client-Binding [A-Za-z0-9_-]{43}$'
     IdempotencyKey:
       name: Idempotency-Key
       in: header

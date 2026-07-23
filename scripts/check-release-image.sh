@@ -95,6 +95,7 @@ expected = [
     ("dtx-opaque-push-broker", "dtx-opaque-push-broker", "/usr/local/bin/dtx-opaque-push-broker"),
     ("dtx-realtime-sync-gateway", "dtx-realtime-sync-gateway", "/usr/local/bin/dtx-realtime-sync-gateway"),
     ("dtx-agent-control", "dtx-agent-control-bin", "/usr/local/bin/dtx-agent-control"),
+    ("dtx-identity-provision", "dtx-identity-node", "/usr/local/bin/dtx-identity-provision"),
 ]
 actual = [
     (artifact.get("binary"), artifact.get("package"), artifact.get("path"))
@@ -141,7 +142,7 @@ runtime_stage = instructions[runtime_start:]
 if [instruction.keyword for instruction in build_stage] != ["FROM", "WORKDIR", "COPY", "RUN"]:
     fail("build stage instruction structure changed")
 if [instruction.keyword for instruction in runtime_stage] != [
-    "FROM", "COPY", "RUN", "COPY", "COPY", "COPY", "COPY",
+    "FROM", "COPY", "RUN", "COPY", "COPY", "COPY", "COPY", "COPY",
     "ENV", "EXPOSE", "STOPSIGNAL", "USER", "ENTRYPOINT",
 ]:
     fail("runtime stage instruction structure changed")
@@ -198,6 +199,7 @@ if cargo_commands != [
         "--package", "dtx-node",
         "--package", "dtx-opaque-push-broker",
         "--package", "dtx-realtime-sync-gateway",
+        "--package", "dtx-identity-node", "--bin", "dtx-identity-provision",
     ],
     [
         "cargo", "build", "--release", "--locked",
@@ -211,6 +213,7 @@ if remove_commands != [
         "/workspace/target/release/dtx-node",
         "/workspace/target/release/dtx-opaque-push-broker",
         "/workspace/target/release/dtx-realtime-sync-gateway",
+        "/workspace/target/release/dtx-identity-provision",
         "/workspace/target/release/dtx-agent-control",
     ],
     ["rm", "-f", "/workspace/target/release/dtx-agent-control"],

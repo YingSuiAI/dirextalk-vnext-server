@@ -9,12 +9,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         /workspace/target/release/dtx-node \
         /workspace/target/release/dtx-opaque-push-broker \
         /workspace/target/release/dtx-realtime-sync-gateway \
+        /workspace/target/release/dtx-identity-provision \
         /workspace/target/release/dtx-agent-control \
     && \
     cargo build --release --locked \
         --package dtx-node \
         --package dtx-opaque-push-broker \
         --package dtx-realtime-sync-gateway \
+        --package dtx-identity-node --bin dtx-identity-provision \
     && install -D -m 0555 /workspace/target/release/dtx-node /artifacts/dtx-node \
     && install -D -m 0555 /workspace/target/release/dtx-opaque-push-broker /artifacts/dtx-opaque-push-broker \
     && install -D -m 0555 /workspace/target/release/dtx-realtime-sync-gateway /artifacts/dtx-realtime-sync-gateway \
@@ -22,7 +24,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --release --locked \
         --package dtx-agent-control-bin \
         --bin dtx-agent-control \
-    && install -D -m 0555 /workspace/target/release/dtx-agent-control /artifacts/dtx-agent-control
+    && install -D -m 0555 /workspace/target/release/dtx-agent-control /artifacts/dtx-agent-control \
+    && install -D -m 0555 /workspace/target/release/dtx-identity-provision /artifacts/dtx-identity-provision
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
@@ -33,6 +36,7 @@ COPY --from=build /artifacts/dtx-node /usr/local/bin/dtx-node
 COPY --from=build /artifacts/dtx-opaque-push-broker /usr/local/bin/dtx-opaque-push-broker
 COPY --from=build /artifacts/dtx-realtime-sync-gateway /usr/local/bin/dtx-realtime-sync-gateway
 COPY --from=build /artifacts/dtx-agent-control /usr/local/bin/dtx-agent-control
+COPY --from=build /artifacts/dtx-identity-provision /usr/local/bin/dtx-identity-provision
 
 ENV DTX_NODE_LISTEN=0.0.0.0:8443
 EXPOSE 8443 9444 9448

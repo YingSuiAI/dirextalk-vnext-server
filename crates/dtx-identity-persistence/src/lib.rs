@@ -14,7 +14,8 @@ mod types;
 
 pub use client_binding::{
     CLIENT_BINDING_AUTHORIZATION_HASH_DOMAIN, ClientBindingAuthorization, ClientBindingImport,
-    ClientBindingImportError,
+    ClientBindingImportError, ClientBindingIssueCommand, ClientBindingIssueOutcome,
+    ClientBindingRepository, ClientBindingState, ClientBindingWorkflowError,
 };
 pub use device_enrollment::{
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,

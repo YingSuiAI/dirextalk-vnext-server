@@ -24,6 +24,11 @@
       "binary": "dtx-agent-control",
       "package": "dtx-agent-control-bin",
       "path": "/usr/local/bin/dtx-agent-control"
+    },
+    {
+      "binary": "dtx-identity-provision",
+      "package": "dtx-identity-node",
+      "path": "/usr/local/bin/dtx-identity-provision"
     }
   ],
   "runtime": {

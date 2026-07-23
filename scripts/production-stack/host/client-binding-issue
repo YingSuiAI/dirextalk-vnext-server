@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(id -u)" != 0 ]]; then
+  echo 'client-binding issuance requires root' >&2
+  exit 1
+fi
+
+root=/etc/dirextalk/vnext/client-binding
+request="$root/request.json"
+output="$root/import.json"
+compose=/etc/dirextalk/vnext/config/production-compose.yml
+env_file=/etc/dirextalk/vnext/config/production.env
+
+[[ -f "$compose" && ! -L "$compose" ]] || { echo 'missing production compose' >&2; exit 1; }
+[[ -f "$env_file" && ! -L "$env_file" ]] || { echo 'missing production env' >&2; exit 1; }
+[[ -f "$request" && ! -L "$request" ]] || { echo 'missing client-binding request.json' >&2; exit 1; }
+[[ "$(stat -c '%u:%g:%a' "$request")" == '0:0:600' ]] || { echo 'request must be root:root 0600' >&2; exit 1; }
+mkdir -p "$root"
+chmod 700 "$root"
+exec docker compose --project-name dirextalk-vnext-production \
+  --env-file "$env_file" -f "$compose" \
+  --profile client-binding run --rm --no-deps client-binding-issuer

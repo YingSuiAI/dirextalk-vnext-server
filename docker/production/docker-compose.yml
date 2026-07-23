@@ -114,6 +114,29 @@ services:
     expose: ["8443"]
     restart: unless-stopped
 
+  # Root-only, one-shot issuer. The host helper supplies the fixed request
+  # and output files under /etc/dirextalk/vnext/client-binding; no arbitrary
+  # command, path, or environment passthrough is accepted.
+  client-binding-issuer:
+    <<: *server-image
+    user: "0:0"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    entrypoint: ["/usr/local/bin/dtx-identity-provision"]
+    volumes:
+      - ${DTX_SECRET_ROOT:?set secret root}/identity-database-url:/run/dtx-secrets/identity-database-url:ro
+      - /etc/dirextalk/vnext/client-binding:/run/dtx-client-binding
+    command:
+      - client-binding-issue
+      - --database-url-file
+      - /run/dtx-secrets/identity-database-url
+      - --request-file
+      - /run/dtx-client-binding/request.json
+      - --output-file
+      - /run/dtx-client-binding/import.json
+    profiles: ["client-binding"]
+
   node-ready:
     <<: *probe-image
     read_only: true

@@ -9,9 +9,14 @@ publish = false
 name = "dtx-identity-node"
 path = "src/main.rs"
 
+[[bin]]
+name = "dtx-identity-provision"
+path = "src/provision.rs"
+
 [dependencies]
 axum.workspace = true
 base64ct.workspace = true
+sha2.workspace = true
 dtx-domain = { path = "../../crates/dtx-domain" }
 dtx-contact = { path = "../../crates/dtx-contact" }
 dtx-federated-identity = { path = "../../crates/dtx-federated-identity" }
@@ -19,12 +24,14 @@ dtx-identity-log = { path = "../../crates/dtx-identity-log" }
 dtx-identity-persistence = { path = "../../crates/dtx-identity-persistence" }
 dtx-wire = { path = "../../crates/dtx-wire" }
 getrandom.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+rustix = { version = "1.1.4", features = ["process", "fs"] }
 
 [dev-dependencies]
 dtx-storage = { path = "../../crates/dtx-storage" }

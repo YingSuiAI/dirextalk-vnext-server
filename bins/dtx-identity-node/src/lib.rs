@@ -39,6 +39,7 @@ use dtx_identity_log::{
 };
 use dtx_identity_persistence::{
     CatalogPreparationCommand, CatalogProviderResponseCommand, CatalogStatus, CatalogUploadCommand,
+    ClientBindingAuthorization, ClientBindingRepository, ClientBindingWorkflowError,
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
     DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability, DeviceEnrollmentChallenge,
     DeviceEnrollmentChallengeOutcome, DeviceEnrollmentChallengeState,
@@ -66,6 +67,8 @@ use zeroize::Zeroize;
 pub const IDENTITY_BOOTSTRAP_PATH: &str = "/v1/identity/bootstrap";
 /// Route for the root-authorized first device after genesis.
 pub const INITIAL_DEVICE_ENROLL_PATH: &str = "/v1/devices/initial-enroll";
+pub const DEPLOYMENT_BOOTSTRAP_PATH: &str = "/v1/identity/deployment-bootstrap";
+pub const DEPLOYMENT_INITIAL_DEVICE_PATH: &str = "/v1/identity/deployment-bootstrap/initial-device";
 /// Route that starts an active-device signature challenge.
 pub const DEVICE_SESSION_CHALLENGE_PATH: &str = "/v1/devices/sessions/challenges";
 /// Route that exchanges a device signature for a short-lived session.
@@ -206,6 +209,8 @@ const HTTP_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.identity-bootstrap-http-idempotency-key.v1\0";
 const HTTP_INITIAL_DEVICE_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.identity-initial-device-http-idempotency-key.v1\0";
+const CLIENT_BINDING_HEADER: &str = "X-Dirextalk-Client-Binding";
+const CLIENT_BINDING_AUTHORIZATION_SCHEME: &str = "DTX-Client-Binding";
 const HTTP_DEVICE_SESSION_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.device-session-http-idempotency-key.v1\0";
 const HTTP_DEVICE_ENROLLMENT_CHALLENGE_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
@@ -236,6 +241,7 @@ pub struct IdentityBootstrapState {
     key_packages: KeyPackageRepository,
     recovery_catalogs: RecoveryScopeCatalogRepository,
     contacts: ContactRepository,
+    client_bindings: ClientBindingRepository,
     federated_identity: FederatedIdentityVerifier,
     public_origin: Arc<str>,
     clock: Arc<dyn Clock>,
@@ -281,6 +287,7 @@ impl IdentityBootstrapState {
             key_packages: KeyPackageRepository::new(),
             recovery_catalogs: RecoveryScopeCatalogRepository,
             contacts: ContactRepository,
+            client_bindings: ClientBindingRepository,
             federated_identity,
             public_origin: device_session_audience.clone(),
             clock,
@@ -338,6 +345,14 @@ pub fn identity_bootstrap_router(store: IdentityPgStore) -> Router {
 pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Router {
     Router::new()
         .route(IDENTITY_BOOTSTRAP_PATH, post(bootstrap_identity))
+        .route(
+            DEPLOYMENT_BOOTSTRAP_PATH,
+            post(deployment_bootstrap_identity),
+        )
+        .route(
+            DEPLOYMENT_INITIAL_DEVICE_PATH,
+            post(deployment_initial_device),
+        )
         .route(IDENTITY_LOG_PAGE_PATH_TEMPLATE, get(get_identity_log_page))
         .route(
             MLS_V5_RECOVERY_AUTHORIZATION_PATH_TEMPLATE,
@@ -679,6 +694,30 @@ async fn bootstrap_identity(
     match state.bootstrap(&parts.headers, body).await {
         Ok(success) => bootstrap_success_response(success, request_id),
         Err(failure) => bootstrap_failure_response(failure, request_id),
+    }
+}
+
+async fn deployment_bootstrap_identity(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.deployment_bootstrap(&parts.headers, body).await {
+        Ok(success) => bootstrap_success_response(success, request_id),
+        Err(failure) => client_binding_failure_response(failure, request_id),
+    }
+}
+
+async fn deployment_initial_device(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.deployment_initial_device(&parts.headers, body).await {
+        Ok(success) => initial_device_success_response(success, request_id),
+        Err(failure) => client_binding_failure_response(failure, request_id),
     }
 }
 
@@ -1086,6 +1125,103 @@ impl IdentityBootstrapState {
             }),
             Ok(IdentityAppendOutcome::Forked { .. }) => Err(BootstrapFailure::IdentityConflict),
             Err(error) => Err(map_persistence_error(&error)),
+        }
+    }
+
+    async fn deployment_bootstrap(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<BootstrapSuccess, ClientBindingFailure> {
+        if !has_exact_event_content_type(headers)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(header::CONTENT_ENCODING)
+        {
+            return Err(ClientBindingFailure::Invalid);
+        }
+        let binding_id = client_binding_id(headers)?;
+        let authorization = client_binding_authorization(headers)?;
+        let idem = idempotency_key_hash_binding(headers, HTTP_IDEMPOTENCY_KEY_HASH_DOMAIN)?;
+        let exact_event_bytes = to_bytes(body, MAX_IDENTITY_BOOTSTRAP_EVENT_BYTES)
+            .await
+            .map_err(|_| ClientBindingFailure::Invalid)?;
+        if exact_event_bytes.is_empty() {
+            return Err(ClientBindingFailure::Invalid);
+        }
+        let now = self
+            .committed_at()
+            .map_err(|_| ClientBindingFailure::Unavailable)?;
+        match self
+            .client_bindings
+            .deployment_bootstrap(
+                &self.store,
+                binding_id,
+                authorization.digest(),
+                idem,
+                exact_event_bytes.to_vec(),
+                now,
+            )
+            .await
+        {
+            Ok(IdentityAppendOutcome::Committed(receipt)) => Ok(BootstrapSuccess {
+                status: StatusCode::CREATED,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+            Ok(IdentityAppendOutcome::Replayed(receipt)) => Ok(BootstrapSuccess {
+                status: StatusCode::OK,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+            Ok(IdentityAppendOutcome::Forked { .. }) => Err(ClientBindingFailure::Conflict),
+            Err(error) => Err(map_client_binding_error(error)),
+        }
+    }
+
+    async fn deployment_initial_device(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<InitialDeviceSuccess, ClientBindingFailure> {
+        if !has_exact_event_content_type(headers) || headers.contains_key(header::CONTENT_ENCODING)
+        {
+            return Err(ClientBindingFailure::Invalid);
+        }
+        let binding_id = client_binding_id(headers)?;
+        let authorization = client_binding_authorization(headers)?;
+        let idem =
+            idempotency_key_hash_binding(headers, HTTP_INITIAL_DEVICE_IDEMPOTENCY_KEY_HASH_DOMAIN)?;
+        let expected = expected_genesis_hash(headers).map_err(|_| ClientBindingFailure::Invalid)?;
+        let exact_event_bytes = to_bytes(body, MAX_IDENTITY_BOOTSTRAP_EVENT_BYTES)
+            .await
+            .map_err(|_| ClientBindingFailure::Invalid)?;
+        if exact_event_bytes.is_empty() {
+            return Err(ClientBindingFailure::Invalid);
+        }
+        let now = self
+            .committed_at()
+            .map_err(|_| ClientBindingFailure::Unavailable)?;
+        match self
+            .client_bindings
+            .initial_device(
+                &self.store,
+                binding_id,
+                authorization.digest(),
+                idem,
+                expected,
+                exact_event_bytes.to_vec(),
+                now,
+            )
+            .await
+        {
+            Ok(IdentityAppendOutcome::Committed(receipt)) => Ok(InitialDeviceSuccess {
+                status: StatusCode::CREATED,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+            Ok(IdentityAppendOutcome::Replayed(receipt)) => Ok(InitialDeviceSuccess {
+                status: StatusCode::OK,
+                exact_receipt_bytes: receipt.exact_bytes().to_vec(),
+            }),
+            Ok(IdentityAppendOutcome::Forked { .. }) => Err(ClientBindingFailure::Conflict),
+            Err(error) => Err(map_client_binding_error(error)),
         }
     }
 
@@ -1900,6 +2036,48 @@ fn idempotency_key_hash(
         return Err(BootstrapFailure::InvalidBootstrap);
     }
     Ok(Sha256Digest::hash_domain(domain, bytes))
+}
+
+fn idempotency_key_hash_binding(
+    headers: &HeaderMap,
+    domain: &[u8],
+) -> Result<Sha256Digest, ClientBindingFailure> {
+    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Err(ClientBindingFailure::Invalid);
+    };
+    if values.next().is_some() {
+        return Err(ClientBindingFailure::Invalid);
+    }
+    let bytes = value.as_bytes();
+    if !(MIN_IDEMPOTENCY_KEY_BYTES..=MAX_IDEMPOTENCY_KEY_BYTES).contains(&bytes.len())
+        || !bytes.iter().copied().all(is_base64url_byte)
+    {
+        return Err(ClientBindingFailure::Invalid);
+    }
+    Ok(Sha256Digest::hash_domain(domain, bytes))
+}
+
+fn client_binding_id(headers: &HeaderMap) -> Result<uuid::Uuid, ClientBindingFailure> {
+    let value = single_graphic_header(headers, CLIENT_BINDING_HEADER, 36, 36)
+        .map_err(|_| ClientBindingFailure::Invalid)?;
+    let id = uuid::Uuid::parse_str(value).map_err(|_| ClientBindingFailure::Invalid)?;
+    if id.to_string() != value || id.get_version_num() != 7 {
+        return Err(ClientBindingFailure::Invalid);
+    }
+    Ok(id)
+}
+
+fn client_binding_authorization(
+    headers: &HeaderMap,
+) -> Result<ClientBindingAuthorization, ClientBindingFailure> {
+    let value = single_graphic_header(headers, header::AUTHORIZATION.as_str(), 61, 80)
+        .map_err(|_| ClientBindingFailure::Invalid)?;
+    let raw = value
+        .strip_prefix(CLIENT_BINDING_AUTHORIZATION_SCHEME)
+        .and_then(|rest| rest.strip_prefix(' '))
+        .ok_or(ClientBindingFailure::Invalid)?;
+    ClientBindingAuthorization::parse(raw).map_err(|_| ClientBindingFailure::Invalid)
 }
 
 fn expected_genesis_hash(headers: &HeaderMap) -> Result<Sha256Digest, InitialDeviceFailure> {
@@ -3557,6 +3735,29 @@ enum InitialDeviceFailure {
     TemporarilyUnavailable,
 }
 
+#[derive(Clone, Copy)]
+enum ClientBindingFailure {
+    Invalid,
+    Conflict,
+    Unauthorized,
+    Expired,
+    Revoked,
+    Unavailable,
+}
+
+fn map_client_binding_error(error: ClientBindingWorkflowError) -> ClientBindingFailure {
+    match error {
+        ClientBindingWorkflowError::Invalid | ClientBindingWorkflowError::Corrupt => {
+            ClientBindingFailure::Invalid
+        }
+        ClientBindingWorkflowError::Unauthorized => ClientBindingFailure::Unauthorized,
+        ClientBindingWorkflowError::Conflict => ClientBindingFailure::Conflict,
+        ClientBindingWorkflowError::Expired => ClientBindingFailure::Expired,
+        ClientBindingWorkflowError::Revoked => ClientBindingFailure::Revoked,
+        ClientBindingWorkflowError::Persistence(_) => ClientBindingFailure::Unavailable,
+    }
+}
+
 struct DeviceSessionSuccess {
     status: StatusCode,
     exact_receipt_bytes: Vec<u8>,
@@ -3958,6 +4159,49 @@ fn bootstrap_failure_response(failure: BootstrapFailure, request_id: RequestId) 
         HeaderValue::from_static("application/json"),
     );
     with_common_headers(response, request_id)
+}
+
+#[derive(Clone, Copy, Serialize)]
+enum ClientBindingErrorCode {
+    #[serde(rename = "CLIENT_BINDING_INVALID")]
+    Invalid,
+    #[serde(rename = "CLIENT_BINDING_CONFLICT")]
+    Conflict,
+    #[serde(rename = "CLIENT_BINDING_INVALID")]
+    Unauthorized,
+    #[serde(rename = "CLIENT_BINDING_INVALID")]
+    Expired,
+    #[serde(rename = "CLIENT_BINDING_INVALID")]
+    Revoked,
+    #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
+    Unavailable,
+}
+
+fn client_binding_failure_response(
+    failure: ClientBindingFailure,
+    request_id: RequestId,
+) -> Response {
+    let (status, code, retryable) = match failure {
+        ClientBindingFailure::Invalid
+        | ClientBindingFailure::Unauthorized
+        | ClientBindingFailure::Expired
+        | ClientBindingFailure::Revoked => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ClientBindingErrorCode::Invalid,
+            false,
+        ),
+        ClientBindingFailure::Conflict => (
+            StatusCode::CONFLICT,
+            ClientBindingErrorCode::Conflict,
+            false,
+        ),
+        ClientBindingFailure::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ClientBindingErrorCode::Unavailable,
+            true,
+        ),
+    };
+    safe_error_response(status, code, retryable, request_id)
 }
 
 fn initial_device_success_response(
