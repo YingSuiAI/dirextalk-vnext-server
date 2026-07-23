@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import inspect
+import json
 import subprocess
 import tempfile
 from pathlib import Path
@@ -343,19 +344,52 @@ def main() -> None:
         MODULE.RUNTIME_ATTESTATION = original_runtime_attestation
         MODULE.read_secure = original_read
 
-    # Proof commands are direct, fixed argv. The incident proof requires the
+    # Docker Compose versions emit either one array or NDJSON. Both forms are
+    # bounded and deterministic; malformed, mixed, duplicate, or non-object
+    # records fail without echoing the raw output.
+    service_records = [
+        {"Service": name, "Image": request["server_image"]}
+        for name in ("dtx-node", "realtime-gateway", "agent-control")
+    ]
+    expected_images = {record["Service"]: record["Image"] for record in service_records}
+    array_output = json.dumps(service_records, separators=(",", ":")).encode()
+    ndjson_output = b"\n".join(
+        json.dumps(record, separators=(",", ":")).encode() for record in service_records
+    ) + b"\n"
+    assert MODULE.parse_compose_ps_images(array_output) == expected_images
+    assert MODULE.parse_compose_ps_images(ndjson_output) == expected_images
+    assert MODULE.parse_compose_ps_images(
+        json.dumps(service_records[0], separators=(",", ":")).encode()
+    ) == {"dtx-node": request["server_image"]}
+
+    def reject_compose_output(raw: bytes) -> None:
+        try:
+            MODULE.parse_compose_ps_images(raw)
+        except MODULE.ContractError as error:
+            assert "LEAK-MARKER" not in str(error)
+            return
+        raise AssertionError("invalid Compose ps output was accepted")
+
+    reject_compose_output(b"")
+    reject_compose_output(b'{"Service":"dtx-node","Image":"LEAK-MARKER"}\n{')
+    reject_compose_output(
+        json.dumps(service_records[0]).encode() + b"\n" + json.dumps(service_records).encode()
+    )
+    reject_compose_output(json.dumps([service_records[0], service_records[0]]).encode())
+    reject_compose_output(json.dumps([1]).encode())
+    reject_compose_output(json.dumps([{"Service": 1, "Image": "image"}]).encode())
+    reject_compose_output(b"x" * (MODULE.MAX_COMPOSE_PS_BYTES + 1))
+
+    # Proof commands remain direct, fixed argv. The incident proof requires the
     # old binary to be absent; candidate proof requires it executable.
     original_run = MODULE.subprocess.run
     try:
         calls: list[list[str]] = []
         class Result:
             def __init__(self, stdout: bytes) -> None: self.stdout = stdout
-        images = b'[{"Service":"dtx-node","Image":"' + request["server_image"].encode() + b'"},' \
-            + b'{"Service":"realtime-gateway","Image":"' + request["server_image"].encode() + b'"},' \
-            + b'{"Service":"agent-control","Image":"' + request["server_image"].encode() + b'"}]'
         def proof_run(command: list[str], **_kwargs: object) -> Result:
             calls.append(command)
-            return Result(images if command[-2:] == ["--format", "json"] else b"ok\n")
+            return Result(ndjson_output if command[-2:] == ["--format", "json"] else b"ok\n")
         MODULE.subprocess.run = proof_run
         MODULE.prove_live_runtime(request, True)
         assert calls[1][-3:] == ["test", "-x", "/usr/local/bin/dtx-identity-provision"]
@@ -419,10 +453,15 @@ def main() -> None:
     original_euid = MODULE.os.geteuid
     original_ensure = MODULE.ensure_root_directory
     try:
-        MODULE.sys.argv = ["/tmp/not-install-vnext"]
         MODULE.os.geteuid = lambda: 0
         MODULE.ensure_root_directory = lambda *_args: (_ for _ in ()).throw(AssertionError("filesystem mutation"))
-        assert MODULE.main() == 1
+        for basename in (
+            "recover-vnext-011-to-014",
+            "attest-vnext-011-to-014",
+            "not-install-vnext",
+        ):
+            MODULE.sys.argv = [f"/tmp/{basename}"]
+            assert MODULE.main() == 1
     finally:
         MODULE.sys.argv = original_argv
         MODULE.os.geteuid = original_euid

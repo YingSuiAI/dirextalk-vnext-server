@@ -213,8 +213,8 @@ canonical sanitized runtime attestation before publishing the candidate receipt.
 
 The same hash-pinned `install-vnext` artifact is a root-only no-argument fixed
 incident helper when it is staged and invoked with the exact basename
-`recover-vnext-011-to-014`.
-When staged under `attest-vnext-011-to-014`, the same bytes perform only a
+`recover-vnext-011-to-014-r2`.
+When staged under `attest-vnext-011-to-014-r2`, the same bytes perform only a
 fresh candidate-runtime proof and atomically refresh its sanitized attestation;
 they never recover or change the configured runtime.
 It accepts only a current `0.1.4` receipt directly chained to retained `0.1.1`,
