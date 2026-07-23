@@ -2,6 +2,7 @@
 
 //! Durable `PostgreSQL` storage for the self-certifying identity log.
 
+mod client_binding;
 mod device_enrollment;
 mod device_session;
 mod error;
@@ -11,6 +12,10 @@ mod repository;
 mod store;
 mod types;
 
+pub use client_binding::{
+    CLIENT_BINDING_AUTHORIZATION_HASH_DOMAIN, ClientBindingAuthorization, ClientBindingImport,
+    ClientBindingImportError,
+};
 pub use device_enrollment::{
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
     DEVICE_ENROLLMENT_APPROVAL_IDEMPOTENCY_HASH_DOMAIN,

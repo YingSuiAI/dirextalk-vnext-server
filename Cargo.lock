@@ -1148,12 +1148,15 @@ dependencies = [
  "dtx-storage",
  "dtx-wire",
  "ed25519-dalek",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "subtle",
  "testcontainers-modules",
  "tokio",
  "uuid",
+ "x509-parser",
  "zeroize",
 ]
 
