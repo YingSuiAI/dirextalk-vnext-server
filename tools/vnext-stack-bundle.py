@@ -26,6 +26,8 @@ SEMVER = re.compile(
 HEX40 = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 IMAGE = re.compile(r"dirextalk/vnet-server@sha256:[0-9a-f]{64}")
+COMPATIBILITY_PATH = "docker/production/migration-compatibility"
+COMPATIBILITY_MARKER = b"forward-schema-compatible-v1\n"
 FILES = (
     "docker/production/Caddyfile",
     "docker/production/README.md",
@@ -158,7 +160,10 @@ def source_files(source_root: Path) -> list[tuple[str, bytes, str]]:
         metadata = path.lstat()
         if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
             raise ValueError(f"bundle source is not a regular file: {relative}")
-        result.append((relative, path.read_bytes(), "0555" if relative in EXECUTABLES else "0444"))
+        data = path.read_bytes()
+        if relative == COMPATIBILITY_PATH and data != COMPATIBILITY_MARKER:
+            raise ValueError("bundle source has no exact forward migration compatibility marker")
+        result.append((relative, data, "0555" if relative in EXECUTABLES else "0444"))
     return result
 
 
@@ -254,6 +259,8 @@ def verify(bundle: Path) -> dict[str, object]:
     for name, record in expected.items():
         if digest(payloads[name]) != record["sha256"] or modes[name] != record["mode"]:
             raise ValueError(f"archive file contract mismatch: {name}")
+    if payloads.get(f"{ROOT}/{COMPATIBILITY_PATH}") != COMPATIBILITY_MARKER:
+        raise ValueError("archive has no exact forward migration compatibility marker")
     return manifest
 
 
@@ -291,6 +298,18 @@ def self_test(source_root: Path) -> None:
             pass
         else:
             raise AssertionError("non-SemVer version was accepted")
+        marker = source_root / COMPATIBILITY_PATH
+        original = marker.read_bytes()
+        try:
+            marker.write_bytes(b"incompatible\n")
+            try:
+                build(source_root, bundle, "1.2.3", "a" * 40, image, image)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("incompatible migration marker was accepted")
+        finally:
+            marker.write_bytes(original)
 
 
 def main() -> int:

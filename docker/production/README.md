@@ -83,13 +83,23 @@ realtime, Agent Control, and PostgreSQL privilege readiness, and only attempts
 the retained prior set when both releases declare
 `forward-schema-compatible-v1` and the compose checksum is unchanged.
 
-This stage supports fresh installation and digest changes within the same
-`DTX_RELEASE_VERSION`. Cross-version database-history compatibility, skipped
-release upgrades, and rollback across schema changes are not implemented yet;
-both the production updater and host installer reject a version change before
-mutation. SemVer is an identity value only—there is no adjacent-version or
-`current + 1` rule. That explicit migration-history contract is the next stage,
-and `latest` remains an external discovery pointer outside execution inputs.
+This stage supports fresh installation, digest changes, and the strictly
+forward `0.1.1` → `0.1.4` schema-history transition. A candidate and its
+retained prior release must both carry the authenticated
+`forward-schema-compatible-v1` marker. The migrator runs only forward `up`
+migrations; no installer or rollback path invokes a down migration. Named
+volumes, operator configuration, secret files, and TLS material are preserved.
+If readiness fails after the forward migration, rollback is code-only: the
+retained prior images and configuration are reconciled with `--no-deps` while
+the new schema remains in place. The prior release is retained for this
+recovery and the receipt chain records the rollback outcome.
+
+Admission is replay-safe: an already-installed authenticated candidate receipt
+is a no-op, and a crash-recovered prior/rolled-back receipt can be retried only
+when its receipt digest chain and compatibility marker validate. Version
+changes must be strictly increasing SemVer values; same-version digest updates
+remain supported. `latest` remains an external discovery pointer outside
+execution inputs.
 
 ## Hash-bound deployment bundle
 
