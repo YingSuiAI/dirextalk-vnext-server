@@ -406,6 +406,11 @@ python3 - <<'PY'
 from pathlib import Path
 
 script = Path("scripts/publish-production-release.sh").read_text()
+migration_preflight = script.index("bash scripts/test-production-cross-version-postgres.sh")
+builder_creation = script.index('builder="dtx-vnet-release-')
+first_push = script.index("docker buildx build")
+if not migration_preflight < builder_creation < first_push:
+    raise SystemExit("cross-version migration preflight must precede builder creation and image push")
 migrator_readback = script.index('    --metadata "$state/migrator-metadata.json"')
 latest_move = script.index("# latest is a runtime discovery pointer only")
 facts = script.index("python3 tools/production-release.py emit-facts")

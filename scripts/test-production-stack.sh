@@ -184,6 +184,7 @@ grep -q "1000:1000:400" "$root/scripts/production-stack/host/client-binding-expo
 grep -q -- '--runtime-image dirextalk/vnet-server@sha256:<64-hex> --migrator-image' "$root/scripts/check-release-image.sh"
 grep -q 'docker export --output' "$root/scripts/check-release-image.sh"
 grep -q 'scripts/check-release-image.sh' "$root/scripts/publish-production-release.sh"
+grep -q 'bash scripts/test-production-cross-version-postgres.sh' "$root/scripts/publish-production-release.sh"
 grep -q -- '--runtime-image "\$repository@\$runtime_digest"' "$root/scripts/publish-production-release.sh"
 grep -q -- '--migrator-image "\$repository@\$migrator_digest"' "$root/scripts/publish-production-release.sh"
 test -x "$root/tools/test-client-binding-release-artifacts.py"
