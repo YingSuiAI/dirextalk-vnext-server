@@ -102,6 +102,7 @@ RUNTIME_ATTESTATION_KEYS = {
     "schema", "schema_version", "bundle_sha256", "version", "server_image",
     "migrator_image", "production_env_sha256", "compose_sha256", "caddy_sha256",
     "running_services_sha256", "client_binding_binary_sha256",
+    "migration_proof_sha256",
     "attestation_sha256",
 }
 RUNTIME_ATTESTATION_SCHEMA = "dirextalk.vnext-runtime-attestation"
@@ -1258,6 +1259,7 @@ def stage_candidate_validator(release: Path) -> None:
 def runtime_attestation(
     release: Path, manifest: dict[str, object], domain: str,
     running_services_sha256: str = "0" * 64, client_binding_binary_sha256: str = "0" * 64,
+    migration_proof_sha256: str = "0" * 64,
 ) -> tuple[dict[str, object], bytes]:
     """Prove only sanitized, durable material selected by a ready runtime."""
     rendered_compose, rendered_caddy = provisioned_host_material(release, domain)
@@ -1300,6 +1302,7 @@ def runtime_attestation(
         "caddy_sha256": hashes["caddy"],
         "running_services_sha256": running_services_sha256,
         "client_binding_binary_sha256": client_binding_binary_sha256,
+        "migration_proof_sha256": migration_proof_sha256,
     }
     value = dict(body)
     value["attestation_sha256"] = digest(canonical(body))
@@ -1323,13 +1326,13 @@ def validate_runtime_attestation(raw: bytes, receipt: dict[str, object]) -> dict
         if value.get(key) != receipt[key]:
             raise ContractError("runtime attestation differs from receipt")
     for key in ("production_env_sha256", "compose_sha256", "caddy_sha256",
-                "running_services_sha256", "client_binding_binary_sha256"):
+                "running_services_sha256", "client_binding_binary_sha256", "migration_proof_sha256"):
         if not isinstance(value.get(key), str) or HEX64.fullmatch(value[key]) is None:
             raise ContractError("runtime attestation digest is invalid")
     return value
 
 
-def prove_live_runtime(manifest: dict[str, object], migrations_present: bool) -> tuple[str, str]:
+def prove_live_runtime(manifest: dict[str, object], migrations_present: bool) -> tuple[str, str, str]:
     environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
     result = subprocess.run(
         ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
@@ -1347,44 +1350,53 @@ def prove_live_runtime(manifest: dict[str, object], migrations_present: bool) ->
     required = {"dtx-node", "realtime-gateway", "agent-control"}
     if set(images) & required != required or any(images[name] != manifest["server_image"] for name in required):
         raise ContractError("running candidate service image differs from authenticated release")
+    binary_test = ["test", "-x", "/usr/local/bin/dtx-identity-provision"] if migrations_present else [
+        "test", "!", "-e", "/usr/local/bin/dtx-identity-provision"
+    ]
     subprocess.run(
         ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
          str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE), "exec", "-T", "dtx-node",
-         "test", "-x", "/usr/local/bin/dtx-identity-provision"],
+         *binary_test],
         env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         check=True, timeout=120,
     )
     expected = "= 3" if migrations_present else "= 0"
+    migration_query = (
+        "SELECT CASE WHEN count(*) " + expected + " AND count(*) FILTER (WHERE success) " + expected
+        + " THEN 'ok' ELSE 'not-ok' END FROM public._sqlx_migrations WHERE version IN "
+        "(202607230056,202607230057,202607230058)"
+    )
     migrations = subprocess.run(
         ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
-         str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE), "exec", "-T", "postgres", "sh", "-ec",
-         "psql -U postgres -d \"$POSTGRES_DB\" -At -c \"SELECT CASE WHEN count(*) "
-         f"{expected} THEN 'ok' ELSE 'not-ok' END FROM public._sqlx_migrations WHERE success "
-         "AND version IN (202607230056,202607230057,202607230058)\""],
+         str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE), "exec", "-T", "postgres", "psql",
+         "-v", "ON_ERROR_STOP=1", "-U", "dtx_admin", "-d", "dtx_node", "-At", "-c", migration_query],
         env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         check=True, timeout=120,
     )
     if migrations.stdout != b"ok\n":
         raise ContractError("fixed migration runtime proof failed")
-    return digest(canonical({name: images[name] for name in sorted(required)})), digest(
-        str(manifest["server_image"]).encode() + b"\0dtx-identity-provision\0client-binding-issue"
+    return (
+        digest(canonical({name: images[name] for name in sorted(required)})),
+        digest(str(manifest["server_image"]).encode() + b"\0dtx-identity-provision"),
+        digest(canonical({"versions": [202607230056, 202607230057, 202607230058], "success": migrations_present})),
     )
 
 
 def attest_runtime(release: Path, manifest: dict[str, object], domain: str) -> None:
-    services, binding = prove_live_runtime(manifest, True)
-    _value, raw = runtime_attestation(release, manifest, domain, services, binding)
+    services, binding, migrations = prove_live_runtime(manifest, True)
+    _value, raw = runtime_attestation(release, manifest, domain, services, binding, migrations)
     atomic_write(RUNTIME_ATTESTATION, raw)
 
 
 def runtime_is_attested(release: Path, manifest: dict[str, object], receipt: dict[str, object]) -> bool:
     raw = read_secure(RUNTIME_ATTESTATION, 0o600, MAX_RECEIPT_BYTES)
     recorded = validate_runtime_attestation(raw, receipt)
-    services, binding = prove_live_runtime(manifest, True)
+    services, binding, migrations = prove_live_runtime(manifest, True)
     current, _expected = runtime_attestation(release, manifest, str(receipt["domain"]))
     return all(recorded[key] == current[key] for key in (
         "production_env_sha256", "compose_sha256", "caddy_sha256",
-    )) and recorded["running_services_sha256"] == services and recorded["client_binding_binary_sha256"] == binding
+    )) and recorded["running_services_sha256"] == services and recorded["client_binding_binary_sha256"] == binding \
+        and recorded["migration_proof_sha256"] == migrations
 
 
 def invoke_candidate_update(release: Path) -> None:
@@ -1503,9 +1515,10 @@ def install_once() -> None:
         )
         expected_previous = None if current is None else current["receipt_sha256"]
         if replay:
-            replay_release, replay_manifest = load_retained_release(current)
-            if not runtime_is_attested(replay_release, replay_manifest, current):
-                raise ContractError("candidate receipt has no exact ready runtime attestation")
+            if current["previous_receipt_sha256"] is not None:
+                replay_release, replay_manifest = load_retained_release(current)
+                if not runtime_is_attested(replay_release, replay_manifest, current):
+                    raise ContractError("candidate receipt has no exact ready runtime attestation")
             return
         recovered_candidate = find_candidate_receipt(request)
         if recovered_candidate is not None and (
@@ -1517,22 +1530,18 @@ def install_once() -> None:
             )
         ):
             recovered_receipt, recovered_raw = recovered_candidate
-            recovered_release, recovered_manifest = load_retained_release(recovered_receipt)
-            if not runtime_is_attested(recovered_release, recovered_manifest, recovered_receipt):
-                raise ContractError("recovered candidate receipt has no exact ready runtime attestation")
+            if current is not None:
+                recovered_release, recovered_manifest = load_retained_release(recovered_receipt)
+                if not runtime_is_attested(recovered_release, recovered_manifest, recovered_receipt):
+                    raise ContractError("recovered candidate receipt has no exact ready runtime attestation")
             atomic_write(CURRENT_RECEIPT, recovered_raw)
             return
         if current is not None and not recovered_rollback and request["previous_receipt_sha256"] != expected_previous:
             raise ContractError("install request does not chain from the current receipt")
-        prior_release: Path | None = None
-        prior_manifest: dict[str, object] | None = None
-        rollback_previous = expected_previous
         if current is not None:
-            prior_release, prior_manifest = load_retained_release(current)
+            prior_release, _prior_manifest = load_retained_release(current)
             if not compatible(prior_release):
                 raise ContractError("retained release has no authenticated forward migration compatibility marker")
-            if recovered_rollback:
-                rollback_previous = current["previous_receipt_sha256"]
         if (
             current is not None
             and request["version"] != current["version"]
@@ -1549,18 +1558,12 @@ def install_once() -> None:
                 # Only a first install may materialize directories and baseline
                 # configuration through the authenticated install.sh.
                 invoke_fixed_installer(release, manifest)
-            activate_candidate(release, manifest, str(request["domain"]))
+            else:
+                activate_candidate(release, manifest, str(request["domain"]))
         except (ContractError, OSError, subprocess.SubprocessError) as install_error:
             if current is None:
                 raise ContractError("candidate installer failed and no prior release exists") from install_error
-            try:
-                assert prior_release is not None and prior_manifest is not None
-                install_code_only_rollback(prior_release, prior_manifest)
-            except (ContractError, OSError, subprocess.SubprocessError) as rollback_error:
-                raise ContractError(
-                    "candidate failed and retained prior services did not become ready; recovery remains nonterminal"
-                ) from rollback_error
-            raise ContractError("candidate activation failed; prior compatible release restored") from install_error
+            raise ContractError("candidate activation failed; authenticated update rollback remains authoritative") from install_error
         publish_receipt(
             request,
             "installed",

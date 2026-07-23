@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.machinery
+import inspect
 import subprocess
 import tempfile
 from pathlib import Path
@@ -341,6 +342,55 @@ def main() -> None:
         MODULE.attest_runtime = original_attest_runtime
         MODULE.RUNTIME_ATTESTATION = original_runtime_attestation
         MODULE.read_secure = original_read
+
+    # Proof commands are direct, fixed argv. The incident proof requires the
+    # old binary to be absent; candidate proof requires it executable.
+    original_run = MODULE.subprocess.run
+    try:
+        calls: list[list[str]] = []
+        class Result:
+            def __init__(self, stdout: bytes) -> None: self.stdout = stdout
+        images = b'[{"Service":"dtx-node","Image":"' + request["server_image"].encode() + b'"},' \
+            + b'{"Service":"realtime-gateway","Image":"' + request["server_image"].encode() + b'"},' \
+            + b'{"Service":"agent-control","Image":"' + request["server_image"].encode() + b'"}]'
+        def proof_run(command: list[str], **_kwargs: object) -> Result:
+            calls.append(command)
+            return Result(images if command[-2:] == ["--format", "json"] else b"ok\n")
+        MODULE.subprocess.run = proof_run
+        MODULE.prove_live_runtime(request, True)
+        assert calls[1][-3:] == ["test", "-x", "/usr/local/bin/dtx-identity-provision"]
+        assert "sh" not in calls[2] and calls[2][-9:-1] == [
+            "-v", "ON_ERROR_STOP=1", "-U", "dtx_admin", "-d", "dtx_node", "-At", "-c",
+        ]
+        assert "202607230056" in calls[2][-1] and "202607230058" in calls[2][-1]
+        calls.clear(); MODULE.prove_live_runtime(prior, False)
+        assert calls[1][-4:] == ["test", "!", "-e", "/usr/local/bin/dtx-identity-provision"]
+    finally:
+        MODULE.subprocess.run = original_run
+
+    # The migration-state digest is authenticated and therefore replay-tamper
+    # resistant, just like the configured/runtime digests.
+    body = {
+        "schema": MODULE.RUNTIME_ATTESTATION_SCHEMA, "schema_version": 1,
+        "bundle_sha256": receipt["bundle_sha256"], "version": receipt["version"],
+        "server_image": receipt["server_image"], "migrator_image": receipt["migrator_image"],
+        "production_env_sha256": "0" * 64, "compose_sha256": "0" * 64,
+        "caddy_sha256": "0" * 64, "running_services_sha256": "0" * 64,
+        "client_binding_binary_sha256": "0" * 64, "migration_proof_sha256": "0" * 64,
+    }
+    value = dict(body); value["attestation_sha256"] = MODULE.digest(MODULE.canonical(body))
+    tampered = dict(value); tampered["migration_proof_sha256"] = "f" * 64
+    try: MODULE.validate_runtime_attestation(MODULE.canonical(tampered), receipt)
+    except MODULE.ContractError: pass
+    else: raise AssertionError("migration-proof attestation tamper was accepted")
+
+    # Keep first-install/replay control flow isolated from runtime activation,
+    # and leave update.sh as the sole failed-update rollback authority.
+    install_source = inspect.getsource(MODULE.install_once)
+    assert "if current is None:\n                # Only a first install" in install_source
+    assert "else:\n                activate_candidate" in install_source
+    assert "install_code_only_rollback" not in install_source
+    assert "if current[\"previous_receipt_sha256\"] is not None:" in install_source
 
     print("production cross-version crash/replay/receipt/rollback checks passed")
 
