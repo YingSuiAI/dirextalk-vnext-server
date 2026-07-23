@@ -107,8 +107,22 @@ assert_count() {
 test_root=$(mktemp -d)
 trap 'find "$test_root" -type f -delete; find "$test_root" -depth -type d -empty -delete' EXIT
 
-# Crash after candidate migration/start but before readiness: replay probes the
-# existing candidate and never reruns compose up/migrations.
+# Crash immediately after the pre-call phase: no candidate Compose command has
+# run, and replay must execute the exact authenticated candidate once.
+started_crash="$test_root/started-crash"
+make_fixture "$started_crash"
+if run_worker "$started_crash" DTX_TEST_FAULT=after-phase-candidate_started; then
+    echo 'candidate_started crash injection unexpectedly succeeded' >&2
+    exit 1
+fi
+[[ $(cat "$started_crash/state/phase") == candidate_started ]]
+assert_count 0 'compose:candidate.env:up -d --remove-orphans' "$started_crash/events"
+run_worker "$started_crash"
+[[ $(cat "$started_crash/state/phase") == ready ]]
+assert_count 1 'compose:candidate.env:up -d --remove-orphans' "$started_crash/events"
+
+# A crash after Compose returns but before candidate_applied is durable leaves
+# only pre-call evidence. Replay reconciles the exact candidate Compose again.
 compose_crash="$test_root/compose-crash"
 make_fixture "$compose_crash"
 if run_worker "$compose_crash" DTX_TEST_FAULT=after-candidate-compose; then
@@ -120,7 +134,21 @@ run_worker "$compose_crash"
 [[ $(cat "$compose_crash/state/phase") == ready ]]
 cmp "$compose_crash/production.env" "$compose_crash/candidate.env"
 cmp "$compose_crash/current.env" "$compose_crash/candidate.env"
-assert_count 1 'compose:candidate.env:up -d --remove-orphans' "$compose_crash/events"
+assert_count 2 'compose:candidate.env:up -d --remove-orphans' "$compose_crash/events"
+
+# candidate_applied is the first durable proof that Compose returned success.
+# Replay from it skips Compose and performs only readiness and promotion.
+applied_crash="$test_root/applied-crash"
+make_fixture "$applied_crash"
+if run_worker "$applied_crash" DTX_TEST_FAULT=after-phase-candidate_applied; then
+    echo 'candidate_applied crash injection unexpectedly succeeded' >&2
+    exit 1
+fi
+[[ $(cat "$applied_crash/state/phase") == candidate_applied ]]
+assert_count 1 'compose:candidate.env:up -d --remove-orphans' "$applied_crash/events"
+run_worker "$applied_crash"
+[[ $(cat "$applied_crash/state/phase") == ready ]]
+assert_count 1 'compose:candidate.env:up -d --remove-orphans' "$applied_crash/events"
 
 # Root-state tampering is detected by the authenticated intent before any
 # Docker command is issued.
@@ -198,5 +226,116 @@ fi
 grep -qx 'status=recovery_failed' "$failed_recovery/state/receipt"
 ! grep -qx 'status=rolled_back' "$failed_recovery/state/receipt"
 grep -q 'retained prior services did not become ready' "$failed_recovery/error"
+
+# An unrepaired retry performs one readiness attempt, remains nonterminal, and
+# does not re-enter either candidate or prior long-service Compose.
+if run_worker "$failed_recovery" DTX_TEST_PRIOR_FAIL=1 \
+    2>"$failed_recovery/retry-error"; then
+    echo 'unrepaired recovery retry unexpectedly succeeded' >&2
+    exit 1
+else
+    retry_status=$?
+fi
+[[ "$retry_status" == 2 ]]
+[[ $(cat "$failed_recovery/state/phase") == recovery_failed ]]
+grep -qx 'status=recovery_failed' "$failed_recovery/state/receipt"
+grep -q 'bounded recovery recheck' "$failed_recovery/retry-error"
+
+# The same authenticated intent has one bounded readiness recheck per
+# invocation after operator repair. It never re-enters candidate or prior
+# long-service Compose, and publishes rolled_back only after readiness.
+if run_worker "$failed_recovery" 2>"$failed_recovery/resume-error"; then
+    echo 'repaired recovery unexpectedly reported update success' >&2
+    exit 1
+else
+    resume_status=$?
+fi
+[[ "$resume_status" == 1 ]]
+[[ $(cat "$failed_recovery/state/phase") == rolled_back ]]
+grep -qx 'status=rolled_back' "$failed_recovery/state/receipt"
+assert_count 1 'compose:candidate.env:up -d --remove-orphans' "$failed_recovery/events"
+assert_count 1 'compose:prior.env:up -d --no-deps dtx-node realtime-gateway agent-control caddy' \
+    "$failed_recovery/events"
+assert_count 3 'ready:prior.env' "$failed_recovery/events"
+grep -q 'repaired prior release is ready on the forward schema' "$failed_recovery/resume-error"
+
+# Lock admission rejects unsafe files and serializes concurrent update critical
+# sections under one root-owned, non-symlink flock.
+unsafe_lock="$test_root/unsafe-lock"
+mkdir -p "$unsafe_lock"
+chmod 0700 "$unsafe_lock"
+touch "$unsafe_lock/target"
+ln -s "$unsafe_lock/target" "$unsafe_lock/update.lock"
+if (
+    # shellcheck source=scripts/production-stack/update.sh
+    source "$root/scripts/production-stack/update.sh"
+    update_lock="$unsafe_lock/update.lock"
+    state_owner_uid=$(id -u)
+    state_owner_gid=$(id -g)
+    sync_path() { :; }
+    acquire_update_lock
+) 2>/dev/null; then
+    echo 'symlink production update lock unexpectedly accepted' >&2
+    exit 1
+fi
+
+unsafe_mode_lock="$test_root/unsafe-mode-lock"
+mkdir -p "$unsafe_mode_lock"
+chmod 0700 "$unsafe_mode_lock"
+touch "$unsafe_mode_lock/update.lock"
+chmod 0644 "$unsafe_mode_lock/update.lock"
+if (
+    # shellcheck source=scripts/production-stack/update.sh
+    source "$root/scripts/production-stack/update.sh"
+    update_lock="$unsafe_mode_lock/update.lock"
+    state_owner_uid=$(id -u)
+    state_owner_gid=$(id -g)
+    sync_path() { :; }
+    acquire_update_lock
+) 2>/dev/null; then
+    echo 'world-readable production update lock unexpectedly accepted' >&2
+    exit 1
+fi
+
+lock_worker() (
+    local fixture=$1 worker_id=$2
+    # shellcheck source=scripts/production-stack/update.sh
+    source "$root/scripts/production-stack/update.sh"
+    update_lock="$fixture/update.lock"
+    state_owner_uid=$(id -u)
+    state_owner_gid=$(id -g)
+    sync_path() { :; }
+    run_locked_update() {
+        printf 'enter:%s\n' "$worker_id" >>"$fixture/events"
+        touch "$fixture/entered-$worker_id"
+        if [[ "$worker_id" == first ]]; then
+            while [[ ! -f "$fixture/release-first" ]]; do
+                sleep 0.01
+            done
+        fi
+        printf 'exit:%s\n' "$worker_id" >>"$fixture/events"
+    }
+    run_serialized_update
+)
+
+concurrent_lock="$test_root/concurrent-lock"
+mkdir -p "$concurrent_lock"
+chmod 0700 "$concurrent_lock"
+lock_worker "$concurrent_lock" first &
+first_pid=$!
+for _attempt in $(seq 1 100); do
+    [[ -f "$concurrent_lock/entered-first" ]] && break
+    sleep 0.01
+done
+[[ -f "$concurrent_lock/entered-first" ]]
+lock_worker "$concurrent_lock" second &
+second_pid=$!
+sleep 0.2
+[[ ! -f "$concurrent_lock/entered-second" ]]
+touch "$concurrent_lock/release-first"
+wait "$first_pid"
+wait "$second_pid"
+diff -u <(printf '%s\n' enter:first exit:first enter:second exit:second) \
+    "$concurrent_lock/events"
 
 echo 'production update executable crash/replay/recovery checks passed'

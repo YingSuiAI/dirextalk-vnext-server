@@ -339,3 +339,5 @@ facts = script.index("python3 tools/production-release.py emit-facts")
 if not migrator_readback < latest_move < facts:
     raise SystemExit("latest discovery pointer is not ordered after both immutable read-backs")
 PY
+bash scripts/test-production-cross-version-postgres.sh
+echo 'release image and retained cross-version compatibility gates passed'
