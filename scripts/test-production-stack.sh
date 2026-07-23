@@ -68,7 +68,24 @@ done
 for script in "$root"/scripts/production-stack/{install,bootstrap,update,verify,down,cleanup-cache,validate-images,validate-files}.sh; do
     test -x "$script" || { echo "not executable: $script" >&2; exit 1; }
 done
-for helper in "$root"/scripts/production-stack/host/{install-vnext,read-vnext-receipt}; do
+for helper in "$root"/scripts/production-stack/host/{install-vnext,read-vnext-receipt,client-binding-issue,client-binding-expire,client-binding-revoke,client-binding-export-cleanup}; do
     test -x "$helper" || { echo "not executable: $helper" >&2; exit 1; }
 done
+grep -q 'client-binding-issue' "$root/tools/vnext-stack-bundle.py"
+grep -q 'client-binding-expire' "$root/tools/vnext-stack-bundle.py"
+grep -q 'client-binding-revoke' "$root/tools/vnext-stack-bundle.py"
+grep -q 'client-binding-export-cleanup' "$root/tools/vnext-stack-bundle.py"
+grep -q '/etc/dirextalk/vnext/client-binding' "$root/scripts/production-stack/host/client-binding-export-cleanup"
+grep -q 'shred --remove=unlink' "$root/scripts/production-stack/host/client-binding-export-cleanup"
+grep -q '/home/ubuntu/dirextalk-client-binding.request' "$root/scripts/production-stack/host/client-binding-issue"
+grep -q '/home/ubuntu/dirextalk-client-binding.import.json' "$root/scripts/production-stack/host/client-binding-issue"
+grep -q "1000:1000:400" "$root/scripts/production-stack/host/client-binding-issue"
+grep -q "0:0:600" "$root/scripts/production-stack/host/client-binding-issue"
+grep -q 'mv -T.*dirextalk-client-binding.request\|mv -T -- "\$staged"' "$root/scripts/production-stack/host/client-binding-issue"
+grep -q 'mv -fT.*"\$export"' "$root/scripts/production-stack/host/client-binding-issue"
+grep -q ':%h' "$root/scripts/production-stack/host/client-binding-issue"
+grep -q '/home/ubuntu/dirextalk-client-binding.request' "$root/scripts/production-stack/host/client-binding-export-cleanup"
+grep -q '/home/ubuntu/dirextalk-client-binding.import.json' "$root/scripts/production-stack/host/client-binding-export-cleanup"
+grep -q "1000:1000:400" "$root/scripts/production-stack/host/client-binding-export-cleanup"
+! grep -Eq 'client-binding-(issue|expire|revoke|export-cleanup).*\$[A-Za-z_]+|client-binding-(issue|expire|revoke|export-cleanup).*\$\{[A-Za-z_]+' "$root/scripts/production-stack/host"/*
 echo 'production stack structural/negative checks passed'

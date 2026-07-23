@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ "$(id -u)" == 0 ]] || { echo 'client-binding export cleanup requires root' >&2; exit 1; }
+root=/etc/dirextalk/vnext/client-binding
+[[ -d "$root" && ! -L "$root" ]] || { echo 'missing client-binding directory' >&2; exit 1; }
+[[ "$(stat -c '%u:%g:%a' "$root")" == '0:0:700' ]] || { echo 'client-binding directory must be root:root 0700' >&2; exit 1; }
+command -v shred >/dev/null 2>&1 || { echo 'shred is required for export cleanup' >&2; exit 1; }
+
+# Fixed allowlist: exported binding material is never selected by caller input.
+for file in \
+  "$root/import.json" \
+  "$root/request.json" \
+  "$root/request.json.tmp" \
+  "$root/import.json.export.tmp" \
+  "$root/revoke-binding-id" \
+  /home/ubuntu/dirextalk-client-binding.request \
+  /home/ubuntu/dirextalk-client-binding.import.json; do
+  if [[ -e "$file" || -L "$file" ]]; then
+    [[ -f "$file" && ! -L "$file" ]] || { echo 'client-binding artifact must be a regular file' >&2; exit 1; }
+    case "$file" in
+      /home/ubuntu/dirextalk-client-binding.request|/home/ubuntu/dirextalk-client-binding.import.json|"$root/import.json.export.tmp")
+        [[ "$(stat -c '%u:%g:%a' "$file")" == '1000:1000:400' ]] || { echo 'ubuntu client-binding artifact must be ubuntu:ubuntu 0400' >&2; exit 1; }
+        ;;
+      *)
+        [[ "$(stat -c '%u:%g:%a' "$file")" == '0:0:600' ]] || { echo 'client-binding artifact must be root:root 0600' >&2; exit 1; }
+        ;;
+    esac
+    shred --remove=unlink -- "$file" >/dev/null 2>&1
+  fi
+done

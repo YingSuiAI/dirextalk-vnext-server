@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if (( $# != 0 )); then
+  echo 'usage: client-binding-revoke' >&2
+  exit 2
+fi
 [[ "$(id -u)" == 0 ]] || { echo 'client-binding revocation requires root' >&2; exit 1; }
 file=/etc/dirextalk/vnext/client-binding/revoke-binding-id
 [[ -f "$file" && ! -L "$file" && "$(stat -c '%u:%g:%a' "$file")" == '0:0:600' ]] || { echo 'revoke binding id must be root:root 0600' >&2; exit 1; }
-exec docker compose --project-name dirextalk-vnext-production --env-file /etc/dirextalk/vnext/config/production.env -f /etc/dirextalk/vnext/config/production-compose.yml --profile client-binding-revoke run --rm --no-deps client-binding-revoker
+exec docker compose --project-name dirextalk-vnext-production --env-file /etc/dirextalk/vnext/config/production.env -f /etc/dirextalk/vnext/config/production-compose.yml --profile client-binding-revoke run --rm --no-deps client-binding-revoker >/dev/null

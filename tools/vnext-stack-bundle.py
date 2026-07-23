@@ -38,6 +38,10 @@ FILES = (
     "scripts/production-stack/bootstrap.sh",
     "scripts/production-stack/cleanup-cache.sh",
     "scripts/production-stack/down.sh",
+    "scripts/production-stack/host/client-binding-expire",
+    "scripts/production-stack/host/client-binding-export-cleanup",
+    "scripts/production-stack/host/client-binding-issue",
+    "scripts/production-stack/host/client-binding-revoke",
     "scripts/production-stack/install.sh",
     "scripts/production-stack/update.sh",
     "scripts/production-stack/validate-files.sh",
@@ -45,7 +49,9 @@ FILES = (
     "scripts/production-stack/verify.sh",
     "tools/validate-production-images.py",
 )
-EXECUTABLES = frozenset(path for path in FILES if path.endswith((".sh", ".py")))
+EXECUTABLES = frozenset(
+    path for path in FILES if path.endswith((".sh", ".py")) or path.startswith("scripts/production-stack/host/")
+)
 MANIFEST_KEYS = {
     "schema", "schema_version", "version", "source_commit", "target",
     "server_image", "migrator_image", "installer_sha256", "files",
