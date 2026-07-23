@@ -287,16 +287,21 @@ END
 $roles$;
 SQL
 
+prior_evidence="$fixture/prior-migrations.expected"
+prior_actual="$fixture/prior-migrations.actual"
+: >"$prior_evidence"
 for migration in "$fixture"/migrations/*.up.sql; do
     base=$(basename "$migration" .up.sql)
     version=${base%%_*}
-    description=${base#*_}
+    description_slug=${base#*_}
+    description=${description_slug//_/ }
     checksum=$(sha384sum "$migration" | awk '{print $1}')
     psql_admin --single-transaction >/dev/null <"$migration"
     psql_admin >/dev/null <<SQL
 INSERT INTO public._sqlx_migrations(version,description,success,checksum,execution_time)
 VALUES ($version,'$description',true,decode('$checksum','hex'),0);
 SQL
+    printf '%s|%s|%s\n' "$version" "$description" "$checksum" >>"$prior_evidence"
 done
 
 # Establish the exact live 0.1.1 grants before the version transition.
@@ -320,11 +325,12 @@ for migration_path in "${candidate_migrations[@]}"; do
     git -C "$root" show "$candidate_commit:$migration_path" >"$candidate_migration"
     base=$(basename "$candidate_migration" .up.sql)
     version=${base%%_*}
-    description=${base#*_}
-    [[ "$version" =~ ^[0-9]{12}$ && "$description" =~ ^[a-z0-9_]+$ ]] || {
+    description_slug=${base#*_}
+    [[ "$version" =~ ^[0-9]{12}$ && "$description_slug" =~ ^[a-z0-9_]+$ ]] || {
         echo "candidate forward migration name is invalid: $migration_path" >&2
         exit 1
     }
+    description=${description_slug//_/ }
     (( 10#$version > 10#$last_version )) || {
         echo "candidate forward migration order is invalid: $migration_path" >&2
         exit 1
@@ -355,6 +361,12 @@ expected_migration_count=$((
 ))
 psql_admin -At -c "SELECT count(*) FROM public._sqlx_migrations WHERE success" \
     | grep -qx "$expected_migration_count"
+psql_admin -At -F '|' -c \
+    "SELECT version,description,encode(checksum,'hex')
+     FROM public._sqlx_migrations
+     WHERE version <= $prior_last_version
+     ORDER BY version" >"$prior_actual"
+diff -u "$prior_evidence" "$prior_actual"
 psql_admin -At -F '|' -c \
     "SELECT version,description,encode(checksum,'hex')
      FROM public._sqlx_migrations

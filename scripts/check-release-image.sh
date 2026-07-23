@@ -387,14 +387,19 @@ for required in (
         fail(f"release README contract missing: {required}")
 PY
 python3 tools/production-release.py self-test --repository-root .
+python3 tools/production-source-snapshot.py self-test
 bash -n scripts/publish-production-release.sh scripts/cleanup-production-release.sh
-for script in scripts/publish-production-release.sh scripts/cleanup-production-release.sh tools/production-release.py; do
+for script in \
+    scripts/publish-production-release.sh \
+    scripts/cleanup-production-release.sh \
+    tools/production-release.py \
+    tools/production-source-snapshot.py; do
     test -x "$script" || { echo "release helper is not executable: $script" >&2; exit 1; }
 done
 grep -q 'dirextalk.vnet-server-release-input' docker/release/production-release.json
 grep -q -- '--platform linux/amd64' scripts/publish-production-release.sh
-grep -q -- '--file docker/release/Dockerfile' scripts/publish-production-release.sh
-grep -q -- '--file docker/production/Dockerfile.migrate' scripts/publish-production-release.sh
+grep -q -- '--file "\$build_context/docker/release/Dockerfile"' scripts/publish-production-release.sh
+grep -q -- '--file "\$build_context/docker/production/Dockerfile.migrate"' scripts/publish-production-release.sh
 grep -q 'runtime_version_tag=.*repository.*version' scripts/publish-production-release.sh
 grep -q 'migrator_version_tag=.*repository:migrate-.*version' scripts/publish-production-release.sh
 grep -q 'verified-digest' scripts/publish-production-release.sh
@@ -403,17 +408,64 @@ grep -q 'buildx imagetools create' scripts/publish-production-release.sh
 grep -q 'buildx rm --force' scripts/cleanup-production-release.sh
 ! grep -Eq 'docker (image|volume|system) (rm|prune)' scripts/{publish,cleanup}-production-release.sh
 python3 - <<'PY'
+import re
 from pathlib import Path
 
 script = Path("scripts/publish-production-release.sh").read_text()
 migration_preflight = script.index("bash scripts/test-production-cross-version-postgres.sh")
+source_validations = [
+    match.start()
+    for match in re.finditer(r'python3 "\$snapshot_tool" validate-source', script)
+]
+if len(source_validations) != 2:
+    raise SystemExit("publication must validate the exact source before and after preflight")
+snapshot_prepare = script.index('python3 "$snapshot_tool" prepare')
+snapshot_verifications = [
+    match.start()
+    for match in re.finditer(r'python3 "\$snapshot_tool" verify', script)
+]
+if len(snapshot_verifications) != 3:
+    raise SystemExit("publication must verify the snapshot before the builder and both builds")
 builder_creation = script.index('builder="dtx-vnet-release-')
-first_push = script.index("docker buildx build")
-if not migration_preflight < builder_creation < first_push:
-    raise SystemExit("cross-version migration preflight must precede builder creation and image push")
+build_positions = [match.start() for match in re.finditer(r"docker buildx build \\\n", script)]
+if len(build_positions) != 2:
+    raise SystemExit("publication must have exactly two immutable image builds")
+if not (
+    source_validations[0]
+    < snapshot_prepare
+    < migration_preflight
+    < source_validations[1]
+    < snapshot_verifications[0]
+    < builder_creation
+    < snapshot_verifications[1]
+    < build_positions[0]
+    < snapshot_verifications[2]
+    < build_positions[1]
+):
+    raise SystemExit("commit snapshot/preflight/source revalidation ordering is unsafe")
+build_blocks = re.findall(
+    r"docker buildx build \\\n(?P<body>.*?)(?=\ndocker buildx imagetools inspect)",
+    script,
+    flags=re.DOTALL,
+)
+if len(build_blocks) != len(build_positions):
+    raise SystemExit("publication build blocks could not be parsed exactly")
+expected_dockerfiles = (
+    '--file "$build_context/docker/release/Dockerfile"',
+    '--file "$build_context/docker/production/Dockerfile.migrate"',
+)
+for block, dockerfile in zip(build_blocks, expected_dockerfiles, strict=True):
+    if dockerfile not in block:
+        raise SystemExit(f"build does not use its archived Dockerfile: {dockerfile}")
+    if not block.rstrip().endswith('"$build_context"'):
+        raise SystemExit("build does not use the shared commit snapshot as its context")
+    if '--label "org.opencontainers.image.revision=$source_commit"' not in block:
+        raise SystemExit("build revision label is not bound to the selected commit")
+if 'remove --state-root "$state"' not in script[script.index("finish() {"):snapshot_prepare]:
+    raise SystemExit("publication exit trap does not clean the source snapshot")
 migrator_readback = script.index('    --metadata "$state/migrator-metadata.json"')
 latest_move = script.index("# latest is a runtime discovery pointer only")
-facts = script.index("python3 tools/production-release.py emit-facts")
+facts = script.index('"$build_context/tools/production-release.py" emit-facts')
 if not migrator_readback < latest_move < facts:
     raise SystemExit("latest discovery pointer is not ordered after both immutable read-backs")
 PY

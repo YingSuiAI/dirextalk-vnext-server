@@ -130,7 +130,12 @@ input versions together, commit them, and publish only from a clean worktree:
 bash scripts/publish-production-release.sh
 ```
 
-The no-argument publisher creates a unique disposable Buildx builder and first
+After proving the clean `HEAD`, the no-argument publisher extracts that exact
+commit with `git archive` into a private, verified source snapshot under
+`target/production-release`. It reruns the source check after the mandatory
+cross-version gate and before creating a unique disposable Buildx builder.
+Both runtime and migrator builds use the same read-only snapshot, so a later
+working-tree change cannot alter either build context. The publisher first
 proves all four immutable tags absent. It publishes the runtime Dockerfile as
 `dirextalk/vnet-server:<semver>` and `:git-<40hex>`, and the production migrator
 as `:migrate-<semver>` and `:migrate-git-<40hex>`. Both builds target only
@@ -138,7 +143,8 @@ as `:migrate-<semver>` and `:migrate-git-<40hex>`. Both builds target only
 each immutable tag and requires each pair to match its Buildx push metadata.
 Only after both products pass that check does it repoint
 `dirextalk/vnet-server:latest` to the runtime digest and read that pointer back.
-The migrator is never published as or selected through `latest`.
+The migrator is never published as or selected through `latest`. The snapshot
+is removed on every normal publisher exit together with its builder state.
 
 On success, canonical digest facts are written to
 `target/production-release/release-facts.json`. Runtime execution uses only its

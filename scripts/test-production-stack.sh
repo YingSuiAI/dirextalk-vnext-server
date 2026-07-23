@@ -197,6 +197,12 @@ grep -q 'diff --name-status --no-renames' \
     "$root/scripts/test-production-cross-version-postgres.sh"
 grep -q 'candidate-migrations.expected' \
     "$root/scripts/test-production-cross-version-postgres.sh"
+grep -q 'prior-migrations.expected' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+[[ $(grep -Fc 'description=${description_slug//_/ }' \
+    "$root/scripts/test-production-cross-version-postgres.sh") -eq 2 ]]
+! grep -Fq 'description=${base#*_}' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
 grep -q 'candidate_migration_count=.*candidate_migrations' \
     "$root/scripts/test-production-cross-version-postgres.sh"
 grep -q 'secrets.token_hex(8)' \
@@ -209,6 +215,16 @@ grep -q 'docker logs "\$retained_container_id"' \
     "$root/scripts/test-production-cross-version-postgres.sh"
 grep -q -- '--runtime-image "\$repository@\$runtime_digest"' "$root/scripts/publish-production-release.sh"
 grep -q -- '--migrator-image "\$repository@\$migrator_digest"' "$root/scripts/publish-production-release.sh"
+grep -q 'snapshot_tool=.*production-source-snapshot.py' \
+    "$root/scripts/publish-production-release.sh"
+grep -q 'validate-source' \
+    "$root/scripts/publish-production-release.sh"
+grep -q -- '--file "\$build_context/docker/release/Dockerfile"' \
+    "$root/scripts/publish-production-release.sh"
+grep -q -- '--file "\$build_context/docker/production/Dockerfile.migrate"' \
+    "$root/scripts/publish-production-release.sh"
+[[ $(grep -Fc '    "$build_context"' "$root/scripts/publish-production-release.sh") -eq 2 ]]
+test -x "$root/tools/production-source-snapshot.py"
 test -x "$root/tools/test-client-binding-release-artifacts.py"
 for test_script in "$root"/scripts/{test-production-stack-update-recovery,test-production-cross-version-postgres}.sh; do
     test -x "$test_script" || { echo "not executable: $test_script" >&2; exit 1; }
