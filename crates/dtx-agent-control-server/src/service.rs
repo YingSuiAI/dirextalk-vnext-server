@@ -430,31 +430,32 @@ async fn drive_control(
     // boundary; retaining these small pending limits would cap legitimate NATs.
     drop(first_hello_permit);
     let mut last_delivered_sequence = opened.acknowledged_command_sequence;
-    for command in opened.replay_commands {
-        last_delivered_sequence = command.sequence();
-        if !send_frame(
+    let initial_replay = deliver_replay_commands(
+        opened.replay_commands,
+        protocol_minor,
+        &mut last_delivered_sequence,
+        &sender,
+    )
+    .await;
+    if initial_replay == ReplayDelivery::Closed {
+        return;
+    }
+
+    // Durable replay after subscription is mandatory even when the initial
+    // Hello transaction returned no backlog.
+    if initial_replay != ReplayDelivery::Held {
+        if !poll_and_deliver_commands(
+            application.as_ref(),
+            peer,
+            stream_fence,
+            protocol_minor,
+            &mut last_delivered_sequence,
             &sender,
-            v1::server_frame::Kind::DurableCommand(build_durable_command_frame(&command)),
         )
         .await
         {
             return;
         }
-    }
-
-    // Durable replay after subscription is mandatory even when the initial
-    // Hello transaction returned no backlog.
-    if !poll_and_deliver_commands(
-        application.as_ref(),
-        peer,
-        stream_fence,
-        protocol_minor,
-        &mut last_delivered_sequence,
-        &sender,
-    )
-    .await
-    {
-        return;
     }
     let mut run_offer_cursor = 0;
     let mut run_cancel_cursor = 0;
@@ -961,7 +962,12 @@ async fn poll_and_deliver_commands(
 ) -> bool {
     loop {
         let commands = match application
-            .poll_commands(peer, stream_fence, *last_delivered_sequence)
+            .poll_commands_for_protocol(
+                peer,
+                stream_fence,
+                *last_delivered_sequence,
+                protocol_minor,
+            )
             .await
         {
             Ok(commands) => commands,
@@ -978,13 +984,7 @@ async fn poll_and_deliver_commands(
                 send_status(sender, Status::internal("INTERNAL")).await;
                 return false;
             }
-            if protocol_minor < 4
-                && matches!(
-                    command.payload(),
-                    dtx_agent_control::ServerCommandPayload::PrepareAgentRouteRecipient(_)
-                        | dtx_agent_control::ServerCommandPayload::DeliverAgentRouteBootstrap(_)
-                )
-            {
+            if !command_is_delivery_eligible(protocol_minor, &command) {
                 // RouteBootstrap commands intentionally remain at the durable
                 // head until this Connector upgrades and negotiates Control
                 // v1.4. Advancing past one would break the exact command cursor.
@@ -1002,6 +1002,51 @@ async fn poll_and_deliver_commands(
         }
         tokio::task::yield_now().await;
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayDelivery {
+    Complete,
+    Held,
+    Closed,
+}
+
+async fn deliver_replay_commands(
+    commands: Vec<dtx_agent_control::DurableServerCommand>,
+    protocol_minor: u32,
+    last_delivered_sequence: &mut u64,
+    sender: &mpsc::Sender<Result<v1::ServerFrame, Status>>,
+) -> ReplayDelivery {
+    for command in commands {
+        if !command_is_delivery_eligible(protocol_minor, &command) {
+            // RouteBootstrap commands remain at the durable head until this
+            // Connector negotiates Control v1.4. Do not advance the transient
+            // cursor: a later command must not bypass the retained frame.
+            return ReplayDelivery::Held;
+        }
+        *last_delivered_sequence = command.sequence();
+        if !send_frame(
+            sender,
+            v1::server_frame::Kind::DurableCommand(build_durable_command_frame(&command)),
+        )
+        .await
+        {
+            return ReplayDelivery::Closed;
+        }
+    }
+    ReplayDelivery::Complete
+}
+
+fn command_is_delivery_eligible(
+    protocol_minor: u32,
+    command: &dtx_agent_control::DurableServerCommand,
+) -> bool {
+    protocol_minor >= 4
+        || !matches!(
+            command.payload(),
+            dtx_agent_control::ServerCommandPayload::PrepareAgentRouteRecipient(_)
+                | dtx_agent_control::ServerCommandPayload::DeliverAgentRouteBootstrap(_)
+        )
 }
 
 async fn send_frame(
@@ -1068,7 +1113,61 @@ fn application_status(error: ConnectorControlApplicationError) -> Status {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use dtx_agent_control::{
+        CloseStreamCommand, CommandLog, DurableServerCommand, DurableServerCommandSnapshot,
+        OpaqueAgentRouteBytes, PrepareAgentRouteRecipient, ServerCommandPayload,
+    };
+    use dtx_domain::{
+        AgentDeviceId, AgentRouteBootstrapId, BindingId, ConnectorId, DeviceId, IdentityId,
+        InstallationId, RequestId, Revision, TenantId,
+    };
+
     use super::*;
+
+    fn durable_command(
+        sequence: u64,
+        payload: ServerCommandPayload,
+    ) -> (DurableServerCommand, Vec<u8>) {
+        let operation_id = RequestId::new();
+        let encoded = crate::ProtobufDurableCommandEncoder
+            .encode(sequence, operation_id, 1, Revision::INITIAL, &payload)
+            .expect("fixture command encodes");
+        let payload_digest = encoded.payload_digest();
+        let exact_bytes = encoded.into_exact_bytes();
+        let expected = exact_bytes.as_slice().to_vec();
+        let command = DurableServerCommand::try_from_snapshot(DurableServerCommandSnapshot {
+            sequence,
+            operation_id,
+            generation: 1,
+            spec_revision: Revision::INITIAL,
+            payload,
+            payload_digest,
+            encoded_command_digest: exact_bytes.encoded_command_digest(),
+            exact_bytes,
+        })
+        .expect("fixture command snapshot is valid");
+        (command, expected)
+    }
+
+    fn route_bootstrap_prepare(sequence: u64) -> (DurableServerCommand, Vec<u8>) {
+        durable_command(
+            sequence,
+            ServerCommandPayload::PrepareAgentRouteRecipient(PrepareAgentRouteRecipient {
+                bootstrap_id: AgentRouteBootstrapId::new(),
+                tenant_id: TenantId::new(),
+                installation_id: InstallationId::new(),
+                binding_id: BindingId::new(),
+                agent_control_device_id: AgentDeviceId::new(),
+                owner_identity_id: "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la"
+                    .parse::<IdentityId>()
+                    .expect("fixture identity ID is canonical"),
+                owner_device_id: DeviceId::new(),
+                owner_signed_intent: OpaqueAgentRouteBytes::new(b"opaque-owner-intent".to_vec())
+                    .expect("fixture opaque intent is bounded"),
+                expires_at_millis: 2_000,
+            }),
+        )
+    }
 
     struct ReconcileTickApplication {
         calls: AtomicUsize,
@@ -1324,5 +1423,80 @@ mod tests {
             .expect_err("failure is not a successful frame");
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert_eq!(status.message(), "UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn route_bootstrap_replay_holds_at_head_before_v1_4_and_replays_exactly_at_v1_4() {
+        let (route_bootstrap, exact_route_bootstrap) = route_bootstrap_prepare(1);
+        let (later_command, _) = durable_command(
+            2,
+            ServerCommandPayload::CloseStream(CloseStreamCommand::reconnect()),
+        );
+        let (sender, mut receiver) = mpsc::channel(2);
+        let mut cursor = 0;
+        let mut durable_log =
+            CommandLog::new(TenantId::new(), ConnectorId::new(), 1, Revision::INITIAL)
+                .expect("fixture command log is valid");
+        durable_log
+            .append(
+                1,
+                Revision::INITIAL,
+                route_bootstrap.operation_id(),
+                route_bootstrap.payload().clone(),
+                route_bootstrap.payload_digest(),
+                route_bootstrap.exact_bytes().clone(),
+            )
+            .expect("fixture RouteBootstrap command appends");
+
+        assert_eq!(
+            deliver_replay_commands(
+                vec![route_bootstrap.clone(), later_command],
+                3,
+                &mut cursor,
+                &sender,
+            )
+            .await,
+            ReplayDelivery::Held,
+            "a v1.3 replay stays open while the RouteBootstrap durable head is retained",
+        );
+        assert_eq!(
+            cursor, 0,
+            "the transient cursor must remain before the blocked head"
+        );
+        assert_eq!(
+            durable_log.acknowledged_sequence(),
+            0,
+            "delivery eligibility never advances the durable ACK",
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receiver.recv())
+                .await
+                .is_err(),
+            "the blocked RouteBootstrap frame and every later frame stay unsent",
+        );
+
+        assert_eq!(
+            deliver_replay_commands(vec![route_bootstrap], 4, &mut cursor, &sender).await,
+            ReplayDelivery::Complete,
+            "v1.4 makes the retained RouteBootstrap frame eligible",
+        );
+        assert_eq!(cursor, 1);
+        assert_eq!(
+            durable_log.acknowledged_sequence(),
+            0,
+            "sending a replayed frame still requires a separate durable ACK",
+        );
+        let frame = receiver
+            .recv()
+            .await
+            .expect("eligible replay emits one frame")
+            .expect("eligible replay is not a status");
+        let Some(v1::server_frame::Kind::DurableCommand(frame)) = frame.kind else {
+            panic!("eligible replay emits a durable command");
+        };
+        assert_eq!(
+            frame.encoded_command, exact_route_bootstrap,
+            "v1.4 replay forwards the exact retained durable bytes",
+        );
     }
 }

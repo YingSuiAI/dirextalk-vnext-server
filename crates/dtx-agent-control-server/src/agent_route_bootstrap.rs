@@ -284,9 +284,6 @@ struct RouteBootstrapRecord {
 }
 
 /// Begins one RouteBootstrap and writes an opaque PrepareRecipient outbox row.
-///
-/// The outbox is durable but deliberately not drained until Control v1.4 frame
-/// wiring is added.  Therefore this function never creates a binding head.
 pub async fn begin_agent_route_bootstrap(
     store: &PgStore,
     credential: &DeviceSessionCredential,

@@ -152,6 +152,20 @@ pub trait ConnectorControlApplication: Send + Sync + 'static {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    /// Returns only the durable suffix eligible for the negotiated protocol.
+    ///
+    /// Implementations that persist delivery transitions must not mutate an
+    /// ineligible command or any later command in the same suffix.
+    fn poll_commands_for_protocol(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        fence: ConnectorFence,
+        after_sequence: u64,
+        _protocol_minor: u32,
+    ) -> ApplicationFuture<'_, Vec<DurableServerCommand>> {
+        self.poll_commands(peer, fence, after_sequence)
+    }
+
     /// Subscribes before the stream queries its durable active-offer page.
     fn subscribe_run_offers(
         &self,

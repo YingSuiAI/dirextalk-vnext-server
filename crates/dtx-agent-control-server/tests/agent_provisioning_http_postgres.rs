@@ -2404,6 +2404,39 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     .await?;
     assert_eq!(before_install.0, StatusCode::CONFLICT);
 
+    let blocked_commands = app
+        .poll_commands_for_protocol(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            fence,
+            expired_prepare.sequence(),
+            3,
+        )
+        .await
+        .expect("v1.3 must retain the RouteBootstrap durable head");
+    assert!(
+        blocked_commands.is_empty(),
+        "v1.3 cannot receive the RouteBootstrap Prepare command",
+    );
+    let mut blocked_verify_session = store.begin_tenant(tenant_id).await?;
+    let blocked_outbox_state: String = sqlx::query_scalar(
+        "SELECT state FROM agent.agent_route_bootstrap_outbox
+          WHERE tenant_id=$1 AND bootstrap_id=$2 AND command_kind='prepare_recipient'",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(bootstrap_id))
+    .fetch_one(blocked_verify_session.connection())
+    .await?;
+    assert_eq!(
+        blocked_outbox_state, "pending",
+        "polling a v1.3 suffix must not dispatch the blocked durable RouteBootstrap row",
+    );
+    blocked_verify_session.rollback().await?;
+
     let commands = app
         .poll_commands(
             authenticate_at(

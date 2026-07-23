@@ -3883,6 +3883,7 @@ impl PostgresConnectorControlApplication {
         peer: AuthenticatedConnectorPeer,
         fence: ConnectorFence,
         after_sequence: u64,
+        protocol_minor: u32,
     ) -> Result<Vec<DurableServerCommand>, ConnectorControlApplicationError> {
         ensure_peer_identity(peer, fence.tenant_id(), fence.connector_id())?;
         let parsed_fence = ParsedLeaseFence {
@@ -3932,7 +3933,19 @@ impl PostgresConnectorControlApplication {
             )
             .await
             .map_err(persistence_error)?;
-        let commands = self.decode_command_batch(batch)?;
+        let mut commands = self.decode_command_batch(batch)?;
+        if protocol_minor < 4 {
+            let first_ineligible = commands.iter().position(|command| {
+                matches!(
+                    command.payload(),
+                    ServerCommandPayload::PrepareAgentRouteRecipient(_)
+                        | ServerCommandPayload::DeliverAgentRouteBootstrap(_)
+                )
+            });
+            if let Some(first_ineligible) = first_ineligible {
+                commands.truncate(first_ineligible);
+            }
+        }
         for command in &commands {
             match command.payload() {
                 ServerCommandPayload::DeliverAgentProvisioning(delivery) => {
@@ -5714,7 +5727,17 @@ impl ConnectorControlApplication for PostgresConnectorControlApplication {
         fence: ConnectorFence,
         after_sequence: u64,
     ) -> ApplicationFuture<'_, Vec<DurableServerCommand>> {
-        Box::pin(self.poll_commands_operation(peer, fence, after_sequence))
+        Box::pin(self.poll_commands_operation(peer, fence, after_sequence, 4))
+    }
+
+    fn poll_commands_for_protocol(
+        &self,
+        peer: AuthenticatedConnectorPeer,
+        fence: ConnectorFence,
+        after_sequence: u64,
+        protocol_minor: u32,
+    ) -> ApplicationFuture<'_, Vec<DurableServerCommand>> {
+        Box::pin(self.poll_commands_operation(peer, fence, after_sequence, protocol_minor))
     }
 
     fn subscribe_run_offers(
