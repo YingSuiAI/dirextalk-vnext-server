@@ -26,6 +26,7 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 
 cd -- "$repository_root"
+python3 tools/check-runtime-secret-artifacts.py --self-test
 python3 - <<'PY'
 import json
 import shlex

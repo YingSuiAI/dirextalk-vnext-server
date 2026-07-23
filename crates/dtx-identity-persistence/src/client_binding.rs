@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     IdentityAppendCommand, IdentityAppendOutcome, IdentityLogRepository, IdentityPersistenceError,
@@ -37,7 +37,9 @@ impl ClientBindingAuthorization {
         }
         let mut raw = [0; 32];
         Base64UrlUnpadded::decode(value, &mut raw).map_err(|_| ClientBindingImportError)?;
-        Ok(Self(raw))
+        let authorization = Self(raw);
+        raw.zeroize();
+        Ok(authorization)
     }
     #[must_use]
     pub fn digest(&self) -> Sha256Digest {
@@ -62,6 +64,13 @@ struct ImportWire {
     identity_tls_root_ca_sha256: String,
     expires_at_unix_ms: i64,
     authorization: String,
+}
+
+impl Drop for ImportWire {
+    fn drop(&mut self) {
+        self.authorization.zeroize();
+        self.identity_tls_root_ca_pem.zeroize();
+    }
 }
 
 /// Strict, locally parsed import.  The authorization is retained only in this
@@ -676,9 +685,11 @@ impl ClientBindingImport {
         {
             return Err(ClientBindingImportError);
         };
-        let wire: ImportWire =
+        let mut wire: ImportWire =
             serde_json::from_slice(bytes).map_err(|_| ClientBindingImportError)?;
-        if serde_json::to_vec(&wire).map_err(|_| ClientBindingImportError)? != bytes {
+        let canonical =
+            Zeroizing::new(serde_json::to_vec(&wire).map_err(|_| ClientBindingImportError)?);
+        if *canonical != bytes {
             return Err(ClientBindingImportError);
         }
         if wire.schema != "dirextalk.client-binding"
@@ -706,14 +717,15 @@ impl ClientBindingImport {
         if actual.as_slice() != digest.as_bytes() {
             return Err(ClientBindingImportError);
         }
+        let authorization = ClientBindingAuthorization::parse(&wire.authorization)?;
         Ok(Self {
             binding_id,
             deployment_operation_id,
             tenant_id,
-            server_origin: wire.server_origin,
-            identity_tls_root_ca_pem: wire.identity_tls_root_ca_pem,
+            server_origin: std::mem::take(&mut wire.server_origin),
+            identity_tls_root_ca_pem: std::mem::take(&mut wire.identity_tls_root_ca_pem),
             expires_at_unix_ms: wire.expires_at_unix_ms,
-            authorization: ClientBindingAuthorization::parse(&wire.authorization)?,
+            authorization,
         })
     }
     #[must_use]
@@ -738,14 +750,17 @@ fn canonical_v7(value: &str) -> Result<Uuid, ClientBindingImportError> {
     }
 }
 fn canonical_origin(value: &str) -> bool {
-    let authority = value.strip_prefix("https://");
-    authority.is_some_and(|authority| {
-        !authority.is_empty()
-            && !authority.bytes().any(|byte| byte.is_ascii_whitespace())
-            && !authority.contains(['/', '?', '#', '@', ':'])
-            && value == value.to_ascii_lowercase()
-            && !authority.ends_with('.')
-    })
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.origin().ascii_serialization() == value
 }
 fn hex_digest(value: &str) -> Result<Sha256Digest, ClientBindingImportError> {
     if value.len() != 64
