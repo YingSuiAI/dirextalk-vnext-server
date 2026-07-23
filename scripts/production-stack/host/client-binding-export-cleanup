@@ -20,10 +20,23 @@ for file in \
     [[ -f "$file" && ! -L "$file" ]] || { echo 'client-binding artifact must be a regular file' >&2; exit 1; }
     case "$file" in
       /home/ubuntu/dirextalk-client-binding.request|/home/ubuntu/dirextalk-client-binding.import.json|"$root/import.json.export.tmp")
-        [[ "$(stat -c '%u:%g:%a' "$file")" == '1000:1000:400' ]] || { echo 'ubuntu client-binding artifact must be ubuntu:ubuntu 0400' >&2; exit 1; }
+        if [[ "$file" == "$root/import.json.export.tmp" ]]; then
+          case "$(stat -c '%u:%g:%a:%h' "$file")" in
+            0:0:600:1|1000:1000:400:1) ;;
+            *) echo 'export staging artifact is not a valid crash-boundary state' >&2; exit 1 ;;
+          esac
+        else
+          [[ "$(stat -c '%u:%g:%a:%h' "$file")" == '1000:1000:400:1' ]] || { echo 'ubuntu client-binding artifact must be ubuntu:ubuntu 0400 with one link' >&2; exit 1; }
+        fi
+        ;;
+      "$root/request.json.tmp")
+        case "$(stat -c '%u:%g:%a:%h' "$file")" in
+          0:0:600:1|1000:1000:400:1) ;;
+          *) echo 'request staging artifact is not a valid crash-boundary state' >&2; exit 1 ;;
+        esac
         ;;
       *)
-        [[ "$(stat -c '%u:%g:%a' "$file")" == '0:0:600' ]] || { echo 'client-binding artifact must be root:root 0600' >&2; exit 1; }
+        [[ "$(stat -c '%u:%g:%a:%h' "$file")" == '0:0:600:1' ]] || { echo 'client-binding artifact must be root:root 0600 with one link' >&2; exit 1; }
         ;;
     esac
     shred --remove=unlink -- "$file" >/dev/null 2>&1

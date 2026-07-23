@@ -126,6 +126,7 @@ services:
     entrypoint: ["/usr/local/bin/dtx-identity-provision"]
     volumes:
       - ${DTX_SECRET_ROOT:?set secret root}/identity-database-url:/run/dtx-secrets/identity-database-url:ro
+      - ${DTX_TLS_ROOT:?set TLS root}/private-ca.pem:/run/dtx-client-binding/private-ca.pem:ro
       - /etc/dirextalk/vnext/client-binding:/run/dtx-client-binding
     command:
       - client-binding-issue

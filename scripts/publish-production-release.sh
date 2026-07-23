@@ -112,6 +112,7 @@ runtime_digest=$(python3 tools/production-release.py verified-digest \
     --metadata "$state/runtime-metadata.json" \
     --version-manifest "$state/runtime-version-manifest.json" \
     --commit-manifest "$state/runtime-commit-manifest.json")
+scripts/check-release-image.sh --runtime-image "$repository@$runtime_digest"
 
 docker buildx build \
     --builder "$builder" \
