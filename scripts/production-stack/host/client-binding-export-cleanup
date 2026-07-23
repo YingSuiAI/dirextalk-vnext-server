@@ -5,6 +5,7 @@ set -euo pipefail
 root=/etc/dirextalk/vnext/client-binding
 [[ -d "$root" && ! -L "$root" ]] || { echo 'missing client-binding directory' >&2; exit 1; }
 [[ "$(stat -c '%u:%g:%a' "$root")" == '0:0:700' ]] || { echo 'client-binding directory must be root:root 0700' >&2; exit 1; }
+[[ -d /home/ubuntu && ! -L /home/ubuntu ]] || { echo 'missing ubuntu home' >&2; exit 1; }
 command -v shred >/dev/null 2>&1 || { echo 'shred is required for export cleanup' >&2; exit 1; }
 
 # Fixed allowlist: exported binding material is never selected by caller input.
