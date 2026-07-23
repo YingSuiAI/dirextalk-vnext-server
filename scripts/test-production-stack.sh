@@ -211,6 +211,10 @@ grep -q 'retained_container_id=.*docker run -d' \
     "$root/scripts/test-production-cross-version-postgres.sh"
 grep -q 'docker logs "\$retained_container_id"' \
     "$root/scripts/test-production-cross-version-postgres.sh"
+grep -q '^umask 077$' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
+grep -q 'chmod 0755 "\$runtime"' \
+    "$root/scripts/test-production-cross-version-postgres.sh"
 ! grep -q 'docker run -d --rm --name "\$retained_container"' \
     "$root/scripts/test-production-cross-version-postgres.sh"
 grep -q -- '--runtime-image "\$repository@\$runtime_digest"' "$root/scripts/publish-production-release.sh"

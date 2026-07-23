@@ -10,6 +10,7 @@ command -v git >/dev/null 2>&1 || { echo 'git is required' >&2; exit 1; }
 command -v openssl >/dev/null 2>&1 || { echo 'openssl is required' >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo 'python3 is required' >&2; exit 1; }
 docker info >/dev/null 2>&1 || { echo 'docker daemon is required' >&2; exit 1; }
+umask 077
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 prior_commit=72de88304813ee9a28852daca07996b8f7c245e5
@@ -385,7 +386,6 @@ cp "$runtime/server-key.pem" "$runtime/issuer-key.pem"
 printf '%s\n' \
     'postgresql://dtx_agent_control:retained-code-test-only@postgres/dtx_cross_version' \
     >"$runtime/database-url"
-chmod 0644 "$runtime"/*
 cat >"$runtime/config.json" <<'JSON'
 {
   "database_url_file": "/run/dtx-test/database-url",
@@ -398,7 +398,11 @@ cat >"$runtime/config.json" <<'JSON'
   "connector_issuer": {"certificate_pem": "/run/dtx-test/issuer.pem", "private_key_pkcs8_pem": "/run/dtx-test/issuer-key.pem"}
 }
 JSON
-chmod 0644 "$runtime/config.json"
+# The publisher's private umask must not make this bind-mount unreadable to the
+# retained image's fixed non-root runtime user. The 0700 fixture parent still
+# prevents other host users from traversing into these test-only credentials.
+chmod 0755 "$runtime"
+chmod 0644 "$runtime"/*
 retained_container_id=$(docker run -d --name "$retained_container" --network "$network" \
     --network-alias "$retained_alias" \
     --label com.dirextalk.test=production-cross-version \
