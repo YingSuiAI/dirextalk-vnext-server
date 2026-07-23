@@ -3,7 +3,7 @@
 use std::{
     env, fs, io,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::ExitCode,
 };
 
@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::PgConnectOptions;
 use uuid::Uuid;
 use x509_parser::pem::parse_x509_pem;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAX_REQUEST_BYTES: usize = 24 * 1024;
 const MAX_CA_BYTES: usize = 12 * 1024;
@@ -44,10 +44,12 @@ async fn run() -> Result<(), ProvisionError> {
         return run_expire().await;
     }
     let arguments = Arguments::parse(env::args_os())?;
-    let request_bytes = read_root_file(&arguments.request_file, MAX_REQUEST_BYTES)?;
+    let request_bytes = Zeroizing::new(read_root_file(&arguments.request_file, MAX_REQUEST_BYTES)?);
     let request: IssueRequest =
         serde_json::from_slice(&request_bytes).map_err(|_| ProvisionError::Request)?;
-    if serde_json::to_vec(&request).map_err(|_| ProvisionError::Request)? != request_bytes {
+    let canonical_request =
+        Zeroizing::new(serde_json::to_vec(&request).map_err(|_| ProvisionError::Request)?);
+    if *canonical_request != *request_bytes {
         return Err(ProvisionError::Request);
     }
     request.validate()?;
@@ -61,8 +63,9 @@ async fn run() -> Result<(), ProvisionError> {
     validate_ca_certificate(&ca_bytes)?;
     let ca_digest = Sha256Digest::from_bytes(Sha256::digest(&ca_bytes).into());
     let now = now_ms()?;
-    let (binding_id, issued_at_ms, expires_at_ms, mut authorization_raw, output_bytes) =
+    let (binding_id, issued_at_ms, expires_at_ms, authorization_raw, output_bytes) =
         if let Ok(existing_bytes) = read_root_file(&arguments.output_file, MAX_REQUEST_BYTES) {
+            let existing_bytes = Zeroizing::new(existing_bytes);
             let existing: ImportOutputOwned = serde_json::from_slice(&existing_bytes)
                 .map_err(|_| ProvisionError::ArtifactLost)?;
             if existing.schema != "dirextalk.client-binding"
@@ -75,8 +78,8 @@ async fn run() -> Result<(), ProvisionError> {
             {
                 return Err(ProvisionError::ArtifactLost);
             }
-            let mut raw = [0_u8; 32];
-            Base64UrlUnpadded::decode(&existing.authorization, &mut raw)
+            let mut raw = Zeroizing::new([0_u8; 32]);
+            Base64UrlUnpadded::decode(&existing.authorization, &mut *raw)
                 .map_err(|_| ProvisionError::ArtifactLost)?;
             let issued = existing
                 .expires_at_unix_ms
@@ -95,8 +98,8 @@ async fn run() -> Result<(), ProvisionError> {
                 .checked_add(request.ttl_millis)
                 .ok_or(ProvisionError::Request)?;
             let binding = Uuid::now_v7();
-            let mut raw = [0_u8; 32];
-            fill_random(&mut raw).map_err(|_| ProvisionError::Random)?;
+            let mut raw = Zeroizing::new([0_u8; 32]);
+            fill_random(&mut *raw).map_err(|_| ProvisionError::Random)?;
             let output = ImportOutput {
                 schema: "dirextalk.client-binding",
                 schema_version: 1,
@@ -108,12 +111,12 @@ async fn run() -> Result<(), ProvisionError> {
                     .map_err(|_| ProvisionError::Request)?,
                 identity_tls_root_ca_sha256: ca_digest.to_string(),
                 expires_at_unix_ms: expires,
-                authorization: Base64UrlUnpadded::encode_string(&raw),
+                authorization: Base64UrlUnpadded::encode_string(&*raw),
             };
-            let bytes = serde_json::to_vec(&output).map_err(|_| ProvisionError::Output)?;
+            let bytes =
+                Zeroizing::new(serde_json::to_vec(&output).map_err(|_| ProvisionError::Output)?);
             (binding, issued, expires, raw, bytes)
         };
-    let output_bytes = Zeroizing::new(output_bytes);
     if output_bytes.len() > MAX_REQUEST_BYTES {
         return Err(ProvisionError::Output);
     }
@@ -137,13 +140,12 @@ async fn run() -> Result<(), ProvisionError> {
         tls_root_ca_sha256: ca_digest,
         authorization_digest: Sha256Digest::hash_domain(
             dtx_identity_persistence::CLIENT_BINDING_AUTHORIZATION_HASH_DOMAIN,
-            &authorization_raw,
+            &*authorization_raw,
         ),
         artifact_digest,
         issued_at_ms,
         expires_at_ms,
     };
-    authorization_raw.fill(0);
     let result = ClientBindingRepository::default()
         .issue(&store, &command)
         .await;
@@ -254,6 +256,13 @@ struct ImportOutput<'a> {
     authorization: String,
 }
 
+impl Drop for ImportOutput<'_> {
+    fn drop(&mut self) {
+        self.authorization.zeroize();
+        self.identity_tls_root_ca_pem.zeroize();
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImportOutputOwned {
@@ -267,6 +276,13 @@ struct ImportOutputOwned {
     identity_tls_root_ca_sha256: String,
     expires_at_unix_ms: i64,
     authorization: String,
+}
+
+impl Drop for ImportOutputOwned {
+    fn drop(&mut self) {
+        self.authorization.zeroize();
+        self.identity_tls_root_ca_pem.zeroize();
+    }
 }
 
 struct Arguments {
@@ -346,27 +362,21 @@ fn ensure_root() -> Result<(), ProvisionError> {
 
 #[cfg(unix)]
 fn read_root_file(path: &Path, max: usize) -> Result<Vec<u8>, ProvisionError> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
-    use std::os::unix::fs::OpenOptionsExt;
-    let metadata = fs::symlink_metadata(path).map_err(|_| ProvisionError::Input)?;
+    let (parent, name) = protected_parent(path)?;
+    let file = rustix::fs::openat(
+        &parent,
+        &name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map(fs::File::from)
+    .map_err(|_| ProvisionError::Input)?;
+    let metadata = file.metadata().map_err(|_| ProvisionError::Input)?;
     if !metadata.is_file()
         || metadata.uid() != 0
         || metadata.mode() & 0o777 != 0o600
         || metadata.len() > max as u64
-    {
-        return Err(ProvisionError::Input);
-    }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|_| ProvisionError::Input)?;
-    let opened = file.metadata().map_err(|_| ProvisionError::Input)?;
-    if opened.dev() != metadata.dev()
-        || opened.ino() != metadata.ino()
-        || opened.len() != metadata.len()
-        || file.as_raw_fd() < 0
     {
         return Err(ProvisionError::Input);
     }
@@ -387,32 +397,88 @@ fn read_root_file(_path: &Path, _max: usize) -> Result<Vec<u8>, ProvisionError> 
 
 #[cfg(unix)]
 fn write_new_root_file(path: &Path, bytes: &[u8]) -> Result<(), ProvisionError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    if path.exists() {
-        return Err(ProvisionError::ArtifactLost);
+    let (parent, name) = protected_parent(path)?;
+    let temporary = format!(".{}.{}.tmp", name.to_string_lossy(), Uuid::now_v7());
+    let mut file = rustix::fs::openat(
+        &parent,
+        &temporary,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map(fs::File::from)
+    .map_err(|_| ProvisionError::Output)?;
+    let result = (|| {
+        io::Write::write_all(&mut file, bytes).map_err(|_| ProvisionError::Output)?;
+        file.sync_all().map_err(|_| ProvisionError::Output)?;
+        rustix::fs::linkat(
+            &parent,
+            &temporary,
+            &parent,
+            &name,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|_| ProvisionError::ArtifactLost)?;
+        parent.sync_all().map_err(|_| ProvisionError::Output)?;
+        rustix::fs::unlinkat(&parent, &temporary, rustix::fs::AtFlags::empty())
+            .map_err(|_| ProvisionError::Output)?;
+        parent.sync_all().map_err(|_| ProvisionError::Output)
+    })();
+    if result.is_err() {
+        let _ = rustix::fs::unlinkat(&parent, &temporary, rustix::fs::AtFlags::empty());
+        let _ = parent.sync_all();
     }
-    let parent = path.parent().ok_or(ProvisionError::Output)?;
+    result
+}
+
+#[cfg(unix)]
+fn protected_parent(path: &Path) -> Result<(fs::File, std::ffi::OsString), ProvisionError> {
+    if !path.is_absolute() {
+        return Err(ProvisionError::Input);
+    }
     let name = path
         .file_name()
-        .ok_or(ProvisionError::Output)?
-        .to_string_lossy();
-    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::now_v7()));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    let mut file = options
-        .open(&temporary)
-        .map_err(|_| ProvisionError::Output)?;
-    if io::Write::write_all(&mut file, bytes).is_err() || file.sync_all().is_err() {
-        let _ = fs::remove_file(&temporary);
-        return Err(ProvisionError::Output);
+        .filter(|name| !name.is_empty())
+        .ok_or(ProvisionError::Input)?
+        .to_os_string();
+    let mut directory = fs::File::open("/").map_err(|_| ProvisionError::Input)?;
+    validate_protected_directory(&directory)?;
+    for component in path.parent().ok_or(ProvisionError::Input)?.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(segment) => {
+                directory = rustix::fs::openat(
+                    &directory,
+                    segment,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::DIRECTORY
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NOFOLLOW,
+                    rustix::fs::Mode::empty(),
+                )
+                .map(fs::File::from)
+                .map_err(|_| ProvisionError::Input)?;
+                validate_protected_directory(&directory)?;
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(ProvisionError::Input);
+            }
+        }
     }
-    if fs::hard_link(&temporary, path).is_err() {
-        let _ = fs::remove_file(&temporary);
-        return Err(ProvisionError::ArtifactLost);
+    Ok((directory, name))
+}
+
+#[cfg(unix)]
+fn validate_protected_directory(directory: &fs::File) -> Result<(), ProvisionError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = directory.metadata().map_err(|_| ProvisionError::Input)?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(ProvisionError::Input);
     }
-    let directory = fs::File::open(parent).map_err(|_| ProvisionError::Output)?;
-    directory.sync_all().map_err(|_| ProvisionError::Output)?;
-    fs::remove_file(&temporary).map_err(|_| ProvisionError::Output)
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -485,5 +551,58 @@ impl std::fmt::Display for ProvisionError {
             Self::Random => "secure random generation failed",
             Self::Time => "clock failure",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_origin_requires_exact_https_serialization() {
+        assert_eq!(
+            canonical_https_origin("https://example.test"),
+            Some("https://example.test".to_owned())
+        );
+        assert_eq!(
+            canonical_https_origin("https://[2001:db8::1]:8443"),
+            Some("https://[2001:db8::1]:8443".to_owned())
+        );
+        for invalid in [
+            "https://example.test/",
+            "https://example.test:443",
+            "https://EXAMPLE.test",
+            "https://example.test/path",
+            "https://user@example.test",
+        ] {
+            assert_eq!(canonical_https_origin(invalid), None, "{invalid}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_parent_rejects_relative_and_parent_traversal_paths() {
+        assert!(matches!(
+            protected_parent(Path::new("request.json")),
+            Err(ProvisionError::Input)
+        ));
+        assert!(matches!(
+            protected_parent(Path::new("/tmp/../request.json")),
+            Err(ProvisionError::Input)
+        ));
+    }
+
+    #[test]
+    fn ca_parser_rejects_non_certificate_and_trailing_pem() {
+        assert!(
+            validate_ca_certificate(b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n")
+                .is_err()
+        );
+        assert!(
+            validate_ca_certificate(
+                b"-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\nextra"
+            )
+            .is_err()
+        );
     }
 }
