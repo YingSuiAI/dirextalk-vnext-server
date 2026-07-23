@@ -32,17 +32,25 @@ CONTENT_RULES = [
     re.compile(rb"(?i)(?:x[-_]dirextalk[-_]client[-_]binding[-_]authorization|client[-_]?binding[-_]?authorization|enrollment[_-]?token|binding[_-]?authorization)\s*[\"']?\s*[=:]\s*[\"']?[^\s,}\"']+"),
     re.compile(rb"(?i)(?:connector[-_ ]?(?:bearer|handoff|config|log)|mcp[-_]?bearer|connector[-_]?enrollment)\s*[\"']?\s*[=:]\s*[\"']?[^\s,}\"']+"),
     re.compile(rb"(?i)\bdtxi1[a-z0-9]{20,}\b"),
-    re.compile(
-        rb'(?s)(?=.*"schema"\s*:\s*"dirextalk\.client-binding")'
-        rb'(?=.*"authorization"\s*:\s*"[A-Za-z0-9_-]{43}")'
-    ),
 ]
+CLIENT_BINDING_SCHEMA_RULE = re.compile(
+    rb'"schema"\s*:\s*"dirextalk\.client-binding"'
+)
+CLIENT_BINDING_AUTHORIZATION_RULE = re.compile(
+    rb'"authorization"\s*:\s*"[A-Za-z0-9_-]{43}"'
+)
 
 
 def suspicious(name: str, content: bytes) -> str | None:
     if NAME_RULE.search(name):
         return "sensitive-name"
     if any(rule.search(content) for rule in CONTENT_RULES):
+        return "sensitive-content"
+    has_binding_schema = CLIENT_BINDING_SCHEMA_RULE.search(content) is not None
+    has_binding_authorization = (
+        CLIENT_BINDING_AUTHORIZATION_RULE.search(content) is not None
+    )
+    if has_binding_schema and has_binding_authorization:
         return "sensitive-content"
     return None
 
@@ -109,6 +117,7 @@ def self_test() -> int:
         root = Path(directory)
         (root / "usr/bin").mkdir(parents=True)
         (root / "usr/bin/dtx-node").write_bytes(b"runtime binary")
+        (root / "usr/bin/large-clean-blob").write_bytes(b"\x00" * (8 * 1024 * 1024))
         if scan_directory(root):
             return 1
         fixtures = {
