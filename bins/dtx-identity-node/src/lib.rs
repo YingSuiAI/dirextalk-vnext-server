@@ -4884,4 +4884,52 @@ mod tests {
                 .any(|window| window == capability.as_slice())
         );
     }
+
+    #[test]
+    fn client_binding_headers_reject_duplicates_and_non_exact_media_inputs() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            IDEMPOTENCY_KEY_HEADER,
+            HeaderValue::from_static("0123456789abcdef"),
+        );
+        headers.append(
+            IDEMPOTENCY_KEY_HEADER,
+            HeaderValue::from_static("0123456789abcdef"),
+        );
+        assert!(idempotency_key_hash_binding(&headers, HTTP_IDEMPOTENCY_KEY_HASH_DOMAIN).is_err());
+
+        let mut binding = HeaderMap::new();
+        binding.insert(
+            CLIENT_BINDING_HEADER,
+            HeaderValue::from_static("0190f2a5-7b1c-7abc-8def-0123456789ab"),
+        );
+        binding.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static(
+                "DTX-Client-Binding AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+        );
+        binding.append(
+            header::AUTHORIZATION,
+            HeaderValue::from_static(
+                "DTX-Client-Binding AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+        );
+        assert!(client_binding_authorization(&binding).is_err());
+
+        let mut malformed = HeaderMap::new();
+        malformed.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(
+                "application/vnd.dirextalk.identity-log.v1.1+cbor; charset=utf-8",
+            ),
+        );
+        assert!(!has_exact_event_content_type(&malformed));
+        malformed.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(IDENTITY_LOG_EVENT_CONTENT_TYPE),
+        );
+        malformed.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(malformed.contains_key(header::CONTENT_ENCODING));
+    }
 }

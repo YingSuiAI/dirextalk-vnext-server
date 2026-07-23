@@ -66,32 +66,9 @@ async fn run() -> Result<(), ProvisionError> {
     let (binding_id, issued_at_ms, expires_at_ms, authorization_raw, output_bytes) =
         if let Ok(existing_bytes) = read_root_file(&arguments.output_file, MAX_REQUEST_BYTES) {
             let existing_bytes = Zeroizing::new(existing_bytes);
-            let existing: ImportOutputOwned = serde_json::from_slice(&existing_bytes)
-                .map_err(|_| ProvisionError::ArtifactLost)?;
-            if existing.schema != "dirextalk.client-binding"
-                || existing.schema_version != 1
-                || existing.deployment_operation_id != request.deployment_operation_id
-                || existing.tenant_id != request.tenant_id
-                || existing.server_origin != request.server_origin
-                || existing.identity_tls_root_ca_sha256 != ca_digest.to_string()
-                || existing.expires_at_unix_ms <= now
-            {
-                return Err(ProvisionError::ArtifactLost);
-            }
-            let mut raw = Zeroizing::new([0_u8; 32]);
-            Base64UrlUnpadded::decode(&existing.authorization, &mut *raw)
-                .map_err(|_| ProvisionError::ArtifactLost)?;
-            let issued = existing
-                .expires_at_unix_ms
-                .checked_sub(request.ttl_millis)
-                .ok_or(ProvisionError::ArtifactLost)?;
-            (
-                existing.binding_id,
-                issued,
-                existing.expires_at_unix_ms,
-                raw,
-                existing_bytes,
-            )
+            let (binding_id, issued, expires, raw) =
+                validate_existing_artifact(&existing_bytes, &request, ca_digest, now)?;
+            (binding_id, issued, expires, raw, existing_bytes)
         } else {
             let issued = now;
             let expires = issued
@@ -162,6 +139,71 @@ async fn run() -> Result<(), ProvisionError> {
     }
     write_new_root_file(&arguments.output_file, &output_bytes)?;
     Ok(())
+}
+
+fn validate_existing_artifact(
+    bytes: &[u8],
+    request: &IssueRequest,
+    ca_digest: Sha256Digest,
+    now: i64,
+) -> Result<(Uuid, i64, i64, Zeroizing<[u8; 32]>), ProvisionError> {
+    let existing: ImportOutputOwned =
+        serde_json::from_slice(bytes).map_err(|_| ProvisionError::ArtifactLost)?;
+    let canonical = Zeroizing::new(
+        serde_json::to_vec(&ImportOutput {
+            schema: &existing.schema,
+            schema_version: existing.schema_version,
+            binding_id: existing.binding_id,
+            deployment_operation_id: existing.deployment_operation_id,
+            tenant_id: existing.tenant_id,
+            server_origin: existing.server_origin.clone(),
+            identity_tls_root_ca_pem: existing.identity_tls_root_ca_pem.clone(),
+            identity_tls_root_ca_sha256: existing.identity_tls_root_ca_sha256.clone(),
+            expires_at_unix_ms: existing.expires_at_unix_ms,
+            authorization: existing.authorization.clone(),
+        })
+        .map_err(|_| ProvisionError::ArtifactLost)?,
+    );
+    if *canonical != bytes
+        || existing.schema != "dirextalk.client-binding"
+        || existing.schema_version != 1
+        || existing.binding_id.get_version_num() != 7
+        || existing.deployment_operation_id.get_version_num() != 7
+        || existing.tenant_id.get_version_num() != 7
+        || existing.deployment_operation_id != request.deployment_operation_id
+        || existing.tenant_id != request.tenant_id
+        || existing.server_origin != request.server_origin
+        || existing.identity_tls_root_ca_sha256 != ca_digest.to_string()
+        || existing.expires_at_unix_ms <= now
+    {
+        return Err(ProvisionError::ArtifactLost);
+    }
+    let pem_digest = Sha256Digest::from_bytes(
+        Sha256::digest(existing.identity_tls_root_ca_pem.as_bytes()).into(),
+    );
+    if existing.identity_tls_root_ca_pem.len() > MAX_CA_BYTES
+        || !existing.identity_tls_root_ca_pem.is_ascii()
+        || validate_ca_certificate(existing.identity_tls_root_ca_pem.as_bytes()).is_err()
+        || pem_digest.to_string() != existing.identity_tls_root_ca_sha256
+    {
+        return Err(ProvisionError::ArtifactLost);
+    }
+    if existing.authorization.len() != 43 {
+        return Err(ProvisionError::ArtifactLost);
+    }
+    let mut raw = Zeroizing::new([0_u8; 32]);
+    Base64UrlUnpadded::decode(&existing.authorization, &mut *raw)
+        .map_err(|_| ProvisionError::ArtifactLost)?;
+    let issued = existing
+        .expires_at_unix_ms
+        .checked_sub(request.ttl_millis)
+        .ok_or(ProvisionError::ArtifactLost)?;
+    Ok((
+        existing.binding_id,
+        issued,
+        existing.expires_at_unix_ms,
+        raw,
+    ))
 }
 
 async fn open_store(path: &Path) -> Result<IdentityPgStore, ProvisionError> {
@@ -604,5 +646,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn replay_artifact_validation_is_fail_closed_and_exact() {
+        let request = IssueRequest {
+            schema: "dirextalk.client-binding-issue".to_owned(),
+            schema_version: 1,
+            deployment_operation_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            server_origin: "https://identity.example".to_owned(),
+            identity_tls_root_ca_file: PathBuf::from("/root/ca.pem"),
+            ttl_millis: 60_000,
+        };
+        let malformed = br#"{"schema":"dirextalk.client-binding","schema_version":1}"#;
+        assert!(matches!(
+            validate_existing_artifact(malformed, &request, Sha256Digest::from_bytes([0; 32]), 1,),
+            Err(ProvisionError::ArtifactLost)
+        ));
     }
 }
