@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$(id -u)" == 0 ]] || { echo 'client-binding expiry requires root' >&2; exit 1; }
+exec docker compose --project-name dirextalk-vnext-production --env-file /etc/dirextalk/vnext/config/production.env -f /etc/dirextalk/vnext/config/production-compose.yml --profile client-binding-expire run --rm --no-deps client-binding-expirer

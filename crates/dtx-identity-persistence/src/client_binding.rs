@@ -180,13 +180,7 @@ impl ClientBindingRepository {
     ) -> Result<ClientBindingIssueOutcome, ClientBindingWorkflowError> {
         if command.expires_at_ms <= command.issued_at_ms
             || command.expires_at_ms > command.issued_at_ms.saturating_add(900_000)
-            || !command.server_origin.starts_with("https://")
-            || command.server_origin[8..].contains(['/', '?', '#', '@', ':'])
-            || command.server_origin[8..]
-                .bytes()
-                .any(|byte| byte.is_ascii_whitespace())
-            || command.server_origin.ends_with('.')
-            || command.server_origin != command.server_origin.to_ascii_lowercase()
+            || !is_canonical_https_origin(&command.server_origin)
         {
             return Err(ClientBindingWorkflowError::Invalid);
         }
@@ -296,7 +290,7 @@ impl ClientBindingRepository {
             .begin()
             .await
             .map_err(ClientBindingWorkflowError::from)?;
-        sqlx::query(
+        let rows = sqlx::query(
             "UPDATE identity.client_bindings
                 SET state='revoked', revision=revision+1
               WHERE binding_id=$1 AND state IN ('issued','identity_bound')
@@ -306,7 +300,12 @@ impl ClientBindingRepository {
         .bind(now_ms)
         .execute(session.connection())
         .await
-        .map_err(|e| ClientBindingWorkflowError::Persistence(e.into()))?;
+        .map_err(|e| ClientBindingWorkflowError::Persistence(e.into()))?
+        .rows_affected();
+        if rows != 1 {
+            let _ = session.rollback().await;
+            return Err(ClientBindingWorkflowError::Conflict);
+        }
         session
             .commit()
             .await
@@ -566,6 +565,20 @@ impl ClientBindingRepository {
             }
         }
     }
+}
+
+fn is_canonical_https_origin(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.origin().ascii_serialization() == value
 }
 
 fn request_digest(domain: &[u8], body: &[u8], idempotency: Sha256Digest) -> Sha256Digest {

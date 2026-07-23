@@ -92,6 +92,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
 uuid = { version = "1.23.5", features = ["serde", "v7"] }
+url = "2.5.8"
 zeroize = { version = "1.9.0", features = ["derive"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "getrandom", "zeroize"] }
 yaml_serde = "0.10.4"

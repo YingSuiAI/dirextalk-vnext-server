@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgConnectOptions;
 use uuid::Uuid;
+use x509_parser::pem::parse_x509_pem;
 use zeroize::Zeroizing;
 
 const MAX_REQUEST_BYTES: usize = 24 * 1024;
@@ -57,6 +58,7 @@ async fn run() -> Result<(), ProvisionError> {
     if ca_bytes.is_empty() || ca_bytes.len() > MAX_CA_BYTES || !ca_bytes.is_ascii() {
         return Err(ProvisionError::Request);
     }
+    validate_ca_certificate(&ca_bytes)?;
     let ca_digest = Sha256Digest::from_bytes(Sha256::digest(&ca_bytes).into());
     let now = now_ms()?;
     let (binding_id, issued_at_ms, expires_at_ms, mut authorization_raw, output_bytes) =
@@ -175,7 +177,15 @@ async fn open_store(path: &Path) -> Result<IdentityPgStore, ProvisionError> {
 
 async fn run_revoke() -> Result<(), ProvisionError> {
     let args = FixedActionArguments::parse(env::args_os(), "client-binding-revoke")?;
-    let binding_id = Uuid::parse_str(&args.binding_id).map_err(|_| ProvisionError::Request)?;
+    let binding_id_text = if let Some(path) = args.binding_id_file {
+        Zeroizing::new(
+            String::from_utf8(read_root_file(&path, 128)?).map_err(|_| ProvisionError::Request)?,
+        )
+    } else {
+        Zeroizing::new(args.binding_id)
+    };
+    let binding_id =
+        Uuid::parse_str(binding_id_text.trim()).map_err(|_| ProvisionError::Request)?;
     ClientBindingRepository::default()
         .revoke(
             &open_store(&args.database_url_file).await?,
@@ -191,8 +201,14 @@ async fn run_expire() -> Result<(), ProvisionError> {
     ClientBindingRepository::default()
         .expire(&open_store(&args.database_url_file).await?, now_ms()?)
         .await
-        .map(|_| ())
         .map_err(|_| ProvisionError::Database)
+        .and_then(|rows| {
+            if rows > 0 {
+                Ok(())
+            } else {
+                Err(ProvisionError::Request)
+            }
+        })
 }
 
 #[derive(Deserialize, Serialize)]
@@ -213,16 +229,11 @@ impl IssueRequest {
             || self.schema_version != 1
             || self.deployment_operation_id.get_version_num() != 7
             || self.tenant_id.get_version_num() != 7
-            || self.server_origin.len() <= 8
-            || !self.server_origin.starts_with("https://")
-            || self.server_origin[8..].contains(['/', '?', '#', '@', ':'])
-            || self.server_origin[8..]
-                .bytes()
-                .any(|byte| byte.is_ascii_whitespace())
-            || self.server_origin.ends_with('.')
-            || self.server_origin != self.server_origin.to_ascii_lowercase()
             || !(1..=900_000).contains(&self.ttl_millis)
         {
+            return Err(ProvisionError::Request);
+        }
+        if canonical_https_origin(&self.server_origin).is_none() {
             return Err(ProvisionError::Request);
         }
         Ok(())
@@ -267,6 +278,7 @@ struct Arguments {
 struct FixedActionArguments {
     database_url_file: PathBuf,
     binding_id: String,
+    binding_id_file: Option<PathBuf>,
 }
 
 impl FixedActionArguments {
@@ -280,17 +292,20 @@ impl FixedActionArguments {
         }
         let mut database_url_file = None;
         let mut binding_id = None;
+        let mut binding_id_file = None;
         while let Some(flag) = args.next() {
             let value = args.next().ok_or(ProvisionError::Usage)?;
             match flag.to_str() {
                 Some("--database-url-file") => database_url_file = Some(PathBuf::from(value)),
                 Some("--binding-id") => binding_id = Some(value.to_string_lossy().into_owned()),
+                Some("--binding-id-file") => binding_id_file = Some(PathBuf::from(value)),
                 _ => return Err(ProvisionError::Usage),
             }
         }
         Ok(Self {
             database_url_file: database_url_file.ok_or(ProvisionError::Usage)?,
             binding_id: binding_id.unwrap_or_default(),
+            binding_id_file,
         })
     }
 }
@@ -411,6 +426,38 @@ fn now_ms() -> Result<i64, ProvisionError> {
         .ok()
         .and_then(|value| i64::try_from(value.as_millis()).ok())
         .ok_or(ProvisionError::Time)
+}
+
+fn validate_ca_certificate(bytes: &[u8]) -> Result<(), ProvisionError> {
+    let (remaining, pem) = parse_x509_pem(bytes).map_err(|_| ProvisionError::Request)?;
+    if !remaining.is_empty() || pem.label != "CERTIFICATE" {
+        return Err(ProvisionError::Request);
+    }
+    let certificate = pem.parse_x509().map_err(|_| ProvisionError::Request)?;
+    if !certificate
+        .basic_constraints()
+        .map_err(|_| ProvisionError::Request)?
+        .is_some_and(|extension| extension.value.ca)
+    {
+        return Err(ProvisionError::Request);
+    }
+    Ok(())
+}
+
+fn canonical_https_origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let canonical = url.origin().ascii_serialization();
+    (canonical == value).then_some(canonical)
 }
 
 #[derive(Clone, Copy)]

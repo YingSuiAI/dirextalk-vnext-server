@@ -1137,7 +1137,9 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tower",
+ "url",
  "uuid",
+ "x509-parser",
  "zeroize",
 ]
 
@@ -1158,6 +1160,7 @@ dependencies = [
  "subtle",
  "testcontainers-modules",
  "tokio",
+ "url",
  "uuid",
  "x509-parser",
  "zeroize",

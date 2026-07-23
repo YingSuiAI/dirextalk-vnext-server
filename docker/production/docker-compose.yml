@@ -137,6 +137,31 @@ services:
       - /run/dtx-client-binding/import.json
     profiles: ["client-binding"]
 
+  client-binding-expirer:
+    <<: *server-image
+    user: "0:0"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    entrypoint: ["/usr/local/bin/dtx-identity-provision"]
+    volumes:
+      - ${DTX_SECRET_ROOT:?set secret root}/identity-database-url:/run/dtx-secrets/identity-database-url:ro
+    command: ["client-binding-expire", "--database-url-file", "/run/dtx-secrets/identity-database-url"]
+    profiles: ["client-binding-expire"]
+
+  client-binding-revoker:
+    <<: *server-image
+    user: "0:0"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    entrypoint: ["/usr/local/bin/dtx-identity-provision"]
+    volumes:
+      - ${DTX_SECRET_ROOT:?set secret root}/identity-database-url:/run/dtx-secrets/identity-database-url:ro
+      - /etc/dirextalk/vnext/client-binding:/run/dtx-client-binding:ro
+    command: ["client-binding-revoke", "--database-url-file", "/run/dtx-secrets/identity-database-url", "--binding-id-file", "/run/dtx-client-binding/revoke-binding-id"]
+    profiles: ["client-binding-revoke"]
+
   node-ready:
     <<: *probe-image
     read_only: true
