@@ -412,3 +412,4 @@ facts = script.index("python3 tools/production-release.py emit-facts")
 if not migrator_readback < latest_move < facts:
     raise SystemExit("latest discovery pointer is not ordered after both immutable read-backs")
 PY
+echo 'release image contract and runtime/migrator secret-artifact gates passed'

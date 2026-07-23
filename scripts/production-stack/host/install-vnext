@@ -33,11 +33,29 @@ RECEIPT_SCHEMA = "dirextalk.vnext-installed-release"
 INSTALLER_PATH = "scripts/production-stack/install.sh"
 COMPATIBILITY_PATH = "docker/production/migration-compatibility"
 COMPATIBILITY = b"forward-schema-compatible-v1\n"
+SUPPORTED_CROSS_VERSION = ("0.1.1", "0.1.4")
+PRODUCTION_CONFIG_ROOT = Path("/etc/dirextalk/vnext/config")
+PRODUCTION_ENV = PRODUCTION_CONFIG_ROOT / "production.env"
+PRODUCTION_COMPOSE = PRODUCTION_CONFIG_ROOT / "production-compose.yml"
+PRODUCTION_INSTALL_ROOT = Path("/usr/local/lib/dirextalk")
+CURRENT_ENV = Path("/var/lib/dirextalk/vnext/current.env")
+VERIFY_PATH = "scripts/production-stack/verify.sh"
 MAX_BUNDLE_BYTES = 32 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_MEMBERS = 256
+STATE_OWNER_UID = 0
+STATE_OWNER_GID = 0
+MAX_RETAINED_RELEASES = 8
+RETAIN_UNREFERENCED_RELEASES = 2
+MAX_RELEASE_STORAGE_BYTES = MAX_RETAINED_RELEASES * MAX_BUNDLE_BYTES
+MIN_RELEASE_FREE_BYTES = 64 * 1024 * 1024
+MAX_RECEIPT_HISTORY = 64
+RETAIN_UNREFERENCED_RECEIPTS = 16
+MAX_RECEIPT_STORAGE_BYTES = 4 * 1024 * 1024
+MIN_STATE_FREE_BYTES = 8 * 1024 * 1024
+RECEIPT_PUBLICATION_RESERVE = 3 * MAX_RECEIPT_BYTES
 
 SEMVER = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
@@ -116,7 +134,11 @@ def safe_relative(value: str) -> bool:
 def ensure_root_directory(path: Path, mode: int) -> None:
     path.mkdir(parents=True, exist_ok=True)
     metadata = path.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != STATE_OWNER_UID
+        or metadata.st_gid != STATE_OWNER_GID
+    ):
         raise ContractError(f"unsafe state directory: {path}")
     os.chmod(path, mode)
 
@@ -128,8 +150,8 @@ def secure_metadata(path: Path, expected_mode: int) -> os.stat_result:
         raise ContractError(f"required artifact is missing: {path}") from error
     if (
         not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or metadata.st_gid != 0
+        or metadata.st_uid != STATE_OWNER_UID
+        or metadata.st_gid != STATE_OWNER_GID
         or stat.S_IMODE(metadata.st_mode) != expected_mode
         or metadata.st_nlink != 1
     ):
@@ -310,6 +332,9 @@ def validate_bundle(raw: bytes) -> tuple[dict[str, object], bytes, dict[str, byt
     for name, record in expected.items():
         if digest(payloads[name]) != record["sha256"] or modes[name] != record["mode"]:
             raise ContractError(f"bundle file contract mismatch: {name}")
+    compatibility = payloads.get(f"{ARCHIVE_ROOT}/{COMPATIBILITY_PATH}")
+    if compatibility != COMPATIBILITY:
+        raise ContractError("bundle is missing the exact forward migration compatibility marker")
     relative_payloads = {name.removeprefix(ARCHIVE_ROOT + "/"): data for name, data in payloads.items()}
     relative_modes = {name.removeprefix(ARCHIVE_ROOT + "/"): mode for name, mode in modes.items()}
     return manifest, manifest_raw, relative_payloads, relative_modes
@@ -329,7 +354,7 @@ def write_file(path: Path, data: bytes, mode: int) -> None:
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags, mode)
     try:
-        os.fchown(descriptor, 0, 0)
+        os.fchown(descriptor, STATE_OWNER_UID, STATE_OWNER_GID)
         os.fchmod(descriptor, mode)
         view = memoryview(data)
         while view:
@@ -363,8 +388,8 @@ def verify_release(
         metadata = current_path.lstat()
         if (
             not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != 0
-            or metadata.st_gid != 0
+            or metadata.st_uid != STATE_OWNER_UID
+            or metadata.st_gid != STATE_OWNER_GID
             or stat.S_IMODE(metadata.st_mode) != 0o555
         ):
             raise ContractError("installed release contains an unsafe directory")
@@ -397,7 +422,7 @@ def materialize_release(
 ) -> Path:
     target = RELEASE_ROOT / bundle_sha256
     stage = Path(tempfile.mkdtemp(prefix=".incoming-", dir=RELEASE_ROOT))
-    os.chown(stage, 0, 0)
+    os.chown(stage, STATE_OWNER_UID, STATE_OWNER_GID)
     os.chmod(stage, 0o700)
     try:
         entries = {"manifest.json": (manifest_raw, "0444")}
@@ -414,7 +439,7 @@ def materialize_release(
                 current = current.parent
             write_file(path, data, int(mode, 8))
         for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
-            os.chown(directory, 0, 0)
+            os.chown(directory, STATE_OWNER_UID, STATE_OWNER_GID)
             os.chmod(directory, 0o555)
         if target.exists() or target.is_symlink():
             verify_release(target, manifest, manifest_raw, payloads, modes)
@@ -456,11 +481,56 @@ def validate_receipt(raw: bytes) -> dict[str, object]:
     return receipt
 
 
+def semver_key(value: str) -> tuple[tuple[int, int, int], tuple[tuple[int, object], ...]]:
+    """Return a comparison key for the SemVer subset accepted by the bundle contract."""
+    if SEMVER.fullmatch(value) is None:
+        raise ContractError("release version is not SemVer")
+    core, _, _metadata = value.partition("+")
+    core, _, prerelease = core.partition("-")
+    numbers = tuple(int(part) for part in core.split("."))
+    if len(numbers) != 3:
+        raise ContractError("release version is not SemVer")
+    identifiers: list[tuple[int, object]] = []
+    if prerelease:
+        for identifier in prerelease.split("."):
+            if identifier.isdigit():
+                identifiers.append((0, int(identifier)))
+            else:
+                identifiers.append((1, identifier))
+    # A release without a prerelease suffix sorts after all prereleases.
+    return numbers, tuple(identifiers) if prerelease else ((2, ""),)
+
+
+def strictly_forward(prior: str, candidate: str) -> bool:
+    return semver_key(candidate) > semver_key(prior)
+
+
+def admitted_cross_version(prior: str, candidate: str) -> bool:
+    return (prior, candidate) == SUPPORTED_CROSS_VERSION and strictly_forward(prior, candidate)
+
+
 def read_current_receipt() -> tuple[dict[str, object] | None, bytes | None]:
     if not CURRENT_RECEIPT.exists() and not CURRENT_RECEIPT.is_symlink():
         return None, None
     raw = read_secure(CURRENT_RECEIPT, 0o600, MAX_RECEIPT_BYTES)
     return validate_receipt(raw), raw
+
+
+def find_candidate_receipt(
+    request: dict[str, object],
+) -> tuple[dict[str, object], bytes] | None:
+    """Recover a receipt published before a crash interrupted current.json."""
+    for path in sorted(RECEIPT_ROOT.glob("*.json")):
+        if path == CURRENT_RECEIPT or path.is_symlink():
+            continue
+        try:
+            raw = read_secure(path, 0o600, MAX_RECEIPT_BYTES)
+            receipt = validate_receipt(raw)
+        except (ContractError, OSError):
+            continue
+        if receipt["state"] == "installed" and request_matches_receipt(request, receipt):
+            return receipt, raw
+    return None
 
 
 def make_receipt(facts: dict[str, object], state: str, previous: str | None) -> tuple[dict[str, object], bytes]:
@@ -486,12 +556,12 @@ def make_receipt(facts: dict[str, object], state: str, previous: str | None) -> 
     return receipt, raw
 
 
-def atomic_write(path: Path, raw: bytes) -> None:
+def atomic_replace(path: Path, raw: bytes, mode: int) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        os.fchown(descriptor, 0, 0)
-        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, STATE_OWNER_UID, STATE_OWNER_GID)
+        os.fchmod(descriptor, mode)
         view = memoryview(raw)
         while view:
             written = os.write(descriptor, view)
@@ -513,6 +583,10 @@ def atomic_write(path: Path, raw: bytes) -> None:
             temporary.unlink()
 
 
+def atomic_write(path: Path, raw: bytes) -> None:
+    atomic_replace(path, raw, 0o600)
+
+
 def publish_receipt(facts: dict[str, object], state: str, previous: str | None) -> dict[str, object]:
     receipt, raw = make_receipt(facts, state, previous)
     history = RECEIPT_ROOT / f"{receipt['receipt_sha256']}.json"
@@ -530,8 +604,8 @@ def load_retained_release(receipt: dict[str, object]) -> tuple[Path, dict[str, o
     release_metadata = release.lstat()
     if (
         not stat.S_ISDIR(release_metadata.st_mode)
-        or release_metadata.st_uid != 0
-        or release_metadata.st_gid != 0
+        or release_metadata.st_uid != STATE_OWNER_UID
+        or release_metadata.st_gid != STATE_OWNER_GID
         or stat.S_IMODE(release_metadata.st_mode) != 0o555
     ):
         raise ContractError("retained release root is unsafe")
@@ -559,6 +633,411 @@ def compatible(release: Path) -> bool:
         return read_secure(release / COMPATIBILITY_PATH, 0o444, len(COMPATIBILITY)) == COMPATIBILITY
     except ContractError:
         return False
+
+
+def request_matches_receipt(request: dict[str, object], receipt: dict[str, object]) -> bool:
+    return all(request[key] == receipt[key] for key in (
+        "target", "domain", "version", "source_commit", "bundle_sha256",
+        "manifest_sha256", "server_image", "migrator_image",
+    )) and request["previous_receipt_sha256"] == receipt["previous_receipt_sha256"]
+
+
+def potentially_matches_request(
+    request: dict[str, object],
+    value: object,
+) -> bool:
+    keys = (
+        "target", "domain", "version", "source_commit", "bundle_sha256",
+        "manifest_sha256", "server_image", "migrator_image",
+        "previous_receipt_sha256",
+    )
+    return isinstance(value, dict) and all(
+        key in value and request[key] == value[key] for key in keys
+    )
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def disk_free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def remove_receipt_file(path: Path) -> None:
+    secure_metadata(path, 0o600)
+    path.unlink()
+
+
+def maintain_receipt_storage(
+    request: dict[str, object],
+    current: dict[str, object] | None,
+) -> tuple[set[str], set[str]]:
+    explicit: set[str] = {
+        value for value in (
+            None if current is None else current["receipt_sha256"],
+            None if current is None else current["previous_receipt_sha256"],
+            request["previous_receipt_sha256"],
+        )
+        if isinstance(value, str)
+    }
+    records: dict[str, tuple[Path, dict[str, object], int]] = {}
+    invalid_records: dict[str, tuple[Path, dict[str, object] | None]] = {}
+    garbage: list[Path] = []
+    for path in sorted(RECEIPT_ROOT.iterdir()):
+        if path == CURRENT_RECEIPT:
+            continue
+        name = path.name
+        if name.startswith(".") and name.endswith(".tmp") and len(name) <= 160:
+            metadata = secure_metadata(path, 0o600)
+            if metadata.st_size > MAX_RECEIPT_BYTES:
+                raise ContractError("stale receipt temporary exceeds its size bound")
+            garbage.append(path)
+            continue
+        match = re.fullmatch(r"([0-9a-f]{64})\.json", name)
+        if match is None:
+            raise ContractError(f"unexpected receipt storage entry: {path}")
+        receipt_hash = match.group(1)
+        metadata = secure_metadata(path, 0o600)
+        if metadata.st_size > MAX_RECEIPT_BYTES:
+            if receipt_hash in explicit:
+                raise ContractError("recovery-referenced receipt exceeds its size bound")
+            garbage.append(path)
+            continue
+        raw: bytes | None = None
+        try:
+            raw = read_secure(path, 0o600, MAX_RECEIPT_BYTES)
+            receipt = validate_receipt(raw)
+            if receipt["receipt_sha256"] != receipt_hash:
+                raise ContractError("receipt history filename differs from its self-hash")
+        except ContractError:
+            candidate: dict[str, object] | None = None
+            if raw is not None:
+                try:
+                    decoded = decode_json(raw, "invalid receipt history")
+                    if isinstance(decoded, dict):
+                        candidate = decoded
+                except ContractError:
+                    pass
+            invalid_records[receipt_hash] = (path, candidate)
+            garbage.append(path)
+            continue
+        records[receipt_hash] = (path, receipt, len(raw))
+
+    # Resolve the complete authenticated reference graph before unlinking even
+    # stale or malformed entries. Roots are current/request references; valid
+    # installed descendants are crash-recoverable candidates. Every selected
+    # receipt contributes its predecessor recursively.
+    protected: set[str] = set()
+    pending = list(explicit)
+    while True:
+        while pending:
+            receipt_hash = pending.pop()
+            if receipt_hash in protected:
+                continue
+            if receipt_hash in invalid_records:
+                raise ContractError("an authoritative receipt history is corrupt")
+            record = records.get(receipt_hash)
+            if record is None:
+                raise ContractError("an authoritative receipt history is missing")
+            receipt = record[1]
+            if (
+                current is not None
+                and receipt_hash == current["receipt_sha256"]
+                and receipt != current
+            ):
+                raise ContractError("current receipt differs from its authoritative history")
+            protected.add(receipt_hash)
+            previous = receipt["previous_receipt_sha256"]
+            if isinstance(previous, str):
+                pending.append(previous)
+
+        for receipt_hash, (_path, receipt, _size) in records.items():
+            if (
+                receipt_hash not in protected
+                and receipt["state"] == "installed"
+                and (
+                    request_matches_receipt(request, receipt)
+                    or receipt["previous_receipt_sha256"] in protected
+                )
+            ):
+                pending.append(receipt_hash)
+        for receipt_hash, (_path, candidate) in invalid_records.items():
+            if receipt_hash in protected:
+                raise ContractError("an authoritative receipt history is corrupt")
+            previous = (
+                None
+                if candidate is None
+                else candidate.get("previous_receipt_sha256")
+            )
+            if (
+                potentially_matches_request(request, candidate)
+                or (isinstance(previous, str) and previous in protected)
+            ):
+                raise ContractError("a recovery-referenced receipt history is corrupt")
+        if not pending:
+            break
+
+    protected_release_digests = {str(request["bundle_sha256"])}
+    required_release_digests: set[str] = set()
+    if current is not None:
+        current_bundle = str(current["bundle_sha256"])
+        protected_release_digests.add(current_bundle)
+        required_release_digests.add(current_bundle)
+    for receipt_hash in protected:
+        receipt = records[receipt_hash][1]
+        release_digest = str(receipt["bundle_sha256"])
+        protected_release_digests.add(release_digest)
+        required_release_digests.add(release_digest)
+
+    count_limit = MAX_RECEIPT_HISTORY - 1
+    bytes_limit = MAX_RECEIPT_STORAGE_BYTES - RECEIPT_PUBLICATION_RESERVE
+    protected_size = sum(records[value][2] for value in protected)
+    current_size = 0 if current is None else len(canonical(current))
+    if (
+        count_limit < 1
+        or bytes_limit < MAX_RECEIPT_BYTES
+        or len(protected) > count_limit
+        or protected_size + current_size > bytes_limit
+    ):
+        raise ContractError("recovery-referenced receipts exceed the bounded storage quota")
+    for path in garbage:
+        remove_receipt_file(path)
+    if garbage:
+        fsync_directory(RECEIPT_ROOT)
+    unprotected = sorted(
+        (
+            (receipt["installed_at_ms"], receipt_hash, path, size)
+            for receipt_hash, (path, receipt, size) in records.items()
+            if receipt_hash not in protected
+        ),
+        reverse=True,
+    )
+    kept_extra = 0
+    retained_size = protected_size + current_size
+    removed = False
+    for _installed_at, _receipt_hash, path, size in unprotected:
+        if (
+            kept_extra < RETAIN_UNREFERENCED_RECEIPTS
+            and len(protected) + kept_extra + 1 <= count_limit
+            and retained_size + size <= bytes_limit
+        ):
+            kept_extra += 1
+            retained_size += size
+        else:
+            remove_receipt_file(path)
+            removed = True
+    if removed:
+        fsync_directory(RECEIPT_ROOT)
+    return protected_release_digests, required_release_digests
+
+
+def release_tree_size(release: Path, root_mode: int = 0o555) -> int:
+    root_metadata = release.lstat()
+    release_root_metadata = RELEASE_ROOT.lstat()
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != STATE_OWNER_UID
+        or root_metadata.st_gid != STATE_OWNER_GID
+        or stat.S_IMODE(root_metadata.st_mode) != root_mode
+        or root_metadata.st_dev != release_root_metadata.st_dev
+        or os.path.ismount(release)
+    ):
+        raise ContractError(f"unsafe retained release directory: {release}")
+    total = 0
+    for current, directory_names, file_names in os.walk(release, topdown=True, followlinks=False):
+        current_path = Path(current)
+        metadata = current_path.lstat()
+        allowed_directory_modes = {root_mode} if root_mode == 0o555 else {0o700, 0o555}
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != STATE_OWNER_UID
+            or metadata.st_gid != STATE_OWNER_GID
+            or stat.S_IMODE(metadata.st_mode) not in allowed_directory_modes
+            or metadata.st_dev != root_metadata.st_dev
+            or (current_path != release and os.path.ismount(current_path))
+        ):
+            raise ContractError("retained release contains an unsafe directory")
+        for name in directory_names:
+            path = current_path / name
+            child = path.lstat()
+            if (
+                stat.S_ISLNK(child.st_mode)
+                or child.st_dev != root_metadata.st_dev
+                or os.path.ismount(path)
+            ):
+                raise ContractError("retained release crosses a symlink or mount boundary")
+        for name in file_names:
+            path = current_path / name
+            child = path.lstat()
+            if (
+                not stat.S_ISREG(child.st_mode)
+                or child.st_uid != STATE_OWNER_UID
+                or child.st_gid != STATE_OWNER_GID
+                or child.st_nlink != 1
+                or stat.S_IMODE(child.st_mode) not in (0o444, 0o555)
+                or child.st_dev != root_metadata.st_dev
+            ):
+                raise ContractError("retained release contains an unsafe file")
+            total += child.st_size
+    return total
+
+
+def remove_release_tree(release: Path, root_mode: int = 0o555) -> None:
+    release_tree_size(release, root_mode)
+    directories = [Path(current) for current, _dirs, _files in os.walk(release, topdown=False)]
+    for directory in directories:
+        os.chmod(directory, 0o700)
+    shutil.rmtree(release)
+    fsync_directory(RELEASE_ROOT)
+
+
+def maintain_release_storage(
+    candidate_digest: str,
+    protected_digests: set[str],
+    required_digests: set[str],
+    candidate_bytes: int,
+) -> None:
+    if candidate_bytes > MAX_BUNDLE_BYTES:
+        raise ContractError("candidate release exceeds the 32 MiB bundle bound")
+    records: list[tuple[int, str, Path, int]] = []
+    for path in sorted(RELEASE_ROOT.iterdir()):
+        name = path.name
+        if name.startswith(".incoming-"):
+            if len(name) > 96:
+                raise ContractError("stale release staging name is invalid")
+            release_tree_size(path, 0o700)
+            remove_release_tree(path, 0o700)
+            continue
+        if HEX64.fullmatch(name) is None:
+            raise ContractError(f"unexpected retained release entry: {path}")
+        size = release_tree_size(path)
+        if size > MAX_BUNDLE_BYTES:
+            if name in protected_digests:
+                raise ContractError("recovery-referenced release exceeds the 32 MiB bound")
+            remove_release_tree(path)
+            continue
+        records.append((path.lstat().st_mtime_ns, name, path, size))
+    present = {name for _mtime, name, _path, _size in records}
+    missing = required_digests - present
+    if missing:
+        raise ContractError("a recovery-referenced retained release is missing")
+    candidate_present = candidate_digest in present
+    additional_bytes = 0 if candidate_present else candidate_bytes
+    count_limit = MAX_RETAINED_RELEASES - (0 if candidate_present else 1)
+    bytes_limit = MAX_RELEASE_STORAGE_BYTES - additional_bytes
+    protected_records = [record for record in records if record[1] in protected_digests]
+    protected_size = sum(record[3] for record in protected_records)
+    if (
+        count_limit < 1
+        or bytes_limit < MAX_BUNDLE_BYTES
+        or len(protected_records) > count_limit
+        or protected_size > bytes_limit
+    ):
+        raise ContractError("recovery-referenced releases exceed the bounded storage quota")
+    unprotected = sorted(
+        (record for record in records if record[1] not in protected_digests),
+        reverse=True,
+    )
+    kept_extra = 0
+    retained_size = protected_size
+    for _mtime, _name, path, size in unprotected:
+        if (
+            kept_extra < RETAIN_UNREFERENCED_RELEASES
+            and len(protected_records) + kept_extra + 1 <= count_limit
+            and retained_size + size <= bytes_limit
+        ):
+            kept_extra += 1
+            retained_size += size
+        else:
+            remove_release_tree(path)
+    if disk_free_bytes(RELEASE_ROOT) < MIN_RELEASE_FREE_BYTES + candidate_bytes:
+        raise ContractError("insufficient free space for bounded release materialization")
+
+
+def maintain_host_storage(
+    request: dict[str, object],
+    current: dict[str, object] | None,
+    candidate_bytes: int,
+) -> None:
+    protected, required = maintain_receipt_storage(request, current)
+    maintain_release_storage(str(request["bundle_sha256"]), protected, required, candidate_bytes)
+    # Release and receipt roots commonly share the host filesystem. Check the
+    # receipt floor only after both retention passes so releasable bundles can
+    # satisfy admission; a separate receipt filesystem still fails closed.
+    if disk_free_bytes(STATE_ROOT) < MIN_STATE_FREE_BYTES + RECEIPT_PUBLICATION_RESERVE:
+        raise ContractError("insufficient free space for bounded receipt publication")
+
+
+def install_code_only_rollback(release: Path, manifest: dict[str, object]) -> None:
+    """Restore the retained release's code/config without touching schema or volumes."""
+    files = {
+        "docker/production/Caddyfile": (PRODUCTION_CONFIG_ROOT / "Caddyfile", 0o644),
+        "docker/production/docker-compose.yml": (PRODUCTION_COMPOSE, 0o644),
+        "tools/validate-production-images.py": (
+            PRODUCTION_INSTALL_ROOT / "validate-production-images.py", 0o555
+        ),
+    }
+    for relative, (destination, mode) in files.items():
+        data = read_secure(release / relative, 0o555 if relative.endswith(".py") else 0o444, MAX_BUNDLE_BYTES)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        atomic_replace(destination, data, mode)
+    # Keep all operator-owned configuration, secret, and TLS paths intact while
+    # switching only the two executable image references and release identity.
+    try:
+        env_raw = read_secure(PRODUCTION_ENV, 0o644, MAX_BUNDLE_BYTES).decode()
+        replacements = {
+            "DTX_SERVER_IMAGE": str(manifest["server_image"]),
+            "DTX_MIGRATOR_IMAGE": str(manifest["migrator_image"]),
+            "DTX_RELEASE_VERSION": str(manifest["version"]),
+        }
+        lines = []
+        replaced: set[str] = set()
+        for line in env_raw.splitlines(keepends=True):
+            key, separator, _value = line.partition("=")
+            if separator and key in replacements:
+                if key in replaced:
+                    raise ContractError("production environment duplicates a rollback identity field")
+                newline = "\n" if line.endswith("\n") else ""
+                line = f"{key}={replacements[key]}{newline}"
+                replaced.add(key)
+            lines.append(line)
+        if replaced != set(replacements):
+            raise ContractError("production environment is missing a rollback identity field")
+        env_data = "".join(lines).encode()
+        atomic_replace(PRODUCTION_ENV, env_data, 0o644)
+        atomic_replace(CURRENT_ENV, env_data, 0o600)
+    except (UnicodeDecodeError, ContractError) as error:
+        raise ContractError("production environment is unavailable for code-only rollback") from error
+    # Reconcile only long-running containers.  --no-deps is the code-only
+    # boundary: it cannot invoke bootstrap/migrate/grant/verify or any down
+    # migration, and named volumes/secrets/TLS are left untouched.
+    environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+    subprocess.run(
+        [
+            "docker", "compose", "--project-name", "dirextalk-vnext-production",
+            "--env-file", str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE),
+            "up", "-d", "--no-deps", "dtx-node", "realtime-gateway", "agent-control", "caddy",
+        ],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        check=True,
+        timeout=600,
+    )
+    verifier = release / VERIFY_PATH
+    read_secure(verifier, 0o555, MAX_BUNDLE_BYTES)
+    subprocess.run(
+        [str(verifier)],
+        cwd=release,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        check=True,
+        timeout=600,
+    )
 
 
 def invoke_fixed_installer(release: Path, manifest: dict[str, object]) -> None:
@@ -591,7 +1070,7 @@ def consume_uploads(incoming: Path) -> tuple[Path, Path]:
 
 def install_once() -> None:
     incoming = Path(tempfile.mkdtemp(prefix="install-", dir=INCOMING_ROOT))
-    os.chown(incoming, 0, 0)
+    os.chown(incoming, STATE_OWNER_UID, STATE_OWNER_GID)
     os.chmod(incoming, 0o700)
     try:
         bundle_path, request_path = consume_uploads(incoming)
@@ -603,29 +1082,71 @@ def install_once() -> None:
         manifest, manifest_raw, payloads, modes = validate_bundle(bundle_raw)
         request_matches_bundle(request, manifest, manifest_raw)
         current, _ = read_current_receipt()
+        maintain_host_storage(request, current, len(bundle_raw))
+        replay = current is not None and current["state"] == "installed" and request_matches_receipt(request, current)
+        recovered_rollback = (
+            current is not None
+            and current["state"] == "rolled_back"
+            and request["previous_receipt_sha256"] == current["previous_receipt_sha256"]
+        )
         expected_previous = None if current is None else current["receipt_sha256"]
-        if request["previous_receipt_sha256"] != expected_previous:
+        if replay:
+            load_retained_release(current)
+            return
+        recovered_candidate = find_candidate_receipt(request)
+        if recovered_candidate is not None and (
+            current is None
+            or recovered_candidate[0]["previous_receipt_sha256"] == current["receipt_sha256"]
+            or (
+                current["state"] == "rolled_back"
+                and recovered_candidate[0]["previous_receipt_sha256"] == current["previous_receipt_sha256"]
+            )
+        ):
+            recovered_receipt, recovered_raw = recovered_candidate
+            load_retained_release(recovered_receipt)
+            atomic_write(CURRENT_RECEIPT, recovered_raw)
+            return
+        if current is not None and not recovered_rollback and request["previous_receipt_sha256"] != expected_previous:
             raise ContractError("install request does not chain from the current receipt")
-        if current is not None and request["version"] != current["version"]:
-            raise ContractError("cross-version install is not implemented; request rejected before mutation")
+        prior_release: Path | None = None
+        prior_manifest: dict[str, object] | None = None
+        rollback_previous = expected_previous
+        if current is not None:
+            prior_release, prior_manifest = load_retained_release(current)
+            if not compatible(prior_release):
+                raise ContractError("retained release has no authenticated forward migration compatibility marker")
+            if recovered_rollback:
+                rollback_previous = current["previous_receipt_sha256"]
+        if (
+            current is not None
+            and request["version"] != current["version"]
+            and not admitted_cross_version(str(current["version"]), str(request["version"]))
+        ):
+            raise ContractError("cross-version install is outside the admitted 0.1.1 to 0.1.4 transition")
         release = materialize_release(
             str(request["bundle_sha256"]), manifest, manifest_raw, payloads, modes
         )
+        if not compatible(release):
+            raise ContractError("candidate release has no authenticated forward migration compatibility marker")
         try:
             invoke_fixed_installer(release, manifest)
         except (ContractError, OSError, subprocess.SubprocessError) as install_error:
             if current is None:
                 raise ContractError("candidate installer failed and no prior release exists") from install_error
-            prior_release, prior_manifest = load_retained_release(current)
-            if not compatible(release) or not compatible(prior_release):
-                raise ContractError("candidate installer failed and compatible rollback is not permitted") from install_error
             try:
-                invoke_fixed_installer(prior_release, prior_manifest)
+                assert prior_release is not None and prior_manifest is not None
+                install_code_only_rollback(prior_release, prior_manifest)
             except (ContractError, OSError, subprocess.SubprocessError) as rollback_error:
-                raise ContractError("candidate and retained release installers both failed") from rollback_error
-            publish_receipt(current, "rolled_back", str(current["receipt_sha256"]))
+                raise ContractError(
+                    "candidate failed and retained prior services did not become ready; recovery remains nonterminal"
+                ) from rollback_error
+            publish_receipt(current, "rolled_back", str(rollback_previous))
             raise ContractError("candidate installer failed; prior compatible release restored") from install_error
-        publish_receipt(request, "installed", expected_previous)
+        publish_receipt(
+            request,
+            "installed",
+            request["previous_receipt_sha256"] if recovered_rollback else expected_previous,
+        )
     finally:
         shutil.rmtree(incoming)
 
@@ -638,8 +1159,8 @@ def open_lock() -> int:
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or metadata.st_gid != 0
+        or metadata.st_uid != STATE_OWNER_UID
+        or metadata.st_gid != STATE_OWNER_GID
         or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
         os.close(descriptor)

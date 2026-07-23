@@ -10,4 +10,5 @@ python3 tools/vnext-stack-bundle.py self-test --source-root .
 python3 tools/test-vnext-stack-host.py
 python3 tools/test-client-binding-release-artifacts.py
 bash scripts/check-release-image.sh
-echo 'production stack and four-binary release gates passed'
+bash scripts/test-production-cross-version-postgres.sh
+echo 'production stack and retained cross-version release gates passed'
