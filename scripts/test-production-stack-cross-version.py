@@ -392,6 +392,42 @@ def main() -> None:
     assert "install_code_only_rollback" not in install_source
     assert "if current[\"previous_receipt_sha256\"] is not None:" in install_source
 
+    # An absent current receipt may only recover a true initial receipt. A
+    # chained historical candidate cannot be promoted without its predecessor.
+    original_atomic = MODULE.atomic_write
+    original_current_path = MODULE.CURRENT_RECEIPT
+    try:
+        writes: list[tuple[Path, bytes]] = []
+        MODULE.CURRENT_RECEIPT = Path("/receipt/current.json")
+        MODULE.atomic_write = lambda path, raw: writes.append((path, raw))
+        fresh, fresh_raw = MODULE.make_receipt(prior, "installed", None)
+        MODULE.promote_initial_recovered_receipt(fresh, fresh_raw)
+        assert writes == [(MODULE.CURRENT_RECEIPT, fresh_raw)]
+        chained = dict(fresh); chained["previous_receipt_sha256"] = "e" * 64
+        writes.clear()
+        try: MODULE.promote_initial_recovered_receipt(chained, fresh_raw)
+        except MODULE.ContractError: pass
+        else: raise AssertionError("chained historical receipt was promoted as initial")
+        assert not writes
+    finally:
+        MODULE.atomic_write = original_atomic
+        MODULE.CURRENT_RECEIPT = original_current_path
+
+    # Unknown staged names fail before directory creation, locking, or upload
+    # handling. This keeps the one-artifact basename dispatch fail-closed.
+    original_argv = MODULE.sys.argv
+    original_euid = MODULE.os.geteuid
+    original_ensure = MODULE.ensure_root_directory
+    try:
+        MODULE.sys.argv = ["/tmp/not-install-vnext"]
+        MODULE.os.geteuid = lambda: 0
+        MODULE.ensure_root_directory = lambda *_args: (_ for _ in ()).throw(AssertionError("filesystem mutation"))
+        assert MODULE.main() == 1
+    finally:
+        MODULE.sys.argv = original_argv
+        MODULE.os.geteuid = original_euid
+        MODULE.ensure_root_directory = original_ensure
+
     print("production cross-version crash/replay/receipt/rollback checks passed")
 
 

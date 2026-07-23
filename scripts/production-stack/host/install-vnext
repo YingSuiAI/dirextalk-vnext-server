@@ -1492,6 +1492,12 @@ def consume_uploads(incoming: Path) -> tuple[Path, Path]:
     return bundle, request
 
 
+def promote_initial_recovered_receipt(receipt: dict[str, object], raw: bytes) -> None:
+    if receipt["previous_receipt_sha256"] is not None:
+        raise ContractError("initial receipt recovery rejects a chained historical candidate")
+    atomic_write(CURRENT_RECEIPT, raw)
+
+
 def install_once() -> None:
     incoming = Path(tempfile.mkdtemp(prefix="install-", dir=INCOMING_ROOT))
     os.chown(incoming, STATE_OWNER_UID, STATE_OWNER_GID)
@@ -1521,19 +1527,21 @@ def install_once() -> None:
                     raise ContractError("candidate receipt has no exact ready runtime attestation")
             return
         recovered_candidate = find_candidate_receipt(request)
-        if recovered_candidate is not None and (
-            current is None
-            or recovered_candidate[0]["previous_receipt_sha256"] == current["receipt_sha256"]
+        if recovered_candidate is not None and current is None:
+            recovered_receipt, recovered_raw = recovered_candidate
+            promote_initial_recovered_receipt(recovered_receipt, recovered_raw)
+            return
+        if recovered_candidate is not None and current is not None and (
+            recovered_candidate[0]["previous_receipt_sha256"] == current["receipt_sha256"]
             or (
                 current["state"] == "rolled_back"
                 and recovered_candidate[0]["previous_receipt_sha256"] == current["previous_receipt_sha256"]
             )
         ):
             recovered_receipt, recovered_raw = recovered_candidate
-            if current is not None:
-                recovered_release, recovered_manifest = load_retained_release(recovered_receipt)
-                if not runtime_is_attested(recovered_release, recovered_manifest, recovered_receipt):
-                    raise ContractError("recovered candidate receipt has no exact ready runtime attestation")
+            recovered_release, recovered_manifest = load_retained_release(recovered_receipt)
+            if not runtime_is_attested(recovered_release, recovered_manifest, recovered_receipt):
+                raise ContractError("recovered candidate receipt has no exact ready runtime attestation")
             atomic_write(CURRENT_RECEIPT, recovered_raw)
             return
         if current is not None and not recovered_rollback and request["previous_receipt_sha256"] != expected_previous:
@@ -1640,6 +1648,10 @@ def main() -> int:
     if os.geteuid() != 0:
         print("install-vnext requires root", file=sys.stderr)
         return 1
+    basename = Path(sys.argv[0]).name
+    if basename not in {"install-vnext", "recover-vnext-011-to-014", "attest-vnext-011-to-014"}:
+        print("install-vnext: unrecognized helper basename", file=sys.stderr)
+        return 1
     try:
         ensure_root_directory(STATE_ROOT, 0o700)
         ensure_root_directory(INCOMING_ROOT, 0o700)
@@ -1648,7 +1660,6 @@ def main() -> int:
         lock = open_lock()
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            basename = Path(sys.argv[0]).name
             if basename == "recover-vnext-011-to-014":
                 recover_false_runtime_once()
             elif basename == "attest-vnext-011-to-014":
