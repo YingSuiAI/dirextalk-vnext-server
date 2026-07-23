@@ -27,6 +27,7 @@ fn command(operation: Uuid, tenant: Uuid, binding: Uuid, now: i64) -> ClientBind
         tls_root_ca_sha256: Sha256Digest::from_bytes([1; 32]),
         authorization_digest: Sha256Digest::from_bytes([2; 32]),
         artifact_digest: Sha256Digest::from_bytes([3; 32]),
+        issue_request_digest: Sha256Digest::from_bytes([4; 32]),
         issued_at_ms: now,
         expires_at_ms: now + 60_000,
     }
@@ -56,10 +57,17 @@ async fn client_binding_issue_replay_conflict_concurrency_and_lifecycle()
         repository.issue(&store, &divergent).await,
         Err(ClientBindingWorkflowError::Conflict)
     ));
+    let mut changed_path = first.clone();
+    changed_path.issue_request_digest = Sha256Digest::from_bytes([7; 32]);
+    assert!(matches!(
+        repository.issue(&store, &changed_path).await,
+        Err(ClientBindingWorkflowError::Conflict)
+    ));
 
     let concurrent_operation = Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789ab")?;
     let mut left = command(concurrent_operation, tenant, Uuid::now_v7(), 2_000);
     left.authorization_digest = Sha256Digest::from_bytes([5; 32]);
+    left.issue_request_digest = Sha256Digest::from_bytes([8; 32]);
     let right = left.clone();
     let (left_result, right_result) = tokio::join!(
         repository.issue(&store, &left),
@@ -119,6 +127,35 @@ async fn client_binding_bootstrap_and_consume_are_exactly_replayable_and_atomic(
     let recovery = signing_key(8);
     let genesis = genesis_event(&root, &recovery, 9_000);
     let genesis_bytes = genesis.to_deterministic_cbor()?;
+    let rollback_binding = Uuid::now_v7();
+    let mut rollback_issue = command(Uuid::now_v7(), tenant, rollback_binding, 9_500);
+    rollback_issue.authorization_digest = Sha256Digest::from_bytes([21; 32]);
+    rollback_issue.issue_request_digest = Sha256Digest::from_bytes([22; 32]);
+    repository.issue(&store, &rollback_issue).await?;
+    sqlx::query("REVOKE INSERT ON identity.log_outbox FROM dtx_identity_runtime")
+        .execute(harness.admin_pool())
+        .await?;
+    let rollback = repository
+        .deployment_bootstrap(
+            &store,
+            rollback_binding,
+            rollback_issue.authorization_digest,
+            Sha256Digest::from_bytes([91; 32]),
+            genesis_bytes.clone(),
+            UtcMillis::new(9_501)?,
+        )
+        .await;
+    sqlx::query("GRANT INSERT ON identity.log_outbox TO dtx_identity_runtime")
+        .execute(harness.admin_pool())
+        .await?;
+    assert!(matches!(
+        rollback,
+        Err(ClientBindingWorkflowError::Persistence(_))
+    ));
+    assert_eq!(
+        binding_state(harness.identity_runtime_pool(), rollback_binding).await?,
+        "issued"
+    );
     let genesis_key = Sha256Digest::from_bytes([9; 32]);
     let first = repository
         .deployment_bootstrap(
@@ -170,46 +207,107 @@ async fn client_binding_bootstrap_and_consume_are_exactly_replayable_and_atomic(
         "identity_bound"
     );
 
-    let device = signing_key(12);
-    let device_id = DeviceId::new();
-    let certificate =
-        device_certificate(&root, genesis.identity_id(), &device, device_id, 13, 10_004);
-    let device_event = signed_event(
+    let device_a = signing_key(12);
+    let first_device_id = DeviceId::new();
+    let certificate_a = device_certificate(
+        &root,
+        genesis.identity_id(),
+        &device_a,
+        first_device_id,
+        13,
+        10_004,
+    );
+    let device_event_a = signed_event(
         &root,
         genesis.identity_id(),
         2,
         Some(receipt.head().hash()),
         10_005,
-        IdentityLogEventPayloadV1::DeviceAdd { certificate },
+        IdentityLogEventPayloadV1::DeviceAdd {
+            certificate: certificate_a,
+        },
     );
-    let device_bytes = device_event.to_deterministic_cbor()?;
-    let device_key = Sha256Digest::from_bytes([10; 32]);
-    let consumed = repository
-        .initial_device(
+    let device_bytes_a = device_event_a.to_deterministic_cbor()?;
+    let device_b = signing_key(14);
+    let second_device_id = DeviceId::new();
+    let certificate_b = device_certificate(
+        &root,
+        genesis.identity_id(),
+        &device_b,
+        second_device_id,
+        15,
+        10_005,
+    );
+    let device_event_b = signed_event(
+        &root,
+        genesis.identity_id(),
+        2,
+        Some(receipt.head().hash()),
+        10_006,
+        IdentityLogEventPayloadV1::DeviceAdd {
+            certificate: certificate_b,
+        },
+    );
+    let device_bytes_b = device_event_b.to_deterministic_cbor()?;
+    let device_key_a = Sha256Digest::from_bytes([10; 32]);
+    let device_key_b = Sha256Digest::from_bytes([11; 32]);
+    let (left, right) = tokio::join!(
+        repository.initial_device(
             &store,
             binding,
             issue.authorization_digest,
-            device_key,
+            device_key_a,
             receipt.head().hash(),
-            device_bytes.clone(),
-            UtcMillis::new(10_006)?,
-        )
-        .await?;
-    assert!(matches!(consumed, IdentityAppendOutcome::Committed(_)));
+            device_bytes_a.clone(),
+            UtcMillis::new(10_007)?,
+        ),
+        repository.initial_device(
+            &store,
+            binding,
+            issue.authorization_digest,
+            device_key_b,
+            receipt.head().hash(),
+            device_bytes_b.clone(),
+            UtcMillis::new(10_008)?,
+        ),
+    );
+    let committed = [left.as_ref(), right.as_ref()]
+        .into_iter()
+        .filter_map(|result| {
+            matches!(result, Ok(IdentityAppendOutcome::Committed(_))).then_some(())
+        })
+        .count();
+    assert_eq!(
+        committed, 1,
+        "concurrent distinct consume requests must have one winner"
+    );
+    assert_eq!(
+        [left.as_ref(), right.as_ref()]
+            .into_iter()
+            .filter(|result| matches!(result, Err(ClientBindingWorkflowError::Conflict)))
+            .count(),
+        1,
+        "the losing distinct consume request must conflict"
+    );
     assert_eq!(
         binding_state(harness.identity_runtime_pool(), binding).await?,
         "consumed"
     );
+    let (winner_key, winner_bytes) = if matches!(left, Ok(IdentityAppendOutcome::Committed(_))) {
+        (device_key_a, device_bytes_a)
+    } else {
+        (device_key_b, device_bytes_b)
+    };
 
     let replay = repository
         .initial_device(
             &store,
             binding,
             issue.authorization_digest,
-            device_key,
+            winner_key,
             receipt.head().hash(),
-            device_bytes,
-            UtcMillis::new(10_007)?,
+            winner_bytes,
+            UtcMillis::new(10_009)?,
         )
         .await?;
     assert!(matches!(replay, IdentityAppendOutcome::Replayed(_)));

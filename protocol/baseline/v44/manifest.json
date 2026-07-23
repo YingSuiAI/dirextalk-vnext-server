@@ -1,0 +1,9 @@
+{
+  "version": 44,
+  "events": {},
+  "errors": {},
+  "artifacts": {
+    "protocol/cddl/client-binding/v1/client-binding-v1.cddl": "sha256:1e0bce08e73578295dc0f70b54e58d3dfd551ff76326c463d20a7178520510ea",
+    "protocol/openapi/client-binding/v1/openapi.yaml": "sha256:30a798200dcfb196be1bbadf4778abf8f48cb0ee3c274d212c0e5c959fca75e2"
+  }
+}

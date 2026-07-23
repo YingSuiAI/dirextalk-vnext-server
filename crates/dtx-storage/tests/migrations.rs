@@ -59,7 +59,10 @@ const RECOVERY_SCOPE_CATALOG_V1_MIGRATION_VERSION: i64 = 202_607_210_052;
 const OPAQUE_PUSH_V1_MIGRATION_VERSION: i64 = 202_607_220_053;
 const CONNECTOR_BOOTSTRAP_ISSUANCE_V1_MIGRATION_VERSION: i64 = 202_607_220_054;
 const AGENT_IDENTITY_READER_RLS_FIX_MIGRATION_VERSION: i64 = 202_607_230_055;
-const EXPECTED_MIGRATION_COUNT: i64 = 57;
+const CLIENT_BINDING_MIGRATION_VERSION: i64 = 202_607_230_056;
+const CLIENT_BINDING_ISSUANCE_FENCES_MIGRATION_VERSION: i64 = 202_607_230_057;
+const CLIENT_BINDING_ISSUE_REQUEST_DIGEST_MIGRATION_VERSION: i64 = 202_607_230_058;
+const EXPECTED_MIGRATION_COUNT: i64 = 58;
 const INITIAL_DOWN: &str =
     include_str!("../../../migrations/202607130001_persistence_kernel.down.sql");
 const AGENT_CONTROL_DOWN: &str =
@@ -205,6 +208,13 @@ const AGENT_IDENTITY_READER_RLS_FIX_DOWN: &str =
     include_str!("../../../migrations/202607230055_agent_identity_reader_rls_fix.down.sql");
 const AGENT_IDENTITY_READER_RLS_FIX_UP: &str =
     include_str!("../../../migrations/202607230055_agent_identity_reader_rls_fix.up.sql");
+const CLIENT_BINDING_DOWN: &str =
+    include_str!("../../../migrations/202607230056_client_binding_v1.down.sql");
+const CLIENT_BINDING_ISSUANCE_FENCES_DOWN: &str =
+    include_str!("../../../migrations/202607230057_client_binding_issuance_fences_v1.down.sql");
+const CLIENT_BINDING_ISSUE_REQUEST_DIGEST_DOWN: &str = include_str!(
+    "../../../migrations/202607230058_client_binding_issue_request_digest_v1.down.sql"
+);
 const LOCAL_RUNTIME_GRANTS: &str =
     include_str!("../../../docker/local/postgres/20-local-runtime-grants.sql");
 
@@ -3833,7 +3843,7 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
 
     sqlx::query(
         "DELETE FROM public._sqlx_migrations
-          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55)",
+          WHERE version IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58)",
     )
     .bind(INITIAL_MIGRATION_VERSION)
     .bind(AGENT_CONTROL_MIGRATION_VERSION)
@@ -3890,8 +3900,20 @@ async fn all_schemas_can_run_up_down_up_on_an_empty_database()
     .bind(OPAQUE_PUSH_V1_MIGRATION_VERSION)
     .bind(CONNECTOR_BOOTSTRAP_ISSUANCE_V1_MIGRATION_VERSION)
     .bind(AGENT_IDENTITY_READER_RLS_FIX_MIGRATION_VERSION)
+    .bind(CLIENT_BINDING_MIGRATION_VERSION)
+    .bind(CLIENT_BINDING_ISSUANCE_FENCES_MIGRATION_VERSION)
+    .bind(CLIENT_BINDING_ISSUE_REQUEST_DIGEST_MIGRATION_VERSION)
     .execute(harness.admin_pool())
     .await?;
+    sqlx::raw_sql(CLIENT_BINDING_ISSUE_REQUEST_DIGEST_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(CLIENT_BINDING_ISSUANCE_FENCES_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
+    sqlx::raw_sql(CLIENT_BINDING_DOWN)
+        .execute(harness.admin_pool())
+        .await?;
     sqlx::raw_sql(AGENT_IDENTITY_READER_RLS_FIX_DOWN)
         .execute(harness.admin_pool())
         .await?;

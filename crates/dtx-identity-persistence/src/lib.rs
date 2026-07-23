@@ -13,9 +13,11 @@ mod store;
 mod types;
 
 pub use client_binding::{
-    CLIENT_BINDING_AUTHORIZATION_HASH_DOMAIN, ClientBindingAuthorization, ClientBindingImport,
-    ClientBindingImportError, ClientBindingIssueCommand, ClientBindingIssueOutcome,
-    ClientBindingRepository, ClientBindingState, ClientBindingWorkflowError,
+    CLIENT_BINDING_AUTHORIZATION_HASH_DOMAIN, CLIENT_BINDING_BOOTSTRAP_HASH_DOMAIN,
+    CLIENT_BINDING_INITIAL_DEVICE_HASH_DOMAIN, CLIENT_BINDING_ISSUE_HASH_DOMAIN,
+    ClientBindingAuthorization, ClientBindingImport, ClientBindingImportError,
+    ClientBindingIssueCommand, ClientBindingIssueOutcome, ClientBindingRepository,
+    ClientBindingState, ClientBindingWorkflowError,
 };
 pub use device_enrollment::{
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,

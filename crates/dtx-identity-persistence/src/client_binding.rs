@@ -46,11 +46,9 @@ impl ClientBindingAuthorization {
         if value.len() != 43 {
             return Err(ClientBindingImportError);
         }
-        let mut raw = [0; 32];
-        Base64UrlUnpadded::decode(value, &mut raw).map_err(|_| ClientBindingImportError)?;
-        let authorization = Self(raw);
-        raw.zeroize();
-        Ok(authorization)
+        let mut raw = Zeroizing::new([0; 32]);
+        Base64UrlUnpadded::decode(value, &mut *raw).map_err(|_| ClientBindingImportError)?;
+        Ok(Self(*raw))
     }
     #[must_use]
     pub fn digest(&self) -> Sha256Digest {
@@ -127,6 +125,7 @@ pub struct ClientBindingIssueCommand {
     pub tls_root_ca_sha256: Sha256Digest,
     pub authorization_digest: Sha256Digest,
     pub artifact_digest: Sha256Digest,
+    pub issue_request_digest: Sha256Digest,
     pub issued_at_ms: i64,
     pub expires_at_ms: i64,
 }
@@ -140,6 +139,7 @@ pub struct ClientBindingIssueOutcome {
     pub tls_root_ca_sha256: Sha256Digest,
     pub authorization_digest: Sha256Digest,
     pub artifact_digest: Sha256Digest,
+    pub issue_request_digest: Option<Sha256Digest>,
     pub issued_at_ms: i64,
     pub expires_at_ms: i64,
     pub state: ClientBindingState,
@@ -222,6 +222,7 @@ impl ClientBindingRepository {
             if let Some(row) = sqlx::query(
                 "SELECT binding_id, deployment_operation_id, tenant_id, server_origin,
                         tls_root_ca_sha256, authorization_digest, artifact_digest,
+                        issue_request_digest,
                         issued_at_ms, expires_at_ms, state
                    FROM identity.client_bindings
                   WHERE tenant_id=$1 AND deployment_operation_id=$2
@@ -239,6 +240,7 @@ impl ClientBindingRepository {
                     || existing.tls_root_ca_sha256 != command.tls_root_ca_sha256
                     || existing.authorization_digest != command.authorization_digest
                     || existing.artifact_digest != command.artifact_digest
+                    || existing.issue_request_digest != Some(command.issue_request_digest)
                     || existing.issued_at_ms != command.issued_at_ms
                     || existing.expires_at_ms != command.expires_at_ms
                 {
@@ -253,8 +255,8 @@ impl ClientBindingRepository {
                 "INSERT INTO identity.client_bindings (
                      binding_id, deployment_operation_id, tenant_id, server_origin,
                      tls_root_ca_sha256, authorization_digest, artifact_digest,
-                     issued_at_ms, expires_at_ms, state, revision
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'issued',1)",
+                     issue_request_digest, issued_at_ms, expires_at_ms, state, revision
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'issued',1)",
             )
             .bind(command.binding_id)
             .bind(command.deployment_operation_id)
@@ -263,6 +265,7 @@ impl ClientBindingRepository {
             .bind(command.tls_root_ca_sha256.as_bytes().as_slice())
             .bind(command.authorization_digest.as_bytes().as_slice())
             .bind(command.artifact_digest.as_bytes().as_slice())
+            .bind(command.issue_request_digest.as_bytes().as_slice())
             .bind(command.issued_at_ms)
             .bind(command.expires_at_ms)
             .execute(session.connection())
@@ -276,6 +279,7 @@ impl ClientBindingRepository {
                     tls_root_ca_sha256: command.tls_root_ca_sha256,
                     authorization_digest: command.authorization_digest,
                     artifact_digest: command.artifact_digest,
+                    issue_request_digest: Some(command.issue_request_digest),
                     issued_at_ms: command.issued_at_ms,
                     expires_at_ms: command.expires_at_ms,
                     state: ClientBindingState::Issued,
@@ -677,6 +681,7 @@ fn issue_outcome_from_row(
         tls_root_ca_sha256: digest("tls_root_ca_sha256")?,
         authorization_digest: digest("authorization_digest")?,
         artifact_digest: digest("artifact_digest")?,
+        issue_request_digest: optional_digest(row, "issue_request_digest")?,
         issued_at_ms: row
             .try_get("issued_at_ms")
             .map_err(|_| ClientBindingWorkflowError::Corrupt)?,
@@ -690,6 +695,24 @@ fn issue_outcome_from_row(
         )?,
         replayed,
     })
+}
+
+fn optional_digest(
+    row: &sqlx::postgres::PgRow,
+    name: &str,
+) -> Result<Option<Sha256Digest>, ClientBindingWorkflowError> {
+    let Some(bytes) = row
+        .try_get::<Option<Vec<u8>>, _>(name)
+        .map_err(|_| ClientBindingWorkflowError::Corrupt)?
+    else {
+        return Ok(None);
+    };
+    if bytes.len() != 32 {
+        return Err(ClientBindingWorkflowError::Corrupt);
+    }
+    let mut value = [0_u8; 32];
+    value.copy_from_slice(&bytes);
+    Ok(Some(Sha256Digest::from_bytes(value)))
 }
 
 fn extract_device_id(event: &IdentityLogEventV1) -> Option<Uuid> {

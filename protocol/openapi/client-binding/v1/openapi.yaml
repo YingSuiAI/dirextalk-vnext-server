@@ -1,0 +1,171 @@
+openapi: 3.1.0
+info:
+  title: Dirextalk Client Binding Deployment Contract
+  version: 1.0.0
+  description: Short-lived deployment client binding authorization for identity bootstrap.
+paths:
+  /v1/identity/deployment-bootstrap:
+    post:
+      operationId: deploymentBootstrapIdentity
+      summary: Commit genesis authorized by a short-lived deployment client binding.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/ClientBindingId'
+        - $ref: '#/components/parameters/ClientBindingAuthorization'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.identity-log.v1.1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 1048576
+            schema: { $ref: '#/components/schemas/ExactIdentityLogGenesisV1_1' }
+      responses:
+        '201': { $ref: '#/components/responses/IdentityBootstrapCommitted' }
+        '200': { $ref: '#/components/responses/IdentityBootstrapReplayed' }
+        '409': { $ref: '#/components/responses/ClientBindingConflict' }
+        '422': { $ref: '#/components/responses/ClientBindingInvalid' }
+        '503': { $ref: '#/components/responses/IdentityServiceUnavailable' }
+  /v1/identity/deployment-bootstrap/initial-device:
+    post:
+      operationId: deploymentInitialDevice
+      summary: Commit the root-authorized initial device under a client binding.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/ClientBindingId'
+        - $ref: '#/components/parameters/ClientBindingAuthorization'
+        - $ref: '#/components/parameters/GenesisIfMatch'
+      requestBody:
+        required: true
+        content:
+          application/vnd.dirextalk.identity-log.v1.1+cbor:
+            x-dirextalk-exact-cbor: true
+            x-dirextalk-max-body-bytes: 1048576
+            schema: { $ref: '#/components/schemas/ExactInitialDeviceV1_1' }
+      responses:
+        '201': { $ref: '#/components/responses/IdentityBootstrapCommitted' }
+        '200': { $ref: '#/components/responses/IdentityBootstrapReplayed' }
+        '409': { $ref: '#/components/responses/ClientBindingConflict' }
+        '422': { $ref: '#/components/responses/ClientBindingInvalid' }
+        '503': { $ref: '#/components/responses/IdentityServiceUnavailable' }
+components:
+  parameters:
+    ClientBindingId:
+      name: X-Dirextalk-Client-Binding
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+    ClientBindingAuthorization:
+      name: Authorization
+      in: header
+      required: true
+      description: Exactly one DTX-Client-Binding bearer value; raw authorization is never echoed.
+      schema:
+        type: string
+        pattern: '^DTX-Client-Binding [A-Za-z0-9_-]{43}$'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
+        pattern: '^[A-Za-z0-9_-]{16,128}$'
+    GenesisIfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^"[0-9a-f]{64}"$'
+  headers:
+    CacheControlNoStore:
+      description: Deployment binding responses are never cacheable.
+      schema: { type: string, const: no-store }
+    XContentTypeOptions:
+      description: Prevents content-type sniffing.
+      schema: { type: string, const: nosniff }
+    XRequestId:
+      description: Opaque request correlation ID; credentials and event bytes are never echoed.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+  responses:
+    IdentityBootstrapCommitted:
+      description: The event committed durably for the first time.
+      headers:
+        Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+        X-Content-Type-Options: { $ref: '#/components/headers/XContentTypeOptions' }
+        X-Request-Id: { $ref: '#/components/headers/XRequestId' }
+      content:
+        application/vnd.dirextalk.identity-append-receipt.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: { $ref: '#/components/schemas/IdentityAppendReceiptCborV1' }
+    IdentityBootstrapReplayed:
+      description: The immutable original receipt for an exact replay.
+      headers:
+        Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+        X-Content-Type-Options: { $ref: '#/components/headers/XContentTypeOptions' }
+        X-Request-Id: { $ref: '#/components/headers/XRequestId' }
+      content:
+        application/vnd.dirextalk.identity-append-receipt.v1+cbor:
+          x-dirextalk-exact-cbor: true
+          schema: { $ref: '#/components/schemas/IdentityAppendReceiptCborV1' }
+    ClientBindingInvalid:
+      description: Invalid, unauthorized, expired, or revoked binding request.
+      $ref: '#/components/responses/ClientBindingError'
+    ClientBindingConflict:
+      description: Divergent request or already-consumed binding conflict.
+      $ref: '#/components/responses/ClientBindingError'
+    IdentityServiceUnavailable:
+      description: Durable identity store unavailable.
+      $ref: '#/components/responses/ClientBindingError'
+    ClientBindingError:
+      description: Exact redacted client-binding error envelope.
+      headers:
+        Cache-Control: { $ref: '#/components/headers/CacheControlNoStore' }
+        X-Content-Type-Options: { $ref: '#/components/headers/XContentTypeOptions' }
+        X-Request-Id: { $ref: '#/components/headers/XRequestId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ClientBindingErrorEnvelopeV1' }
+  schemas:
+    ExactIdentityLogGenesisV1_1:
+      type: string
+      format: binary
+      description: Exact canonical CBOR bytes of a signed identity-log V1.1 genesis event.
+    ExactInitialDeviceV1_1:
+      type: string
+      format: binary
+      description: Exact canonical CBOR bytes of a signed sequence-two DeviceAdd event.
+    IdentityAppendReceiptCborV1:
+      type: string
+      format: binary
+      description: Exact canonical CBOR IdentityAppendReceipt V1 bytes.
+    ClientBindingErrorEnvelopeV1:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ClientBindingErrorV1'
+    ClientBindingErrorV1:
+      type: object
+      additionalProperties: false
+      required: [code, request_id, retryable]
+      properties:
+        code:
+          type: string
+          enum:
+            - CLIENT_BINDING_INVALID
+            - CLIENT_BINDING_CONFLICT
+            - IDENTITY_SERVICE_UNAVAILABLE
+        request_id:
+          type: string
+          format: uuid
+          pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+        retryable:
+          type: boolean

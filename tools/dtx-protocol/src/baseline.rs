@@ -229,6 +229,10 @@ const V43_ARTIFACT_PATHS: &[&str] = &[
     "protocol/openapi/opaque-push/v1",
     "protocol/test-vectors/opaque-push/v1",
 ];
+const V44_ARTIFACT_PATHS: &[&str] = &[
+    "protocol/cddl/client-binding/v1",
+    "protocol/openapi/client-binding/v1",
+];
 const OWNED_ARTIFACT_ROOTS: &[&str] = &[
     "protocol/cddl",
     "protocol/openapi",
@@ -502,6 +506,12 @@ const BASELINE_SPECS: &[BaselineSpec] = &[
         path: "protocol/baseline/v43/manifest.json",
         includes_registries: false,
         artifact_paths: V43_ARTIFACT_PATHS,
+    },
+    BaselineSpec {
+        version: 44,
+        path: "protocol/baseline/v44/manifest.json",
+        includes_registries: false,
+        artifact_paths: V44_ARTIFACT_PATHS,
     },
 ];
 

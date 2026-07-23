@@ -4926,4 +4926,31 @@ mod tests {
         malformed.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
         assert!(malformed.contains_key(header::CONTENT_ENCODING));
     }
+
+    #[tokio::test]
+    async fn client_binding_error_response_is_redacted_and_exact() {
+        let request_id = RequestId::new();
+        let response = client_binding_failure_response(ClientBindingFailure::Conflict, request_id);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("fixed error body is bounded");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
+        assert_eq!(value["error"]["code"], "CLIENT_BINDING_CONFLICT");
+        assert_eq!(value["error"]["retryable"], false);
+        assert!(value["error"].get("authorization").is_none());
+        assert!(value["error"].get("body").is_none());
+    }
 }

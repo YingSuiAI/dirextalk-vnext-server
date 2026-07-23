@@ -57,6 +57,10 @@ async fn run() -> Result<(), ProvisionError> {
         return Err(ProvisionError::Request);
     }
     request.validate()?;
+    let issue_request_digest = Sha256Digest::hash_domain(
+        dtx_identity_persistence::CLIENT_BINDING_ISSUE_HASH_DOMAIN,
+        &canonical_request,
+    );
     let ca_bytes = Zeroizing::new(read_root_file(
         &request.identity_tls_root_ca_file,
         MAX_CA_BYTES,
@@ -124,6 +128,7 @@ async fn run() -> Result<(), ProvisionError> {
             &*authorization_raw,
         ),
         artifact_digest,
+        issue_request_digest,
         issued_at_ms,
         expires_at_ms,
     };
