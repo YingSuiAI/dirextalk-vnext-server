@@ -199,13 +199,17 @@ These programs accept no arguments. The installer exclusively consumes root-owne
 `domain`, `version`, `source_commit`, `bundle_sha256`, `manifest_sha256`,
 `server_image`, `migrator_image`, and nullable
 `previous_receipt_sha256`. It rechecks every archive and manifest invariant,
-materializes only `/opt/dirextalk-vnext/releases/<bundle_sha256>/`, invokes
-only that release's digest-bound `scripts/production-stack/install.sh`, then
-selects only its server image, migrator image, and release version while
-preserving operator environment fields. It runs that same authenticated
-release's `update.sh` forward migration/readiness state machine and requires a
-canonical sanitized runtime attestation before atomically writing root-owned
-mode `0600` `/var/lib/dirextalk-vnext/receipts/current.json`.
+and materializes only `/opt/dirextalk-vnext/releases/<bundle_sha256>/`. A true
+initial install invokes only that release's digest-bound
+`scripts/production-stack/install.sh` to materialize the baseline and publishes
+the initial root-owned mode `0600`
+`/var/lib/dirextalk-vnext/receipts/current.json`; later host provisioning owns
+runtime activation. Only when a current release already exists does a candidate
+path stage provisioned host material, select its server image, migrator image,
+and release version while preserving operator environment fields, invoke that
+candidate's authenticated `update.sh` forward migration/readiness state
+machine, prove the resulting runtime and fixed migrations, and then write its
+canonical sanitized runtime attestation before publishing the candidate receipt.
 
 The same hash-pinned `install-vnext` artifact is a root-only no-argument fixed
 incident helper when it is staged and invoked with the exact basename
