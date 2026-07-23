@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import importlib.machinery
-import inspect
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -45,21 +45,46 @@ def main() -> None:
     assert MODULE.validate_receipt(raw) == receipt
     assert MODULE.request_matches_receipt(request, receipt)
 
-    # Crash recovery: a candidate receipt may already be authenticated in the
-    # history directory while current.json still points at the prior release.
+    # Fault-inject a crash after receipt history publication but before
+    # current.json promotion, then recover the authenticated candidate.
     original_root = MODULE.RECEIPT_ROOT
+    original_current = MODULE.CURRENT_RECEIPT
     original_read = MODULE.read_secure
+    original_atomic = MODULE.atomic_write
+    original_fchown = MODULE.os.fchown
     try:
         with tempfile.TemporaryDirectory() as directory:
             MODULE.RECEIPT_ROOT = Path(directory)
-            history = MODULE.RECEIPT_ROOT / f"{receipt['receipt_sha256']}.json"
-            history.write_bytes(raw)
+            MODULE.CURRENT_RECEIPT = MODULE.RECEIPT_ROOT / "current.json"
+            MODULE.os.fchown = lambda _descriptor, _uid, _gid: None
+            def crash_before_current(path: Path, value: bytes) -> None:
+                if path == MODULE.CURRENT_RECEIPT:
+                    raise OSError("injected current receipt promotion crash")
+                original_atomic(path, value)
+
+            MODULE.atomic_write = crash_before_current
+            try:
+                MODULE.publish_receipt(request, "installed", request["previous_receipt_sha256"])
+            except OSError:
+                pass
+            else:
+                raise AssertionError("receipt promotion crash injection unexpectedly succeeded")
+            history_files = list(MODULE.RECEIPT_ROOT.glob("*.json"))
+            assert len(history_files) == 1
+            history = history_files[0]
+            published = MODULE.validate_receipt(history.read_bytes())
+            assert not MODULE.CURRENT_RECEIPT.exists()
             MODULE.read_secure = lambda path, _mode, _limit: Path(path).read_bytes()
             recovered = MODULE.find_candidate_receipt(request)
-            assert recovered is not None and recovered[0]["receipt_sha256"] == receipt["receipt_sha256"]
+            assert recovered is not None and recovered[0]["receipt_sha256"] == published["receipt_sha256"]
+            original_atomic(MODULE.CURRENT_RECEIPT, recovered[1])
+            assert MODULE.validate_receipt(MODULE.CURRENT_RECEIPT.read_bytes()) == published
     finally:
         MODULE.RECEIPT_ROOT = original_root
+        MODULE.CURRENT_RECEIPT = original_current
         MODULE.read_secure = original_read
+        MODULE.atomic_write = original_atomic
+        MODULE.os.fchown = original_fchown
 
     # A crash after publishing the candidate receipt is a no-op on replay;
     # a chained rolled-back receipt remains a recoverable prior shape.
@@ -69,16 +94,97 @@ def main() -> None:
     assert MODULE.validate_receipt(rolled_back_raw)["state"] == "rolled_back"
     assert rolled_back["previous_receipt_sha256"] == request["previous_receipt_sha256"]
 
-    source = inspect.getsource(MODULE.install_code_only_rollback)
-    assert "--no-deps" in source
-    assert "migrate" in source and "down" in source
-    assert "invoke_fixed_installer" not in source
-    assert "--volumes" not in source and "down -v" not in source
+    # Execute code-only rollback against a temporary canonical environment.
+    # Prior readiness is a mandatory second subprocess; failure propagates and
+    # therefore cannot publish a rolled_back receipt.
+    original_config = MODULE.PRODUCTION_CONFIG_ROOT
+    original_env = MODULE.PRODUCTION_ENV
+    original_compose = MODULE.PRODUCTION_COMPOSE
+    original_install_root = MODULE.PRODUCTION_INSTALL_ROOT
+    original_current_env = MODULE.CURRENT_ENV
+    original_run = MODULE.subprocess.run
+    original_read = MODULE.read_secure
+    original_fchown = MODULE.os.fchown
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            release = base / "release"
+            config = base / "config"
+            install_root = base / "lib"
+            current_env = base / "current.env"
+            for path in (
+                release / "docker/production",
+                release / "tools",
+                release / "scripts/production-stack",
+                config,
+                install_root,
+            ):
+                path.mkdir(parents=True, exist_ok=True)
+            (release / "docker/production/Caddyfile").write_text("prior caddy\n")
+            (release / "docker/production/docker-compose.yml").write_text("services: {}\n")
+            (release / "tools/validate-production-images.py").write_text("# prior validator\n")
+            verifier = release / MODULE.VERIFY_PATH
+            verifier.write_text("#!/usr/bin/env bash\nexit 0\n")
+            candidate_env = "\n".join(
+                (
+                    "DTX_SERVER_IMAGE=dirextalk/vnet-server@sha256:" + "f" * 64,
+                    "DTX_MIGRATOR_IMAGE=dirextalk/vnet-server@sha256:" + "e" * 64,
+                    "DTX_RELEASE_VERSION=0.1.4",
+                    "DTX_SECRET_ROOT=/preserved/secrets",
+                    "DTX_TLS_ROOT=/preserved/tls",
+                    "",
+                )
+            )
+            (config / "production.env").write_text(candidate_env)
+            MODULE.PRODUCTION_CONFIG_ROOT = config
+            MODULE.PRODUCTION_ENV = config / "production.env"
+            MODULE.PRODUCTION_COMPOSE = config / "production-compose.yml"
+            MODULE.PRODUCTION_INSTALL_ROOT = install_root
+            MODULE.CURRENT_ENV = current_env
+            MODULE.os.fchown = lambda _descriptor, _uid, _gid: None
+            MODULE.read_secure = lambda path, _mode, _limit: Path(path).read_bytes()
+            calls: list[list[str]] = []
 
-    update = (ROOT / "scripts/production-stack/update.sh").read_text()
-    assert "candidate_version" in update and "strictly forward" in update
-    assert "--no-deps dtx-node realtime-gateway agent-control caddy" in update
-    assert "down -v" not in update and "down --volumes" not in update
+            def successful_run(command: list[str], **_kwargs: object) -> None:
+                calls.append(command)
+
+            MODULE.subprocess.run = successful_run
+            prior_manifest = {
+                **prior,
+                "server_image": "dirextalk/vnet-server@sha256:" + "1" * 64,
+                "migrator_image": "dirextalk/vnet-server@sha256:" + "2" * 64,
+            }
+            MODULE.install_code_only_rollback(release, prior_manifest)
+            assert len(calls) == 2
+            assert "--no-deps" in calls[0]
+            assert calls[1] == [str(verifier)]
+            restored = MODULE.PRODUCTION_ENV.read_text()
+            assert "DTX_RELEASE_VERSION=0.1.1" in restored
+            assert "DTX_SECRET_ROOT=/preserved/secrets" in restored
+            assert "DTX_TLS_ROOT=/preserved/tls" in restored
+            assert MODULE.CURRENT_ENV.read_text() == restored
+
+            def failed_probe(command: list[str], **_kwargs: object) -> None:
+                if command == [str(verifier)]:
+                    raise subprocess.CalledProcessError(1, command)
+
+            MODULE.subprocess.run = failed_probe
+            try:
+                MODULE.install_code_only_rollback(release, prior_manifest)
+            except subprocess.CalledProcessError:
+                pass
+            else:
+                raise AssertionError("failed prior readiness was accepted")
+    finally:
+        MODULE.PRODUCTION_CONFIG_ROOT = original_config
+        MODULE.PRODUCTION_ENV = original_env
+        MODULE.PRODUCTION_COMPOSE = original_compose
+        MODULE.PRODUCTION_INSTALL_ROOT = original_install_root
+        MODULE.CURRENT_ENV = original_current_env
+        MODULE.subprocess.run = original_run
+        MODULE.read_secure = original_read
+        MODULE.os.fchown = original_fchown
+
     print("production cross-version crash/replay/receipt/rollback checks passed")
 
 

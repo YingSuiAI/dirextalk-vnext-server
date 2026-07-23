@@ -38,6 +38,8 @@ PRODUCTION_CONFIG_ROOT = Path("/etc/dirextalk/vnext/config")
 PRODUCTION_ENV = PRODUCTION_CONFIG_ROOT / "production.env"
 PRODUCTION_COMPOSE = PRODUCTION_CONFIG_ROOT / "production-compose.yml"
 PRODUCTION_INSTALL_ROOT = Path("/usr/local/lib/dirextalk")
+CURRENT_ENV = Path("/var/lib/dirextalk/vnext/current.env")
+VERIFY_PATH = "scripts/production-stack/verify.sh"
 MAX_BUNDLE_BYTES = 32 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -539,12 +541,12 @@ def make_receipt(facts: dict[str, object], state: str, previous: str | None) -> 
     return receipt, raw
 
 
-def atomic_write(path: Path, raw: bytes) -> None:
+def atomic_replace(path: Path, raw: bytes, mode: int) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
         os.fchown(descriptor, 0, 0)
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, mode)
         view = memoryview(raw)
         while view:
             written = os.write(descriptor, view)
@@ -564,6 +566,10 @@ def atomic_write(path: Path, raw: bytes) -> None:
             os.close(descriptor)
         if temporary.exists():
             temporary.unlink()
+
+
+def atomic_write(path: Path, raw: bytes) -> None:
+    atomic_replace(path, raw, 0o600)
 
 
 def publish_receipt(facts: dict[str, object], state: str, previous: str | None) -> dict[str, object]:
@@ -633,16 +639,7 @@ def install_code_only_rollback(release: Path, manifest: dict[str, object]) -> No
     for relative, (destination, mode) in files.items():
         data = read_secure(release / relative, 0o555 if relative.endswith(".py") else 0o444, MAX_BUNDLE_BYTES)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(f".{destination.name}.rollback.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, mode)
-        try:
-            os.fchown(descriptor, 0, 0)
-            os.fchmod(descriptor, mode)
-            os.write(descriptor, data)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.replace(temporary, destination)
+        atomic_replace(destination, data, mode)
     # Keep all operator-owned configuration, secret, and TLS paths intact while
     # switching only the two executable image references and release identity.
     try:
@@ -653,23 +650,21 @@ def install_code_only_rollback(release: Path, manifest: dict[str, object]) -> No
             "DTX_RELEASE_VERSION": str(manifest["version"]),
         }
         lines = []
+        replaced: set[str] = set()
         for line in env_raw.splitlines(keepends=True):
             key, separator, _value = line.partition("=")
             if separator and key in replacements:
+                if key in replaced:
+                    raise ContractError("production environment duplicates a rollback identity field")
                 newline = "\n" if line.endswith("\n") else ""
                 line = f"{key}={replacements[key]}{newline}"
+                replaced.add(key)
             lines.append(line)
+        if replaced != set(replacements):
+            raise ContractError("production environment is missing a rollback identity field")
         env_data = "".join(lines).encode()
-        temporary = PRODUCTION_ENV.with_name(f".{PRODUCTION_ENV.name}.rollback.tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o644)
-        try:
-            os.fchown(descriptor, 0, 0)
-            os.fchmod(descriptor, 0o644)
-            os.write(descriptor, env_data)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.replace(temporary, PRODUCTION_ENV)
+        atomic_replace(PRODUCTION_ENV, env_data, 0o644)
+        atomic_replace(CURRENT_ENV, env_data, 0o600)
     except (UnicodeDecodeError, ContractError) as error:
         raise ContractError("production environment is unavailable for code-only rollback") from error
     # Reconcile only long-running containers.  --no-deps is the code-only
@@ -682,6 +677,16 @@ def install_code_only_rollback(release: Path, manifest: dict[str, object]) -> No
             "--env-file", str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE),
             "up", "-d", "--no-deps", "dtx-node", "realtime-gateway", "agent-control", "caddy",
         ],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        check=True,
+        timeout=600,
+    )
+    verifier = release / VERIFY_PATH
+    read_secure(verifier, 0o555, MAX_BUNDLE_BYTES)
+    subprocess.run(
+        [str(verifier)],
+        cwd=release,
         env=environment,
         stdin=subprocess.DEVNULL,
         check=True,
@@ -785,7 +790,9 @@ def install_once() -> None:
                 assert prior_release is not None and prior_manifest is not None
                 install_code_only_rollback(prior_release, prior_manifest)
             except (ContractError, OSError, subprocess.SubprocessError) as rollback_error:
-                raise ContractError("candidate and retained release installers both failed") from rollback_error
+                raise ContractError(
+                    "candidate failed and retained prior services did not become ready; recovery remains nonterminal"
+                ) from rollback_error
             publish_receipt(current, "rolled_back", str(rollback_previous))
             raise ContractError("candidate installer failed; prior compatible release restored") from install_error
         publish_receipt(

@@ -101,6 +101,36 @@ changes must be strictly increasing SemVer values; same-version digest updates
 remain supported. `latest` remains an external discovery pointer outside
 execution inputs.
 
+Before the first pull or Compose mutation, `update.sh` durably writes a
+self-authenticating root-owned intent under
+`/var/lib/dirextalk/vnext/update-intent/`. It binds the retained and candidate
+environment digests, compose digest, versions, and compatibility contract.
+Explicit durable phases distinguish candidate start/readiness, the two
+desired-active promotions, rollback start/readiness, completion, and
+`recovery_failed`. Canonical `production.env` and `current.env` remain on the
+retained release until candidate readiness is durable; each atomic replacement
+and its parent directory are synced. A replay from `candidate_started` probes
+the already-started candidate without rerunning Compose up or migrations, and
+a replay from `candidate_ready` performs only the pending promotions.
+
+Rollback first durably restores both canonical environment files, then
+reconciles only the retained long-running services with `--no-deps`. It writes
+`rolled_back` only after the same node, realtime, and Agent Control readiness
+probes used by `verify.sh` succeed. If retained services do not become ready,
+the durable phase and receipt remain `recovery_failed`; this is nonterminal and
+requires operator repair rather than claiming rollback success.
+
+`scripts/test-production-cross-version-postgres.sh` applies the exact 0.1.1
+migration set, then the sole 0.1.4 forward migration, in an ephemeral pinned
+PostgreSQL 18 container. It applies the frozen 0.1.1 and candidate 0.1.4 grants,
+then exercises the retained Agent Control database identity/query contract on
+the resulting schema. When the immutable local
+`dirextalk/vnet-server@sha256:c972…f17a` 0.1.1 runtime fixture is available, the
+test also starts that exact image and requires its live readiness endpoint on
+the migrated database. If that immutable fixture is unavailable, the test says
+so explicitly and limits its claim to schema/grant/query compatibility; it does
+not substitute an unauthenticated source rebuild.
+
 ## Hash-bound deployment bundle
 
 `tools/vnext-stack-bundle.py build` emits a deterministic uncompressed tar

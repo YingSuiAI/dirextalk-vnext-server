@@ -43,14 +43,7 @@ grep -q 'O_NOFOLLOW' "$root/bins/dtx-production-migrate/src/main.rs"
 grep -q 'validate_root_ancestor_chain' "$root/bins/dtx-production-migrate/src/main.rs"
 grep -q 'preload_role_passwords' "$root/bins/dtx-production-migrate/src/main.rs"
 grep -q '\.commit()' "$root/bins/dtx-production-migrate/src/main.rs"
-grep -q 'prior.env' "$root/scripts/production-stack/update.sh"
-grep -q 'compose.sha256' "$root/scripts/production-stack/update.sh"
-grep -q 'status=rolled_back' "$root/scripts/production-stack/update.sh"
-grep -q 'must move strictly forward across schema history' "$root/scripts/production-stack/update.sh"
-grep -q -- '--no-deps dtx-node realtime-gateway agent-control caddy' "$root/scripts/production-stack/update.sh"
 ! grep -Eq 'docker compose.*down.*(--volumes|-v)' "$root/scripts/production-stack/update.sh"
-grep -q 'strictly_forward' "$root/scripts/production-stack/host/install-vnext"
-grep -q 'install_code_only_rollback' "$root/scripts/production-stack/host/install-vnext"
 grep -q 'bundle is missing the exact forward migration compatibility marker' "$root/scripts/production-stack/host/install-vnext"
 grep -q 'invokes a down migration' "$root/docker/production/README.md"
 grep -q 'force-recreate --no-deps --abort-on-container-failure' "$root/scripts/production-stack/verify.sh"
@@ -69,6 +62,7 @@ grep -q 'dirextalk/vnet-server@sha256:' "$root/scripts/production-stack/host/ins
 python3 "$root/tools/validate-production-images.py" --self-test
 python3 "$root/tools/vnext-stack-bundle.py" self-test --source-root "$root"
 python3 "$root/scripts/test-production-stack-cross-version.py"
+bash "$root/scripts/test-production-stack-update-recovery.sh"
 for example in "$root"/docker/production/examples/x{6,7,8}.env.example; do
     python3 "$root/tools/validate-production-images.py" "$example"
 done
@@ -77,5 +71,8 @@ for script in "$root"/scripts/production-stack/{install,bootstrap,update,verify,
 done
 for helper in "$root"/scripts/production-stack/host/{install-vnext,read-vnext-receipt}; do
     test -x "$helper" || { echo "not executable: $helper" >&2; exit 1; }
+done
+for test_script in "$root"/scripts/{test-production-stack-update-recovery,test-production-cross-version-postgres}.sh; do
+    test -x "$test_script" || { echo "not executable: $test_script" >&2; exit 1; }
 done
 echo 'production stack structural/negative checks passed'
