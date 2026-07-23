@@ -5,52 +5,94 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repository_root="$(cd -- "$script_dir/.." && pwd -P)"
 
 usage() {
-    printf 'Usage: bash scripts/check-release-image.sh [--runtime-image dirextalk/vnet-server@sha256:<64-hex>]\n'
+    printf 'Usage: bash scripts/check-release-image.sh [--runtime-image dirextalk/vnet-server@sha256:<64-hex> --migrator-image dirextalk/vnet-server@sha256:<64-hex>]\n'
 }
 
 runtime_image=
-if (( $# > 0 )); then
+migrator_image=
+while (( $# > 0 )); do
     case "$1" in
         -h|--help)
             usage
             exit 0
             ;;
         --runtime-image)
-            (( $# == 2 )) || { usage >&2; exit 2; }
+            (( $# >= 2 )) && [[ -z "$runtime_image" ]] || { usage >&2; exit 2; }
             runtime_image=$2
-            [[ "$runtime_image" =~ ^dirextalk/vnet-server@sha256:[0-9a-f]{64}$ ]] || {
-                echo 'runtime image must be an immutable repository digest' >&2
-                exit 2
-            }
+            shift 2
+            ;;
+        --migrator-image)
+            (( $# >= 2 )) && [[ -z "$migrator_image" ]] || { usage >&2; exit 2; }
+            migrator_image=$2
+            shift 2
             ;;
         *)
             usage >&2
             exit 2
             ;;
     esac
-fi
+done
+for image in "$runtime_image" "$migrator_image"; do
+    if [[ -n "$image" ]]; then
+        [[ "$image" =~ ^dirextalk/vnet-server@sha256:[0-9a-f]{64}$ ]] || {
+            echo 'release image must be an immutable repository digest' >&2
+            exit 2
+        }
+    fi
+done
 if ! command -v python3 >/dev/null 2>&1; then
     printf 'python3 is required to inspect the release image contract.\n' >&2
     exit 1
 fi
 
 cd -- "$repository_root"
-if [[ -n "$runtime_image" ]]; then
-    command -v docker >/dev/null 2>&1 || { echo 'docker is required for runtime image export scanning' >&2; exit 1; }
-    export_tar=$(mktemp)
+if [[ -n "$runtime_image" || -n "$migrator_image" ]]; then
+    command -v docker >/dev/null 2>&1 || { echo 'docker is required for release image export scanning' >&2; exit 1; }
+    export_tar=
     container=
     cleanup_export() {
+        local failed=0
         if [[ -n "$container" ]]; then
-            docker rm "$container" >/dev/null 2>&1 || true
+            if docker rm "$container" >/dev/null 2>&1; then
+                container=
+            else
+                failed=1
+            fi
         fi
-        rm -f -- "$export_tar"
+        if [[ -n "$export_tar" && ( -e "$export_tar" || -L "$export_tar" ) ]]; then
+            if rm -f -- "$export_tar"; then
+                export_tar=
+            else
+                failed=1
+            fi
+        fi
+        return "$failed"
     }
-    trap cleanup_export EXIT
-    docker pull "$runtime_image" >/dev/null
-    container=$(docker create "$runtime_image")
-    [[ -n "$container" ]] || { echo 'runtime image container creation returned no id' >&2; exit 1; }
-    docker export --output "$export_tar" "$container"
-    python3 tools/check-runtime-secret-artifacts.py --tar "$export_tar"
+    finish_export() {
+        local status=$?
+        trap - EXIT
+        if ! cleanup_export; then
+            status=1
+        fi
+        exit "$status"
+    }
+    scan_image() {
+        local image=$1
+        export_tar=$(mktemp)
+        docker pull "$image" >/dev/null
+        container=$(docker create "$image")
+        [[ -n "$container" ]] || { echo 'release image container creation returned no id' >&2; return 1; }
+        docker export --output "$export_tar" "$container"
+        python3 tools/check-runtime-secret-artifacts.py --tar "$export_tar"
+        if ! cleanup_export; then
+            echo 'release image export cleanup failed' >&2
+            return 1
+        fi
+    }
+    trap finish_export EXIT
+    [[ -z "$runtime_image" ]] || scan_image "$runtime_image"
+    [[ -z "$migrator_image" ]] || scan_image "$migrator_image"
+    trap - EXIT
 else
     python3 tools/check-runtime-secret-artifacts.py --self-test
 fi

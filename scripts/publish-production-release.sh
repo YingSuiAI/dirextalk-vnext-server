@@ -112,7 +112,6 @@ runtime_digest=$(python3 tools/production-release.py verified-digest \
     --metadata "$state/runtime-metadata.json" \
     --version-manifest "$state/runtime-version-manifest.json" \
     --commit-manifest "$state/runtime-commit-manifest.json")
-scripts/check-release-image.sh --runtime-image "$repository@$runtime_digest"
 
 docker buildx build \
     --builder "$builder" \
@@ -128,10 +127,14 @@ docker buildx build \
     .
 docker buildx imagetools inspect "$migrator_version_tag" --format '{{json .Manifest}}' >"$state/migrator-version-manifest.json"
 docker buildx imagetools inspect "$migrator_commit_tag" --format '{{json .Manifest}}' >"$state/migrator-commit-manifest.json"
-python3 tools/production-release.py verified-digest \
+migrator_digest=$(python3 tools/production-release.py verified-digest \
     --metadata "$state/migrator-metadata.json" \
     --version-manifest "$state/migrator-version-manifest.json" \
-    --commit-manifest "$state/migrator-commit-manifest.json" >/dev/null
+    --commit-manifest "$state/migrator-commit-manifest.json")
+
+scripts/check-release-image.sh \
+    --runtime-image "$repository@$runtime_digest" \
+    --migrator-image "$repository@$migrator_digest"
 
 # latest is a runtime discovery pointer only. Both immutable products have
 # already been pushed and independently read back before this line can run.

@@ -32,6 +32,10 @@ CONTENT_RULES = [
     re.compile(rb"(?i)(?:x[-_]dirextalk[-_]client[-_]binding[-_]authorization|client[-_]?binding[-_]?authorization|enrollment[_-]?token|binding[_-]?authorization)\s*[\"']?\s*[=:]\s*[\"']?[^\s,}\"']+"),
     re.compile(rb"(?i)(?:connector[-_ ]?(?:bearer|handoff|config|log)|mcp[-_]?bearer|connector[-_]?enrollment)\s*[\"']?\s*[=:]\s*[\"']?[^\s,}\"']+"),
     re.compile(rb"(?i)\bdtxi1[a-z0-9]{20,}\b"),
+    re.compile(
+        rb'(?s)(?=.*"schema"\s*:\s*"dirextalk\.client-binding")'
+        rb'(?=.*"authorization"\s*:\s*"[A-Za-z0-9_-]{43}")'
+    ),
 ]
 
 
@@ -113,6 +117,7 @@ def self_test() -> int:
             "blob-c": b'{"client_binding_authorization":"synthetic"}',
             "blob-d": b'{"connector_bearer":"synthetic"}',
             "blob-e": b"dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la",
+            "blob-f": b'{"authorization":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","schema":"dirextalk.client-binding"}',
         }
         for name, content in fixtures.items():
             target = root / name
