@@ -490,6 +490,7 @@ impl PostgresHarness {
 
              GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
              GRANT USAGE ON SCHEMA messaging TO dtx_identity_runtime;
+             GRANT EXECUTE ON FUNCTION system.is_uuid_v7(uuid) TO dtx_identity_runtime;
              GRANT USAGE ON SCHEMA identity TO dtx_push_identity_auth_runtime;
              GRANT SELECT ON identity.device_sessions, identity.log_heads, identity.log_entries
                 TO dtx_push_identity_auth_runtime;
@@ -533,6 +534,8 @@ impl PostgresHarness {
              GRANT SELECT, INSERT ON identity.recovery_scope_catalogs
                 TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.recovery_scope_catalog_preparations
+                TO dtx_identity_runtime;
+             GRANT SELECT, INSERT, UPDATE ON identity.client_bindings
                 TO dtx_identity_runtime;
              GRANT UPDATE(
                 provider_response_bytes,provider_response_digest,provider_device_id,

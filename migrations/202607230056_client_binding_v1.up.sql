@@ -31,6 +31,7 @@ ALTER TABLE identity.client_bindings FORCE ROW LEVEL SECURITY;
 CREATE POLICY identity_runtime_only ON identity.client_bindings USING (identity.identity_runtime_authorized() OR identity.identity_owner_authorized()) WITH CHECK (identity.identity_runtime_authorized() OR identity.identity_owner_authorized());
 DO $grant$ BEGIN
   IF to_regrole('dtx_identity_runtime') IS NOT NULL THEN
+    GRANT EXECUTE ON FUNCTION system.is_uuid_v7(uuid) TO dtx_identity_runtime;
     GRANT SELECT, INSERT, UPDATE ON identity.client_bindings TO dtx_identity_runtime;
   END IF;
 END $grant$;

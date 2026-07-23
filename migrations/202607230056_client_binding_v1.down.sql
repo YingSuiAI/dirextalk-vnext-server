@@ -5,7 +5,10 @@ DO $guard$ BEGIN
   END IF;
 END $guard$;
 DO $grant$ BEGIN
-  IF to_regrole('dtx_identity_runtime') IS NOT NULL THEN REVOKE ALL ON identity.client_bindings FROM dtx_identity_runtime; END IF;
+  IF to_regrole('dtx_identity_runtime') IS NOT NULL THEN
+    REVOKE ALL ON identity.client_bindings FROM dtx_identity_runtime;
+    REVOKE EXECUTE ON FUNCTION system.is_uuid_v7(uuid) FROM dtx_identity_runtime;
+  END IF;
 END $grant$;
 DROP POLICY identity_runtime_only ON identity.client_bindings;
 ALTER TABLE identity.client_bindings DISABLE ROW LEVEL SECURITY;

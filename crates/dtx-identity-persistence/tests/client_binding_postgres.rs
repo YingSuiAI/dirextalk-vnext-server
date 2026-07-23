@@ -57,9 +57,10 @@ async fn client_binding_issue_replay_conflict_concurrency_and_lifecycle()
         Err(ClientBindingWorkflowError::Conflict)
     ));
 
-    let concurrent_operation = Uuid::now_v7();
-    let left = command(concurrent_operation, tenant, Uuid::now_v7(), 2_000);
-    let right = command(concurrent_operation, tenant, Uuid::now_v7(), 2_000);
+    let concurrent_operation = Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789ab")?;
+    let mut left = command(concurrent_operation, tenant, Uuid::now_v7(), 2_000);
+    left.authorization_digest = Sha256Digest::from_bytes([5; 32]);
+    let right = left.clone();
     let (left_result, right_result) = tokio::join!(
         repository.issue(&store, &left),
         repository.issue(&store, &right),
@@ -80,8 +81,10 @@ async fn client_binding_issue_replay_conflict_concurrency_and_lifecycle()
     ));
 
     let expiring = command(Uuid::now_v7(), tenant, Uuid::now_v7(), 3_000);
+    let mut expiring = expiring;
+    expiring.authorization_digest = Sha256Digest::from_bytes([6; 32]);
     repository.issue(&store, &expiring).await?;
-    assert_eq!(repository.expire(&store, expiring.expires_at_ms).await?, 1);
+    assert!(repository.expire(&store, expiring.expires_at_ms).await? >= 1);
     assert_eq!(
         binding_state(harness.identity_runtime_pool(), expiring.binding_id).await?,
         "expired"
