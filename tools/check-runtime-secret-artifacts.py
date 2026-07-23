@@ -27,9 +27,9 @@ NAME_RULE = re.compile(
 CONTENT_RULES = [
     re.compile(rb"-----BEGIN (?:RSA |EC |)?PRIVATE KEY-----"),
     re.compile(rb"(?:AKIA|ASIA)[0-9A-Z]{16}"),
-    re.compile(rb"(?i)aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)\s*[=:]\s*[^\s,}\"]+"),
-    re.compile(rb"(?i)(?:x[-_]dirextalk[-_]client[-_]binding[-_]authorization|client[-_]?binding[-_]?authorization|enrollment[_-]?token|binding[_-]?authorization)\s*[=:]\s*[^\s,}\"]+"),
-    re.compile(rb"(?i)(?:connector[-_ ]?(?:bearer|handoff|config|log)|mcp[-_]?bearer|connector[-_]?enrollment)\s*[=:]\s*[^\s,}\"]+"),
+    re.compile(rb"(?i)aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)\s*[=:]\s*[\"']?[^\s,}\"']+"),
+    re.compile(rb"(?i)(?:x[-_]dirextalk[-_]client[-_]binding[-_]authorization|client[-_]?binding[-_]?authorization|enrollment[_-]?token|binding[_-]?authorization)\s*[=:]\s*[\"']?[^\s,}\"']+"),
+    re.compile(rb"(?i)(?:connector[-_ ]?(?:bearer|handoff|config|log)|mcp[-_]?bearer|connector[-_]?enrollment)\s*[=:]\s*[\"']?[^\s,}\"']+"),
     re.compile(rb"(?i)\bdtxi1[a-z0-9]{20,}\b"),
 ]
 
