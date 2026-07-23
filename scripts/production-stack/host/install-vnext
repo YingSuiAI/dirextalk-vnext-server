@@ -45,6 +45,17 @@ MAX_REQUEST_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_MEMBERS = 256
+STATE_OWNER_UID = 0
+STATE_OWNER_GID = 0
+MAX_RETAINED_RELEASES = 8
+RETAIN_UNREFERENCED_RELEASES = 2
+MAX_RELEASE_STORAGE_BYTES = MAX_RETAINED_RELEASES * MAX_BUNDLE_BYTES
+MIN_RELEASE_FREE_BYTES = 64 * 1024 * 1024
+MAX_RECEIPT_HISTORY = 64
+RETAIN_UNREFERENCED_RECEIPTS = 16
+MAX_RECEIPT_STORAGE_BYTES = 4 * 1024 * 1024
+MIN_STATE_FREE_BYTES = 8 * 1024 * 1024
+RECEIPT_PUBLICATION_RESERVE = 3 * MAX_RECEIPT_BYTES
 
 SEMVER = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
@@ -123,7 +134,11 @@ def safe_relative(value: str) -> bool:
 def ensure_root_directory(path: Path, mode: int) -> None:
     path.mkdir(parents=True, exist_ok=True)
     metadata = path.lstat()
-    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_gid != 0:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != STATE_OWNER_UID
+        or metadata.st_gid != STATE_OWNER_GID
+    ):
         raise ContractError(f"unsafe state directory: {path}")
     os.chmod(path, mode)
 
@@ -135,8 +150,8 @@ def secure_metadata(path: Path, expected_mode: int) -> os.stat_result:
         raise ContractError(f"required artifact is missing: {path}") from error
     if (
         not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or metadata.st_gid != 0
+        or metadata.st_uid != STATE_OWNER_UID
+        or metadata.st_gid != STATE_OWNER_GID
         or stat.S_IMODE(metadata.st_mode) != expected_mode
         or metadata.st_nlink != 1
     ):
@@ -339,7 +354,7 @@ def write_file(path: Path, data: bytes, mode: int) -> None:
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags, mode)
     try:
-        os.fchown(descriptor, 0, 0)
+        os.fchown(descriptor, STATE_OWNER_UID, STATE_OWNER_GID)
         os.fchmod(descriptor, mode)
         view = memoryview(data)
         while view:
@@ -373,8 +388,8 @@ def verify_release(
         metadata = current_path.lstat()
         if (
             not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != 0
-            or metadata.st_gid != 0
+            or metadata.st_uid != STATE_OWNER_UID
+            or metadata.st_gid != STATE_OWNER_GID
             or stat.S_IMODE(metadata.st_mode) != 0o555
         ):
             raise ContractError("installed release contains an unsafe directory")
@@ -407,7 +422,7 @@ def materialize_release(
 ) -> Path:
     target = RELEASE_ROOT / bundle_sha256
     stage = Path(tempfile.mkdtemp(prefix=".incoming-", dir=RELEASE_ROOT))
-    os.chown(stage, 0, 0)
+    os.chown(stage, STATE_OWNER_UID, STATE_OWNER_GID)
     os.chmod(stage, 0o700)
     try:
         entries = {"manifest.json": (manifest_raw, "0444")}
@@ -424,7 +439,7 @@ def materialize_release(
                 current = current.parent
             write_file(path, data, int(mode, 8))
         for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
-            os.chown(directory, 0, 0)
+            os.chown(directory, STATE_OWNER_UID, STATE_OWNER_GID)
             os.chmod(directory, 0o555)
         if target.exists() or target.is_symlink():
             verify_release(target, manifest, manifest_raw, payloads, modes)
@@ -545,7 +560,7 @@ def atomic_replace(path: Path, raw: bytes, mode: int) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        os.fchown(descriptor, 0, 0)
+        os.fchown(descriptor, STATE_OWNER_UID, STATE_OWNER_GID)
         os.fchmod(descriptor, mode)
         view = memoryview(raw)
         while view:
@@ -589,8 +604,8 @@ def load_retained_release(receipt: dict[str, object]) -> tuple[Path, dict[str, o
     release_metadata = release.lstat()
     if (
         not stat.S_ISDIR(release_metadata.st_mode)
-        or release_metadata.st_uid != 0
-        or release_metadata.st_gid != 0
+        or release_metadata.st_uid != STATE_OWNER_UID
+        or release_metadata.st_gid != STATE_OWNER_GID
         or stat.S_IMODE(release_metadata.st_mode) != 0o555
     ):
         raise ContractError("retained release root is unsafe")
@@ -625,6 +640,275 @@ def request_matches_receipt(request: dict[str, object], receipt: dict[str, objec
         "target", "domain", "version", "source_commit", "bundle_sha256",
         "manifest_sha256", "server_image", "migrator_image",
     )) and request["previous_receipt_sha256"] == receipt["previous_receipt_sha256"]
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def disk_free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def remove_receipt_file(path: Path) -> None:
+    secure_metadata(path, 0o600)
+    path.unlink()
+
+
+def maintain_receipt_storage(
+    request: dict[str, object],
+    current: dict[str, object] | None,
+) -> tuple[set[str], set[str]]:
+    explicit: set[str] = {
+        value for value in (
+            None if current is None else current["receipt_sha256"],
+            None if current is None else current["previous_receipt_sha256"],
+            request["previous_receipt_sha256"],
+        )
+        if isinstance(value, str)
+    }
+    records: dict[str, tuple[Path, dict[str, object], int]] = {}
+    garbage: list[Path] = []
+    for path in sorted(RECEIPT_ROOT.iterdir()):
+        if path == CURRENT_RECEIPT:
+            continue
+        name = path.name
+        if name.startswith(".") and name.endswith(".tmp") and len(name) <= 160:
+            metadata = secure_metadata(path, 0o600)
+            if metadata.st_size > MAX_RECEIPT_BYTES:
+                raise ContractError("stale receipt temporary exceeds its size bound")
+            garbage.append(path)
+            continue
+        match = re.fullmatch(r"([0-9a-f]{64})\.json", name)
+        if match is None:
+            raise ContractError(f"unexpected receipt storage entry: {path}")
+        receipt_hash = match.group(1)
+        metadata = secure_metadata(path, 0o600)
+        if metadata.st_size > MAX_RECEIPT_BYTES:
+            if receipt_hash in explicit:
+                raise ContractError("recovery-referenced receipt exceeds its size bound")
+            garbage.append(path)
+            continue
+        try:
+            raw = read_secure(path, 0o600, MAX_RECEIPT_BYTES)
+            receipt = validate_receipt(raw)
+            if receipt["receipt_sha256"] != receipt_hash:
+                raise ContractError("receipt history filename differs from its self-hash")
+        except ContractError:
+            if receipt_hash in explicit:
+                raise
+            garbage.append(path)
+            continue
+        records[receipt_hash] = (path, receipt, len(raw))
+    for path in garbage:
+        remove_receipt_file(path)
+    if garbage:
+        fsync_directory(RECEIPT_ROOT)
+
+    protected = set(explicit)
+    recovery_bases = set(explicit)
+    for receipt_hash, (_path, receipt, _size) in records.items():
+        if (
+            receipt["state"] == "installed"
+            and (
+                request_matches_receipt(request, receipt)
+                or receipt["previous_receipt_sha256"] in recovery_bases
+            )
+        ):
+            protected.add(receipt_hash)
+            previous = receipt["previous_receipt_sha256"]
+            if isinstance(previous, str):
+                protected.add(previous)
+    protected.intersection_update(records)
+    protected_release_digests = {str(request["bundle_sha256"])}
+    required_release_digests: set[str] = set()
+    if current is not None:
+        current_bundle = str(current["bundle_sha256"])
+        protected_release_digests.add(current_bundle)
+        required_release_digests.add(current_bundle)
+    for receipt_hash in protected:
+        receipt = records[receipt_hash][1]
+        release_digest = str(receipt["bundle_sha256"])
+        protected_release_digests.add(release_digest)
+        required_release_digests.add(release_digest)
+
+    count_limit = MAX_RECEIPT_HISTORY - 1
+    bytes_limit = MAX_RECEIPT_STORAGE_BYTES - RECEIPT_PUBLICATION_RESERVE
+    protected_size = sum(records[value][2] for value in protected)
+    current_size = 0 if current is None else len(canonical(current))
+    if (
+        count_limit < 1
+        or bytes_limit < MAX_RECEIPT_BYTES
+        or len(protected) > count_limit
+        or protected_size + current_size > bytes_limit
+    ):
+        raise ContractError("recovery-referenced receipts exceed the bounded storage quota")
+    unprotected = sorted(
+        (
+            (receipt["installed_at_ms"], receipt_hash, path, size)
+            for receipt_hash, (path, receipt, size) in records.items()
+            if receipt_hash not in protected
+        ),
+        reverse=True,
+    )
+    kept_extra = 0
+    retained_size = protected_size + current_size
+    removed = False
+    for _installed_at, _receipt_hash, path, size in unprotected:
+        if (
+            kept_extra < RETAIN_UNREFERENCED_RECEIPTS
+            and len(protected) + kept_extra + 1 <= count_limit
+            and retained_size + size <= bytes_limit
+        ):
+            kept_extra += 1
+            retained_size += size
+        else:
+            remove_receipt_file(path)
+            removed = True
+    if removed:
+        fsync_directory(RECEIPT_ROOT)
+    return protected_release_digests, required_release_digests
+
+
+def release_tree_size(release: Path, root_mode: int = 0o555) -> int:
+    root_metadata = release.lstat()
+    release_root_metadata = RELEASE_ROOT.lstat()
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or root_metadata.st_uid != STATE_OWNER_UID
+        or root_metadata.st_gid != STATE_OWNER_GID
+        or stat.S_IMODE(root_metadata.st_mode) != root_mode
+        or root_metadata.st_dev != release_root_metadata.st_dev
+        or os.path.ismount(release)
+    ):
+        raise ContractError(f"unsafe retained release directory: {release}")
+    total = 0
+    for current, directory_names, file_names in os.walk(release, topdown=True, followlinks=False):
+        current_path = Path(current)
+        metadata = current_path.lstat()
+        allowed_directory_modes = {root_mode} if root_mode == 0o555 else {0o700, 0o555}
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != STATE_OWNER_UID
+            or metadata.st_gid != STATE_OWNER_GID
+            or stat.S_IMODE(metadata.st_mode) not in allowed_directory_modes
+            or metadata.st_dev != root_metadata.st_dev
+            or (current_path != release and os.path.ismount(current_path))
+        ):
+            raise ContractError("retained release contains an unsafe directory")
+        for name in directory_names:
+            path = current_path / name
+            child = path.lstat()
+            if (
+                stat.S_ISLNK(child.st_mode)
+                or child.st_dev != root_metadata.st_dev
+                or os.path.ismount(path)
+            ):
+                raise ContractError("retained release crosses a symlink or mount boundary")
+        for name in file_names:
+            path = current_path / name
+            child = path.lstat()
+            if (
+                not stat.S_ISREG(child.st_mode)
+                or child.st_uid != STATE_OWNER_UID
+                or child.st_gid != STATE_OWNER_GID
+                or child.st_nlink != 1
+                or stat.S_IMODE(child.st_mode) not in (0o444, 0o555)
+                or child.st_dev != root_metadata.st_dev
+            ):
+                raise ContractError("retained release contains an unsafe file")
+            total += child.st_size
+    return total
+
+
+def remove_release_tree(release: Path, root_mode: int = 0o555) -> None:
+    release_tree_size(release, root_mode)
+    directories = [Path(current) for current, _dirs, _files in os.walk(release, topdown=False)]
+    for directory in directories:
+        os.chmod(directory, 0o700)
+    shutil.rmtree(release)
+    fsync_directory(RELEASE_ROOT)
+
+
+def maintain_release_storage(
+    candidate_digest: str,
+    protected_digests: set[str],
+    required_digests: set[str],
+    candidate_bytes: int,
+) -> None:
+    if candidate_bytes > MAX_BUNDLE_BYTES:
+        raise ContractError("candidate release exceeds the 32 MiB bundle bound")
+    records: list[tuple[int, str, Path, int]] = []
+    for path in sorted(RELEASE_ROOT.iterdir()):
+        name = path.name
+        if name.startswith(".incoming-"):
+            if len(name) > 96:
+                raise ContractError("stale release staging name is invalid")
+            release_tree_size(path, 0o700)
+            remove_release_tree(path, 0o700)
+            continue
+        if HEX64.fullmatch(name) is None:
+            raise ContractError(f"unexpected retained release entry: {path}")
+        size = release_tree_size(path)
+        if size > MAX_BUNDLE_BYTES:
+            if name in protected_digests:
+                raise ContractError("recovery-referenced release exceeds the 32 MiB bound")
+            remove_release_tree(path)
+            continue
+        records.append((path.lstat().st_mtime_ns, name, path, size))
+    present = {name for _mtime, name, _path, _size in records}
+    missing = required_digests - present
+    if missing:
+        raise ContractError("a recovery-referenced retained release is missing")
+    candidate_present = candidate_digest in present
+    additional_bytes = 0 if candidate_present else candidate_bytes
+    count_limit = MAX_RETAINED_RELEASES - (0 if candidate_present else 1)
+    bytes_limit = MAX_RELEASE_STORAGE_BYTES - additional_bytes
+    protected_records = [record for record in records if record[1] in protected_digests]
+    protected_size = sum(record[3] for record in protected_records)
+    if (
+        count_limit < 1
+        or bytes_limit < MAX_BUNDLE_BYTES
+        or len(protected_records) > count_limit
+        or protected_size > bytes_limit
+    ):
+        raise ContractError("recovery-referenced releases exceed the bounded storage quota")
+    unprotected = sorted(
+        (record for record in records if record[1] not in protected_digests),
+        reverse=True,
+    )
+    kept_extra = 0
+    retained_size = protected_size
+    for _mtime, _name, path, size in unprotected:
+        if (
+            kept_extra < RETAIN_UNREFERENCED_RELEASES
+            and len(protected_records) + kept_extra + 1 <= count_limit
+            and retained_size + size <= bytes_limit
+        ):
+            kept_extra += 1
+            retained_size += size
+        else:
+            remove_release_tree(path)
+    if disk_free_bytes(RELEASE_ROOT) < MIN_RELEASE_FREE_BYTES + candidate_bytes:
+        raise ContractError("insufficient free space for bounded release materialization")
+
+
+def maintain_host_storage(
+    request: dict[str, object],
+    current: dict[str, object] | None,
+    candidate_bytes: int,
+) -> None:
+    protected, required = maintain_receipt_storage(request, current)
+    maintain_release_storage(str(request["bundle_sha256"]), protected, required, candidate_bytes)
+    # Release and receipt roots commonly share the host filesystem. Check the
+    # receipt floor only after both retention passes so releasable bundles can
+    # satisfy admission; a separate receipt filesystem still fails closed.
+    if disk_free_bytes(STATE_ROOT) < MIN_STATE_FREE_BYTES + RECEIPT_PUBLICATION_RESERVE:
+        raise ContractError("insufficient free space for bounded receipt publication")
 
 
 def install_code_only_rollback(release: Path, manifest: dict[str, object]) -> None:
@@ -724,7 +1008,7 @@ def consume_uploads(incoming: Path) -> tuple[Path, Path]:
 
 def install_once() -> None:
     incoming = Path(tempfile.mkdtemp(prefix="install-", dir=INCOMING_ROOT))
-    os.chown(incoming, 0, 0)
+    os.chown(incoming, STATE_OWNER_UID, STATE_OWNER_GID)
     os.chmod(incoming, 0o700)
     try:
         bundle_path, request_path = consume_uploads(incoming)
@@ -736,6 +1020,7 @@ def install_once() -> None:
         manifest, manifest_raw, payloads, modes = validate_bundle(bundle_raw)
         request_matches_bundle(request, manifest, manifest_raw)
         current, _ = read_current_receipt()
+        maintain_host_storage(request, current, len(bundle_raw))
         replay = current is not None and current["state"] == "installed" and request_matches_receipt(request, current)
         recovered_rollback = (
             current is not None
@@ -812,8 +1097,8 @@ def open_lock() -> int:
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or metadata.st_gid != 0
+        or metadata.st_uid != STATE_OWNER_UID
+        or metadata.st_gid != STATE_OWNER_GID
         or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
         os.close(descriptor)

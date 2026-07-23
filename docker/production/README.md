@@ -74,9 +74,17 @@ scripts/production-stack/verify.sh
 scripts/production-stack/down.sh
 ```
 
-They accept no positional command or arbitrary path. `cleanup-cache.sh` only
-removes Docker dangling images and the BuildKit cache after retained success
-evidence exists; it never touches volumes, active images, logs, or secrets.
+They accept no positional command or arbitrary path. `cleanup-cache.sh` removes
+the retired pre-bundle compiler tree at the exact fixed path
+`/opt/dirextalk-vnext/build` only after authenticating its root ownership,
+non-writable directory tree, file types, link counts, device boundary, and lack
+of symlinks or mount points. Current and recovery releases live under the
+separate `/opt/dirextalk-vnext/releases` root. The helper also removes dangling
+images older than 24 hours and unused BuildKit cache after retained success
+evidence exists. Each operation has a 120-second termination bound; BuildKit is
+reduced toward a fixed 1 GiB maximum while reserving 512 MiB. The cleanup never
+touches releases, volumes, containers, active images, logs, source trees,
+configuration, TLS, or secrets.
 Bootstrap records the executed digest set. Update records both prior and
 candidate immutable sets plus the compose checksum, waits for real node,
 realtime, Agent Control, and PostgreSQL privilege readiness, and only attempts
@@ -105,10 +113,15 @@ Before the first pull or Compose mutation, `update.sh` durably writes a
 self-authenticating root-owned intent under
 `/var/lib/dirextalk/vnext/update-intent/`. It binds the retained and candidate
 environment digests, compose digest, versions, and compatibility contract.
-The complete admission, intent/archive mutation, update state machine, and
-cache cleanup sequence is serialized by a root-owned mode `0600`, non-symlink
-`flock` under the root-owned production state directory. Explicit durable
-phases distinguish the pre-call `candidate_started` phase from
+New intents use schema v2 and include a kernel-generated 128-bit attempt ID
+inside the self-hash. Terminal attempts are archived append-only as
+`update.<attempt-id>.<intent-sha256>`; identical candidate material therefore
+receives a distinct authenticated archive identity and no archive is
+overwritten. Schema-v1 intents remain readable for interrupted upgrade
+recovery. The complete admission, intent/archive mutation, retention, update
+state machine, and cache cleanup sequence is serialized by a root-owned mode
+`0600`, non-symlink `flock` under the root-owned production state directory.
+Explicit durable phases distinguish the pre-call `candidate_started` phase from
 `candidate_applied`, which is written only after Compose returns successfully,
 as well as candidate readiness, the two desired-active promotions, rollback
 start/readiness, completion, and `recovery_failed`. Canonical `production.env`
@@ -125,9 +138,19 @@ reconciles only the retained long-running services with `--no-deps`. It writes
 probes used by `verify.sh` succeed. If retained services do not become ready,
 the durable phase and receipt remain `recovery_failed`; this is nonterminal and
 requires operator repair rather than claiming rollback success. A later
-invocation under the same authenticated intent performs one bounded readiness
-recheck of the repaired prior services. It never re-enters candidate Compose
-or migrations and publishes `rolled_back` only after that readiness succeeds.
+invocation under the same authenticated intent first reconciles the exact prior
+`dtx-node`, realtime, Agent Control, and Caddy services with `--no-deps`, then
+performs one bounded prior-readiness attempt. It never re-enters candidate
+Compose or migrations and publishes `rolled_back` only after prior readiness
+succeeds.
+
+Update archive admission reserves 1 MiB for the next attempt and a 64 MiB free
+space floor. Each authenticated terminal archive is limited to 1 MiB; at most
+16 archives and 32 MiB are allowed. Retention keeps the newest eight
+unreferenced attempts plus the newest copies that bind the current/prior
+recovery digests, deleting only fully validated flat update archives. Active
+intent state, named volumes, configuration, TLS, and secrets are outside the
+deletion allowlist.
 
 `scripts/test-production-cross-version-postgres.sh` applies the exact 0.1.1
 migration set, then the sole 0.1.4 forward migration, in an ephemeral pinned
@@ -180,6 +203,20 @@ materializes only `/opt/dirextalk-vnext/releases/<bundle_sha256>/`, invokes
 only that release's digest-bound `scripts/production-stack/install.sh`, and
 atomically writes root-owned mode `0600`
 `/var/lib/dirextalk-vnext/receipts/current.json`.
+
+Host installation performs retention and free-space admission while holding
+the same exclusive install lock. Every bundle and materialized release remains
+limited to 32 MiB. The release store is bounded to eight releases/256 MiB and
+reserves a 64 MiB free-space floor plus the incoming candidate; it preserves
+the current release, directly prior release, request candidate, and every
+release referenced by a crash-recoverable candidate receipt, plus the newest
+two unreferenced releases. Receipt history is bounded to 64 files/4 MiB and
+reserves an 8 MiB free-space floor plus three receipt-sized atomic-write
+slots; it preserves current, directly prior, and all recovery-candidate
+receipts plus the newest sixteen unreferenced receipts. Only validated
+root-owned release trees, receipt histories, and stale installer temporaries
+inside those exact roots can be removed. Volumes, images, containers,
+configuration, TLS, and secrets are never part of this retention pass.
 
 The canonical receipt schema is `dirextalk.vnext-installed-release` version 1.
 It repeats the request facts, adds `state` (`installed` or `rolled_back`),

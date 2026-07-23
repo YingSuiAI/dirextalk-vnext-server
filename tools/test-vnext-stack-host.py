@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import os
 import sys
 import tarfile
 import tempfile
@@ -144,6 +145,210 @@ def main() -> int:
             image,
             migrator_image,
         )
+
+    # Retention runs under the installer lock. It preserves the current,
+    # directly prior, and crash-recoverable candidate receipts/releases while
+    # bounding valid but unreferenced history.
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary)
+        state_root = base / "state"
+        receipt_root = state_root / "receipts"
+        release_root = base / "releases"
+        secret_root = base / "secrets"
+        volume_root = base / "volumes"
+        receipt_root.mkdir(parents=True)
+        release_root.mkdir()
+        secret_root.mkdir()
+        volume_root.mkdir()
+        (secret_root / "operator-secret").write_text("preserve\n")
+        (volume_root / "database").write_text("preserve\n")
+        os.chmod(state_root, 0o700)
+        os.chmod(receipt_root, 0o700)
+        os.chmod(release_root, 0o700)
+        owner_uid = os.getuid()
+        owner_gid = os.getgid()
+
+        def release_dir(bundle_sha256: str, payload_size: int = 1) -> Path:
+            path = release_root / bundle_sha256
+            path.mkdir()
+            os.chmod(path, 0o700)
+            payload = path / "payload"
+            with payload.open("wb") as stream:
+                stream.truncate(payload_size)
+            os.chmod(payload, 0o444)
+            os.chmod(path, 0o555)
+            return path
+
+        def receipt_facts(bundle_sha256: str, marker: str) -> dict[str, object]:
+            return {
+                **request,
+                "version": f"1.2.{int(marker, 16)}",
+                "source_commit": marker * 40,
+                "bundle_sha256": bundle_sha256,
+                "manifest_sha256": marker * 64,
+                "previous_receipt_sha256": None,
+            }
+
+        def history(
+            facts_value: dict[str, object],
+            previous: str | None,
+        ) -> tuple[dict[str, object], bytes]:
+            receipt_value, raw = installer.make_receipt(facts_value, "installed", previous)
+            path = receipt_root / f"{receipt_value['receipt_sha256']}.json"
+            path.write_bytes(raw)
+            os.chmod(path, 0o600)
+            return receipt_value, raw
+
+        prior_bundle = "a" * 64
+        current_bundle = "b" * 64
+        candidate_bundle = "c" * 64
+        alternate_candidate_bundle = "d" * 64
+        prior_receipt, _ = history(receipt_facts(prior_bundle, "1"), None)
+        current_receipt, current_raw = history(
+            receipt_facts(current_bundle, "2"), str(prior_receipt["receipt_sha256"])
+        )
+        candidate_request = receipt_facts(candidate_bundle, "3")
+        candidate_request["previous_receipt_sha256"] = current_receipt["receipt_sha256"]
+        candidate_receipt, _ = history(
+            candidate_request, str(current_receipt["receipt_sha256"])
+        )
+        alternate_candidate_receipt, _ = history(
+            receipt_facts(alternate_candidate_bundle, "d"),
+            str(current_receipt["receipt_sha256"]),
+        )
+        current_path = receipt_root / "current.json"
+        current_path.write_bytes(current_raw)
+        os.chmod(current_path, 0o600)
+        stale_receipt = receipt_root / ".current.json.stale.tmp"
+        stale_receipt.write_text("stale\n")
+        os.chmod(stale_receipt, 0o600)
+        for bundle_sha256 in (
+            prior_bundle,
+            current_bundle,
+            candidate_bundle,
+            alternate_candidate_bundle,
+        ):
+            release_dir(bundle_sha256)
+        stale_release = release_root / ".incoming-stale"
+        stale_release.mkdir()
+        os.chmod(stale_release, 0o700)
+        stale_payload = stale_release / "partial"
+        stale_payload.write_text("stale\n")
+        os.chmod(stale_payload, 0o444)
+
+        garbage_receipts: list[str] = []
+        garbage_releases: list[str] = []
+        for index in range(4, 12):
+            marker = format(index, "x")
+            bundle_sha256 = f"{index:064x}"
+            garbage, _ = history(receipt_facts(bundle_sha256, marker), None)
+            garbage_receipts.append(str(garbage["receipt_sha256"]))
+            garbage_releases.append(bundle_sha256)
+            release_dir(bundle_sha256)
+
+        saved = {
+            "STATE_ROOT": installer.STATE_ROOT,
+            "RECEIPT_ROOT": installer.RECEIPT_ROOT,
+            "CURRENT_RECEIPT": installer.CURRENT_RECEIPT,
+            "RELEASE_ROOT": installer.RELEASE_ROOT,
+            "STATE_OWNER_UID": installer.STATE_OWNER_UID,
+            "STATE_OWNER_GID": installer.STATE_OWNER_GID,
+            "MAX_RETAINED_RELEASES": installer.MAX_RETAINED_RELEASES,
+            "RETAIN_UNREFERENCED_RELEASES": installer.RETAIN_UNREFERENCED_RELEASES,
+            "MAX_RELEASE_STORAGE_BYTES": installer.MAX_RELEASE_STORAGE_BYTES,
+            "MIN_RELEASE_FREE_BYTES": installer.MIN_RELEASE_FREE_BYTES,
+            "MAX_RECEIPT_HISTORY": installer.MAX_RECEIPT_HISTORY,
+            "RETAIN_UNREFERENCED_RECEIPTS": installer.RETAIN_UNREFERENCED_RECEIPTS,
+            "MAX_RECEIPT_STORAGE_BYTES": installer.MAX_RECEIPT_STORAGE_BYTES,
+            "MIN_STATE_FREE_BYTES": installer.MIN_STATE_FREE_BYTES,
+            "disk_free_bytes": installer.disk_free_bytes,
+        }
+        try:
+            installer.STATE_ROOT = state_root
+            installer.RECEIPT_ROOT = receipt_root
+            installer.CURRENT_RECEIPT = current_path
+            installer.RELEASE_ROOT = release_root
+            installer.STATE_OWNER_UID = owner_uid
+            installer.STATE_OWNER_GID = owner_gid
+            installer.MAX_RETAINED_RELEASES = 6
+            installer.RETAIN_UNREFERENCED_RELEASES = 1
+            installer.MAX_RELEASE_STORAGE_BYTES = 6 * installer.MAX_BUNDLE_BYTES
+            installer.MIN_RELEASE_FREE_BYTES = 1
+            installer.MAX_RECEIPT_HISTORY = 6
+            installer.RETAIN_UNREFERENCED_RECEIPTS = 1
+            installer.MAX_RECEIPT_STORAGE_BYTES = 1024 * 1024
+            installer.MIN_STATE_FREE_BYTES = 1
+            installer.disk_free_bytes = lambda _path: 1024 * 1024 * 1024
+
+            installer.maintain_host_storage(
+                candidate_request, current_receipt, installer.MAX_BUNDLE_BYTES
+            )
+            protected_receipts = {
+                str(prior_receipt["receipt_sha256"]),
+                str(current_receipt["receipt_sha256"]),
+                str(candidate_receipt["receipt_sha256"]),
+                str(alternate_candidate_receipt["receipt_sha256"]),
+            }
+            for receipt_hash in protected_receipts:
+                assert (receipt_root / f"{receipt_hash}.json").is_file()
+            assert current_path.read_bytes() == current_raw
+            assert not stale_receipt.exists()
+            assert not stale_release.exists()
+            for bundle_sha256 in (
+                prior_bundle,
+                current_bundle,
+                candidate_bundle,
+                alternate_candidate_bundle,
+            ):
+                assert (release_root / bundle_sha256).is_dir()
+            remaining_receipts = [
+                path for path in receipt_root.glob("*.json") if path != current_path
+            ]
+            remaining_releases = list(release_root.iterdir())
+            assert len(remaining_receipts) <= 5
+            assert len(remaining_releases) <= 5
+            assert sum(
+                (receipt_root / f"{value}.json").exists() for value in garbage_receipts
+            ) <= 1
+            assert sum((release_root / value).exists() for value in garbage_releases) <= 1
+            assert (secret_root / "operator-secret").read_text() == "preserve\n"
+            assert (volume_root / "database").read_text() == "preserve\n"
+
+            reclaimable = release_dir("e" * 64, installer.MAX_BUNDLE_BYTES + 1)
+            installer.disk_free_bytes = (
+                lambda _path: 0 if reclaimable.exists() else 1024 * 1024 * 1024
+            )
+            installer.maintain_host_storage(
+                candidate_request, current_receipt, installer.MAX_BUNDLE_BYTES
+            )
+            assert not reclaimable.exists()
+
+            installer.disk_free_bytes = lambda _path: 0
+            must_reject(
+                lambda: installer.maintain_host_storage(
+                    candidate_request, current_receipt, installer.MAX_BUNDLE_BYTES
+                ),
+                "low-space retained storage admission",
+            )
+            installer.disk_free_bytes = lambda _path: 1024 * 1024 * 1024
+
+            candidate_path = release_root / candidate_bundle
+            os.chmod(candidate_path, 0o700)
+            oversized = candidate_path / "oversized"
+            with oversized.open("wb") as stream:
+                stream.truncate(installer.MAX_BUNDLE_BYTES + 1)
+            os.chmod(oversized, 0o444)
+            os.chmod(candidate_path, 0o555)
+            must_reject(
+                lambda: installer.maintain_host_storage(
+                    candidate_request, current_receipt, installer.MAX_BUNDLE_BYTES
+                ),
+                "oversized recovery-referenced release",
+            )
+            assert candidate_path.is_dir()
+        finally:
+            for name, value in saved.items():
+                setattr(installer, name, value)
     print("vNext stack bundle/host negative contract checks passed")
     return 0
 

@@ -48,6 +48,19 @@ grep -q 'bundle is missing the exact forward migration compatibility marker' "$r
 grep -q 'invokes a down migration' "$root/docker/production/README.md"
 grep -q 'force-recreate --no-deps --abort-on-container-failure' "$root/scripts/production-stack/verify.sh"
 grep -q 'last-successful-operation' "$root/scripts/production-stack/cleanup-cache.sh"
+grep -q 'legacy_build=/opt/dirextalk-vnext/build' \
+    "$root/scripts/production-stack/cleanup-cache.sh"
+grep -q -- 'find -P "$legacy_build" -xdev' \
+    "$root/scripts/production-stack/cleanup-cache.sh"
+grep -q 'mountpoint -q -- "$legacy_build"' \
+    "$root/scripts/production-stack/cleanup-cache.sh"
+grep -q -- '--filter until=24h' "$root/scripts/production-stack/cleanup-cache.sh"
+grep -q -- '--max-used-space 1073741824' "$root/scripts/production-stack/cleanup-cache.sh"
+grep -q 'cleanup_timeout_seconds=120' "$root/scripts/production-stack/cleanup-cache.sh"
+grep -q -- '--kill-after=10s "$cleanup_timeout_seconds"' \
+    "$root/scripts/production-stack/cleanup-cache.sh"
+! grep -Eq 'docker (volume|system|container) (rm|prune)' \
+    "$root/scripts/production-stack/cleanup-cache.sh"
 grep -q '440:0:10001' "$root/scripts/production-stack/validate-files.sh"
 grep -q '400:0:0' "$root/scripts/production-stack/validate-files.sh"
 grep -q '444:0:0' "$root/scripts/production-stack/validate-files.sh"
@@ -63,6 +76,69 @@ python3 "$root/tools/validate-production-images.py" --self-test
 python3 "$root/tools/vnext-stack-bundle.py" self-test --source-root "$root"
 python3 "$root/scripts/test-production-stack-cross-version.py"
 bash "$root/scripts/test-production-stack-update-recovery.sh"
+
+cleanup_test_root=$(mktemp -d)
+trap 'find "$cleanup_test_root" -xdev -type f -delete; find "$cleanup_test_root" -xdev -type l -delete; find "$cleanup_test_root" -xdev -depth -type d -empty -delete' EXIT
+cleanup_fixture="$cleanup_test_root/opt/dirextalk-vnext"
+mkdir -p "$cleanup_fixture"/{build/nested,releases,config,tls,secrets,volumes,logs}
+chmod 0755 "$cleanup_fixture"
+chmod 0700 "$cleanup_fixture/build" "$cleanup_fixture/build/nested"
+printf 'retired compiler output\n' >"$cleanup_fixture/build/nested/artifact"
+printf 'preserve\n' >"$cleanup_fixture/releases/current"
+printf 'preserve\n' >"$cleanup_fixture/secrets/operator"
+(
+    # shellcheck source=scripts/production-stack/cleanup-cache.sh
+    source "$root/scripts/production-stack/cleanup-cache.sh"
+    legacy_parent="$cleanup_fixture"
+    legacy_build="$cleanup_fixture/build"
+    cleanup_owner_uid=$(id -u)
+    cleanup_owner_gid=$(id -g)
+    cleanup_timeout_seconds=5
+    cleanup_legacy_build
+)
+[[ ! -e "$cleanup_fixture/build" && ! -L "$cleanup_fixture/build" ]]
+grep -qx preserve "$cleanup_fixture/releases/current"
+grep -qx preserve "$cleanup_fixture/secrets/operator"
+for sibling in releases config tls secrets volumes logs; do
+    [[ -d "$cleanup_fixture/$sibling" ]]
+done
+
+mkdir -m 0700 "$cleanup_fixture/build"
+ln -s "$cleanup_fixture/releases/current" "$cleanup_fixture/build/outside"
+if (
+    # shellcheck source=scripts/production-stack/cleanup-cache.sh
+    source "$root/scripts/production-stack/cleanup-cache.sh"
+    legacy_parent="$cleanup_fixture"
+    legacy_build="$cleanup_fixture/build"
+    cleanup_owner_uid=$(id -u)
+    cleanup_owner_gid=$(id -g)
+    cleanup_timeout_seconds=5
+    cleanup_legacy_build
+) 2>/dev/null; then
+    echo 'legacy build cleanup unexpectedly accepted a symlink' >&2
+    exit 1
+fi
+[[ -L "$cleanup_fixture/build/outside" ]]
+grep -qx preserve "$cleanup_fixture/releases/current"
+unlink "$cleanup_fixture/build/outside"
+rmdir "$cleanup_fixture/build"
+ln -s "$cleanup_fixture/releases" "$cleanup_fixture/build"
+if (
+    # shellcheck source=scripts/production-stack/cleanup-cache.sh
+    source "$root/scripts/production-stack/cleanup-cache.sh"
+    legacy_parent="$cleanup_fixture"
+    legacy_build="$cleanup_fixture/build"
+    cleanup_owner_uid=$(id -u)
+    cleanup_owner_gid=$(id -g)
+    cleanup_timeout_seconds=5
+    cleanup_legacy_build
+) 2>/dev/null; then
+    echo 'legacy build cleanup unexpectedly followed a root symlink' >&2
+    exit 1
+fi
+[[ -L "$cleanup_fixture/build" ]]
+grep -qx preserve "$cleanup_fixture/releases/current"
+
 for example in "$root"/docker/production/examples/x{6,7,8}.env.example; do
     python3 "$root/tools/validate-production-images.py" "$example"
 done
