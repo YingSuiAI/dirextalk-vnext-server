@@ -344,6 +344,99 @@ async fn applying_forward_migrations_twice_is_a_no_op() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
+async fn client_binding_issue_request_digest_down_preserves_schema_when_rows_exist()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    insert_client_binding_fixture(harness.admin_pool()).await?;
+
+    let error = sqlx::raw_sql(CLIENT_BINDING_ISSUE_REQUEST_DIGEST_DOWN)
+        .execute(harness.admin_pool())
+        .await
+        .expect_err("v58 downgrade must reject durable client bindings before DDL");
+    assert_eq!(sqlstate(&error).as_deref(), Some("55000"));
+
+    let preserved: (bool, bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (
+             SELECT 1 FROM information_schema.columns
+              WHERE table_schema='identity' AND table_name='client_bindings'
+                AND column_name='issue_request_digest'
+         ),
+         EXISTS (
+             SELECT 1 FROM pg_constraint
+              WHERE conrelid='identity.client_bindings'::regclass
+                AND conname='client_bindings_issue_request_digest_length'
+         ),
+         EXISTS (
+             SELECT 1 FROM identity.client_bindings
+              WHERE binding_id='0190f2a5-7b1c-7abc-8def-0123456789ab'
+                AND octet_length(issue_request_digest)=32
+         )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(preserved, (true, true, true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_binding_issuance_fences_down_preserves_constraints_when_rows_exist()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = PostgresHarness::start().await?;
+    insert_client_binding_fixture(harness.admin_pool()).await?;
+
+    let error = sqlx::raw_sql(CLIENT_BINDING_ISSUANCE_FENCES_DOWN)
+        .execute(harness.admin_pool())
+        .await
+        .expect_err("v57 downgrade must reject durable client bindings before DDL");
+    assert_eq!(sqlstate(&error).as_deref(), Some("55000"));
+
+    let preserved: (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_constraint
+              WHERE conrelid='identity.client_bindings'::regclass
+                AND conname='client_bindings_authorization_digest_unique'
+         ),
+         EXISTS (
+             SELECT 1 FROM pg_constraint
+              WHERE conrelid='identity.client_bindings'::regclass
+                AND conname='client_bindings_device_id_v7'
+         ),
+         to_regclass('identity.client_bindings_live_operation_unique') IS NOT NULL,
+         EXISTS (
+             SELECT 1 FROM identity.client_bindings
+              WHERE binding_id='0190f2a5-7b1c-7abc-8def-0123456789ab'
+         )",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(preserved, (true, true, true, true));
+    Ok(())
+}
+
+async fn insert_client_binding_fixture(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO identity.client_bindings (
+             binding_id, deployment_operation_id, tenant_id, server_origin,
+             tls_root_ca_sha256, authorization_digest, artifact_digest,
+             issue_request_digest, issued_at_ms, expires_at_ms, state, revision
+         ) VALUES (
+             '0190f2a5-7b1c-7abc-8def-0123456789ab',
+             '0190f2a5-7b1d-7abc-8def-0123456789ab',
+             '0190f2a5-7b1e-7abc-8def-0123456789ab',
+             'https://identity.example',
+             decode(repeat('11',32),'hex'),
+             decode(repeat('22',32),'hex'),
+             decode(repeat('33',32),'hex'),
+             decode(repeat('44',32),'hex'),
+             1000, 2000, 'issued', 1
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn agent_identity_reader_rls_fix_restores_read_only_agent_branch_and_exact_down_policy()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = PostgresHarness::start().await?;

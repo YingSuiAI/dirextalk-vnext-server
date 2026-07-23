@@ -61,7 +61,7 @@ use dtx_wire::{
 use getrandom::fill as fill_random;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::Row;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Route for the self-authenticated identity genesis request.
 pub const IDENTITY_BOOTSTRAP_PATH: &str = "/v1/identity/bootstrap";
@@ -702,8 +702,8 @@ async fn deployment_bootstrap_identity(
     request: Request,
 ) -> Response {
     let request_id = RequestId::new();
-    let (parts, body) = request.into_parts();
-    match state.deployment_bootstrap(&parts.headers, body).await {
+    let (mut parts, body) = request.into_parts();
+    match state.deployment_bootstrap(&mut parts.headers, body).await {
         Ok(success) => bootstrap_success_response(success, request_id),
         Err(failure) => client_binding_failure_response(failure, request_id),
     }
@@ -714,8 +714,11 @@ async fn deployment_initial_device(
     request: Request,
 ) -> Response {
     let request_id = RequestId::new();
-    let (parts, body) = request.into_parts();
-    match state.deployment_initial_device(&parts.headers, body).await {
+    let (mut parts, body) = request.into_parts();
+    match state
+        .deployment_initial_device(&mut parts.headers, body)
+        .await
+    {
         Ok(success) => initial_device_success_response(success, request_id),
         Err(failure) => client_binding_failure_response(failure, request_id),
     }
@@ -1130,7 +1133,7 @@ impl IdentityBootstrapState {
 
     async fn deployment_bootstrap(
         &self,
-        headers: &HeaderMap,
+        headers: &mut HeaderMap,
         body: Body,
     ) -> Result<BootstrapSuccess, ClientBindingFailure> {
         if !has_exact_event_content_type(headers)
@@ -1140,7 +1143,7 @@ impl IdentityBootstrapState {
             return Err(ClientBindingFailure::Invalid);
         }
         let binding_id = client_binding_id(headers)?;
-        let authorization = client_binding_authorization(headers)?;
+        let authorization_digest = take_client_binding_authorization_digest(headers)?;
         let idem = idempotency_key_hash_binding(headers, HTTP_IDEMPOTENCY_KEY_HASH_DOMAIN)?;
         let exact_event_bytes = to_bytes(body, MAX_IDENTITY_BOOTSTRAP_EVENT_BYTES)
             .await
@@ -1156,7 +1159,7 @@ impl IdentityBootstrapState {
             .deployment_bootstrap(
                 &self.store,
                 binding_id,
-                authorization.digest(),
+                authorization_digest,
                 idem,
                 exact_event_bytes.to_vec(),
                 now,
@@ -1178,7 +1181,7 @@ impl IdentityBootstrapState {
 
     async fn deployment_initial_device(
         &self,
-        headers: &HeaderMap,
+        headers: &mut HeaderMap,
         body: Body,
     ) -> Result<InitialDeviceSuccess, ClientBindingFailure> {
         if !has_exact_event_content_type(headers) || headers.contains_key(header::CONTENT_ENCODING)
@@ -1186,7 +1189,7 @@ impl IdentityBootstrapState {
             return Err(ClientBindingFailure::Invalid);
         }
         let binding_id = client_binding_id(headers)?;
-        let authorization = client_binding_authorization(headers)?;
+        let authorization_digest = take_client_binding_authorization_digest(headers)?;
         let idem =
             idempotency_key_hash_binding(headers, HTTP_INITIAL_DEVICE_IDEMPOTENCY_KEY_HASH_DOMAIN)?;
         let expected = expected_genesis_hash(headers).map_err(|_| ClientBindingFailure::Invalid)?;
@@ -1204,7 +1207,7 @@ impl IdentityBootstrapState {
             .initial_device(
                 &self.store,
                 binding_id,
-                authorization.digest(),
+                authorization_digest,
                 idem,
                 expected,
                 exact_event_bytes.to_vec(),
@@ -2068,16 +2071,38 @@ fn client_binding_id(headers: &HeaderMap) -> Result<uuid::Uuid, ClientBindingFai
     Ok(id)
 }
 
-fn client_binding_authorization(
-    headers: &HeaderMap,
-) -> Result<ClientBindingAuthorization, ClientBindingFailure> {
-    let value = single_graphic_header(headers, header::AUTHORIZATION.as_str(), 61, 80)
-        .map_err(|()| ClientBindingFailure::Invalid)?;
+fn take_client_binding_authorization_digest(
+    headers: &mut HeaderMap,
+) -> Result<Sha256Digest, ClientBindingFailure> {
+    // Move every raw header value out before any body or database await. Only
+    // the domain-separated digest crosses the asynchronous boundary.
+    let mut values = headers
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .map(|value| Zeroizing::new(value.as_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    headers.remove(header::AUTHORIZATION);
+    if values.len() != 1 {
+        return Err(ClientBindingFailure::Invalid);
+    }
+    let value = values.pop().ok_or(ClientBindingFailure::Invalid)?;
+    if !(61..=80).contains(&value.len())
+        || !value
+            .iter()
+            .copied()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    {
+        return Err(ClientBindingFailure::Invalid);
+    }
+    let value = std::str::from_utf8(&value).map_err(|_| ClientBindingFailure::Invalid)?;
     let raw = value
         .strip_prefix(CLIENT_BINDING_AUTHORIZATION_SCHEME)
         .and_then(|rest| rest.strip_prefix(' '))
         .ok_or(ClientBindingFailure::Invalid)?;
-    ClientBindingAuthorization::parse(raw).map_err(|_| ClientBindingFailure::Invalid)
+    let authorization =
+        ClientBindingAuthorization::parse(raw).map_err(|_| ClientBindingFailure::Invalid)?;
+    let digest = authorization.digest();
+    Ok(digest)
 }
 
 fn expected_genesis_hash(headers: &HeaderMap) -> Result<Sha256Digest, InitialDeviceFailure> {
@@ -4909,7 +4934,25 @@ mod tests {
                 "DTX-Client-Binding AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             ),
         );
-        assert!(client_binding_authorization(&binding).is_err());
+        assert!(take_client_binding_authorization_digest(&mut binding).is_err());
+        assert!(!binding.contains_key(header::AUTHORIZATION));
+
+        let mut exact_authorization = HeaderMap::new();
+        exact_authorization.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static(
+                "DTX-Client-Binding AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            ),
+        );
+        let expected =
+            ClientBindingAuthorization::parse("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .expect("fixed authorization decodes")
+                .digest();
+        let Ok(actual) = take_client_binding_authorization_digest(&mut exact_authorization) else {
+            panic!("fixed authorization is accepted");
+        };
+        assert_eq!(actual, expected);
+        assert!(!exact_authorization.contains_key(header::AUTHORIZATION));
 
         let mut malformed = HeaderMap::new();
         malformed.insert(
@@ -4929,28 +4972,50 @@ mod tests {
 
     #[tokio::test]
     async fn client_binding_error_response_is_redacted_and_exact() {
-        let request_id = RequestId::new();
-        let response = client_binding_failure_response(ClientBindingFailure::Conflict, request_id);
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE),
-            Some(&HeaderValue::from_static("application/json"))
-        );
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL),
-            Some(&HeaderValue::from_static("no-store"))
-        );
-        assert_eq!(
-            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
-            Some(&HeaderValue::from_static("nosniff"))
-        );
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .expect("fixed error body is bounded");
-        let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
-        assert_eq!(value["error"]["code"], "CLIENT_BINDING_CONFLICT");
-        assert_eq!(value["error"]["retryable"], false);
-        assert!(value["error"].get("authorization").is_none());
-        assert!(value["error"].get("body").is_none());
+        for (failure, status, code, retryable) in [
+            (
+                ClientBindingFailure::Invalid,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "CLIENT_BINDING_INVALID",
+                false,
+            ),
+            (
+                ClientBindingFailure::Conflict,
+                StatusCode::CONFLICT,
+                "CLIENT_BINDING_CONFLICT",
+                false,
+            ),
+            (
+                ClientBindingFailure::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "IDENTITY_SERVICE_UNAVAILABLE",
+                true,
+            ),
+        ] {
+            let request_id = RequestId::new();
+            let response = client_binding_failure_response(failure, request_id);
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json"))
+            );
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store"))
+            );
+            assert_eq!(
+                response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                Some(&HeaderValue::from_static("nosniff"))
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("fixed error body is bounded");
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("JSON envelope");
+            assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["request_id"], request_id.to_string());
+            assert_eq!(value["error"]["retryable"], retryable);
+            assert!(value["error"].get("authorization").is_none());
+            assert!(value["error"].get("body").is_none());
+        }
     }
 }
