@@ -4,23 +4,26 @@ FROM rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e7
 WORKDIR /workspace
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/workspace/target \
-    rm -f \
-        /workspace/target/release/dtx-node \
-        /workspace/target/release/dtx-opaque-push-broker \
-        /workspace/target/release/dtx-realtime-sync-gateway \
-        /workspace/target/release/dtx-identity-provision \
-        /workspace/target/release/dtx-agent-control \
+    --mount=type=cache,id=dtx-vnet-release-target,target=/workspace/target,sharing=locked \
+    cargo clean --release --locked \
+        --package dtx-node \
+        --package dtx-opaque-push-broker \
+        --package dtx-realtime-sync-gateway \
+        --package dtx-identity-node \
+        --package dtx-agent-control-bin \
     && \
     cargo build --release --locked \
         --package dtx-node \
         --package dtx-opaque-push-broker \
         --package dtx-realtime-sync-gateway \
-        --package dtx-identity-node --bin dtx-identity-provision \
+        --package dtx-identity-node \
+        --bin dtx-node \
+        --bin dtx-opaque-push-broker \
+        --bin dtx-realtime-sync-gateway \
+        --bin dtx-identity-provision \
     && install -D -m 0555 /workspace/target/release/dtx-node /artifacts/dtx-node \
     && install -D -m 0555 /workspace/target/release/dtx-opaque-push-broker /artifacts/dtx-opaque-push-broker \
     && install -D -m 0555 /workspace/target/release/dtx-realtime-sync-gateway /artifacts/dtx-realtime-sync-gateway \
-    && rm -f /workspace/target/release/dtx-agent-control \
     && cargo build --release --locked \
         --package dtx-agent-control-bin \
         --bin dtx-agent-control \

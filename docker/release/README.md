@@ -2,17 +2,20 @@
 
 `docker/release/Dockerfile` builds the production image containing the
 independent `dtx-node`, `dtx-opaque-push-broker`, `dtx-realtime-sync-gateway`,
-and `dtx-agent-control` artifacts used by the
-new Rust release CLI. The production repository is exactly
+`dtx-agent-control`, and `dtx-identity-provision` artifacts used by the new
+Rust release CLI. The production repository is exactly
 `dirextalk/vnet-server`. Releases use an immutable version/commit tag and must
 be read back by digest after publication. A `latest` discovery pointer may be
 updated, but deployment execution accepts only the read-back
 `dirextalk/vnet-server@sha256:<64>` reference.
 
-The exact four binaries, their Cargo packages, fixed image paths, and runtime
+The exact five binaries, their Cargo packages, fixed image paths, and runtime
 permission contract are recorded in [`manifest.json`](manifest.json). Both the
 release Dockerfile and this manifest are source-controlled inputs; a release
-must not add an unlisted executable.
+must not add an unlisted executable. The build uses a locked target cache,
+invalidates the five selected packages before compilation, and names every
+binary target explicitly. An interrupted cache therefore cannot make Cargo
+report success while leaving a selected release output stale or absent.
 
 The default entrypoint remains the unified Rust node. A separately scheduled
 Gateway container must override the entrypoint with

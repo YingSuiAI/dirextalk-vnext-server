@@ -237,6 +237,13 @@ for segment in build_stage[-1].argument.split("&&"):
     if segment_tokens:
         run_segments.append(segment_tokens)
 
+expected_cache_mounts = [
+    "--mount=type=cache,target=/usr/local/cargo/registry",
+    "--mount=type=cache,id=dtx-vnet-release-target,target=/workspace/target,sharing=locked",
+]
+if run_segments[0][:2] != expected_cache_mounts:
+    fail("release build target cache must be fixed and locked")
+
 def command_after_mounts(segment_tokens: list[str], command: str) -> list[str] | None:
     try:
         index = segment_tokens.index(command)
@@ -265,11 +272,23 @@ for segment_tokens in run_segments:
 
 if cargo_commands != [
     [
+        "cargo", "clean", "--release", "--locked",
+        "--package", "dtx-node",
+        "--package", "dtx-opaque-push-broker",
+        "--package", "dtx-realtime-sync-gateway",
+        "--package", "dtx-identity-node",
+        "--package", "dtx-agent-control-bin",
+    ],
+    [
         "cargo", "build", "--release", "--locked",
         "--package", "dtx-node",
         "--package", "dtx-opaque-push-broker",
         "--package", "dtx-realtime-sync-gateway",
-        "--package", "dtx-identity-node", "--bin", "dtx-identity-provision",
+        "--package", "dtx-identity-node",
+        "--bin", "dtx-node",
+        "--bin", "dtx-opaque-push-broker",
+        "--bin", "dtx-realtime-sync-gateway",
+        "--bin", "dtx-identity-provision",
     ],
     [
         "cargo", "build", "--release", "--locked",
@@ -277,18 +296,8 @@ if cargo_commands != [
     ],
 ]:
     fail(f"release build targets changed: {cargo_commands!r}")
-if remove_commands != [
-    [
-        "rm", "-f",
-        "/workspace/target/release/dtx-node",
-        "/workspace/target/release/dtx-opaque-push-broker",
-        "/workspace/target/release/dtx-realtime-sync-gateway",
-        "/workspace/target/release/dtx-identity-provision",
-        "/workspace/target/release/dtx-agent-control",
-    ],
-    ["rm", "-f", "/workspace/target/release/dtx-agent-control"],
-]:
-    fail("release build must clear cached outputs before each target selection")
+if remove_commands:
+    fail("release build must invalidate package fingerprints instead of unlinking outputs")
 
 expected_installs = [
     ["install", "-D", "-m", "0555", f"/workspace/target/release/{binary}", f"/artifacts/{binary}"]
