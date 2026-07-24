@@ -208,7 +208,7 @@ async fn identity_mailbox_v3_pull_and_v2_ack_is_isolated_per_authorized_device()
         let CanonicalValue::Map(fields) = decoded else {
             return Err("V3 pull receipt not a map".into());
         };
-        assert!(matches!(&fields[4].1, CanonicalValue::Array(entries) if entries.len()==1));
+        assert!(matches!(&fields[5].1, CanonicalValue::Array(entries) if entries.len()==1));
     }
 
     let ack_body = encode_deterministic_cbor(&CanonicalValue::Map(vec![
@@ -244,7 +244,7 @@ async fn identity_mailbox_v3_pull_and_v2_ack_is_isolated_per_authorized_device()
     else {
         return Err("second V3 pull receipt not a map".into());
     };
-    assert!(matches!(&fields[4].1, CanonicalValue::Array(entries) if entries.len()==1));
+    assert!(matches!(&fields[5].1, CanonicalValue::Array(entries) if entries.len()==1));
     assert_eq!(
         send_v2(
             app.clone(),
@@ -282,7 +282,7 @@ async fn identity_mailbox_v3_pull_and_v2_ack_is_isolated_per_authorized_device()
             second.session_id,
             second.session_secret,
             encode_deterministic_cbor(&CanonicalValue::Map(vec![
-                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
                 (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
                 (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
             ]))?,
