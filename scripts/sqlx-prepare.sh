@@ -109,4 +109,4 @@ fi
 export DATABASE_URL="postgres://dtx_sqlx@127.0.0.1:${host_port}/dtx_sqlx?sslmode=disable"
 
 "$cargo_script" sqlx migrate run --source migrations
-"$cargo_script" sqlx prepare --workspace --check
+"$cargo_script" sqlx prepare --check

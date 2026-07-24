@@ -5,6 +5,7 @@
 /.codegraph/
 /.worktrees/
 /.idea/
+/.run/
 /.vscode/
 .env
 .env.*

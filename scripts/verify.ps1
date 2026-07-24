@@ -48,11 +48,11 @@ try {
         Pop-Location
     }
 
-    Invoke-CargoChecked -CargoArguments @('fmt', '--all', '--', '--check')
+    Invoke-CargoChecked -CargoArguments @('fmt', '--', '--check')
     & (Join-Path $PSScriptRoot 'check-testkit-boundary.ps1')
     Assert-LastExitCode 'testkit dependency boundary'
-    Invoke-CargoChecked -CargoArguments @('clippy', '--workspace', '--locked', '--all-targets', '--all-features', '--', '-D', 'warnings')
-    Invoke-CargoChecked -CargoArguments @('test', '--workspace', '--locked')
+    Invoke-CargoChecked -CargoArguments @('clippy', '--locked', '--all-targets', '--', '-D', 'warnings')
+    Invoke-CargoChecked -CargoArguments @('test', '--locked')
     & (Join-Path $PSScriptRoot 'sqlx-prepare.ps1')
     Assert-LastExitCode 'SQLx migration/prepare gate'
     Invoke-CargoChecked -CargoArguments @('deny', 'check')

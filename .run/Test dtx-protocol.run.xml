@@ -1,7 +1,0 @@
-<component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="Test dtx-protocol" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
-    <option name="command" value="test -p dtx-protocol --locked" />
-    <option name="workingDirectory" value="$PROJECT_DIR$" />
-    <method v="2" />
-  </configuration>
-</component>

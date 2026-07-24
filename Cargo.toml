@@ -46,6 +46,38 @@ members = [
     "crates/dtx-wire",
     "tools/dtx-protocol",
 ]
+# Product Core Alpha release gates select these packages by default. Agent,
+# Connector, Public Feed, and Indexer packages remain frozen workspace members
+# for the next version but do not block the current IM release.
+default-members = [
+    "bins/dtx-dev-local-tls",
+    "bins/dtx-dev-migrate",
+    "bins/dtx-production-migrate",
+    "bins/dtx-group-node",
+    "bins/dtx-identity-node",
+    "bins/dtx-mailbox-node",
+    "bins/dtx-realtime-sync-gateway",
+    "bins/dtx-node",
+    "bins/dtx-opaque-push-broker",
+    "crates/dtx-domain",
+    "crates/dtx-contact",
+    "crates/dtx-federated-identity",
+    "crates/dtx-group-policy",
+    "crates/dtx-group-persistence",
+    "crates/dtx-identity-log",
+    "crates/dtx-identity-persistence",
+    "crates/dtx-membership-command",
+    "crates/dtx-mailbox",
+    "crates/dtx-opaque-push",
+    "crates/dtx-opaque-push-postgres",
+    "crates/dtx-opaque-push-fcm",
+    "crates/dtx-realtime-sync",
+    "crates/dtx-security",
+    "crates/dtx-storage",
+    "crates/dtx-testkit",
+    "crates/dtx-wire",
+    "tools/dtx-protocol",
+]
 resolver = "3"
 
 [workspace.package]

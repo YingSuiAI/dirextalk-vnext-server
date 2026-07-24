@@ -5,18 +5,18 @@ Run commands from this repository root.
 | Task | Command |
 | --- | --- |
 | pinned Cargo (Ubuntu/WSL) | `bash scripts/cargo.sh <cargo-command> [arguments...]` |
-| format | `cargo fmt --all` |
+| format | `cargo fmt` |
 | verify (Ubuntu/WSL) | `bash scripts/verify.sh` |
 | verify (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1` |
-| test | `cargo test --workspace --locked` |
+| test | `cargo test --locked` |
 | persistence fresh baseline | `cargo test -p dtx-storage --test migrations --locked` |
 | persistence contracts | `cargo test -p dtx-storage --test persistence_contract --locked` |
 | SQLx baseline/prepare gate (Ubuntu/WSL) | `bash scripts/sqlx-prepare.sh` |
 | SQLx baseline/prepare gate (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sqlx-prepare.ps1` |
 | testkit dependency boundary (Ubuntu/WSL) | `bash scripts/check-testkit-boundary.sh` |
 | testkit dependency boundary (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-testkit-boundary.ps1` |
-| build | `cargo build --workspace --locked` |
-| release-build | `cargo build --workspace --locked --release` |
+| build | `cargo build --locked` |
+| release-build | `cargo build --locked --release` |
 | release-image-check | `bash scripts/check-release-image.sh` |
 | Product Core production-stack gate | `bash scripts/check-production-stack.sh` |
 | production PostgreSQL role/readiness gate | `bash scripts/test-production-postgres.sh` |
@@ -28,11 +28,17 @@ Run commands from this repository root.
 | check Product Core Alpha inventory | `cargo run -p dtx-protocol --locked -- check-alpha .` |
 | update Product Core Alpha inventory | `cargo run -p dtx-protocol --locked -- write-alpha .` |
 
+Cargo `default-members` is the authoritative Product Core package set. Agent,
+Connector, Public Feed, and Indexer remain workspace members but are excluded
+from the current release gate.
+
 The full Product Core verification gate checks generated Rust/Dart sources before and after
 idempotent regeneration, validates Product Core Alpha CDDL/OpenAPI/Protobuf and
 golden vectors, checks the exact current Alpha inventory, runs Dart VM and
 compiled-JavaScript conformance, then runs fmt/clippy/test/deny/audit and
-`git diff --check`. CI pins the latest stable Dart SDK selected for S0.3
+`git diff --check`. CI installs the pinned tools and invokes this same script
+instead of maintaining a second copy of the gate. CI pins the stable Dart SDK
+selected for S0.3
 (`3.12.2`). Agent/Public source remains frozen and is intentionally outside the
 Alpha release gate; its operator and VM acceptance commands are not current
 Product Core entry points.
@@ -47,9 +53,9 @@ Tools. When they are unavailable but the user-scoped LLVM-MinGW toolchain is
 installed, use the checked-in wrapper:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 fmt --all -- --check
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 clippy --workspace --locked --all-targets --all-features -- -D warnings
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 test --workspace --locked
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 fmt -- --check
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 clippy --locked --all-targets -- -D warnings
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 test --locked
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 deny check
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 audit
 ```

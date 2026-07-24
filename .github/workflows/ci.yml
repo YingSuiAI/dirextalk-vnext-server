@@ -11,20 +11,6 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18.4-alpine3.24
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-          POSTGRES_USER: dtx_ci
-          POSTGRES_DB: dtx_ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready --username dtx_ci --dbname dtx_ci"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 30
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -39,59 +25,14 @@ jobs:
         with:
           sdk: 3.12.2
 
-      - name: Verify generated and Product Core Alpha protocol contracts
+      - name: Install Product Core verification tools
         run: |
-          cargo run -p dtx-protocol --locked -- generate .
-          if [[ -n "$(git status --porcelain --untracked-files=all -- crates/dtx-wire/src/generated protocol/generated/dart/lib/src)" ]]; then
-            git status --short -- crates/dtx-wire/src/generated protocol/generated/dart/lib/src
-            exit 1
-          fi
-          cargo run -p dtx-protocol --locked -- check-generated .
-          cargo run -p dtx-protocol --locked -- validate .
-          cargo run -p dtx-protocol --locked -- check-alpha .
-
-      - name: Install locked Dart dependencies
-        working-directory: protocol/generated/dart
-        run: dart pub get --enforce-lockfile
-
-      - name: Check Dart contracts
-        working-directory: protocol/generated/dart
-        run: |
-          dart format --output=none --set-exit-if-changed .
-          dart analyze --fatal-infos
-          dart test
-          dart compile js tool/web_smoke.dart -O2 -o "$RUNNER_TEMP/dtx-protocol-web-smoke.js"
-          node "$RUNNER_TEMP/dtx-protocol-web-smoke.js"
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Enforce testkit dependency boundary
-        run: ./scripts/check-testkit-boundary.sh
-
-      - name: Lint
-        run: cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace --locked
-
-      - name: Check SQLx migrations and prepare compatibility
-        env:
-          DATABASE_URL: postgres://dtx_ci@localhost:5432/dtx_ci?sslmode=disable
-        run: |
-          cargo install sqlx-cli --version 0.9.0 --no-default-features --features rustls,postgres
-          cargo sqlx migrate run --source migrations
-          cargo sqlx prepare --workspace --check
-
-      - name: Install dependency policy tools
-        run: |
+          cargo install sqlx-cli --version 0.9.0 --force --no-default-features \
+            --features rustls,postgres --root "$RUNNER_TEMP/dtx-sqlx"
           cargo install cargo-deny --version 0.20.2 --locked
           cargo install cargo-audit --version 0.22.2 --locked
 
-      - name: Check dependency policy
-        run: |
-          cargo deny check
-          cargo audit
-
-      - name: Check diff hygiene
-        run: git diff --check
+      - name: Run canonical Product Core gate
+        env:
+          DTX_SQLX_TOOL_ROOT: ${{ runner.temp }}/dtx-sqlx
+        run: bash scripts/verify.sh

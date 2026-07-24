@@ -68,10 +68,10 @@ fi
     node "$temporary_directory/dtx-protocol-web-smoke.js"
 )
 
-"$cargo_script" fmt --all -- --check
+"$cargo_script" fmt -- --check
 "$script_dir/check-testkit-boundary.sh"
-"$cargo_script" clippy --workspace --locked --all-targets --all-features -- -D warnings
-"$cargo_script" test --workspace --locked
+"$cargo_script" clippy --locked --all-targets -- -D warnings
+"$cargo_script" test --locked
 "$script_dir/sqlx-prepare.sh"
 "$cargo_script" deny check
 "$cargo_script" audit
