@@ -55,7 +55,7 @@ if ! diff -qr "$temporary_directory/generated-rust" crates/dtx-wire/src/generate
 fi
 
 "$cargo_script" run -p dtx-protocol --locked -- validate .
-"$cargo_script" run -p dtx-protocol --locked -- check-breaking .
+"$cargo_script" run -p dtx-protocol --locked -- check-alpha .
 
 (
     cd -- "$repository_root/protocol/generated/dart"

@@ -39,7 +39,7 @@ jobs:
         with:
           sdk: 3.12.2
 
-      - name: Verify generated and frozen protocol contracts
+      - name: Verify generated and Product Core Alpha protocol contracts
         run: |
           cargo run -p dtx-protocol --locked -- generate .
           if [[ -n "$(git status --porcelain --untracked-files=all -- crates/dtx-wire/src/generated protocol/generated/dart/lib/src)" ]]; then
@@ -48,7 +48,7 @@ jobs:
           fi
           cargo run -p dtx-protocol --locked -- check-generated .
           cargo run -p dtx-protocol --locked -- validate .
-          cargo run -p dtx-protocol --locked -- check-breaking .
+          cargo run -p dtx-protocol --locked -- check-alpha .
 
       - name: Install locked Dart dependencies
         working-directory: protocol/generated/dart

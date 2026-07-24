@@ -1,9 +1,0 @@
-{
-  "version": 34,
-  "events": {},
-  "errors": {},
-  "artifacts": {
-    "protocol/cddl/private-event/v6_v7/private-agent-approval-v6-v7.cddl": "sha256:9255eb759c5c67a69d32c1c4a27f7bef0fafd30cf182869d9ad245141b7622f8",
-    "protocol/test-vectors/private-event/v6_v7/private-agent-approval-v6-v7.json": "sha256:41aa634708d0b709526cb194881c64bd87ae8072c261b94437cc585bf0ced96a"
-  }
-}

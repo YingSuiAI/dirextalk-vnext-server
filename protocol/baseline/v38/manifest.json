@@ -1,9 +1,0 @@
-{
-  "version": 38,
-  "events": {},
-  "errors": {},
-  "artifacts": {
-    "protocol/cddl/account-read-cursor/v1/account-read-cursor-v1.cddl": "sha256:87a57e0a2224653f9fc57aa172abac31dc87a72934ed87bc4bfb27e99edae1bb",
-    "protocol/test-vectors/account-read-cursor/v1/account-read-cursor-v1.json": "sha256:9e163be6534101ed6982024106ebe309af50d6bdf3264bc16918e5a5c95b9e01"
-  }
-}

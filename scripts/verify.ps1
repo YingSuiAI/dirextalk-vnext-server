@@ -26,7 +26,7 @@ try {
     Invoke-CargoChecked -CargoArguments @('run', '-p', 'dtx-protocol', '--locked', '--', 'generate', '.')
     Invoke-CargoChecked -CargoArguments @('run', '-p', 'dtx-protocol', '--locked', '--', 'check-generated', '.')
     Invoke-CargoChecked -CargoArguments @('run', '-p', 'dtx-protocol', '--locked', '--', 'validate', '.')
-    Invoke-CargoChecked -CargoArguments @('run', '-p', 'dtx-protocol', '--locked', '--', 'check-breaking', '.')
+    Invoke-CargoChecked -CargoArguments @('run', '-p', 'dtx-protocol', '--locked', '--', 'check-alpha', '.')
 
     Push-Location (Join-Path $repositoryRoot 'protocol/generated/dart')
     $webSmokeOutput = Join-Path $repositoryRoot 'target/dtx-protocol-web-smoke.js'

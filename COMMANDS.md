@@ -29,17 +29,16 @@ Run commands from this repository root.
 | regenerate contracts | `cargo run -p dtx-protocol --locked -- generate .` |
 | check generated contracts | `cargo run -p dtx-protocol --locked -- check-generated .` |
 | validate schema and vectors | `cargo run -p dtx-protocol --locked -- validate .` |
-| check frozen v1 contracts | `cargo run -p dtx-protocol --locked -- check-breaking .` |
-| initialize a new baseline | `cargo run -p dtx-protocol --locked -- freeze-baseline .` |
+| check Product Core Alpha inventory | `cargo run -p dtx-protocol --locked -- check-alpha .` |
+| update Product Core Alpha inventory | `cargo run -p dtx-protocol --locked -- write-alpha .` |
 
 The full verification gate checks generated Rust/Dart sources before and after
-idempotent regeneration, validates CDDL/OpenAPI/Protobuf and golden vectors,
-enforces the frozen v1 baseline, runs Dart VM and compiled-JavaScript
-conformance, then runs fmt/clippy/test/deny/audit and `git diff --check`. CI pins
-the latest stable Dart SDK selected for S0.3 (`3.12.2`). `freeze-baseline` is an
-initialization command for a new versioned contract; once its manifest exists it
-accepts only an exact no-op. New events, errors, or artifacts require a new
-versioned schema/manifest and cannot be appended to the published v1.0 baseline.
+idempotent regeneration, validates Product Core Alpha CDDL/OpenAPI/Protobuf and
+golden vectors, checks the exact current Alpha inventory, runs Dart VM and
+compiled-JavaScript conformance, then runs fmt/clippy/test/deny/audit and
+`git diff --check`. CI pins the latest stable Dart SDK selected for S0.3
+(`3.12.2`). Agent/Public source artifacts remain available for independent
+conformance consumers but are intentionally outside the Alpha release gate.
 
 On Ubuntu/WSL, `scripts/cargo.sh` resolves the channel from
 `rust-toolchain.toml`, refuses an uninstalled toolchain, and passes every

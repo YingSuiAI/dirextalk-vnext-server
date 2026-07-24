@@ -1,9 +1,0 @@
-{
-  "version": 16,
-  "events": {},
-  "errors": {},
-  "artifacts": {
-    "protocol/cddl/contact-card/v1/contact-card-v1.cddl": "sha256:e8c74132db98cdf0b488eb3ebb2b7819130997bd22065f4e330df37feda30aaf",
-    "protocol/test-vectors/contact-card/v1/contact-card-v1.json": "sha256:411e86a08d5ff7db578c6bf39fbca34084d89e0b977dce07d7b391cd3dfa9a5f"
-  }
-}

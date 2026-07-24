@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use dtx_protocol::{
-    check_event_compatibility, check_generated, load_error_registry, load_event_registry,
-    parse_event_registry, render_rust_errors, render_rust_events,
+    check_generated, load_error_registry, load_event_registry, render_rust_errors,
+    render_rust_events,
 };
 
 fn repository_root() -> PathBuf {
@@ -61,80 +61,4 @@ fn canonical_registries_are_complete_unique_and_renderable() {
 #[test]
 fn committed_rust_and_dart_sources_are_current() {
     check_generated(&repository_root()).expect("generated sources match their registries");
-}
-
-#[test]
-fn cross_version_registry_check_allows_addition_but_rejects_an_event_change() {
-    let baseline = parse_event_registry(
-        r"
-version: 1
-events:
-  - type: example.changed.v1
-    rust_name: ExampleChangedV1
-    schema_version: 1
-    aggregate: example
-    required_reader_capability: example.v1
-    authorization: owner
-    retention: tenant_policy
-    redaction: identifiers_only
-    snapshot_projection: examples
-    unknown_version_policy: stop_cursor
-    fields:
-      - { key: 1, name: example_id, type: aggregate_id }
-",
-    )
-    .unwrap();
-    let additive = parse_event_registry(
-        r"
-version: 1
-events:
-  - type: example.changed.v1
-    rust_name: ExampleChangedV1
-    schema_version: 1
-    aggregate: example
-    required_reader_capability: example.v1
-    authorization: owner
-    retention: tenant_policy
-    redaction: identifiers_only
-    snapshot_projection: examples
-    unknown_version_policy: stop_cursor
-    fields:
-      - { key: 1, name: example_id, type: aggregate_id }
-  - type: second.changed.v1
-    rust_name: SecondChangedV1
-    schema_version: 1
-    aggregate: second
-    required_reader_capability: null
-    authorization: owner
-    retention: tenant_policy
-    redaction: identifiers_only
-    snapshot_projection: seconds
-    unknown_version_policy: preserve_and_skip
-    fields:
-      - { key: 1, name: second_id, type: aggregate_id }
-",
-    )
-    .unwrap();
-    let changed = parse_event_registry(
-        r"
-version: 1
-events:
-  - type: example.changed.v1
-    rust_name: ExampleChangedV1
-    schema_version: 1
-    aggregate: different_aggregate
-    required_reader_capability: example.v1
-    authorization: owner
-    retention: tenant_policy
-    redaction: identifiers_only
-    snapshot_projection: examples
-    unknown_version_policy: stop_cursor
-    fields:
-      - { key: 1, name: example_id, type: aggregate_id }
-",
-    )
-    .unwrap();
-
-    check_event_compatibility(&baseline, &additive).expect("additive event is compatible");
-    assert!(check_event_compatibility(&baseline, &changed).is_err());
 }

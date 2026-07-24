@@ -22,17 +22,17 @@ fn run() -> Result<(), dtx_protocol::ProtocolToolError> {
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
     if arguments.next().is_some() {
         return Err(dtx_protocol::ProtocolToolError::new(
-            "usage: dtx-protocol [generate|check-generated|validate|check-breaking|freeze-baseline] [repository-root]",
+            "usage: dtx-protocol [generate|check-generated|validate|check-alpha|write-alpha] [repository-root]",
         ));
     }
     match command.as_str() {
         "generate" => dtx_protocol::generate(&root),
         "check-generated" => dtx_protocol::check_generated(&root),
         "validate" => dtx_protocol::validate_artifacts(&root),
-        "check-breaking" => dtx_protocol::check_breaking(&root),
-        "freeze-baseline" => dtx_protocol::freeze_baseline(&root),
+        "check-alpha" => dtx_protocol::check_alpha(&root),
+        "write-alpha" => dtx_protocol::write_alpha(&root),
         _ => Err(dtx_protocol::ProtocolToolError::new(
-            "usage: dtx-protocol [generate|check-generated|validate|check-breaking|freeze-baseline] [repository-root]",
+            "usage: dtx-protocol [generate|check-generated|validate|check-alpha|write-alpha] [repository-root]",
         )),
     }
 }

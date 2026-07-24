@@ -1,8 +1,0 @@
-{
-  "version": 4,
-  "events": {},
-  "errors": {},
-  "artifacts": {
-    "protocol/proto/dirextalk/agent_gateway/v1/agent_gateway.proto": "sha256:4f8ab24ec3b39c729e2b21f6e81aaa2f4359c39c3d80892d29af76bb978dc1cf"
-  }
-}

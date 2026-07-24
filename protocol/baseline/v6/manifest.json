@@ -1,9 +1,0 @@
-{
-  "version": 6,
-  "events": {},
-  "errors": {},
-  "artifacts": {
-    "protocol/cddl/identity-log/v1_1/identity-log-v1-1.cddl": "sha256:a290bcf0f5cf861ad003e6ba5d4b474e1bd187eeac44c2014f7ca86b87d35b74",
-    "protocol/test-vectors/identity-log/v1_1/identity-log-v1_1.json": "sha256:91ea940e5450f7082f4faec14100a3ea4b28a8110f28c0616e5018e048382b13"
-  }
-}

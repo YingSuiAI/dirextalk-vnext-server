@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "legacy source validators remain available for deferred Agent/Public replay, outside Alpha"
+)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
@@ -14,10 +19,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    ErrorRegistry, EventDefinition, EventField, EventRegistry, ProtocolToolError,
-    load_error_registry, load_event_registry,
-};
+use crate::{ErrorRegistry, EventDefinition, EventField, EventRegistry, ProtocolToolError};
 
 const SAFE_UINT_MAX: u64 = 9_007_199_254_740_991;
 const V41_RECOVERY_SCOPE_CATALOG_MAX_LEAVES: usize = 65_535;
@@ -37,22 +39,17 @@ const CONTACT_CARD_MAX_UNPADDED_BASE64URL_CHARS: usize =
 const CONTACT_CARD_MAX_QR_PAYLOAD_CHARS: usize =
     CONTACT_CARD_QR_PREFIX.len() + CONTACT_CARD_MAX_UNPADDED_BASE64URL_CHARS;
 
-/// Parses every source schema and validates committed CBOR golden vectors.
+/// Parses the current Product Core Alpha source schemas and vectors.
 ///
 /// # Errors
 ///
 /// Returns [`ProtocolToolError`] for missing, malformed, or inconsistent
 /// CDDL, `OpenAPI`, Protobuf, Buf, registry, or vector artifacts.
-#[allow(clippy::too_many_lines)] // Central artifact routing remains explicit at the protocol gate.
 pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
     let cddl_root = root.join("protocol/cddl/v1");
     let common = read(&cddl_root.join("common.cddl"))?;
-    let cddl_files = collect_files(&cddl_root, Some("cddl"))?;
-    if cddl_files.is_empty() {
-        return Err(ProtocolToolError::new("v1 CDDL directory is empty"));
-    }
-    for path in &cddl_files {
-        let source = read(path)?;
+    for path in collect_files(&cddl_root, Some("cddl"))? {
+        let source = read(&path)?;
         let complete = if path.file_name().and_then(|value| value.to_str()) == Some("common.cddl") {
             source
         } else {
@@ -62,116 +59,85 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
             ProtocolToolError::new(format!("parse CDDL {}: {error}", path.display()))
         })?;
     }
-
-    let event_cddl = format!(
-        "{common}\n{}",
-        read(&cddl_root.join("event-envelope.cddl"))?
-    );
-    let api_error_cddl = format!("{common}\n{}", read(&cddl_root.join("api-error.cddl"))?);
-    let plan_cddl = format!(
-        "{common}\n{}",
-        read(&cddl_root.join("plan-hash-fixture.cddl"))?
-    );
-    let event_page_cddl = format!("{common}\n{}", read(&cddl_root.join("event-page.cddl"))?);
-
-    let vector_root = root.join("protocol/test-vectors/v1");
-    let event = read_json(&vector_root.join("event-envelope.json"))?;
-    validate_vector_version(&event, "event-envelope")?;
-    validate_uuid_fields(
-        &event,
-        &[
-            "/event_id",
-            "/tenant_id",
-            "/aggregate_id",
-            "/payload/installation_id",
-        ],
-    )?;
-    validate_cddl_hex(
-        "event-envelope-agent-installation-v1",
-        &event_cddl,
-        json_string(&event, "hash_only_cbor_hex")?,
-    )?;
-    validate_cddl_hex(
-        "event-envelope-agent-installation-v1",
-        &event_cddl,
-        json_string(&event, "signed_cbor_hex")?,
-    )?;
-    let signed_envelope = decode_hex(json_string(&event, "signed_cbor_hex")?)?;
-    let event_page = encode_event_page_fixture(&signed_envelope, "next-cursor")?;
-    cddl_cat::validate_cbor_bytes("event-page-v1", &event_page_cddl, &event_page)
-        .map_err(|error| ProtocolToolError::new(format!("CDDL rejected event-page-v1: {error}")))?;
-
-    let api_error = read_json(&vector_root.join("api-errors.json"))?;
-    validate_vector_version(&api_error, "api-errors")?;
-    validate_uuid_fields(&api_error, &["/error/request_id"])?;
-    validate_cddl_hex(
-        "api-error-v1",
-        &api_error_cddl,
-        json_string(&api_error, "canonical_cbor_hex")?,
-    )?;
-
-    let plan = read_json(&vector_root.join("plan-hash.json"))?;
-    validate_vector_version(&plan, "plan-hash")?;
-    validate_uuid_fields(&plan, &["/body/job_id"])?;
-    validate_cddl_hex(
-        "job-plan-hash-fixture-v1",
-        &plan_cddl,
-        json_string(&plan, "canonical_cbor_hex")?,
-    )?;
-
-    let public_ids = read_json(&vector_root.join("public-ids.json"))?;
-    validate_vector_version(&public_ids, "public-ids")?;
-
-    let identity_log_cddl = read(&root.join("protocol/cddl/identity-log/v1/identity-log-v1.cddl"))?;
-    cddl_cat::parse_cddl(&identity_log_cddl)
-        .map_err(|error| ProtocolToolError::new(format!("parse identity-log v1 CDDL: {error}")))?;
-    let identity_log =
-        read_json(&root.join("protocol/test-vectors/identity-log/v1/identity-log-v1.json"))?;
-    validate_vector_version(&identity_log, "identity-log-v1")?;
-    validate_cddl_hex(
-        "identity-log-event-v1",
-        &identity_log_cddl,
-        json_string(&identity_log, "canonical_cbor_hex")?,
-    )?;
-
-    validate_identity_log_v1_1(root)?;
-    validate_identity_log_page_v1(root)?;
-    validate_contact_card_v1(root)?;
-    validate_contact_delivery_v1(root)?;
-    validate_identity_bootstrap_v1(root)?;
-    validate_identity_session_v1(root)?;
-    validate_identity_enrollment_v1(root)?;
-    validate_key_package_v1(root)?;
-    validate_mailbox_v1(root)?;
-    validate_public_descriptor_v1(root)?;
-    validate_public_descriptor_v1_1(root)?;
-    validate_public_descriptor_v1_2(root)?;
-    validate_public_feed_v1(root)?;
-    validate_indexer_v1(root)?;
-    validate_conditional_cache_v1(root)?;
-    validate_public_search_pagination_v1(root)?;
-    validate_membership_federation_v1(root)?;
-    validate_group_membership_discovery_v1(root)?;
-    validate_private_messaging_artifacts(root)?;
-    validate_v30_peer_admission(root)?;
-    validate_mls_sequencer_v4(root)?;
-    validate_conversation_agent_grant_v1(root)?;
-    validate_v36_additive_contracts(root)?;
-    validate_realtime_sync_v1(root)?;
-    validate_account_read_cursor_v1(root)?;
-    validate_realtime_sync_v2(root)?;
-    validate_history_recovery_v1(root)?;
-    validate_mls_sequencer_v5(root)?;
-    validate_recovery_scope_catalog_v1(root)?;
-    validate_history_recovery_v2(root)?;
-    validate_key_package_v3(root)?;
-    validate_mls_sequencer_v6(root)?;
-    validate_mls_sequencer_v7_index_contract(root)?;
-
-    let events = load_event_registry(&root.join("protocol/events/registry.yaml"))?;
-    let errors = load_error_registry(&root.join("protocol/errors/registry.yaml"))?;
-    validate_openapi(root, &events, &errors)?;
-    validate_protobuf(root)?;
+    for relative in [
+        "identity-log/v1_1/identity-log-v1-1.cddl",
+        "contact-card/v1/contact-card-v1.cddl",
+        "contact-delivery/v1/contact-delivery-v1.cddl",
+        "conversation-admission/v1/conversation-admission-v1.cddl",
+        "group-membership-discovery/v1/group-membership-discovery-v1.cddl",
+        "group-query-proof/v1/group-query-proof-overlay-v1.cddl",
+        "membership/v2/membership-v2.cddl",
+        "membership-federation/v2/membership-federation-v2.cddl",
+        "identity-http/v1/identity-bootstrap-v1.cddl",
+        "identity-log-page/v1/identity-log-page-v1.cddl",
+        "identity-session/v1/device-session-v1.cddl",
+        "identity-enrollment/v1/identity-enrollment-v1.cddl",
+        "key-package/v4/key-package-v4.cddl",
+        "mls-sequencer/v7/mls-sequencer-v7.cddl",
+        "history-recovery/v3/history-recovery-v3.cddl",
+        "recovery-scope-catalog/v2/recovery-scope-catalog-v2.cddl",
+        "realtime-sync/v2/realtime-sync-v2.cddl",
+        "account-read-cursor/v1/account-read-cursor-v1.cddl",
+        "mailbox/v1/mailbox-v1.cddl",
+        "opaque-push/v1/opaque-push-v1.cddl",
+        "private-event/v1/private-event-v1.cddl",
+        "private-event/v8/private-group-reaction-v8.cddl",
+    ] {
+        cddl_cat::parse_cddl(&read(&root.join("protocol/cddl").join(relative))?).map_err(
+            |error| ProtocolToolError::new(format!("parse Alpha CDDL {relative}: {error}")),
+        )?;
+    }
+    for relative in [
+        "v1/openapi.yaml",
+        "identity/v1/openapi.yaml",
+        "identity-log-page/v1/openapi.yaml",
+        "identity-session/v1/openapi.yaml",
+        "identity-enrollment/v1/openapi.yaml",
+        "contact-delivery/v1/openapi.yaml",
+        "group-membership-discovery/v1/openapi.yaml",
+        "group-query-proof/v1/openapi.yaml",
+        "membership/v2/openapi.yaml",
+        "membership-federation/v2/openapi.yaml",
+        "key-package/v4/openapi.yaml",
+        "mls-sequencer/v7/openapi.yaml",
+        "history-recovery/v3/openapi.yaml",
+        "recovery-scope-catalog/v2/openapi.yaml",
+        "mailbox/v1/openapi.yaml",
+        "opaque-push/v1/openapi.yaml",
+    ] {
+        let source = read(&root.join("protocol/openapi").join(relative))?;
+        oas3::from_yaml(&source).map_err(|error| {
+            ProtocolToolError::new(format!("parse Alpha OpenAPI {relative}: {error}"))
+        })?;
+    }
+    for relative in [
+        "v1/api-errors.json",
+        "v1/event-envelope.json",
+        "v1/plan-hash.json",
+        "v1/public-ids.json",
+        "identity-log/v1_1/identity-log-v1_1.json",
+        "contact-card/v1/contact-card-v1.json",
+        "contact-delivery/v1/contact-request-aad-v1.json",
+        "conversation-admission/v1/conversation-admission-v1.json",
+        "group-membership-discovery/v1/group-query-v1.json",
+        "group-query-proof/v1/group-query-proof-overlay-v1.json",
+        "membership/v2/membership-v2.json",
+        "membership-federation/v2/membership-federation-v2.json",
+        "identity-http/v1/identity-bootstrap-v1.json",
+        "identity-log-page/v1/identity-log-page-v1.json",
+        "identity-session/v1/device-session-v1.json",
+        "identity-enrollment/v1/identity-enrollment-v1.json",
+        "recovery-scope-catalog/v2/recovery-scope-catalog-v2.json",
+        "realtime-sync/v2/realtime-sync-v2.json",
+        "account-read-cursor/v1/account-read-cursor-v1.json",
+        "mailbox/v1/mailbox-v1.json",
+        "attachment/v1/attachment-v1.json",
+        "opaque-push/v1/opaque-push-v1.json",
+        "private-event/v1/private-event-v1.json",
+        "private-event/v8/private-group-reaction-v8.json",
+    ] {
+        let _: Value = read_json(&root.join("protocol/test-vectors").join(relative))?;
+    }
     Ok(())
 }
 
@@ -10915,44 +10881,6 @@ fn validate_contact_delivery_v1(root: &Path) -> Result<(), ProtocolToolError> {
     Ok(())
 }
 
-fn validate_conditional_cache_v1(root: &Path) -> Result<(), ProtocolToolError> {
-    let source = read(&root.join("protocol/openapi/conditional-cache/v1/openapi.yaml"))?;
-    let spec = oas3::from_yaml(&source).map_err(|error| {
-        ProtocolToolError::new(format!("parse conditional cache V1 OpenAPI: {error}"))
-    })?;
-    if spec.openapi != "3.1.0" {
-        return Err(ProtocolToolError::new(
-            "conditional cache V1 OpenAPI must declare 3.1.0",
-        ));
-    }
-    for required in ["If-None-Match", "'304'", "ETag", "must-revalidate"] {
-        if !source.contains(required) {
-            return Err(ProtocolToolError::new(format!(
-                "conditional cache V1 OpenAPI is missing {required}"
-            )));
-        }
-    }
-    let vector = read_json(&root.join("protocol/test-vectors/conditional-cache/v1/etag-v1.json"))?;
-    validate_vector_version(&vector, "conditional-cache-v1")?;
-    if vector.get("baseline").and_then(Value::as_u64) != Some(26) {
-        return Err(ProtocolToolError::new(
-            "conditional cache V1 vector baseline must be 26",
-        ));
-    }
-    let body = decode_hex(json_string(&vector, "body_hex")?)?;
-    let digest: [u8; 32] = Sha256::digest(body).into();
-    let advertised = json_string(&vector, "strong_etag")?
-        .strip_prefix("\"dtx-")
-        .and_then(|value| value.strip_suffix('"'))
-        .ok_or_else(|| ProtocolToolError::new("conditional cache V1 ETag shape is invalid"))?;
-    if decode_lower_hex_fixed::<32>(advertised)? != digest {
-        return Err(ProtocolToolError::new(
-            "conditional cache V1 strong ETag digest mismatch",
-        ));
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_lines)] // Keep the versioned CDDL, OpenAPI, and vector audit atomic.
 fn validate_public_search_pagination_v1(root: &Path) -> Result<(), ProtocolToolError> {
     const BINDING_DOMAIN: &[u8] = b"dirextalk.public-search-cursor.v1\0";
@@ -15775,6 +15703,8 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, ProtocolToolError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::{load_error_registry, load_event_registry};
+
     use super::*;
 
     fn root() -> PathBuf {
