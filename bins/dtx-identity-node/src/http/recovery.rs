@@ -1,0 +1,241 @@
+use super::*;
+
+pub(crate) async fn publish_recovery_scope_catalog(
+    State(state): State<IdentityBootstrapState>,
+    Path(generation): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .publish_recovery_scope_catalog(&generation, &parts.headers, body)
+        .await
+    {
+        Ok(success) => recovery_catalog_head_response(success, request_id),
+        Err(failure) => recovery_catalog_failure_response(failure, request_id),
+    }
+}
+
+pub(crate) async fn prepare_recovery_scope_catalog(
+    State(state): State<IdentityBootstrapState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .prepare_recovery_scope_catalog(&parts.headers, body)
+        .await
+    {
+        Ok(success) => recovery_catalog_status_response(&success, request_id),
+        Err(failure) => recovery_catalog_failure_response(failure, request_id),
+    }
+}
+
+pub(crate) async fn get_recovery_scope_catalog_preparation(
+    State(state): State<IdentityBootstrapState>,
+    Path(route_request_id): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .get_recovery_scope_catalog_preparation(&route_request_id, &parts.headers, body)
+        .await
+    {
+        Ok(success) => recovery_catalog_status_response(&success, request_id),
+        Err(failure) => recovery_catalog_failure_response(failure, request_id),
+    }
+}
+
+pub(crate) async fn put_recovery_scope_catalog_provider_response(
+    State(state): State<IdentityBootstrapState>,
+    Path(route_request_id): Path<String>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state
+        .put_recovery_scope_catalog_provider_response(&route_request_id, &parts.headers, body)
+        .await
+    {
+        Ok(success) => recovery_catalog_status_response(&success, request_id),
+        Err(failure) => recovery_catalog_failure_response(failure, request_id),
+    }
+}
+
+impl IdentityBootstrapState {
+    async fn publish_recovery_scope_catalog(
+        &self,
+        route_generation: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<RecoveryCatalogHeadSuccess, RecoveryCatalogFailure> {
+        if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+            || headers.contains_key(RECOVERY_RESPONSE_CAPABILITY_HEADER)
+        {
+            return Err(RecoveryCatalogFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)
+            .map_err(|_| RecoveryCatalogFailure::AuthenticationRejected)?;
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_RECOVERY_CATALOG_IDEMPOTENCY_KEY_HASH_DOMAIN)
+                .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let generation = parse_positive_safe_uint_path(route_generation)?;
+        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES)
+            .await
+            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let command = CatalogUploadCommand::parse(idempotency_key_hash, generation, &bytes)
+            .map_err(|error| map_recovery_catalog_publish_error(&error))?;
+        let now = self
+            .committed_at()
+            .map_err(|()| RecoveryCatalogFailure::TemporarilyUnavailable)?;
+        let outcome = self
+            .recovery_catalogs
+            .publish(&self.store, &command, &credential, now)
+            .await
+            .map_err(|error| map_recovery_catalog_publish_error(&error))?;
+        Ok(RecoveryCatalogHeadSuccess {
+            status: if outcome.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            outcome,
+        })
+    }
+
+    async fn prepare_recovery_scope_catalog(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(header::AUTHORIZATION)
+        {
+            return Err(RecoveryCatalogFailure::InvalidRequest);
+        }
+        let idempotency_key_hash = idempotency_key_hash(
+            headers,
+            HTTP_RECOVERY_PREPARATION_IDEMPOTENCY_KEY_HASH_DOMAIN,
+        )
+        .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let enrollment_capability = parse_recovery_enrollment_capability(headers)?;
+        let response_capability = parse_recovery_response_capability(headers)?;
+        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES)
+            .await
+            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let command = CatalogPreparationCommand::parse(
+            idempotency_key_hash,
+            bytes.to_vec(),
+            enrollment_capability,
+            &response_capability,
+        )
+        .map_err(|error| map_recovery_catalog_prepare_error(&error))?;
+        let now = self
+            .committed_at()
+            .map_err(|()| RecoveryCatalogFailure::TemporarilyUnavailable)?;
+        let (created, outcome) = self
+            .recovery_catalogs
+            .prepare(&self.store, &command, now)
+            .await
+            .map_err(|error| map_recovery_catalog_prepare_error(&error))?;
+        Ok(RecoveryCatalogStatusSuccess {
+            status: if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            outcome,
+        })
+    }
+
+    async fn get_recovery_scope_catalog_preparation(
+        &self,
+        route_request_id: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        if headers.contains_key(header::CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(header::AUTHORIZATION)
+            || headers.contains_key(IDEMPOTENCY_KEY_HEADER)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+        {
+            return Err(RecoveryCatalogFailure::CapabilityRejected);
+        }
+        let body = to_bytes(body, 1)
+            .await
+            .map_err(|_| RecoveryCatalogFailure::CapabilityRejected)?;
+        if !body.is_empty() {
+            return Err(RecoveryCatalogFailure::CapabilityRejected);
+        }
+        let request_id = route_request_id
+            .parse::<DeviceEnrollmentChallengeId>()
+            .map_err(|_| RecoveryCatalogFailure::CapabilityRejected)?;
+        let response_capability = parse_recovery_response_capability(headers)?;
+        let now = self
+            .committed_at()
+            .map_err(|()| RecoveryCatalogFailure::TemporarilyUnavailable)?;
+        let outcome = self
+            .recovery_catalogs
+            .status(&self.store, request_id, &response_capability, now)
+            .await
+            .map_err(|error| map_recovery_catalog_status_error(&error))?;
+        let status = match outcome.status {
+            CatalogStatus::Pending | CatalogStatus::ResponseAvailable => StatusCode::OK,
+            CatalogStatus::Expired => StatusCode::GONE,
+            CatalogStatus::Invalidated(_) => StatusCode::PRECONDITION_FAILED,
+        };
+        Ok(RecoveryCatalogStatusSuccess { status, outcome })
+    }
+
+    async fn put_recovery_scope_catalog_provider_response(
+        &self,
+        route_request_id: &str,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        if !has_exact_content_type(
+            headers,
+            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        ) || headers.contains_key(header::CONTENT_ENCODING)
+            || headers.contains_key(header::IF_MATCH)
+            || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+            || headers.contains_key(RECOVERY_RESPONSE_CAPABILITY_HEADER)
+        {
+            return Err(RecoveryCatalogFailure::InvalidRequest);
+        }
+        let request_id = route_request_id
+            .parse::<DeviceEnrollmentChallengeId>()
+            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let credential = parse_device_session_authorization(headers)
+            .map_err(|_| RecoveryCatalogFailure::AuthenticationRejected)?;
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_RECOVERY_PROVIDER_IDEMPOTENCY_KEY_HASH_DOMAIN)
+                .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES)
+            .await
+            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+        let command =
+            CatalogProviderResponseCommand::parse(idempotency_key_hash, request_id, bytes.to_vec())
+                .map_err(|error| map_recovery_catalog_provider_error(&error))?;
+        let now = self
+            .committed_at()
+            .map_err(|()| RecoveryCatalogFailure::TemporarilyUnavailable)?;
+        let outcome = self
+            .recovery_catalogs
+            .put_provider_response(&self.store, &command, &credential, now)
+            .await
+            .map_err(|error| map_recovery_catalog_provider_error(&error))?;
+        Ok(RecoveryCatalogStatusSuccess {
+            status: StatusCode::OK,
+            outcome,
+        })
+    }
+}
