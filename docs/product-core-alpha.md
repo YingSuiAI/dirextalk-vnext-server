@@ -65,9 +65,10 @@ next **Platform Integration Alpha**. Do not describe their deferred work as
 current server capability or use it to widen the IM contract.
 
 The production composition starts only the Product Core services by default.
-Agent Control requires an explicit profile. Public/Indexer components are
-similarly non-default and cannot be readiness dependencies for identity,
-Mailbox, Realtime, or Push.
+Opaque Push is a required Product Core service with a private-CA HTTPS
+registration route and loopback readiness probe. Agent Control requires an
+explicit profile. Public/Indexer components are similarly non-default and
+cannot be readiness dependencies for identity, Mailbox, Realtime, or Push.
 
 ## Current architecture
 

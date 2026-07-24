@@ -232,6 +232,66 @@ services:
         condition: service_started
     restart: "no"
 
+  opaque-push:
+    <<: *server-image
+    user: "0:0"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    cap_add: ["SETGID", "SETUID"]
+    entrypoint: ["/usr/local/bin/dtx-opaque-push-broker"]
+    environment:
+      DTX_PUSH_TENANT_ID: ${DTX_NODE_TENANT_ID:?set tenant id}
+      DTX_PUSH_BIND: 0.0.0.0:9448
+      DTX_PUSH_READY_BIND: 127.0.0.1:9488
+      DTX_PUSH_UID: "10001"
+      DTX_PUSH_GID: "10001"
+      DTX_PUSH_IDENTITY_LOGIN: dtx_push_identity_auth
+      DTX_PUSH_REGISTRATION_LOGIN: dtx_push_registration
+      DTX_PUSH_BROKER_LOGIN: dtx_push_broker
+      DTX_PUSH_IDENTITY_DATABASE_URL_FILE: /run/dtx-push-secrets/identity-database-url
+      DTX_PUSH_REGISTRATION_DATABASE_URL_FILE: /run/dtx-push-secrets/registration-database-url
+      DTX_PUSH_BROKER_DATABASE_URL_FILE: /run/dtx-push-secrets/broker-database-url
+      DTX_PUSH_ROOT_KEY_FILE: /run/dtx-push-secrets/root-key
+      DTX_PUSH_FCM_SERVICE_ACCOUNT_FILE: /run/dtx-push-secrets/fcm-service-account.json
+      DTX_PUSH_TLS_CERTIFICATE_FILE: /run/dtx-push-secrets/tls-certificate.pem
+      DTX_PUSH_TLS_PRIVATE_KEY_FILE: /run/dtx-push-secrets/tls-private-key.pem
+    volumes:
+      - ${DTX_SECRET_ROOT:?set secret root}/push-identity-database-url:/run/dtx-push-secrets/identity-database-url:ro
+      - ${DTX_SECRET_ROOT:?set secret root}/push-registration-database-url:/run/dtx-push-secrets/registration-database-url:ro
+      - ${DTX_SECRET_ROOT:?set secret root}/push-broker-database-url:/run/dtx-push-secrets/broker-database-url:ro
+      - ${DTX_SECRET_ROOT:?set secret root}/push-root-key:/run/dtx-push-secrets/root-key:ro
+      - ${DTX_SECRET_ROOT:?set secret root}/push-fcm-service-account.json:/run/dtx-push-secrets/fcm-service-account.json:ro
+      - ${DTX_TLS_ROOT:?set TLS root}/push-certificate.pem:/run/dtx-push-secrets/tls-certificate.pem:ro
+      - ${DTX_TLS_ROOT:?set TLS root}/push-private-key.pem:/run/dtx-push-secrets/tls-private-key.pem:ro
+    depends_on:
+      verify-roles:
+        condition: service_completed_successfully
+    expose: ["9448"]
+    restart: unless-stopped
+
+  opaque-push-ready:
+    <<: *probe-image
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    entrypoint: ["curl"]
+    command:
+      - --fail
+      - --silent
+      - --show-error
+      - --retry
+      - "30"
+      - --retry-connrefused
+      - --retry-delay
+      - "2"
+      - http://127.0.0.1:9488/local/ready
+    network_mode: service:opaque-push
+    depends_on:
+      opaque-push:
+        condition: service_started
+    restart: "no"
+
   agent-control:
     <<: *server-image
     user: "10001:10001"
@@ -289,6 +349,8 @@ services:
       node-ready:
         condition: service_completed_successfully
       realtime-ready:
+        condition: service_completed_successfully
+      opaque-push-ready:
         condition: service_completed_successfully
     ports:
       - "443:443"

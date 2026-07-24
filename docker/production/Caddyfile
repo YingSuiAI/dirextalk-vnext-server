@@ -15,20 +15,18 @@
         }
     }
 
-    # Canonical public API routes use a positive, non-zero decimal version.
-    # Keep MCP on the node upstream in this shared production template.
-    @node path_regexp versioned_api ^/v[1-9][0-9]*/.*$
-    reverse_proxy @node https://dtx-node:8443 {
+    @opaque_push path /v1/devices/push-registrations/fcm
+    reverse_proxy @opaque_push https://opaque-push:9448 {
         transport http {
             tls_trust_pool file /data/caddy/private-ca.pem
             tls_server_name {$DTX_NODE_HOSTNAME}
         }
     }
 
-    # Public feed discovery and feed resources use their exact well-known
-    # namespace and the same private-CA-authenticated node transport.
-    @public_feed path_regexp public_feed ^/\.well-known/dirextalk/public/v1/[^/]+(/.*)?$
-    reverse_proxy @public_feed https://dtx-node:8443 {
+    # Canonical public API routes use a positive, non-zero decimal version.
+    # Keep MCP on the node upstream in this shared production template.
+    @node path_regexp versioned_api ^/v[1-9][0-9]*/.*$
+    reverse_proxy @node https://dtx-node:8443 {
         transport http {
             tls_trust_pool file /data/caddy/private-ca.pem
             tls_server_name {$DTX_NODE_HOSTNAME}

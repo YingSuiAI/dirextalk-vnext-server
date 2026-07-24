@@ -27,7 +27,6 @@ const ADMIN_DATABASE_URL_FILE_ENV: &str = "DTX_ADMIN_DATABASE_URL_FILE";
 const ROLE_PASSWORD_DIR: &str = "/run/dtx-production/role-passwords";
 const MAX_URL_BYTES: u64 = 8 * 1024;
 const MAX_PASSWORD_BYTES: u64 = 512;
-const AGENT_PEER_ADMIN_ROLE: &str = "dtx_agent_peer_admin";
 
 #[derive(Clone, Copy)]
 struct RoleSpec {
@@ -70,23 +69,6 @@ const ROLE_SPECS: &[RoleSpec] = &[
     RoleSpec {
         login: "dtx_push_broker",
         membership: "dtx_push_broker_runtime",
-        inherit: true,
-    },
-    // These two logins receive distinct direct grants. Membership is only the
-    // RLS authorization marker, so PostgreSQL inheritance must remain off.
-    RoleSpec {
-        login: "dtx_public_feed_node",
-        membership: "dtx_public_feed_runtime",
-        inherit: false,
-    },
-    RoleSpec {
-        login: "dtx_indexer_node",
-        membership: "dtx_public_feed_runtime",
-        inherit: false,
-    },
-    RoleSpec {
-        login: "dtx_agent_control",
-        membership: "dtx_agent_runtime",
         inherit: true,
     },
 ];
@@ -233,25 +215,6 @@ async fn create_roles(pool: &PgPool) -> Result<(), &'static str> {
             return Err("role bootstrap failed");
         }
     }
-    // This role is an authorization boundary for a local peer administration
-    // path, not a database principal. It must never receive a credential or
-    // inherit either runtime capabilities or arbitrary memberships.
-    if let Err(error) = sqlx::raw_sql(AssertSqlSafe(format!(
-        "DO $$ BEGIN IF to_regrole('{AGENT_PEER_ADMIN_ROLE}') IS NULL THEN CREATE ROLE {AGENT_PEER_ADMIN_ROLE}; END IF; END $$;\
-         ALTER ROLE {AGENT_PEER_ADMIN_ROLE} NOLOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD NULL;\
-         DO $peer_admin$ DECLARE extra name; BEGIN FOR extra IN \
-           SELECT granted.rolname FROM pg_auth_members edges \
-           JOIN pg_roles granted ON granted.oid = edges.roleid \
-           JOIN pg_roles member ON member.oid = edges.member \
-           WHERE member.rolname = '{AGENT_PEER_ADMIN_ROLE}' \
-         LOOP EXECUTE format('REVOKE %I FROM {AGENT_PEER_ADMIN_ROLE}', extra); END LOOP; END $peer_admin$;"
-    )))
-    .execute(&mut *transaction)
-    .await
-    {
-        eprintln!("dtx-production-migrate: role normalization failed for {AGENT_PEER_ADMIN_ROLE}: {error}");
-        return Err("role bootstrap failed");
-    }
     transaction
         .commit()
         .await
@@ -264,13 +227,7 @@ async fn grant_roles(pool: &PgPool) -> Result<(), &'static str> {
     // executed only after migrations and never through a shell command.
     let mut transaction = pool.begin().await.map_err(|_| "grant bootstrap failed")?;
     sqlx::raw_sql(include_str!(
-        "../../../docker/local/postgres/20-local-runtime-grants.sql"
-    ))
-    .execute(&mut *transaction)
-    .await
-    .map_err(|_| "grant bootstrap failed")?;
-    sqlx::raw_sql(include_str!(
-        "../../../docker/production/postgres/agent-control-grants.sql"
+        "../../../docker/production/postgres/product-core-grants.sql"
     ))
     .execute(&mut *transaction)
     .await
@@ -292,7 +249,7 @@ async fn verify_roles(pool: &PgPool) -> Result<(), &'static str> {
     .map_err(|_| "role verification failed")?;
     // Exercise the same role DDL transaction boundary and prove rollback
     // preserves the live login before declaring PostgreSQL ready.
-    sqlx::query("ALTER ROLE dtx_agent_control NOLOGIN")
+    sqlx::query("ALTER ROLE dtx_identity_node NOLOGIN")
         .execute(&mut *transaction)
         .await
         .map_err(|_| "role verification failed")?;
@@ -301,7 +258,7 @@ async fn verify_roles(pool: &PgPool) -> Result<(), &'static str> {
         .await
         .map_err(|_| "role verification failed")?;
     let login_enabled: bool =
-        sqlx::query_scalar("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'dtx_agent_control'")
+        sqlx::query_scalar("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'dtx_identity_node'")
             .fetch_one(pool)
             .await
             .map_err(|_| "role verification failed")?;

@@ -43,25 +43,29 @@ recreates only the readiness probes; `down.sh` stops the stack without volume
 removal.
 
 Secret and key files read by UID/GID `10001:10001` are `root:10001` mode
-`0440`; admin URLs/passwords and role-password files are root-owned mode
-`0400`. Public certificates and the private CA are `root:root` mode `0444`;
-private keys remain non-world-readable. Database URLs are mounted as regular
-files through the `*_DATABASE_URL_FILE` variables; raw URL environment values
-are forbidden. The fixed TLS/CA files, node hostname/public origin, tenant
-identifier, and role/password grants must remain aligned with the Compose and
-Caddy templates.
+`0440`; admin URLs/passwords, opaque-push URL/key/service-account files, and
+role-password files are root-owned mode `0400`. Public certificates and the
+private CA are `root:root` mode `0444`; private keys remain non-world-readable.
+The opaque-push broker loads its three database URLs, root key, FCM service
+account, and TLS key material as root before dropping to UID/GID `10001:10001`.
+Database URLs are mounted as regular files through the `*_DATABASE_URL_FILE`
+variables; raw URL environment values are forbidden. The fixed TLS/CA files,
+node hostname/public origin, tenant identifier, and role/password grants must
+remain aligned with the Compose and Caddy templates.
 
 The migrator performs only the fresh baseline operations
-`bootstrap-roles`, `migrate`, `grant-roles`, and `verify-roles`. The shared
-PostgreSQL role contract, including `dtx_agent_control`, `dtx_agent_peer_admin`,
-MCP credential digest functions, Connector bootstrap issuance tables, and
-directory index cache grants, remains unchanged.
+`bootstrap-roles`, `migrate`, `grant-roles`, and `verify-roles`. Product Core
+requires identity, group, mailbox, realtime, and opaque-push registration,
+identity-auth, and broker roles. Agent/Public roles and their frozen grants are
+not required by the default production mutation or verification path.
 
 Agent Control is deferred and default-off. Its Compose services are available
 only through the reviewed `agent-control` profile, with a private/VPC
 `DTX_AGENT_CONTROL_BIND`; the default stack neither mounts its config/secrets
-nor publishes its readiness service. Public Channel/Indexer services and all
-opaque-push broker/registration routes are also default-off; opaque push is fail-closed disabled in this bundle.
+nor publishes its readiness service. Public Channel/Indexer services remain
+non-default. Opaque push is a required Product Core service: its registration
+HTTPS endpoint is routed by Caddy to the broker, and the broker readiness
+listener stays loopback-only.
 
 The fixed client-binding helpers under
 `scripts/production-stack/host/client-binding-*` accept no caller-selected
