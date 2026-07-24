@@ -229,6 +229,28 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         CatalogStatus::Pending,
     );
 
+    // Status and an idempotent prepare replay contend on the same durable
+    // identity/challenge/preparation lock chain.  They must complete without
+    // deadlock, and only the original prepare remains the CAS winner.
+    let (prepare_replay, concurrent_status) = tokio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            tokio::join!(
+                catalog_repository.prepare(&store, &prepare_a, at(5_002)),
+                catalog_repository.status(
+                    &store,
+                    challenge.challenge_id(),
+                    &response_capability,
+                    at(5_002),
+                ),
+            )
+        },
+    )
+    .await
+    .map_err(|_| "concurrent prepare/status deadlocked")?;
+    assert!(!prepare_replay?.0);
+    assert_eq!(concurrent_status?.status, CatalogStatus::Pending);
+
     let wrong_capability = RecoveryResponseCapability::new([62; 32])?;
     assert!(matches!(
         catalog_repository
@@ -391,7 +413,107 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         invalidated.status,
         CatalogStatus::Invalidated(CatalogStatusInvalidation::Catalog)
     );
+    assert_eq!(invalidated.observed_at, at(7_300));
+    let invalidated_exact = invalidated.exact_bytes()?;
     assert!(invalidated.provider_response.is_none());
+
+    // A preparation bound to generation N+1 sees a successor and an identity
+    // event at the same timestamp below; enum numeric priority must choose
+    // Identity (1) over Catalog (2).
+    let candidate_two = key(6);
+    let challenge_two = enrollment_repository
+        .create_challenge(
+            &store,
+            CreateDeviceEnrollmentChallengeCommand::new(
+                Sha256Digest::from_bytes([43; 32]),
+                identity_id,
+                DeviceId::from_str(SECOND_CANDIDATE_DEVICE)?,
+                public(&candidate_two),
+                DeviceEncryptionPublicKey::try_from([56; 32])?,
+                DeviceEnrollmentCapability::new([44; 32])?,
+            )?,
+            at(7_301),
+        )
+        .await?;
+    let DeviceEnrollmentChallengeOutcome::Created(challenge_two) = challenge_two else {
+        return Err("second ordinary enrollment challenge must be created".into());
+    };
+    let response_capability_two = RecoveryResponseCapability::new([63; 32])?;
+    let prep_two = CatalogPreparationCommand::parse_v2(
+        Sha256Digest::from_bytes([64; 32]),
+        preparation_bytes(
+            challenge_two.challenge_id(),
+            identity_id,
+            DeviceId::from_str(SECOND_CANDIDATE_DEVICE)?,
+            &candidate_two,
+            [56; 32],
+            head4,
+            [63; 32],
+            &rotated,
+            Sha256Digest::from_bytes([64; 32]),
+        )?,
+        DeviceEnrollmentCapability::new([44; 32])?,
+        &response_capability_two,
+    )?;
+    assert!(catalog_repository.prepare(&store, &prep_two, at(7_302)).await?.0);
+
+    let rotated_again = catalog_command(
+        identity_id,
+        committed(
+            identity_repository
+                .append(
+                    &store,
+                    &append_command(
+                        7,
+                        Some(head4),
+                        &relay_event(
+                            &root,
+                            identity_id,
+                            5,
+                            head4.hash(),
+                            "equal-terminal-time",
+                            7_400,
+                        ),
+                    )?,
+                    at(7_400),
+                )
+                .await?,
+        )?,
+        &authority,
+        Sha256Digest::from_bytes([74; 32]),
+        safe(3),
+        Some(rotated.head_digest),
+        [35; 32],
+    )?;
+    catalog_repository
+        .publish(&store, &rotated_again, &authority_credential, at(7_400))
+        .await?;
+    let invalidated_after_multiple_successors = catalog_repository
+        .status(
+            &store,
+            challenge.challenge_id(),
+            &response_capability,
+            at(7_401),
+        )
+        .await?;
+    assert_eq!(
+        invalidated_after_multiple_successors.status,
+        CatalogStatus::Invalidated(CatalogStatusInvalidation::Catalog)
+    );
+    assert_eq!(invalidated_after_multiple_successors.observed_at, at(7_300));
+    let simultaneous = catalog_repository
+        .status(
+            &store,
+            challenge_two.challenge_id(),
+            &response_capability_two,
+            at(7_401),
+        )
+        .await?;
+    assert_eq!(
+        simultaneous.status,
+        CatalogStatus::Invalidated(CatalogStatusInvalidation::Identity)
+    );
+    assert_eq!(simultaneous.observed_at, at(7_400));
 
     // V2 rejects a provider descriptor that reuses the candidate identity or
     // signing key; the old disabled second-candidate block did not exercise
@@ -424,7 +546,15 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
             at(200_000),
         )
         .await?;
-    assert_eq!(expired.status, CatalogStatus::Expired);
+    // The catalog successor invalidated this preparation before its own
+    // expiry.  That earliest terminal event remains immutable after the
+    // preparation expiry and must replay byte-identically.
+    assert_eq!(
+        expired.status,
+        CatalogStatus::Invalidated(CatalogStatusInvalidation::Catalog)
+    );
+    assert_eq!(expired.observed_at, at(7_300));
+    assert_eq!(expired.exact_bytes()?, invalidated_exact);
     assert!(expired.provider_response.is_none());
 
     let no_plaintext_columns: bool = sqlx::query_scalar(

@@ -84,6 +84,11 @@ impl RecoveryScopeCatalogRepository {
             let capability_hash = command.enrollment_capability.hash();
             let identity_id =
                 load_linked_challenge_identity_hint(tx.connection(), command.request_id).await?;
+            // Every catalog route acquires the identity fence before any
+            // challenge/preparation row locks.  Enrollment approval and
+            // cancellation use this same order; taking the challenge first
+            // here would allow a prepare-vs-approve deadlock.
+            let snapshot = lock_and_load_active_snapshot(tx.connection(), identity_id).await?;
             let challenge = load_linked_challenge(tx.connection(), command.request_id, true).await?;
             if challenge.identity_id != identity_id {
                 return Err(corrupt("linked enrollment identity changed"));
@@ -115,7 +120,6 @@ impl RecoveryScopeCatalogRepository {
                 }
                 return Err(IdentityPersistenceError::IdempotencyConflict);
             }
-            let snapshot = lock_and_load_active_snapshot(tx.connection(), identity_id).await?;
             if challenge.protocol_version != 1 || challenge.state != "open" {
                 return Err(IdentityPersistenceError::RecoveryPreparationRevoked);
             }
@@ -292,7 +296,7 @@ impl RecoveryScopeCatalogRepository {
             if challenge.identity_id != identity_id {
                 return Err(corrupt("linked enrollment identity changed"));
             }
-            let row = load_preparation(tx.connection(), request_id, false).await?;
+            let row = load_preparation(tx.connection(), request_id, true).await?;
             if !bool::from(
                 row.response_capability_hash
                     .as_bytes()
@@ -332,7 +336,6 @@ struct StoredCatalog {
     authority_key: SigningPublicKey,
     issued_at: UtcMillis,
     expires_at: UtcMillis,
-    created_at: UtcMillis,
 }
 
 fn authority_is_active(
@@ -449,7 +452,7 @@ async fn load_current_catalog(
     connection: &mut PgConnection,
     identity_id: IdentityId,
 ) -> Result<Option<StoredCatalog>, IdentityPersistenceError> {
-    let row = sqlx::query("SELECT catalog_id,generation,head_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key,issued_at_ms,expires_at_ms,created_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
+    let row = sqlx::query("SELECT catalog_id,generation,head_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key,issued_at_ms,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
         .bind(identity_id.to_string()).fetch_optional(&mut *connection).await?;
     let Some(row) = row else {
         return Ok(None);
@@ -468,7 +471,6 @@ async fn load_current_catalog(
         authority_key: signing_key(&row.try_get::<Vec<u8>, _>("authority_signing_key")?)?,
         issued_at: utc(row.try_get("issued_at_ms")?)?,
         expires_at: utc(row.try_get("expires_at_ms")?)?,
-        created_at: utc(row.try_get("created_at_ms")?)?,
     }))
 }
 
@@ -563,18 +565,12 @@ async fn preparation_validity(
     row: &StoredPreparation,
     challenge: &StoredLinkedChallenge,
     snapshot: &IdentityLogSnapshot,
-    now: UtcMillis,
+    _now: UtcMillis,
 ) -> Result<PreparationValidity, IdentityPersistenceError> {
     let invalid = |reason| PreparationValidity {
         invalidation: Some(reason),
         history_provider_device_id: None,
     };
-    if now >= row.expires_at {
-        return Ok(PreparationValidity {
-            invalidation: None,
-            history_provider_device_id: None,
-        });
-    }
     if challenge.identity_id != row.identity_id
         || challenge.protocol_version != 1
         || challenge.candidate_device_id != row.candidate_device_id
@@ -591,7 +587,6 @@ async fn preparation_validity(
         || current.generation != row.catalog_generation
         || current.head_digest != row.catalog_head_digest
         || current.observed_head != row.observed_head
-        || now >= current.expires_at
     {
         return Ok(invalid(CatalogStatusInvalidation::Catalog));
     }
@@ -623,7 +618,7 @@ async fn preparation_validity(
     }
     let current_head = snapshot.head();
     if challenge.state == "open" {
-        if now >= challenge.expires_at || current_head != row.observed_head {
+        if current_head != row.observed_head {
             return Ok(invalid(CatalogStatusInvalidation::Identity));
         }
         return Ok(PreparationValidity {
@@ -741,27 +736,25 @@ async fn current_preparation_status(
     .flatten()
     .min();
     let mut invalidation_options = Vec::new();
-    if now < row.expires_at {
-        for reason in [
-            CatalogStatusInvalidation::Identity,
-            CatalogStatusInvalidation::Catalog,
-            CatalogStatusInvalidation::Authority,
-            CatalogStatusInvalidation::Candidate,
-            CatalogStatusInvalidation::Provider,
-            CatalogStatusInvalidation::IndependentAuthority,
-        ] {
-            let observed_at = match reason {
-                CatalogStatusInvalidation::Catalog => {
-                    catalog_invalidation_observed_at(connection, &row).await?
-                }
-                _ => first_identity_log_invalidation_at(connection, &row, reason)
-                    .await?
-                    .map(utc)
-                    .transpose()?,
-            };
-            if let Some(observed_at) = observed_at {
-                invalidation_options.push((reason, observed_at));
+    for reason in [
+        CatalogStatusInvalidation::Identity,
+        CatalogStatusInvalidation::Catalog,
+        CatalogStatusInvalidation::Authority,
+        CatalogStatusInvalidation::Candidate,
+        CatalogStatusInvalidation::Provider,
+        CatalogStatusInvalidation::IndependentAuthority,
+    ] {
+        let observed_at = match reason {
+            CatalogStatusInvalidation::Catalog => {
+                catalog_invalidation_observed_at(connection, &row).await?
             }
+            _ => first_identity_log_invalidation_at(connection, &row, reason)
+                .await?
+                .map(utc)
+                .transpose()?,
+        };
+        if let Some(observed_at) = observed_at {
+            invalidation_options.push((reason, observed_at));
         }
     }
     if let Some(reason) = invalid {
@@ -843,8 +836,8 @@ async fn invalidation_observed_at(
     now: UtcMillis,
 ) -> Result<UtcMillis, IdentityPersistenceError> {
     if reason == CatalogStatusInvalidation::Catalog {
-        if let Some(catalog) = load_current_catalog(connection, row.identity_id).await? {
-            return Ok(catalog.created_at);
+        if let Some(observed_at) = catalog_invalidation_observed_at(connection, row).await? {
+            return Ok(observed_at);
         }
     }
     if let Some(recorded) = first_identity_log_invalidation_at(connection, row, reason).await? {
@@ -865,20 +858,22 @@ async fn catalog_invalidation_observed_at(
     connection: &mut PgConnection,
     row: &StoredPreparation,
 ) -> Result<Option<UtcMillis>, IdentityPersistenceError> {
-    let Some(current) = load_current_catalog(connection, row.identity_id).await? else {
-        return Ok(None);
-    };
-    if current.catalog_id != row.catalog_id
-        || current.generation != row.catalog_generation
-        || current.head_digest != row.catalog_head_digest
-        || current.observed_head != row.observed_head
-        || current.authority_key != row.authority_key
-        || current.authority_key_id != row.authority_key_id
-        || current.authority_device_id != row.authority_device_id
-    {
-        return Ok(Some(current.created_at));
-    }
-    Ok(None)
+    // Catalog generations are immutable.  Once a successor exists, the
+    // preparation was invalidated at the first successor's creation, not at
+    // whichever later generation happens to be current when status is read.
+    let generation = to_i64(row.catalog_generation)?;
+    let created_at = sqlx::query_scalar::<_, i64>(
+        "SELECT created_at_ms
+           FROM identity.recovery_scope_catalogs
+          WHERE identity_id=$1 AND generation>$2
+          ORDER BY generation ASC
+          LIMIT 1",
+    )
+    .bind(row.identity_id.to_string())
+    .bind(generation)
+    .fetch_optional(&mut *connection)
+    .await?;
+    created_at.map(utc).transpose()
 }
 
 /// Returns the first persisted identity-log event that actually causes the

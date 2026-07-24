@@ -115,10 +115,10 @@ fn catalog_command(
     merkle: [u8; 32],
 ) -> Result<CatalogUploadCommand, IdentityPersistenceError> {
     let ciphertext = b"opaque-encrypted-catalog-v2".to_vec();
-    let catalog_id = uuid::Uuid::parse_str(if generation.get() == 1 {
-        "0190f2a5-7b1c-7abc-8def-0123456789b1"
-    } else {
-        "0190f2a5-7b1c-7abc-8def-0123456789b3"
+    let catalog_id = uuid::Uuid::parse_str(match generation.get() {
+        1 => "0190f2a5-7b1c-7abc-8def-0123456789b1",
+        2 => "0190f2a5-7b1c-7abc-8def-0123456789b3",
+        _ => "0190f2a5-7b1c-7abc-8def-0123456789b4",
     })
     .unwrap();
     let authority_device = DeviceId::from_str(AUTHORITY_DEVICE).unwrap();
