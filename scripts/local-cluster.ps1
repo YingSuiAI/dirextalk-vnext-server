@@ -125,7 +125,7 @@ function Confirm-PlaintextHttpIsRejected {
         throw 'curl.exe is required to prove plaintext HTTP is unavailable.'
     }
     foreach ($port in @(18443, 18444, 18445, 19443, 19444, 19445)) {
-        & curl.exe --silent --output NUL --max-time 3 "http://127.0.0.1:$port/local-health"
+        & curl.exe --silent --output NUL --max-time 3 "http://127.0.0.1:$port/local/ready"
         if ($LASTEXITCODE -eq 0) {
             throw "Local node on port $port accepted plaintext HTTP."
         }

@@ -45,6 +45,14 @@ impl IdentityPgStore {
         Ok(Self { pool })
     }
 
+    /// Revalidates the current role and the exact fresh-only schema epoch.
+    pub async fn readiness_check(&self) -> Result<bool, IdentityPersistenceError> {
+        validate_identity_runtime_role(&self.pool).await?;
+        dtx_storage::PgStore::readiness_check_schema(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Begins a transaction isolated from tenant-scoped RLS context.
     ///
     /// # Errors

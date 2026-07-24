@@ -219,6 +219,28 @@ impl RealtimeSyncStore {
         Ok(Self { pool })
     }
 
+    /// Revalidates the runtime role and exact fresh-only schema epoch.
+    pub async fn readiness_check(&self) -> Result<bool, RealtimeSyncError> {
+        let authorized: bool = sqlx::query_scalar(
+            "SELECT realtime.runtime_authorized()
+                AND has_table_privilege(current_user,'realtime.journal','SELECT')
+                AND has_table_privilege(current_user,'realtime.device_leases','SELECT,INSERT,UPDATE')
+                AND has_function_privilege(current_user,'realtime.claim_outbox(uuid,uuid,bigint,bigint,integer)','EXECUTE')
+                AND has_function_privilege(current_user,'realtime.mark_outbox_published(uuid,uuid,bigint)','EXECUTE')
+                AND has_function_privilege(current_user,'realtime.compact_expired(bigint,integer)','EXECUTE')
+                AND has_function_privilege(current_user,'messaging.compact_expired_identity_deliveries(bigint,integer)','EXECUTE')
+                AND NOT has_table_privilege(current_user,'messaging.mailbox_envelopes','SELECT')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if !authorized {
+            return Err(RealtimeSyncError::Overprivileged);
+        }
+        dtx_storage::PgStore::readiness_check_schema(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Acquires the latest fenced lease for an authenticated device.
     ///
     /// # Errors

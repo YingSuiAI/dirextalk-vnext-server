@@ -108,6 +108,19 @@ impl PublicFeedPgStore {
         }
         Ok(Self { pool })
     }
+
+    /// Rechecks the current directory role and immutable schema epoch.
+    pub async fn readiness_check(&self) -> Result<bool, StoreError> {
+        let authorized: bool = sqlx::query_scalar(
+            "SELECT directory.public_feed_runtime_authorized() AND has_schema_privilege(current_user, 'directory', 'USAGE') AND has_table_privilege(current_user, 'directory.public_subjects', 'SELECT,INSERT,UPDATE') AND has_table_privilege(current_user, 'directory.feed_entries', 'SELECT,INSERT')",
+        ).fetch_one(&self.pool).await?;
+        if !authorized {
+            return Err(StoreError::UnauthorizedDatabaseRole);
+        }
+        dtx_storage::PgStore::readiness_check_schema(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Debug)]

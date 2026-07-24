@@ -47,6 +47,14 @@ impl GroupPgStore {
         Ok(Self { pool })
     }
 
+    /// Revalidates the current role and the exact fresh-only schema epoch.
+    pub async fn readiness_check(&self) -> Result<bool, GroupPersistenceError> {
+        validate_group_runtime_role(&self.pool).await?;
+        dtx_storage::PgStore::readiness_check_schema(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Begins one transaction bound to an authenticated tenant-scoped RLS context.
     ///
     /// # Errors

@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 dtx-domain = { path = "../dtx-domain" }
 dtx-identity-log = { path = "../dtx-identity-log" }
+dtx-storage = { path = "../dtx-storage" }
 dtx-wire = { path = "../dtx-wire" }
 ed25519-dalek.workspace = true
 base64ct.workspace = true
@@ -22,7 +23,6 @@ zeroize.workspace = true
 x509-parser.workspace = true
 
 [dev-dependencies]
-dtx-storage = { path = "../dtx-storage" }
 testcontainers-modules.workspace = true
 tokio.workspace = true
 

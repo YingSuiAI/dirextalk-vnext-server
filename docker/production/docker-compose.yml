@@ -91,12 +91,9 @@ services:
       DTX_NODE_LISTEN: 0.0.0.0:8443
       DTX_NODE_PUBLIC_ORIGIN: ${DTX_NODE_PUBLIC_ORIGIN:?set https origin}
       DTX_NODE_TENANT_ID: ${DTX_NODE_TENANT_ID:?set tenant id}
-      DTX_NODE_INDEXER_ID: ${DTX_NODE_INDEXER_ID:?set indexer id}
       DTX_IDENTITY_DATABASE_URL_FILE: /run/dtx-secrets/identity-database-url
       DTX_GROUP_DATABASE_URL_FILE: /run/dtx-secrets/group-database-url
       DTX_MAILBOX_DATABASE_URL_FILE: /run/dtx-secrets/mailbox-database-url
-      DTX_PUBLIC_FEED_DATABASE_URL_FILE: /run/dtx-secrets/public-feed-database-url
-      DTX_INDEXER_DATABASE_URL_FILE: /run/dtx-secrets/indexer-database-url
       DTX_GROUP_MLS_SEQUENCER_KEY_FILE: /run/dtx-tls/mls-sequencer-key.pem
       DTX_NODE_TLS_CERTIFICATE_FILE: /run/dtx-tls/node-cert.pem
       DTX_NODE_TLS_PRIVATE_KEY_FILE: /run/dtx-tls/node-key.pem
@@ -105,8 +102,6 @@ services:
       - ${DTX_SECRET_ROOT:?set secret root}/identity-database-url:/run/dtx-secrets/identity-database-url:ro
       - ${DTX_SECRET_ROOT:?set secret root}/group-database-url:/run/dtx-secrets/group-database-url:ro
       - ${DTX_SECRET_ROOT:?set secret root}/mailbox-database-url:/run/dtx-secrets/mailbox-database-url:ro
-      - ${DTX_SECRET_ROOT:?set secret root}/public-feed-database-url:/run/dtx-secrets/public-feed-database-url:ro
-      - ${DTX_SECRET_ROOT:?set secret root}/indexer-database-url:/run/dtx-secrets/indexer-database-url:ro
       - ${DTX_TLS_ROOT:?set TLS root}:/run/dtx-tls:ro
     depends_on:
       verify-roles:
@@ -181,7 +176,7 @@ services:
       - /run/dtx-tls/private-ca.pem
       - --connect-to
       - ${DTX_NODE_HOSTNAME:?set node hostname}:8443:dtx-node:8443
-      - https://${DTX_NODE_HOSTNAME:?set node hostname}:8443/local-health
+      - https://${DTX_NODE_HOSTNAME:?set node hostname}:8443/local/ready
     volumes:
       - ${DTX_TLS_ROOT:?set TLS root}/private-ca.pem:/run/dtx-tls/private-ca.pem:ro
     depends_on:

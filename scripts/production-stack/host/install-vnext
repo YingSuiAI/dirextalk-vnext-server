@@ -1210,7 +1210,7 @@ def caddyfile(domain):
     return f'''{domain} {{
     @health path /healthz
     handle @health {{
-        rewrite * /local-health
+        rewrite * /local/ready
         reverse_proxy https://dtx-node:8443 {{
             transport http {{
                 tls_trust_pool file /data/caddy/private-ca.pem

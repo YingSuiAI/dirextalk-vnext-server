@@ -1,13 +1,18 @@
 #![forbid(unsafe_code)]
 
+mod admission;
+mod config;
+mod health;
+mod outbox;
+
 use std::{
     collections::HashMap,
-    env, fs,
-    net::{IpAddr, SocketAddr},
+    env,
+    net::SocketAddr,
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -34,7 +39,7 @@ use dtx_wire::{
 };
 use futures_util::StreamExt;
 use sqlx::postgres::PgConnectOptions;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 const SUBPROTOCOL_V1: &str = "dirextalk.realtime-sync.v1";
@@ -42,7 +47,8 @@ const SUBPROTOCOL_V2: &str = "dirextalk.realtime-sync.v2";
 const SYNC_PATH: &str = "/v1/realtime-sync";
 const READY_PATH: &str = "/local/ready";
 const SESSION_SCHEME: &str = "DTX-Device-Session";
-const OUTBOX_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const READY_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_DB_MAX_CONNECTIONS: u32 = 8;
 const SAFETY_REPLAY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_FRAME_BYTES: usize = 16_384;
 const MAX_EPHEMERAL_TTL_MILLIS: u64 = 10_000;
@@ -54,9 +60,8 @@ const MAX_CONNECTIONS_PER_SOURCE: usize = 32;
 const MAX_SCOPES_PER_CONNECTION: usize = 32;
 const MAX_GLOBAL_SCOPE_SUBSCRIPTIONS: usize = 8_192;
 const EPHEMERAL_ACTOR_DIGEST_DOMAIN: &[u8] = b"dirextalk.realtime-ephemeral-actor.v2\0";
-const DATABASE_URL_ENV: &str = "DTX_REALTIME_SYNC_DATABASE_URL";
-const DATABASE_URL_FILE_ENV: &str = "DTX_REALTIME_SYNC_DATABASE_URL_FILE";
-const MAX_DATABASE_URL_BYTES: u64 = 8_192;
+use admission::{AdmissionGate, AdmissionPermit};
+use health::OutboxHealth;
 
 #[derive(Clone)]
 struct AppState {
@@ -66,57 +71,7 @@ struct AppState {
     durable: broadcast::Sender<OutboxNotification>,
     admission: Arc<AdmissionGate>,
     scopes: Arc<EphemeralRegistry>,
-}
-
-struct AdmissionGate {
-    global: Arc<Semaphore>,
-    per_source_limit: usize,
-    per_source: Mutex<HashMap<IpAddr, usize>>,
-}
-
-impl AdmissionGate {
-    fn new(global_limit: usize, per_source_limit: usize) -> Self {
-        Self {
-            global: Arc::new(Semaphore::new(global_limit)),
-            per_source_limit,
-            per_source: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn try_acquire(self: &Arc<Self>, source: IpAddr) -> Option<AdmissionPermit> {
-        let global = self.global.clone().try_acquire_owned().ok()?;
-        let mut per_source = self.per_source.lock().ok()?;
-        let current = per_source.entry(source).or_default();
-        if *current >= self.per_source_limit {
-            return None;
-        }
-        *current += 1;
-        drop(per_source);
-        Some(AdmissionPermit {
-            gate: self.clone(),
-            source,
-            _global: global,
-        })
-    }
-}
-
-struct AdmissionPermit {
-    gate: Arc<AdmissionGate>,
-    source: IpAddr,
-    _global: OwnedSemaphorePermit,
-}
-
-impl Drop for AdmissionPermit {
-    fn drop(&mut self) {
-        if let Ok(mut per_source) = self.gate.per_source.lock()
-            && let Some(current) = per_source.get_mut(&self.source)
-        {
-            *current = current.saturating_sub(1);
-            if *current == 0 {
-                per_source.remove(&self.source);
-            }
-        }
-    }
+    health: Arc<Mutex<OutboxHealth>>,
 }
 
 #[derive(Clone, Copy)]
@@ -303,15 +258,24 @@ impl WireLine {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = load_database_url()?;
+    let database_url = config::database_url()?;
     let bind = env::var("DTX_REALTIME_SYNC_BIND")
         .unwrap_or_else(|_| "0.0.0.0:9444".to_owned())
         .parse::<SocketAddr>()?;
     let certificate = PathBuf::from(env::var("DTX_REALTIME_SYNC_TLS_CERTIFICATE_FILE")?);
     let private_key = PathBuf::from(env::var("DTX_REALTIME_SYNC_TLS_PRIVATE_KEY_FILE")?);
-    let store = RealtimeSyncStore::connect(PgConnectOptions::from_str(&database_url)?, 16).await?;
+    let store = RealtimeSyncStore::connect(
+        PgConnectOptions::from_str(&database_url)?,
+        config::pool_size(
+            "DTX_REALTIME_SYNC_DB_MAX_CONNECTIONS",
+            DEFAULT_DB_MAX_CONNECTIONS,
+            128,
+        )?,
+    )
+    .await?;
     let (ephemeral, _) = broadcast::channel(256);
     let (durable, _) = broadcast::channel(1_024);
+    let health = Arc::new(Mutex::new(OutboxHealth::starting()));
     let state = AppState {
         store: store.clone(),
         clock: Arc::new(SystemClock),
@@ -322,8 +286,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             MAX_CONNECTIONS_PER_SOURCE,
         )),
         scopes: Arc::new(EphemeralRegistry::default()),
+        health: health.clone(),
     };
-    tokio::spawn(publish_outbox(store, durable, Uuid::now_v7()));
+    tokio::spawn(outbox::publish(store, durable, Uuid::now_v7(), health));
     let router = Router::new()
         .route(SYNC_PATH, get(upgrade))
         .route(READY_PATH, get(ready))
@@ -336,54 +301,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn ready() -> StatusCode {
-    StatusCode::NO_CONTENT
-}
-
-fn load_database_url() -> Result<String, std::io::Error> {
-    let direct = env::var_os(DATABASE_URL_ENV);
-    let file = env::var_os(DATABASE_URL_FILE_ENV);
-    match (direct, file) {
-        (Some(_), Some(_)) | (None, None) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "configure exactly one realtime database source",
-        )),
-        (Some(value), None) => value.into_string().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "realtime database URL is not UTF-8",
-            )
-        }),
-        (None, Some(path)) => {
-            let path = PathBuf::from(path);
-            let metadata = fs::symlink_metadata(&path)?;
-            if !metadata.file_type().is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.len() == 0
-                || metadata.len() > MAX_DATABASE_URL_BYTES
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "realtime database credential file rejected",
-                ));
-            }
-            let bytes = fs::read(path)?;
-            let value = std::str::from_utf8(&bytes).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "realtime database credential is not UTF-8",
-                )
-            })?;
-            let value = value.strip_suffix('\n').unwrap_or(value);
-            let value = value.strip_suffix('\r').unwrap_or(value);
-            if value.is_empty() || value.chars().any(char::is_control) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "realtime database credential shape rejected",
-                ));
-            }
-            Ok(value.to_owned())
-        }
+async fn ready(State(state): State<AppState>) -> StatusCode {
+    let checks = async {
+        let worker_ready = state
+            .health
+            .lock()
+            .is_ok_and(|health| health.ready(Instant::now()));
+        worker_ready && state.store.readiness_check().await.is_ok_and(|ready| ready)
+    };
+    if tokio::time::timeout(READY_TIMEOUT, checks).await == Ok(true) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     }
 }
 
@@ -638,46 +567,6 @@ async fn serve_socket(
                     _ => { close(&mut socket, 1008, "frame fence rejected").await; return; }
                 }
             }
-        }
-    }
-}
-
-async fn publish_outbox(
-    store: RealtimeSyncStore,
-    durable: broadcast::Sender<OutboxNotification>,
-    worker_id: Uuid,
-) {
-    let mut poll = tokio::time::interval(OUTBOX_POLL_INTERVAL);
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let clock = SystemClock;
-    let mut compaction_tick = 0_u16;
-    let mut failures = 0_u8;
-    loop {
-        poll.tick().await;
-        let Ok(now_ms) = clock.now_utc_millis() else {
-            continue;
-        };
-        let Ok(now) = UtcMillis::new(now_ms) else {
-            continue;
-        };
-        let claim = if let Ok(claim) = store.claim_outbox(worker_id, now).await {
-            failures = 0;
-            claim
-        } else {
-            failures = failures.saturating_add(1).min(5);
-            tokio::time::sleep(Duration::from_millis(100_u64 << u32::from(failures))).await;
-            continue;
-        };
-        for notification in &claim.notifications {
-            let _ = durable.send(*notification);
-        }
-        if !claim.notifications.is_empty() {
-            let _ = store.mark_outbox_published(&claim, now).await;
-        }
-        compaction_tick = compaction_tick.wrapping_add(1);
-        if compaction_tick >= 300 {
-            let _ = store.compact_expired(now).await;
-            compaction_tick = 0;
         }
     }
 }
@@ -1080,12 +969,22 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
 
     #[tokio::test]
     async fn readiness_is_fixed_and_only_reports_after_router_startup() {
         assert_eq!(READY_PATH, "/local/ready");
-        assert_eq!(ready().await, StatusCode::NO_CONTENT);
+        let health = OutboxHealth::starting();
+        assert!(!health.ready(Instant::now()));
+        let mut health = health;
+        health.succeeded(Instant::now());
+        assert!(health.ready(Instant::now()));
+        health.failed();
+        health.failed();
+        health.failed();
+        assert!(!health.ready(Instant::now()));
     }
 
     #[test]

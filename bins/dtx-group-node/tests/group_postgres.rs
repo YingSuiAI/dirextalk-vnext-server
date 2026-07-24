@@ -2332,7 +2332,7 @@ async fn three_node_compose_runs_v30_peer_admission_and_exact_recovery_over_tls(
         ("node-c", 18_445, "https://node-c:8443"),
     ] {
         let health = client
-            .get(format!("https://{host}:{port}/local-health"))
+            .get(format!("https://{host}:{port}/local/live"))
             .send()
             .await?;
         assert_eq!(health.status(), StatusCode::NO_CONTENT);

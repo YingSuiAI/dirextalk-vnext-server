@@ -150,6 +150,25 @@ impl PgStore {
             }))
     }
 
+    /// Checks the immutable Product Core schema epoch on an already-authorized
+    /// pool.  Service stores use this after their own exact role validators.
+    pub async fn readiness_check_schema(pool: &PgPool) -> Result<bool, sqlx::Error> {
+        let applied = sqlx::query_as::<_, (i64, bool, Vec<u8>)>(
+            "SELECT version, success, checksum FROM system.schema_versions",
+        )
+        .fetch_all(pool)
+        .await?;
+        let epoch = sqlx::query_as::<_, (String, Vec<u8>)>(
+            "SELECT epoch, baseline_digest FROM system.schema_epoch WHERE singleton = true",
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(embedded_migrations_match(&applied)
+            && epoch.is_some_and(|(epoch, digest)| {
+                epoch == SCHEMA_EPOCH && digest == baseline_digest()
+            }))
+    }
+
     /// Starts a transaction and binds its RLS context to one authenticated tenant.
     ///
     /// Transaction-local `set_config` is used so a pooled connection cannot retain

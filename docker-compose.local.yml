@@ -4,7 +4,7 @@ x-dev-image: &dev-image
   image: dirextalk-vnext-local:dev
 
 x-node-healthcheck: &node-healthcheck
-  test: ["CMD-SHELL", "curl --fail --silent --show-error --cacert /run/dtx-local-tls/ca.pem https://localhost:8443/local-health >/dev/null"]
+  test: ["CMD-SHELL", "curl --fail --silent --show-error --cacert /run/dtx-local-tls/ca.pem https://localhost:8443/local/ready >/dev/null"]
   interval: 2s
   timeout: 3s
   retries: 15
@@ -15,7 +15,7 @@ x-node-environment: &node-environment
   DTX_GROUP_FEDERATED_IDENTITY_TRUST_ROOT_FILE: /run/dtx-local-tls/ca.pem
 
 x-gateway-healthcheck: &gateway-healthcheck
-  test: ["CMD-SHELL", "test \"$(curl --silent --output /dev/null --write-out '%{http_code}' --cacert /run/dtx-local-tls/ca.pem https://localhost:9444/v1/realtime-sync)\" = 400"]
+  test: ["CMD-SHELL", "curl --fail --silent --show-error --cacert /run/dtx-local-tls/ca.pem https://localhost:9444/local/ready >/dev/null"]
   interval: 2s
   timeout: 3s
   retries: 15
@@ -191,13 +191,10 @@ services:
       DTX_DEV_IDENTITY_DATABASE_URL: postgres://dtx_identity_node@postgres:5432/dtx_node_a?sslmode=disable
       DTX_DEV_GROUP_DATABASE_URL: postgres://dtx_group_node@postgres:5432/dtx_node_a?sslmode=disable
       DTX_DEV_MAILBOX_DATABASE_URL: postgres://dtx_mailbox_node@postgres:5432/dtx_node_a?sslmode=disable
-      DTX_DEV_PUBLIC_FEED_DATABASE_URL: postgres://dtx_public_feed_node@postgres:5432/dtx_node_a?sslmode=disable
-      DTX_DEV_INDEXER_DATABASE_URL: postgres://dtx_indexer_node@postgres:5432/dtx_node_a?sslmode=disable
       DTX_NODE_PUBLIC_ORIGIN: https://node-a:8443
       DTX_NODE_TLS_CERTIFICATE_FILE: /run/dtx-local-tls/node-a-cert.pem
       DTX_NODE_TLS_PRIVATE_KEY_FILE: /run/dtx-local-tls/node-a-key.pem
       DTX_NODE_TENANT_ID: 0190f2a5-7b1c-7abc-8def-0123456789a0
-      DTX_NODE_INDEXER_ID: 0190f2a5-7b1c-7abc-8def-0123456789b0
     depends_on:
       provision-a:
         condition: service_completed_successfully
@@ -217,13 +214,10 @@ services:
       DTX_DEV_IDENTITY_DATABASE_URL: postgres://dtx_identity_node@postgres:5432/dtx_node_b?sslmode=disable
       DTX_DEV_GROUP_DATABASE_URL: postgres://dtx_group_node@postgres:5432/dtx_node_b?sslmode=disable
       DTX_DEV_MAILBOX_DATABASE_URL: postgres://dtx_mailbox_node@postgres:5432/dtx_node_b?sslmode=disable
-      DTX_DEV_PUBLIC_FEED_DATABASE_URL: postgres://dtx_public_feed_node@postgres:5432/dtx_node_b?sslmode=disable
-      DTX_DEV_INDEXER_DATABASE_URL: postgres://dtx_indexer_node@postgres:5432/dtx_node_b?sslmode=disable
       DTX_NODE_PUBLIC_ORIGIN: https://node-b:8443
       DTX_NODE_TLS_CERTIFICATE_FILE: /run/dtx-local-tls/node-b-cert.pem
       DTX_NODE_TLS_PRIVATE_KEY_FILE: /run/dtx-local-tls/node-b-key.pem
       DTX_NODE_TENANT_ID: 0190f2a5-7b1c-7abc-8def-0123456789a1
-      DTX_NODE_INDEXER_ID: 0190f2a5-7b1c-7abc-8def-0123456789b1
     depends_on:
       provision-b:
         condition: service_completed_successfully
@@ -243,13 +237,10 @@ services:
       DTX_DEV_IDENTITY_DATABASE_URL: postgres://dtx_identity_node@postgres:5432/dtx_node_c?sslmode=disable
       DTX_DEV_GROUP_DATABASE_URL: postgres://dtx_group_node@postgres:5432/dtx_node_c?sslmode=disable
       DTX_DEV_MAILBOX_DATABASE_URL: postgres://dtx_mailbox_node@postgres:5432/dtx_node_c?sslmode=disable
-      DTX_DEV_PUBLIC_FEED_DATABASE_URL: postgres://dtx_public_feed_node@postgres:5432/dtx_node_c?sslmode=disable
-      DTX_DEV_INDEXER_DATABASE_URL: postgres://dtx_indexer_node@postgres:5432/dtx_node_c?sslmode=disable
       DTX_NODE_PUBLIC_ORIGIN: https://node-c:8443
       DTX_NODE_TLS_CERTIFICATE_FILE: /run/dtx-local-tls/node-c-cert.pem
       DTX_NODE_TLS_PRIVATE_KEY_FILE: /run/dtx-local-tls/node-c-key.pem
       DTX_NODE_TENANT_ID: 0190f2a5-7b1c-7abc-8def-0123456789a2
-      DTX_NODE_INDEXER_ID: 0190f2a5-7b1c-7abc-8def-0123456789b2
     depends_on:
       provision-c:
         condition: service_completed_successfully

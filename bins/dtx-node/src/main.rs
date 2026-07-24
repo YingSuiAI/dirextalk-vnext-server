@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use axum::{http::StatusCode, routing::get};
+use axum::{extract::State, http::StatusCode, routing::get};
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use dtx_domain::{Clock, IndexerId, SystemClock, TenantId};
 use dtx_federated_identity::FederatedIdentityVerifier;
@@ -36,6 +36,8 @@ const MAILBOX_DATABASE_URL_FILE_ENV: &str = "DTX_MAILBOX_DATABASE_URL_FILE";
 const PUBLIC_FEED_DATABASE_URL_FILE_ENV: &str = "DTX_PUBLIC_FEED_DATABASE_URL_FILE";
 const INDEXER_DATABASE_URL_FILE_ENV: &str = "DTX_INDEXER_DATABASE_URL_FILE";
 const INDEXER_ID_ENV: &str = "DTX_NODE_INDEXER_ID";
+const PUBLIC_CONTENT_ENABLED_ENV: &str = "DTX_NODE_PUBLIC_CONTENT_ENABLED";
+const DB_MAX_CONNECTIONS_ENV: &str = "DTX_NODE_DB_MAX_CONNECTIONS";
 const DEV_HTTP_IDENTITY_ORIGINS_ENV: &str = "DTX_GROUP_DEV_HTTP_IDENTITY_ORIGINS";
 const TLS_CERTIFICATE_FILE_ENV: &str = "DTX_NODE_TLS_CERTIFICATE_FILE";
 const TLS_PRIVATE_KEY_FILE_ENV: &str = "DTX_NODE_TLS_PRIVATE_KEY_FILE";
@@ -45,6 +47,8 @@ const MAX_DATABASE_URL_BYTES: usize = 8_192;
 const MAX_TLS_PEM_BYTES: u64 = 1_048_576;
 const MAX_FEDERATED_IDENTITY_TRUST_ROOT_PEM_BYTES: usize = 64 * 1024;
 const TLS_GRACEFUL_SHUTDOWN: Duration = Duration::from_secs(30);
+const READY_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_DB_MAX_CONNECTIONS: u32 = 2;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -67,33 +71,26 @@ async fn run() -> Result<(), NodeError> {
         group_database,
         group_mls_sequencer_key_file,
         mailbox_database,
-        public_feed_database,
-        indexer_database,
-        indexer_id,
+        public_content,
+        db_max_connections,
         allowed_http_identity_origins,
         additional_federated_identity_trust_root_pem,
     } = NodeConfig::load()?;
     let sequencer_signing_key = load_mls_sequencer_signing_key(&group_mls_sequencer_key_file)
         .map_err(|_| NodeError::Configuration)?;
-    let identity_store = IdentityPgStore::connect(identity_database, 8)
+    let identity_store = IdentityPgStore::connect(identity_database, db_max_connections)
         .await
         .map_err(|_| NodeError::Database("identity"))?;
-    let group_store = GroupPgStore::connect(group_database, 8)
+    let group_store = GroupPgStore::connect(group_database, db_max_connections)
         .await
         .map_err(|_| NodeError::Database("group"))?;
-    let mailbox_store = MailboxPgStore::connect(mailbox_database, 8)
+    let mailbox_store = MailboxPgStore::connect(mailbox_database, db_max_connections)
         .await
         .map_err(|_| NodeError::Database("mailbox"))?;
-    let public_feed_store = PublicFeedPgStore::connect(public_feed_database, 8)
-        .await
-        .map_err(|_| NodeError::Database("public feed"))?;
-    let indexer_store = IndexerPgStore::connect(indexer_database, 8)
-        .await
-        .map_err(|_| NodeError::Database("indexer"))?;
 
     let clock = Arc::new(SystemClock);
     let identity_state = IdentityBootstrapState::with_clock_and_device_session_audience(
-        identity_store,
+        identity_store.clone(),
         clock.clone(),
         public_origin.clone(),
     )
@@ -104,7 +101,7 @@ async fn run() -> Result<(), NodeError> {
     )
     .map_err(|_| NodeError::Configuration)?;
     let group_state = configured_group_state(
-        group_store,
+        group_store.clone(),
         tenant_id,
         clock.clone(),
         sequencer_signing_key,
@@ -112,32 +109,56 @@ async fn run() -> Result<(), NodeError> {
         allowed_http_identity_origins.clone(),
         additional_federated_identity_trust_root_pem.as_deref(),
     )?;
-    let (discussion_identity, _) =
-        FederatedIdentityVerifier::new_with_public_origin_and_additional_trust_root_pem(
-            &public_origin,
-            allowed_http_identity_origins,
-            additional_federated_identity_trust_root_pem.as_deref(),
-        )
-        .map_err(|_| NodeError::Configuration)?;
-    let mailbox_state = MailboxNodeState::with_clock(mailbox_store, clock);
+    let mailbox_state = MailboxNodeState::with_clock(mailbox_store.clone(), clock);
 
-    let router = identity_bootstrap_router_with_state(identity_state)
+    let mut router = identity_bootstrap_router_with_state(identity_state)
         .merge(group_router_with_state(group_state))
-        .merge(mailbox_router_with_state(mailbox_state))
-        .merge(public_feed_router_with_discussion(
-            public_feed_store,
-            tenant_id,
-            PublicDiscussionRouterConfig::new(Arc::new(FederatedDeviceAuthority::new(
-                discussion_identity,
-            ))),
-        ))
-        .merge(indexer_router(
-            indexer_store,
-            tenant_id,
-            indexer_id,
-            Arc::new(PinnedHttpsBundleFetcher::default()),
-        ))
-        .route("/local-health", get(local_health));
+        .merge(mailbox_router_with_state(mailbox_state));
+    let mut active_public_stores = None;
+    if let Some(public_content) = public_content {
+        let public_feed_store =
+            PublicFeedPgStore::connect(public_content.public_feed_database, db_max_connections)
+                .await
+                .map_err(|_| NodeError::Database("public feed"))?;
+        let indexer_store =
+            IndexerPgStore::connect(public_content.indexer_database, db_max_connections)
+                .await
+                .map_err(|_| NodeError::Database("indexer"))?;
+        active_public_stores = Some((public_feed_store.clone(), indexer_store.clone()));
+        let (discussion_identity, _) =
+            FederatedIdentityVerifier::new_with_public_origin_and_additional_trust_root_pem(
+                &public_origin,
+                allowed_http_identity_origins,
+                additional_federated_identity_trust_root_pem.as_deref(),
+            )
+            .map_err(|_| NodeError::Configuration)?;
+        router = router
+            .merge(public_feed_router_with_discussion(
+                public_feed_store,
+                tenant_id,
+                PublicDiscussionRouterConfig::new(Arc::new(FederatedDeviceAuthority::new(
+                    discussion_identity,
+                ))),
+            ))
+            .merge(indexer_router(
+                indexer_store,
+                tenant_id,
+                public_content.indexer_id,
+                Arc::new(PinnedHttpsBundleFetcher::default()),
+            ));
+    }
+    let readiness = NodeReadiness {
+        identity: identity_store.clone(),
+        group: group_store.clone(),
+        mailbox: mailbox_store.clone(),
+        public_content: active_public_stores,
+        mls_key_loaded: true,
+    };
+    let local_router = axum::Router::new()
+        .route("/local/live", get(local_live))
+        .route("/local/ready", get(local_ready))
+        .with_state(readiness);
+    let router = router.merge(local_router);
     serve_node(router, listen, tls).await
 }
 
@@ -192,8 +213,47 @@ fn configured_group_state(
         .map_err(|_| NodeError::Configuration)
 }
 
-async fn local_health() -> StatusCode {
+async fn local_live() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+#[derive(Clone)]
+struct NodeReadiness {
+    identity: IdentityPgStore,
+    group: GroupPgStore,
+    mailbox: MailboxPgStore,
+    public_content: Option<(PublicFeedPgStore, IndexerPgStore)>,
+    mls_key_loaded: bool,
+}
+
+async fn local_ready(State(state): State<NodeReadiness>) -> StatusCode {
+    if !state.mls_key_loaded {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    let checks = async {
+        let (identity, group, mailbox) = tokio::join!(
+            state.identity.readiness_check(),
+            state.group.readiness_check(),
+            state.mailbox.readiness_check(),
+        );
+        let core_ready = identity.is_ok_and(|ready| ready)
+            && group.is_ok_and(|ready| ready)
+            && mailbox.is_ok_and(|ready| ready);
+        let public_ready = match &state.public_content {
+            None => true,
+            Some((feed, indexer)) => {
+                let (feed, indexer) =
+                    tokio::join!(feed.readiness_check(), indexer.readiness_check());
+                feed.is_ok_and(|ready| ready) && indexer.is_ok_and(|ready| ready)
+            }
+        };
+        core_ready && public_ready
+    };
+    if tokio::time::timeout(READY_TIMEOUT, checks).await == Ok(true) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 struct NodeConfig {
@@ -205,11 +265,16 @@ struct NodeConfig {
     group_database: PgConnectOptions,
     group_mls_sequencer_key_file: PathBuf,
     mailbox_database: PgConnectOptions,
+    public_content: Option<PublicContentConfig>,
+    db_max_connections: u32,
+    allowed_http_identity_origins: Vec<String>,
+    additional_federated_identity_trust_root_pem: Option<Vec<u8>>,
+}
+
+struct PublicContentConfig {
     public_feed_database: PgConnectOptions,
     indexer_database: PgConnectOptions,
     indexer_id: IndexerId,
-    allowed_http_identity_origins: Vec<String>,
-    additional_federated_identity_trust_root_pem: Option<Vec<u8>>,
 }
 
 struct NodeTlsConfig {
@@ -246,10 +311,18 @@ impl NodeConfig {
             .map_err(|_| NodeError::Configuration)?
             .parse::<TenantId>()
             .map_err(|_| NodeError::Configuration)?;
-        let indexer_id = env::var(INDEXER_ID_ENV)
-            .map_err(|_| NodeError::Configuration)?
-            .parse::<IndexerId>()
-            .map_err(|_| NodeError::Configuration)?;
+        let public_content =
+            match public_content_enabled(env::var(PUBLIC_CONTENT_ENABLED_ENV).ok())? {
+                false => None,
+                true => Some(PublicContentConfig {
+                    public_feed_database: load_database_options(PUBLIC_FEED_DATABASE_URL_FILE_ENV)?,
+                    indexer_database: load_database_options(INDEXER_DATABASE_URL_FILE_ENV)?,
+                    indexer_id: env::var(INDEXER_ID_ENV)
+                        .map_err(|_| NodeError::Configuration)?
+                        .parse::<IndexerId>()
+                        .map_err(|_| NodeError::Configuration)?,
+                }),
+            };
         let allowed_http_identity_origins = env::var(DEV_HTTP_IDENTITY_ORIGINS_ENV)
             .ok()
             .map(|value| {
@@ -275,12 +348,34 @@ impl NodeConfig {
                 .map(PathBuf::from)
                 .ok_or(NodeError::Configuration)?,
             mailbox_database: load_database_options(MAILBOX_DATABASE_URL_FILE_ENV)?,
-            public_feed_database: load_database_options(PUBLIC_FEED_DATABASE_URL_FILE_ENV)?,
-            indexer_database: load_database_options(INDEXER_DATABASE_URL_FILE_ENV)?,
-            indexer_id,
+            public_content,
+            db_max_connections: parse_pool_size(
+                DB_MAX_CONNECTIONS_ENV,
+                DEFAULT_DB_MAX_CONNECTIONS,
+                64,
+            )?,
             allowed_http_identity_origins,
             additional_federated_identity_trust_root_pem,
         })
+    }
+}
+
+fn parse_pool_size(name: &str, default: u32, maximum: u32) -> Result<u32, NodeError> {
+    match env::var(name) {
+        Err(env::VarError::NotPresent) => Ok(default),
+        Ok(value) => match value.parse::<u32>() {
+            Ok(size) if (1..=maximum).contains(&size) => Ok(size),
+            _ => Err(NodeError::Configuration),
+        },
+        Err(_) => Err(NodeError::Configuration),
+    }
+}
+
+fn public_content_enabled(value: Option<String>) -> Result<bool, NodeError> {
+    match value.as_deref() {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(NodeError::Configuration),
     }
 }
 
@@ -448,6 +543,14 @@ mod tests {
         assert!(validate_listen_scope(external, true).is_ok());
         assert!(validate_listen_scope(external, false).is_err());
         assert!(validate_listen_scope(loopback, false).is_ok());
+    }
+
+    #[test]
+    fn public_opt_in_and_pool_bounds_fail_closed() {
+        assert!(!super::public_content_enabled(None).expect("default disabled"));
+        assert!(super::public_content_enabled(Some("true".to_owned())).expect("explicit opt in"));
+        assert!(super::public_content_enabled(Some("1".to_owned())).is_err());
+        assert!(super::parse_pool_size("DTX_NODE_TEST_MISSING", 2, 64).is_ok());
     }
 
     #[tokio::test]

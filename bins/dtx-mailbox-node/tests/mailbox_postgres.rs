@@ -3707,7 +3707,7 @@ async fn three_node_compose_delivers_post_admission_private_envelope_exactly()
         .build()?;
     for port in [18_080, 18_081, 18_082] {
         let health = client
-            .get(format!("http://127.0.0.1:{port}/local-health"))
+            .get(format!("http://127.0.0.1:{port}/local/live"))
             .send()
             .await?;
         assert_eq!(health.status(), StatusCode::NO_CONTENT);

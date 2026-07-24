@@ -303,6 +303,16 @@ impl IndexerPgStore {
         }
         Ok(Self { pool })
     }
+    /// Rechecks the current directory role and immutable schema epoch.
+    pub async fn readiness_check(&self) -> Result<bool, NodeError> {
+        let allowed: bool = sqlx::query_scalar("SELECT directory.public_feed_runtime_authorized() AND has_table_privilege(current_user,'directory.index_registrations','SELECT,INSERT,UPDATE') AND has_table_privilege(current_user,'directory.index_cache_generations','SELECT,INSERT,UPDATE')").fetch_one(&self.pool).await?;
+        if !allowed {
+            return Err(NodeError::UnauthorizedDatabaseRole);
+        }
+        dtx_storage::PgStore::readiness_check_schema(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
     async fn begin(&self, tenant: TenantId) -> Result<Transaction<'_, Postgres>, NodeError> {
         let mut tx = self.pool.begin().await?;
         let existing: Option<String> =

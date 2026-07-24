@@ -18,6 +18,7 @@ dtx-http-cache = { path = "../../crates/dtx-http-cache" }
 dtx-public-descriptor = { path = "../../crates/dtx-public-descriptor" }
 dtx-public-discussion = { path = "../../crates/dtx-public-discussion" }
 dtx-public-feed = { path = "../../crates/dtx-public-feed" }
+dtx-storage = { path = "../../crates/dtx-storage" }
 dtx-wire = { path = "../../crates/dtx-wire" }
 serde.workspace = true
 serde_json.workspace = true
@@ -30,7 +31,6 @@ name = "dtx_public_feed_node"
 path = "src/lib.rs"
 
 [dev-dependencies]
-dtx-storage = { path = "../../crates/dtx-storage" }
 ed25519-dalek.workspace = true
 testcontainers-modules.workspace = true
 tower.workspace = true

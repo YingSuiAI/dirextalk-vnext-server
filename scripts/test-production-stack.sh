@@ -24,7 +24,7 @@ grep -q "directory.index_cache_generations', 'UPDATE'" "$root/docker/production/
 grep -q 'DTX_.*DATABASE_URL_FILE' "$compose"
 grep -q 'DTX_AGENT_CONTROL_BIND.*:9443:9443' "$compose"
 grep -q 'network_mode: service:agent-control' "$compose"
-grep -q 'https://.*:8443/local-health' "$compose"
+grep -q 'https://.*:8443/local/ready' "$compose"
 grep -q 'https://.*:9444/local/ready' "$compose"
 grep -q 'reverse_proxy @realtime https://realtime-gateway:9444' "$root/docker/production/Caddyfile"
 grep -q 'reverse_proxy @node https://dtx-node:8443' "$root/docker/production/Caddyfile"
