@@ -90,6 +90,10 @@ impl RecoveryResponseCapability {
     fn digest(&self) -> Sha256Digest {
         Sha256Digest::hash_domain(RESPONSE_CAPABILITY_HASH_DOMAIN, &self.0)
     }
+
+    pub fn equals_raw(&self, bytes: &[u8; 32]) -> bool {
+        bool::from(self.0.ct_eq(bytes))
+    }
 }
 
 #[derive(Clone)]
