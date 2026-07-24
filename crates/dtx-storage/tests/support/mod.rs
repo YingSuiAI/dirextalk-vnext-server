@@ -413,6 +413,7 @@ impl PostgresHarness {
              GRANT EXECUTE ON FUNCTION system.enforce_completed_inbox() TO dtx_runtime_test;
              GRANT EXECUTE ON FUNCTION system.enforce_inbox_transition() TO dtx_runtime_test;
              GRANT SELECT ON system.schema_versions TO dtx_runtime_test;
+             GRANT SELECT ON system.schema_epoch TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON system.tenant_stream_heads TO dtx_runtime_test;
              GRANT SELECT, INSERT ON system.durable_events TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON system.outbox_events TO dtx_runtime_test;

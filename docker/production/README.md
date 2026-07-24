@@ -152,19 +152,9 @@ recovery digests, deleting only fully validated flat update archives. Active
 intent state, named volumes, configuration, TLS, and secrets are outside the
 deletion allowlist.
 
-`scripts/test-production-cross-version-postgres.sh` applies the exact 0.1.1
-migration set, then the sole 0.1.4 forward migration, in an ephemeral pinned
-PostgreSQL 18 container. It applies the frozen 0.1.1 and candidate 0.1.4 grants,
-then exercises the retained Agent Control database identity/query contract on
-the resulting schema. The checked-in retained release evidence binds source
-commit `72de88304813ee9a28852daca07996b8f7c245e5`, release input `0.1.1`,
-immutable version/commit tags, and
-`dirextalk/vnet-server@sha256:c972…f17a`. The test authenticates the local image
-against that evidence and its OCI revision/version labels, starts that exact
-image, and requires its live readiness endpoint on the migrated database.
-Missing or mismatched retained release images fail the test; no source rebuild
-or schema-only success path is accepted. This compatibility test is mandatory
-in both `check-production-stack.sh` and the release-image gate it invokes.
+`scripts/test-production-postgres.sh` verifies the current Product Core Alpha
+baseline against an empty ephemeral PostgreSQL database and its production role
+matrix. Existing database histories are not accepted.
 
 ## Hash-bound deployment bundle
 

@@ -6,7 +6,10 @@ use sqlx::{
     postgres::{PgConnectOptions, PgListener, PgPoolOptions},
 };
 
-use crate::{StorageError, migrations::embedded_migrations_match};
+use crate::{
+    StorageError,
+    migrations::{SCHEMA_EPOCH, baseline_digest, embedded_migrations_match},
+};
 
 /// Validated runtime `PostgreSQL` pool whose credentials cannot bypass RLS.
 #[derive(Clone)]
@@ -130,14 +133,21 @@ impl PgStore {
         if !runtime_ready {
             return Ok(false);
         }
-        let applied = sqlx::query_as::<_, (i64, Vec<u8>)>(
-            "SELECT version, checksum \
-             FROM system.schema_versions \
-             WHERE success = true",
+        let applied = sqlx::query_as::<_, (i64, bool, Vec<u8>)>(
+            "SELECT version, success, checksum \
+             FROM system.schema_versions",
         )
         .fetch_all(&mut *connection)
         .await?;
-        Ok(embedded_migrations_match(&applied))
+        let epoch = sqlx::query_as::<_, (String, Vec<u8>)>(
+            "SELECT epoch, baseline_digest FROM system.schema_epoch WHERE singleton = true",
+        )
+        .fetch_optional(&mut *connection)
+        .await?;
+        Ok(embedded_migrations_match(&applied)
+            && epoch.is_some_and(|(epoch, digest)| {
+                epoch == SCHEMA_EPOCH && digest == baseline_digest()
+            }))
     }
 
     /// Starts a transaction and binds its RLS context to one authenticated tenant.

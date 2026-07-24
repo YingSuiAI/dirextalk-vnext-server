@@ -51,6 +51,12 @@ run_migrator() {
 # bootstrapped. Migration 38's conditional grant must leave no optional role or
 # ACL behind when the role did not yet exist.
 run_migrator migrate >/dev/null
+run_migrator migrate >/dev/null
+docker exec "$database" psql -Atq -U postgres -d dtx_node \
+    -c "SELECT (SELECT count(*) FROM public._sqlx_migrations WHERE success) = 21
+               AND (SELECT epoch = 'product-core-alpha-20260724'
+                          AND octet_length(baseline_digest) = 32
+                      FROM system.schema_epoch WHERE singleton);" | grep -qx t
 docker exec "$database" psql -Atq -U postgres -d dtx_node \
     -c "SELECT to_regrole('dtx_agent_peer_admin') IS NULL AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE coalesce(array_to_string(nspacl, ','), '') LIKE '%dtx_agent_peer_admin%') AND NOT EXISTS (SELECT 1 FROM pg_proc WHERE coalesce(array_to_string(proacl, ','), '') LIKE '%dtx_agent_peer_admin%') AND NOT EXISTS (SELECT 1 FROM pg_class WHERE coalesce(array_to_string(relacl, ','), '') LIKE '%dtx_agent_peer_admin%')" | grep -qx t
 if docker run --rm --network "$network" \
@@ -133,7 +139,7 @@ run_migrator grant-roles >/dev/null
 run_migrator verify-roles >/dev/null
 
 docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
-    -c "SET ROLE dtx_agent_control; SELECT count(*) FROM system.schema_versions;" >/dev/null
+    -c "SET ROLE dtx_agent_control; SELECT count(*) FROM system.schema_versions; SELECT epoch, baseline_digest FROM system.schema_epoch;" >/dev/null
 if docker exec "$database" psql -v ON_ERROR_STOP=1 -U postgres -d dtx_node \
     -c "SET ROLE dtx_agent_control; TRUNCATE agent.connector_control_operations;" >/dev/null 2>&1; then
     echo 'Agent Control acquired forbidden TRUNCATE privilege' >&2

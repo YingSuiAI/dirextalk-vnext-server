@@ -9,12 +9,12 @@ Run commands from this repository root.
 | verify (Ubuntu/WSL) | `bash scripts/verify.sh` |
 | verify (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1` |
 | test | `cargo test --workspace --locked` |
-| persistence migrations | `cargo test -p dtx-storage --test migrations --locked` |
+| persistence fresh baseline | `cargo test -p dtx-storage --test migrations --locked` |
 | persistence contracts | `cargo test -p dtx-storage --test persistence_contract --locked` |
 | root-only Connector bootstrap issuance | `dtx-agent-provision bootstrap-issue --database-url-file <0600-file> --request-file <root-0600-json> --handoff-file <tenant-operation.handoff.json> --plan-file <tenant-operation.plan.json>` |
 | Host Supervisor VM acceptance (destructive; isolated disposable Linux VM only) | `sudo DTX_DISPOSABLE_VM_ACCEPTANCE=1 bash scripts/test-host-supervisor-vm.sh` |
-| SQLx migration/prepare gate (Ubuntu/WSL) | `bash scripts/sqlx-prepare.sh` |
-| SQLx migration/prepare gate (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sqlx-prepare.ps1` |
+| SQLx baseline/prepare gate (Ubuntu/WSL) | `bash scripts/sqlx-prepare.sh` |
+| SQLx baseline/prepare gate (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sqlx-prepare.ps1` |
 | testkit dependency boundary (Ubuntu/WSL) | `bash scripts/check-testkit-boundary.sh` |
 | testkit dependency boundary (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-testkit-boundary.ps1` |
 | build | `cargo build --workspace --locked` |

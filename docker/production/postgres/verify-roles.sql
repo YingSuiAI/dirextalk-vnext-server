@@ -128,6 +128,7 @@ BEGIN
        OR NOT has_table_privilege('dtx_agent_control', 'agent.connector_bootstrap_issuances', 'SELECT')
        OR NOT has_table_privilege('dtx_agent_control', 'agent.connector_bootstrap_issuances', 'INSERT')
        OR NOT has_table_privilege('dtx_agent_control', 'system.schema_versions', 'SELECT')
+       OR NOT has_table_privilege('dtx_agent_control', 'system.schema_epoch', 'SELECT')
        OR has_schema_privilege('dtx_agent_control', 'agent', 'CREATE')
        OR has_table_privilege('dtx_agent_control', 'agent.connector_control_operations', 'TRUNCATE')
        OR has_table_privilege('dtx_agent_control', 'agent.connector_bootstrap_issuances', 'UPDATE')

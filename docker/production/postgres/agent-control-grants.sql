@@ -12,6 +12,7 @@ GRANT EXECUTE ON FUNCTION system.current_tenant_id(), system.is_uuid_v7(uuid),
     system.is_stable_code(text, integer), system.enforce_completed_inbox(),
     system.enforce_inbox_transition() TO dtx_agent_runtime;
 GRANT SELECT ON system.schema_versions TO dtx_agent_runtime;
+GRANT SELECT ON system.schema_epoch TO dtx_agent_runtime;
 GRANT SELECT, INSERT, UPDATE ON system.tenant_stream_heads TO dtx_agent_runtime;
 GRANT SELECT, INSERT ON system.durable_events, system.audit_events TO dtx_agent_runtime;
 GRANT SELECT, INSERT, UPDATE ON system.outbox_events, system.inbox_dedup,

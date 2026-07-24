@@ -77,7 +77,6 @@ grep -q 'dirextalk/vnet-server@sha256:' "$root/scripts/production-stack/host/ins
 ! grep -q 'dirextalk/vnet-server:latest' "$root/scripts/production-stack/host/install-vnext"
 python3 "$root/tools/validate-production-images.py" --self-test
 python3 "$root/tools/vnext-stack-bundle.py" self-test --source-root "$root"
-python3 "$root/scripts/test-production-stack-cross-version.py"
 bash "$root/scripts/test-production-stack-update-recovery.sh"
 
 cleanup_test_root=$(mktemp -d)
@@ -184,39 +183,9 @@ grep -q "1000:1000:400" "$root/scripts/production-stack/host/client-binding-expo
 grep -q -- '--runtime-image dirextalk/vnet-server@sha256:<64-hex> --migrator-image' "$root/scripts/check-release-image.sh"
 grep -q 'docker export --output' "$root/scripts/check-release-image.sh"
 grep -q 'scripts/check-release-image.sh' "$root/scripts/publish-production-release.sh"
-grep -q 'bash scripts/test-production-cross-version-postgres.sh' "$root/scripts/publish-production-release.sh"
+grep -q 'bash scripts/test-production-postgres.sh' "$root/scripts/publish-production-release.sh"
 grep -q 'DTX_PUBLICATION_SOURCE_COMMIT="\$source_commit"' \
     "$root/scripts/publish-production-release.sh"
-grep -q "candidate_commit=.*rev-parse --verify 'HEAD" \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-! grep -q 'candidate_commit=b5c24a1277ee5b65268c601f43b634cd2943c004' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-! grep -q '202607230055_agent_identity_reader_rls_fix' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-grep -q 'diff --name-status --no-renames' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-grep -q 'candidate-migrations.expected' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-grep -q 'prior-migrations.expected' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-[[ $(grep -Fc 'description=${description_slug//_/ }' \
-    "$root/scripts/test-production-cross-version-postgres.sh") -eq 2 ]]
-! grep -Fq 'description=${base#*_}' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-grep -q 'candidate_migration_count=.*candidate_migrations' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-grep -q 'secrets.token_hex(8)' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-grep -q 'retained_container_id=.*docker run -d' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-grep -q 'docker logs "\$retained_container_id"' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-grep -q '^umask 077$' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-grep -q 'chmod 0755 "\$runtime"' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
-! grep -q 'docker run -d --rm --name "\$retained_container"' \
-    "$root/scripts/test-production-cross-version-postgres.sh"
 grep -q -- '--runtime-image "\$repository@\$runtime_digest"' "$root/scripts/publish-production-release.sh"
 grep -q -- '--migrator-image "\$repository@\$migrator_digest"' "$root/scripts/publish-production-release.sh"
 grep -q 'snapshot_tool=.*production-source-snapshot.py' \
@@ -230,7 +199,7 @@ grep -q -- '--file "\$build_context/docker/production/Dockerfile.migrate"' \
 [[ $(grep -Fc '    "$build_context"' "$root/scripts/publish-production-release.sh") -eq 2 ]]
 test -x "$root/tools/production-source-snapshot.py"
 test -x "$root/tools/test-client-binding-release-artifacts.py"
-for test_script in "$root"/scripts/{test-production-stack-update-recovery,test-production-cross-version-postgres}.sh; do
+for test_script in "$root"/scripts/test-production-stack-update-recovery.sh; do
     test -x "$test_script" || { echo "not executable: $test_script" >&2; exit 1; }
 done
 echo 'production stack structural/negative checks passed'

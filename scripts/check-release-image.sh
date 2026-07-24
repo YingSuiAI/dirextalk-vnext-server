@@ -468,7 +468,7 @@ import re
 from pathlib import Path
 
 script = Path("scripts/publish-production-release.sh").read_text()
-migration_preflight = script.index("bash scripts/test-production-cross-version-postgres.sh")
+migration_preflight = script.index("bash scripts/test-production-postgres.sh")
 source_validations = [
     match.start()
     for match in re.finditer(r'python3 "\$snapshot_tool" validate-source', script)

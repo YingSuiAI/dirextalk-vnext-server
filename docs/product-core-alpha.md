@@ -27,7 +27,7 @@ The workspace currently contains the production-oriented foundations for:
   sequencing/receipt boundaries while message plaintext remains opaque;
 - durable opaque Mailbox enqueue, Pull/ACK, account read cursors, and realtime
   invalidation/recovery paths;
-- PostgreSQL persistence, forward migrations, authorization/RLS boundaries,
+- PostgreSQL fresh-schema baseline, authorization/RLS boundaries,
   protocol schemas, generated consumers, and byte-exact test vectors;
 - the unified `dtx-node` HTTP composition used by the IM services.
 
@@ -38,7 +38,7 @@ client workflow or live environment has passed final acceptance.
 
 Alpha intentionally starts clean:
 
-- deploy a fresh schema and run the documented forward migrations;
+- install the documented current schema baseline into an empty database;
 - use fresh client-native identity, enrollment, sync, and local-store state;
 - do not import or dual-write legacy Matrix/workspace-monolith state;
 - do not add a compatibility shim merely to make an old state appear usable.
@@ -46,6 +46,11 @@ Alpha intentionally starts clean:
 Historical protocol artifacts remain available for explicit wire validation, but
 they are not alternate runtime writers or a migration source for Product Core
 Alpha.
+
+The database baseline is an exact schema epoch: its complete version and
+checksum set must match the embedded baseline. Existing databases from earlier
+schema histories are intentionally rejected; Alpha does not provide an
+upgrade, downgrade, or partial-incident recovery path for them.
 
 ## Frozen and deferred scope
 

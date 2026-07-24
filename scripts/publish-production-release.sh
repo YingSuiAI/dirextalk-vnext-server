@@ -113,10 +113,9 @@ tag_must_be_absent "$runtime_commit_tag" runtime-commit
 tag_must_be_absent "$migrator_version_tag" migrator-version
 tag_must_be_absent "$migrator_commit_tag" migrator-commit
 
-# Cross-version compatibility is a mandatory preflight. It must complete before
-# creating a builder or pushing either immutable image to the registry.
-DTX_PUBLICATION_SOURCE_COMMIT="$source_commit" \
-    bash scripts/test-production-cross-version-postgres.sh
+# Fresh PostgreSQL schema and role verification is a mandatory preflight. It
+# must complete before creating a builder or pushing either immutable image.
+bash scripts/test-production-postgres.sh
 
 # Reject a source race before any builder or push. A later worktree change is
 # harmless because both products below consume the same verified commit archive.
