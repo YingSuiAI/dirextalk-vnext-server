@@ -143,21 +143,6 @@ impl fmt::Debug for CatalogUploadCommand {
 }
 
 impl CatalogUploadCommand {
-    /// Parses and validates one exact deterministic-CBOR catalog upload.
-    ///
-    /// # Errors
-    ///
-    /// Rejects malformed, non-canonical, oversized, route-mismatched, or
-    /// internally inconsistent catalog uploads.
-    pub fn parse(
-        idempotency_key_hash: Sha256Digest,
-        route_generation: SafeUint,
-        exact_upload: &[u8],
-    ) -> Result<Self, IdentityPersistenceError> {
-        let _ = (idempotency_key_hash, route_generation, exact_upload);
-        Err(invalid("recovery catalog V1 parser removed; use parse_v2"))
-    }
-
     /// Strict V2 catalog upload parser keyed by the route catalog UUID.
     pub fn parse_v2(
         idempotency_key_hash: Sha256Digest,
@@ -266,25 +251,8 @@ pub struct CatalogPreparationCommand {
 }
 
 impl CatalogPreparationCommand {
-    /// Parses and authenticates one exact candidate-signed preparation.
-    ///
-    /// # Errors
-    ///
-    /// Rejects malformed, non-canonical, incorrectly signed, expired, or
-    /// capability-mismatched preparations.
-    pub fn parse(
-        idempotency_key_hash: Sha256Digest,
-        exact_bytes: Vec<u8>,
-        enrollment_capability: DeviceEnrollmentCapability,
-        response_capability: &RecoveryResponseCapability,
-    ) -> Result<Self, IdentityPersistenceError> {
-        let _ = (idempotency_key_hash, exact_bytes, enrollment_capability, response_capability);
-        return Err(invalid("recovery preparation V1 parser removed; use parse_v2"));
-    }
-
-    /// Strict V2 parser used by the HTTP V3 handoff. The legacy `parse` entry
-    /// point remains available to older internal fixtures, while this method
-    /// accepts only the frozen 17-field V2 preparation map.
+    /// Strict V2 parser used by the HTTP V3 handoff. It accepts only the
+    /// frozen 17-field V2 preparation map.
     pub fn parse_v2(
         idempotency_key_hash: Sha256Digest,
         exact_bytes: Vec<u8>,
@@ -318,11 +286,12 @@ impl CatalogPreparationCommand {
         let expires_at = parse_utc(fields[15])?;
         if observed_head.sequence().get() > 9_007_199_254_740_990
             || candidate_signing_key.as_bytes() == candidate_recipient_key.as_bytes()
-            || is_low_order_x25519(candidate_recipient_key.as_bytes())
             || candidate_nonce.iter().all(|byte| *byte == 0)
             || issued_at >= expires_at {
             return Err(invalid("catalog preparation binding"));
         }
+        validate_x25519_public_key(candidate_recipient_key.as_bytes())
+            .map_err(|_| invalid("catalog preparation binding"))?;
         if response_capability_hash != response_capability.digest()
             || idempotency_digest != idempotency_key_hash
         {
@@ -413,21 +382,6 @@ impl fmt::Debug for CatalogProviderResponseCommand {
 }
 
 impl CatalogProviderResponseCommand {
-    /// Parses and authenticates one exact provider-signed response.
-    ///
-    /// # Errors
-    ///
-    /// Rejects malformed, non-canonical, route-mismatched, incorrectly
-    /// signed, or digest-inconsistent responses.
-    pub fn parse(
-        idempotency_key_hash: Sha256Digest,
-        route_request_id: DeviceEnrollmentChallengeId,
-        exact_bytes: Vec<u8>,
-    ) -> Result<Self, IdentityPersistenceError> {
-        let _ = (idempotency_key_hash, route_request_id, exact_bytes);
-        Err(invalid("recovery provider V1 parser removed; use parse_v2"))
-    }
-
     /// Strict parser for the frozen 26-field V2 provider response. It checks
     /// the closed provider descriptor and provider signature coordinates and
     /// never accepts the renamed V1 response shape.
@@ -795,9 +749,7 @@ fn validate_hpke_envelope(value: &CanonicalValue) -> Result<(), IdentityPersiste
         return Err(invalid("HPKE envelope"));
     }
     let enc = parse_fixed::<32>(&fields[1].1)?;
-    if is_low_order_x25519(&enc) {
-        return Err(invalid("HPKE encapsulation"));
-    }
+    validate_x25519_public_key(&enc).map_err(|_| invalid("HPKE encapsulation"))?;
     let ciphertext = parse_bounded_bytes(&fields[2].1, 1_049_473)?;
     if ciphertext.len() < 17 {
         return Err(invalid("HPKE ciphertext"));
@@ -805,20 +757,95 @@ fn validate_hpke_envelope(value: &CanonicalValue) -> Result<(), IdentityPersiste
     Ok(())
 }
 
-/// RFC 7748's complete X25519 low-order blacklist.  Parsing a wire key is
-/// intentionally a semantic admission boundary: accepting any of these
-/// encodings permits a non-contributory all-zero DH result at the HPKE stage.
-fn is_low_order_x25519(key: &[u8]) -> bool {
-    const LOW_ORDER: [[u8; 32]; 5] = [
-        [0x00; 32],
-        [0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00],
-        [0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57],
-        [0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+/// Validates one wire X25519 public key using RFC 7748 decoding semantics.
+///
+/// RFC 7748 masks the high bit of the final little-endian byte before the
+/// Montgomery ladder. The semantic admission boundary must therefore reject
+/// both each canonical low-order encoding and its distinct bit-255 alias;
+/// otherwise an alias could bypass the low-order check while producing the
+/// same non-contributory all-zero DH result at the HPKE stage.
+fn validate_x25519_public_key(key: &[u8]) -> Result<(), ()> {
+    const fn boundary(first: u8) -> [u8; 32] {
+        let mut key = [0xff; 32];
+        key[0] = first;
+        key[31] = 0x7f;
+        key
+    }
+
+    const LOW_ORDER: &[&[u8]] = &[
+        &[0x00; 32],
+        &[0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        &[0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00],
+        &[0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57],
+        &boundary(0xec),
+        &boundary(0xed),
+        &boundary(0xee),
     ];
-    LOW_ORDER.iter().any(|candidate| key == candidate)
-        || key.len() == 32
-            && (key[0] == 0xed || key[0] == 0xee)
-            && key[1..31].iter().all(|byte| *byte == 0xff)
-            && key[31] == 0x7f
+    if key.len() != 32 {
+        return Err(());
+    }
+    let mut decoded = [0; 32];
+    decoded.copy_from_slice(key);
+    decoded[31] &= 0x7f;
+    let boundary = (0xec..=0xee).contains(&decoded[0])
+        && decoded[1..31].iter().all(|byte| *byte == 0xff)
+        && decoded[31] == 0x7f;
+    if LOW_ORDER.iter().any(|candidate| decoded.as_slice() == *candidate) || boundary {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_x25519_public_key;
+
+    #[test]
+    fn x25519_validation_rejects_canonical_low_order_encodings_and_aliases() {
+        let canonical: &[&[u8]] = &[
+            &[0x00; 32],
+            &[0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00],
+            &[0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57],
+            &[0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+            &[0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+            &[0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+        ];
+        for key in canonical {
+            assert!(validate_x25519_public_key(key).is_err());
+            if key.len() != 32 {
+                continue;
+            }
+            let mut alias = key.to_vec();
+            alias[31] |= 0x80;
+            assert!(validate_x25519_public_key(&alias).is_err());
+        }
+        for first in [0xec, 0xed, 0xee] {
+            let mut key = [0xff; 32];
+            key[0] = first;
+            key[31] = 0x7f;
+            assert!(validate_x25519_public_key(&key).is_err());
+            key[31] |= 0x80;
+            assert!(validate_x25519_public_key(&key).is_err());
+        }
+    }
+
+    #[test]
+    fn x25519_validation_accepts_valid_boundary_keys_and_aliases() {
+        let mut low_boundary = [0; 32];
+        low_boundary[0] = 2;
+        assert!(validate_x25519_public_key(&low_boundary).is_ok());
+        let mut low_boundary_alias = low_boundary;
+        low_boundary_alias[31] |= 0x80;
+        assert!(validate_x25519_public_key(&low_boundary_alias).is_ok());
+
+        let mut high_boundary = [0xff; 32];
+        high_boundary[31] = 0x7f;
+        high_boundary[0] = 0xef;
+        assert!(validate_x25519_public_key(&high_boundary).is_ok());
+        let mut high_boundary_alias = high_boundary;
+        high_boundary_alias[31] |= 0x80;
+        assert!(validate_x25519_public_key(&high_boundary_alias).is_ok());
+    }
 }
