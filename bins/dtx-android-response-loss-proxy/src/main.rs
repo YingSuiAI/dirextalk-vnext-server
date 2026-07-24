@@ -4,7 +4,9 @@
 //!
 //! It only copies TCP bytes. In particular it has no TLS configuration and never
 //! observes, parses, stores, or logs application/TLS payloads. A trigger drops
-//! the first nonempty upstream-to-client response after the trigger.
+//! the first nonempty upstream-to-client response after the trigger. A client
+//! FIN before that first response byte wins the arbiter and leaves the trigger
+//! armed; pre-response client half-close is intentionally unsupported.
 
 use std::{net::SocketAddr, sync::Arc};
 
@@ -33,28 +35,14 @@ impl LossGate {
         self.counters.triggers
     }
 
-    fn take_response_loss(&mut self, connection: &mut ConnectionState) -> bool {
-        // A trigger belongs to the first *live* response receiver.  The same
-        // mutex arbitration is used by the client reader and backend reader so
-        // an EOF observed before the first backend byte cannot consume it.
-        if !self.armed || !connection.client_read_half_active || connection.proxy_cut {
+    fn take_response_loss(&mut self) -> bool {
+        if !self.armed {
             return false;
         }
         self.armed = false;
-        connection.proxy_cut = true;
         self.counters.dropped_responses += 1;
         true
     }
-}
-
-#[derive(Debug, Default)]
-struct ConnectionState {
-    // This is the client-to-proxy read half.  Once it has ended, the proxy no
-    // longer manufactures a response loss for that connection.  In particular,
-    // a client that has already closed cannot steal an armed trigger from a
-    // later live connection.
-    client_read_half_active: bool,
-    proxy_cut: bool,
 }
 
 fn loopback(address: &str) -> Result<SocketAddr, &'static str> {
@@ -167,35 +155,30 @@ async fn relay(client: TcpStream, upstream: SocketAddr, gate: Arc<Mutex<LossGate
     };
     let (mut client_read, mut client_write) = client.into_split();
     let (mut server_read, mut server_write) = server.into_split();
-    let connection = Arc::new(Mutex::new(ConnectionState {
-        client_read_half_active: true,
-        proxy_cut: false,
-    }));
-    let reader_connection = Arc::clone(&connection);
-    let forward = tokio::spawn(async move {
-        let result = tokio::io::copy(&mut client_read, &mut server_write).await;
-        reader_connection.lock().await.client_read_half_active = false;
-        result
-    });
-    let mut buffer = [0_u8; 16_384];
-    while let Ok(read) = server_read.read(&mut buffer).await {
-        if read == 0 {
-            break;
-        }
-        // Hold both state machines while deciding the first backend byte.  The
-        // only other writer is the client read-half completion above.
-        let should_cut = {
-            let mut connection = connection.lock().await;
-            gate.lock().await.take_response_loss(&mut connection)
-        };
-        if should_cut {
-            break;
-        }
-        if client_write.write_all(&buffer[..read]).await.is_err() {
-            break;
+    let mut client_buffer = [0_u8; 16_384];
+    let mut server_buffer = [0_u8; 16_384];
+    // The sole pre-response event arbiter. `biased` makes an already-ready
+    // FIN win over an already-ready backend byte without post-I/O mutex races.
+    loop {
+        tokio::select! {
+            biased;
+            client_result = client_read.read(&mut client_buffer) => {
+                let Ok(read) = client_result else { break; };
+                if read == 0 { break; }
+                if server_write.write_all(&client_buffer[..read]).await.is_err() { break; }
+            }
+            server_result = server_read.read(&mut server_buffer) => {
+                let Ok(read) = server_result else { break; };
+                if read == 0 { break; }
+                if gate.lock().await.take_response_loss() {
+                    let _ = client_write.shutdown().await;
+                    let _ = server_write.shutdown().await;
+                    break;
+                }
+                if client_write.write_all(&server_buffer[..read]).await.is_err() { break; }
+            }
         }
     }
-    forward.abort();
 }
 
 #[cfg(test)]
@@ -209,23 +192,18 @@ mod tests {
         time::{Duration, sleep},
     };
 
-    use super::{ConnectionState, LossGate, loopback, relay};
+    use super::{LossGate, loopback, relay};
 
     #[test]
     fn loss_is_exactly_once_per_trigger_and_counters_are_deterministic() {
         let mut gate = LossGate::default();
-        let mut connection = ConnectionState {
-            client_read_half_active: true,
-            proxy_cut: false,
-        };
-        assert!(!gate.take_response_loss(&mut connection));
+        assert!(!gate.take_response_loss());
         assert_eq!(gate.trigger(), 1);
-        assert!(gate.take_response_loss(&mut connection));
-        assert!(!gate.take_response_loss(&mut connection));
+        assert!(gate.take_response_loss());
+        assert!(!gate.take_response_loss());
         assert_eq!(gate.trigger(), 2);
         assert_eq!(gate.trigger(), 3);
-        connection.proxy_cut = false;
-        assert!(gate.take_response_loss(&mut connection));
+        assert!(gate.take_response_loss());
         assert_eq!(gate.counters.triggers, 3);
         assert_eq!(gate.counters.dropped_responses, 2);
     }
@@ -265,26 +243,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_client_does_not_consume_trigger() {
-        let mut gate = LossGate::default();
-        gate.trigger();
-        let mut connection = ConnectionState {
-            client_read_half_active: false,
-            proxy_cut: false,
-        };
-        assert!(!gate.take_response_loss(&mut connection));
-        assert_eq!(gate.counters.dropped_responses, 0);
-    }
-
-    #[tokio::test]
-    async fn tcp_half_close_is_arbitrated_before_the_first_backend_byte() {
+    async fn tcp_fin_before_delayed_backend_response_keeps_trigger_armed() {
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut socket, _) = backend.accept().await.unwrap();
             let mut request = [0; 1];
             socket.read_exact(&mut request).await.unwrap();
-            // The client-to-proxy half closes before this response exists.
+            sleep(Duration::from_millis(25)).await;
             socket.write_all(b"response").await.unwrap();
         });
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -300,8 +266,7 @@ mod tests {
         client.write_all(b"x").await.unwrap();
         client.shutdown().await.unwrap();
         let mut response = [0; 8];
-        client.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"response");
+        assert_eq!(client.read(&mut response).await.unwrap(), 0);
         let gate = gate.lock().await;
         assert_eq!(gate.counters.dropped_responses, 0);
         assert!(gate.armed);

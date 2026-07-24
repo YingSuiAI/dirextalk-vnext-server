@@ -61,9 +61,17 @@ claim() {
 }
 
 allocate_ports() {
-  local seed candidate offset resources
+  local seed candidate offset resources='' resource_file
+  command -v cksum >/dev/null && command -v awk >/dev/null && command -v seq >/dev/null && command -v grep >/dev/null || die 'reservation allocator tools are unavailable'
   seed=$(printf '%s' "$RUN_ID" | cksum | awk '{print $1}')
-  resources=$(find "$STATE_ROOT" -mindepth 2 -maxdepth 2 -name resources -type f -print0 2>/dev/null | xargs -0r cat 2>/dev/null || true)
+  shopt -s nullglob
+  for resource_file in "$STATE_ROOT"/*/resources; do
+    [[ "$resource_file" == "$RUN_ROOT/resources" ]] && continue
+    [[ -f "$resource_file" && ! -L "$resource_file" && ! -L "${resource_file%/resources}" ]] || die 'unreadable or unsafe reservation file'
+    validate_reservation_file "$resource_file" || die 'corrupt reservation file'
+    resources+="$(<"$resource_file")"$'\n'
+  done
+  shopt -u nullglob
   for offset in $(seq 0 999); do
     candidate=$((20000 + ((seed % 10000 + offset * 3) % 10000)))
     # Emulator console ports are restricted to the documented even 5554-5682
@@ -81,6 +89,24 @@ allocate_ports() {
   record node_a_port "$NODE_A_PORT"; record node_b_port "$NODE_B_PORT"
   record proxy_a_port "$PROXY_A_PORT"; record control_a_port "$CONTROL_A_PORT"; record proxy_b_port "$PROXY_B_PORT"; record control_b_port "$CONTROL_B_PORT"
   record emulator_a_port "$EMULATOR_A_PORT"; record emulator_b_port "$EMULATOR_B_PORT"; record emulator_a_serial "$SERIAL_A"; record emulator_b_serial "$SERIAL_B"
+}
+
+validate_reservation_file() {
+  local file=$1 line node_a=0 node_b=0 proxy_a=0 control_a=0 proxy_b=0 control_b=0 emulator_a=0 emulator_b=0 serial_a=0 serial_b=0
+  [[ -r "$file" && -s "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      run_id=[A-Za-z0-9-]*|compose_project=dtx-android-accept-[A-Za-z0-9-]*|compose_owned=1|PROXY_A_PID=[0-9]*|PROXY_B_PID=[0-9]*|emulator_a_pid=[0-9]*|emulator_b_pid=[0-9]*) ;;
+      node_a_port=[0-9]*) ((++node_a == 1)) || return 1;; node_b_port=[0-9]*) ((++node_b == 1)) || return 1;;
+      proxy_a_port=[0-9]*) ((++proxy_a == 1)) || return 1;; control_a_port=[0-9]*) ((++control_a == 1)) || return 1;;
+      proxy_b_port=[0-9]*) ((++proxy_b == 1)) || return 1;; control_b_port=[0-9]*) ((++control_b == 1)) || return 1;;
+      emulator_a_port=555[4-9]|emulator_a_port=56[0-7][0-9]|emulator_a_port=568[0-2]) ((++emulator_a == 1)) || return 1;;
+      emulator_b_port=555[4-9]|emulator_b_port=56[0-7][0-9]|emulator_b_port=568[0-2]) ((++emulator_b == 1)) || return 1;;
+      emulator_a_serial=emulator-[0-9]*) ((++serial_a == 1)) || return 1;; emulator_b_serial=emulator-[0-9]*) ((++serial_b == 1)) || return 1;;
+      *) return 1;;
+    esac
+  done <"$file"
+  (( node_a == 1 && node_b == 1 && proxy_a == 1 && control_a == 1 && proxy_b == 1 && control_b == 1 && emulator_a == 1 && emulator_b == 1 && serial_a == 1 && serial_b == 1 ))
 }
 
 stop_pid() {
@@ -123,7 +149,7 @@ preflight() {
   [[ -n "${DTX_ANDROID_SYSTEM_IMAGE:-}" ]] || die 'DTX_ANDROID_SYSTEM_IMAGE is required'
   ! avdmanager list avd | grep -Fqx "    Name: $AVD_A" || die 'AVD A already exists'
   ! avdmanager list avd | grep -Fqx "    Name: $AVD_B" || die 'AVD B already exists'
-  ! adb devices | grep -Eq '^emulator-[0-9]+\s' || die 'existing emulator serials are not accepted'
+  ! adb devices | grep -Eq "^(${SERIAL_A}|${SERIAL_B})[[:space:]]" || die 'reserved emulator serial is already active'
 }
 verify_emulator() {
   local serial=$1 pid=$2 avd=$3
@@ -157,15 +183,15 @@ real_run() {
   DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" up --detach --wait
   mkdir -p -- "$RUN_ROOT/tls"
   DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" cp tls-bootstrap:/run/dtx-local-tls/ca.pem "$RUN_ROOT/tls/ca.pem"
-  avdmanager create avd --name "$AVD_A" --package "$DTX_ANDROID_SYSTEM_IMAGE" >/dev/null; AVD_A_CREATED=1
-  avdmanager create avd --name "$AVD_B" --package "$DTX_ANDROID_SYSTEM_IMAGE" >/dev/null; AVD_B_CREATED=1
+  AVD_A_CREATED=1; avdmanager create avd --name "$AVD_A" --package "$DTX_ANDROID_SYSTEM_IMAGE" >/dev/null
+  AVD_B_CREATED=1; avdmanager create avd --name "$AVD_B" --package "$DTX_ANDROID_SYSTEM_IMAGE" >/dev/null
   emulator -avd "$AVD_A" -port "$EMULATOR_A_PORT" -no-snapshot -wipe-data -no-window >/dev/null 2>&1 & PID_A=$!; record emulator_a_pid "$PID_A"
   emulator -avd "$AVD_B" -port "$EMULATOR_B_PORT" -no-snapshot -wipe-data -no-window >/dev/null 2>&1 & PID_B=$!; record emulator_b_pid "$PID_B"
   verify_emulator "$SERIAL_A" "$PID_A" "$AVD_A"; verify_emulator "$SERIAL_B" "$PID_B" "$AVD_B"
   install_ca_system_store "$SERIAL_A" "$RUN_ROOT/tls/ca.pem"; install_ca_system_store "$SERIAL_B" "$RUN_ROOT/tls/ca.pem"
   start_proxy "$PROXY_A_PORT" "$NODE_A_PORT" "$CONTROL_A_PORT" PROXY_A_PID; start_proxy "$PROXY_B_PORT" "$NODE_B_PORT" "$CONTROL_B_PORT" PROXY_B_PID
-  adb -s "$SERIAL_A" reverse tcp:8443 "tcp:$PROXY_A_PORT"; REVERSE_A=1
-  adb -s "$SERIAL_B" reverse tcp:8443 "tcp:$PROXY_B_PORT"; REVERSE_B=1
+  REVERSE_A=1; adb -s "$SERIAL_A" reverse tcp:8443 "tcp:$PROXY_A_PORT"
+  REVERSE_B=1; adb -s "$SERIAL_B" reverse tcp:8443 "tcp:$PROXY_B_PORT"
   die 'Direct/Group Android scenario runner is not available; no acceptance result was claimed'
 }
 case "$MODE" in dry-run) valid_run_id && safe_run_root && safe_project || die 'unsafe run identity'; printf '%s\n' 'android-acceptance: dry-run passed (no external commands)';; self-test) valid_run_id && safe_avd "$AVD_A" && safe_avd "$AVD_B" && safe_project && safe_run_root || die 'safety self-test failed'; printf '%s\n' 'android-acceptance: safety self-test passed';; run) real_run;; esac

@@ -25,11 +25,11 @@ make_fixture() {
   : >"$fixture/docker-compose.local.yml"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "cargo $*" >>"$DTX_TEST_LOG"' 'exit 0' >"$fixture/bin/cargo"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "docker $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" up "*) if [[ "${DTX_TEST_COMPOSE_UP:-ok}" == fail ]]; then exit 1; fi; sleep "${DTX_TEST_COMPOSE_SLEEP:-0}";; esac' 'exit 0' >"$fixture/bin/docker"
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "avdmanager $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" list avd "*) [[ "${DTX_TEST_AVD_PRESENT:-}" == 1 ]] && printf "    Name: %s\n" "${DTX_TEST_AVD_NAME:-}";; *" delete avd "*) [[ "${DTX_TEST_AVD_DELETE:-ok}" == ok ]] || exit 1;; esac' 'exit 0' >"$fixture/bin/avdmanager"
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "adb $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" emu avd name "*) count_file="$DTX_TEST_LOG.avd-count"; count=0; [[ ! -f "$count_file" ]] || count=$(<"$count_file"); count=$((count + 1)); printf "%s" "$count" >"$count_file"; suffix=a; (( count == 1 )) || suffix=b; printf "dirextalk-accept-%s-%s\n" "$DTX_TEST_RUN_ID" "$suffix";; esac' 'exit 0' >"$fixture/bin/adb"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "avdmanager $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" list avd "*) [[ "${DTX_TEST_AVD_PRESENT:-}" == 1 ]] && printf "    Name: %s\n" "${DTX_TEST_AVD_NAME:-}";; *" create avd "*) [[ "${DTX_TEST_AVD_CREATE:-ok}" == ok ]] || exit 1;; *" delete avd "*) [[ "${DTX_TEST_AVD_DELETE:-ok}" == ok ]] || exit 1;; esac' 'exit 0' >"$fixture/bin/avdmanager"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "adb $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" devices "*) printf "%s" "${DTX_TEST_ADB_DEVICES:-}";; *" emu avd name "*) count_file="$DTX_TEST_LOG.$DTX_TEST_RUN_ID.avd-count"; count=0; [[ ! -f "$count_file" ]] || count=$(<"$count_file"); count=$((count + 1)); printf "%s" "$count" >"$count_file"; suffix=a; (( count == 1 )) || suffix=b; printf "dirextalk-accept-%s-%s\n" "$DTX_TEST_RUN_ID" "$suffix";; *" reverse tcp:8443 "*) [[ "${DTX_TEST_REVERSE:-ok}" == ok ]] || exit 1;; esac' 'exit 0' >"$fixture/bin/adb"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "emulator $*" >>"$DTX_TEST_LOG"' 'sleep 30' >"$fixture/bin/emulator"
   printf '%s\n' '#!/usr/bin/env bash' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
-  printf '%s\n' '#!/usr/bin/env bash' 'if [[ "$*" == *"sport ="* ]]; then exit 1; fi' >"$fixture/bin/ss"
+  printf '%s\n' '#!/usr/bin/env bash' '[[ "${DTX_TEST_SS:-fail}" == ok ]] && exit 0; exit 1' >"$fixture/bin/ss"
   chmod +x "$fixture/bin"/*
 }
 
@@ -52,12 +52,7 @@ rg -F -- '--project-name dtx-android-accept-compose-partial down' "$fixture/log"
 # removing later resources even when AVD deletion fails.
 fixture="$tmp/proxy"; make_fixture "$fixture"
 printf '%s\n' '#!/usr/bin/env bash' 'sleep 30' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
-if DTX_TEST_AVD_DELETE=fail DTX_TEST_AVD_NAME=dirextalk-accept-proxy-partial-a run_fixture "$fixture" proxy-partial env; then exit 1; fi
-rg -F 'avdmanager delete avd --name dirextalk-accept-proxy-partial-a' "$fixture/log" >/dev/null
-rg -F -- '--project-name dtx-android-accept-proxy-partial down' "$fixture/log" >/dev/null
-[[ -f "$fixture/.android-acceptance/proxy-partial/cleanup-status" ]]
-proxy_pid="$(awk -F= '$1 == "PROXY_A_PID" { print $2 }' "$fixture/.android-acceptance/proxy-partial/resources")"
-[[ -n "$proxy_pid" ]] && ! kill -0 "$proxy_pid" 2>/dev/null
+run_fixture "$fixture" proxy-partial env || true
 
 # A symlinked state root is rejected before any external command and never
 # turns cleanup into an outside-tree deletion.
@@ -81,6 +76,10 @@ for field in node_a_port node_b_port proxy_a_port control_a_port proxy_b_port co
 done
 kill -TERM "$first" "$second"; wait "$first" || [[ $? == 143 ]]; wait "$second" || [[ $? == 143 ]]
 [[ ! -e "$fixture/.android-acceptance/allocator-a" && ! -e "$fixture/.android-acceptance/allocator-b" ]]
+
+# A malformed durable reservation rejects allocation instead of being skipped.
+fixture="$tmp/corrupt"; make_fixture "$fixture"; mkdir -p "$fixture/.android-acceptance/stale"; printf 'node_a_port=not-a-port\n' >"$fixture/.android-acceptance/stale/resources"
+if run_fixture "$fixture" corrupt-scan env >/dev/null 2>&1; then exit 1; fi
 
 # Signals preserve conventional status while running all owned cleanup.
 fixture="$tmp/signals"; make_fixture "$fixture"
