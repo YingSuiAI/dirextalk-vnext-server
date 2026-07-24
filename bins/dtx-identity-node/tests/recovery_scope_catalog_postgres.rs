@@ -26,23 +26,26 @@ use dtx_identity_node::{
     IdentityBootstrapState, RECOVERY_RESPONSE_CAPABILITY_HEADER,
     RECOVERY_SCOPE_CATALOG_CONTENT_TYPE, RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE,
     RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
-    RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE, RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH,
+    RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH,
     RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_PATH_TEMPLATE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE, identity_bootstrap_router_with_state,
 };
 use dtx_identity_persistence::{
     CATALOG_CIPHERTEXT_HASH_DOMAIN, CATALOG_HEAD_SIGNATURE_DOMAIN,
-    CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN, CreateDeviceEnrollmentChallengeCommand,
-    DEVICE_SESSION_SECRET_HASH_DOMAIN, DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability,
-    DeviceEnrollmentChallengeOutcome, DeviceEnrollmentRepository, DeviceSessionCompletionCommand,
-    DeviceSessionCredential, DeviceSessionOutcome, DeviceSessionRepository, IdentityAppendCommand,
-    IdentityAppendOutcome, IdentityLogHead, IdentityLogRepository, IdentityPgStore,
-    MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES, PREPARATION_SIGNATURE_DOMAIN,
-    PROVIDER_CIPHERTEXT_HASH_DOMAIN, PROVIDER_RESPONSE_SIGNATURE_DOMAIN, RECIPIENT_KEY_HASH_DOMAIN,
-    RESPONSE_CAPABILITY_HASH_DOMAIN, device_session_proof_input,
+    CreateDeviceEnrollmentChallengeCommand, DEVICE_SESSION_SECRET_HASH_DOMAIN,
+    DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability, DeviceEnrollmentChallengeOutcome,
+    DeviceEnrollmentRepository, DeviceSessionCompletionCommand, DeviceSessionCredential,
+    DeviceSessionOutcome, DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome,
+    IdentityLogHead, IdentityLogRepository, IdentityPgStore,
+    MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES, PREPARATION_DIGEST_DOMAIN,
+    PREPARATION_SIGNATURE_DOMAIN, PROVIDER_AAD_DIGEST_DOMAIN, PROVIDER_AUTHORITY_SIGNATURE_DOMAIN,
+    PROVIDER_CIPHERTEXT_HASH_DOMAIN, PROVIDER_PACKAGE_DIGEST_DOMAIN,
+    PROVIDER_RESPONSE_SIGNATURE_DOMAIN, RECIPIENT_KEY_HASH_DOMAIN, RESPONSE_CAPABILITY_HASH_DOMAIN,
+    device_session_proof_input,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -380,11 +383,19 @@ fn preparation_body(
         field(10, head.sequence().to_canonical_value()),
         field(11, head.hash().to_canonical_value()),
         field(12, CanonicalValue::Bytes(vec![60; 32])),
-        field(13,
+        field(
+            13,
             Sha256Digest::hash_domain(RESPONSE_CAPABILITY_HASH_DOMAIN, &response_capability)
                 .to_canonical_value(),
         ),
-        field(14, Sha256Digest::hash_domain(b"dirextalk.recovery-scope-catalog-handoff-preparation-idempotency.v2\0", idempotency_key.as_bytes()).to_canonical_value()),
+        field(
+            14,
+            Sha256Digest::hash_domain(
+                b"dirextalk.recovery-scope-catalog-handoff-preparation-idempotency.v2\0",
+                idempotency_key.as_bytes(),
+            )
+            .to_canonical_value(),
+        ),
         field(15, at(4_500).to_canonical_value()),
         field(16, at(200_000).to_canonical_value()),
     ]);
@@ -398,42 +409,153 @@ fn preparation_body(
     ))?)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fixture names every signed V2 response coordinate explicitly"
+)]
 fn provider_body(
     request: dtx_domain::DeviceEnrollmentChallengeId,
-    catalog: Sha256Digest,
-    device: DeviceId,
-    signer: &SigningKey,
-    authority: Sha256Digest,
-    recipient: [u8; 32],
+    identity: IdentityId,
+    catalog_id: uuid::Uuid,
+    catalog_generation: SafeUint,
+    catalog_head_digest: Sha256Digest,
+    preparation: &[u8],
+    signed_head: &[u8],
+    observed_head: IdentityLogHead,
+    successor_head: IdentityLogHead,
+    candidate_device: DeviceId,
+    candidate_recipient: [u8; 32],
+    device_add: &[u8],
+    provider_device: DeviceId,
+    provider_signer: &SigningKey,
+    authority_device: DeviceId,
+    authority_signer: &SigningKey,
+    response_idempotency_key: &str,
+    issued_at: UtcMillis,
+    expires_at: UtcMillis,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let ciphertext = b"opaque-hpke-response-v1".to_vec();
-    let unsigned = CanonicalValue::Map(vec![
-        field(1, CanonicalValue::Unsigned(1)),
-        field(2, CanonicalValue::Text(request.to_string())),
-        field(3, catalog.to_canonical_value()),
-        field(4, CanonicalValue::Text(device.to_string())),
-        field(5, public(signer).to_canonical_value()),
-        field(6, authority.to_canonical_value()),
-        field(
-            7,
-            Sha256Digest::hash_domain(RECIPIENT_KEY_HASH_DOMAIN, &recipient).to_canonical_value(),
-        ),
-        field(8, CanonicalValue::Bytes(ciphertext.clone())),
-        field(
-            9,
-            Sha256Digest::hash_domain(PROVIDER_CIPHERTEXT_HASH_DOMAIN, &ciphertext)
-                .to_canonical_value(),
-        ),
-        field(10, at(200_000).to_canonical_value()),
+    let preparation_digest = Sha256Digest::hash_domain(PREPARATION_DIGEST_DOMAIN, preparation);
+    let recipient_key_digest =
+        Sha256Digest::hash_domain(RECIPIENT_KEY_HASH_DOMAIN, &candidate_recipient);
+    let device_add_digest =
+        Sha256Digest::hash_domain(b"dirextalk.identity-device-add.v1\0", device_add);
+    let provider_descriptor = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(provider_device.to_string())),
+        field(3, public(provider_signer).to_canonical_value()),
     ]);
-    let signature = domain_signature(signer, PROVIDER_RESPONSE_SIGNATURE_DOMAIN, &unsigned)?;
-    let CanonicalValue::Map(mut signed_fields) = unsigned else {
+    let authority_descriptor = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(1)),
+        field(2, CanonicalValue::Text(authority_device.to_string())),
+        field(3, public(authority_signer).to_canonical_value()),
+    ]);
+    let package = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(request.to_string())),
+        field(3, preparation_digest.to_canonical_value()),
+        field(4, CanonicalValue::Bytes(signed_head.to_vec())),
+        // The identity service remains blind to this candidate-decrypted
+        // package; a canonical opaque placeholder keeps the helper bounded.
+        field(5, CanonicalValue::Bytes(vec![0xa1, 0x01, 0x02])),
+        field(6, CanonicalValue::Text(identity.to_string())),
+        field(7, CanonicalValue::Text(catalog_id.to_string())),
+        field(8, catalog_generation.to_canonical_value()),
+        field(9, CanonicalValue::Text(candidate_device.to_string())),
+        field(10, CanonicalValue::Bytes(candidate_recipient.to_vec())),
+        field(11, observed_head.sequence().to_canonical_value()),
+        field(12, observed_head.hash().to_canonical_value()),
+        field(13, successor_head.sequence().to_canonical_value()),
+        field(14, successor_head.hash().to_canonical_value()),
+        field(15, device_add_digest.to_canonical_value()),
+        field(16, issued_at.to_canonical_value()),
+        field(17, expires_at.to_canonical_value()),
+    ]);
+    let package_bytes = encode_deterministic_cbor(&package)?;
+    let package_digest = Sha256Digest::hash_domain(PROVIDER_PACKAGE_DIGEST_DOMAIN, &package_bytes);
+
+    let response_idempotency_digest = Sha256Digest::hash_domain(
+        b"dirextalk.recovery-scope-catalog-handoff-response-idempotency.v2\0",
+        response_idempotency_key.as_bytes(),
+    );
+    let aad = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(request.to_string())),
+        field(3, preparation_digest.to_canonical_value()),
+        field(4, CanonicalValue::Text(identity.to_string())),
+        field(5, CanonicalValue::Text(catalog_id.to_string())),
+        field(6, catalog_generation.to_canonical_value()),
+        field(7, catalog_head_digest.to_canonical_value()),
+        field(8, CanonicalValue::Text(candidate_device.to_string())),
+        field(9, recipient_key_digest.to_canonical_value()),
+        field(10, observed_head.sequence().to_canonical_value()),
+        field(11, observed_head.hash().to_canonical_value()),
+        field(12, successor_head.sequence().to_canonical_value()),
+        field(13, successor_head.hash().to_canonical_value()),
+        field(14, device_add_digest.to_canonical_value()),
+        field(15, provider_descriptor.clone()),
+        field(16, authority_descriptor.clone()),
+        field(17, package_digest.to_canonical_value()),
+        field(18, response_idempotency_digest.to_canonical_value()),
+        field(19, issued_at.to_canonical_value()),
+        field(20, expires_at.to_canonical_value()),
+    ]);
+    let aad_bytes = encode_deterministic_cbor(&aad)?;
+    let aad_digest = Sha256Digest::hash_domain(PROVIDER_AAD_DIGEST_DOMAIN, &aad_bytes);
+
+    // Structural RFC 9180 base-mode envelope: a fresh non-low-order X25519
+    // encapsulation and ciphertext including the required ChaCha20-Poly1305
+    // authentication tag. The identity service intentionally does not decrypt.
+    let envelope = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Bytes(vec![7; 32])),
+        field(3, CanonicalValue::Bytes(vec![8; 17])),
+    ]);
+    let envelope_bytes = encode_deterministic_cbor(&envelope)?;
+    let envelope_digest =
+        Sha256Digest::hash_domain(PROVIDER_CIPHERTEXT_HASH_DOMAIN, &envelope_bytes);
+
+    let unsigned = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(request.to_string())),
+        field(3, preparation_digest.to_canonical_value()),
+        field(4, CanonicalValue::Text(identity.to_string())),
+        field(5, CanonicalValue::Text(catalog_id.to_string())),
+        field(6, catalog_generation.to_canonical_value()),
+        field(7, catalog_head_digest.to_canonical_value()),
+        field(8, CanonicalValue::Text(candidate_device.to_string())),
+        field(9, recipient_key_digest.to_canonical_value()),
+        field(10, observed_head.sequence().to_canonical_value()),
+        field(11, observed_head.hash().to_canonical_value()),
+        field(12, successor_head.sequence().to_canonical_value()),
+        field(13, successor_head.hash().to_canonical_value()),
+        field(14, device_add_digest.to_canonical_value()),
+        field(15, provider_descriptor),
+        field(16, authority_descriptor),
+        field(17, package_digest.to_canonical_value()),
+        field(18, aad_digest.to_canonical_value()),
+        field(19, envelope_digest.to_canonical_value()),
+        field(20, response_idempotency_digest.to_canonical_value()),
+        field(21, issued_at.to_canonical_value()),
+        field(22, expires_at.to_canonical_value()),
+    ]);
+    let provider_signature = domain_signature(
+        provider_signer,
+        PROVIDER_RESPONSE_SIGNATURE_DOMAIN,
+        &unsigned,
+    )?;
+    let authority_signature = domain_signature(
+        authority_signer,
+        PROVIDER_AUTHORITY_SIGNATURE_DOMAIN,
+        &unsigned,
+    )?;
+    let CanonicalValue::Map(mut fields) = unsigned else {
         unreachable!()
     };
-    signed_fields.push(field(11, signature.to_canonical_value()));
-    Ok(encode_deterministic_cbor(&CanonicalValue::Map(
-        signed_fields,
-    ))?)
+    fields.push(field(23, provider_signature.to_canonical_value()));
+    fields.push(field(24, authority_signature.to_canonical_value()));
+    fields.push(field(25, CanonicalValue::Bytes(device_add.to_vec())));
+    fields.push(field(26, envelope));
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
 }
 
 fn genesis(root: &SigningKey, recovery: &SigningKey) -> IdentityLogEventV1 {

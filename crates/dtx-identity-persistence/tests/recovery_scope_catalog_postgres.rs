@@ -34,8 +34,6 @@ const AUTHORITY_DEVICE: &str = "0190f2a5-7b1c-7abc-8def-0123456789a3";
 const PROVIDER_DEVICE: &str = "0190f2a5-7b1c-7abc-8def-0123456789a4";
 const CANDIDATE_DEVICE: &str = "0190f2a5-7b1c-7abc-8def-0123456789a5";
 const SECOND_CANDIDATE_DEVICE: &str = "0190f2a5-7b1c-7abc-8def-0123456789a6";
-const AUTHORITY_CANDIDATE_DEVICE: &str = "0190f2a5-7b1c-7abc-8def-0123456789a7";
-const RACING_CANDIDATE_DEVICE: &str = "0190f2a5-7b1c-7abc-8def-0123456789a8";
 
 include!("recovery_scope_catalog_parts/helpers.rs");
 

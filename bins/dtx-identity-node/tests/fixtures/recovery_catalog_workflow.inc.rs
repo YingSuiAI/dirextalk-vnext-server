@@ -284,6 +284,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     let prepare_second = prepare_second?;
     assert_created_and_replayed(&prepare_first, &prepare_second);
     assert_catalog_headers(&prepare_first, RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE);
+    let preparation_receipt_bytes = to_bytes(prepare_first.into_body(), 16_384).await?.to_vec();
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 0));
 
     let wrong_capability = send_status(app.clone(), challenge.challenge_id(), [62; 32]).await?;
@@ -298,30 +299,6 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     assert_catalog_headers(&pending, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
     assert_redacted_status(pending, 1).await?;
 
-    let invalid_provider = provider_body(
-        challenge.challenge_id(),
-        catalog_head_digest,
-        authority_device,
-        &authority,
-        Sha256Digest::from_bytes([99; 32]),
-        [55; 32],
-    )?;
-    let invalid_provider_response = send_provider_response(
-        app.clone(),
-        "catalog-provider-invalid",
-        &authority_session,
-        challenge.challenge_id(),
-        invalid_provider,
-    )
-    .await?;
-    assert_error(
-        invalid_provider_response,
-        StatusCode::PRECONDITION_FAILED,
-        "RECOVERY_PREPARATION_INVALIDATED",
-    )
-    .await?;
-    assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 0));
-
     let candidate_add = device_add(
         &root,
         identity_id,
@@ -332,12 +309,13 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         head3.hash(),
         5_200,
     );
+    let candidate_add_bytes = candidate_add.to_deterministic_cbor()?;
     let approval = DeviceEnrollmentApprovalCommand::new(
         Sha256Digest::from_bytes([71; 32]),
         challenge.challenge_id(),
         DeviceEnrollmentCapability::new(enrollment_capability)?,
         head3.hash(),
-        candidate_add.to_deterministic_cbor()?,
+        candidate_add_bytes.clone(),
     )?;
     let head4 = committed(
         enrollment_repository
@@ -353,16 +331,62 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
             .await?,
     )?;
     clock.set(5_300);
-    let provider_response_body = provider_body(
+    let invalid_provider = provider_body(
         challenge.challenge_id(),
+        identity_id,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        safe(1),
         catalog_head_digest,
+        &preparation,
+        &first_head,
+        head3,
+        head4,
+        candidate_device,
+        [55; 32],
+        &candidate_add_bytes,
         provider_device,
         &provider,
-        Sha256Digest::hash_domain(
-            CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN,
-            public(&authority).as_bytes(),
-        ),
+        DeviceId::from_str(SECOND_CANDIDATE_DEVICE)?,
+        &key(6),
+        "catalog-provider-invalid",
+        at(5_300),
+        at(200_000),
+    )?;
+    let invalid_provider_response = send_provider_response(
+        app.clone(),
+        "catalog-provider-invalid",
+        &provider_session,
+        challenge.challenge_id(),
+        invalid_provider,
+    )
+    .await?;
+    assert_error(
+        invalid_provider_response,
+        StatusCode::PRECONDITION_FAILED,
+        "RECOVERY_PREPARATION_INVALIDATED",
+    )
+    .await?;
+    assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 0));
+    let provider_response_body = provider_body(
+        challenge.challenge_id(),
+        identity_id,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        safe(1),
+        catalog_head_digest,
+        &preparation,
+        &first_head,
+        head3,
+        head4,
+        candidate_device,
         [55; 32],
+        &candidate_add_bytes,
+        provider_device,
+        &provider,
+        authority_device,
+        &authority,
+        "catalog-provider-0001",
+        at(5_300),
+        at(200_000),
     )?;
     let (provider_first, provider_second) = tokio::join!(
         send_provider_response(
@@ -382,8 +406,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     );
     let provider_first = provider_first?;
     let provider_second = provider_second?;
-    assert_eq!(provider_first.status(), StatusCode::OK);
-    assert_eq!(provider_second.status(), StatusCode::OK);
+    assert_created_and_replayed(&provider_first, &provider_second);
     assert_catalog_headers(&provider_first, RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE);
     assert_catalog_headers(&provider_second, RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE);
     assert_eq!(
@@ -413,10 +436,13 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     )
     .await?;
     assert_eq!(ready_replay.status(), StatusCode::OK);
-    assert_catalog_headers(&ready_replay, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
+    assert_catalog_headers(
+        &ready_replay,
+        RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
+    );
     assert_eq!(
         to_bytes(ready_replay.into_body(), 1_100_000).await?,
-        ready_bytes
+        preparation_receipt_bytes
     );
 
     clock.set(5_400);
@@ -448,8 +474,8 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     );
     let invalidated =
         send_status(app.clone(), challenge.challenge_id(), response_capability).await?;
-    assert_eq!(invalidated.status(), StatusCode::PRECONDITION_FAILED);
-    let invalidated_bytes = assert_redacted_status(invalidated, 4).await?;
+    assert_eq!(invalidated.status(), StatusCode::OK);
+    assert_redacted_status(invalidated, 5).await?;
     let invalidated_replay = send_preparation(
         app.clone(),
         "catalog-preparation-0001",
@@ -461,11 +487,11 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     assert_eq!(invalidated_replay.status(), StatusCode::OK);
     assert_catalog_headers(
         &invalidated_replay,
-        RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+        RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
     );
     assert_eq!(
         to_bytes(invalidated_replay.into_body(), 1_100_000).await?,
-        invalidated_bytes
+        preparation_receipt_bytes
     );
 
     let cancelled_candidate = key(6);
@@ -507,7 +533,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         "catalog-preparation-cancelled",
         cancelled_enrollment_capability,
         cancelled_response_capability,
-        cancelled_preparation,
+        cancelled_preparation.clone(),
     )
     .await?;
     assert_eq!(prepared.status(), StatusCode::CREATED);
@@ -526,18 +552,44 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         cancelled_response_capability,
     )
     .await?;
-    assert_eq!(cancelled_status.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(cancelled_status.status(), StatusCode::OK);
     assert_redacted_status(cancelled_status, 4).await?;
+    let cancelled_add = device_add(
+        &root,
+        identity_id,
+        cancelled_candidate_device,
+        &cancelled_candidate,
+        66,
+        5,
+        head4.hash(),
+        5_401,
+    );
+    let cancelled_add_bytes = cancelled_add.to_deterministic_cbor()?;
+    let cancelled_successor = IdentityLogHead::observed(
+        identity_id,
+        safe(5),
+        cancelled_add.entry_hash()?,
+    )?;
     let cancelled_provider = provider_body(
         cancelled_challenge.challenge_id(),
+        identity_id,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b3")?,
+        safe(2),
         rotated_head_digest,
+        &cancelled_preparation,
+        &rotated_head,
+        head4,
+        cancelled_successor,
+        cancelled_candidate_device,
+        [66; 32],
+        &cancelled_add_bytes,
         provider_device,
         &provider,
-        Sha256Digest::hash_domain(
-            CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN,
-            public(&authority).as_bytes(),
-        ),
-        [66; 32],
+        authority_device,
+        &authority,
+        "catalog-provider-cancelled",
+        at(5_403),
+        at(200_000),
     )?;
     let cancelled_provider_response = send_provider_response(
         app.clone(),
@@ -593,8 +645,8 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
 
     clock.set(200_000);
     let expired = send_status(app.clone(), challenge.challenge_id(), response_capability).await?;
-    assert_eq!(expired.status(), StatusCode::GONE);
-    let expired_bytes = assert_redacted_status(expired, 3).await?;
+    assert_eq!(expired.status(), StatusCode::OK);
+    assert_redacted_status(expired, 3).await?;
     let expired_replay = send_preparation(
         app.clone(),
         "catalog-preparation-0001",
@@ -604,10 +656,13 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     )
     .await?;
     assert_eq!(expired_replay.status(), StatusCode::OK);
-    assert_catalog_headers(&expired_replay, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
+    assert_catalog_headers(
+        &expired_replay,
+        RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
+    );
     assert_eq!(
         to_bytes(expired_replay.into_body(), 1_100_000).await?,
-        expired_bytes
+        preparation_receipt_bytes
     );
 
     sqlx::query("REVOKE SELECT ON identity.recovery_scope_catalogs FROM dtx_identity_runtime")
