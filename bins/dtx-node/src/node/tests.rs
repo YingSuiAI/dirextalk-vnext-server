@@ -49,8 +49,8 @@ mod tests {
     #[test]
     fn public_opt_in_and_pool_bounds_fail_closed() {
         assert!(!super::public_content_enabled(None).expect("default disabled"));
-        assert!(super::public_content_enabled(Some("true".to_owned())).expect("explicit opt in"));
-        assert!(super::public_content_enabled(Some("1".to_owned())).is_err());
+        assert!(super::public_content_enabled(Some("true")).expect("explicit opt in"));
+        assert!(super::public_content_enabled(Some("1")).is_err());
         assert!(super::parse_pool_size("DTX_NODE_TEST_MISSING", 2, 64).is_ok());
     }
 

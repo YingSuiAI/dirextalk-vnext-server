@@ -57,7 +57,8 @@ impl NodeConfig {
             .parse::<TenantId>()
             .map_err(|_| NodeError::Configuration)?;
         #[cfg(feature = "public-content")]
-        let public_content = match public_content_enabled(env::var(PUBLIC_CONTENT_ENABLED_ENV).ok())? {
+        let public_content =
+            match public_content_enabled(env::var(PUBLIC_CONTENT_ENABLED_ENV).ok().as_deref())? {
                 false => None,
                 true => Some(PublicContentConfig {
                     public_feed_database: load_database_options(PUBLIC_FEED_DATABASE_URL_FILE_ENV)?,
@@ -69,7 +70,7 @@ impl NodeConfig {
                 }),
             };
         #[cfg(not(feature = "public-content"))]
-        if public_content_enabled(env::var(PUBLIC_CONTENT_ENABLED_ENV).ok())? {
+        if public_content_enabled(env::var(PUBLIC_CONTENT_ENABLED_ENV).ok().as_deref())? {
             return Err(NodeError::Configuration);
         }
         let allowed_http_identity_origins = env::var(DEV_HTTP_IDENTITY_ORIGINS_ENV)
@@ -121,8 +122,8 @@ fn parse_pool_size(name: &str, default: u32, maximum: u32) -> Result<u32, NodeEr
     }
 }
 
-fn public_content_enabled(value: Option<String>) -> Result<bool, NodeError> {
-    match value.as_deref() {
+fn public_content_enabled(value: Option<&str>) -> Result<bool, NodeError> {
+    match value {
         None | Some("false") => Ok(false),
         Some("true") => Ok(true),
         Some(_) => Err(NodeError::Configuration),

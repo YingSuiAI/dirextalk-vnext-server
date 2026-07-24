@@ -87,15 +87,13 @@ async fn run() -> Result<(), NodeError> {
     } = NodeConfig::load()?;
     let sequencer_signing_key = load_mls_sequencer_signing_key(&group_mls_sequencer_key_file)
         .map_err(|_| NodeError::Configuration)?;
-    let identity_store = IdentityPgStore::connect(identity_database, db_max_connections)
-        .await
-        .map_err(|_| NodeError::Database("identity"))?;
-    let group_store = GroupPgStore::connect(group_database, db_max_connections)
-        .await
-        .map_err(|_| NodeError::Database("group"))?;
-    let mailbox_store = MailboxPgStore::connect(mailbox_database, db_max_connections)
-        .await
-        .map_err(|_| NodeError::Database("mailbox"))?;
+    let (identity_store, group_store, mailbox_store) = connect_product_stores(
+        identity_database,
+        group_database,
+        mailbox_database,
+        db_max_connections,
+    )
+    .await?;
 
     let clock = Arc::new(SystemClock);
     let identity_state = IdentityBootstrapState::with_clock_and_device_session_audience(
@@ -120,9 +118,7 @@ async fn run() -> Result<(), NodeError> {
     )?;
     let mailbox_state = MailboxNodeState::with_clock(mailbox_store.clone(), clock);
 
-    let router = identity_bootstrap_router_with_state(identity_state)
-        .merge(group_router_with_state(group_state))
-        .merge(mailbox_router_with_state(mailbox_state));
+    let router = product_core_router(identity_state, group_state, mailbox_state);
     #[cfg(feature = "public-content")]
     let mut router = router;
     #[cfg(feature = "public-content")]
@@ -174,6 +170,34 @@ async fn run() -> Result<(), NodeError> {
         .with_state(readiness);
     let router = router.merge(local_router);
     serve_node(router, listen, tls).await
+}
+
+async fn connect_product_stores(
+    identity_database: PgConnectOptions,
+    group_database: PgConnectOptions,
+    mailbox_database: PgConnectOptions,
+    max_connections: u32,
+) -> Result<(IdentityPgStore, GroupPgStore, MailboxPgStore), NodeError> {
+    let identity = IdentityPgStore::connect(identity_database, max_connections)
+        .await
+        .map_err(|_| NodeError::Database("identity"))?;
+    let group = GroupPgStore::connect(group_database, max_connections)
+        .await
+        .map_err(|_| NodeError::Database("group"))?;
+    let mailbox = MailboxPgStore::connect(mailbox_database, max_connections)
+        .await
+        .map_err(|_| NodeError::Database("mailbox"))?;
+    Ok((identity, group, mailbox))
+}
+
+fn product_core_router(
+    identity: IdentityBootstrapState,
+    group: GroupNodeState,
+    mailbox: MailboxNodeState,
+) -> axum::Router {
+    identity_bootstrap_router_with_state(identity)
+        .merge(group_router_with_state(group))
+        .merge(mailbox_router_with_state(mailbox))
 }
 
 async fn serve_node(
