@@ -87,6 +87,11 @@ struct AlphaManifest {
 }
 
 /// Verifies the exact current Product Core Alpha inventory.
+///
+/// # Errors
+///
+/// Returns an error when the manifest cannot be read or the current inventory
+/// differs from the committed Alpha contract.
 pub fn check_alpha(root: &Path) -> Result<(), ProtocolToolError> {
     let manifest_path = root.join(MANIFEST_PATH);
     let manifest = read_manifest(&manifest_path)?;
@@ -101,6 +106,11 @@ pub fn check_alpha(root: &Path) -> Result<(), ProtocolToolError> {
 }
 
 /// Writes the current Alpha inventory once during an intentional contract update.
+///
+/// # Errors
+///
+/// Returns an error when the current inventory cannot be collected or the
+/// manifest cannot be serialized or written.
 pub fn write_alpha(root: &Path) -> Result<(), ProtocolToolError> {
     let manifest = current_manifest(root)?;
     let path = root.join(MANIFEST_PATH);

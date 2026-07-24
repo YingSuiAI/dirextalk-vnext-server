@@ -8,6 +8,7 @@ use crate::ProtocolToolError;
 
 use super::ExpectedType;
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn validate_contract(cddl: &Cddl) -> Result<(), ProtocolToolError> {
     let expected_rules = [
         "digest",

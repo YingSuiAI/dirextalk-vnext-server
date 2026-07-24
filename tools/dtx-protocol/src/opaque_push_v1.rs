@@ -8,6 +8,7 @@ use crate::ProtocolToolError;
 /// Validates the V43 opaque push registration CDDL, vector, and provider
 /// payload boundary. This module intentionally has no runtime or persistence
 /// dependencies.
+#[allow(clippy::too_many_lines)]
 pub fn validate(root: &Path) -> Result<(), ProtocolToolError> {
     let cddl_path = root.join("protocol/cddl/opaque-push/v1/opaque-push-v1.cddl");
     let cddl = fs::read_to_string(&cddl_path).map_err(|error| {
@@ -119,6 +120,7 @@ pub fn validate(root: &Path) -> Result<(), ProtocolToolError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_openapi(root: &Path) -> Result<(), ProtocolToolError> {
     let path = root.join("protocol/openapi/opaque-push/v1/openapi.yaml");
     let source = fs::read_to_string(&path)
@@ -265,7 +267,7 @@ fn is_canonical_uuid_v7(value: &str) -> bool {
         return false;
     }
     if bytes.iter().enumerate().any(|(index, byte)| {
-        [8, 13, 18, 23].contains(&index) == false
+        ![8, 13, 18, 23].contains(&index)
             && (!byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
     }) {
         return false;
@@ -314,7 +316,7 @@ fn validate_cbor_hex(
 }
 
 fn decode_hex(input: &str) -> Result<Vec<u8>, ProtocolToolError> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return Err(ProtocolToolError::new(
             "opaque push vector hex has odd length",
         ));

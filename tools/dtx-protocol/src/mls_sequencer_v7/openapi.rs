@@ -230,6 +230,7 @@ pub(super) const SUCCESS_RESPONSE_SPECS: &[ResponseSpec<'static>] = &[
     },
 ];
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn validate_contract(document: &Value) -> Result<(), ProtocolToolError> {
     if string_at(document, "/openapi", "OpenAPI version")? != "3.1.0"
         || string_at(document, "/info/version", "OpenAPI info version")? != "7.0.0"

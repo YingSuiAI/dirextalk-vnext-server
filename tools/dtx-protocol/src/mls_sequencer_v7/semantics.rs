@@ -178,6 +178,7 @@ fn validate_no_store_responses(document: &Value) -> Result<(), ProtocolToolError
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn validate_semantics(document: &Value) -> Result<(), ProtocolToolError> {
     require_json(
         document,
@@ -458,6 +459,7 @@ fn require_receipt_and_idempotency_bindings(document: &Value) -> Result<(), Prot
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn require_persistence_and_privacy_semantics(document: &Value) -> Result<(), ProtocolToolError> {
     require_json(
         document,

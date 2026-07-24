@@ -5,6 +5,7 @@ use crate::ProtocolToolError;
 use super::helpers::{object_at, require_exact_keys, require_json, string_at};
 use super::{CDDL_RELATIVE, DOMAINS};
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn validate_contract(document: &Value) -> Result<(), ProtocolToolError> {
     if string_at(document, "/openapi", "OpenAPI version")? != "3.1.0"
         || string_at(document, "/info/version", "OpenAPI info version")? != "4.0.0"
@@ -461,6 +462,7 @@ pub(super) fn validate_contract(document: &Value) -> Result<(), ProtocolToolErro
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_operation(
     document: &Value,
     pointer: &str,
