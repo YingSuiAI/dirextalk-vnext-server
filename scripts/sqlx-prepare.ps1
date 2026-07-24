@@ -75,8 +75,8 @@ try {
 
     & $cargoScript sqlx migrate run --source migrations
     Assert-LastExitCode 'cargo sqlx migrate run'
-    & $cargoScript sqlx prepare --check
-    Assert-LastExitCode 'cargo sqlx prepare --check'
+    & $cargoScript sqlx prepare --workspace --check
+    Assert-LastExitCode 'cargo sqlx prepare --workspace --check'
 } finally {
     if ($null -eq $previousDatabaseUrl) {
         Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue
