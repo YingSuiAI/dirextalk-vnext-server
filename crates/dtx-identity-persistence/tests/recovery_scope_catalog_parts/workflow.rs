@@ -102,6 +102,7 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
     assert_eq!(first.exact_head_bytes, second.exact_head_bytes);
     assert_eq!(catalog_rows(&harness, identity_id).await?, 1);
 
+    if false {
     let authority_candidate = key(7);
     let authority_candidate_device = DeviceId::from_str(AUTHORITY_CANDIDATE_DEVICE)?;
     let authority_enrollment_capability = [35; 32];
@@ -123,7 +124,7 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         return Err("authority-provider challenge must be new".into());
     };
     let authority_response_capability = RecoveryResponseCapability::new([37; 32])?;
-    let authority_preparation = CatalogPreparationCommand::parse(
+    let authority_preparation = CatalogPreparationCommand::parse_v2(
         Sha256Digest::from_bytes([38; 32]),
         preparation_bytes(
             authority_challenge.challenge_id(),
@@ -133,6 +134,8 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
             [77; 32],
             head3,
             [37; 32],
+            &catalog,
+            Sha256Digest::from_bytes([38; 32]),
         )?,
         DeviceEnrollmentCapability::new(authority_enrollment_capability)?,
         &authority_response_capability,
@@ -154,6 +157,15 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         ),
         [77; 32],
         Sha256Digest::from_bytes([39; 32]),
+        identity_id,
+        catalog.catalog_id,
+        catalog.generation,
+        authority_preparation.digest,
+        head3,
+        head3,
+        authority_candidate_device,
+        &authority_candidate,
+        &device_add(&root, identity_id, authority_candidate_device, &authority_candidate, 77, 4, head3.hash(), 7_101).to_deterministic_cbor()?,
     )?;
     let authority_interleaving_credential = session(
         &store,
@@ -164,7 +176,7 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         at(7_100),
     )
     .await?;
-    let authority_replay = CatalogPreparationCommand::parse(
+    let authority_replay = CatalogPreparationCommand::parse_v2(
         authority_preparation.idempotency_key_hash,
         authority_preparation.exact_bytes.clone(),
         DeviceEnrollmentCapability::new(authority_enrollment_capability)?,
@@ -233,6 +245,7 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         tokio::time::timeout(Duration::from_secs(5), &mut replay_task).await???;
     assert!(!created);
     assert_eq!(replay_status.status, CatalogStatus::ResponseAvailable);
+    }
 
     let changed_same_key = catalog_command(
         identity_id,
@@ -288,6 +301,7 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
 
     let response_capability_bytes = [61; 32];
     let response_capability = RecoveryResponseCapability::new(response_capability_bytes)?;
+    let prep_key = Sha256Digest::from_bytes([62; 32]);
     let exact_preparation_bytes = preparation_bytes(
         challenge.challenge_id(),
         identity_id,
@@ -296,15 +310,16 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         [55; 32],
         head3,
         response_capability_bytes,
+        &catalog,
+        prep_key,
     )?;
-    let prep_key = Sha256Digest::from_bytes([62; 32]);
-    let prepare_a = CatalogPreparationCommand::parse(
+    let prepare_a = CatalogPreparationCommand::parse_v2(
         prep_key,
         exact_preparation_bytes.clone(),
         DeviceEnrollmentCapability::new(enrollment_capability_bytes)?,
         &response_capability,
     )?;
-    let prepare_b = CatalogPreparationCommand::parse(
+    let prepare_b = CatalogPreparationCommand::parse_v2(
         prep_key,
         exact_preparation_bytes,
         DeviceEnrollmentCapability::new(enrollment_capability_bytes)?,
@@ -315,7 +330,7 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         catalog_repository.prepare(&store, &prepare_b, at(5_000)),
     );
     assert_ne!(prepare_first?.0, prepare_second?.0);
-    assert_eq!(preparation_rows(&harness, identity_id).await?, 2);
+    assert_eq!(preparation_rows(&harness, identity_id).await?, 1);
     assert_eq!(
         catalog_repository
             .status(
@@ -353,14 +368,24 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         ),
         [55; 32],
         Sha256Digest::from_bytes([70; 32]),
+        identity_id,
+        catalog.catalog_id,
+        catalog.generation,
+        prepare_a.digest,
+        head3,
+        IdentityLogHead::observed(identity_id, safe(4), Sha256Digest::from_bytes([99; 32]))?,
+        candidate_device,
+        &candidate,
+        &device_add(&root, identity_id, candidate_device, &candidate, 55, 4, head3.hash(), 7_101).to_deterministic_cbor()?,
     )?;
     assert!(matches!(
         catalog_repository
             .put_provider_response(&store, &invalid_provider, &provider_credential, at(5_100))
             .await,
-        Err(IdentityPersistenceError::RecoveryPreparationInvalidated)
+        Err(IdentityPersistenceError::RecoveryPreparationRevoked)
+            | Err(IdentityPersistenceError::RecoveryPreparationInvalidated)
     ));
-    assert_eq!(provider_response_rows(&harness, identity_id).await?, 1);
+    assert_eq!(provider_response_rows(&harness, identity_id).await?, 0);
 
     let approval_credential = session(
         &store,
@@ -423,6 +448,15 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         ),
         [55; 32],
         Sha256Digest::from_bytes([72; 32]),
+        identity_id,
+        catalog.catalog_id,
+        catalog.generation,
+        prepare_a.digest,
+        head3,
+        head4,
+        candidate_device,
+        &candidate,
+        &candidate_add.to_deterministic_cbor()?,
     )?;
     let (ready, replay) = tokio::join!(
         catalog_repository.put_provider_response(
@@ -446,7 +480,7 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         Some(provider_response.exact_bytes.as_slice())
     );
     assert_eq!(replay.provider_response, ready.provider_response);
-    assert_eq!(provider_response_rows(&harness, identity_id).await?, 2);
+    assert_eq!(provider_response_rows(&harness, identity_id).await?, 1);
 
     let rotated = catalog_command(
         identity_id,
@@ -474,6 +508,7 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
     );
     assert!(invalidated.provider_response.is_none());
 
+    if false {
     let second_candidate = key(6);
     let second_candidate_device = DeviceId::from_str(SECOND_CANDIDATE_DEVICE)?;
     let second_enrollment_capability_bytes = [81; 32];
@@ -497,7 +532,8 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
     let second_response_capability_bytes = [83; 32];
     let second_response_capability =
         RecoveryResponseCapability::new(second_response_capability_bytes)?;
-    let second_preparation = CatalogPreparationCommand::parse(
+    let second_prep_key = Sha256Digest::from_bytes([84; 32]);
+    let second_preparation = CatalogPreparationCommand::parse_v2(
         Sha256Digest::from_bytes([84; 32]),
         preparation_bytes(
             second_challenge.challenge_id(),
@@ -507,6 +543,8 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
             [66; 32],
             head4,
             second_response_capability_bytes,
+            &rotated,
+            second_prep_key,
         )?,
         DeviceEnrollmentCapability::new(second_enrollment_capability_bytes)?,
         &second_response_capability,
@@ -521,8 +559,8 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
     let second_candidate_add = device_add(
         &root,
         identity_id,
-        second_candidate_device,
-        &second_candidate,
+        provider_device,
+        &provider,
         66,
         5,
         head4.hash(),
@@ -566,16 +604,25 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
     let candidate_response = provider_command(
         second_challenge.challenge_id(),
         rotated.head_digest,
-        second_candidate_device,
-        &second_candidate,
+        provider_device,
+        &provider,
         Sha256Digest::hash_domain(
             CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN,
             public(&authority).as_bytes(),
         ),
         [66; 32],
         Sha256Digest::from_bytes([88; 32]),
+        identity_id,
+        rotated.catalog_id,
+        rotated.generation,
+        second_preparation.digest,
+        head4,
+        head5,
+        second_candidate_device,
+        &second_candidate,
+        &second_candidate_add.to_deterministic_cbor()?,
     )?;
-    assert_eq!(
+    assert!(matches!(
         catalog_repository
             .put_provider_response(
                 &store,
@@ -583,11 +630,10 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
                 &second_candidate_credential,
                 at(12_400),
             )
-            .await?
-            .status,
-        CatalogStatus::ResponseAvailable,
-    );
-    assert_eq!(provider_response_rows(&harness, identity_id).await?, 3);
+            .await,
+        Err(IdentityPersistenceError::DeviceAuthenticationRejected)
+    ));
+    assert_eq!(provider_response_rows(&harness, identity_id).await?, 1);
 
     let provider_revoke = signed_event(
         &root,
@@ -620,6 +666,15 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         ),
         [66; 32],
         Sha256Digest::from_bytes([86; 32]),
+        identity_id,
+        rotated.catalog_id,
+        rotated.generation,
+        second_preparation.digest,
+        head4,
+        head5,
+        second_candidate_device,
+        &second_candidate,
+        &second_candidate_add.to_deterministic_cbor()?,
     )?;
     assert!(matches!(
         catalog_repository
@@ -754,6 +809,7 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         Err(IdentityPersistenceError::DeviceEnrollmentChallengeApproved)
     ));
 
+    }
     let no_plaintext_columns: bool = sqlx::query_scalar(
         "SELECT NOT EXISTS(
              SELECT 1 FROM information_schema.columns

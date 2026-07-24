@@ -291,24 +291,6 @@ impl CatalogUploadCommand {
         Ok(command)
     }
 
-    fn verify_signature(&self, key: SigningPublicKey) -> Result<(), IdentityPersistenceError> {
-        let value =
-            decode_deterministic_cbor(&self.head_bytes).map_err(|_| invalid("catalog head"))?;
-        let fields = numbered_fields(&value, 12)?;
-        let unsigned = CanonicalValue::Map(
-            (1_u64..)
-                .zip(fields.iter().take(11))
-                .map(|(key, value)| (CanonicalValue::Unsigned(key), (*value).clone()))
-                .collect(),
-        );
-        verify_signature(
-            key,
-            CATALOG_HEAD_SIGNATURE_DOMAIN,
-            &unsigned,
-            self.signature,
-        )
-    }
-
     fn verify_signature_v2(&self, key: SigningPublicKey) -> Result<(), IdentityPersistenceError> {
         let value = decode_deterministic_cbor(&self.head_bytes).map_err(|_| invalid("catalog head"))?;
         let fields = numbered_fields(&value, 16)?;
@@ -519,6 +501,7 @@ impl CatalogPreparationCommand {
 pub struct CatalogProviderResponseCommand {
     pub idempotency_key_hash: Sha256Digest,
     pub request_id: DeviceEnrollmentChallengeId,
+    pub preparation_digest: Sha256Digest,
     pub identity_id: IdentityId,
     pub catalog_id: Uuid,
     pub catalog_generation: SafeUint,
@@ -720,6 +703,9 @@ impl CatalogProviderResponseCommand {
         if candidate_signing_key.as_bytes() == candidate_recipient_key.as_bytes() {
             return Err(invalid("candidate key separation"));
         }
+        if candidate_signing_key == authority_signing_key {
+            return Err(invalid("candidate authority key separation"));
+        }
         let signature = parse_signature(fields[22])?;
         let authority_signature = parse_signature(fields[23])?;
         let unsigned = CanonicalValue::Map(
@@ -745,9 +731,17 @@ impl CatalogProviderResponseCommand {
         if parse_authority_digest(fields[15])? != authority_id {
             return Err(invalid("authority descriptor digest"));
         }
+        // Public AAD repeats response fields 1..17 exactly, then sources its
+        // validity/idempotency coordinates from response fields 20..22.  The
+        // response's fields 18/19 are digests of the AAD and envelope and are
+        // deliberately not fed back into the AAD input.
+        let mut aad_fields = fields[..17].to_vec();
+        aad_fields.push(fields[19]);
+        aad_fields.push(fields[20]);
+        aad_fields.push(fields[21]);
         let aad = CanonicalValue::Map(
             (1_u64..=20)
-                .zip(fields.iter().take(20))
+                .zip(aad_fields)
                 .map(|(key, value)| (CanonicalValue::Unsigned(key), (*value).clone()))
                 .collect(),
         );
@@ -758,6 +752,7 @@ impl CatalogProviderResponseCommand {
         Ok(Self {
             idempotency_key_hash,
             request_id,
+            preparation_digest: parse_digest(fields[2])?,
             identity_id,
             catalog_id,
             catalog_generation,
@@ -769,7 +764,7 @@ impl CatalogProviderResponseCommand {
             authority_id,
             authority_device_id,
             authority_signing_key,
-            current_authority_digest: parse_authority_digest(fields[16])?,
+            current_authority_digest: authority_id,
             recipient_key_digest: parse_digest(fields[8])?,
             observed_head,
             successor_head,

@@ -340,11 +340,11 @@ const HTTP_KEY_PACKAGE_PUBLISH_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
 const HTTP_KEY_PACKAGE_CLAIM_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.key-package-http-claim-idempotency-key.v1\0";
 const HTTP_RECOVERY_CATALOG_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
-    b"dirextalk.recovery-scope-catalog-http-publish-idempotency-key.v1\0";
+    b"dirextalk.recovery-scope-catalog-http-publish-idempotency-key.v2\0";
 const HTTP_RECOVERY_PREPARATION_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
-    b"dirextalk.recovery-scope-catalog-http-preparation-idempotency-key.v1\0";
+    b"dirextalk.recovery-scope-catalog-handoff-preparation-idempotency.v2\0";
 const HTTP_RECOVERY_PROVIDER_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
-    b"dirextalk.recovery-scope-catalog-http-provider-idempotency-key.v1\0";
+    b"dirextalk.recovery-scope-catalog-handoff-response-idempotency.v2\0";
 pub(crate) const HTTP_HISTORY_RECOVERY_REQUEST_V4_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.history-recovery.request-idempotency.v4\0";
 const DEFAULT_DEVICE_SESSION_AUDIENCE: &str = "http://127.0.0.1";

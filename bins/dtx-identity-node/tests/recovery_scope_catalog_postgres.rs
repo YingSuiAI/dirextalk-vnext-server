@@ -125,9 +125,11 @@ async fn send_catalog(
                 .method("PUT")
                 .uri(
                     RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE
+                        .replace("{catalog_id}", "0190f2a5-7b1c-7abc-8def-0123456789b1")
                         .replace("{generation}", &generation.to_string()),
                 )
                 .header(header::CONTENT_TYPE, content_type)
+                .header(header::ACCEPT, RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE)
                 .header("idempotency-key", idempotency)
                 .header(header::AUTHORIZATION, authorization(session))
                 .body(Body::from(body))?,
@@ -291,32 +293,43 @@ fn catalog_body(
     previous: Option<Sha256Digest>,
     merkle: [u8; 32],
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let ciphertext = b"opaque-encrypted-catalog-v1".to_vec();
+    let ciphertext = b"opaque-encrypted-catalog-v2".to_vec();
+    let catalog_id = uuid::Uuid::parse_str(if generation.get() == 1 {
+        "0190f2a5-7b1c-7abc-8def-0123456789b1"
+    } else {
+        "0190f2a5-7b1c-7abc-8def-0123456789b3"
+    })?;
+    let authority_device = DeviceId::from_str(AUTHORITY_DEVICE)?;
+    let authority_key_id = uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b2")?;
     let unsigned = CanonicalValue::Map(vec![
-        field(1, CanonicalValue::Unsigned(1)),
-        field(2, CanonicalValue::Text(identity.to_string())),
-        field(3, generation.to_canonical_value()),
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(catalog_id.to_string())),
+        field(3, CanonicalValue::Text(identity.to_string())),
+        field(4, generation.to_canonical_value()),
         field(
-            4,
+            5,
             previous.map_or(CanonicalValue::Null, |value| value.to_canonical_value()),
         ),
-        field(5, CanonicalValue::Unsigned(1)),
-        field(6, CanonicalValue::Bytes(merkle.to_vec())),
+        field(6, CanonicalValue::Unsigned(1)),
+        field(7, CanonicalValue::Bytes(merkle.to_vec())),
         field(
-            7,
+            8,
             Sha256Digest::hash_domain(CATALOG_CIPHERTEXT_HASH_DOMAIN, &ciphertext)
                 .to_canonical_value(),
         ),
-        field(8, head.sequence().to_canonical_value()),
-        field(9, head.hash().to_canonical_value()),
-        field(10, at(2_500).to_canonical_value()),
-        field(11, at(250_000).to_canonical_value()),
+        field(9, head.sequence().to_canonical_value()),
+        field(10, head.hash().to_canonical_value()),
+        field(11, CanonicalValue::Text(authority_device.to_string())),
+        field(12, CanonicalValue::Text(authority_key_id.to_string())),
+        field(13, public(signer).to_canonical_value()),
+        field(14, at(2_500).to_canonical_value()),
+        field(15, at(250_000).to_canonical_value()),
     ]);
     let signature = domain_signature(signer, CATALOG_HEAD_SIGNATURE_DOMAIN, &unsigned)?;
     let CanonicalValue::Map(mut signed_fields) = unsigned else {
         unreachable!()
     };
-    signed_fields.push(field(12, signature.to_canonical_value()));
+    signed_fields.push(field(16, signature.to_canonical_value()));
     Ok(encode_deterministic_cbor(&CanonicalValue::Map(vec![
         field(1, CanonicalValue::Map(signed_fields)),
         field(2, CanonicalValue::Bytes(ciphertext)),

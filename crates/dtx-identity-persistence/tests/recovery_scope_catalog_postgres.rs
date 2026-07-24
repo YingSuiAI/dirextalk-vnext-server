@@ -19,6 +19,7 @@ use dtx_identity_persistence::{
     DeviceEnrollmentRepository, DeviceSessionCompletionCommand, DeviceSessionCredential,
     DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead,
     IdentityLogRepository, IdentityPersistenceError, IdentityPgStore, PREPARATION_SIGNATURE_DOMAIN,
+    PROVIDER_AAD_DIGEST_DOMAIN, PROVIDER_AUTHORITY_SIGNATURE_DOMAIN,
     PROVIDER_CIPHERTEXT_HASH_DOMAIN, PROVIDER_RESPONSE_SIGNATURE_DOMAIN, RECIPIENT_KEY_HASH_DOMAIN,
     RESPONSE_CAPABILITY_HASH_DOMAIN, RecoveryResponseCapability, RecoveryScopeCatalogRepository,
     device_session_proof_input,

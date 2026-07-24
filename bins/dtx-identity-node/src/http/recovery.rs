@@ -126,7 +126,7 @@ impl IdentityBootstrapState {
             .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
         let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES)
             .await
-            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+            .map_err(|_| RecoveryCatalogFailure::TooLarge)?;
         let command = CatalogUploadCommand::parse_v2(idempotency_key_hash, catalog_id, &bytes)
             .map_err(|error| map_recovery_catalog_publish_error(&error))?;
         let now = self
@@ -186,7 +186,7 @@ impl IdentityBootstrapState {
         let response_capability = parse_recovery_response_capability(headers)?;
         let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES)
             .await
-            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+            .map_err(|_| RecoveryCatalogFailure::TooLarge)?;
         let command = CatalogPreparationCommand::parse_v2(
             idempotency_key_hash,
             bytes.to_vec(),
