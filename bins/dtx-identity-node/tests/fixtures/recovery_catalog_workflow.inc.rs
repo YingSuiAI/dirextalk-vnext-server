@@ -680,7 +680,12 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     let invalidated =
         send_status(app.clone(), challenge.challenge_id(), response_capability).await?;
     assert_eq!(invalidated.status(), StatusCode::OK);
-    assert_redacted_status(invalidated, 5).await?;
+    let invalidated_bytes = assert_redacted_status(invalidated, 5).await?;
+    let CanonicalValue::Map(invalidated_fields) = decode_deterministic_cbor(&invalidated_bytes)? else {
+        return Err("invalidated status must be a map".into());
+    };
+    assert_eq!(invalidated_fields[4].1, CanonicalValue::Unsigned(2));
+    assert_eq!(invalidated_fields[5].1, CanonicalValue::Unsigned(5_400));
     let invalidated_replay = send_preparation(
         app.clone(),
         "catalog-preparation-0001",
@@ -851,7 +856,8 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     clock.set(200_000);
     let expired = send_status(app.clone(), challenge.challenge_id(), response_capability).await?;
     assert_eq!(expired.status(), StatusCode::OK);
-    assert_redacted_status(expired, 3).await?;
+    let expired_bytes = assert_redacted_status(expired, 5).await?;
+    assert_eq!(expired_bytes, invalidated_bytes);
     let expired_replay = send_preparation(
         app.clone(),
         "catalog-preparation-0001",
