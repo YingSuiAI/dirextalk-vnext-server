@@ -226,11 +226,3 @@ async fn opaque_attachment_is_exact_idempotent_and_cancel_revokes_read()
     ));
     Ok(())
 }
-
-struct RecoveredDevice {
-    active: ActiveDevice,
-    request_id: DeviceEnrollmentChallengeId,
-    request_digest: Sha256Digest,
-    approved_head: IdentityLogHead,
-    recipient_package_digest: Sha256Digest,
-}
