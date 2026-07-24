@@ -26,8 +26,10 @@ use dtx_identity_node::{
     IdentityBootstrapState, RECOVERY_RESPONSE_CAPABILITY_HEADER,
     RECOVERY_SCOPE_CATALOG_CONTENT_TYPE, RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE, RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH,
     RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_PATH_TEMPLATE,
     RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE, identity_bootstrap_router_with_state,
 };
@@ -125,7 +127,14 @@ async fn send_catalog(
                 .method("PUT")
                 .uri(
                     RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE
-                        .replace("{catalog_id}", "0190f2a5-7b1c-7abc-8def-0123456789b1")
+                        .replace(
+                            "{catalog_id}",
+                            if generation == 1 {
+                                "0190f2a5-7b1c-7abc-8def-0123456789b1"
+                            } else {
+                                "0190f2a5-7b1c-7abc-8def-0123456789b3"
+                            },
+                        )
                         .replace("{generation}", &generation.to_string()),
                 )
                 .header(header::CONTENT_TYPE, content_type)
@@ -152,6 +161,10 @@ async fn send_preparation(
                 .header(
                     header::CONTENT_TYPE,
                     RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
+                )
+                .header(
+                    header::ACCEPT,
+                    RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
                 )
                 .header("idempotency-key", idempotency)
                 .header(
@@ -207,6 +220,10 @@ async fn send_provider_response(
                 .header(
                     header::CONTENT_TYPE,
                     RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+                )
+                .header(
+                    header::ACCEPT,
+                    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
                 )
                 .header("idempotency-key", idempotency)
                 .header(header::AUTHORIZATION, authorization(session))

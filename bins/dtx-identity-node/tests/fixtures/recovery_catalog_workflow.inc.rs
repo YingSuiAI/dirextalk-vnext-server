@@ -182,8 +182,8 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     .await?;
     assert_error(
         wrong_media,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "RECOVERY_CATALOG_INVALID",
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "RECOVERY_HANDOFF_UNSUPPORTED_MEDIA_TYPE",
     )
     .await?;
     let oversized = send_catalog(
@@ -197,8 +197,8 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     .await?;
     assert_error(
         oversized,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "RECOVERY_CATALOG_INVALID",
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "RECOVERY_HANDOFF_TOO_LARGE",
     )
     .await?;
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 0, 0));
