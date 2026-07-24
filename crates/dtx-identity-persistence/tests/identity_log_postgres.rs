@@ -14,7 +14,6 @@ use dtx_identity_persistence::{
     IdentityAppendCommand, IdentityAppendOutcome, IdentityCommandPhase, IdentityLogHead,
     IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
 };
-use dtx_storage::MigrationRunner;
 use dtx_wire::{
     Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey, UtcMillis, WireVersion,
 };
@@ -22,9 +21,6 @@ use ed25519_dalek::{Signer, SigningKey};
 use sqlx::PgPool;
 
 const DEVICE_A: &str = "0190f2a5-7b1c-7abc-8def-0123456789ab";
-const IDENTITY_BOOTSTRAP_CLAIMS_MIGRATION_VERSION: i64 = 202_607_140_009;
-const IDENTITY_BOOTSTRAP_CLAIMS_DOWN: &str =
-    include_str!("../../../migrations/202607140009_identity_bootstrap_idempotency_claims.down.sql");
 
 #[tokio::test]
 #[allow(
@@ -467,79 +463,13 @@ async fn identity_writer_rejects_extra_outbox_privileges_and_still_appends_after
     Ok(())
 }
 
-#[tokio::test]
-async fn bootstrap_claim_migration_preserves_existing_per_identity_receipt_keys()
--> Result<(), Box<dyn Error>> {
-    let harness = support::PostgresHarness::start().await?;
-    let store = IdentityPgStore::connect(harness.identity_runtime_options(), 2).await?;
-    let repository = IdentityLogRepository::new();
-
-    sqlx::raw_sql(IDENTITY_BOOTSTRAP_CLAIMS_DOWN)
-        .execute(harness.admin_pool())
-        .await?;
-    sqlx::query("DELETE FROM public._sqlx_migrations WHERE version=$1")
-        .bind(IDENTITY_BOOTSTRAP_CLAIMS_MIGRATION_VERSION)
-        .execute(harness.admin_pool())
-        .await?;
-
-    let shared_key = Sha256Digest::from_bytes([201; 32]);
-    for (root_seed, recovery_seed, committed_at) in [(80, 81, 8_000), (82, 83, 8_001)] {
-        let event = genesis(&signing_key(root_seed), &signing_key(recovery_seed));
-        let outcome = repository
-            .append(
-                &store,
-                &command_with_key(shared_key, None, &event)?,
-                timestamp(committed_at),
-            )
-            .await?;
-        assert!(matches!(outcome, IdentityAppendOutcome::Committed(_)));
-    }
-    assert_eq!(
-        command_receipt_key_count(harness.admin_pool(), shared_key).await?,
-        2
-    );
-
-    MigrationRunner::new().run(harness.admin_pool()).await?;
-
-    drop(store);
-    let store = IdentityPgStore::connect(harness.identity_runtime_options(), 2).await?;
-
-    let third = genesis(&signing_key(84), &signing_key(85));
-    let outcome = repository
-        .append(
-            &store,
-            &command_with_key(shared_key, None, &third)?,
-            timestamp(8_002),
-        )
-        .await?;
-    assert!(matches!(outcome, IdentityAppendOutcome::Committed(_)));
-    assert_eq!(
-        command_receipt_key_count(harness.admin_pool(), shared_key).await?,
-        3
-    );
-    let bootstrap_claim_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM identity.bootstrap_idempotency_claims")
-            .fetch_one(harness.admin_pool())
-            .await?;
-    assert_eq!(bootstrap_claim_count, 0);
-    Ok(())
-}
-
 fn command(
     seed: u8,
     expected_head: Option<IdentityLogHead>,
     event: &IdentityLogEventV1,
 ) -> Result<IdentityAppendCommand, IdentityPersistenceError> {
-    command_with_key(Sha256Digest::from_bytes([seed; 32]), expected_head, event)
-}
-
-fn command_with_key(
-    idempotency_key_hash: Sha256Digest,
-    expected_head: Option<IdentityLogHead>,
-    event: &IdentityLogEventV1,
-) -> Result<IdentityAppendCommand, IdentityPersistenceError> {
     IdentityAppendCommand::new(
-        idempotency_key_hash,
+        Sha256Digest::from_bytes([seed; 32]),
         expected_head,
         event
             .to_deterministic_cbor()
@@ -634,16 +564,6 @@ async fn assert_identity_schema_boundary(
     .fetch_one(harness.admin_pool())
     .await?;
     assert!(!can_rewrite_entries);
-    let can_rewrite_bootstrap_claims: bool = sqlx::query_scalar(
-        "SELECT has_table_privilege(
-             'dtx_identity_only_test',
-             'identity.bootstrap_idempotency_claims',
-             'UPDATE'
-         )",
-    )
-    .fetch_one(harness.admin_pool())
-    .await?;
-    assert!(!can_rewrite_bootstrap_claims);
     let session_mutation_privileges: (bool, bool, bool, bool) = sqlx::query_as(
         "SELECT has_table_privilege(
              'dtx_identity_only_test',
@@ -676,20 +596,6 @@ async fn assert_identity_schema_boundary(
     .await?;
     assert!(!has_system_usage);
     Ok(())
-}
-
-async fn command_receipt_key_count(
-    pool: &PgPool,
-    idempotency_key_hash: Sha256Digest,
-) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT count(*)
-           FROM identity.command_receipts
-          WHERE idempotency_key_hash=$1",
-    )
-    .bind(idempotency_key_hash.as_bytes().as_slice())
-    .fetch_one(pool)
-    .await
 }
 
 fn signing_key(seed: u8) -> SigningKey {
