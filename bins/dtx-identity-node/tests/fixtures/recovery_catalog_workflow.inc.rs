@@ -463,10 +463,10 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         candidate_device,
         [55; 32],
         &candidate_add_bytes,
-        provider_device,
-        &provider,
         DeviceId::from_str(SECOND_CANDIDATE_DEVICE)?,
         &key(6),
+        authority_device,
+        &authority,
         "catalog-provider-invalid",
         at(5_300),
         at(200_000),
@@ -481,8 +481,8 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     .await?;
     assert_error(
         invalid_provider_response,
-        StatusCode::PRECONDITION_FAILED,
-        "RECOVERY_PREPARATION_INVALIDATED",
+        StatusCode::FORBIDDEN,
+        "RECOVERY_PROVIDER_MISMATCH",
     )
     .await?;
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 0));
@@ -533,6 +533,26 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         to_bytes(provider_second.into_body(), 1_100_000).await?
     );
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 1));
+
+    let (provider_replay, concurrent_status) = tokio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            tokio::join!(
+                send_provider_response(
+                    app.clone(),
+                    "catalog-provider-0001",
+                    &provider_session,
+                    challenge.challenge_id(),
+                    provider_response_body.clone(),
+                ),
+                send_status(app.clone(), challenge.challenge_id(), response_capability),
+            )
+        },
+    )
+    .await
+    .map_err(|_| "concurrent provider PUT/GET deadlocked")?;
+    assert_eq!(provider_replay?.status(), StatusCode::OK);
+    assert_eq!(concurrent_status?.status(), StatusCode::OK);
 
     let wrong_media = send_provider_response_custom(
         app.clone(),
@@ -588,7 +608,33 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         provider_response_body.clone(),
     )
     .await?;
-    assert_error(wrong_key, StatusCode::UNAUTHORIZED, "DEVICE_AUTHENTICATION_FAILED").await?;
+    assert_error(
+        wrong_key,
+        StatusCode::FORBIDDEN,
+        "RECOVERY_PROVIDER_MISMATCH",
+    )
+    .await?;
+    let invalid_credential = Session {
+        session_id: provider_session.session_id,
+        session_secret: [99; 32],
+    };
+    let invalid_credential_response = send_provider_response_custom(
+        app.clone(),
+        "catalog-provider-0001",
+        &invalid_credential,
+        challenge.challenge_id(),
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE),
+        None,
+        provider_response_body.clone(),
+    )
+    .await?;
+    assert_error(
+        invalid_credential_response,
+        StatusCode::UNAUTHORIZED,
+        "DEVICE_AUTHENTICATION_FAILED",
+    )
+    .await?;
     let wrong_body = send_provider_response_custom(
         app.clone(),
         "catalog-provider-wrong-body",

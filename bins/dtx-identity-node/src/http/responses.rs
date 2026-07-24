@@ -646,6 +646,11 @@ pub(crate) fn recovery_catalog_failure_response(
             RecoveryCatalogErrorCode::CandidateKeyChanged,
             false,
         ),
+        RecoveryCatalogFailure::ProviderMismatch => (
+            StatusCode::FORBIDDEN,
+            RecoveryCatalogErrorCode::ProviderMismatch,
+            false,
+        ),
         RecoveryCatalogFailure::IdempotencyConflict => (
             StatusCode::CONFLICT,
             RecoveryCatalogErrorCode::IdempotencyConflict,

@@ -92,10 +92,17 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         None,
         [31; 32],
     )?;
-    let (first, second) = tokio::join!(
-        catalog_repository.publish(&store, &catalog, &authority_credential, at(3_000)),
-        catalog_repository.publish(&store, &catalog, &authority_credential, at(3_000)),
-    );
+    let (first, second) = tokio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            tokio::join!(
+                catalog_repository.publish(&store, &catalog, &authority_credential, at(3_000)),
+                catalog_repository.publish(&store, &catalog, &authority_credential, at(3_000)),
+            )
+        },
+    )
+    .await
+    .map_err(|_| "concurrent first catalog publish deadlocked")?;
     let first = first?;
     let second = second?;
     assert_ne!(first.created, second.created);

@@ -25,14 +25,8 @@ impl RecoveryScopeCatalogRepository {
             {
                 return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
             }
-            if let Some(row) = sqlx::query("SELECT generation,upload_digest,head_bytes FROM identity.recovery_scope_catalogs WHERE identity_id=$1 AND idempotency_key_hash=$2")
-                .bind(command.identity_id.to_string()).bind(command.idempotency_key_hash.as_bytes().as_slice()).fetch_optional(&mut *tx.connection()).await? {
-                let stored_generation: i64 = row.try_get("generation")?;
-                let stored_digest: Vec<u8> = row.try_get("upload_digest")?;
-                if stored_generation == to_i64(command.generation)? && stored_digest.as_slice() == command.upload_digest.as_bytes() {
-                    return Ok(RecoveryScopeCatalogOutcome { created: false, exact_head_bytes: row.try_get("head_bytes")? });
-                }
-                return Err(IdentityPersistenceError::IdempotencyConflict);
+            if let Some(exact_head_bytes) = load_catalog_idempotency_replay(tx.connection(), command).await? {
+                return Ok(RecoveryScopeCatalogOutcome { created: false, exact_head_bytes });
             }
             // Mutable validity is evaluated only for first admission.  An
             // authenticated exact replay returns the committed bytes above,
@@ -45,6 +39,12 @@ impl RecoveryScopeCatalogRepository {
                 return Err(IdentityPersistenceError::RecoveryCatalogExpired);
             }
             let snapshot = lock_and_load_active_snapshot(tx.connection(), command.identity_id).await?;
+            // Re-read after the identity fence.  This closes the first-request
+            // race even if a caller changes the authentication/fence sequence
+            // in the future; mismatched bytes remain an immutable conflict.
+            if let Some(exact_head_bytes) = load_catalog_idempotency_replay(tx.connection(), command).await? {
+                return Ok(RecoveryScopeCatalogOutcome { created: false, exact_head_bytes });
+            }
             if snapshot.head() != command.observed_head { return Err(IdentityPersistenceError::HeadConflict { current: Some(snapshot.head()) }); }
             let latest = sqlx::query("SELECT generation,head_digest FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
                 .bind(command.identity_id.to_string()).fetch_optional(&mut *tx.connection()).await?;
@@ -186,12 +186,23 @@ impl RecoveryScopeCatalogRepository {
     ) -> Result<RecoveryScopeCatalogStatusOutcome, IdentityPersistenceError> {
         let mut tx = store.begin().await?;
         let result = async {
-            let authenticated = DeviceSessionRepository::authenticate_with_signing_key_in_transaction(tx.connection(), credential, now).await?;
-            if authenticated.session().device_id() != command.provider_device_id || authenticated.signing_key() != command.provider_signing_key {
+            // Derive the request identity before authenticating the bearer.
+            // This keeps provider/status lock acquisition identical even when
+            // a valid session is presented for another identity.
+            let identity_id =
+                load_linked_challenge_identity_hint(tx.connection(), command.request_id).await?;
+            if load_session_identity_hint(tx.connection(), credential).await? != identity_id {
                 return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
             }
+            let _snapshot = lock_and_load_active_snapshot(tx.connection(), identity_id).await?;
+            let authenticated = DeviceSessionRepository::authenticate_with_signing_key_in_transaction(tx.connection(), credential, now).await?;
+            if authenticated.session().device_id() != command.provider_device_id || authenticated.signing_key() != command.provider_signing_key {
+                return Err(IdentityPersistenceError::RecoveryProviderMismatch);
+            }
             let challenge = load_linked_challenge(tx.connection(), command.request_id, true).await?;
-            if challenge.identity_id != authenticated.session().identity_id() {
+            if challenge.identity_id != identity_id
+                || authenticated.session().identity_id() != identity_id
+            {
                 return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
             }
             let row = load_preparation(tx.connection(), command.request_id, true).await?;
@@ -394,6 +405,47 @@ async fn load_linked_challenge_identity_hint(
     .await?
     .ok_or(IdentityPersistenceError::RecoveryResponseCapabilityRejected)?;
     IdentityId::from_str(&identity_id).map_err(|_| corrupt("linked enrollment identity"))
+}
+
+async fn load_session_identity_hint(
+    connection: &mut PgConnection,
+    credential: &DeviceSessionCredential,
+) -> Result<IdentityId, IdentityPersistenceError> {
+    let identity_id: String = sqlx::query_scalar(
+        "SELECT identity_id FROM identity.device_sessions WHERE session_id=$1",
+    )
+    .bind(*credential.session_id().as_uuid())
+    .fetch_optional(&mut *connection)
+    .await?
+    .ok_or(IdentityPersistenceError::DeviceAuthenticationRejected)?;
+    IdentityId::from_str(&identity_id)
+        .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)
+}
+
+async fn load_catalog_idempotency_replay(
+    connection: &mut PgConnection,
+    command: &CatalogUploadCommand,
+) -> Result<Option<Vec<u8>>, IdentityPersistenceError> {
+    let Some(row) = sqlx::query(
+        "SELECT generation,upload_digest,head_bytes
+           FROM identity.recovery_scope_catalogs
+          WHERE identity_id=$1 AND idempotency_key_hash=$2",
+    )
+    .bind(command.identity_id.to_string())
+    .bind(command.idempotency_key_hash.as_bytes().as_slice())
+    .fetch_optional(&mut *connection)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let stored_generation: i64 = row.try_get("generation")?;
+    let stored_digest: Vec<u8> = row.try_get("upload_digest")?;
+    if stored_generation == to_i64(command.generation)?
+        && stored_digest.as_slice() == command.upload_digest.as_bytes()
+    {
+        return Ok(Some(row.try_get("head_bytes")?));
+    }
+    Err(IdentityPersistenceError::IdempotencyConflict)
 }
 
 async fn load_linked_challenge(

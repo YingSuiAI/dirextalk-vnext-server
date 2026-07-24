@@ -53,6 +53,7 @@ pub(crate) fn map_persistence_error(error: &IdentityPersistenceError) -> Bootstr
         | IdentityPersistenceError::RecoveryAuthorityChanged
         | IdentityPersistenceError::RecoveryCandidateKeyChanged
         | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::RecoveryProviderMismatch
         | IdentityPersistenceError::CorruptData(_) => BootstrapFailure::TemporarilyUnavailable,
     }
 }
@@ -98,6 +99,7 @@ pub(crate) fn map_initial_device_persistence_error(
         | IdentityPersistenceError::RecoveryAuthorityChanged
         | IdentityPersistenceError::RecoveryCandidateKeyChanged
         | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::RecoveryProviderMismatch
         | IdentityPersistenceError::CorruptData(_) => InitialDeviceFailure::TemporarilyUnavailable,
     }
 }
@@ -151,6 +153,7 @@ pub(crate) fn map_device_session_persistence_error(
         | IdentityPersistenceError::RecoveryAuthorityChanged
         | IdentityPersistenceError::RecoveryCandidateKeyChanged
         | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::RecoveryProviderMismatch
         | IdentityPersistenceError::CorruptData(_) => DeviceSessionFailure::TemporarilyUnavailable,
     }
 }
@@ -204,6 +207,7 @@ pub(crate) fn map_recovery_catalog_publish_error(
         | IdentityPersistenceError::RecoveryAuthorityChanged
         | IdentityPersistenceError::RecoveryCandidateKeyChanged
         | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::RecoveryProviderMismatch
         | IdentityPersistenceError::CorruptData(_) => {
             RecoveryCatalogFailure::TemporarilyUnavailable
         }
@@ -275,6 +279,7 @@ pub(crate) fn map_recovery_catalog_prepare_error(
         | IdentityPersistenceError::DeviceSessionChallengeRateLimited
         | IdentityPersistenceError::KeyPackageUnavailable
         | IdentityPersistenceError::KeyPackageConflict
+        | IdentityPersistenceError::RecoveryProviderMismatch
         | IdentityPersistenceError::CorruptData(_) => {
             RecoveryCatalogFailure::TemporarilyUnavailable
         }
@@ -323,6 +328,7 @@ pub(crate) fn map_recovery_catalog_status_error(
         | IdentityPersistenceError::RecoveryAuthorityChanged
         | IdentityPersistenceError::RecoveryCandidateKeyChanged
         | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::RecoveryProviderMismatch
         | IdentityPersistenceError::CorruptData(_) => {
             RecoveryCatalogFailure::TemporarilyUnavailable
         }
@@ -363,6 +369,9 @@ pub(crate) fn map_recovery_catalog_provider_error(
         | IdentityPersistenceError::RecoveryAuthorityChanged
         | IdentityPersistenceError::RecoveryCandidateKeyChanged => {
             RecoveryCatalogFailure::PreparationInvalidated
+        }
+        IdentityPersistenceError::RecoveryProviderMismatch => {
+            RecoveryCatalogFailure::ProviderMismatch
         }
         IdentityPersistenceError::RecoveryCatalogConflict => {
             RecoveryCatalogFailure::CatalogConflict
@@ -445,6 +454,7 @@ pub(crate) fn map_device_enrollment_persistence_error(
         | IdentityPersistenceError::RecoveryAuthorityChanged
         | IdentityPersistenceError::RecoveryCandidateKeyChanged
         | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::RecoveryProviderMismatch
         | IdentityPersistenceError::CorruptData(_) => {
             DeviceEnrollmentFailure::TemporarilyUnavailable
         }
@@ -494,6 +504,7 @@ pub(crate) fn map_device_revoke_persistence_error(
         | IdentityPersistenceError::RecoveryAuthorityChanged
         | IdentityPersistenceError::RecoveryCandidateKeyChanged
         | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::RecoveryProviderMismatch
         | IdentityPersistenceError::CorruptData(_) => DeviceRevokeFailure::TemporarilyUnavailable,
     }
 }
@@ -539,6 +550,7 @@ pub(crate) fn map_key_package_persistence_error(
         | IdentityPersistenceError::RecoveryAuthorityChanged
         | IdentityPersistenceError::RecoveryCandidateKeyChanged
         | IdentityPersistenceError::RecoveryPreparationInvalidated
+        | IdentityPersistenceError::RecoveryProviderMismatch
         | IdentityPersistenceError::CorruptData(_) => KeyPackageFailure::TemporarilyUnavailable,
     }
 }

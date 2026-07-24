@@ -205,6 +205,7 @@ pub(crate) enum RecoveryCatalogFailure {
     CatalogHeadChanged,
     AuthorityChanged,
     CandidateKeyChanged,
+    ProviderMismatch,
     IdempotencyConflict,
     TemporarilyUnavailable,
 }
@@ -410,6 +411,8 @@ pub(crate) enum RecoveryCatalogErrorCode {
     AuthorityChanged,
     #[serde(rename = "CANDIDATE_KEY_CHANGED")]
     CandidateKeyChanged,
+    #[serde(rename = "RECOVERY_PROVIDER_MISMATCH")]
+    ProviderMismatch,
     #[serde(rename = "IDEMPOTENCY_CONFLICT")]
     IdempotencyConflict,
     #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
