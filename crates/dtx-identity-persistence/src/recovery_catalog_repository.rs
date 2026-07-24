@@ -45,8 +45,9 @@ impl RecoveryScopeCatalogRepository {
                     && digest(&row.try_get::<Vec<u8>,_>("head_digest")?)? == command.previous_head_digest.unwrap_or(Sha256Digest::from_bytes([0;32])) => {}
                 _ => return Err(IdentityPersistenceError::RecoveryCatalogConflict),
             }
-            sqlx::query("INSERT INTO identity.recovery_scope_catalogs(identity_id,generation,previous_head_digest,leaf_count,merkle_root,ciphertext_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_signing_key,issued_at_ms,expires_at_ms,signature,head_bytes,head_digest,encrypted_catalog,upload_digest,idempotency_key_hash,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)")
-                .bind(command.identity_id.to_string()).bind(to_i64(command.generation)?).bind(command.previous_head_digest.map(|v| v.as_bytes().to_vec()))
+            sqlx::query("INSERT INTO identity.recovery_scope_catalogs(identity_id,catalog_id,generation,previous_head_digest,leaf_count,merkle_root,ciphertext_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_signing_key,issued_at_ms,expires_at_ms,signature,head_bytes,head_digest,encrypted_catalog,upload_digest,idempotency_key_hash,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)")
+                .bind(command.identity_id.to_string()).bind(command.catalog_id)
+                .bind(to_i64(command.generation)?).bind(command.previous_head_digest.map(|v| v.as_bytes().to_vec()))
                 .bind(to_i64(command.leaf_count)?).bind(command.merkle_root.as_bytes().as_slice()).bind(command.ciphertext_digest.as_bytes().as_slice())
                 .bind(to_i64(command.observed_head.sequence())?).bind(command.observed_head.hash().as_bytes().as_slice()).bind(*authenticated.session().device_id().as_uuid()).bind(authenticated.signing_key().as_bytes().as_slice())
                 .bind(command.issued_at.get()).bind(command.expires_at.get()).bind(command.signature.as_bytes().as_slice()).bind(&command.head_bytes)
@@ -120,12 +121,16 @@ impl RecoveryScopeCatalogRepository {
             if catalog.observed_head != command.observed_head {
                 return Err(IdentityPersistenceError::RecoveryCatalogHeadChanged);
             }
+            if command.catalog_id != catalog.catalog_id {
+                return Err(IdentityPersistenceError::RecoveryCatalogHeadChanged);
+            }
             if command.expires_at > catalog.expires_at {
                 return Err(invalid("preparation exceeds catalog expiry"));
             }
-            sqlx::query("INSERT INTO identity.recovery_scope_catalog_preparations(request_id,identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,candidate_nonce,issued_at_ms,expires_at_ms,response_capability_hash,enrollment_capability_hash,candidate_signature,preparation_bytes,preparation_digest,catalog_generation,catalog_head_digest,authority_device_id,authority_signing_key,idempotency_key_hash,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)")
-                .bind(*command.request_id.as_uuid()).bind(command.identity_id.to_string()).bind(*command.candidate_device_id.as_uuid())
-                .bind(command.candidate_signing_key.as_bytes().as_slice()).bind(command.candidate_recipient_key.as_bytes().as_slice())
+            sqlx::query("INSERT INTO identity.recovery_scope_catalog_preparations(request_id,identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,candidate_nonce,issued_at_ms,expires_at_ms,response_capability_hash,enrollment_capability_hash,candidate_signature,preparation_bytes,preparation_digest,catalog_generation,catalog_head_digest,authority_device_id,authority_signing_key,idempotency_key_hash,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)")
+                .bind(*command.request_id.as_uuid()).bind(command.identity_id.to_string()).bind(command.catalog_id)
+                .bind(*command.candidate_device_id.as_uuid()).bind(command.candidate_signing_key.as_bytes().as_slice())
+                .bind(command.candidate_recipient_key.as_bytes().as_slice())
                 .bind(to_i64(command.observed_head.sequence())?).bind(command.observed_head.hash().as_bytes().as_slice()).bind(command.candidate_nonce.as_slice())
                 .bind(command.issued_at.get()).bind(command.expires_at.get()).bind(command.response_capability_hash.as_bytes().as_slice()).bind(capability_hash.as_bytes().as_slice())
                 .bind(command.candidate_signature.as_bytes().as_slice()).bind(&command.exact_bytes).bind(command.digest.as_bytes().as_slice())
@@ -232,6 +237,7 @@ impl RecoveryScopeCatalogRepository {
 
 #[derive(Clone)]
 struct StoredCatalog {
+    catalog_id: uuid::Uuid,
     generation: SafeUint,
     head_digest: Sha256Digest,
     observed_head: IdentityLogHead,
@@ -352,12 +358,13 @@ async fn load_current_catalog(
     connection: &mut PgConnection,
     identity_id: IdentityId,
 ) -> Result<Option<StoredCatalog>, IdentityPersistenceError> {
-    let row = sqlx::query("SELECT generation,head_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_signing_key,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
+    let row = sqlx::query("SELECT catalog_id,generation,head_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_signing_key,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
         .bind(identity_id.to_string()).fetch_optional(&mut *connection).await?;
     let Some(row) = row else {
         return Ok(None);
     };
     Ok(Some(StoredCatalog {
+        catalog_id: row.try_get("catalog_id")?,
         generation: safe_uint(row.try_get("generation")?)?,
         head_digest: digest(&row.try_get::<Vec<u8>, _>("head_digest")?)?,
         observed_head: IdentityLogHead::observed(
@@ -374,6 +381,7 @@ async fn load_current_catalog(
 struct StoredPreparation {
     request_id: DeviceEnrollmentChallengeId,
     identity_id: IdentityId,
+    catalog_id: uuid::Uuid,
     candidate_device_id: DeviceId,
     candidate_signing_key: SigningPublicKey,
     candidate_recipient_key: DeviceEncryptionPublicKey,
@@ -395,10 +403,10 @@ async fn load_preparation(
     lock: bool,
 ) -> Result<StoredPreparation, IdentityPersistenceError> {
     let row = if lock {
-        sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,response_capability_hash,enrollment_capability_hash,catalog_generation,catalog_head_digest,authority_device_id,authority_signing_key,provider_response_bytes,provider_idempotency_key_hash FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR UPDATE")
+        sqlx::query("SELECT identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,response_capability_hash,enrollment_capability_hash,catalog_generation,catalog_head_digest,authority_device_id,authority_signing_key,provider_response_bytes,provider_idempotency_key_hash FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR UPDATE")
             .bind(*request_id.as_uuid()).fetch_optional(&mut *connection).await?
     } else {
-        sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,response_capability_hash,enrollment_capability_hash,catalog_generation,catalog_head_digest,authority_device_id,authority_signing_key,provider_response_bytes,provider_idempotency_key_hash FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1")
+        sqlx::query("SELECT identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,response_capability_hash,enrollment_capability_hash,catalog_generation,catalog_head_digest,authority_device_id,authority_signing_key,provider_response_bytes,provider_idempotency_key_hash FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1")
             .bind(*request_id.as_uuid()).fetch_optional(&mut *connection).await?
     }.ok_or(IdentityPersistenceError::RecoveryResponseCapabilityRejected)?;
     let identity_id = IdentityId::from_str(&row.try_get::<String, _>("identity_id")?)
@@ -406,6 +414,7 @@ async fn load_preparation(
     Ok(StoredPreparation {
         request_id,
         identity_id,
+        catalog_id: row.try_get("catalog_id")?,
         candidate_device_id: parse_device_uuid(row.try_get("candidate_device_id")?)?,
         candidate_signing_key: signing_key(&row.try_get::<Vec<u8>, _>("candidate_signing_key")?)?,
         candidate_recipient_key: DeviceEncryptionPublicKey::try_from(fixed::<32>(
@@ -472,7 +481,8 @@ async fn preparation_validity(
     let Some(current) = load_current_catalog(connection, row.identity_id).await? else {
         return Ok(invalid(CatalogStatusInvalidation::Catalog));
     };
-    if current.generation != row.catalog_generation
+    if current.catalog_id != row.catalog_id
+        || current.generation != row.catalog_generation
         || current.head_digest != row.catalog_head_digest
         || current.observed_head != row.observed_head
         || current.authority_key != row.authority_key
@@ -548,7 +558,9 @@ async fn current_preparation_status(
     let invalid = preparation_validity(connection, &row, challenge, snapshot, now)
         .await?
         .invalidation;
-    let status = if now >= row.expires_at {
+    let status = if challenge.state == "cancelled" {
+        CatalogStatus::Cancelled
+    } else if now >= row.expires_at {
         CatalogStatus::Expired
     } else if let Some(reason) = invalid {
         CatalogStatus::Invalidated(reason)

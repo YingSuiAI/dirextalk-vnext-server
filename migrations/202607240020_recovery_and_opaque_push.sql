@@ -52,9 +52,10 @@ $$;
 
 CREATE TABLE identity.recovery_scope_catalogs (
     identity_id text NOT NULL,
+    catalog_id uuid NOT NULL CHECK (messaging.is_uuid_v7(catalog_id)),
     generation bigint NOT NULL CHECK (generation BETWEEN 1 AND 9007199254740991),
     previous_head_digest bytea CHECK (previous_head_digest IS NULL OR octet_length(previous_head_digest)=32),
-    leaf_count bigint NOT NULL CHECK (leaf_count BETWEEN 1 AND 65535),
+    leaf_count bigint NOT NULL CHECK (leaf_count BETWEEN 1 AND 1023),
     merkle_root bytea NOT NULL CHECK (octet_length(merkle_root)=32),
     ciphertext_digest bytea NOT NULL CHECK (octet_length(ciphertext_digest)=32),
     observed_head_sequence bigint NOT NULL CHECK (observed_head_sequence BETWEEN 0 AND 9007199254740991),
@@ -64,13 +65,14 @@ CREATE TABLE identity.recovery_scope_catalogs (
     issued_at_ms bigint NOT NULL CHECK (issued_at_ms BETWEEN 0 AND 9007199254740991),
     expires_at_ms bigint NOT NULL CHECK (expires_at_ms>issued_at_ms AND expires_at_ms<=9007199254740991),
     signature bytea NOT NULL CHECK (octet_length(signature)=64),
-    head_bytes bytea NOT NULL CHECK (octet_length(head_bytes) BETWEEN 1 AND 16384),
+    head_bytes bytea NOT NULL CHECK (octet_length(head_bytes) BETWEEN 1 AND 466),
     head_digest bytea NOT NULL CHECK (octet_length(head_digest)=32),
     encrypted_catalog bytea NOT NULL CHECK (octet_length(encrypted_catalog) BETWEEN 1 AND 1048576),
     upload_digest bytea NOT NULL CHECK (octet_length(upload_digest)=32),
     idempotency_key_hash bytea NOT NULL CHECK (octet_length(idempotency_key_hash)=32),
     created_at_ms bigint NOT NULL,
     PRIMARY KEY(identity_id,generation),
+    UNIQUE(identity_id,catalog_id),
     UNIQUE(identity_id,head_digest),
     UNIQUE(identity_id,idempotency_key_hash),
     FOREIGN KEY(identity_id) REFERENCES identity.log_heads(identity_id)
@@ -79,6 +81,7 @@ CREATE TABLE identity.recovery_scope_catalogs (
 CREATE TABLE identity.recovery_scope_catalog_preparations (
     request_id uuid PRIMARY KEY CHECK (messaging.is_uuid_v7(request_id)),
     identity_id text NOT NULL,
+    catalog_id uuid NOT NULL CHECK (messaging.is_uuid_v7(catalog_id)),
     candidate_device_id uuid NOT NULL CHECK (messaging.is_uuid_v7(candidate_device_id)),
     candidate_signing_key bytea NOT NULL CHECK (octet_length(candidate_signing_key)=32),
     candidate_recipient_key bytea NOT NULL CHECK (octet_length(candidate_recipient_key)=32),
@@ -120,6 +123,7 @@ CREATE TABLE identity.recovery_scope_catalog_preparations (
          AND provider_expires_at_ms<=expires_at_ms)
     ),
     UNIQUE(identity_id,idempotency_key_hash),
+    UNIQUE(identity_id,catalog_id,request_id),
     FOREIGN KEY(identity_id,catalog_generation)
         REFERENCES identity.recovery_scope_catalogs(identity_id,generation),
     FOREIGN KEY(request_id) REFERENCES identity.device_enrollment_challenges(challenge_id)
@@ -130,6 +134,7 @@ RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF OLD.request_id IS DISTINCT FROM NEW.request_id
        OR OLD.identity_id IS DISTINCT FROM NEW.identity_id
+       OR OLD.catalog_id IS DISTINCT FROM NEW.catalog_id
        OR OLD.candidate_device_id IS DISTINCT FROM NEW.candidate_device_id
        OR OLD.candidate_signing_key IS DISTINCT FROM NEW.candidate_signing_key
        OR OLD.candidate_recipient_key IS DISTINCT FROM NEW.candidate_recipient_key

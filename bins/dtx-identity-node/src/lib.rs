@@ -51,9 +51,11 @@ use dtx_identity_persistence::{
     IdentityPersistenceError, IdentityPgStore, KeyPackageClaimCommand, KeyPackageClaimOutcome,
     KeyPackagePublishCommand, KeyPackagePublishOutcome, KeyPackageRepository,
     MAX_KEY_PACKAGE_PUBLISH_BYTES, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES,
-    MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES, RecoveryResponseCapability,
-    RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository, RecoveryScopeCatalogStatusOutcome,
-    lock_and_load_active_snapshot,
+    MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
+    MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES,
+    MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES,
+    RecoveryResponseCapability, RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository,
+    RecoveryScopeCatalogStatusOutcome, lock_and_load_active_snapshot,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -134,8 +136,8 @@ pub(crate) use identity::{
 pub(crate) use identity_codec::{
     is_base64url_byte, load_mls_v5_recovery_authorization_projection,
     parse_identity_log_page_request, parse_mls_v5_recovery_authorization_query,
-    parse_positive_safe_uint_path, parse_recovery_capability_header,
-    parse_recovery_enrollment_capability, parse_recovery_response_capability,
+    parse_recovery_capability_header, parse_recovery_enrollment_capability,
+    parse_recovery_response_capability,
 };
 pub(crate) use key_package_codec::{
     parse_federated_key_package_claim_proof, parse_key_package_claim, parse_key_package_publish,
@@ -200,7 +202,7 @@ pub const MLS_V5_RECOVERY_AUTHORIZATION_PATH_TEMPLATE: &str =
 pub const DEVICE_REVOKE_PATH_TEMPLATE: &str =
     "/v1/identities/{identity_id}/devices/{device_id}/revoke";
 /// Active-device publication route for one immutable encrypted catalog generation.
-pub const RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE: &str = "/v1/recovery-scope-catalogs/{generation}";
+pub const RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE: &str = "/v2/recovery-scope-catalogs/{catalog_id}";
 /// Candidate route that freezes the current catalog before ordinary enrollment.
 pub const RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH: &str =
     "/v3/devices/enroll/catalog-preparations";
@@ -265,10 +267,10 @@ pub const KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.key-package-claim-receipt.v1+cbor";
 /// Exact encrypted catalog upload media type.
 pub const RECOVERY_SCOPE_CATALOG_CONTENT_TYPE: &str =
-    "application/vnd.dirextalk.recovery-scope-catalog.v1+cbor";
+    "application/vnd.dirextalk.recovery-scope-catalog.v2+cbor";
 /// Exact signed catalog-head response media type.
 pub const RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE: &str =
-    "application/vnd.dirextalk.recovery-scope-catalog-head.v1+cbor";
+    "application/vnd.dirextalk.recovery-scope-catalog-head.v2+cbor";
 /// Exact candidate preparation media type.
 pub const RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.recovery-scope-catalog-preparation.v2+cbor";
