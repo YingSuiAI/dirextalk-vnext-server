@@ -11,8 +11,6 @@ Run commands from this repository root.
 | test | `cargo test --workspace --locked` |
 | persistence fresh baseline | `cargo test -p dtx-storage --test migrations --locked` |
 | persistence contracts | `cargo test -p dtx-storage --test persistence_contract --locked` |
-| root-only Connector bootstrap issuance | `dtx-agent-provision bootstrap-issue --database-url-file <0600-file> --request-file <root-0600-json> --handoff-file <tenant-operation.handoff.json> --plan-file <tenant-operation.plan.json>` |
-| Host Supervisor VM acceptance (destructive; isolated disposable Linux VM only) | `sudo DTX_DISPOSABLE_VM_ACCEPTANCE=1 bash scripts/test-host-supervisor-vm.sh` |
 | SQLx baseline/prepare gate (Ubuntu/WSL) | `bash scripts/sqlx-prepare.sh` |
 | SQLx baseline/prepare gate (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sqlx-prepare.ps1` |
 | testkit dependency boundary (Ubuntu/WSL) | `bash scripts/check-testkit-boundary.sh` |
@@ -32,13 +30,14 @@ Run commands from this repository root.
 | check Product Core Alpha inventory | `cargo run -p dtx-protocol --locked -- check-alpha .` |
 | update Product Core Alpha inventory | `cargo run -p dtx-protocol --locked -- write-alpha .` |
 
-The full verification gate checks generated Rust/Dart sources before and after
+The full Product Core verification gate checks generated Rust/Dart sources before and after
 idempotent regeneration, validates Product Core Alpha CDDL/OpenAPI/Protobuf and
 golden vectors, checks the exact current Alpha inventory, runs Dart VM and
 compiled-JavaScript conformance, then runs fmt/clippy/test/deny/audit and
 `git diff --check`. CI pins the latest stable Dart SDK selected for S0.3
-(`3.12.2`). Agent/Public source artifacts remain available for independent
-conformance consumers but are intentionally outside the Alpha release gate.
+(`3.12.2`). Agent/Public source remains frozen and is intentionally outside the
+Alpha release gate; its operator and VM acceptance commands are not current
+Product Core entry points.
 
 On Ubuntu/WSL, `scripts/cargo.sh` resolves the channel from
 `rust-toolchain.toml`, refuses an uninstalled toolchain, and passes every

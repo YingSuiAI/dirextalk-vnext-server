@@ -10,10 +10,10 @@ It hashes the current registries and Product Core artifact set. `check-alpha`
 accepts only that exact inventory; it does not compare against prior releases
 and there is no cross-version compatibility gate.
 
-Agent execution, Connector, and Public Channel/Feed artifacts are retained for
-their independent frozen-source consumers, but are explicitly excluded from
-the Product Core Alpha release gate. Historical artifacts are removed only
-when no runtime, test, or generated consumer depends on them.
+Agent execution, Connector, and Public Channel/Feed artifacts are frozen source
+for the next version and are explicitly excluded from the Product Core Alpha
+release gate. There is no historical baseline directory or compatibility
+validator.
 
 Use the repository commands from `../COMMANDS.md`:
 

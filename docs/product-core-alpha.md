@@ -43,9 +43,10 @@ Alpha intentionally starts clean:
 - do not import or dual-write legacy Matrix/workspace-monolith state;
 - do not add a compatibility shim merely to make an old state appear usable.
 
-Historical protocol artifacts remain available for explicit wire validation, but
-they are not alternate runtime writers or a migration source for Product Core
-Alpha.
+Historical protocol baselines, compatibility validators, upgrade tests, and
+rollback-only branches have been deleted. The exact current wire inventory is
+`protocol/alpha/manifest.json`; artifacts outside that inventory are either
+frozen next-version source or are not part of Product Core Alpha.
 
 The database baseline is an exact schema epoch: its complete version and
 checksum set must match the embedded baseline. Existing databases from earlier
@@ -62,6 +63,40 @@ Agent/Public expansion is frozen at this boundary.
 `dirextalk-vnext-deployer` and `dirextalk-agent-connector` are deferred to the
 next **Platform Integration Alpha**. Do not describe their deferred work as
 current server capability or use it to widen the IM contract.
+
+The production composition starts only the Product Core services by default.
+Agent Control requires an explicit profile. Public/Indexer components are
+similarly non-default and cannot be readiness dependencies for identity,
+Mailbox, Realtime, or Push.
+
+## Current architecture
+
+```text
+Android / Flutter
+       |
+       v
+Rust ClientRuntime + encrypted client.redb
+       |
+       +-- Identity / Contact / Device
+       +-- MLS / Conversation / Group
+       +-- Outbox / Inbox / Attachment
+       `-- Reconcile / Snapshot streams
+                    |
+                    v
+Identity + Group + Opaque Mailbox + Realtime + Opaque Push
+                    |
+                    v
+             PostgreSQL current baseline
+```
+
+The client database is the UI truth. WSS and Push are wake-up signals only:
+the client Pulls to a durable high-water mark, atomically commits domain state,
+MLS state, deduplication state, ACK state, and cursors, increments
+`state_revision`, and then publishes a new immutable snapshot.
+
+The server stores and orders protocol facts but never becomes a second
+plaintext timeline. Mailbox ACK is recovery state, not an instruction for a
+widget to refresh.
 
 ## Acceptance and recovery invariants
 
@@ -88,10 +123,9 @@ from crate presence or a green focused test alone.
 ## Verification entry points
 
 - [`README.md`](../README.md) — repository status and boundaries;
-- [`COMMANDS.md`](../COMMANDS.md) — documented focused and full checks;
-- [`protocol/README.md`](../protocol/README.md) — versioned wire artifacts and
-  frozen baselines;
-- [`docs/history-recovery-v1.md`](history-recovery-v1.md),
-  [`docs/realtime-sync-v1.md`](realtime-sync-v1.md), and
-  [`docs/opaque-push-v1.md`](opaque-push-v1.md) — focused recovery and delivery
-  contracts.
+- [`COMMANDS.md`](../COMMANDS.md) — the small set of supported focused and
+  release checks;
+- [`protocol/README.md`](../protocol/README.md) — the current Alpha wire
+  inventory;
+- [`docs/security-boundary.md`](security-boundary.md) — current visibility,
+  secret-handling, and fail-closed rules.
