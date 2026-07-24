@@ -18,10 +18,14 @@ PID_A='' PID_B='' PROXY_A_PID='' PROXY_B_PID=''
 SERIAL_A='' SERIAL_B='' PROXY_A_PORT='' CONTROL_A_PORT='' PROXY_B_PORT='' CONTROL_B_PORT='' NODE_A_PORT='' NODE_B_PORT='' EMULATOR_A_PORT='' EMULATOR_B_PORT='' ALLOCATOR_LOCK_FD=''
 
 die() { printf '%s\n' "android-acceptance: $*" >&2; exit 1; }
-valid_run_id() { [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,47}$ ]]; }
+valid_run_id_value() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,47}$ ]]; }
+valid_run_id() { valid_run_id_value "$RUN_ID"; }
 safe_run_root() { [[ "$RUN_ROOT" == "$STATE_ROOT/$RUN_ID" && "$RUN_ID" != *'/'* ]]; }
 safe_avd() { [[ "$1" == "$RUN_PREFIX"-* && "$1" != "$RUN_PREFIX" ]]; }
 safe_project() { [[ "$COMPOSE_PROJECT" == "dtx-android-accept-$RUN_ID" ]]; }
+valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
+valid_emulator_port() { valid_port "$1" && (( 10#$1 >= 5554 && 10#$1 <= 5682 && 10#$1 % 2 == 0 )); }
+valid_pid() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
 record() { printf '%s=%s\n' "$1" "$2" >>"$RUN_ROOT/resources"; }
 
 safe_state_tree() {
@@ -92,21 +96,31 @@ allocate_ports() {
 }
 
 validate_reservation_file() {
-  local file=$1 line node_a=0 node_b=0 proxy_a=0 control_a=0 proxy_b=0 control_b=0 emulator_a=0 emulator_b=0 serial_a=0 serial_b=0
+  local file=$1 line key value run_id='' compose_project='' node_a_port='' node_b_port='' proxy_a_port='' control_a_port='' proxy_b_port='' control_b_port='' emulator_a_port='' emulator_b_port='' emulator_a_serial='' emulator_b_serial='' compose_owned='' proxy_a_pid='' proxy_b_pid='' emulator_a_pid='' emulator_b_pid=''
+  local -A seen=() ports=()
   [[ -r "$file" && -s "$file" ]] || return 1
   while IFS= read -r line || [[ -n "$line" ]]; do
-    case "$line" in
-      run_id=[A-Za-z0-9-]*|compose_project=dtx-android-accept-[A-Za-z0-9-]*|compose_owned=1|PROXY_A_PID=[0-9]*|PROXY_B_PID=[0-9]*|emulator_a_pid=[0-9]*|emulator_b_pid=[0-9]*) ;;
-      node_a_port=[0-9]*) ((++node_a == 1)) || return 1;; node_b_port=[0-9]*) ((++node_b == 1)) || return 1;;
-      proxy_a_port=[0-9]*) ((++proxy_a == 1)) || return 1;; control_a_port=[0-9]*) ((++control_a == 1)) || return 1;;
-      proxy_b_port=[0-9]*) ((++proxy_b == 1)) || return 1;; control_b_port=[0-9]*) ((++control_b == 1)) || return 1;;
-      emulator_a_port=555[4-9]|emulator_a_port=56[0-7][0-9]|emulator_a_port=568[0-2]) ((++emulator_a == 1)) || return 1;;
-      emulator_b_port=555[4-9]|emulator_b_port=56[0-7][0-9]|emulator_b_port=568[0-2]) ((++emulator_b == 1)) || return 1;;
-      emulator_a_serial=emulator-[0-9]*) ((++serial_a == 1)) || return 1;; emulator_b_serial=emulator-[0-9]*) ((++serial_b == 1)) || return 1;;
-      *) return 1;;
+    [[ "$line" == *=* ]] || return 1
+    key=${line%%=*}; value=${line#*=}
+    [[ -z "${seen[$key]+x}" ]] || return 1
+    seen[$key]=1
+    case "$key" in
+      run_id) valid_run_id_value "$value" || return 1; run_id=$value ;;
+      compose_project) compose_project=$value ;;
+      compose_owned) [[ "$value" == 1 ]] || return 1; compose_owned=$value ;;
+      node_a_port|node_b_port|proxy_a_port|control_a_port|proxy_b_port|control_b_port)
+        valid_port "$value" || return 1; [[ -z "${ports[$value]+x}" ]] || return 1; ports[$value]=1
+        printf -v "$key" '%s' "$value" ;;
+      emulator_a_port|emulator_b_port) valid_emulator_port "$value" || return 1; printf -v "$key" '%s' "$value" ;;
+      emulator_a_serial|emulator_b_serial) [[ "$value" =~ ^emulator-[1-9][0-9]{0,4}$ ]] || return 1; printf -v "$key" '%s' "$value" ;;
+      PROXY_A_PID|PROXY_B_PID|emulator_a_pid|emulator_b_pid) valid_pid "$value" || return 1; printf -v "${key,,}" '%s' "$value" ;;
+      *) return 1 ;;
     esac
   done <"$file"
-  (( node_a == 1 && node_b == 1 && proxy_a == 1 && control_a == 1 && proxy_b == 1 && control_b == 1 && emulator_a == 1 && emulator_b == 1 && serial_a == 1 && serial_b == 1 ))
+  [[ -n "$run_id" && "$compose_project" == "dtx-android-accept-$run_id" ]] || return 1
+  [[ -n "$node_a_port" && -n "$node_b_port" && -n "$proxy_a_port" && -n "$control_a_port" && -n "$proxy_b_port" && -n "$control_b_port" ]] || return 1
+  [[ -n "$emulator_a_port" && -n "$emulator_b_port" && "$emulator_a_port" != "$emulator_b_port" ]] || return 1
+  [[ "$emulator_a_serial" == "emulator-$emulator_a_port" && "$emulator_b_serial" == "emulator-$emulator_b_port" ]]
 }
 
 stop_pid() {
