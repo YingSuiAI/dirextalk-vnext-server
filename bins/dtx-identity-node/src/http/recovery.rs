@@ -184,6 +184,9 @@ impl IdentityBootstrapState {
         .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
         let enrollment_capability = parse_recovery_enrollment_capability(headers)?;
         let response_capability = parse_recovery_response_capability(headers)?;
+        if response_capability.equals_raw(enrollment_capability.as_bytes()) {
+            return Err(RecoveryCatalogFailure::CapabilityRejected);
+        }
         let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES)
             .await
             .map_err(|_| RecoveryCatalogFailure::TooLarge)?;

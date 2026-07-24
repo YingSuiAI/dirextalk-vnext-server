@@ -197,6 +197,7 @@ async fn send_status(
                     RECOVERY_RESPONSE_CAPABILITY_HEADER,
                     Base64UrlUnpadded::encode_string(&response_capability),
                 )
+                .header(header::ACCEPT, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE)
                 .body(Body::empty())?,
         )
         .await?)
@@ -361,30 +362,37 @@ fn preparation_body(
     recipient: [u8; 32],
     head: IdentityLogHead,
     response_capability: [u8; 32],
+    catalog_id: uuid::Uuid,
+    catalog_generation: SafeUint,
+    catalog_head_digest: Sha256Digest,
+    idempotency_key: &str,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
     let unsigned = CanonicalValue::Map(vec![
-        field(1, CanonicalValue::Unsigned(1)),
+        field(1, CanonicalValue::Unsigned(2)),
         field(2, CanonicalValue::Text(request.to_string())),
         field(3, CanonicalValue::Text(identity.to_string())),
-        field(4, CanonicalValue::Text(device.to_string())),
-        field(5, public(signer).to_canonical_value()),
-        field(6, CanonicalValue::Bytes(recipient.to_vec())),
-        field(7, head.sequence().to_canonical_value()),
-        field(8, head.hash().to_canonical_value()),
-        field(9, CanonicalValue::Bytes(vec![60; 32])),
-        field(10, at(4_500).to_canonical_value()),
-        field(11, at(200_000).to_canonical_value()),
-        field(
-            12,
+        field(4, CanonicalValue::Text(catalog_id.to_string())),
+        field(5, catalog_generation.to_canonical_value()),
+        field(6, catalog_head_digest.to_canonical_value()),
+        field(7, CanonicalValue::Text(device.to_string())),
+        field(8, public(signer).to_canonical_value()),
+        field(9, CanonicalValue::Bytes(recipient.to_vec())),
+        field(10, head.sequence().to_canonical_value()),
+        field(11, head.hash().to_canonical_value()),
+        field(12, CanonicalValue::Bytes(vec![60; 32])),
+        field(13,
             Sha256Digest::hash_domain(RESPONSE_CAPABILITY_HASH_DOMAIN, &response_capability)
                 .to_canonical_value(),
         ),
+        field(14, Sha256Digest::hash_domain(b"dirextalk.recovery-scope-catalog-handoff-preparation-idempotency.v2\0", idempotency_key.as_bytes()).to_canonical_value()),
+        field(15, at(4_500).to_canonical_value()),
+        field(16, at(200_000).to_canonical_value()),
     ]);
     let signature = domain_signature(signer, PREPARATION_SIGNATURE_DOMAIN, &unsigned)?;
     let CanonicalValue::Map(mut signed_fields) = unsigned else {
         unreachable!()
     };
-    signed_fields.push(field(13, signature.to_canonical_value()));
+    signed_fields.push(field(17, signature.to_canonical_value()));
     Ok(encode_deterministic_cbor(&CanonicalValue::Map(
         signed_fields,
     ))?)

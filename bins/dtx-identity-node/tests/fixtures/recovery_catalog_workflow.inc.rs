@@ -231,6 +231,10 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         [55; 32],
         head3,
         enrollment_capability,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        safe(1),
+        catalog_head_digest,
+        "catalog-preparation-equal-capabilities",
     )?;
     let equal_capability_response = send_preparation(
         app.clone(),
@@ -255,6 +259,10 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         [55; 32],
         head3,
         response_capability,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        safe(1),
+        catalog_head_digest,
+        "catalog-preparation-0001",
     )?;
     let (prepare_first, prepare_second) = tokio::join!(
         send_preparation(
@@ -275,7 +283,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     let prepare_first = prepare_first?;
     let prepare_second = prepare_second?;
     assert_created_and_replayed(&prepare_first, &prepare_second);
-    assert_catalog_headers(&prepare_first, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
+    assert_catalog_headers(&prepare_first, RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE);
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 0));
 
     let wrong_capability = send_status(app.clone(), challenge.challenge_id(), [62; 32]).await?;
@@ -376,8 +384,8 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     let provider_second = provider_second?;
     assert_eq!(provider_first.status(), StatusCode::OK);
     assert_eq!(provider_second.status(), StatusCode::OK);
-    assert_catalog_headers(&provider_first, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
-    assert_catalog_headers(&provider_second, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
+    assert_catalog_headers(&provider_first, RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE);
+    assert_catalog_headers(&provider_second, RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE);
     assert_eq!(
         to_bytes(provider_first.into_body(), 1_100_000).await?,
         to_bytes(provider_second.into_body(), 1_100_000).await?
@@ -489,6 +497,10 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         [66; 32],
         head4,
         cancelled_response_capability,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b3")?,
+        safe(2),
+        rotated_head_digest,
+        "catalog-preparation-cancelled",
     )?;
     let prepared = send_preparation(
         app.clone(),
