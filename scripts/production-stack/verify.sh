@@ -18,4 +18,4 @@ scripts/production-stack/validate-files.sh
 command -v docker >/dev/null 2>&1 || { echo 'docker is required' >&2; exit 1; }
 docker compose --project-name dirextalk-vnext-production --env-file "$env_file" -f "$compose_file" config >/dev/null
 scripts/production-stack/validate-images.sh
-docker compose --project-name dirextalk-vnext-production --env-file "$env_file" -f "$compose_file" up --force-recreate --no-deps --abort-on-container-failure node-ready realtime-ready agent-control-ready
+docker compose --project-name dirextalk-vnext-production --env-file "$env_file" -f "$compose_file" up --force-recreate --no-deps --abort-on-container-failure node-ready realtime-ready

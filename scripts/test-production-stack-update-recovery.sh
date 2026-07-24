@@ -66,7 +66,7 @@ worker() {
         printf 'compose:%s:%s\n' "$(basename -- "$selected")" "$*" >>"$fixture/events"
         if [[ "$*" == 'up -d --remove-orphans' ]]; then
             touch "$fixture/candidate-started"
-        elif [[ "$*" == 'up -d --no-deps dtx-node realtime-gateway agent-control caddy' ]]; then
+        elif [[ "$*" == 'up -d --no-deps dtx-node realtime-gateway caddy' ]]; then
             touch "$fixture/prior-started"
         fi
     }
@@ -236,7 +236,7 @@ fi
 cmp "$rollback/production.env" "$rollback/prior.env"
 cmp "$rollback/current.env" "$rollback/prior.env"
 grep -qx 'status=rolled_back' "$rollback/state/receipt"
-assert_count 1 'compose:prior.env:up -d --no-deps dtx-node realtime-gateway agent-control caddy' "$rollback/events"
+assert_count 1 'compose:prior.env:up -d --no-deps dtx-node realtime-gateway caddy' "$rollback/events"
 assert_count 1 'ready:prior.env' "$rollback/events"
 grep -q 'compatible prior release restored on the forward schema' "$rollback/error"
 
@@ -280,7 +280,7 @@ fi
 [[ $(cat "$failed_recovery/state/phase") == rolled_back ]]
 grep -qx 'status=rolled_back' "$failed_recovery/state/receipt"
 assert_count 1 'compose:candidate.env:up -d --remove-orphans' "$failed_recovery/events"
-assert_count 3 'compose:prior.env:up -d --no-deps dtx-node realtime-gateway agent-control caddy' \
+assert_count 3 'compose:prior.env:up -d --no-deps dtx-node realtime-gateway caddy' \
     "$failed_recovery/events"
 assert_count 3 'ready:prior.env' "$failed_recovery/events"
 grep -q 'repaired prior release is ready on the forward schema' "$failed_recovery/resume-error"
@@ -298,7 +298,7 @@ fi
 [[ $(cat "$precompose_recovery/state/phase") == recovery_failed ]]
 [[ -f "$precompose_recovery/candidate-started" ]]
 [[ ! -f "$precompose_recovery/prior-started" ]]
-assert_count 0 'compose:prior.env:up -d --no-deps dtx-node realtime-gateway agent-control caddy' \
+assert_count 0 'compose:prior.env:up -d --no-deps dtx-node realtime-gateway caddy' \
     "$precompose_recovery/events"
 if run_worker "$precompose_recovery" 2>"$precompose_recovery/resume-error"; then
     echo 'pre-Compose recovery resume unexpectedly reported update success' >&2
@@ -308,11 +308,11 @@ else
 fi
 [[ "$precompose_status" == 1 ]]
 [[ $(cat "$precompose_recovery/state/phase") == rolled_back ]]
-assert_count 1 'compose:prior.env:up -d --no-deps dtx-node realtime-gateway agent-control caddy' \
+assert_count 1 'compose:prior.env:up -d --no-deps dtx-node realtime-gateway caddy' \
     "$precompose_recovery/events"
 assert_count 1 'ready:prior.env' "$precompose_recovery/events"
 prior_compose_line=$(grep -nF \
-    'compose:prior.env:up -d --no-deps dtx-node realtime-gateway agent-control caddy' \
+    'compose:prior.env:up -d --no-deps dtx-node realtime-gateway caddy' \
     "$precompose_recovery/events" | cut -d: -f1)
 prior_ready_line=$(grep -nF 'ready:prior.env' "$precompose_recovery/events" | cut -d: -f1)
 (( prior_compose_line < prior_ready_line ))

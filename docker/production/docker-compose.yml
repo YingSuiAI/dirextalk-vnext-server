@@ -245,6 +245,7 @@ services:
     cap_drop: ["ALL"]
     entrypoint: ["/usr/local/bin/dtx-agent-control"]
     command: ["--config", "/etc/dirextalk/agent-control.json"]
+    profiles: ["agent-control"]
     volumes:
       - ${DTX_CONFIG_ROOT:?set config root}/agent-control.json:/etc/dirextalk/agent-control.json:ro
       - ${DTX_SECRET_ROOT:?set secret root}/agent-control:/run/dtx-agent-control-secrets:ro
@@ -254,9 +255,9 @@ services:
         condition: service_completed_successfully
     expose: ["9443", "9444", "9445"]
     ports:
-      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9443:9443"
-      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9444:9444"
-      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9445:9445"
+      - "${DTX_AGENT_CONTROL_BIND:-127.0.0.1}:9443:9443"
+      - "${DTX_AGENT_CONTROL_BIND:-127.0.0.1}:9444:9444"
+      - "${DTX_AGENT_CONTROL_BIND:-127.0.0.1}:9445:9445"
     restart: unless-stopped
 
   agent-control-ready:
@@ -266,6 +267,7 @@ services:
     cap_drop: ["ALL"]
     entrypoint: ["curl"]
     command: ["--fail", "--silent", "--show-error", "--retry", "30", "--retry-connrefused", "--retry-delay", "2", "http://127.0.0.1:9080/ready"]
+    profiles: ["agent-control"]
     network_mode: service:agent-control
     depends_on:
       agent-control:

@@ -1054,7 +1054,7 @@ def install_code_only_rollback(release: Path, manifest: dict[str, object]) -> No
         [
             "docker", "compose", "--project-name", "dirextalk-vnext-production",
             "--env-file", str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE),
-            "up", "-d", "--no-deps", "dtx-node", "realtime-gateway", "agent-control", "caddy",
+            "up", "-d", "--no-deps", "dtx-node", "realtime-gateway", "caddy",
         ],
         env=environment,
         stdin=subprocess.DEVNULL,
@@ -1101,15 +1101,9 @@ def replace_runtime_identity(manifest: dict[str, object]) -> bytes:
     return result
 
 
-AGENT_PORTS='''    ports:\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9443:9443"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9444:9444"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9445:9445"'''
-CADDY_PORTS='''    ports:\n      - "443:443"\n      - "80:80"'''
 # This is a mechanically copied, self-contained rendering contract from
 # provision-vnext.  Recovery bundles can predate that provisioner.
 def transform_compose(source):
-    if source.count(AGENT_PORTS)!=1 or source.count(CADDY_PORTS)!=1: raise ContractError('unexpected compose port template')
-    source=source.replace(AGENT_PORTS, AGENT_PORTS+'\n      - "80:80"\n      - "443:443"', 1)
-    source=source.replace(CADDY_PORTS, '    network_mode: service:agent-control', 1)
-    if source.count('network_mode: service:agent-control') != 2: raise ContractError('compose transformation count invalid')
     return source
 def owner_routes():
     return '''    # Owner API is an explicit authenticated allowlist. Caddy shares Agent
@@ -1235,8 +1229,13 @@ def caddyfile(domain):
         method POST
         path_regexp mcp ^/mcp$
     }}
-    reverse_proxy @mcp http://127.0.0.1:9081
-{owner_routes()}    # Canonical public API routes use a positive, non-zero decimal version.
+    reverse_proxy @mcp https://dtx-node:8443 {{
+        transport http {{
+            tls_trust_pool file /data/caddy/private-ca.pem
+            tls_server_name {domain}
+        }}
+    }}
+    # Canonical public API routes use a positive, non-zero decimal version.
     @node path_regexp versioned_api ^/v[1-9][0-9]*/.*$
     reverse_proxy @node https://dtx-node:8443 {{
         transport http {{
@@ -1426,7 +1425,7 @@ def clear_r3_transition(current: dict[str, object], prior: dict[str, object]) ->
     fsync_directory(STATE_ROOT)
 
 
-REQUIRED_RUNTIME_SERVICES = frozenset({"dtx-node", "realtime-gateway", "agent-control"})
+REQUIRED_RUNTIME_SERVICES = frozenset({"dtx-node", "realtime-gateway"})
 
 
 def parse_compose_ps_images(raw: bytes) -> dict[str, str]:

@@ -26,7 +26,7 @@ raw environment values. Role teardown only disables login and requires an
 explicit confirmation string. It preloads the complete password set, uses
 `O_NOFOLLOW`, verifies a root-owned non-writable ancestor chain, reads and
 checks one descriptor, and mutates roles in one transaction. The PostgreSQL
-gate normalizes role attributes/memberships and tests Agent Control's required
+gate normalizes role attributes/memberships and tests managed roles' required
 and forbidden privileges before any application starts.
 
 Provision `/etc/dirextalk/vnext/{config,secrets,tls}` as root. Secret and key
@@ -35,29 +35,26 @@ admin password, the admin URL, and role-password inputs are root-loaded and
 remain `root:root` mode `0400`. Public certificates/CA bundles are
 `root:root` mode `0444`; private keys are never world-readable. Non-secret
 configuration is `0644` and root-owned. Populate one password file per fixed
-login role, including `dtx_agent_control`, under `secrets/role-passwords/`; the
-migrator never emits them. `dtx_agent_peer_admin` is instead a passwordless
+login role under `secrets/role-passwords/`; the migrator never emits them.
+`dtx_agent_peer_admin` is instead a passwordless
 `NOLOGIN NOINHERIT` capability role: it has no runtime membership or table
 access and receives only `agent` schema usage plus the two exact MCP credential
-digest register/revoke functions. Caddy normally routes node HTTPS/MCP and realtime
-WSS only, and accepts MCP only as `POST /mcp`. The fixed fresh-host provisioner
-is the sole exception: it runs Caddy in Agent Control's network namespace,
-publishes 80/443 there, and forwards to loopback `127.0.0.1:9081` only the
-authenticated, method-specific Owner API allowlist registered in `owner_http.rs`
-(Connector control, bindings, conversation grants and route runs, route
-bootstraps, identity approvals, provisioning targets/deliveries, and
-revocations). All other Owner paths and methods fall through to the node route;
-the Owner listener itself remains loopback-only. The shared Caddy template does
-not receive this allowlist because its network topology cannot reach that
-loopback listener. Agent Control remains on its dedicated
-native TLS/mTLS listeners and is not terminated by Caddy.
+digest register/revoke functions. Caddy routes node HTTPS/MCP and realtime WSS
+only, and accepts MCP only as `POST /mcp`.
 
-Set `DTX_AGENT_CONTROL_BIND` to the EC2 private/VPC address. Docker publishes
-9443 (enrollment server-auth TLS), 9444 (Connector mTLS), and 9445 (legacy
-gateway mTLS) only on that address. The security group and host firewall must
-allow 9443 solely from approved enrollment clients, 9444 solely from approved
-Connector networks, and 9445 solely from the legacy gateway. Do not allow
-these ports from `0.0.0.0/0`; health/owner ports 9080/9081 stay unpublished.
+Agent Control is deferred and frozen outside Product Core Alpha. It is not
+started or checked by the default production stack. A separately reviewed
+operator may opt in with Compose's `agent-control` profile; that profile starts
+both `agent-control` and `agent-control-ready`. When opting in, set
+`DTX_AGENT_CONTROL_BIND` to the EC2 private/VPC address and restrict 9443
+(enrollment), 9444 (Connector), and 9445 (legacy gateway) to approved networks;
+health/owner ports 9080/9081 stay unpublished.
+
+The retained `dtx_agent_control` role-password input is frozen PostgreSQL
+bootstrap material required by the shared role contract. It is not Agent Control
+service configuration and does not cause the default Product Core stack to
+start, bind, or verify Agent Control. Conditional role activation is deferred
+to Platform Integration Alpha.
 
 Opaque push is fail-closed disabled in this bundle: no broker service and no
 public registration route are present. Enabling FCM requires a separately
@@ -87,7 +84,7 @@ touches releases, volumes, containers, active images, logs, source trees,
 configuration, TLS, or secrets.
 Bootstrap records the executed digest set. Update records both prior and
 candidate immutable sets plus the compose checksum, waits for real node,
-realtime, Agent Control, and PostgreSQL privilege readiness, and only attempts
+realtime, and PostgreSQL privilege readiness, and only attempts
 the retained prior set when both releases declare
 `forward-schema-compatible-v1` and the compose checksum is unchanged.
 
@@ -133,13 +130,13 @@ at readiness. A replay from `candidate_ready` performs only the pending
 promotions.
 
 Rollback first durably restores both canonical environment files, then
-reconciles only the retained long-running services with `--no-deps`. It writes
-`rolled_back` only after the same node, realtime, and Agent Control readiness
-probes used by `verify.sh` succeed. If retained services do not become ready,
+reconciles only the retained Product Core long-running services with `--no-deps`.
+It writes `rolled_back` only after the same node and realtime readiness probes
+used by `verify.sh` succeed. If retained services do not become ready,
 the durable phase and receipt remain `recovery_failed`; this is nonterminal and
 requires operator repair rather than claiming rollback success. A later
 invocation under the same authenticated intent first reconciles the exact prior
-`dtx-node`, realtime, Agent Control, and Caddy services with `--no-deps`, then
+`dtx-node`, realtime, and Caddy services with `--no-deps`, then
 performs one bounded prior-readiness attempt. It never re-enters candidate
 Compose or migrations and publishes `rolled_back` only after prior readiness
 succeeds.

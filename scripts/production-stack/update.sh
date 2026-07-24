@@ -487,7 +487,7 @@ readiness_with() {
     validate_images_for "$selected_env" || return $?
     compose_with "$selected_env" config >/dev/null || return $?
     compose_with "$selected_env" up --force-recreate --no-deps --abort-on-container-failure \
-        node-ready realtime-ready agent-control-ready
+        node-ready realtime-ready
 }
 
 fault_point() {
@@ -547,7 +547,7 @@ recover_prior_code() {
     atomic_copy "$state_root/prior.env" "$current_env" 0600 || return $?
     if ! validate_images_for "$state_root/prior.env" \
         || ! compose_with "$state_root/prior.env" up -d --no-deps \
-            dtx-node realtime-gateway agent-control caddy \
+            dtx-node realtime-gateway caddy \
         || ! readiness_with "$state_root/prior.env"; then
         mark_recovery_failed || return $?
         echo 'candidate failed and retained prior services did not become ready' >&2
@@ -568,7 +568,7 @@ resume_failed_recovery() {
     atomic_copy "$state_root/prior.env" "$current_env" 0600 || return $?
     if ! validate_images_for "$state_root/prior.env" \
         || ! compose_with "$state_root/prior.env" up -d --no-deps \
-            dtx-node realtime-gateway agent-control caddy \
+            dtx-node realtime-gateway caddy \
         || ! readiness_with "$state_root/prior.env"; then
         echo 'retained prior services remain unready after bounded recovery reconciliation' >&2
         return 2

@@ -92,13 +92,7 @@ def write(path, data, mode, gid=0, uid=0):
         except FileNotFoundError: pass
 def run(*args, cwd=None): subprocess.run(args, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-AGENT_PORTS='''    ports:\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9443:9443"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9444:9444"\n      - "${DTX_AGENT_CONTROL_BIND:?set private host/VPC bind IP}:9445:9445"'''
-CADDY_PORTS='''    ports:\n      - "443:443"\n      - "80:80"'''
 def transform_compose(source):
-    if source.count(AGENT_PORTS)!=1 or source.count(CADDY_PORTS)!=1: raise ContractError('unexpected compose port template')
-    source=source.replace(AGENT_PORTS, AGENT_PORTS+'\n      - "80:80"\n      - "443:443"', 1)
-    source=source.replace(CADDY_PORTS, '    network_mode: service:agent-control', 1)
-    if source.count('network_mode: service:agent-control') != 2: raise ContractError('compose transformation count invalid')
     return source
 def owner_routes():
     return '''    # Owner API is an explicit authenticated allowlist. Caddy shares Agent
@@ -224,8 +218,13 @@ def caddyfile(domain):
         method POST
         path_regexp mcp ^/mcp$
     }}
-    reverse_proxy @mcp http://127.0.0.1:9081
-{owner_routes()}    # Canonical public API routes use a positive, non-zero decimal version.
+    reverse_proxy @mcp https://dtx-node:8443 {{
+        transport http {{
+            tls_trust_pool file /data/caddy/private-ca.pem
+            tls_server_name {domain}
+        }}
+    }}
+    # Canonical public API routes use a positive, non-zero decimal version.
     @node path_regexp versioned_api ^/v[1-9][0-9]*/.*$
     reverse_proxy @node https://dtx-node:8443 {{
         transport http {{
@@ -243,26 +242,21 @@ def caddyfile(domain):
 }}
 '''
 
-def agent_config(v):
-    s='/run/dtx-agent-control-secrets/'; t='/run/dtx-agent-control-tls/'
-    return canonical({'database_url_file':s+'database-url','max_database_connections':16,'health':{'listen':'127.0.0.1:9080'},'owner_api':{'listen':'127.0.0.1:9081','tenant_id':v['tenant_id']},'enrollment':{'listen':'0.0.0.0:9443','certificate_chain_pem':t+'enrollment-chain.pem','private_key_pkcs8_pem':s+'enrollment-key.pem'},'control':{'listen':'0.0.0.0:9444','certificate_chain_pem':t+'control-chain.pem','private_key_pkcs8_pem':s+'control-key.pem','client_ca_bundle_pem':t+'connector-client-roots.pem'},'legacy_gateway':{'listen':'0.0.0.0:9445','certificate_chain_pem':t+'legacy-gateway-server-chain.pem','private_key_pkcs8_pem':s+'legacy-gateway-server-key.pem','client_ca_bundle_pem':t+'internal-service-client-roots.pem'},'connector_issuer':{'certificate_pem':t+'connector-issuer.pem','private_key_pkcs8_pem':s+'connector-issuer-key.pem','response_intermediate_bundle_pem':t+'connector-response-intermediates.pem'}})
 def make_tls(v):
-    mkdir(TLS,0o750,10001); mkdir(SECRETS/'agent-control',0o750,10001)
+    mkdir(TLS,0o750,10001)
     ca=TLS/'private-ca.pem'; cak=SECRETS/'private-ca-key.pem'
     run('openssl','genpkey','-algorithm','ED25519','-out',str(cak)); os.chmod(cak,0o440); os.chown(cak,0,10001)
     run('openssl','req','-x509','-new','-key',str(cak),'-out',str(ca),'-subj','/CN='+v['domain'],'-days','3650'); os.chmod(ca,0o444)
-    for name, keyname, certname in [('node','node-key.pem','node-cert.pem'),('gateway','gateway-key.pem','gateway-cert.pem'),('server','server-key.pem','server-cert.pem'),('enrollment','enrollment-key.pem','enrollment-chain.pem'),('control','control-key.pem','control-chain.pem'),('legacy','legacy-gateway-server-key.pem','legacy-gateway-server-chain.pem')]:
-        key=(SECRETS/'agent-control'/keyname) if name in ('enrollment','control','legacy') else TLS/keyname
+    for name, keyname, certname in [('node','node-key.pem','node-cert.pem'),('gateway','gateway-key.pem','gateway-cert.pem'),('server','server-key.pem','server-cert.pem')]:
+        key=TLS/keyname
         run('openssl','genpkey','-algorithm','ED25519','-out',str(key)); os.chmod(key,0o440); os.chown(key,0,10001)
         csr=Path(str(key)+'.csr'); ext=Path(str(key)+'.ext'); write(ext,('subjectAltName=DNS:'+v['domain']+'\n').encode(),0o600); run('openssl','req','-new','-key',str(key),'-out',str(csr),'-subj','/CN='+v['domain']); cert=TLS/certname; run('openssl','x509','-req','-in',str(csr),'-CA',str(ca),'-CAkey',str(cak),'-CAcreateserial','-extfile',str(ext),'-out',str(cert),'-days','825'); write(cert,cert.read_bytes()+ca.read_bytes(),0o444); csr.unlink(missing_ok=True); ext.unlink(missing_ok=True)
     write(TLS/'mls-sequencer-key.pem',os.urandom(32),0o400,10001,10001)
-    issuerk=SECRETS/'agent-control/connector-issuer-key.pem'; issuer=TLS/'connector-issuer.pem'; run('openssl','genpkey','-algorithm','ED25519','-out',str(issuerk)); os.chmod(issuerk,0o440); os.chown(issuerk,0,10001); run('openssl','req','-x509','-new','-key',str(issuerk),'-out',str(issuer),'-subj','/CN=connector-issuer.'+v['domain'],'-days','3650'); os.chmod(issuer,0o444)
-    for n in ('connector-client-roots.pem','connector-response-intermediates.pem','internal-service-client-roots.pem'): write(TLS/n,issuer.read_bytes(),0o444)
 def material(v, release):
     for p,m,g in ((CONFIG,0o755,0),(SECRETS,0o750,10001),(SECRETS/'role-passwords',0o700,0),(TLS,0o750,10001)): mkdir(p,m,g)
     write(CONFIG/'production-compose.yml',transform_compose((release/'docker/production/docker-compose.yml').read_text()).encode(),0o644)
-    write(CONFIG/'Caddyfile',caddyfile(v['domain']).encode(),0o644); write(CONFIG/'agent-control.json',agent_config(v),0o644)
-    env='\n'.join([f'DTX_SERVER_IMAGE={v["server_image"]}',f'DTX_MIGRATOR_IMAGE={v["migrator_image"]}',f'DTX_POSTGRES_IMAGE={v["postgres_image"]}',f'DTX_CADDY_IMAGE={v["caddy_image"]}',f'DTX_PROBE_IMAGE={v["probe_image"]}',f'DTX_RELEASE_VERSION={v["release_version"]}','DTX_ROLLBACK_COMPATIBILITY=forward-schema-compatible-v1',f'DTX_NODE_HOSTNAME={v["domain"]}',f'DTX_NODE_PUBLIC_ORIGIN=https://{v["domain"]}',f'DTX_NODE_TENANT_ID={v["tenant_id"]}',f'DTX_NODE_INDEXER_ID={v["indexer_id"]}',f'DTX_AGENT_CONTROL_BIND={v["private_ipv4"]}',f'DTX_CONFIG_ROOT={CONFIG}',f'DTX_SECRET_ROOT={SECRETS}',f'DTX_TLS_ROOT={TLS}',''])
+    write(CONFIG/'Caddyfile',caddyfile(v['domain']).encode(),0o644)
+    env='\n'.join([f'DTX_SERVER_IMAGE={v["server_image"]}',f'DTX_MIGRATOR_IMAGE={v["migrator_image"]}',f'DTX_POSTGRES_IMAGE={v["postgres_image"]}',f'DTX_CADDY_IMAGE={v["caddy_image"]}',f'DTX_PROBE_IMAGE={v["probe_image"]}',f'DTX_RELEASE_VERSION={v["release_version"]}','DTX_ROLLBACK_COMPATIBILITY=forward-schema-compatible-v1',f'DTX_NODE_HOSTNAME={v["domain"]}',f'DTX_NODE_PUBLIC_ORIGIN=https://{v["domain"]}',f'DTX_NODE_TENANT_ID={v["tenant_id"]}',f'DTX_NODE_INDEXER_ID={v["indexer_id"]}',f'DTX_CONFIG_ROOT={CONFIG}',f'DTX_SECRET_ROOT={SECRETS}',f'DTX_TLS_ROOT={TLS}',''])
     write(CONFIG/'production.env',env.encode(),0o644)
     admin=os.urandom(32).hex(); write(SECRETS/'postgres-admin-password',(admin+'\n').encode(),0o400); write(SECRETS/'admin-database-url',('postgresql://dtx_admin:'+admin+'@postgres/dtx_node\n').encode(),0o400)
     roles=['dtx_identity_node','dtx_group_node','dtx_mailbox_node','dtx_push_registration','dtx_push_identity_auth','dtx_realtime_sync_gateway','dtx_push_broker','dtx_public_feed_node','dtx_indexer_node','dtx_agent_control']
@@ -271,7 +265,6 @@ def material(v, release):
     for name in ('identity','group','mailbox','public-feed','indexer','realtime'):
         role={'realtime':'dtx_realtime_sync_gateway'}.get(name,'dtx_'+name.replace('-','_')+'_node')
         write(SECRETS/(name+'-database-url'),('postgresql://'+role+':'+passwords[role]+'@postgres/dtx_node\n').encode(),0o440,10001)
-    write(SECRETS/'agent-control/database-url',('postgresql://dtx_agent_control:'+passwords['dtx_agent_control']+'@postgres/dtx_node\n').encode(),0o440,10001)
     make_tls(v)
 def ready(v, reqsha):
     body={'schema':RECEIPT_SCHEMA,'schema_version':1,'state':'ready','request_sha256':reqsha,'target':v['target'],'domain':v['domain'],'tenant_id':v['tenant_id'],'indexer_id':v['indexer_id'],'release_version':v['release_version'],'bundle_sha256':v['bundle_sha256'],'compose_sha256':v['compose_sha256']}; body['receipt_sha256']=sha(canonical(body)); return canonical(body)
