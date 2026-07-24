@@ -16,16 +16,3 @@ scripts/production-stack/validate-files.sh
 scripts/production-stack/validate-images.sh
 docker compose --project-name dirextalk-vnext-production --env-file "$env_file" -f "$compose_file" up -d
 scripts/production-stack/verify.sh
-record=$(mktemp -d /var/lib/dirextalk/vnext/releases/bootstrap.XXXXXXXX)
-install -o root -g root -m 0600 "$env_file" "$record/candidate.env"
-sha256sum "$compose_file" >"$record/compose.sha256"
-chmod 0600 "$record/compose.sha256"
-printf 'status=ready\nkind=bootstrap\n' >"$record/receipt.tmp"
-chmod 0600 "$record/receipt.tmp"
-mv "$record/receipt.tmp" "$record/receipt"
-install -o root -g root -m 0600 "$env_file" /var/lib/dirextalk/vnext/current.env.tmp
-mv /var/lib/dirextalk/vnext/current.env.tmp /var/lib/dirextalk/vnext/current.env
-printf 'status=ready\n' >/var/lib/dirextalk/vnext/last-successful-operation.tmp
-chmod 0600 /var/lib/dirextalk/vnext/last-successful-operation.tmp
-mv /var/lib/dirextalk/vnext/last-successful-operation.tmp /var/lib/dirextalk/vnext/last-successful-operation
-scripts/production-stack/cleanup-cache.sh

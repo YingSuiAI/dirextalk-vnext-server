@@ -16,11 +16,6 @@ PATTERNS = {
     "DTX_CADDY_IMAGE": re.compile(rf"caddy@{DIGEST}"),
     "DTX_PROBE_IMAGE": re.compile(rf"curlimages/curl@{DIGEST}"),
 }
-RELEASE_VERSION = re.compile(
-    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
-    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
-)
 
 
 def parse(path: Path) -> dict[str, str]:
@@ -56,11 +51,6 @@ def validate(values: dict[str, str]) -> None:
     )
     if bind.version != 4 or not any(bind in network for network in private_v4):
         raise ValueError("DTX_AGENT_CONTROL_BIND must be an RFC1918 host/VPC address")
-    if values.get("DTX_ROLLBACK_COMPATIBILITY") != "forward-schema-compatible-v1":
-        raise ValueError("rollback compatibility contract is missing")
-    version = values.get("DTX_RELEASE_VERSION")
-    if version is None or RELEASE_VERSION.fullmatch(version) is None:
-        raise ValueError("DTX_RELEASE_VERSION is not tag-safe SemVer")
 
 
 def self_test() -> None:
@@ -72,8 +62,6 @@ def self_test() -> None:
         "DTX_CADDY_IMAGE": f"caddy@{digest}",
         "DTX_PROBE_IMAGE": f"curlimages/curl@{digest}",
         "DTX_AGENT_CONTROL_BIND": "10.0.0.6",
-        "DTX_ROLLBACK_COMPATIBILITY": "forward-schema-compatible-v1",
-        "DTX_RELEASE_VERSION": "0.1.0",
     }
     validate(valid)
     negatives = [
@@ -85,8 +73,6 @@ def self_test() -> None:
         ("DTX_PROBE_IMAGE", f"busybox@{digest}"),
         ("DTX_AGENT_CONTROL_BIND", "0.0.0.0"),
         ("DTX_AGENT_CONTROL_BIND", "127.0.0.1"),
-        ("DTX_ROLLBACK_COMPATIBILITY", "unknown"),
-        ("DTX_RELEASE_VERSION", "0.1.0+mutable"),
     ]
     for key, bad in negatives:
         candidate = dict(valid)

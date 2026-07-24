@@ -21,12 +21,11 @@ Run commands from this repository root.
 | release-build | `cargo build --workspace --locked --release` |
 | release-image-check | `bash scripts/check-release-image.sh` |
 | production-stack structural gate | `bash scripts/check-production-stack.sh` |
-| vNext fixed host provisioner contract | `python3 tools/test-vnext-host-provision.py` |
+| production-stack focused test | `bash scripts/test-production-stack.sh` |
+| client-binding artifact test | `python3 tools/test-client-binding-release-artifacts.py` |
 | production PostgreSQL role/readiness gate | `bash scripts/test-production-postgres.sh` |
 | publish production images | `bash scripts/publish-production-release.sh` |
 | clean interrupted release builder/cache | `bash scripts/cleanup-production-release.sh` |
-| vNext stack bundle build | `python3 tools/vnext-stack-bundle.py build --source-root . --release-facts target/production-release/release-facts.json --output <path>.bundle` |
-| vNext stack bundle verify | `python3 tools/vnext-stack-bundle.py verify --output <path>.bundle` |
 | regenerate contracts | `cargo run -p dtx-protocol --locked -- generate .` |
 | check generated contracts | `cargo run -p dtx-protocol --locked -- check-generated .` |
 | validate schema and vectors | `cargo run -p dtx-protocol --locked -- validate .` |
