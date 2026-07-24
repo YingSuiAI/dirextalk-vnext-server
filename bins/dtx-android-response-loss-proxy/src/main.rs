@@ -6,7 +6,13 @@
 //! observes, parses, stores, or logs application/TLS payloads. A trigger drops
 //! the first nonempty upstream-to-client response after the trigger.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -33,8 +39,8 @@ impl LossGate {
         self.counters.triggers
     }
 
-    fn take_response_loss(&mut self) -> bool {
-        if !self.armed {
+    fn take_response_loss(&mut self, client_open: bool) -> bool {
+        if !self.armed || !client_open {
             return false;
         }
         self.armed = false;
@@ -141,14 +147,25 @@ async fn relay(client: TcpStream, upstream: SocketAddr, gate: Arc<Mutex<LossGate
     };
     let (mut client_read, mut client_write) = client.into_split();
     let (mut server_read, mut server_write) = server.into_split();
-    let forward =
-        tokio::spawn(async move { tokio::io::copy(&mut client_read, &mut server_write).await });
+    let client_open = Arc::new(AtomicBool::new(true));
+    let reader_open = Arc::clone(&client_open);
+    let forward = tokio::spawn(async move {
+        let result = tokio::io::copy(&mut client_read, &mut server_write).await;
+        reader_open.store(false, Ordering::Release);
+        result
+    });
     let mut buffer = [0_u8; 16_384];
     while let Ok(read) = server_read.read(&mut buffer).await {
         if read == 0 {
             break;
         }
-        if gate.lock().await.take_response_loss() {
+        // The mutex makes trigger/response consumption one-shot. A closed client
+        // cannot consume a trigger or increment the drop counter.
+        if gate
+            .lock()
+            .await
+            .take_response_loss(client_open.load(Ordering::Acquire))
+        {
             break;
         }
         if client_write.write_all(&buffer[..read]).await.is_err() {
@@ -160,18 +177,29 @@ async fn relay(client: TcpStream, upstream: SocketAddr, gate: Arc<Mutex<LossGate
 
 #[cfg(test)]
 mod tests {
-    use super::{LossGate, loopback};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::{TcpListener, TcpStream},
+        sync::Mutex,
+    };
+
+    use super::{LossGate, loopback, relay};
 
     #[test]
     fn loss_is_exactly_once_per_trigger_and_counters_are_deterministic() {
         let mut gate = LossGate::default();
-        assert!(!gate.take_response_loss());
+        assert!(!gate.take_response_loss(true));
         assert_eq!(gate.trigger(), 1);
-        assert!(gate.take_response_loss());
-        assert!(!gate.take_response_loss());
+        assert!(gate.take_response_loss(true));
+        assert!(!gate.take_response_loss(true));
         assert_eq!(gate.trigger(), 2);
         assert_eq!(gate.trigger(), 3);
-        assert!(gate.take_response_loss());
+        assert!(gate.take_response_loss(true));
         assert_eq!(gate.counters.triggers, 3);
         assert_eq!(gate.counters.dropped_responses, 2);
     }
@@ -182,5 +210,40 @@ mod tests {
         assert!(loopback("[::1]:1").is_ok());
         assert!(loopback("0.0.0.0:1").is_err());
         assert!(loopback("192.168.1.10:1").is_err());
+    }
+
+    #[tokio::test]
+    async fn actual_tcp_response_is_cut_once_after_trigger() {
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = backend.accept().await.unwrap();
+            let mut request = [0; 1];
+            socket.read_exact(&mut request).await.unwrap();
+            socket.write_all(b"response").await.unwrap();
+        });
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let gate = Arc::new(Mutex::new(LossGate::default()));
+        gate.lock().await.trigger();
+        let relay_gate = Arc::clone(&gate);
+        tokio::spawn(async move {
+            let (client, _) = proxy.accept().await.unwrap();
+            Box::pin(relay(client, backend_address, relay_gate)).await;
+        });
+        let mut client = TcpStream::connect(proxy_address).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        let mut response = [0; 8];
+        assert_eq!(client.read(&mut response).await.unwrap(), 0);
+        assert_eq!(gate.lock().await.counters.dropped_responses, 1);
+    }
+
+    #[tokio::test]
+    async fn closed_client_does_not_consume_trigger() {
+        let mut gate = LossGate::default();
+        gate.trigger();
+        let client_open = AtomicBool::new(false);
+        assert!(!gate.take_response_loss(client_open.load(Ordering::Acquire)));
+        assert_eq!(gate.counters.dropped_responses, 0);
     }
 }

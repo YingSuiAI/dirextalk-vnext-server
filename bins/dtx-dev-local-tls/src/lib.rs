@@ -407,10 +407,19 @@ fn has_expected_server_sans(
         "node-b" => &["node-b.localhost"],
         _ => &[],
     };
+    let allowed_dns_names: Vec<&str> = [node_name, "localhost"]
+        .into_iter()
+        .chain(expected_android_loopback_names.iter().copied())
+        .collect();
+    let has_only_expected_dns_names = names.iter().all(|name| match name {
+        GeneralName::DNSName(value) => allowed_dns_names.contains(value),
+        _ => true,
+    });
     has_node_name
         && has_localhost
         && has_loopback
         && android_loopback_names == expected_android_loopback_names
+        && has_only_expected_dns_names
 }
 
 struct GeneratedArtifacts {

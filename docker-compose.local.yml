@@ -201,7 +201,7 @@ services:
       tls-bootstrap:
         condition: service_completed_successfully
     ports:
-      - "127.0.0.1:18443:8443"
+      - "127.0.0.1:${DTX_ANDROID_NODE_A_PORT:-18443}:8443"
     volumes:
       - dtx-local-tls:/run/dtx-local-tls:ro
     healthcheck: *node-healthcheck
@@ -224,7 +224,7 @@ services:
       tls-bootstrap:
         condition: service_completed_successfully
     ports:
-      - "127.0.0.1:18444:8443"
+      - "127.0.0.1:${DTX_ANDROID_NODE_B_PORT:-18444}:8443"
     volumes:
       - dtx-local-tls:/run/dtx-local-tls:ro
     healthcheck: *node-healthcheck
