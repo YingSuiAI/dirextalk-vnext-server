@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+default = []
+public-content = ["dep:dtx-indexer-node", "dep:dtx-public-feed-node"]
+
 [dependencies]
 axum.workspace = true
 axum-server.workspace = true
@@ -14,10 +18,10 @@ dtx-group-node = { path = "../dtx-group-node" }
 dtx-group-persistence = { path = "../../crates/dtx-group-persistence" }
 dtx-identity-node = { path = "../dtx-identity-node" }
 dtx-identity-persistence = { path = "../../crates/dtx-identity-persistence" }
-dtx-indexer-node = { path = "../dtx-indexer-node" }
+dtx-indexer-node = { path = "../dtx-indexer-node", optional = true }
 dtx-mailbox = { path = "../../crates/dtx-mailbox" }
 dtx-mailbox-node = { path = "../dtx-mailbox-node" }
-dtx-public-feed-node = { path = "../dtx-public-feed-node" }
+dtx-public-feed-node = { path = "../dtx-public-feed-node", optional = true }
 ed25519-dalek.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
