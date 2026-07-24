@@ -7,10 +7,13 @@ use super::{
     IdentityBootstrapState, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
     MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES,
     Path, RECOVERY_RESPONSE_CAPABILITY_HEADER, RECOVERY_SCOPE_CATALOG_CONTENT_TYPE,
-    RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
-    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE, RecoveryCatalogFailure,
-    RecoveryCatalogHeadSuccess, RecoveryCatalogStatusSuccess, Request, RequestId, Response, State,
-    StatusCode, has_exact_content_type, header, idempotency_key_hash,
+    RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE, RecoveryCatalogFailure, RecoveryCatalogHeadSuccess,
+    RecoveryCatalogReceiptKind, RecoveryCatalogStatusSuccess, Request, RequestId, Response, State,
+    StatusCode, has_exact_content_type, has_exact_header, header, idempotency_key_hash,
     map_recovery_catalog_prepare_error, map_recovery_catalog_provider_error,
     map_recovery_catalog_publish_error, map_recovery_catalog_status_error,
     parse_device_session_authorization, parse_recovery_enrollment_capability,
@@ -88,7 +91,25 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<RecoveryCatalogHeadSuccess, RecoveryCatalogFailure> {
+        if !has_exact_header(
+            headers,
+            header::ACCEPT,
+            RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
+        ) {
+            return Err(RecoveryCatalogFailure::NotAcceptable);
+        }
+        if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_CONTENT_TYPE) {
+            return Err(RecoveryCatalogFailure::UnsupportedMedia);
+        }
+        if content_length_exceeds(headers, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES) {
+            return Err(RecoveryCatalogFailure::TooLarge);
+        }
         if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_CONTENT_TYPE)
+            || !has_exact_header(
+                headers,
+                header::ACCEPT,
+                RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
+            )
             || headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
@@ -131,7 +152,25 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        if !has_exact_header(
+            headers,
+            header::ACCEPT,
+            RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
+        ) {
+            return Err(RecoveryCatalogFailure::NotAcceptable);
+        }
+        if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE) {
+            return Err(RecoveryCatalogFailure::UnsupportedMedia);
+        }
+        if content_length_exceeds(headers, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES) {
+            return Err(RecoveryCatalogFailure::TooLarge);
+        }
         if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE)
+            || !has_exact_header(
+                headers,
+                header::ACCEPT,
+                RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
+            )
             || headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(header::AUTHORIZATION)
@@ -170,6 +209,7 @@ impl IdentityBootstrapState {
                 StatusCode::OK
             },
             outcome,
+            receipt: RecoveryCatalogReceiptKind::Preparation,
         })
     }
 
@@ -179,7 +219,28 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        if !has_exact_header(
+            headers,
+            header::ACCEPT,
+            RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+        ) {
+            return Err(RecoveryCatalogFailure::NotAcceptable);
+        }
+        if !has_exact_content_type(
+            headers,
+            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        ) {
+            return Err(RecoveryCatalogFailure::UnsupportedMedia);
+        }
+        if content_length_exceeds(headers, MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES) {
+            return Err(RecoveryCatalogFailure::TooLarge);
+        }
         if headers.contains_key(header::CONTENT_TYPE)
+            || !has_exact_header(
+                headers,
+                header::ACCEPT,
+                RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+            )
             || headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(header::AUTHORIZATION)
@@ -209,7 +270,11 @@ impl IdentityBootstrapState {
         // Catalog V2 status is an authoritative one-of-five representation;
         // terminal state is carried in the body and GET itself remains 200.
         let status = StatusCode::OK;
-        Ok(RecoveryCatalogStatusSuccess { status, outcome })
+        Ok(RecoveryCatalogStatusSuccess {
+            status,
+            outcome,
+            receipt: RecoveryCatalogReceiptKind::None,
+        })
     }
 
     async fn put_recovery_scope_catalog_provider_response(
@@ -218,10 +283,22 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        if !has_exact_header(
+            headers,
+            header::ACCEPT,
+            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        ) {
+            return Err(RecoveryCatalogFailure::NotAcceptable);
+        }
         if !has_exact_content_type(
             headers,
             RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
         ) || headers.contains_key(header::CONTENT_ENCODING)
+            || !has_exact_header(
+                headers,
+                header::ACCEPT,
+                RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+            )
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
             || headers.contains_key(RECOVERY_RESPONSE_CAPABILITY_HEADER)
@@ -254,8 +331,21 @@ impl IdentityBootstrapState {
             .await
             .map_err(|error| map_recovery_catalog_provider_error(&error))?;
         Ok(RecoveryCatalogStatusSuccess {
-            status: StatusCode::OK,
+            status: if outcome.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
             outcome,
+            receipt: RecoveryCatalogReceiptKind::ProviderResponse,
         })
     }
+}
+
+fn content_length_exceeds(headers: &HeaderMap, maximum: usize) -> bool {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > maximum)
 }

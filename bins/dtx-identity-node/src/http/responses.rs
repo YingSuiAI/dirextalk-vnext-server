@@ -14,10 +14,13 @@ use super::{
     IntoResponse, KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE, KEY_PACKAGE_PUBLISH_RECEIPT_CONTENT_TYPE,
     KeyPackageClaimSuccess, KeyPackageErrorCode, KeyPackageFailure, KeyPackagePublishSuccess,
     MlsV5RecoveryAuthorizationErrorCode, MlsV5RecoveryAuthorizationFailure,
-    RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
-    REQUEST_ID_HEADER, RecoveryCatalogErrorCode, RecoveryCatalogFailure,
-    RecoveryCatalogHeadSuccess, RecoveryCatalogStatusSuccess, RequestId, Response, SafeErrorBody,
-    SafeErrorEnvelope, Serialize, StatusCode, UtcMillis, encode_deterministic_cbor, header,
+    RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE, REQUEST_ID_HEADER, RecoveryCatalogErrorCode,
+    RecoveryCatalogFailure, RecoveryCatalogHeadSuccess, RecoveryCatalogReceiptKind,
+    RecoveryCatalogStatusSuccess, RequestId, Response, SafeErrorBody, SafeErrorEnvelope, Serialize,
+    StatusCode, UtcMillis, encode_deterministic_cbor, header,
 };
 
 pub(crate) fn bootstrap_success_response(
@@ -526,11 +529,24 @@ pub(crate) fn recovery_catalog_status_response(
     success: &RecoveryCatalogStatusSuccess,
     request_id: RequestId,
 ) -> Response {
-    match success.outcome.exact_bytes() {
+    let response = if success.receipt != RecoveryCatalogReceiptKind::None {
+        success.outcome.receipt_bytes.clone().ok_or(())
+    } else {
+        success.outcome.exact_bytes().map_err(|_| ())
+    };
+    match response {
         Ok(bytes) => exact_cbor_response(
             success.status,
             bytes,
-            RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+            match success.receipt {
+                RecoveryCatalogReceiptKind::Preparation => {
+                    RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE
+                }
+                RecoveryCatalogReceiptKind::ProviderResponse => {
+                    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE
+                }
+                RecoveryCatalogReceiptKind::None => RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+            },
             request_id,
         ),
         Err(_) => recovery_catalog_failure_response(
@@ -545,6 +561,21 @@ pub(crate) fn recovery_catalog_failure_response(
     request_id: RequestId,
 ) -> Response {
     let (status, code, retryable) = match failure {
+        RecoveryCatalogFailure::NotAcceptable => (
+            StatusCode::NOT_ACCEPTABLE,
+            RecoveryCatalogErrorCode::NotAcceptable,
+            false,
+        ),
+        RecoveryCatalogFailure::UnsupportedMedia => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            RecoveryCatalogErrorCode::UnsupportedMedia,
+            false,
+        ),
+        RecoveryCatalogFailure::TooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            RecoveryCatalogErrorCode::TooLarge,
+            false,
+        ),
         RecoveryCatalogFailure::InvalidRequest => (
             StatusCode::UNPROCESSABLE_ENTITY,
             RecoveryCatalogErrorCode::InvalidRequest,

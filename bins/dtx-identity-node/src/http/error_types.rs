@@ -176,10 +176,21 @@ pub(crate) struct RecoveryCatalogHeadSuccess {
 pub(crate) struct RecoveryCatalogStatusSuccess {
     pub(crate) status: StatusCode,
     pub(crate) outcome: RecoveryScopeCatalogStatusOutcome,
+    pub(crate) receipt: RecoveryCatalogReceiptKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryCatalogReceiptKind {
+    None,
+    Preparation,
+    ProviderResponse,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RecoveryCatalogFailure {
+    NotAcceptable,
+    UnsupportedMedia,
+    TooLarge,
     InvalidRequest,
     ExactCborInvalid,
     CapabilityRejected,
@@ -365,6 +376,12 @@ pub(crate) enum KeyPackageErrorCode {
 
 #[derive(Clone, Copy, Serialize)]
 pub(crate) enum RecoveryCatalogErrorCode {
+    #[serde(rename = "RECOVERY_HANDOFF_NOT_ACCEPTABLE")]
+    NotAcceptable,
+    #[serde(rename = "RECOVERY_HANDOFF_UNSUPPORTED_MEDIA_TYPE")]
+    UnsupportedMedia,
+    #[serde(rename = "RECOVERY_HANDOFF_TOO_LARGE")]
+    TooLarge,
     #[serde(rename = "RECOVERY_CATALOG_INVALID")]
     InvalidRequest,
     #[serde(rename = "EXACT_CBOR_INVALID")]

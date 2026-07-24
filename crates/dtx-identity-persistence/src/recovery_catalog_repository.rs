@@ -26,6 +26,11 @@ impl RecoveryScopeCatalogRepository {
             let authenticated = DeviceSessionRepository::authenticate_with_signing_key_in_transaction(tx.connection(), credential, now).await?;
             if authenticated.session().identity_id() != command.identity_id { return Err(IdentityPersistenceError::DeviceAuthenticationRejected); }
             command.verify_signature(authenticated.signing_key())?;
+            if authenticated.session().device_id() != command.authority_device_id
+                || authenticated.signing_key() != command.authority_signing_key
+            {
+                return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
+            }
             let snapshot = lock_and_load_active_snapshot(tx.connection(), command.identity_id).await?;
             if let Some(row) = sqlx::query("SELECT generation,upload_digest,head_bytes FROM identity.recovery_scope_catalogs WHERE identity_id=$1 AND idempotency_key_hash=$2")
                 .bind(command.identity_id.to_string()).bind(command.idempotency_key_hash.as_bytes().as_slice()).fetch_optional(&mut *tx.connection()).await? {
@@ -45,11 +50,11 @@ impl RecoveryScopeCatalogRepository {
                     && digest(&row.try_get::<Vec<u8>,_>("head_digest")?)? == command.previous_head_digest.unwrap_or(Sha256Digest::from_bytes([0;32])) => {}
                 _ => return Err(IdentityPersistenceError::RecoveryCatalogConflict),
             }
-            sqlx::query("INSERT INTO identity.recovery_scope_catalogs(identity_id,catalog_id,generation,previous_head_digest,leaf_count,merkle_root,ciphertext_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_signing_key,issued_at_ms,expires_at_ms,signature,head_bytes,head_digest,encrypted_catalog,upload_digest,idempotency_key_hash,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)")
+            sqlx::query("INSERT INTO identity.recovery_scope_catalogs(identity_id,catalog_id,generation,previous_head_digest,leaf_count,merkle_root,ciphertext_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key,issued_at_ms,expires_at_ms,signature,head_bytes,head_digest,encrypted_catalog,upload_digest,idempotency_key_hash,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)")
                 .bind(command.identity_id.to_string()).bind(command.catalog_id)
                 .bind(to_i64(command.generation)?).bind(command.previous_head_digest.map(|v| v.as_bytes().to_vec()))
                 .bind(to_i64(command.leaf_count)?).bind(command.merkle_root.as_bytes().as_slice()).bind(command.ciphertext_digest.as_bytes().as_slice())
-                .bind(to_i64(command.observed_head.sequence())?).bind(command.observed_head.hash().as_bytes().as_slice()).bind(*authenticated.session().device_id().as_uuid()).bind(authenticated.signing_key().as_bytes().as_slice())
+                .bind(to_i64(command.observed_head.sequence())?).bind(command.observed_head.hash().as_bytes().as_slice()).bind(*command.authority_device_id.as_uuid()).bind(command.authority_key_id).bind(command.authority_signing_key.as_bytes().as_slice())
                 .bind(command.issued_at.get()).bind(command.expires_at.get()).bind(command.signature.as_bytes().as_slice()).bind(&command.head_bytes)
                 .bind(command.head_digest.as_bytes().as_slice()).bind(&command.encrypted_catalog).bind(command.upload_digest.as_bytes().as_slice())
                 .bind(command.idempotency_key_hash.as_bytes().as_slice()).bind(now.get()).execute(&mut *tx.connection()).await?;
@@ -75,7 +80,6 @@ impl RecoveryScopeCatalogRepository {
             let capability_hash = command.enrollment_capability.hash();
             let identity_id =
                 load_linked_challenge_identity_hint(tx.connection(), command.request_id).await?;
-            let snapshot = lock_and_load_active_snapshot(tx.connection(), identity_id).await?;
             let challenge = load_linked_challenge(tx.connection(), command.request_id, true).await?;
             if challenge.identity_id != identity_id {
                 return Err(corrupt("linked enrollment identity changed"));
@@ -90,11 +94,24 @@ impl RecoveryScopeCatalogRepository {
                 .bind(identity_id.to_string()).bind(command.idempotency_key_hash.as_bytes().as_slice()).fetch_optional(&mut *tx.connection()).await? {
                 if digest(&row.try_get::<Vec<u8>,_>("preparation_digest")?)? == command.digest && row.try_get::<Vec<u8>,_>("preparation_bytes")? == command.exact_bytes {
                     let stored = load_preparation(tx.connection(), command.request_id, true).await?;
-                    let outcome = current_preparation_status(tx.connection(), stored, &challenge, &snapshot, now).await?;
+                    let status = if stored.provider_response.is_some() {
+                        CatalogStatus::ResponseAvailable
+                    } else {
+                        CatalogStatus::Pending
+                    };
+                    let outcome = RecoveryScopeCatalogStatusOutcome {
+                        request_id: stored.request_id,
+                        status,
+                        provider_response: stored.provider_response.clone(),
+                        observed_at: stored.accepted_at,
+                        receipt_bytes: Some(preparation_receipt(&stored)?),
+                        created: false,
+                    };
                     return Ok((false, outcome));
                 }
                 return Err(IdentityPersistenceError::IdempotencyConflict);
             }
+            let snapshot = lock_and_load_active_snapshot(tx.connection(), identity_id).await?;
             if challenge.protocol_version != 1 || challenge.state != "open" {
                 return Err(IdentityPersistenceError::RecoveryPreparationRevoked);
             }
@@ -124,19 +141,24 @@ impl RecoveryScopeCatalogRepository {
             if command.catalog_id != catalog.catalog_id {
                 return Err(IdentityPersistenceError::RecoveryCatalogHeadChanged);
             }
+            if command.catalog_generation != catalog.generation
+                || command.catalog_head_digest != catalog.head_digest
+            {
+                return Err(IdentityPersistenceError::RecoveryCatalogHeadChanged);
+            }
             if command.expires_at > catalog.expires_at {
                 return Err(invalid("preparation exceeds catalog expiry"));
             }
-            sqlx::query("INSERT INTO identity.recovery_scope_catalog_preparations(request_id,identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,candidate_nonce,issued_at_ms,expires_at_ms,response_capability_hash,enrollment_capability_hash,candidate_signature,preparation_bytes,preparation_digest,catalog_generation,catalog_head_digest,authority_device_id,authority_signing_key,idempotency_key_hash,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)")
+            sqlx::query("INSERT INTO identity.recovery_scope_catalog_preparations(request_id,identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,candidate_nonce,issued_at_ms,expires_at_ms,response_capability_hash,enrollment_capability_hash,candidate_signature,preparation_bytes,preparation_digest,catalog_generation,catalog_head_digest,authority_device_id,authority_key_id,authority_signing_key,idempotency_key_hash,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)")
                 .bind(*command.request_id.as_uuid()).bind(command.identity_id.to_string()).bind(command.catalog_id)
                 .bind(*command.candidate_device_id.as_uuid()).bind(command.candidate_signing_key.as_bytes().as_slice())
                 .bind(command.candidate_recipient_key.as_bytes().as_slice())
                 .bind(to_i64(command.observed_head.sequence())?).bind(command.observed_head.hash().as_bytes().as_slice()).bind(command.candidate_nonce.as_slice())
                 .bind(command.issued_at.get()).bind(command.expires_at.get()).bind(command.response_capability_hash.as_bytes().as_slice()).bind(capability_hash.as_bytes().as_slice())
                 .bind(command.candidate_signature.as_bytes().as_slice()).bind(&command.exact_bytes).bind(command.digest.as_bytes().as_slice())
-                .bind(to_i64(catalog.generation)?).bind(catalog.head_digest.as_bytes().as_slice()).bind(*catalog.authority_device_id.as_uuid()).bind(catalog.authority_key.as_bytes().as_slice())
+                .bind(to_i64(catalog.generation)?).bind(catalog.head_digest.as_bytes().as_slice()).bind(*catalog.authority_device_id.as_uuid()).bind(catalog.authority_key_id).bind(catalog.authority_key.as_bytes().as_slice())
                 .bind(command.idempotency_key_hash.as_bytes().as_slice()).bind(now.get()).execute(&mut *tx.connection()).await?;
-            Ok((true, RecoveryScopeCatalogStatusOutcome { request_id: command.request_id, status: CatalogStatus::Pending, provider_response: None, observed_at: now }))
+            Ok((true, RecoveryScopeCatalogStatusOutcome { request_id: command.request_id, status: CatalogStatus::Pending, provider_response: None, observed_at: now, receipt_bytes: Some(preparation_receipt_from_command(command, now)? ), created: true }))
         }.await;
         finish(tx, result).await
     }
@@ -167,6 +189,21 @@ impl RecoveryScopeCatalogRepository {
             }
             let row = load_preparation(tx.connection(), command.request_id, true).await?;
             if row.identity_id != authenticated.session().identity_id() { return Err(IdentityPersistenceError::DeviceAuthenticationRejected); }
+            if let Some(ref existing) = row.provider_response {
+                if row.provider_idempotency_key_hash == Some(command.idempotency_key_hash)
+                    && *existing == command.exact_bytes
+                {
+                    return Ok(RecoveryScopeCatalogStatusOutcome {
+                        request_id: row.request_id,
+                        status: CatalogStatus::ResponseAvailable,
+                        provider_response: Some(existing.clone()),
+                        observed_at: row.provider_recorded_at.unwrap_or(now),
+                        receipt_bytes: Some(provider_receipt(&row, true)?),
+                        created: false,
+                    });
+                }
+                return Err(IdentityPersistenceError::RecoveryPreparationConflict);
+            }
             if challenge.protocol_version != 1
                 || (challenge.state != "open" && challenge.state != "approved")
             {
@@ -178,22 +215,17 @@ impl RecoveryScopeCatalogRepository {
             let validity = preparation_validity(tx.connection(), &row, &challenge, &snapshot, now).await?;
             if validity.invalidation.is_some() { return Err(IdentityPersistenceError::RecoveryPreparationInvalidated); }
             if command.catalog_head_digest != row.catalog_head_digest
-                || command.current_authority_digest != Sha256Digest::hash_domain(CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN, row.authority_key.as_bytes())
+                || command.current_authority_digest != command.authority_id
                 || command.recipient_key_digest != Sha256Digest::hash_domain(RECIPIENT_KEY_HASH_DOMAIN, row.candidate_recipient_key.as_bytes())
                 || command.expires_at > row.expires_at
                 || !provider_is_allowed(command, &row, validity)
+                || !independent_authority_is_current(command, &snapshot, &row)
             { return Err(IdentityPersistenceError::RecoveryPreparationInvalidated); }
-            if let Some(existing) = row.provider_response {
-                if row.provider_idempotency_key_hash == Some(command.idempotency_key_hash) && existing == command.exact_bytes {
-                    return Ok(RecoveryScopeCatalogStatusOutcome { request_id: row.request_id, status: CatalogStatus::ResponseAvailable, provider_response: Some(existing), observed_at: now });
-                }
-                return Err(IdentityPersistenceError::RecoveryPreparationConflict);
-            }
             sqlx::query("UPDATE identity.recovery_scope_catalog_preparations SET provider_response_bytes=$2,provider_response_digest=$3,provider_device_id=$4,provider_signing_key=$5,provider_ciphertext_digest=$6,provider_expires_at_ms=$7,provider_idempotency_key_hash=$8,provider_recorded_at_ms=$9 WHERE request_id=$1 AND provider_response_bytes IS NULL")
                 .bind(*command.request_id.as_uuid()).bind(&command.exact_bytes).bind(command.digest.as_bytes().as_slice()).bind(*command.provider_device_id.as_uuid())
                 .bind(command.provider_signing_key.as_bytes().as_slice()).bind(command.ciphertext_digest.as_bytes().as_slice()).bind(command.expires_at.get())
                 .bind(command.idempotency_key_hash.as_bytes().as_slice()).bind(now.get()).execute(&mut *tx.connection()).await?;
-            Ok(RecoveryScopeCatalogStatusOutcome { request_id: row.request_id, status: CatalogStatus::ResponseAvailable, provider_response: Some(command.exact_bytes.clone()), observed_at: now })
+            Ok(RecoveryScopeCatalogStatusOutcome { request_id: row.request_id, status: CatalogStatus::ResponseAvailable, provider_response: Some(command.exact_bytes.clone()), observed_at: now, receipt_bytes: Some(provider_receipt_from_command(command, now)? ), created: true })
         }.await;
         finish(tx, result).await
     }
@@ -235,6 +267,20 @@ impl RecoveryScopeCatalogRepository {
     }
 }
 
+fn independent_authority_is_current(
+    command: &CatalogProviderResponseCommand,
+    snapshot: &IdentityLogSnapshot,
+    row: &StoredPreparation,
+) -> bool {
+    match command.authority_kind {
+        1 => command.authority_device_id == Some(row.authority_device_id)
+            && command.authority_signing_key == row.authority_key,
+        2 => command.authority_signing_key == snapshot.projection().current_root_key(),
+        3 => command.authority_signing_key == snapshot.projection().current_recovery_key(),
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 struct StoredCatalog {
     catalog_id: uuid::Uuid,
@@ -242,6 +288,7 @@ struct StoredCatalog {
     head_digest: Sha256Digest,
     observed_head: IdentityLogHead,
     authority_device_id: DeviceId,
+    authority_key_id: uuid::Uuid,
     authority_key: SigningPublicKey,
     expires_at: UtcMillis,
 }
@@ -267,6 +314,7 @@ struct StoredLinkedChallenge {
     capability_hash: Sha256Digest,
     state: String,
     expires_at: UtcMillis,
+    cancelled_at: Option<UtcMillis>,
     protocol_version: i16,
     approved_head: Option<IdentityLogHead>,
     approver_device_id: Option<DeviceId>,
@@ -309,9 +357,9 @@ async fn load_linked_challenge(
     lock: bool,
 ) -> Result<StoredLinkedChallenge, IdentityPersistenceError> {
     let sql = if lock {
-        "SELECT identity_id,target_device_id,target_device_signing_key,target_device_encryption_key,capability_hash,state,expires_at_ms,protocol_version,approved_head_sequence,approved_head_hash,approver_device_id FROM identity.device_enrollment_challenges WHERE challenge_id=$1 FOR UPDATE"
+        "SELECT identity_id,target_device_id,target_device_signing_key,target_device_encryption_key,capability_hash,state,expires_at_ms,cancelled_at_ms,protocol_version,approved_head_sequence,approved_head_hash,approver_device_id FROM identity.device_enrollment_challenges WHERE challenge_id=$1 FOR UPDATE"
     } else {
-        "SELECT identity_id,target_device_id,target_device_signing_key,target_device_encryption_key,capability_hash,state,expires_at_ms,protocol_version,approved_head_sequence,approved_head_hash,approver_device_id FROM identity.device_enrollment_challenges WHERE challenge_id=$1"
+        "SELECT identity_id,target_device_id,target_device_signing_key,target_device_encryption_key,capability_hash,state,expires_at_ms,cancelled_at_ms,protocol_version,approved_head_sequence,approved_head_hash,approver_device_id FROM identity.device_enrollment_challenges WHERE challenge_id=$1"
     };
     let row = sqlx::query(sql)
         .bind(*request_id.as_uuid())
@@ -345,6 +393,7 @@ async fn load_linked_challenge(
         capability_hash: digest(&row.try_get::<Vec<u8>, _>("capability_hash")?)?,
         state: row.try_get("state")?,
         expires_at: utc(row.try_get("expires_at_ms")?)?,
+        cancelled_at: row.try_get::<Option<i64>, _>("cancelled_at_ms")?.map(utc).transpose()?,
         protocol_version: row.try_get("protocol_version")?,
         approved_head,
         approver_device_id: row
@@ -358,7 +407,7 @@ async fn load_current_catalog(
     connection: &mut PgConnection,
     identity_id: IdentityId,
 ) -> Result<Option<StoredCatalog>, IdentityPersistenceError> {
-    let row = sqlx::query("SELECT catalog_id,generation,head_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_signing_key,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
+    let row = sqlx::query("SELECT catalog_id,generation,head_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
         .bind(identity_id.to_string()).fetch_optional(&mut *connection).await?;
     let Some(row) = row else {
         return Ok(None);
@@ -373,11 +422,13 @@ async fn load_current_catalog(
             digest(&row.try_get::<Vec<u8>, _>("observed_head_hash")?)?,
         )?,
         authority_device_id: parse_device_uuid(row.try_get("authority_device_id")?)?,
+        authority_key_id: row.try_get("authority_key_id")?,
         authority_key: signing_key(&row.try_get::<Vec<u8>, _>("authority_signing_key")?)?,
         expires_at: utc(row.try_get("expires_at_ms")?)?,
     }))
 }
 
+#[derive(Clone)]
 struct StoredPreparation {
     request_id: DeviceEnrollmentChallengeId,
     identity_id: IdentityId,
@@ -392,8 +443,13 @@ struct StoredPreparation {
     catalog_generation: SafeUint,
     catalog_head_digest: Sha256Digest,
     authority_device_id: DeviceId,
+    authority_key_id: uuid::Uuid,
     authority_key: SigningPublicKey,
+    preparation_digest: Sha256Digest,
+    accepted_at: UtcMillis,
     provider_response: Option<Vec<u8>>,
+    provider_response_digest: Option<Sha256Digest>,
+    provider_recorded_at: Option<UtcMillis>,
     provider_idempotency_key_hash: Option<Sha256Digest>,
 }
 
@@ -403,10 +459,10 @@ async fn load_preparation(
     lock: bool,
 ) -> Result<StoredPreparation, IdentityPersistenceError> {
     let row = if lock {
-        sqlx::query("SELECT identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,response_capability_hash,enrollment_capability_hash,catalog_generation,catalog_head_digest,authority_device_id,authority_signing_key,provider_response_bytes,provider_idempotency_key_hash FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR UPDATE")
+        sqlx::query("SELECT identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,response_capability_hash,enrollment_capability_hash,catalog_generation,catalog_head_digest,authority_device_id,authority_key_id,authority_signing_key,preparation_digest,created_at_ms,provider_response_bytes,provider_response_digest,provider_idempotency_key_hash,provider_recorded_at_ms FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR UPDATE")
             .bind(*request_id.as_uuid()).fetch_optional(&mut *connection).await?
     } else {
-        sqlx::query("SELECT identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,response_capability_hash,enrollment_capability_hash,catalog_generation,catalog_head_digest,authority_device_id,authority_signing_key,provider_response_bytes,provider_idempotency_key_hash FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1")
+        sqlx::query("SELECT identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,response_capability_hash,enrollment_capability_hash,catalog_generation,catalog_head_digest,authority_device_id,authority_key_id,authority_signing_key,preparation_digest,created_at_ms,provider_response_bytes,provider_response_digest,provider_idempotency_key_hash,provider_recorded_at_ms FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1")
             .bind(*request_id.as_uuid()).fetch_optional(&mut *connection).await?
     }.ok_or(IdentityPersistenceError::RecoveryResponseCapabilityRejected)?;
     let identity_id = IdentityId::from_str(&row.try_get::<String, _>("identity_id")?)
@@ -434,12 +490,17 @@ async fn load_preparation(
         catalog_generation: safe_uint(row.try_get("catalog_generation")?)?,
         catalog_head_digest: digest(&row.try_get::<Vec<u8>, _>("catalog_head_digest")?)?,
         authority_device_id: parse_device_uuid(row.try_get("authority_device_id")?)?,
+        authority_key_id: row.try_get("authority_key_id")?,
         authority_key: signing_key(&row.try_get::<Vec<u8>, _>("authority_signing_key")?)?,
+        preparation_digest: digest(&row.try_get::<Vec<u8>, _>("preparation_digest")?)?,
+        accepted_at: utc(row.try_get("created_at_ms")?)?,
         provider_response: row.try_get("provider_response_bytes")?,
+        provider_response_digest: row.try_get::<Option<Vec<u8>>, _>("provider_response_digest")?.map(|v| digest(&v)).transpose()?,
         provider_idempotency_key_hash: row
             .try_get::<Option<Vec<u8>>, _>("provider_idempotency_key_hash")?
             .map(|v| digest(&v))
             .transpose()?,
+        provider_recorded_at: row.try_get::<Option<i64>, _>("provider_recorded_at_ms")?.map(utc).transpose()?,
     })
 }
 
@@ -447,7 +508,6 @@ async fn load_preparation(
 struct PreparationValidity {
     invalidation: Option<CatalogStatusInvalidation>,
     history_provider_device_id: Option<DeviceId>,
-    candidate_added: bool,
 }
 
 async fn preparation_validity(
@@ -460,13 +520,11 @@ async fn preparation_validity(
     let invalid = |reason| PreparationValidity {
         invalidation: Some(reason),
         history_provider_device_id: None,
-        candidate_added: false,
     };
     if now >= row.expires_at {
         return Ok(PreparationValidity {
             invalidation: None,
             history_provider_device_id: None,
-            candidate_added: false,
         });
     }
     if challenge.identity_id != row.identity_id
@@ -476,7 +534,7 @@ async fn preparation_validity(
         || challenge.candidate_recipient_key != row.candidate_recipient_key
         || challenge.capability_hash != row.enrollment_capability_hash
     {
-        return Ok(invalid(CatalogStatusInvalidation::Key));
+        return Ok(invalid(CatalogStatusInvalidation::Candidate));
     }
     let Some(current) = load_current_catalog(connection, row.identity_id).await? else {
         return Ok(invalid(CatalogStatusInvalidation::Catalog));
@@ -485,12 +543,35 @@ async fn preparation_validity(
         || current.generation != row.catalog_generation
         || current.head_digest != row.catalog_head_digest
         || current.observed_head != row.observed_head
-        || current.authority_key != row.authority_key
         || now >= current.expires_at
+    {
+        return Ok(invalid(CatalogStatusInvalidation::Catalog));
+    }
+    if current.authority_key != row.authority_key
+        || current.authority_key_id != row.authority_key_id
         || current.authority_device_id != row.authority_device_id
         || !authority_is_active(snapshot, row.authority_device_id, row.authority_key)
     {
-        return Ok(invalid(CatalogStatusInvalidation::Catalog));
+        return Ok(invalid(CatalogStatusInvalidation::Authority));
+    }
+    if let Some(response_bytes) = row.provider_response.as_deref() {
+        let response = CatalogProviderResponseCommand::parse_v2(
+            row.provider_idempotency_key_hash.unwrap_or(row.catalog_head_digest),
+            row.request_id,
+            response_bytes.to_vec(),
+        ).map_err(|_| corrupt("provider response"))?;
+        if snapshot.projection().device_status(response.provider_device_id)
+            != Some(DeviceStatusV1::Active)
+            || snapshot
+                .projection()
+                .device_certificate(response.provider_device_id)
+                .is_none_or(|cert| cert.device_signing_key() != response.provider_signing_key)
+        {
+            return Ok(invalid(CatalogStatusInvalidation::Provider));
+        }
+        if !independent_authority_is_current(&response, snapshot, row) {
+            return Ok(invalid(CatalogStatusInvalidation::IndependentAuthority));
+        }
     }
     let current_head = snapshot.head();
     if challenge.state == "open" {
@@ -500,7 +581,6 @@ async fn preparation_validity(
         return Ok(PreparationValidity {
             invalidation: None,
             history_provider_device_id: None,
-            candidate_added: false,
         });
     }
     if challenge.state != "approved" || challenge.approved_head != Some(current_head) {
@@ -521,7 +601,7 @@ async fn preparation_validity(
         || certificate.device_signing_key() != row.candidate_signing_key
         || certificate.device_encryption_key() != row.candidate_recipient_key
     {
-        return Ok(invalid(CatalogStatusInvalidation::Key));
+        return Ok(invalid(CatalogStatusInvalidation::Candidate));
     }
     let Some(history_provider_device_id) = challenge.approver_device_id else {
         return Err(corrupt("approved enrollment history provider"));
@@ -529,7 +609,6 @@ async fn preparation_validity(
     Ok(PreparationValidity {
         invalidation: None,
         history_provider_device_id: Some(history_provider_device_id),
-        candidate_added: true,
     })
 }
 
@@ -543,9 +622,52 @@ fn provider_is_allowed(
         || validity
             .history_provider_device_id
             .is_some_and(|device_id| device_id == command.provider_device_id)
-        || (validity.candidate_added
-            && command.provider_device_id == row.candidate_device_id
-            && command.provider_signing_key == row.candidate_signing_key)
+}
+
+fn receipt_cbor(
+    request_id: DeviceEnrollmentChallengeId,
+    digest: Sha256Digest,
+    accepted_at: UtcMillis,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    encode_deterministic_cbor_with_limit(
+        &CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+            (CanonicalValue::Unsigned(2), CanonicalValue::Text(request_id.to_string())),
+            (CanonicalValue::Unsigned(3), digest.to_canonical_value()),
+            (CanonicalValue::Unsigned(4), accepted_at.to_canonical_value()),
+        ]),
+        87,
+    )
+    .map_err(|_| invalid("recovery handoff receipt"))
+}
+
+fn preparation_receipt(
+    row: &StoredPreparation,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    receipt_cbor(row.request_id, row.preparation_digest, row.accepted_at)
+}
+
+fn preparation_receipt_from_command(
+    command: &CatalogPreparationCommand,
+    accepted_at: UtcMillis,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    receipt_cbor(command.request_id, command.digest, accepted_at)
+}
+
+fn provider_receipt(
+    row: &StoredPreparation,
+    _replay: bool,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    let digest = row.provider_response_digest.ok_or_else(|| invalid("provider receipt"))?;
+    let accepted_at = row.provider_recorded_at.ok_or_else(|| invalid("provider receipt"))?;
+    receipt_cbor(row.request_id, digest, accepted_at)
+}
+
+fn provider_receipt_from_command(
+    command: &CatalogProviderResponseCommand,
+    accepted_at: UtcMillis,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    receipt_cbor(command.request_id, command.digest, accepted_at)
 }
 
 async fn current_preparation_status(
@@ -558,7 +680,9 @@ async fn current_preparation_status(
     let invalid = preparation_validity(connection, &row, challenge, snapshot, now)
         .await?
         .invalidation;
-    let status = if challenge.state == "cancelled" {
+    let status = if challenge.state == "cancelled"
+        && challenge.cancelled_at.is_some_and(|at| at <= row.expires_at)
+    {
         CatalogStatus::Cancelled
     } else if now >= row.expires_at {
         CatalogStatus::Expired
@@ -577,10 +701,14 @@ async fn current_preparation_status(
         } else {
             None
         },
-        observed_at: if status == CatalogStatus::Expired {
-            row.expires_at
-        } else {
-            now
+        observed_at: match status {
+            CatalogStatus::Expired => row.expires_at,
+            CatalogStatus::Cancelled => challenge.cancelled_at.unwrap_or(now),
+            CatalogStatus::Pending => row.accepted_at,
+            CatalogStatus::ResponseAvailable => row.provider_recorded_at.unwrap_or(now),
+            CatalogStatus::Invalidated(_) => now,
         },
+        receipt_bytes: None,
+        created: false,
     })
 }

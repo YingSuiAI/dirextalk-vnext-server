@@ -37,6 +37,8 @@ pub const PROVIDER_CIPHERTEXT_HASH_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-handoff-provider-envelope.v2\0";
 pub const PROVIDER_RESPONSE_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-handoff-provider-signature.v2\0";
+pub const PROVIDER_AUTHORITY_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.recovery-scope-catalog-handoff-provider-authority-signature.v2\0";
 pub const PROVIDER_RESPONSE_DIGEST_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-handoff-provider-response.v2\0";
 const UPLOAD_HASH_DOMAIN: &[u8] = b"dirextalk.recovery-scope-catalog-upload.v2\0";
@@ -97,6 +99,9 @@ pub struct CatalogUploadCommand {
     pub merkle_root: Sha256Digest,
     pub ciphertext_digest: Sha256Digest,
     pub observed_head: IdentityLogHead,
+    pub authority_device_id: DeviceId,
+    pub authority_key_id: Uuid,
+    pub authority_signing_key: SigningPublicKey,
     pub issued_at: UtcMillis,
     pub expires_at: UtcMillis,
     pub signature: Ed25519Signature,
@@ -141,6 +146,9 @@ impl CatalogUploadCommand {
         route_generation: SafeUint,
         exact_upload: &[u8],
     ) -> Result<Self, IdentityPersistenceError> {
+        let _ = (idempotency_key_hash, route_generation, exact_upload);
+        Err(invalid("recovery catalog V1 parser removed; use parse_v2"))
+        /*
         if exact_upload.is_empty() || exact_upload.len() > MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES
         {
             return Err(invalid("recovery catalog upload bytes"));
@@ -204,6 +212,7 @@ impl CatalogUploadCommand {
             encrypted_catalog,
             upload_digest: Sha256Digest::hash_domain(UPLOAD_HASH_DOMAIN, exact_upload),
         })
+        */
     }
 
     /// Strict V2 catalog upload parser keyed by the route catalog UUID.
@@ -222,10 +231,7 @@ impl CatalogUploadCommand {
         if head_fields[0] != &CanonicalValue::Unsigned(2) {
             return Err(invalid("recovery catalog version"));
         }
-        let catalog_id = match head_fields[1] {
-            CanonicalValue::Text(value) => Uuid::parse_str(value).map_err(|_| invalid("catalog ID"))?,
-            _ => return Err(invalid("catalog ID")),
-        };
+        let catalog_id = parse_uuid_v7(head_fields[1], "catalog ID")?;
         if catalog_id != route_catalog_id {
             return Err(invalid("catalog route ID"));
         }
@@ -239,6 +245,12 @@ impl CatalogUploadCommand {
         let merkle_root = parse_digest(head_fields[6])?;
         let ciphertext_digest = parse_digest(head_fields[7])?;
         let observed_head = IdentityLogHead::observed(identity_id, parse_safe_uint(head_fields[8])?, parse_digest(head_fields[9])?)?;
+        if observed_head.sequence().get() > 9_007_199_254_740_990 {
+            return Err(invalid("catalog highwater"));
+        }
+        let authority_device_id = parse_device_uuid_text(head_fields[10])?;
+        let authority_key_id = parse_uuid_v7(head_fields[11], "authority key ID")?;
+        let authority_signing_key = parse_signing_key(head_fields[12])?;
         let issued_at = parse_utc(head_fields[13])?;
         let expires_at = parse_utc(head_fields[14])?;
         if issued_at >= expires_at {
@@ -260,6 +272,9 @@ impl CatalogUploadCommand {
             merkle_root,
             ciphertext_digest,
             observed_head,
+            authority_device_id,
+            authority_key_id,
+            authority_signing_key,
             issued_at,
             expires_at,
             signature,
@@ -338,6 +353,9 @@ impl CatalogPreparationCommand {
         enrollment_capability: DeviceEnrollmentCapability,
         response_capability: &RecoveryResponseCapability,
     ) -> Result<Self, IdentityPersistenceError> {
+        let _ = (idempotency_key_hash, exact_bytes, enrollment_capability, response_capability);
+        return Err(invalid("recovery preparation V1 parser removed; use parse_v2"));
+        /*
         if bool::from(
             enrollment_capability
                 .as_bytes()
@@ -412,6 +430,7 @@ impl CatalogPreparationCommand {
             catalog_head_digest: Sha256Digest::from_bytes([0; 32]),
             idempotency_digest: idempotency_key_hash,
         })
+        */
     }
 
     /// Strict V2 parser used by the HTTP V3 handoff. The legacy `parse` entry
@@ -434,10 +453,7 @@ impl CatalogPreparationCommand {
         }
         let request_id = parse_challenge(fields[1])?;
         let identity_id = parse_identity(fields[2])?;
-        let catalog_id = match fields[3] {
-            CanonicalValue::Text(value) => Uuid::parse_str(value).map_err(|_| invalid("catalog ID"))?,
-            _ => return Err(invalid("catalog ID")),
-        };
+        let catalog_id = parse_uuid_v7(fields[3], "catalog ID")?;
         let catalog_generation = parse_positive_safe_uint(fields[4])?;
         let catalog_head_digest = parse_digest(fields[5])?;
         let candidate_device_id = parse_device(fields[6])?;
@@ -451,7 +467,10 @@ impl CatalogPreparationCommand {
         let idempotency_digest = parse_digest(fields[13])?;
         let issued_at = parse_utc(fields[14])?;
         let expires_at = parse_utc(fields[15])?;
-        if candidate_nonce.iter().all(|byte| *byte == 0) || issued_at >= expires_at {
+        if observed_head.sequence().get() > 9_007_199_254_740_990
+            || candidate_signing_key.as_bytes() == candidate_recipient_key.as_bytes()
+            || candidate_nonce.iter().all(|byte| *byte == 0)
+            || issued_at >= expires_at {
             return Err(invalid("catalog preparation binding"));
         }
         if response_capability_hash != response_capability.digest()
@@ -498,9 +517,16 @@ pub struct CatalogProviderResponseCommand {
     pub catalog_head_digest: Sha256Digest,
     pub provider_device_id: DeviceId,
     pub provider_signing_key: SigningPublicKey,
+    pub authority_kind: u64,
+    pub authority_id: Sha256Digest,
+    pub authority_device_id: Option<DeviceId>,
+    pub authority_signing_key: SigningPublicKey,
     pub current_authority_digest: Sha256Digest,
     pub recipient_key_digest: Sha256Digest,
     pub ciphertext_digest: Sha256Digest,
+    pub device_add_bytes: Vec<u8>,
+    pub envelope_bytes: Vec<u8>,
+    pub issued_at: UtcMillis,
     pub expires_at: UtcMillis,
     pub signature: Ed25519Signature,
     pub exact_bytes: Vec<u8>,
@@ -537,6 +563,9 @@ impl CatalogProviderResponseCommand {
         route_request_id: DeviceEnrollmentChallengeId,
         exact_bytes: Vec<u8>,
     ) -> Result<Self, IdentityPersistenceError> {
+        let _ = (idempotency_key_hash, route_request_id, exact_bytes);
+        Err(invalid("recovery provider V1 parser removed; use parse_v2"))
+        /*
         if exact_bytes.is_empty() || exact_bytes.len() > MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES {
             return Err(invalid("provider response bytes"));
         }
@@ -552,6 +581,9 @@ impl CatalogProviderResponseCommand {
         let request_id = parse_challenge(fields[1])?;
         if request_id != route_request_id {
             return Err(invalid("provider response request ID"));
+        }
+        if parse_digest(fields[19])? != idempotency_key_hash {
+            return Err(IdentityPersistenceError::RecoveryPreparationConflict);
         }
         let provider_signing_key = SigningPublicKey::try_from(parse_fixed::<32>(if v2 { match fields[14] { CanonicalValue::Map(inner) => inner.iter().find(|(k,_)| k == &CanonicalValue::Unsigned(3)).map(|(_,v)| v).ok_or_else(|| invalid("provider descriptor"))?, _ => return Err(invalid("provider descriptor")) } } else { fields[4] })?)
             .map_err(|_| invalid("provider signing key"))?;
@@ -585,6 +617,7 @@ impl CatalogProviderResponseCommand {
             digest: Sha256Digest::hash_domain(PROVIDER_RESPONSE_DIGEST_DOMAIN, &exact_bytes),
             exact_bytes,
         })
+        */
     }
 
     /// Strict parser for the frozen 26-field V2 provider response. It checks
@@ -608,6 +641,9 @@ impl CatalogProviderResponseCommand {
         if request_id != route_request_id {
             return Err(invalid("provider response request ID"));
         }
+        if parse_digest(fields[19])? != idempotency_key_hash {
+            return Err(IdentityPersistenceError::RecoveryPreparationConflict);
+        }
         let provider_descriptor = match fields[14] {
             CanonicalValue::Map(inner) => inner,
             _ => return Err(invalid("provider descriptor")),
@@ -615,13 +651,42 @@ impl CatalogProviderResponseCommand {
         if provider_descriptor.len() != 3
             || provider_descriptor[0].0 != CanonicalValue::Unsigned(1)
             || provider_descriptor[0].1 != CanonicalValue::Unsigned(2)
+            || provider_descriptor[1].0 != CanonicalValue::Unsigned(2)
+            || provider_descriptor[2].0 != CanonicalValue::Unsigned(3)
         {
             return Err(invalid("provider descriptor"));
         }
         let provider_device_id = parse_device(&provider_descriptor[1].1)?;
         let provider_signing_key = SigningPublicKey::try_from(parse_fixed::<32>(&provider_descriptor[2].1)?)
             .map_err(|_| invalid("provider signing key"))?;
+        let authority_descriptor = match fields[15] {
+            CanonicalValue::Map(inner) => inner,
+            _ => return Err(invalid("independent authority")),
+        };
+        let (authority_kind, authority_id, authority_device_id, authority_signing_key) = parse_authority_descriptor(authority_descriptor)?;
+        if provider_signing_key == authority_signing_key {
+            return Err(invalid("signer key separation"));
+        }
+        let candidate_device_id = parse_device(fields[7])?;
+        let (candidate_signing_key, candidate_recipient_key) = parse_device_add_candidate(
+            fields[24],
+            candidate_device_id,
+            parse_identity(fields[3])?,
+            parse_safe_uint(fields[9])?,
+            parse_digest(fields[10])?,
+            parse_digest(fields[13])?,
+        )?;
+        if provider_device_id == candidate_device_id || provider_signing_key == candidate_signing_key {
+            return Err(invalid("candidate cannot be provider"));
+        }
+        if authority_device_id.is_some_and(|device| device == provider_device_id || device == candidate_device_id) {
+            return Err(invalid("authority device separation"));
+        }
+        if candidate_signing_key.as_bytes() == candidate_recipient_key.as_bytes() {
+            return Err(invalid("candidate key separation"));
+        }
         let signature = parse_signature(fields[22])?;
+        let authority_signature = parse_signature(fields[23])?;
         let unsigned = CanonicalValue::Map(
             (1_u64..)
                 .zip(fields.iter().take(22))
@@ -629,16 +694,39 @@ impl CatalogProviderResponseCommand {
                 .collect(),
         );
         verify_signature(provider_signing_key, PROVIDER_RESPONSE_SIGNATURE_DOMAIN, &unsigned, signature)?;
+        verify_signature(authority_signing_key, PROVIDER_AUTHORITY_SIGNATURE_DOMAIN, &unsigned, authority_signature)?;
+        let device_add_bytes = parse_bounded_bytes(fields[24], 533)?;
+        let envelope_bytes = encode_deterministic_cbor(fields[25]).map_err(|_| invalid("HPKE envelope"))?;
+        validate_hpke_envelope(fields[25])?;
+        let envelope_digest = Sha256Digest::hash_domain(PROVIDER_CIPHERTEXT_HASH_DOMAIN, &envelope_bytes);
+        if envelope_digest != parse_digest(fields[18])? {
+            return Err(invalid("HPKE envelope digest"));
+        }
+        let issued_at = parse_utc(fields[20])?;
+        let expires_at = parse_utc(fields[21])?;
+        if issued_at >= expires_at {
+            return Err(invalid("provider response validity"));
+        }
+        if parse_authority_digest(fields[15])? != authority_id {
+            return Err(invalid("authority descriptor digest"));
+        }
         Ok(Self {
             idempotency_key_hash,
             request_id,
             catalog_head_digest: parse_digest(fields[6])?,
             provider_device_id,
             provider_signing_key,
+            authority_kind,
+            authority_id,
+            authority_device_id,
+            authority_signing_key,
             current_authority_digest: parse_authority_digest(fields[16])?,
             recipient_key_digest: parse_digest(fields[8])?,
             ciphertext_digest: parse_digest(fields[19])?,
-            expires_at: parse_utc(fields[21])?,
+            device_add_bytes,
+            envelope_bytes,
+            issued_at,
+            expires_at,
             signature,
             exact_bytes: exact_bytes.clone(),
             digest: Sha256Digest::hash_domain(PROVIDER_RESPONSE_DIGEST_DOMAIN, &exact_bytes),
@@ -650,7 +738,10 @@ impl CatalogProviderResponseCommand {
 pub enum CatalogStatusInvalidation {
     Identity = 1,
     Catalog = 2,
-    Key = 3,
+    Authority = 3,
+    Candidate = 4,
+    Provider = 5,
+    IndependentAuthority = 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -668,6 +759,8 @@ pub struct RecoveryScopeCatalogStatusOutcome {
     pub status: CatalogStatus,
     pub provider_response: Option<Vec<u8>>,
     pub observed_at: UtcMillis,
+    pub receipt_bytes: Option<Vec<u8>>,
+    pub created: bool,
 }
 
 impl fmt::Debug for RecoveryScopeCatalogStatusOutcome {
@@ -686,6 +779,12 @@ impl fmt::Debug for RecoveryScopeCatalogStatusOutcome {
 }
 
 impl RecoveryScopeCatalogStatusOutcome {
+    pub fn receipt_bytes(&self) -> Result<Vec<u8>, IdentityPersistenceError> {
+        self.receipt_bytes
+            .clone()
+            .ok_or_else(|| invalid("receipt unavailable"))
+    }
+
     /// Encodes the exact deterministic-CBOR preparation status.
     ///
     /// # Errors
@@ -706,7 +805,7 @@ impl RecoveryScopeCatalogStatusOutcome {
                 .map_err(|_| invalid("stored provider response"))?,
                 CanonicalValue::Null,
             ),
-            CatalogStatus::Expired => (3, CanonicalValue::Null, CanonicalValue::Unsigned(4)),
+            CatalogStatus::Expired => (3, CanonicalValue::Null, CanonicalValue::Unsigned(1)),
             CatalogStatus::Cancelled => (4, CanonicalValue::Null, CanonicalValue::Unsigned(2)),
             CatalogStatus::Invalidated(reason) => (
                 5,
@@ -716,7 +815,7 @@ impl RecoveryScopeCatalogStatusOutcome {
         };
         encode_deterministic_cbor_with_limit(
             &CanonicalValue::Map(vec![
-                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
                 (
                     CanonicalValue::Unsigned(2),
                     CanonicalValue::Text(self.request_id.to_string()),
@@ -757,24 +856,93 @@ fn parse_signing_key(value: &CanonicalValue) -> Result<SigningPublicKey, Identit
 
 fn parse_authority_digest(value: &CanonicalValue) -> Result<Sha256Digest, IdentityPersistenceError> {
     let CanonicalValue::Map(fields) = value else { return Err(invalid("independent authority")); };
-    if fields.len() != 3 || fields[0].0 != CanonicalValue::Unsigned(1) {
+    let (_, id, _, _) = parse_authority_descriptor(fields)?;
+    Ok(id)
+}
+
+fn parse_authority_descriptor(
+    fields: &[(CanonicalValue, CanonicalValue)],
+) -> Result<(u64, Sha256Digest, Option<DeviceId>, SigningPublicKey), IdentityPersistenceError> {
+    if fields.len() != 3
+        || fields[0].0 != CanonicalValue::Unsigned(1)
+        || fields[1].0 != CanonicalValue::Unsigned(2)
+        || fields[2].0 != CanonicalValue::Unsigned(3)
+    {
         return Err(invalid("independent authority"));
     }
-    let kind = &fields[0].1;
-    if *kind != CanonicalValue::Unsigned(1)
-        && *kind != CanonicalValue::Unsigned(2)
-        && *kind != CanonicalValue::Unsigned(3)
-    {
+    let CanonicalValue::Unsigned(kind) = fields[0].1 else {
+        return Err(invalid("independent authority kind"));
+    };
+    if !(1..=3).contains(&kind) {
         return Err(invalid("independent authority kind"));
     }
-    if fields[1].0 != CanonicalValue::Unsigned(2) || fields[2].0 != CanonicalValue::Unsigned(3) {
-        return Err(invalid("independent authority fields"));
-    }
-    let key = parse_fixed::<32>(&fields[2].1)?;
-    if kind == &CanonicalValue::Unsigned(1) {
-        let _ = parse_device(&fields[1].1)?;
-        Ok(Sha256Digest::hash_domain(CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN, &key))
+    let key = SigningPublicKey::try_from(parse_fixed::<32>(&fields[2].1)?)
+        .map_err(|_| invalid("authority signing key"))?;
+    let (id, authority_device_id) = if kind == 1 {
+        let device = parse_device(&fields[1].1)?;
+        (Sha256Digest::hash_domain(CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN, key.as_bytes()), Some(device))
     } else {
-        Ok(Sha256Digest::from_bytes(parse_fixed::<32>(&fields[1].1)?))
+        let id = parse_digest(&fields[1].1)?;
+        let expected = Sha256Digest::hash_domain(CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN, key.as_bytes());
+        if id != expected {
+            return Err(invalid("authority ID/key binding"));
+        }
+        (id, None)
+    };
+    Ok((kind, id, authority_device_id, key))
+}
+
+fn parse_device_add_candidate(
+    value: &CanonicalValue,
+    candidate: DeviceId,
+    identity: IdentityId,
+    highwater: SafeUint,
+    predecessor: Sha256Digest,
+    device_add_digest: Sha256Digest,
+) -> Result<(SigningPublicKey, DeviceEncryptionPublicKey), IdentityPersistenceError> {
+    let bytes = parse_bounded_bytes(value, 533)?;
+    let event = IdentityLogEventV1::decode_and_verify(&bytes)
+        .map_err(|_| invalid("DeviceAdd event"))?;
+    if event.identity_id() != identity
+        || event.sequence().get() != highwater.get().checked_add(1).ok_or_else(|| invalid("DeviceAdd sequence"))?
+        || event.previous_event_hash() != Some(predecessor)
+    {
+        return Err(invalid("DeviceAdd binding"));
     }
+    let IdentityLogEventPayloadV1::DeviceAdd { certificate } = event.payload() else {
+        return Err(invalid("DeviceAdd event kind"));
+    };
+    if certificate.device_id() != candidate {
+        return Err(invalid("DeviceAdd candidate"));
+    }
+    let digest = Sha256Digest::hash_domain(b"dirextalk.identity-device-add.v1\0", &bytes);
+    if digest != device_add_digest {
+        return Err(invalid("DeviceAdd digest"));
+    }
+    Ok((certificate.device_signing_key(), certificate.device_encryption_key()))
+}
+
+fn validate_hpke_envelope(value: &CanonicalValue) -> Result<(), IdentityPersistenceError> {
+    let CanonicalValue::Map(fields) = value else {
+        return Err(invalid("HPKE envelope"));
+    };
+    if fields.len() != 3
+        || fields[0].0 != CanonicalValue::Unsigned(1)
+        || fields[0].1 != CanonicalValue::Unsigned(2)
+        || fields[1].0 != CanonicalValue::Unsigned(2)
+        || fields[2].0 != CanonicalValue::Unsigned(3)
+    {
+        return Err(invalid("HPKE envelope"));
+    }
+    let enc = parse_fixed::<32>(&fields[1].1)?;
+    let low_order_one = enc[0] == 1 && enc[1..].iter().all(|byte| *byte == 0);
+    let low_order_max = enc[..31].iter().all(|byte| *byte == 0xff) && enc[31] == 0x7f;
+    if enc.iter().all(|byte| *byte == 0) || low_order_one || low_order_max {
+        return Err(invalid("HPKE encapsulation"));
+    }
+    let ciphertext = parse_bounded_bytes(&fields[2].1, 1_049_473)?;
+    if ciphertext.len() < 17 {
+        return Err(invalid("HPKE ciphertext"));
+    }
+    Ok(())
 }

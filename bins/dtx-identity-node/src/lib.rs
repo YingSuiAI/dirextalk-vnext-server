@@ -38,7 +38,7 @@ use dtx_identity_log::{
     MAX_IDENTITY_LOG_PAGE_EVENTS,
 };
 use dtx_identity_persistence::{
-    CatalogPreparationCommand, CatalogProviderResponseCommand, CatalogStatus, CatalogUploadCommand,
+    CatalogPreparationCommand, CatalogProviderResponseCommand, CatalogUploadCommand,
     ClientBindingAuthorization, ClientBindingRepository, ClientBindingWorkflowError,
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
     CreateHistoryRecoveryRequestV4Command, DeviceEnrollmentApprovalCommand,
@@ -50,10 +50,8 @@ use dtx_identity_persistence::{
     IdentityAppendOutcome, IdentityLogHead, IdentityLogPageReadOutcome, IdentityLogRepository,
     IdentityPersistenceError, IdentityPgStore, KeyPackageClaimCommand, KeyPackageClaimOutcome,
     KeyPackagePublishCommand, KeyPackagePublishOutcome, KeyPackageRepository,
-    MAX_KEY_PACKAGE_PUBLISH_BYTES, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES,
-    MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
-    MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES,
-    MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES,
+    MAX_KEY_PACKAGE_PUBLISH_BYTES, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
+    MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES,
     RecoveryResponseCapability, RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository,
     RecoveryScopeCatalogStatusOutcome, lock_and_load_active_snapshot,
 };
@@ -119,7 +117,8 @@ pub(crate) use error_types::{
     InitialDeviceSuccess, KeyPackageClaimSuccess, KeyPackageErrorCode, KeyPackageFailure,
     KeyPackagePublishSuccess, MlsV5RecoveryAuthorizationErrorCode,
     MlsV5RecoveryAuthorizationFailure, RecoveryCatalogErrorCode, RecoveryCatalogFailure,
-    RecoveryCatalogHeadSuccess, RecoveryCatalogStatusSuccess, SafeErrorBody, SafeErrorEnvelope,
+    RecoveryCatalogHeadSuccess, RecoveryCatalogReceiptKind, RecoveryCatalogStatusSuccess,
+    SafeErrorBody, SafeErrorEnvelope,
 };
 pub(crate) use errors::{
     map_device_enrollment_persistence_error, map_device_revoke_persistence_error,
@@ -280,6 +279,10 @@ pub const RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE: &str =
 /// Exact redacted preparation status media type.
 pub const RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.recovery-scope-catalog-status.v2+cbor";
+pub const RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.recovery-scope-catalog-preparation-receipt.v2+cbor";
+pub const RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.recovery-scope-catalog-provider-response-receipt.v2+cbor";
 pub const CONTACT_INVITE_CONTENT_TYPE: &str = "application/vnd.dirextalk.contact-invite.v1+cbor";
 pub const CONTACT_INVITE_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.contact-invite-receipt.v1+cbor";
