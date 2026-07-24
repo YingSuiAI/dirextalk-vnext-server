@@ -4,8 +4,8 @@ attachment-create = {
   3: tstr .size (8..128),
   4: tstr .size 36,
   5: bstr .size 32,
-  6: uint .ge 1 .le 4096,
-  7: uint .ge 1 .le 1073741824,
+  6: uint 1..4096,
+  7: uint 1..1073741824,
   8: int
 }
 

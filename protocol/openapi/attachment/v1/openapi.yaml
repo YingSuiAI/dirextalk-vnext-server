@@ -16,7 +16,7 @@ paths:
           application/vnd.dirextalk.attachment-create.v1+cbor:
             schema: { type: string, format: binary }
       responses:
-        '201': { description: Created; headers: { DTX-Attachment-Upload-Capability: { schema: { type: string } }, DTX-Attachment-Read-Capability: { schema: { type: string } } } }
+        '201': { description: Created, headers: { DTX-Attachment-Upload-Capability: { schema: { type: string } }, DTX-Attachment-Read-Capability: { schema: { type: string } } } }
         '200': { description: Exact replay; capability headers are intentionally omitted }
   /v1/attachments/{object_id}:
     delete:

@@ -6,7 +6,7 @@
   },
   "artifacts": {
     "protocol/cddl/account-read-cursor/v1/account-read-cursor-v1.cddl": "sha256:87a57e0a2224653f9fc57aa172abac31dc87a72934ed87bc4bfb27e99edae1bb",
-    "protocol/cddl/attachment/v1/attachment-v1.cddl": "sha256:9968f4d133a8e3c11423a0cddb9b0daa05bed7c67e4028b6dc852cdffa18b850",
+    "protocol/cddl/attachment/v1/attachment-v1.cddl": "sha256:07699c2667f6a2fb7a4d28b0db1644d62b1d036ec3d629853aa229cf18f61550",
     "protocol/cddl/contact-card/v1/contact-card-v1.cddl": "sha256:e8c74132db98cdf0b488eb3ebb2b7819130997bd22065f4e330df37feda30aaf",
     "protocol/cddl/contact-delivery/v1/contact-delivery-v1.cddl": "sha256:3531f3f4d51baddefa41107019264216e861c1cac8ebbd14dc47d553af4b61c2",
     "protocol/cddl/conversation-admission/v1/conversation-admission-v1.cddl": "sha256:ce0d596b80308190bf4acf197ac3dfd7c08e961e89b2954751a7677fcacf697a",
@@ -33,7 +33,7 @@
     "protocol/cddl/v1/event-envelope.cddl": "sha256:02f01fb9c99306643757d0bd4693d571e868743f116a1a3c0285a7fcd166f363",
     "protocol/cddl/v1/event-page.cddl": "sha256:20815c38497da905479f12f48c482697d8c69c446ba696c39385f8c15b23b4aa",
     "protocol/cddl/v1/plan-hash-fixture.cddl": "sha256:72465fe499d80f00eef8a467c3a81f7d194de8d72498d455db371fbb9d83855b",
-    "protocol/openapi/attachment/v1/openapi.yaml": "sha256:b41743c0185b3be62cf0550f93c27181cda6ff2e5eb6820a5a323d21c9f02263",
+    "protocol/openapi/attachment/v1/openapi.yaml": "sha256:75ef049a0a6fb29c067f8d071be221fabc37c45b0d18a85e68c684a88d6b9d6a",
     "protocol/openapi/contact-delivery/v1/openapi.yaml": "sha256:cc7c2a5b29853bf653523aa6b5e0ab64c8d576b49b3ae65bc255b78df7224fa7",
     "protocol/openapi/group-membership-discovery/v1/openapi.yaml": "sha256:6b139afd193e3a6465637fb93c6b130495b9c34ca414e6c1110fb9d558c97bf7",
     "protocol/openapi/group-query-proof/v1/openapi.yaml": "sha256:a14c20030c3c5574a7701fbf5c195e2493d84168b0f96fc384068c72b2005a2c",

@@ -54,19 +54,7 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
         "private-event/v1/private-event-v1.cddl",
         "private-event/v8/private-group-reaction-v8.cddl",
     ] {
-        let source = read(&root.join("protocol/cddl").join(relative))?;
-        let complete = if relative == "attachment/v1/attachment-v1.cddl" {
-            // cddl-cat does not accept the source's `.ge`/`.le` controls;
-            // normalize those equivalent inclusive ranges for syntax parsing.
-            format!(
-                "{common}\n{}",
-                source
-                    .replace("uint .ge 1 .le 4096", "uint 1..4096")
-                    .replace("uint .ge 1 .le 1073741824", "uint 1..1073741824")
-            )
-        } else {
-            source
-        };
+        let complete = read(&root.join("protocol/cddl").join(relative))?;
         cddl_cat::parse_cddl(&complete).map_err(|error| {
             ProtocolToolError::new(format!("parse Alpha CDDL {relative}: {error}"))
         })?;
@@ -92,16 +80,6 @@ pub fn validate_artifacts(root: &Path) -> Result<(), ProtocolToolError> {
         "opaque-push/v1/openapi.yaml",
     ] {
         let source = read(&root.join("protocol/openapi").join(relative))?;
-        let source = if relative == "attachment/v1/openapi.yaml" {
-            // The committed attachment map uses a YAML-incompatible semicolon;
-            // normalize it to the equivalent flow-map separator before parsing.
-            source.replace(
-                "description: Created; headers:",
-                "description: Created, headers:",
-            )
-        } else {
-            source
-        };
         oas3::from_yaml(&source).map_err(|error| {
             ProtocolToolError::new(format!("parse Alpha OpenAPI {relative}: {error}"))
         })?;
