@@ -224,6 +224,26 @@ A matching candidate-ready attestation is a no-op. Mixed, forged, incomplete,
 or runtime-mismatched receipt/release/env/compose material fails before
 mutation. It never rewrites receipt history or performs a down migration.
 
+The r2 basenames above retain that deployed incident contract unchanged. The
+immutable r3 basenames `recover-vnext-011-to-014-r3` and
+`attest-vnext-011-to-014-r3` add an explicit migration proof mode. Recovery
+accepts only an authenticated 0.1.1 environment and required images with the
+provision binary absent and either the exact SQLx baseline (55 successful rows,
+056/057/058 absent) or the exact migrated-old state (58 successful rows with
+056/057/058 all present and successful). Any failed row, incident subset,
+different total, image/environment drift, binary presence, receipt/history
+change, or unexpected attestation fails closed. Candidate-ready is a no-op;
+activation uses the existing candidate update path and succeeds only after the
+candidate image/environment, executable provision binary, 58 successful rows,
+all three incident migrations, and canonical runtime attestation are proved,
+without rewriting receipt history.
+Recovery persists a root-owned mode `0600` self-authenticating transition marker
+under `/var/lib/dirextalk-vnext/` before the first candidate mutation. The
+marker is bound to both receipt and retained-release identities, permits only
+idempotent activation replay after a crash, and is removed only after the
+candidate proof and receipt/history byte checks succeed. The standalone r3
+attester refuses while that marker exists.
+
 Host installation performs retention and free-space admission while holding
 the same exclusive install lock. Every bundle and materialized release remains
 limited to 32 MiB. The release store is bounded to eight releases/256 MiB and

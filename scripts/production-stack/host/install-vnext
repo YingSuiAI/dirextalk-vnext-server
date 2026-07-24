@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from enum import Enum
 from pathlib import Path, PurePosixPath
 
 BUNDLE_UPLOAD = Path("/home/ubuntu/dirextalk-vnext.bundle")
@@ -42,6 +43,7 @@ CURRENT_ENV = Path("/var/lib/dirextalk/vnext/current.env")
 VERIFY_PATH = "scripts/production-stack/verify.sh"
 UPDATE_PATH = "scripts/production-stack/update.sh"
 RUNTIME_ATTESTATION = STATE_ROOT / "runtime-attestation.json"
+R3_TRANSITION_MARKER = STATE_ROOT / "r3-transition.json"
 MAX_BUNDLE_BYTES = 32 * 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -107,6 +109,26 @@ RUNTIME_ATTESTATION_KEYS = {
     "attestation_sha256",
 }
 RUNTIME_ATTESTATION_SCHEMA = "dirextalk.vnext-runtime-attestation"
+R3_TRANSITION_SCHEMA = "dirextalk.vnext-transition"
+R3_TRANSITION_KEYS = {
+    "schema", "schema_version", "phase", "current_receipt_sha256",
+    "previous_receipt_sha256", "candidate_bundle_sha256", "prior_bundle_sha256",
+    "marker_sha256",
+}
+
+
+class ProofMode(str, Enum):
+    """Authenticated host-runtime states used by the r3 incident boundary."""
+
+    ORIGINAL = "original"
+    MIGRATED_OLD = "migrated-old"
+    CANDIDATE_READY = "candidate-ready"
+
+
+# Keep these aliases readable at call sites and stable for fixture tests.
+PROOF_ORIGINAL = ProofMode.ORIGINAL
+PROOF_MIGRATED_OLD = ProofMode.MIGRATED_OLD
+PROOF_CANDIDATE_READY = ProofMode.CANDIDATE_READY
 
 
 class ContractError(RuntimeError):
@@ -1333,6 +1355,77 @@ def validate_runtime_attestation(raw: bytes, receipt: dict[str, object]) -> dict
     return value
 
 
+def make_r3_transition_marker(current: dict[str, object], prior: dict[str, object]) -> bytes:
+    body = {
+        "schema": R3_TRANSITION_SCHEMA,
+        "schema_version": 1,
+        "phase": "activating",
+        "current_receipt_sha256": current["receipt_sha256"],
+        "previous_receipt_sha256": prior["receipt_sha256"],
+        "candidate_bundle_sha256": current["bundle_sha256"],
+        "prior_bundle_sha256": prior["bundle_sha256"],
+    }
+    value = dict(body)
+    value["marker_sha256"] = digest(canonical(body))
+    return canonical(value)
+
+
+def validate_r3_transition_marker(
+    raw: bytes, current: dict[str, object], prior: dict[str, object]
+) -> dict[str, object]:
+    value = decode_json(raw, "r3 transition marker")
+    if not isinstance(value, dict) or set(value) != R3_TRANSITION_KEYS:
+        raise ContractError("r3 transition marker keys are not exact")
+    if value.get("schema") != R3_TRANSITION_SCHEMA or value.get("schema_version") != 1 \
+            or value.get("phase") != "activating":
+        raise ContractError("r3 transition marker state is invalid")
+    claimed = value.get("marker_sha256")
+    body = dict(value)
+    body.pop("marker_sha256", None)
+    if not isinstance(claimed, str) or HEX64.fullmatch(claimed) is None \
+            or digest(canonical(body)) != claimed or raw != canonical(value):
+        raise ContractError("r3 transition marker is not canonical or self-authenticating")
+    expected = {
+        "current_receipt_sha256": current["receipt_sha256"],
+        "previous_receipt_sha256": prior["receipt_sha256"],
+        "candidate_bundle_sha256": current["bundle_sha256"],
+        "prior_bundle_sha256": prior["bundle_sha256"],
+    }
+    if any(value[key] != expected[key] for key in expected):
+        raise ContractError("r3 transition marker is not bound to the receipt chain")
+    return value
+
+
+def read_r3_transition_marker(
+    current: dict[str, object], prior: dict[str, object]
+) -> bytes | None:
+    if not R3_TRANSITION_MARKER.exists() and not R3_TRANSITION_MARKER.is_symlink():
+        return None
+    raw = read_secure(R3_TRANSITION_MARKER, 0o600, MAX_RECEIPT_BYTES)
+    validate_r3_transition_marker(raw, current, prior)
+    return raw
+
+
+def reject_if_r3_transition_pending() -> None:
+    """Block every legacy/generic entry point while r3 replay is durable."""
+    if R3_TRANSITION_MARKER.exists() or R3_TRANSITION_MARKER.is_symlink():
+        raise ContractError("r3 transition marker blocks this entry point")
+
+
+def begin_r3_transition(current: dict[str, object], prior: dict[str, object]) -> bytes:
+    raw = make_r3_transition_marker(current, prior)
+    atomic_write(R3_TRANSITION_MARKER, raw)
+    return raw
+
+
+def clear_r3_transition(current: dict[str, object], prior: dict[str, object]) -> None:
+    raw = read_secure(R3_TRANSITION_MARKER, 0o600, MAX_RECEIPT_BYTES)
+    validate_r3_transition_marker(raw, current, prior)
+    secure_metadata(R3_TRANSITION_MARKER, 0o600)
+    R3_TRANSITION_MARKER.unlink()
+    fsync_directory(STATE_ROOT)
+
+
 REQUIRED_RUNTIME_SERVICES = frozenset({"dtx-node", "realtime-gateway", "agent-control"})
 
 
@@ -1380,7 +1473,8 @@ def parse_compose_ps_images(raw: bytes) -> dict[str, str]:
     return images
 
 
-def prove_live_runtime(manifest: dict[str, object], migrations_present: bool) -> tuple[str, str, str]:
+def _prove_live_runtime_r2(manifest: dict[str, object], migrations_present: bool) -> tuple[str, str, str]:
+    """The original r2 proof contract; retained byte-for-byte in its boundary."""
     environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
     result = subprocess.run(
         ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
@@ -1426,6 +1520,82 @@ def prove_live_runtime(manifest: dict[str, object], migrations_present: bool) ->
     )
 
 
+def prove_live_runtime(
+    manifest: dict[str, object], proof_mode: ProofMode | str | bool
+) -> tuple[str, str, str]:
+    """Prove a runtime using an explicit r3 mode (or the frozen r2 bool API)."""
+    if isinstance(proof_mode, bool):
+        # r2 helper basenames and old deployed fixtures continue to use the
+        # historical incident-only query and binary semantics.
+        return _prove_live_runtime_r2(manifest, proof_mode)
+    try:
+        mode = ProofMode(proof_mode)
+    except (TypeError, ValueError) as error:
+        raise ContractError("unknown runtime proof mode") from error
+    environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
+    result = subprocess.run(
+        ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
+         str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE), "ps", "--format", "json"],
+        env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        check=True, timeout=120,
+    )
+    images = parse_compose_ps_images(result.stdout)
+    if (
+        set(images) & REQUIRED_RUNTIME_SERVICES != REQUIRED_RUNTIME_SERVICES
+        or any(images[name] != manifest["server_image"] for name in REQUIRED_RUNTIME_SERVICES)
+    ):
+        raise ContractError("running service image differs from authenticated release")
+    if mode is ProofMode.CANDIDATE_READY:
+        subprocess.run(
+            ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
+             str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE), "exec", "-T", "dtx-node",
+             "test", "-x", "/usr/local/bin/dtx-identity-provision"],
+            env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=True, timeout=120,
+        )
+    else:
+        # Old runtimes may be restarting and cannot be probed through compose.
+        # Inspect the authenticated immutable prior image directly, with no
+        # network, mounts, environment, shell, or output channel.
+        subprocess.run(
+            ["docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
+             "--entrypoint", "/usr/bin/test", str(manifest["server_image"]), "!", "-e",
+             "/usr/local/bin/dtx-identity-provision"],
+            env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=True, timeout=120,
+        )
+    expected_total = 55 if mode is ProofMode.ORIGINAL else 58
+    expected_incident = 0 if mode is ProofMode.ORIGINAL else 3
+    migration_query = (
+        "SELECT count(*) || '|' || count(*) FILTER (WHERE success) || '|' || "
+        "count(*) FILTER (WHERE version IN "
+        "(202607230056,202607230057,202607230058)) || '|' || "
+        "count(*) FILTER (WHERE version IN "
+        "(202607230056,202607230057,202607230058) AND success) "
+        "FROM public._sqlx_migrations"
+    )
+    migrations = subprocess.run(
+        ["docker", "compose", "--project-name", "dirextalk-vnext-production", "--env-file",
+         str(PRODUCTION_ENV), "-f", str(PRODUCTION_COMPOSE), "exec", "-T", "postgres", "psql",
+         "-v", "ON_ERROR_STOP=1", "-U", "dtx_admin", "-d", "dtx_node", "-At", "-c", migration_query],
+        env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        check=True, timeout=120,
+    )
+    expected = f"{expected_total}|{expected_total}|{expected_incident}|{expected_incident}\n".encode()
+    if migrations.stdout != expected:
+        raise ContractError("r3 migration runtime proof failed")
+    return (
+        digest(canonical({name: images[name] for name in sorted(REQUIRED_RUNTIME_SERVICES)})),
+        digest(str(manifest["server_image"]).encode() + b"\0dtx-identity-provision"),
+        digest(canonical({
+            "versions": [202607230056, 202607230057, 202607230058],
+            "mode": mode.value,
+            "total": expected_total,
+            "success": expected_total,
+        })),
+    )
+
+
 def attest_runtime(release: Path, manifest: dict[str, object], domain: str) -> None:
     services, binding, migrations = prove_live_runtime(manifest, True)
     _value, raw = runtime_attestation(release, manifest, domain, services, binding, migrations)
@@ -1443,6 +1613,25 @@ def runtime_is_attested(release: Path, manifest: dict[str, object], receipt: dic
         and recorded["migration_proof_sha256"] == migrations
 
 
+def attest_runtime_r3(release: Path, manifest: dict[str, object], domain: str) -> None:
+    services, binding, migrations = prove_live_runtime(manifest, ProofMode.CANDIDATE_READY)
+    _value, raw = runtime_attestation(release, manifest, domain, services, binding, migrations)
+    atomic_write(RUNTIME_ATTESTATION, raw)
+
+
+def runtime_is_attested_r3(
+    release: Path, manifest: dict[str, object], receipt: dict[str, object]
+) -> bool:
+    raw = read_secure(RUNTIME_ATTESTATION, 0o600, MAX_RECEIPT_BYTES)
+    recorded = validate_runtime_attestation(raw, receipt)
+    services, binding, migrations = prove_live_runtime(manifest, ProofMode.CANDIDATE_READY)
+    current, _expected = runtime_attestation(release, manifest, str(receipt["domain"]))
+    return all(recorded[key] == current[key] for key in (
+        "production_env_sha256", "compose_sha256", "caddy_sha256",
+    )) and recorded["running_services_sha256"] == services and recorded["client_binding_binary_sha256"] == binding \
+        and recorded["migration_proof_sha256"] == migrations
+
+
 def invoke_candidate_update(release: Path) -> None:
     updater = release / UPDATE_PATH
     read_secure(updater, 0o555, MAX_BUNDLE_BYTES)
@@ -1451,13 +1640,19 @@ def invoke_candidate_update(release: Path) -> None:
                    check=True, timeout=900)
 
 
-def activate_candidate(release: Path, manifest: dict[str, object], domain: str) -> None:
+def activate_candidate(
+    release: Path, manifest: dict[str, object], domain: str,
+    proof_mode: ProofMode | None = None,
+) -> None:
     """Select a candidate without re-running first-install materialization."""
     stage_provisioned_host_material(release, domain)
     stage_candidate_validator(release)
     replace_runtime_identity(manifest)
     invoke_candidate_update(release)
-    attest_runtime(release, manifest, domain)
+    if proof_mode is ProofMode.CANDIDATE_READY:
+        attest_runtime_r3(release, manifest, domain)
+    else:
+        attest_runtime(release, manifest, domain)
 
 
 def invoke_fixed_installer(release: Path, manifest: dict[str, object]) -> None:
@@ -1501,8 +1696,138 @@ def prove_known_false_runtime(prior_release: Path, prior_manifest: dict[str, obj
     prove_live_runtime(prior_manifest, False)
 
 
+def prove_partial_migration_runtime(
+    prior_release: Path,
+    prior_manifest: dict[str, object],
+    candidate_release: Path,
+    proof_mode: ProofMode,
+) -> None:
+    """Prove the immutable r3 migrated-old incident shape before activation."""
+    if proof_mode not in (ProofMode.ORIGINAL, ProofMode.MIGRATED_OLD):
+        raise ContractError("partial-migration proof requires an old-runtime mode")
+    for relative, installed in (
+        ("docker/production/docker-compose.yml", PRODUCTION_COMPOSE),
+        ("docker/production/Caddyfile", PRODUCTION_CONFIG_ROOT / "Caddyfile"),
+    ):
+        candidate_raw = read_secure(candidate_release / relative, 0o444, MAX_BUNDLE_BYTES)
+        if read_secure(installed, 0o644, MAX_BUNDLE_BYTES) != candidate_raw:
+            raise ContractError("partial-migration recovery lacks the exact raw candidate host shape")
+    env_raw = read_secure(PRODUCTION_ENV, 0o644, MAX_BUNDLE_BYTES)
+    if read_secure(CURRENT_ENV, 0o600, MAX_BUNDLE_BYTES) != env_raw:
+        raise ContractError("partial-migration recovery current environment differs from production environment")
+    try:
+        identity: dict[str, str] = {}
+        for line in env_raw.decode().splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                if key in identity and key in {
+                    "DTX_SERVER_IMAGE", "DTX_MIGRATOR_IMAGE", "DTX_RELEASE_VERSION",
+                }:
+                    raise ContractError("partial-migration recovery environment duplicates an identity field")
+                identity[key] = value
+    except UnicodeDecodeError as error:
+        raise ContractError("partial-migration recovery environment is not UTF-8") from error
+    for key, value in (
+        ("DTX_SERVER_IMAGE", prior_manifest["server_image"]),
+        ("DTX_MIGRATOR_IMAGE", prior_manifest["migrator_image"]),
+        ("DTX_RELEASE_VERSION", prior_manifest["version"]),
+    ):
+        if identity.get(key) != value:
+            raise ContractError("partial-migration recovery runtime identity is not exactly 0.1.1")
+    prove_live_runtime(prior_manifest, proof_mode)
+
+
+def recover_partial_migration_once() -> None:
+    """Recover only the authenticated r3 partial 0.1.1 -> 0.1.4 incident."""
+    current, current_raw = read_current_receipt()
+    if current is None or current_raw is None:
+        raise ContractError("partial-migration recovery requires a current candidate receipt")
+    if current["state"] != "installed" or current["version"] != "0.1.4":
+        raise ContractError("partial-migration recovery accepts only the 0.1.4 installed receipt")
+    previous = current["previous_receipt_sha256"]
+    if not isinstance(previous, str):
+        raise ContractError("partial-migration recovery requires the retained 0.1.1 receipt")
+    prior_path = RECEIPT_ROOT / f"{previous}.json"
+    prior_raw = read_secure(prior_path, 0o600, MAX_RECEIPT_BYTES)
+    prior = validate_receipt(prior_raw)
+    if prior["receipt_sha256"] != previous or prior["state"] != "installed" or prior["version"] != "0.1.1":
+        raise ContractError("partial-migration recovery receipt chain is not exactly 0.1.1 to 0.1.4")
+    for key in ("target", "domain"):
+        if prior[key] != current[key]:
+            raise ContractError("partial-migration recovery receipt chain is mixed")
+    current_history = RECEIPT_ROOT / f"{current['receipt_sha256']}.json"
+    current_history_raw = read_secure(current_history, 0o600, MAX_RECEIPT_BYTES)
+    if current_history_raw != current_raw:
+        raise ContractError("current candidate receipt differs from receipt history")
+    candidate_release, candidate_manifest = load_retained_release(current)
+    prior_release, prior_manifest = load_retained_release(prior)
+    if not compatible(candidate_release) or not compatible(prior_release):
+        raise ContractError("partial-migration recovery release lacks forward compatibility")
+    marker_raw = read_r3_transition_marker(current, prior)
+    attestation_present = RUNTIME_ATTESTATION.exists() or RUNTIME_ATTESTATION.is_symlink()
+    r3_ready = False
+    try:
+        r3_ready = runtime_is_attested_r3(candidate_release, candidate_manifest, current)
+    except (ContractError, OSError) as error:
+        if attestation_present and marker_raw is None:
+            raise ContractError("partial-migration recovery found an unexpected runtime attestation") from error
+    if r3_ready:
+        if marker_raw is not None:
+            if read_secure(current_history, 0o600, MAX_RECEIPT_BYTES) != current_history_raw \
+                    or read_secure(prior_path, 0o600, MAX_RECEIPT_BYTES) != prior_raw:
+                raise ContractError("partial-migration recovery changed receipt history")
+            clear_r3_transition(current, prior)
+        return
+    if marker_raw is not None:
+        # A durable marker proves that old-state admission already completed;
+        # replay the existing idempotent activation stages from the beginning.
+        activate_candidate(candidate_release, candidate_manifest, str(current["domain"]), ProofMode.CANDIDATE_READY)
+        if read_secure(current_history, 0o600, MAX_RECEIPT_BYTES) != current_history_raw \
+                or read_secure(prior_path, 0o600, MAX_RECEIPT_BYTES) != prior_raw:
+            raise ContractError("partial-migration recovery changed receipt history")
+        if not runtime_is_attested_r3(candidate_release, candidate_manifest, current):
+            raise ContractError("candidate activation did not produce an exact ready runtime attestation")
+        clear_r3_transition(current, prior)
+        return
+    if attestation_present:
+        # A valid frozen r2 candidate-ready proof is the only legacy replay
+        # state admitted for conversion to the r3 attestation.
+        try:
+            legacy_ready = runtime_is_attested(candidate_release, candidate_manifest, current)
+        except (ContractError, OSError) as error:
+            raise ContractError("partial-migration recovery found an invalid legacy runtime attestation") from error
+        if not legacy_ready:
+            raise ContractError("partial-migration recovery found a stale legacy runtime attestation")
+        begin_r3_transition(current, prior)
+        attest_runtime_r3(candidate_release, candidate_manifest, str(current["domain"]))
+        if read_secure(current_history, 0o600, MAX_RECEIPT_BYTES) != current_history_raw \
+                or read_secure(prior_path, 0o600, MAX_RECEIPT_BYTES) != prior_raw \
+                or not runtime_is_attested_r3(candidate_release, candidate_manifest, current):
+            raise ContractError("legacy runtime proof conversion did not produce an exact r3 proof")
+        clear_r3_transition(current, prior)
+        return
+    proof_error: Exception | None = None
+    for mode in (ProofMode.ORIGINAL, ProofMode.MIGRATED_OLD):
+        try:
+            prove_partial_migration_runtime(prior_release, prior_manifest, candidate_release, mode)
+            break
+        except (ContractError, OSError, subprocess.SubprocessError) as error:
+            proof_error = error
+    else:
+        raise ContractError("partial-migration recovery runtime shape is not admitted") from proof_error
+    begin_r3_transition(current, prior)
+    activate_candidate(candidate_release, candidate_manifest, str(current["domain"]), ProofMode.CANDIDATE_READY)
+    if read_secure(current_history, 0o600, MAX_RECEIPT_BYTES) != current_history_raw \
+            or read_secure(prior_path, 0o600, MAX_RECEIPT_BYTES) != prior_raw:
+        raise ContractError("partial-migration recovery changed receipt history")
+    if not runtime_is_attested_r3(candidate_release, candidate_manifest, current):
+        raise ContractError("candidate activation did not produce an exact ready runtime attestation")
+    clear_r3_transition(current, prior)
+
+
 def attest_candidate_runtime_once() -> None:
     """Refresh only the sanitized proof for the fixed ready 0.1.4 candidate."""
+    reject_if_r3_transition_pending()
     current, current_raw = read_current_receipt()
     if current is None or current_raw is None or current["state"] != "installed" or current["version"] != "0.1.4":
         raise ContractError("candidate runtime attestation requires the current installed 0.1.4 receipt")
@@ -1524,6 +1849,40 @@ def attest_candidate_runtime_once() -> None:
     attest_runtime(release, manifest, str(current["domain"]))
 
 
+def attest_candidate_runtime_once_r3() -> None:
+    """Refresh only the strict candidate-ready proof for the r3 helper."""
+    current, current_raw = read_current_receipt()
+    if current is None or current_raw is None or current["state"] != "installed" or current["version"] != "0.1.4":
+        raise ContractError("candidate runtime attestation requires the current installed 0.1.4 receipt")
+    history = RECEIPT_ROOT / f"{current['receipt_sha256']}.json"
+    history_raw = read_secure(history, 0o600, MAX_RECEIPT_BYTES)
+    if history_raw != current_raw:
+        raise ContractError("candidate runtime attestation current receipt differs from receipt history")
+    previous = current["previous_receipt_sha256"]
+    if not isinstance(previous, str):
+        raise ContractError("candidate runtime attestation requires the retained 0.1.1 receipt")
+    prior = validate_receipt(read_secure(RECEIPT_ROOT / f"{previous}.json", 0o600, MAX_RECEIPT_BYTES))
+    if prior["receipt_sha256"] != previous or prior["state"] != "installed" or prior["version"] != "0.1.1" \
+            or prior["target"] != current["target"] or prior["domain"] != current["domain"]:
+        raise ContractError("candidate runtime attestation receipt chain is not exactly 0.1.1 to 0.1.4")
+    if R3_TRANSITION_MARKER.exists() or R3_TRANSITION_MARKER.is_symlink():
+        read_r3_transition_marker(current, prior)
+        raise ContractError("candidate runtime attestation is blocked by an activating transition")
+    release, manifest = load_retained_release(current)
+    if not compatible(release):
+        raise ContractError("candidate runtime attestation release lacks forward compatibility")
+    attestation_present = RUNTIME_ATTESTATION.exists() or RUNTIME_ATTESTATION.is_symlink()
+    try:
+        if runtime_is_attested_r3(release, manifest, current):
+            return
+    except (ContractError, OSError) as error:
+        if attestation_present:
+            raise ContractError("candidate runtime attestation is malformed or unexpected") from error
+    attest_runtime_r3(release, manifest, str(current["domain"]))
+    if read_secure(history, 0o600, MAX_RECEIPT_BYTES) != history_raw:
+        raise ContractError("candidate runtime attestation changed receipt history")
+
+
 def consume_uploads(incoming: Path) -> tuple[Path, Path]:
     secure_metadata(BUNDLE_UPLOAD, 0o400)
     secure_metadata(REQUEST_UPLOAD, 0o400)
@@ -1543,6 +1902,7 @@ def promote_initial_recovered_receipt(receipt: dict[str, object], raw: bytes) ->
 
 
 def install_once() -> None:
+    reject_if_r3_transition_pending()
     incoming = Path(tempfile.mkdtemp(prefix="install-", dir=INCOMING_ROOT))
     os.chown(incoming, STATE_OWNER_UID, STATE_OWNER_GID)
     os.chmod(incoming, 0o700)
@@ -1631,6 +1991,7 @@ def recover_false_runtime_once() -> None:
     This intentionally has no arguments: an operator cannot select a release,
     image, or receipt chain through this emergency entry point.
     """
+    reject_if_r3_transition_pending()
     current, current_raw = read_current_receipt()
     if current is None or current_raw is None:
         raise ContractError("false-runtime recovery requires a current candidate receipt")
@@ -1693,10 +2054,15 @@ def main() -> int:
         print("install-vnext requires root", file=sys.stderr)
         return 1
     basename = Path(sys.argv[0]).name
-    if basename not in {"install-vnext", "recover-vnext-011-to-014-r2", "attest-vnext-011-to-014-r2"}:
+    if basename not in {
+        "install-vnext", "recover-vnext-011-to-014-r2", "attest-vnext-011-to-014-r2",
+        "recover-vnext-011-to-014-r3", "attest-vnext-011-to-014-r3",
+    }:
         print("install-vnext: unrecognized helper basename", file=sys.stderr)
         return 1
     try:
+        if basename != "recover-vnext-011-to-014-r3":
+            reject_if_r3_transition_pending()
         ensure_root_directory(STATE_ROOT, 0o700)
         ensure_root_directory(INCOMING_ROOT, 0o700)
         ensure_root_directory(RECEIPT_ROOT, 0o700)
@@ -1708,6 +2074,10 @@ def main() -> int:
                 recover_false_runtime_once()
             elif basename == "attest-vnext-011-to-014-r2":
                 attest_candidate_runtime_once()
+            elif basename == "recover-vnext-011-to-014-r3":
+                recover_partial_migration_once()
+            elif basename == "attest-vnext-011-to-014-r3":
+                attest_candidate_runtime_once_r3()
             else:
                 install_once()
         finally:

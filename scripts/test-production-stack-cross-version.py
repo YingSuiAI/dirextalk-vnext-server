@@ -116,6 +116,7 @@ def main() -> None:
     original_run = MODULE.subprocess.run
     original_read = MODULE.read_secure
     original_fchown = MODULE.os.fchown
+    original_secure_metadata = MODULE.secure_metadata
     try:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -344,6 +345,140 @@ def main() -> None:
         MODULE.RUNTIME_ATTESTATION = original_runtime_attestation
         MODULE.read_secure = original_read
 
+    # r3 recovery accepts both authenticated old-runtime shapes, then invokes
+    # the existing activation boundary without changing either receipt byte.
+    original_receipt_root = MODULE.RECEIPT_ROOT
+    original_current_reader = MODULE.read_current_receipt
+    original_load = MODULE.load_retained_release
+    original_compatible = MODULE.compatible
+    original_marker = MODULE.R3_TRANSITION_MARKER
+    original_state_root = MODULE.STATE_ROOT
+    original_runtime_attestation = MODULE.RUNTIME_ATTESTATION
+    original_attested_r3 = MODULE.runtime_is_attested_r3
+    original_prove_partial = MODULE.prove_partial_migration_runtime
+    original_activate = MODULE.activate_candidate
+    original_read = MODULE.read_secure
+    original_fchown = MODULE.os.fchown
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            MODULE.RECEIPT_ROOT = base
+            MODULE.STATE_ROOT = base
+            MODULE.R3_TRANSITION_MARKER = base / "r3-transition.json"
+            old, old_raw = MODULE.make_receipt(prior, "installed", None)
+            candidate_request = dict(request)
+            candidate_request["previous_receipt_sha256"] = old["receipt_sha256"]
+            candidate, candidate_raw = MODULE.make_receipt(candidate_request, "installed", old["receipt_sha256"])
+            (base / f"{old['receipt_sha256']}.json").write_bytes(old_raw)
+            (base / f"{candidate['receipt_sha256']}.json").write_bytes(candidate_raw)
+            candidate_release, prior_release = base / "candidate", base / "prior"
+            candidate_release.mkdir(); prior_release.mkdir()
+            MODULE.read_current_receipt = lambda: (candidate, candidate_raw)
+            MODULE.read_secure = lambda path, _mode, _limit: Path(path).read_bytes()
+            MODULE.os.fchown = lambda _descriptor, _uid, _gid: None
+            MODULE.secure_metadata = lambda *_args: None
+            MODULE.load_retained_release = lambda receipt: (
+                (candidate_release, request) if receipt["version"] == "0.1.4" else (prior_release, prior)
+            )
+            MODULE.compatible = lambda _release: True
+            attest_states = iter((False, True))
+            MODULE.runtime_is_attested_r3 = lambda *_args: next(attest_states)
+            calls: list[object] = []
+            MODULE.prove_partial_migration_runtime = lambda *_args: calls.append(_args[-1])
+            MODULE.activate_candidate = lambda *_args: calls.append("activate")
+            MODULE.recover_partial_migration_once()
+            assert calls == [MODULE.ProofMode.ORIGINAL, "activate"]
+
+            attest_states = iter((False, True, True))
+            calls.clear()
+            def partial_proof(*args: object) -> None:
+                calls.append(args[-1])
+                if args[-1] is MODULE.ProofMode.ORIGINAL:
+                    raise MODULE.ContractError("original state not present")
+            MODULE.prove_partial_migration_runtime = partial_proof
+            MODULE.recover_partial_migration_once()
+            assert calls == [MODULE.ProofMode.ORIGINAL, MODULE.ProofMode.MIGRATED_OLD, "activate"]
+            assert (base / f"{old['receipt_sha256']}.json").read_bytes() == old_raw
+            assert (base / f"{candidate['receipt_sha256']}.json").read_bytes() == candidate_raw
+
+            # The marker is written before activation and survives an injected
+            # crash; a retry replays activation only after an exact marker-bound
+            # candidate proof, then removes it. Invalid markers fail closed.
+            MODULE.runtime_is_attested_r3 = lambda *_args: False
+            MODULE.prove_partial_migration_runtime = lambda *_args: None
+            def crash_activate(*_args: object) -> None:
+                calls.append("crash-activate")
+                raise MODULE.ContractError("injected activation crash")
+            MODULE.activate_candidate = crash_activate
+            try:
+                MODULE.recover_partial_migration_once()
+            except MODULE.ContractError:
+                pass
+            else:
+                raise AssertionError("activation crash unexpectedly succeeded")
+            assert MODULE.R3_TRANSITION_MARKER.exists()
+            MODULE.R3_TRANSITION_MARKER.write_bytes(b"malformed\n")
+            try:
+                MODULE.recover_partial_migration_once()
+            except MODULE.ContractError:
+                pass
+            else:
+                raise AssertionError("malformed transition marker was accepted")
+            MODULE.R3_TRANSITION_MARKER.write_bytes(MODULE.make_r3_transition_marker(candidate, old))
+            MODULE.runtime_is_attested_r3 = lambda *_args: True
+            MODULE.activate_candidate = lambda *_args: calls.append("unexpected-activation")
+            MODULE.recover_partial_migration_once()
+            assert not MODULE.R3_TRANSITION_MARKER.exists()
+            MODULE.begin_r3_transition(candidate, old)
+            try:
+                MODULE.attest_candidate_runtime_once_r3()
+            except MODULE.ContractError:
+                pass
+            else:
+                raise AssertionError("r3 attester ignored an activating marker")
+            MODULE.clear_r3_transition(candidate, old)
+
+            # A valid legacy r2 candidate proof is converted in-place to r3;
+            # stale/malformed legacy bytes are not admitted as old-runtime proof.
+            MODULE.RUNTIME_ATTESTATION = base / "runtime-attestation.json"
+            MODULE.RUNTIME_ATTESTATION.write_bytes(b"legacy-r2")
+            attest_states = iter((False, True))
+            MODULE.runtime_is_attested_r3 = lambda *_args: next(attest_states)
+            MODULE.runtime_is_attested = lambda *_args: True
+            MODULE.attest_runtime_r3 = lambda *_args: MODULE.RUNTIME_ATTESTATION.write_bytes(b"r3")
+            MODULE.recover_partial_migration_once()
+            assert not MODULE.R3_TRANSITION_MARKER.exists()
+
+            MODULE.begin_r3_transition(candidate, old)
+            marker_before = MODULE.R3_TRANSITION_MARKER.read_bytes()
+            for entry_point in (
+                MODULE.install_once,
+                MODULE.recover_false_runtime_once,
+                MODULE.attest_candidate_runtime_once,
+            ):
+                try:
+                    entry_point()
+                except MODULE.ContractError:
+                    pass
+                else:
+                    raise AssertionError("legacy entry point ignored an active r3 marker")
+                assert MODULE.R3_TRANSITION_MARKER.read_bytes() == marker_before
+            MODULE.clear_r3_transition(candidate, old)
+    finally:
+        MODULE.RECEIPT_ROOT = original_receipt_root
+        MODULE.read_current_receipt = original_current_reader
+        MODULE.load_retained_release = original_load
+        MODULE.compatible = original_compatible
+        MODULE.R3_TRANSITION_MARKER = original_marker
+        MODULE.STATE_ROOT = original_state_root
+        MODULE.RUNTIME_ATTESTATION = original_runtime_attestation
+        MODULE.runtime_is_attested_r3 = original_attested_r3
+        MODULE.prove_partial_migration_runtime = original_prove_partial
+        MODULE.activate_candidate = original_activate
+        MODULE.read_secure = original_read
+        MODULE.os.fchown = original_fchown
+        MODULE.secure_metadata = original_secure_metadata
+
     # Docker Compose versions emit either one array or NDJSON. Both forms are
     # bounded and deterministic; malformed, mixed, duplicate, or non-object
     # records fail without echoing the raw output.
@@ -399,6 +534,89 @@ def main() -> None:
         assert "202607230056" in calls[2][-1] and "202607230058" in calls[2][-1]
         calls.clear(); MODULE.prove_live_runtime(prior, False)
         assert calls[1][-4:] == ["test", "!", "-e", "/usr/local/bin/dtx-identity-provision"]
+    finally:
+        MODULE.subprocess.run = original_run
+
+    # r3 uses explicit proof modes and authenticates the full SQLx shape. The
+    # original and migrated-old modes require an absent provision binary;
+    # candidate-ready requires it executable and the exact 58-row state.
+    original_run = MODULE.subprocess.run
+    try:
+        class R3Result:
+            def __init__(self, stdout: bytes) -> None: self.stdout = stdout
+
+        def exercise_r3(mode, migration_output: bytes, image: str | None = None, binary_present: bool = False):
+            calls: list[list[str]] = []
+            records = [
+                {"Service": name, "Image": image or request["server_image"]}
+                for name in ("dtx-node", "realtime-gateway", "agent-control")
+            ]
+            output = json.dumps(records, separators=(",", ":")).encode()
+
+            def run(command: list[str], **_kwargs: object) -> R3Result:
+                calls.append(command)
+                if command[-2:] == ["--format", "json"]:
+                    return R3Result(output)
+                if command[:2] == ["docker", "run"] and binary_present:
+                    raise subprocess.CalledProcessError(1, command)
+                if command[-3:] == ["test", "-x", "/usr/local/bin/dtx-identity-provision"] and not binary_present:
+                    raise subprocess.CalledProcessError(1, command)
+                return R3Result(migration_output)
+
+            MODULE.subprocess.run = run
+            MODULE.prove_live_runtime(request, mode)
+            return calls
+
+        for mode, output, present in (
+            (MODULE.ProofMode.ORIGINAL, b"55|55|0|0\n", False),
+            (MODULE.ProofMode.MIGRATED_OLD, b"58|58|3|3\n", False),
+            (MODULE.ProofMode.CANDIDATE_READY, b"58|58|3|3\n", True),
+        ):
+            calls = exercise_r3(mode, output, binary_present=present)
+            if present:
+                assert calls[1][-3:] == ["test", "-x", "/usr/local/bin/dtx-identity-provision"]
+            else:
+                assert calls[1] == [
+                    "docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
+                    "--entrypoint", "/usr/bin/test", request["server_image"], "!", "-e",
+                    "/usr/local/bin/dtx-identity-provision",
+                ]
+        for invalid in (b"54|54|0|0\n", b"56|55|0|0\n", b"58|58|2|2\n", b"58|58|3|2\n", b"59|59|3|3\n"):
+            try:
+                exercise_r3(MODULE.ProofMode.MIGRATED_OLD, invalid)
+            except MODULE.ContractError:
+                pass
+            else:
+                raise AssertionError(f"invalid r3 migration shape was accepted: {invalid!r}")
+        try:
+            exercise_r3(MODULE.ProofMode.MIGRATED_OLD, b"58|58|3|3\n", image="dirextalk/vnet-server@sha256:" + "f" * 64)
+        except MODULE.ContractError:
+            pass
+        else:
+            raise AssertionError("r3 image drift was accepted")
+        try:
+            exercise_r3(MODULE.ProofMode.MIGRATED_OLD, b"58|58|3|3\n", binary_present=True)
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            raise AssertionError("r3 provision binary presence was accepted")
+        for malformed in (b"", b"{}", b'{"schema":"unexpected"}\n'):
+            try:
+                MODULE.validate_runtime_attestation(malformed, receipt)
+            except MODULE.ContractError:
+                pass
+            else:
+                raise AssertionError("malformed r3 attestation was accepted")
+        original_read_attestation = MODULE.read_secure
+        MODULE.read_secure = lambda *_args: (_ for _ in ()).throw(MODULE.ContractError("missing"))
+        try:
+            MODULE.runtime_is_attested_r3(Path("/missing"), request, receipt)
+        except MODULE.ContractError:
+            pass
+        else:
+            raise AssertionError("missing r3 attestation was accepted")
+        finally:
+            MODULE.read_secure = original_read_attestation
     finally:
         MODULE.subprocess.run = original_run
 
