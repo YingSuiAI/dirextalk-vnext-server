@@ -14,7 +14,7 @@ use crate::{
     types::receipt_hash,
 };
 
-/// Maximum identity-owned delivery entries returned by one V2 pull.
+/// Maximum identity-owned delivery entries returned by one V3 pull.
 pub const MAX_IDENTITY_PULL_ENTRIES: u16 = 100;
 const V2_ACK_REQUEST_HASH_DOMAIN: &[u8] = b"dirextalk.identity-mailbox-ack.v2\0";
 const HISTORY_AUTHORITY_ID_DOMAIN: &[u8] = b"dirextalk.device-history-authority-id.v1\0";
@@ -36,7 +36,7 @@ pub enum IdentityDeliverySegment {
     TerminalRange { first: SafeUint, last: SafeUint },
 }
 
-/// Authenticated V2 pull request. A device cannot select another identity.
+/// Authenticated V3 pull request. A device cannot select another identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IdentityMailboxPullRequest {
     after_sequence: SafeUint,
@@ -233,86 +233,6 @@ impl crate::MailboxRepository {
                 safe_sequence(highwater)?,
                 safe_sequence(resumable_floor)?,
                 &segments,
-            )?;
-            Ok(MailboxOperationOutcome::new(receipt, false))
-        }
-        .await;
-        finish_transaction(session, result).await
-    }
-
-    /// Pulls every eligible identity-owned envelope in account delivery order.
-    ///
-    /// The current device session selects both identity and device. A secondary
-    /// device must already have a non-revoked history grant; the immutable first
-    /// identity device is enrolled lazily at sequence one. Pull never consumes
-    /// payload.
-    ///
-    /// # Errors
-    ///
-    /// Rejects invalid/revoked sessions, unauthorized device history access,
-    /// corrupt durable data, and storage failures.
-    pub async fn pull_identity_v2(
-        self,
-        store: &MailboxPgStore,
-        credential: &DeviceSessionCredential,
-        request: IdentityMailboxPullRequest,
-        now: UtcMillis,
-    ) -> Result<MailboxOperationOutcome, MailboxPersistenceError> {
-        let mut session = store.begin().await?;
-        let result = async {
-            let authenticated = authenticate(session.connection(), credential, now).await?;
-            let earliest =
-                authorize_identity_device(session.connection(), authenticated, now).await?;
-            let requested_after = i64::try_from(request.after_sequence().get())
-                .map_err(|_| MailboxPersistenceError::InvalidCommand("identity pull cursor"))?;
-            let lower_bound = requested_after.max(earliest.saturating_sub(1));
-            let rows = sqlx::query(
-                "SELECT journal.delivery_sequence, journal.envelope_id,
-                        envelope.opaque_ciphertext, journal.expires_at_ms
-                   FROM messaging.identity_delivery_journal AS journal
-                   JOIN messaging.mailbox_envelopes AS envelope
-                     ON envelope.mailbox_id=journal.mailbox_id
-                    AND envelope.envelope_id=journal.envelope_id
-                  WHERE journal.identity_id=$1
-                    AND journal.delivery_sequence>$2
-                    AND journal.expires_at_ms>$3
-                  ORDER BY journal.delivery_sequence
-                  LIMIT $4",
-            )
-            .bind(authenticated.identity_id().to_string())
-            .bind(lower_bound)
-            .bind(now.get())
-            .bind(i64::from(request.limit()))
-            .fetch_all(&mut *session.connection())
-            .await?;
-            let mut envelopes = Vec::with_capacity(rows.len());
-            for row in rows {
-                let sequence: i64 = row.try_get("delivery_sequence")?;
-                let ciphertext: Vec<u8> = row.try_get("opaque_ciphertext")?;
-                if ciphertext.is_empty() || ciphertext.len() > MAX_OPAQUE_CIPHERTEXT_BYTES {
-                    return Err(MailboxPersistenceError::CorruptData(
-                        "identity mailbox ciphertext",
-                    ));
-                }
-                envelopes.push(IdentityPulledEnvelope {
-                    delivery_sequence: safe_sequence(sequence)?,
-                    envelope_id: parse_envelope_id(row.try_get("envelope_id")?)?,
-                    opaque_ciphertext: ciphertext,
-                    expires_at: parse_time(row.try_get("expires_at_ms")?)?,
-                });
-            }
-            let highwater: i64 = sqlx::query_scalar(
-                "SELECT next_sequence FROM messaging.identity_delivery_heads WHERE identity_id=$1",
-            )
-            .bind(authenticated.identity_id().to_string())
-            .fetch_optional(&mut *session.connection())
-            .await?
-            .unwrap_or(0);
-            let receipt = encode_pull_receipt(
-                authenticated.identity_id(),
-                authenticated.device_id(),
-                safe_sequence(highwater)?,
-                &envelopes,
             )?;
             Ok(MailboxOperationOutcome::new(receipt, false))
         }
@@ -751,54 +671,6 @@ fn map_identity_authorization_error(error: IdentityPersistenceError) -> MailboxP
         }
         _ => MailboxPersistenceError::IdentityAuthorizationUnavailable,
     }
-}
-
-fn encode_pull_receipt(
-    identity_id: IdentityId,
-    device_id: DeviceId,
-    highwater: SafeUint,
-    envelopes: &[IdentityPulledEnvelope],
-) -> Result<Vec<u8>, MailboxPersistenceError> {
-    let items = envelopes
-        .iter()
-        .map(|entry| {
-            CanonicalValue::Map(vec![
-                (
-                    CanonicalValue::Unsigned(1),
-                    CanonicalValue::Unsigned(entry.delivery_sequence.get()),
-                ),
-                (
-                    CanonicalValue::Unsigned(2),
-                    CanonicalValue::Text(entry.envelope_id.to_string()),
-                ),
-                (
-                    CanonicalValue::Unsigned(3),
-                    CanonicalValue::Bytes(entry.opaque_ciphertext.clone()),
-                ),
-                (
-                    CanonicalValue::Unsigned(4),
-                    entry.expires_at.to_canonical_value(),
-                ),
-            ])
-        })
-        .collect();
-    encode_deterministic_cbor(&CanonicalValue::Map(vec![
-        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
-        (
-            CanonicalValue::Unsigned(2),
-            CanonicalValue::Text(identity_id.to_string()),
-        ),
-        (
-            CanonicalValue::Unsigned(3),
-            CanonicalValue::Text(device_id.to_string()),
-        ),
-        (
-            CanonicalValue::Unsigned(4),
-            CanonicalValue::Unsigned(highwater.get()),
-        ),
-        (CanonicalValue::Unsigned(5), CanonicalValue::Array(items)),
-    ]))
-    .map_err(|_| MailboxPersistenceError::CorruptData("identity pull receipt"))
 }
 
 fn encode_ack_receipt(

@@ -45,14 +45,14 @@ use dtx_mailbox_node::{
     DEVICE_HISTORY_GRANT_V1_PATH, DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
     DEVICE_HISTORY_GRANT_V2_PATH, DEVICE_SESSION_AUTHORIZATION_SCHEME,
     IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE, IDENTITY_MAILBOX_ACK_V2_PATH,
-    IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE, IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
-    IDENTITY_MAILBOX_PULL_V2_PATH, IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE, MAILBOX_ACK_CONTENT_TYPE,
-    MAILBOX_ACK_PATH_TEMPLATE, MAILBOX_ACK_RECEIPT_CONTENT_TYPE,
-    MAILBOX_CAPABILITY_AUTHORIZATION_SCHEME, MAILBOX_ENQUEUE_PATH_TEMPLATE,
-    MAILBOX_ENVELOPE_CONTENT_TYPE, MAILBOX_ENVELOPE_RECEIPT_CONTENT_TYPE,
-    MAILBOX_PULL_CONTENT_TYPE, MAILBOX_PULL_PATH_TEMPLATE, MAILBOX_PULL_RECEIPT_CONTENT_TYPE,
-    MAILBOX_REGISTER_CONTENT_TYPE, MAILBOX_REGISTER_PATH_TEMPLATE,
-    MAILBOX_REGISTER_RECEIPT_CONTENT_TYPE, MailboxNodeState, mailbox_router_with_state,
+    IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE, IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+    IDENTITY_MAILBOX_PULL_V3_PATH, MAILBOX_ACK_CONTENT_TYPE, MAILBOX_ACK_PATH_TEMPLATE,
+    MAILBOX_ACK_RECEIPT_CONTENT_TYPE, MAILBOX_CAPABILITY_AUTHORIZATION_SCHEME,
+    MAILBOX_ENQUEUE_PATH_TEMPLATE, MAILBOX_ENVELOPE_CONTENT_TYPE,
+    MAILBOX_ENVELOPE_RECEIPT_CONTENT_TYPE, MAILBOX_PULL_CONTENT_TYPE, MAILBOX_PULL_PATH_TEMPLATE,
+    MAILBOX_PULL_RECEIPT_CONTENT_TYPE, MAILBOX_REGISTER_CONTENT_TYPE,
+    MAILBOX_REGISTER_PATH_TEMPLATE, MAILBOX_REGISTER_RECEIPT_CONTENT_TYPE, MailboxNodeState,
+    mailbox_router_with_state,
 };
 use dtx_realtime_sync::{
     HEARTBEAT_INTERVAL_MILLIS, InvalidationKind, LEASE_TTL_MILLIS, OUTBOX_CLAIM_TTL_MILLIS,
@@ -371,7 +371,8 @@ async fn opaque_mailbox_is_replay_safe_non_consuming_and_owner_revocation_safe()
     clippy::too_many_lines,
     reason = "one boundary test keeps signed history authorization, two-device pull/ACK isolation, revocation, and ciphertext retention coherent"
 )]
-async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(), Box<dyn Error>> {
+async fn identity_mailbox_v3_pull_and_v2_ack_is_isolated_per_authorized_device()
+-> Result<(), Box<dyn Error>> {
     let harness = support::PostgresHarness::start().await?;
     let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
     let mailbox_store = MailboxPgStore::connect(harness.mailbox_runtime_options(), 4).await?;
@@ -432,15 +433,15 @@ async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(
         StatusCode::CREATED,
     );
     let pull_body = encode_deterministic_cbor(&CanonicalValue::Map(vec![
-        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
         (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
         (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
     ]))?;
     assert_eq!(
         send_v2(
             app.clone(),
-            IDENTITY_MAILBOX_PULL_V2_PATH,
-            IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
+            "/v2/mailbox/pull",
+            "application/vnd.dirextalk.identity-mailbox-pull.v2+cbor",
             None,
             second.session_id,
             second.session_secret,
@@ -558,8 +559,8 @@ async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(
     for device in [&owner, &second] {
         let pulled = send_v2(
             app.clone(),
-            IDENTITY_MAILBOX_PULL_V2_PATH,
-            IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
+            IDENTITY_MAILBOX_PULL_V3_PATH,
+            IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
             None,
             device.session_id,
             device.session_secret,
@@ -569,7 +570,7 @@ async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(
         assert_eq!(pulled.status(), StatusCode::OK);
         let decoded = decode_deterministic_cbor(&response_bytes(pulled).await?)?;
         let CanonicalValue::Map(fields) = decoded else {
-            return Err("V2 pull receipt not a map".into());
+            return Err("V3 pull receipt not a map".into());
         };
         assert!(matches!(&fields[4].1, CanonicalValue::Array(entries) if entries.len()==1));
     }
@@ -594,8 +595,8 @@ async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(
     );
     let second_after_owner_ack = send_v2(
         app.clone(),
-        IDENTITY_MAILBOX_PULL_V2_PATH,
-        IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         second.session_id,
         second.session_secret,
@@ -605,7 +606,7 @@ async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(
     let CanonicalValue::Map(fields) =
         decode_deterministic_cbor(&response_bytes(second_after_owner_ack).await?)?
     else {
-        return Err("second V2 pull receipt not a map".into());
+        return Err("second V3 pull receipt not a map".into());
     };
     assert!(matches!(&fields[4].1, CanonicalValue::Array(entries) if entries.len()==1));
     assert_eq!(
@@ -639,8 +640,8 @@ async fn identity_mailbox_v2_ack_is_isolated_per_authorized_device() -> Result<(
     assert_eq!(
         send_v2(
             app.clone(),
-            IDENTITY_MAILBOX_PULL_V2_PATH,
-            IDENTITY_MAILBOX_PULL_V2_CONTENT_TYPE,
+            IDENTITY_MAILBOX_PULL_V3_PATH,
+            IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
             None,
             second.session_id,
             second.session_secret,
@@ -744,7 +745,7 @@ async fn identity_mailbox_v3_advances_two_devices_across_expired_delivery_gaps()
     .await?;
     let captured = send_v2(
         write_app.clone(),
-        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
         IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         owner.session_id,
@@ -816,7 +817,7 @@ async fn identity_mailbox_v3_advances_two_devices_across_expired_delivery_gaps()
     for (index, device) in [&owner, &second].into_iter().enumerate() {
         let response = send_v2(
             resume_app.clone(),
-            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V3_PATH,
             IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
             None,
             device.session_id,
@@ -1077,7 +1078,7 @@ async fn retained_mailbox_quota_and_replay_metadata_are_horizon_bounded()
     assert_eq!(
         send_v2(
             replay_app.clone(),
-            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V3_PATH,
             IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
             None,
             replay_owner.session_id,
@@ -1235,7 +1236,7 @@ async fn retained_mailbox_quota_and_replay_metadata_are_horizon_bounded()
         assert_eq!(
             send_v2(
                 gc_app.clone(),
-                IDENTITY_MAILBOX_PULL_V2_PATH,
+                IDENTITY_MAILBOX_PULL_V3_PATH,
                 IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
                 None,
                 gc_owner.session_id,
@@ -1491,7 +1492,7 @@ async fn expired_delivery_compaction_is_bounded_and_concurrent_append_safe()
             mailbox_store,
             Arc::new(FixedClock(race_now + 4)),
         )),
-        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
         IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         owner.session_id,
@@ -1928,7 +1929,7 @@ async fn history_grants_accept_current_root_or_recovery_and_reject_stale_or_wron
         assert_eq!(
             send_v2(
                 app.clone(),
-                IDENTITY_MAILBOX_PULL_V2_PATH,
+                IDENTITY_MAILBOX_PULL_V3_PATH,
                 IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
                 None,
                 target.session_id,
@@ -2055,7 +2056,7 @@ async fn history_grants_accept_current_root_or_recovery_and_reject_stale_or_wron
         .head();
     let root_after_rotation = send_v2(
         app.clone(),
-        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
         IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         root_target.session_id,
@@ -2087,7 +2088,7 @@ async fn history_grants_accept_current_root_or_recovery_and_reject_stale_or_wron
     );
     let recovery_still_current = send_v2(
         app.clone(),
-        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
         IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         recovery_target.session_id,
@@ -2154,7 +2155,7 @@ async fn history_grants_accept_current_root_or_recovery_and_reject_stale_or_wron
     ));
     let recovery_after_rotation = send_v2(
         app.clone(),
-        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
         IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         recovery_target.session_id,
@@ -2313,7 +2314,7 @@ async fn history_recovery_v2_offer_is_exact_current_and_device_ack_is_independen
     assert_eq!(
         send_v2(
             app.clone(),
-            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V3_PATH,
             IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
             None,
             recovered.active.session_id,
@@ -2719,7 +2720,7 @@ async fn history_recovery_v2_offer_is_exact_current_and_device_ack_is_independen
 
     let candidate_pull = send_v2(
         app.clone(),
-        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
         IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         recovered.active.session_id,
@@ -2742,7 +2743,7 @@ async fn history_recovery_v2_offer_is_exact_current_and_device_ack_is_independen
 
     let owner_pull = send_v2(
         app.clone(),
-        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
         IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         owner.session_id,
@@ -2779,7 +2780,7 @@ async fn history_recovery_v2_offer_is_exact_current_and_device_ack_is_independen
     );
     let candidate_after_owner_ack = send_v2(
         app.clone(),
-        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
         IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         recovered.active.session_id,
@@ -2856,7 +2857,7 @@ async fn history_recovery_v2_offer_is_exact_current_and_device_ack_is_independen
     assert_eq!(
         send_v2(
             cancelled_app,
-            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V3_PATH,
             IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
             None,
             recovered.active.session_id,
@@ -2882,7 +2883,7 @@ async fn history_recovery_v2_offer_is_exact_current_and_device_ack_is_independen
     ));
     let restored_pull = send_v2(
         restored_app,
-        IDENTITY_MAILBOX_PULL_V2_PATH,
+        IDENTITY_MAILBOX_PULL_V3_PATH,
         IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
         None,
         recovered.active.session_id,
@@ -2935,7 +2936,7 @@ async fn history_recovery_v2_offer_is_exact_current_and_device_ack_is_independen
                 mailbox_store,
                 Arc::new(FixedClock(GRANT_NOW + 11)),
             )),
-            IDENTITY_MAILBOX_PULL_V2_PATH,
+            IDENTITY_MAILBOX_PULL_V3_PATH,
             IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
             None,
             recovered.active.session_id,
