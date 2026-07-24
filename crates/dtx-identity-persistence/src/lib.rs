@@ -21,7 +21,7 @@ pub use client_binding::{
 };
 pub use device_enrollment::{
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
-    DEVICE_ENROLLMENT_APPROVAL_IDEMPOTENCY_HASH_DOMAIN,
+    CreateHistoryRecoveryRequestV4Command, DEVICE_ENROLLMENT_APPROVAL_IDEMPOTENCY_HASH_DOMAIN,
     DEVICE_ENROLLMENT_APPROVAL_REQUEST_HASH_DOMAIN, DEVICE_ENROLLMENT_APPROVAL_RETENTION_MILLIS,
     DEVICE_ENROLLMENT_CAPABILITY_HASH_DOMAIN, DEVICE_ENROLLMENT_CHALLENGE_TTL_MILLIS,
     DEVICE_ENROLLMENT_CREATE_REQUEST_HASH_DOMAIN, DEVICE_ENROLLMENT_EVENT_HASH_DOMAIN,
@@ -29,6 +29,7 @@ pub use device_enrollment::{
     DeviceEnrollmentChallengeOutcome, DeviceEnrollmentChallengeState,
     DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository,
     HISTORY_RECOVERY_REQUEST_HASH_DOMAIN, HISTORY_RECOVERY_REQUEST_SIGNATURE_DOMAIN,
+    HISTORY_RECOVERY_REQUEST_V4_DIGEST_DOMAIN, HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN,
     history_recovery_request_signature_input, history_recovery_request_unsigned_canonical_bytes,
 };
 pub use device_session::{

@@ -26,9 +26,9 @@ pub const CATALOG_HEAD_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-head-signature.v1\0";
 pub const CATALOG_HEAD_DIGEST_DOMAIN: &[u8] = b"dirextalk.recovery-scope-catalog-head-digest.v1\0";
 pub const PREPARATION_SIGNATURE_DOMAIN: &[u8] =
-    b"dirextalk.recovery-scope-catalog-preparation-signature.v1\0";
+    b"dirextalk.recovery-scope-catalog-handoff-preparation-signature.v2\0";
 pub const PREPARATION_DIGEST_DOMAIN: &[u8] =
-    b"dirextalk.recovery-scope-catalog-preparation-digest.v1\0";
+    b"dirextalk.recovery-scope-catalog-handoff-preparation-digest.v2\0";
 pub const RESPONSE_CAPABILITY_HASH_DOMAIN: &[u8] = b"dirextalk.recovery-response-capability.v1\0";
 pub const RECIPIENT_KEY_HASH_DOMAIN: &[u8] = b"dirextalk.recovery-recipient-key.v1\0";
 pub const CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN: &[u8] =
@@ -268,35 +268,33 @@ impl CatalogPreparationCommand {
             MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES,
         )
         .map_err(|_| IdentityPersistenceError::RecoveryExactCborInvalid)?;
-        let fields = numbered_fields(&value, 13)?;
-        require_version(fields[0])?;
+        let version = match &value { CanonicalValue::Map(fields) if !fields.is_empty() => &fields[0].1, _ => return Err(invalid("catalog preparation version")) };
+        let v2 = version == &CanonicalValue::Unsigned(2);
+        let fields = numbered_fields(&value, if v2 { 17 } else { 13 })?;
+        if !v2 { require_version(fields[0])?; }
         let request_id = parse_challenge(fields[1])?;
         let identity_id = parse_identity(fields[2])?;
-        let candidate_device_id = parse_device(fields[3])?;
-        let candidate_signing_key = SigningPublicKey::try_from(parse_fixed::<32>(fields[4])?)
+        let candidate_device_id = parse_device(if v2 { fields[3] } else { fields[3] })?;
+        let candidate_signing_key = SigningPublicKey::try_from(parse_fixed::<32>(if v2 { fields[7] } else { fields[4] })?)
             .map_err(|_| invalid("candidate signing key"))?;
         let candidate_recipient_key =
-            DeviceEncryptionPublicKey::try_from(parse_fixed::<32>(fields[5])?)
+            DeviceEncryptionPublicKey::try_from(parse_fixed::<32>(if v2 { fields[8] } else { fields[5] })?)
                 .map_err(|_| invalid("candidate recipient key"))?;
-        let observed_head = IdentityLogHead::observed(
-            identity_id,
-            parse_safe_uint(fields[6])?,
-            parse_digest(fields[7])?,
-        )?;
-        let candidate_nonce = parse_fixed::<32>(fields[8])?;
-        let issued_at = parse_utc(fields[9])?;
-        let expires_at = parse_utc(fields[10])?;
-        let response_capability_hash = parse_digest(fields[11])?;
+        let observed_head = IdentityLogHead::observed(identity_id, parse_safe_uint(if v2 { fields[9] } else { fields[6] })?, parse_digest(if v2 { fields[10] } else { fields[7] })?)?;
+        let candidate_nonce = parse_fixed::<32>(if v2 { fields[11] } else { fields[8] })?;
+        let issued_at = parse_utc(if v2 { fields[14] } else { fields[9] })?;
+        let expires_at = parse_utc(if v2 { fields[15] } else { fields[10] })?;
+        let response_capability_hash = parse_digest(if v2 { fields[12] } else { fields[11] })?;
         if candidate_nonce.iter().all(|byte| *byte == 0) || issued_at >= expires_at {
             return Err(invalid("catalog preparation binding"));
         }
         if response_capability_hash != response_capability.digest() {
             return Err(IdentityPersistenceError::RecoveryResponseCapabilityRejected);
         }
-        let candidate_signature = parse_signature(fields[12])?;
+        let candidate_signature = parse_signature(if v2 { fields[16] } else { fields[12] })?;
         let unsigned = CanonicalValue::Map(
             (1_u64..)
-                .zip(fields.iter().take(12))
+                .zip(fields.iter().take(if v2 { 16 } else { 12 }))
                 .map(|(key, value)| (CanonicalValue::Unsigned(key), (*value).clone()))
                 .collect(),
         );
@@ -380,26 +378,23 @@ impl CatalogProviderResponseCommand {
             MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES,
         )
         .map_err(|_| IdentityPersistenceError::RecoveryExactCborInvalid)?;
-        let fields = numbered_fields(&value, 11)?;
-        require_version(fields[0])?;
+        let version = match &value { CanonicalValue::Map(fields) if !fields.is_empty() => &fields[0].1, _ => return Err(invalid("provider response version")) };
+        let v2 = version == &CanonicalValue::Unsigned(2);
+        let fields = numbered_fields(&value, if v2 { 26 } else { 11 })?;
+        if !v2 { require_version(fields[0])?; }
         let request_id = parse_challenge(fields[1])?;
         if request_id != route_request_id {
             return Err(invalid("provider response request ID"));
         }
-        let provider_signing_key = SigningPublicKey::try_from(parse_fixed::<32>(fields[4])?)
+        let provider_signing_key = SigningPublicKey::try_from(parse_fixed::<32>(if v2 { match fields[14] { CanonicalValue::Map(inner) => inner.iter().find(|(k,_)| k == &CanonicalValue::Unsigned(3)).map(|(_,v)| v).ok_or_else(|| invalid("provider descriptor"))?, _ => return Err(invalid("provider descriptor")) } } else { fields[4] })?)
             .map_err(|_| invalid("provider signing key"))?;
-        let ciphertext =
-            parse_bounded_bytes(fields[7], MAX_RECOVERY_SCOPE_CATALOG_CIPHERTEXT_BYTES)?;
-        let ciphertext_digest = parse_digest(fields[8])?;
-        if Sha256Digest::hash_domain(PROVIDER_CIPHERTEXT_HASH_DOMAIN, &ciphertext)
-            != ciphertext_digest
-        {
-            return Err(invalid("provider ciphertext digest"));
-        }
-        let signature = parse_signature(fields[10])?;
+        let ciphertext = if v2 { Vec::new() } else { parse_bounded_bytes(fields[7], MAX_RECOVERY_SCOPE_CATALOG_CIPHERTEXT_BYTES)? };
+        let ciphertext_digest = parse_digest(if v2 { fields[18] } else { fields[8] })?;
+        if !v2 && Sha256Digest::hash_domain(PROVIDER_CIPHERTEXT_HASH_DOMAIN, &ciphertext) != ciphertext_digest { return Err(invalid("provider ciphertext digest")); }
+        let signature = parse_signature(if v2 { fields[22] } else { fields[10] })?;
         let unsigned = CanonicalValue::Map(
             (1_u64..)
-                .zip(fields.iter().take(10))
+                .zip(fields.iter().take(if v2 { 22 } else { 10 }))
                 .map(|(key, value)| (CanonicalValue::Unsigned(key), (*value).clone()))
                 .collect(),
         );
@@ -412,13 +407,13 @@ impl CatalogProviderResponseCommand {
         Ok(Self {
             idempotency_key_hash,
             request_id,
-            catalog_head_digest: parse_digest(fields[2])?,
-            provider_device_id: parse_device(fields[3])?,
+            catalog_head_digest: parse_digest(if v2 { fields[6] } else { fields[2] })?,
+            provider_device_id: parse_device(if v2 { match fields[14] { CanonicalValue::Map(inner) => inner.iter().find(|(k,_)| k == &CanonicalValue::Unsigned(2)).map(|(_,v)| v).ok_or_else(|| invalid("provider descriptor"))?, _ => return Err(invalid("provider descriptor")) } } else { fields[3] })?,
             provider_signing_key,
-            current_authority_digest: parse_digest(fields[5])?,
-            recipient_key_digest: parse_digest(fields[6])?,
+            current_authority_digest: parse_digest(if v2 { fields[15] } else { fields[5] })?,
+            recipient_key_digest: parse_digest(if v2 { fields[8] } else { fields[6] })?,
             ciphertext_digest,
-            expires_at: parse_utc(fields[9])?,
+            expires_at: parse_utc(if v2 { fields[21] } else { fields[9] })?,
             signature,
             digest: Sha256Digest::hash_domain(PROVIDER_RESPONSE_DIGEST_DOMAIN, &exact_bytes),
             exact_bytes,

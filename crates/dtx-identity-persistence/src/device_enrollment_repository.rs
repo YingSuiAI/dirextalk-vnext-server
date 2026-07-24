@@ -1,4 +1,56 @@
 impl DeviceEnrollmentRepository {
+    /// Admits one immutable catalog-exhaustive History Recovery Request V4.
+    pub async fn create_history_recovery_request_v4(
+        self,
+        store: &IdentityPgStore,
+        command: CreateHistoryRecoveryRequestV4Command,
+        now: UtcMillis,
+    ) -> Result<(bool, Vec<u8>), IdentityPersistenceError> {
+        if now < command.issued_at || now >= command.expires_at {
+            return Err(IdentityPersistenceError::DeviceEnrollmentChallengeExpired);
+        }
+        let mut tx = store.begin().await?;
+        let result = async {
+            if let Some(row) = sqlx::query("SELECT request_digest,request_bytes,receipt_bytes FROM identity.history_recovery_requests WHERE request_id=$1 FOR UPDATE")
+                .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await? {
+                let digest: Vec<u8> = row.try_get("request_digest")?;
+                let bytes: Vec<u8> = row.try_get("request_bytes")?;
+                if digest.as_slice() == command.request_digest.as_bytes() && bytes == command.exact_request_bytes {
+                    return Ok((false, row.try_get("receipt_bytes")?));
+                }
+                return Err(IdentityPersistenceError::IdempotencyConflict);
+            }
+            let prep = sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,provider_response_bytes,enrollment_capability_hash FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR UPDATE")
+                .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?
+                .ok_or(IdentityPersistenceError::RecoveryPreparationRevoked)?;
+            let identity: String = prep.try_get("identity_id")?;
+            if identity != command.identity_id.to_string() || prep.try_get::<uuid::Uuid,_>("candidate_device_id")? != *command.target_device_id.as_uuid()
+                || prep.try_get::<Vec<u8>,_>("candidate_signing_key")?.as_slice() != command.target_device_signing_key.as_bytes()
+                || prep.try_get::<Vec<u8>,_>("candidate_recipient_key")?.as_slice() != command.recipient_encryption_key.as_bytes()
+                || prep.try_get::<i64,_>("observed_head_sequence")? != i64::try_from(command.pre_head_sequence.get()).unwrap_or(i64::MAX)
+                || prep.try_get::<Vec<u8>,_>("observed_head_hash")?.as_slice() != command.pre_head_hash.as_bytes()
+                || prep.try_get::<Option<Vec<u8>>,_>("provider_response_bytes")?.is_none()
+                || prep.try_get::<Vec<u8>,_>("enrollment_capability_hash")?.as_slice() != command.enrollment_capability_digest.as_bytes()
+            { return Err(IdentityPersistenceError::RecoveryPreparationInvalidated); }
+            let head = sqlx::query("SELECT head_sequence,head_hash FROM identity.log_heads WHERE identity_id=$1 FOR UPDATE")
+                .bind(command.identity_id.to_string()).fetch_one(&mut *tx.connection()).await?;
+            if head.try_get::<i64,_>("head_sequence")? != i64::try_from(command.post_head_sequence.get()).unwrap_or(i64::MAX)
+                || head.try_get::<Vec<u8>,_>("head_hash")?.as_slice() != command.post_head_hash.as_bytes()
+            { return Err(IdentityPersistenceError::HeadConflict { current: None }); }
+            let receipt = encode_v4_request_receipt(command.request_id, command.request_digest, command.response_capability_digest, now)?;
+            sqlx::query("INSERT INTO identity.history_recovery_requests(request_id,identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_bytes,device_add_digest,preparation_bytes,preparation_digest,manifest_bytes,manifest_digest,issued_at_ms,expires_at_ms,response_capability_digest,idempotency_digest,candidate_signature,request_bytes,request_digest,receipt_bytes,accepted_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)")
+                .bind(*command.request_id.as_uuid()).bind(command.identity_id.to_string()).bind(*command.target_device_id.as_uuid())
+                .bind(command.target_device_signing_key.as_bytes().as_slice()).bind(command.recipient_encryption_key.as_bytes().as_slice())
+                .bind(i64::try_from(command.pre_head_sequence.get()).map_err(|_| IdentityPersistenceError::InvalidCommand("pre head"))?).bind(command.pre_head_hash.as_bytes().as_slice())
+                .bind(i64::try_from(command.post_head_sequence.get()).map_err(|_| IdentityPersistenceError::InvalidCommand("post head"))?).bind(command.post_head_hash.as_bytes().as_slice())
+                .bind(&command.device_add_bytes).bind(command.device_add_digest.as_bytes().as_slice()).bind(&command.preparation_bytes).bind(command.preparation_digest.as_bytes().as_slice())
+                .bind(&command.manifest_bytes).bind(command.manifest_digest.as_bytes().as_slice()).bind(command.issued_at.get()).bind(command.expires_at.get())
+                .bind(command.response_capability_digest.as_bytes().as_slice()).bind(command.idempotency_digest.as_bytes().as_slice()).bind(command.candidate_signature.as_bytes().as_slice())
+                .bind(&command.exact_request_bytes).bind(command.request_digest.as_bytes().as_slice()).bind(&receipt).bind(now.get()).execute(&mut *tx.connection()).await?;
+            Ok((true, receipt))
+        }.await;
+        match result { Ok(value) => { tx.commit().await?; Ok(value) }, Err(error) => { let _ = tx.rollback().await; Err(error) } }
+    }
     /// Persists one exact candidate-signed V2 history-recovery request.
     ///
     /// The candidate chooses the request UUID and observed identity head. The
@@ -436,6 +488,22 @@ impl DeviceEnrollmentRepository {
             }
         }
     }
+}
+
+fn encode_v4_request_receipt(
+    request_id: DeviceEnrollmentChallengeId,
+    request_digest: Sha256Digest,
+    response_capability_digest: Sha256Digest,
+    accepted_at: UtcMillis,
+) -> Result<Vec<u8>, IdentityPersistenceError> {
+    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(4)),
+        (CanonicalValue::Unsigned(2), CanonicalValue::Text(request_id.to_string())),
+        (CanonicalValue::Unsigned(3), request_digest.to_canonical_value()),
+        (CanonicalValue::Unsigned(4), response_capability_digest.to_canonical_value()),
+        (CanonicalValue::Unsigned(5), accepted_at.to_canonical_value()),
+    ]))
+    .map_err(|_| IdentityPersistenceError::InvalidCommand("history recovery request receipt"))
 }
 
 #[derive(Clone, Copy)]

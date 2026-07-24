@@ -47,6 +47,10 @@ pub const HISTORY_RECOVERY_REQUEST_SIGNATURE_DOMAIN: &[u8] =
 /// Domain separator for the exact candidate-signed history-recovery request.
 pub const HISTORY_RECOVERY_REQUEST_HASH_DOMAIN: &[u8] =
     b"dirextalk.history-recovery-request-digest.v1\0";
+pub const HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.history-recovery.request-signature.v4\0";
+pub const HISTORY_RECOVERY_REQUEST_V4_DIGEST_DOMAIN: &[u8] =
+    b"dirextalk.history-recovery.request.v4\0";
 
 const OPEN_CHALLENGE_STATE: &str = "open";
 const APPROVED_CHALLENGE_STATE: &str = "approved";
@@ -239,6 +243,34 @@ pub struct CreateHistoryRecoveryRequestCommand {
     capability: DeviceEnrollmentCapability,
     candidate_signature: Ed25519Signature,
     exact_request_bytes: Vec<u8>,
+}
+
+/// V4 request admission payload. Raw capability/idempotency values are never
+/// carried here; callers provide only their domain-separated digests.
+pub struct CreateHistoryRecoveryRequestV4Command {
+    pub enrollment_capability_digest: Sha256Digest,
+    pub idempotency_digest: Sha256Digest,
+    pub response_capability_digest: Sha256Digest,
+    pub request_id: DeviceEnrollmentChallengeId,
+    pub identity_id: IdentityId,
+    pub target_device_id: DeviceId,
+    pub target_device_signing_key: SigningPublicKey,
+    pub recipient_encryption_key: DeviceEncryptionPublicKey,
+    pub pre_head_sequence: SafeUint,
+    pub pre_head_hash: Sha256Digest,
+    pub post_head_sequence: SafeUint,
+    pub post_head_hash: Sha256Digest,
+    pub device_add_bytes: Vec<u8>,
+    pub device_add_digest: Sha256Digest,
+    pub preparation_bytes: Vec<u8>,
+    pub preparation_digest: Sha256Digest,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_digest: Sha256Digest,
+    pub issued_at: UtcMillis,
+    pub expires_at: UtcMillis,
+    pub candidate_signature: Ed25519Signature,
+    pub exact_request_bytes: Vec<u8>,
+    pub request_digest: Sha256Digest,
 }
 
 impl fmt::Debug for CreateHistoryRecoveryRequestCommand {

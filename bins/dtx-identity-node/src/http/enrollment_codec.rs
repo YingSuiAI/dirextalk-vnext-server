@@ -7,6 +7,10 @@ use super::{
     Sha256Digest, SigningPublicKey, UtcMillis, Zeroize, decode_deterministic_cbor,
     encode_deterministic_cbor, header, is_base64url_byte, to_bytes,
 };
+use dtx_identity_persistence::{
+    HISTORY_RECOVERY_REQUEST_V4_DIGEST_DOMAIN, HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN,
+};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 pub(crate) async fn parse_json_body<T>(body: Body) -> Result<T, DeviceSessionFailure>
 where
@@ -57,6 +61,184 @@ pub(crate) struct HistoryRecoveryCandidateRequest {
     pub(crate) candidate_signature: Ed25519Signature,
     pub(crate) capability: DeviceEnrollmentCapability,
     pub(crate) exact_signed_request: Vec<u8>,
+}
+
+/// Exact candidate-signed History Recovery Request V4.  Nested catalog and
+/// DeviceAdd objects remain opaque bytes after structural validation; their
+/// owning validators consume the same bytes at the catalog boundary.
+pub(crate) struct HistoryRecoveryRequestV4 {
+    pub(crate) request_id: DeviceEnrollmentChallengeId,
+    pub(crate) identity_id: IdentityId,
+    pub(crate) target_device_id: DeviceId,
+    pub(crate) target_device_signing_key: SigningPublicKey,
+    pub(crate) recipient_encryption_key: DeviceEncryptionPublicKey,
+    pub(crate) pre_head_sequence: SafeUint,
+    pub(crate) pre_head_hash: Sha256Digest,
+    pub(crate) post_head_sequence: SafeUint,
+    pub(crate) post_head_hash: Sha256Digest,
+    pub(crate) device_add_bytes: Vec<u8>,
+    pub(crate) device_add_digest: Sha256Digest,
+    pub(crate) preparation_bytes: Vec<u8>,
+    pub(crate) preparation_digest: Sha256Digest,
+    pub(crate) manifest_bytes: Vec<u8>,
+    pub(crate) manifest_digest: Sha256Digest,
+    pub(crate) issued_at: UtcMillis,
+    pub(crate) expires_at: UtcMillis,
+    pub(crate) response_capability_digest: Sha256Digest,
+    pub(crate) idempotency_digest: Sha256Digest,
+    pub(crate) candidate_signature: Ed25519Signature,
+    pub(crate) exact_signed_request: Vec<u8>,
+    pub(crate) request_digest: Sha256Digest,
+}
+
+pub(crate) fn parse_history_recovery_request_v4(
+    bytes: &[u8],
+) -> Result<HistoryRecoveryRequestV4, DeviceEnrollmentFailure> {
+    if bytes.is_empty() || bytes.len() > 37_114 {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let value =
+        decode_deterministic_cbor(bytes).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 21)?;
+    if cbor_field(fields, 1)? != &CanonicalValue::Unsigned(4) {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let unsigned = encode_deterministic_cbor(&CanonicalValue::Map(
+        fields.iter().take(20).cloned().collect(),
+    ))
+    .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let request_id = parse_cbor_challenge_id(cbor_field(fields, 2)?)?;
+    let identity_id = parse_cbor_identity_id(cbor_field(fields, 3)?)?;
+    let target_device_id = parse_cbor_device_id(cbor_field(fields, 4)?)?;
+    let target_device_signing_key =
+        SigningPublicKey::try_from(parse_cbor_bytes::<32>(cbor_field(fields, 5)?)?)
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let recipient_encryption_key =
+        DeviceEncryptionPublicKey::try_from(parse_cbor_bytes::<32>(cbor_field(fields, 6)?)?)
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    if target_device_signing_key.as_bytes() == recipient_encryption_key.as_bytes() {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let pre_head_sequence = match cbor_field(fields, 7)? {
+        CanonicalValue::Unsigned(v) => {
+            SafeUint::new(*v).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
+        }
+        _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+    };
+    let pre_head_hash = Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 8)?)?);
+    let post_head_sequence = match cbor_field(fields, 9)? {
+        CanonicalValue::Unsigned(v) => {
+            SafeUint::new(*v).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
+        }
+        _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+    };
+    if post_head_sequence.get()
+        != pre_head_sequence
+            .get()
+            .checked_add(1)
+            .ok_or(DeviceEnrollmentFailure::InvalidRequest)?
+    {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let post_head_hash = Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 10)?)?);
+    let device_add_bytes = parse_cbor_bounded_bytes(cbor_field(fields, 11)?, 533)?;
+    if device_add_bytes.is_empty() || device_add_bytes.len() > 533 {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let device_add_digest = Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 12)?)?);
+    let expected_device_add =
+        Sha256Digest::hash_domain(b"dirextalk.identity-device-add.v1\0", &device_add_bytes);
+    if device_add_digest != expected_device_add {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let preparation_bytes = parse_cbor_bounded_bytes(cbor_field(fields, 13)?, 532)?;
+    if preparation_bytes.is_empty() || preparation_bytes.len() > 532 {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let preparation_digest = Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 14)?)?);
+    let expected_preparation = Sha256Digest::hash_domain(
+        b"dirextalk.recovery-scope-catalog-handoff-preparation-digest.v2\0",
+        &preparation_bytes,
+    );
+    if preparation_digest != expected_preparation {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let manifest_value = cbor_field(fields, 15)?;
+    let manifest_fields = exact_cbor_fields(&manifest_value, 10)?;
+    if cbor_field(manifest_fields, 1)? != &CanonicalValue::Unsigned(2) {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    if cbor_field(manifest_fields, 2)? != &CanonicalValue::Text(identity_id.to_string()) {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let manifest_bytes = encode_deterministic_cbor(manifest_value)
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let manifest_digest = Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 16)?)?);
+    if manifest_digest
+        != Sha256Digest::hash_domain(b"dirextalk.history-recovery.manifest.v2\0", &manifest_bytes)
+    {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let issued_at = parse_cbor_utc_nonnegative(cbor_field(fields, 17)?)?;
+    let expires_at = parse_cbor_utc_nonnegative(cbor_field(fields, 18)?)?;
+    if issued_at >= expires_at {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let response_capability_digest =
+        Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 19)?)?);
+    let idempotency_digest = Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 20)?)?);
+    let candidate_signature =
+        Ed25519Signature::from_bytes(parse_cbor_bytes(cbor_field(fields, 21)?)?);
+    let key = VerifyingKey::from_bytes(target_device_signing_key.as_bytes())
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    key.verify(
+        &{
+            let mut i = Vec::with_capacity(
+                HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN.len() + unsigned.len(),
+            );
+            i.extend_from_slice(HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN);
+            i.extend_from_slice(&unsigned);
+            i
+        },
+        &Signature::from_bytes(candidate_signature.as_bytes()),
+    )
+    .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    Ok(HistoryRecoveryRequestV4 {
+        request_id,
+        identity_id,
+        target_device_id,
+        target_device_signing_key,
+        recipient_encryption_key,
+        pre_head_sequence,
+        pre_head_hash,
+        post_head_sequence,
+        post_head_hash,
+        device_add_bytes,
+        device_add_digest,
+        preparation_bytes,
+        preparation_digest,
+        manifest_bytes,
+        manifest_digest,
+        issued_at,
+        expires_at,
+        response_capability_digest,
+        idempotency_digest,
+        candidate_signature,
+        exact_signed_request: bytes.to_vec(),
+        request_digest: Sha256Digest::hash_domain(HISTORY_RECOVERY_REQUEST_V4_DIGEST_DOMAIN, bytes),
+    })
+}
+
+fn parse_cbor_utc_nonnegative(
+    value: &CanonicalValue,
+) -> Result<UtcMillis, DeviceEnrollmentFailure> {
+    match value {
+        CanonicalValue::Unsigned(v) => {
+            UtcMillis::new(i64::try_from(*v).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?)
+                .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)
+        }
+        _ => Err(DeviceEnrollmentFailure::InvalidRequest),
+    }
 }
 
 pub(crate) struct DeviceEnrollmentCompletionRequest {
@@ -310,6 +492,19 @@ pub(crate) fn parse_cbor_bytes<const N: usize>(
         .as_slice()
         .try_into()
         .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)
+}
+
+fn parse_cbor_bounded_bytes(
+    value: &CanonicalValue,
+    maximum: usize,
+) -> Result<Vec<u8>, DeviceEnrollmentFailure> {
+    let CanonicalValue::Bytes(value) = value else {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    };
+    if value.is_empty() || value.len() > maximum {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    Ok(value.clone())
 }
 
 /// Strictly parses an opaque short-lived device-session capability.

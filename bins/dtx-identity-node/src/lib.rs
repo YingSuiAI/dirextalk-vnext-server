@@ -41,18 +41,19 @@ use dtx_identity_persistence::{
     CatalogPreparationCommand, CatalogProviderResponseCommand, CatalogStatus, CatalogUploadCommand,
     ClientBindingAuthorization, ClientBindingRepository, ClientBindingWorkflowError,
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
-    DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability, DeviceEnrollmentChallenge,
-    DeviceEnrollmentChallengeOutcome, DeviceEnrollmentChallengeState,
-    DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository, DeviceRevokeCommand,
-    DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
-    DeviceSessionRepository, FEDERATED_KEY_PACKAGE_CLAIM_PATH, FederatedKeyPackageClaimProof,
-    HistoryRecoveryKeyPackageScope, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead,
-    IdentityLogPageReadOutcome, IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
-    KeyPackageClaimCommand, KeyPackageClaimOutcome, KeyPackagePublishCommand,
-    KeyPackagePublishOutcome, KeyPackageRepository, MAX_KEY_PACKAGE_PUBLISH_BYTES,
-    MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES, MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES,
-    RecoveryResponseCapability, RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository,
-    RecoveryScopeCatalogStatusOutcome, lock_and_load_active_snapshot,
+    CreateHistoryRecoveryRequestV4Command, DeviceEnrollmentApprovalCommand,
+    DeviceEnrollmentCapability, DeviceEnrollmentChallenge, DeviceEnrollmentChallengeOutcome,
+    DeviceEnrollmentChallengeState, DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository,
+    DeviceRevokeCommand, DeviceSessionCompletionCommand, DeviceSessionCredential,
+    DeviceSessionOutcome, DeviceSessionRepository, FEDERATED_KEY_PACKAGE_CLAIM_PATH,
+    FederatedKeyPackageClaimProof, HistoryRecoveryKeyPackageScope, IdentityAppendCommand,
+    IdentityAppendOutcome, IdentityLogHead, IdentityLogPageReadOutcome, IdentityLogRepository,
+    IdentityPersistenceError, IdentityPgStore, KeyPackageClaimCommand, KeyPackageClaimOutcome,
+    KeyPackagePublishCommand, KeyPackagePublishOutcome, KeyPackageRepository,
+    MAX_KEY_PACKAGE_PUBLISH_BYTES, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES,
+    MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES, RecoveryResponseCapability,
+    RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository, RecoveryScopeCatalogStatusOutcome,
+    lock_and_load_active_snapshot,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -102,7 +103,7 @@ pub use enrollment_codec::parse_device_session_authorization;
 pub(crate) use enrollment_codec::{
     DeviceSessionAuthorizationError, decode_base64url_32, parse_device_enrollment_candidate,
     parse_device_enrollment_completion, parse_device_enrollment_status_request,
-    parse_history_recovery_request, parse_json_body,
+    parse_history_recovery_request, parse_history_recovery_request_v4, parse_json_body,
 };
 pub(crate) use error_types::map_client_binding_error;
 pub(crate) use error_types::{
@@ -111,12 +112,12 @@ pub(crate) use error_types::{
     DeviceEnrollmentChallengeSuccess, DeviceEnrollmentErrorCode, DeviceEnrollmentFailure,
     DeviceRevokeErrorCode, DeviceRevokeFailure, DeviceRevokeSuccess, DeviceSessionChallengeRequest,
     DeviceSessionChallengeResponse, DeviceSessionCompletionRequest, DeviceSessionErrorCode,
-    DeviceSessionFailure, DeviceSessionSuccess, IdentityLogPageErrorCode, IdentityLogPageFailure,
-    InitialDeviceErrorCode, InitialDeviceFailure, InitialDeviceSuccess, KeyPackageClaimSuccess,
-    KeyPackageErrorCode, KeyPackageFailure, KeyPackagePublishSuccess,
-    MlsV5RecoveryAuthorizationErrorCode, MlsV5RecoveryAuthorizationFailure,
-    RecoveryCatalogErrorCode, RecoveryCatalogFailure, RecoveryCatalogHeadSuccess,
-    RecoveryCatalogStatusSuccess, SafeErrorBody, SafeErrorEnvelope,
+    DeviceSessionFailure, DeviceSessionSuccess, HistoryRecoveryRequestV4Success,
+    IdentityLogPageErrorCode, IdentityLogPageFailure, InitialDeviceErrorCode, InitialDeviceFailure,
+    InitialDeviceSuccess, KeyPackageClaimSuccess, KeyPackageErrorCode, KeyPackageFailure,
+    KeyPackagePublishSuccess, MlsV5RecoveryAuthorizationErrorCode,
+    MlsV5RecoveryAuthorizationFailure, RecoveryCatalogErrorCode, RecoveryCatalogFailure,
+    RecoveryCatalogHeadSuccess, RecoveryCatalogStatusSuccess, SafeErrorBody, SafeErrorEnvelope,
 };
 pub(crate) use errors::{
     map_device_enrollment_persistence_error, map_device_revoke_persistence_error,
@@ -133,8 +134,8 @@ pub(crate) use identity::{
 pub(crate) use identity_codec::{
     is_base64url_byte, load_mls_v5_recovery_authorization_projection,
     parse_identity_log_page_request, parse_mls_v5_recovery_authorization_query,
-    parse_positive_safe_uint_path, parse_recovery_enrollment_capability,
-    parse_recovery_response_capability,
+    parse_positive_safe_uint_path, parse_recovery_capability_header,
+    parse_recovery_enrollment_capability, parse_recovery_response_capability,
 };
 pub(crate) use key_package_codec::{
     parse_federated_key_package_claim_proof, parse_key_package_claim, parse_key_package_publish,
@@ -153,7 +154,8 @@ pub(crate) use responses::{
     device_enrollment_status_response, device_revoke_failure_response,
     device_revoke_success_response, device_session_challenge_success_response,
     device_session_failure_response, device_session_success_response, encode_pending,
-    exact_cbor_response, identity_log_page_failure_response, identity_log_page_success_response,
+    exact_cbor_response, history_recovery_request_v4_success_response,
+    identity_log_page_failure_response, identity_log_page_success_response,
     initial_device_failure_response, initial_device_success_response,
     key_package_claim_success_response, key_package_failure_response,
     key_package_publish_success_response, mls_v5_recovery_authorization_failure_response,
@@ -163,7 +165,7 @@ pub(crate) use responses::{
 pub(crate) use sessions_enrollment::{
     approve_device_enrollment, cancel_device_enrollment_challenge, complete_device_session,
     create_device_enrollment_challenge, create_device_session_challenge,
-    get_device_enrollment_challenge, revoke_device,
+    create_history_recovery_request_v4, get_device_enrollment_challenge, revoke_device,
 };
 
 /// Route for the self-authenticated identity genesis request.
@@ -201,13 +203,15 @@ pub const DEVICE_REVOKE_PATH_TEMPLATE: &str =
 pub const RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE: &str = "/v1/recovery-scope-catalogs/{generation}";
 /// Candidate route that freezes the current catalog before ordinary enrollment.
 pub const RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH: &str =
-    "/v2/devices/enroll/catalog-preparations";
+    "/v3/devices/enroll/catalog-preparations";
 /// Candidate capability route for one redacted preparation status.
 pub const RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE: &str =
-    "/v2/devices/enroll/catalog-preparations/{request_id}";
+    "/v3/devices/enroll/catalog-preparations/{request_id}";
 /// Active-provider route for the preparation's one immutable response.
 pub const RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_PATH_TEMPLATE: &str =
-    "/v2/devices/enroll/catalog-preparations/{request_id}/provider-response";
+    "/v3/devices/enroll/catalog-preparations/{request_id}/provider-response";
+/// Candidate-signed catalog-exhaustive History Recovery Request V4 route.
+pub const HISTORY_RECOVERY_REQUEST_V4_PATH: &str = "/v4/devices/history-recovery-requests";
 pub const CONTACT_INVITES_PATH: &str = "/v1/contact-invites";
 pub const CONTACT_INVITE_PATH: &str = "/v1/contact-invites/{invite_id}";
 pub const CONTACT_REQUESTS_PATH: &str = "/v1/contact-requests";
@@ -230,6 +234,10 @@ pub const DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.device-enrollment-candidate.v1+cbor";
 pub const HISTORY_RECOVERY_REQUEST_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.history-recovery-request.v1+cbor";
+pub const HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.history-recovery-request.v4+cbor";
+pub const HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.history-recovery-request-receipt.v4+cbor";
 /// Capability-gated enrollment status response media type.
 pub const DEVICE_ENROLLMENT_STATUS_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.device-enrollment-status.v1+cbor";
@@ -263,13 +271,13 @@ pub const RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.recovery-scope-catalog-head.v1+cbor";
 /// Exact candidate preparation media type.
 pub const RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE: &str =
-    "application/vnd.dirextalk.recovery-scope-catalog-preparation.v1+cbor";
+    "application/vnd.dirextalk.recovery-scope-catalog-preparation.v2+cbor";
 /// Exact active-provider response media type.
 pub const RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE: &str =
-    "application/vnd.dirextalk.recovery-scope-catalog-provider-response.v1+cbor";
+    "application/vnd.dirextalk.recovery-scope-catalog-provider-response.v2+cbor";
 /// Exact redacted preparation status media type.
 pub const RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE: &str =
-    "application/vnd.dirextalk.recovery-scope-catalog-status.v1+cbor";
+    "application/vnd.dirextalk.recovery-scope-catalog-status.v2+cbor";
 pub const CONTACT_INVITE_CONTENT_TYPE: &str = "application/vnd.dirextalk.contact-invite.v1+cbor";
 pub const CONTACT_INVITE_RECEIPT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.contact-invite-receipt.v1+cbor";
@@ -332,6 +340,8 @@ const HTTP_RECOVERY_PREPARATION_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-http-preparation-idempotency-key.v1\0";
 const HTTP_RECOVERY_PROVIDER_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-http-provider-idempotency-key.v1\0";
+pub(crate) const HTTP_HISTORY_RECOVERY_REQUEST_V4_IDEMPOTENCY_KEY_HASH_DOMAIN: &[u8] =
+    b"dirextalk.history-recovery.request-idempotency.v4\0";
 const DEFAULT_DEVICE_SESSION_AUDIENCE: &str = "http://127.0.0.1";
 
 /// State for bootstrap, device-session, and QR device-enrollment HTTP boundaries.
@@ -493,6 +503,10 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
         .route(
             RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_PATH_TEMPLATE,
             put(put_recovery_scope_catalog_provider_response),
+        )
+        .route(
+            HISTORY_RECOVERY_REQUEST_V4_PATH,
+            post(create_history_recovery_request_v4),
         )
         .route(KEY_PACKAGE_PUBLISH_PATH_TEMPLATE, put(publish_key_package))
         .route(KEY_PACKAGE_CLAIM_PATH, post(claim_key_package))

@@ -148,6 +148,11 @@ pub(crate) struct DeviceEnrollmentApprovalSuccess {
     pub(crate) exact_receipt_bytes: Vec<u8>,
 }
 
+pub(crate) struct HistoryRecoveryRequestV4Success {
+    pub(crate) status: StatusCode,
+    pub(crate) exact_receipt_bytes: Vec<u8>,
+}
+
 pub(crate) struct DeviceRevokeSuccess {
     pub(crate) status: StatusCode,
     pub(crate) exact_receipt_bytes: Vec<u8>,

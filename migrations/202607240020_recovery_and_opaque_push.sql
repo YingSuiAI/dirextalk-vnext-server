@@ -198,6 +198,55 @@ DO $grants$ BEGIN
         ) ON identity.recovery_scope_catalog_preparations TO dtx_identity_runtime;
     END IF;
 END $grants$;
+CREATE FUNCTION identity.enforce_history_recovery_request_v4_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'history recovery request is immutable' USING ERRCODE='23514';
+END
+$$;
+CREATE TRIGGER identity_history_recovery_request_v4_immutable
+BEFORE UPDATE OR DELETE ON identity.history_recovery_requests
+FOR EACH ROW EXECUTE FUNCTION identity.enforce_history_recovery_request_v4_immutable();
+-- V42 immutable candidate Request V4 admission. Raw capabilities and
+-- idempotency keys are represented only by domain-separated digests.
+CREATE TABLE identity.history_recovery_requests (
+    request_id uuid PRIMARY KEY CHECK (messaging.is_uuid_v7(request_id)),
+    identity_id text NOT NULL REFERENCES identity.log_heads(identity_id) ON DELETE RESTRICT,
+    candidate_device_id uuid NOT NULL CHECK (messaging.is_uuid_v7(candidate_device_id)),
+    candidate_signing_key bytea NOT NULL CHECK (octet_length(candidate_signing_key)=32),
+    candidate_recipient_key bytea NOT NULL CHECK (octet_length(candidate_recipient_key)=32),
+    pre_head_sequence bigint NOT NULL CHECK (pre_head_sequence BETWEEN 0 AND 9007199254740990),
+    pre_head_hash bytea NOT NULL CHECK (octet_length(pre_head_hash)=32),
+    post_head_sequence bigint NOT NULL CHECK (post_head_sequence=pre_head_sequence+1),
+    post_head_hash bytea NOT NULL CHECK (octet_length(post_head_hash)=32),
+    device_add_bytes bytea NOT NULL CHECK (octet_length(device_add_bytes) BETWEEN 1 AND 533),
+    device_add_digest bytea NOT NULL CHECK (octet_length(device_add_digest)=32),
+    preparation_bytes bytea NOT NULL CHECK (octet_length(preparation_bytes) BETWEEN 1 AND 532),
+    preparation_digest bytea NOT NULL CHECK (octet_length(preparation_digest)=32),
+    manifest_bytes bytea NOT NULL CHECK (octet_length(manifest_bytes) BETWEEN 1 AND 35477),
+    manifest_digest bytea NOT NULL CHECK (octet_length(manifest_digest)=32),
+    issued_at_ms bigint NOT NULL,
+    expires_at_ms bigint NOT NULL CHECK (expires_at_ms>issued_at_ms),
+    response_capability_digest bytea NOT NULL CHECK (octet_length(response_capability_digest)=32),
+    idempotency_digest bytea NOT NULL CHECK (octet_length(idempotency_digest)=32),
+    candidate_signature bytea NOT NULL CHECK (octet_length(candidate_signature)=64),
+    request_bytes bytea NOT NULL CHECK (octet_length(request_bytes) BETWEEN 1 AND 37114),
+    request_digest bytea NOT NULL UNIQUE CHECK (octet_length(request_digest)=32),
+    receipt_bytes bytea NOT NULL CHECK (octet_length(receipt_bytes) BETWEEN 1 AND 256),
+    accepted_at_ms bigint NOT NULL,
+    UNIQUE(identity_id,idempotency_digest)
+);
+ALTER TABLE identity.history_recovery_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE identity.history_recovery_requests FORCE ROW LEVEL SECURITY;
+CREATE POLICY identity_runtime_only ON identity.history_recovery_requests
+    USING (identity.identity_runtime_authorized())
+    WITH CHECK (identity.identity_runtime_authorized());
+DO $grants$ BEGIN
+    IF to_regrole('dtx_identity_runtime') IS NOT NULL THEN
+        GRANT SELECT,INSERT ON identity.history_recovery_requests TO dtx_identity_runtime;
+    END IF;
+END $grants$;
+
 -- V43 opaque push is a wake hint only.  Mailbox Pull/ACK and account read
 -- cursors remain authoritative; this relation never contains a provider body.
 CREATE TABLE messaging.opaque_push_registrations (

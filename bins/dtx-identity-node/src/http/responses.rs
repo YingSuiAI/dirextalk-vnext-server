@@ -7,7 +7,8 @@ use super::{
     DeviceEnrollmentChallengeSuccess, DeviceEnrollmentErrorCode, DeviceEnrollmentFailure,
     DeviceRevokeErrorCode, DeviceRevokeFailure, DeviceRevokeSuccess,
     DeviceSessionChallengeResponse, DeviceSessionErrorCode, DeviceSessionFailure,
-    DeviceSessionSuccess, Encoding, HeaderMap, HeaderValue, IDENTITY_APPEND_RECEIPT_CONTENT_TYPE,
+    DeviceSessionSuccess, Encoding, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE, HeaderMap,
+    HeaderValue, HistoryRecoveryRequestV4Success, IDENTITY_APPEND_RECEIPT_CONTENT_TYPE,
     IDENTITY_LOG_PAGE_CONTENT_TYPE, IdentityLogPageErrorCode, IdentityLogPageFailure,
     IdentityLogPageV1, InitialDeviceErrorCode, InitialDeviceFailure, InitialDeviceSuccess,
     IntoResponse, KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE, KEY_PACKAGE_PUBLISH_RECEIPT_CONTENT_TYPE,
@@ -327,6 +328,18 @@ pub(crate) fn device_enrollment_approval_success_response(
         success.status,
         success.exact_receipt_bytes,
         IDENTITY_APPEND_RECEIPT_CONTENT_TYPE,
+        request_id,
+    )
+}
+
+pub(crate) fn history_recovery_request_v4_success_response(
+    success: HistoryRecoveryRequestV4Success,
+    request_id: RequestId,
+) -> Response {
+    exact_cbor_response(
+        success.status,
+        success.exact_receipt_bytes,
+        HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
         request_id,
     )
 }
