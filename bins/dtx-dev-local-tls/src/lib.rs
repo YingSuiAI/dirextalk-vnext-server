@@ -391,7 +391,26 @@ fn has_expected_server_sans(
     let has_loopback = names
         .iter()
         .any(|name| matches!(name, GeneralName::IPAddress(value) if *value == [127, 0, 0, 1]));
-    has_node_name && has_localhost && has_loopback
+    let android_loopback_names = names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::DNSName(value)
+                if *value == "node-a.localhost" || *value == "node-b.localhost" =>
+            {
+                Some(*value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected_android_loopback_names: &[&str] = match node_name {
+        "node-a" => &["node-a.localhost"],
+        "node-b" => &["node-b.localhost"],
+        _ => &[],
+    };
+    has_node_name
+        && has_localhost
+        && has_loopback
+        && android_loopback_names == expected_android_loopback_names
 }
 
 struct GeneratedArtifacts {
@@ -447,11 +466,15 @@ fn issue_server_leaf(
     node_name: &str,
     now: OffsetDateTime,
 ) -> Result<LeafArtifacts, rcgen::Error> {
-    let mut params = CertificateParams::new(vec![
+    let mut names = vec![
         node_name.to_owned(),
         "localhost".to_owned(),
         "127.0.0.1".to_owned(),
-    ])?;
+    ];
+    if matches!(node_name, "node-a" | "node-b") {
+        names.push(format!("{node_name}.localhost"));
+    }
+    let mut params = CertificateParams::new(names)?;
     params.not_before = now - NOT_BEFORE_SKEW;
     params.not_after = now + CERTIFICATE_LIFETIME;
     params.is_ca = IsCa::ExplicitNoCa;
@@ -657,6 +680,19 @@ mod tests {
             assert!(names.iter().any(
                 |name| matches!(name, GeneralName::IPAddress(value) if *value == [127, 0, 0, 1])
             ));
+            let expected_android_name = format!("{node_name}.localhost");
+            assert_eq!(
+                names.iter().any(|name| matches!(name, GeneralName::DNSName(value) if *value == expected_android_name)),
+                matches!(node_name, "node-a" | "node-b")
+            );
+            for other in ["node-a.localhost", "node-b.localhost"] {
+                assert_eq!(
+                    names
+                        .iter()
+                        .any(|name| matches!(name, GeneralName::DNSName(value) if *value == other)),
+                    other == expected_android_name
+                );
+            }
         }
     }
 

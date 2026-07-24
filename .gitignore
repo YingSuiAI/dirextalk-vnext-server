@@ -17,3 +17,5 @@
 *.pem
 *.key
 *.p12
+/.android-acceptance/
+/artifacts/android-acceptance/

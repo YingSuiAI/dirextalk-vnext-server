@@ -3,6 +3,7 @@ members = [
     "bins/dtx-agent-control",
     "bins/dtx-agent-host-supervisor",
     "bins/dtx-dev-local-tls",
+    "bins/dtx-android-response-loss-proxy",
     "bins/dtx-dev-migrate",
     "bins/dtx-production-migrate",
     "bins/dtx-group-node",
@@ -116,7 +117,7 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
 subtle = "2.6.1"
 testcontainers-modules = { version = "0.15.0", default-features = false, features = ["postgres", "ring"] }
 time = { version = "0.3.53", default-features = false }
-tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tokio-stream = { version = "0.1.18", features = ["net"] }
 tonic = { version = "0.14.6", default-features = false, features = ["codegen", "transport", "tls-ring"] }
