@@ -226,14 +226,8 @@ impl IdentityBootstrapState {
         ) {
             return Err(RecoveryCatalogFailure::NotAcceptable);
         }
-        if !has_exact_content_type(
-            headers,
-            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-        ) {
+        if headers.contains_key(header::CONTENT_TYPE) {
             return Err(RecoveryCatalogFailure::UnsupportedMedia);
-        }
-        if content_length_exceeds(headers, MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES) {
-            return Err(RecoveryCatalogFailure::TooLarge);
         }
         if headers.contains_key(header::CONTENT_TYPE)
             || !has_exact_header(
@@ -305,6 +299,9 @@ impl IdentityBootstrapState {
         {
             return Err(RecoveryCatalogFailure::InvalidRequest);
         }
+        if content_length_exceeds(headers, MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES) {
+            return Err(RecoveryCatalogFailure::TooLarge);
+        }
         let request_id = route_request_id
             .parse::<DeviceEnrollmentChallengeId>()
             .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
@@ -315,7 +312,7 @@ impl IdentityBootstrapState {
                 .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
         let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES)
             .await
-            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
+            .map_err(|_| RecoveryCatalogFailure::TooLarge)?;
         let command = CatalogProviderResponseCommand::parse_v2(
             idempotency_key_hash,
             request_id,

@@ -41,6 +41,10 @@ pub const PROVIDER_AUTHORITY_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-handoff-provider-authority-signature.v2\0";
 pub const PROVIDER_RESPONSE_DIGEST_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-handoff-provider-response.v2\0";
+pub const PROVIDER_PACKAGE_DIGEST_DOMAIN: &[u8] =
+    b"dirextalk.recovery-scope-catalog-handoff-provider-package.v2\0";
+pub const PROVIDER_AAD_DIGEST_DOMAIN: &[u8] =
+    b"dirextalk.recovery-scope-catalog-handoff-provider-aad.v2\0";
 const UPLOAD_HASH_DOMAIN: &[u8] = b"dirextalk.recovery-scope-catalog-upload.v2\0";
 pub const MAX_RECOVERY_SCOPE_CATALOG_CIPHERTEXT_BYTES: usize = 1_048_576;
 pub const MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES: usize = 16_384;
@@ -469,6 +473,7 @@ impl CatalogPreparationCommand {
         let expires_at = parse_utc(fields[15])?;
         if observed_head.sequence().get() > 9_007_199_254_740_990
             || candidate_signing_key.as_bytes() == candidate_recipient_key.as_bytes()
+            || is_low_order_x25519(candidate_recipient_key.as_bytes())
             || candidate_nonce.iter().all(|byte| *byte == 0)
             || issued_at >= expires_at {
             return Err(invalid("catalog preparation binding"));
@@ -514,7 +519,11 @@ impl CatalogPreparationCommand {
 pub struct CatalogProviderResponseCommand {
     pub idempotency_key_hash: Sha256Digest,
     pub request_id: DeviceEnrollmentChallengeId,
+    pub identity_id: IdentityId,
+    pub catalog_id: Uuid,
+    pub catalog_generation: SafeUint,
     pub catalog_head_digest: Sha256Digest,
+    pub candidate_device_id: DeviceId,
     pub provider_device_id: DeviceId,
     pub provider_signing_key: SigningPublicKey,
     pub authority_kind: u64,
@@ -523,6 +532,12 @@ pub struct CatalogProviderResponseCommand {
     pub authority_signing_key: SigningPublicKey,
     pub current_authority_digest: Sha256Digest,
     pub recipient_key_digest: Sha256Digest,
+    pub observed_head: IdentityLogHead,
+    pub successor_head: IdentityLogHead,
+    pub device_add_digest: Sha256Digest,
+    pub package_digest: Sha256Digest,
+    pub public_aad_digest: Sha256Digest,
+    pub envelope_digest: Sha256Digest,
     pub ciphertext_digest: Sha256Digest,
     pub device_add_bytes: Vec<u8>,
     pub envelope_bytes: Vec<u8>,
@@ -667,7 +682,27 @@ impl CatalogProviderResponseCommand {
         if provider_signing_key == authority_signing_key {
             return Err(invalid("signer key separation"));
         }
+        let identity_id = parse_identity(fields[3])?;
+        let catalog_id = parse_uuid_v7(fields[4], "catalog ID")?;
+        let catalog_generation = parse_positive_safe_uint(fields[5])?;
         let candidate_device_id = parse_device(fields[7])?;
+        let observed_head = IdentityLogHead::observed(
+            identity_id,
+            parse_safe_uint(fields[9])?,
+            parse_digest(fields[10])?,
+        )?;
+        let successor_head = IdentityLogHead::observed(
+            identity_id,
+            parse_positive_safe_uint(fields[11])?,
+            parse_digest(fields[12])?,
+        )?;
+        if successor_head.sequence().get() != observed_head.sequence().get().saturating_add(1) {
+            return Err(invalid("DeviceAdd successor sequence"));
+        }
+        let device_add_digest = parse_digest(fields[13])?;
+        let package_digest = parse_digest(fields[16])?;
+        let public_aad_digest = parse_digest(fields[17])?;
+        let envelope_digest = parse_digest(fields[18])?;
         let (candidate_signing_key, candidate_recipient_key) = parse_device_add_candidate(
             fields[24],
             candidate_device_id,
@@ -698,8 +733,8 @@ impl CatalogProviderResponseCommand {
         let device_add_bytes = parse_bounded_bytes(fields[24], 533)?;
         let envelope_bytes = encode_deterministic_cbor(fields[25]).map_err(|_| invalid("HPKE envelope"))?;
         validate_hpke_envelope(fields[25])?;
-        let envelope_digest = Sha256Digest::hash_domain(PROVIDER_CIPHERTEXT_HASH_DOMAIN, &envelope_bytes);
-        if envelope_digest != parse_digest(fields[18])? {
+        let computed_envelope_digest = Sha256Digest::hash_domain(PROVIDER_CIPHERTEXT_HASH_DOMAIN, &envelope_bytes);
+        if computed_envelope_digest != envelope_digest {
             return Err(invalid("HPKE envelope digest"));
         }
         let issued_at = parse_utc(fields[20])?;
@@ -710,10 +745,24 @@ impl CatalogProviderResponseCommand {
         if parse_authority_digest(fields[15])? != authority_id {
             return Err(invalid("authority descriptor digest"));
         }
+        let aad = CanonicalValue::Map(
+            (1_u64..=20)
+                .zip(fields.iter().take(20))
+                .map(|(key, value)| (CanonicalValue::Unsigned(key), (*value).clone()))
+                .collect(),
+        );
+        let aad_bytes = encode_deterministic_cbor(&aad).map_err(|_| invalid("public AAD"))?;
+        if Sha256Digest::hash_domain(PROVIDER_AAD_DIGEST_DOMAIN, &aad_bytes) != public_aad_digest {
+            return Err(invalid("public AAD digest"));
+        }
         Ok(Self {
             idempotency_key_hash,
             request_id,
+            identity_id,
+            catalog_id,
+            catalog_generation,
             catalog_head_digest: parse_digest(fields[6])?,
+            candidate_device_id,
             provider_device_id,
             provider_signing_key,
             authority_kind,
@@ -722,7 +771,13 @@ impl CatalogProviderResponseCommand {
             authority_signing_key,
             current_authority_digest: parse_authority_digest(fields[16])?,
             recipient_key_digest: parse_digest(fields[8])?,
-            ciphertext_digest: parse_digest(fields[19])?,
+            observed_head,
+            successor_head,
+            device_add_digest,
+            package_digest,
+            public_aad_digest,
+            envelope_digest,
+            ciphertext_digest: envelope_digest,
             device_add_bytes,
             envelope_bytes,
             issued_at,
@@ -935,9 +990,7 @@ fn validate_hpke_envelope(value: &CanonicalValue) -> Result<(), IdentityPersiste
         return Err(invalid("HPKE envelope"));
     }
     let enc = parse_fixed::<32>(&fields[1].1)?;
-    let low_order_one = enc[0] == 1 && enc[1..].iter().all(|byte| *byte == 0);
-    let low_order_max = enc[..31].iter().all(|byte| *byte == 0xff) && enc[31] == 0x7f;
-    if enc.iter().all(|byte| *byte == 0) || low_order_one || low_order_max {
+    if is_low_order_x25519(&enc) {
         return Err(invalid("HPKE encapsulation"));
     }
     let ciphertext = parse_bounded_bytes(&fields[2].1, 1_049_473)?;
@@ -945,4 +998,22 @@ fn validate_hpke_envelope(value: &CanonicalValue) -> Result<(), IdentityPersiste
         return Err(invalid("HPKE ciphertext"));
     }
     Ok(())
+}
+
+/// RFC 7748's complete X25519 low-order blacklist.  Parsing a wire key is
+/// intentionally a semantic admission boundary: accepting any of these
+/// encodings permits a non-contributory all-zero DH result at the HPKE stage.
+fn is_low_order_x25519(key: &[u8]) -> bool {
+    const LOW_ORDER: [[u8; 32]; 5] = [
+        [0x00; 32],
+        [0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        [0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00],
+        [0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b, 0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57],
+        [0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+    ];
+    LOW_ORDER.iter().any(|candidate| key == candidate)
+        || key.len() == 32
+            && (key[0] == 0xed || key[0] == 0xee)
+            && key[1..31].iter().all(|byte| *byte == 0xff)
+            && key[31] == 0x7f
 }
