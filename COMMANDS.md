@@ -18,9 +18,7 @@ Run commands from this repository root.
 | build | `cargo build --workspace --locked` |
 | release-build | `cargo build --workspace --locked --release` |
 | release-image-check | `bash scripts/check-release-image.sh` |
-| production-stack structural gate | `bash scripts/check-production-stack.sh` |
-| production-stack focused test | `bash scripts/test-production-stack.sh` |
-| client-binding artifact test | `python3 tools/test-client-binding-release-artifacts.py` |
+| Product Core production-stack gate | `bash scripts/check-production-stack.sh` |
 | production PostgreSQL role/readiness gate | `bash scripts/test-production-postgres.sh` |
 | publish production images | `bash scripts/publish-production-release.sh` |
 | clean interrupted release builder/cache | `bash scripts/cleanup-production-release.sh` |
