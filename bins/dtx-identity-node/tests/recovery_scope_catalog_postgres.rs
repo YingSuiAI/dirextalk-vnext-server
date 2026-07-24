@@ -41,7 +41,8 @@ use dtx_identity_persistence::{
     DeviceEnrollmentRepository, DeviceSessionCompletionCommand, DeviceSessionCredential,
     DeviceSessionOutcome, DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome,
     IdentityLogHead, IdentityLogRepository, IdentityPgStore,
-    MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES, MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES,
+    MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
+    MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES,
     PREPARATION_DIGEST_DOMAIN, PREPARATION_SIGNATURE_DOMAIN, PROVIDER_AAD_DIGEST_DOMAIN,
     PROVIDER_AUTHORITY_SIGNATURE_DOMAIN, PROVIDER_CIPHERTEXT_HASH_DOMAIN,
     PROVIDER_PACKAGE_DIGEST_DOMAIN, PROVIDER_RESPONSE_SIGNATURE_DOMAIN, RECIPIENT_KEY_HASH_DOMAIN,
@@ -124,29 +125,53 @@ async fn send_catalog(
     content_type: &str,
     body: Vec<u8>,
 ) -> Result<axum::response::Response, Box<dyn Error>> {
-    Ok(app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(
-                    RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE
-                        .replace(
-                            "{catalog_id}",
-                            if generation == 1 {
-                                "0190f2a5-7b1c-7abc-8def-0123456789b1"
-                            } else {
-                                "0190f2a5-7b1c-7abc-8def-0123456789b3"
-                            },
-                        )
-                        .replace("{generation}", &generation.to_string()),
+    send_catalog_custom(
+        app,
+        idempotency,
+        session,
+        generation,
+        content_type,
+        Some(RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE),
+        None,
+        body,
+    )
+    .await
+}
+
+async fn send_catalog_custom(
+    app: axum::Router,
+    idempotency: &str,
+    session: &Session,
+    generation: u64,
+    content_type: &str,
+    accept: Option<&str>,
+    declared_length: Option<&str>,
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    let mut builder = Request::builder()
+        .method("PUT")
+        .uri(
+            RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE
+                .replace(
+                    "{catalog_id}",
+                    if generation == 1 {
+                        "0190f2a5-7b1c-7abc-8def-0123456789b1"
+                    } else {
+                        "0190f2a5-7b1c-7abc-8def-0123456789b3"
+                    },
                 )
-                .header(header::CONTENT_TYPE, content_type)
-                .header(header::ACCEPT, RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE)
-                .header("idempotency-key", idempotency)
-                .header(header::AUTHORIZATION, authorization(session))
-                .body(Body::from(body))?,
+                .replace("{generation}", &generation.to_string()),
         )
-        .await?)
+        .header(header::CONTENT_TYPE, content_type)
+        .header("idempotency-key", idempotency)
+        .header(header::AUTHORIZATION, authorization(session));
+    if let Some(accept) = accept {
+        builder = builder.header(header::ACCEPT, accept);
+    }
+    if let Some(length) = declared_length {
+        builder = builder.header(header::CONTENT_LENGTH, length);
+    }
+    Ok(app.oneshot(builder.body(Body::from(body))?).await?)
 }
 
 async fn send_preparation(
@@ -156,31 +181,49 @@ async fn send_preparation(
     response_capability: [u8; 32],
     body: Vec<u8>,
 ) -> Result<axum::response::Response, Box<dyn Error>> {
-    Ok(app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH)
-                .header(
-                    header::CONTENT_TYPE,
-                    RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
-                )
-                .header(
-                    header::ACCEPT,
-                    RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
-                )
-                .header("idempotency-key", idempotency)
-                .header(
-                    DEVICE_ENROLLMENT_CAPABILITY_HEADER,
-                    Base64UrlUnpadded::encode_string(&enrollment_capability),
-                )
-                .header(
-                    RECOVERY_RESPONSE_CAPABILITY_HEADER,
-                    Base64UrlUnpadded::encode_string(&response_capability),
-                )
-                .body(Body::from(body))?,
+    send_preparation_custom(
+        app,
+        idempotency,
+        enrollment_capability,
+        response_capability,
+        RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
+        Some(RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE),
+        None,
+        body,
+    )
+    .await
+}
+
+async fn send_preparation_custom(
+    app: axum::Router,
+    idempotency: &str,
+    enrollment_capability: [u8; 32],
+    response_capability: [u8; 32],
+    content_type: &str,
+    accept: Option<&str>,
+    declared_length: Option<&str>,
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH)
+        .header(header::CONTENT_TYPE, content_type)
+        .header("idempotency-key", idempotency)
+        .header(
+            DEVICE_ENROLLMENT_CAPABILITY_HEADER,
+            Base64UrlUnpadded::encode_string(&enrollment_capability),
         )
-        .await?)
+        .header(
+            RECOVERY_RESPONSE_CAPABILITY_HEADER,
+            Base64UrlUnpadded::encode_string(&response_capability),
+        );
+    if let Some(accept) = accept {
+        builder = builder.header(header::ACCEPT, accept);
+    }
+    if let Some(length) = declared_length {
+        builder = builder.header(header::CONTENT_LENGTH, length);
+    }
+    Ok(app.oneshot(builder.body(Body::from(body))?).await?)
 }
 
 async fn send_status(
@@ -188,7 +231,15 @@ async fn send_status(
     request_id: dtx_domain::DeviceEnrollmentChallengeId,
     response_capability: [u8; 32],
 ) -> Result<axum::response::Response, Box<dyn Error>> {
-    send_status_custom(app, request_id, response_capability, None, Vec::new()).await
+    send_status_custom(
+        app,
+        request_id,
+        response_capability,
+        None,
+        Some(RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE),
+        Vec::new(),
+    )
+    .await
 }
 
 async fn send_status_custom(
@@ -196,6 +247,7 @@ async fn send_status_custom(
     request_id: dtx_domain::DeviceEnrollmentChallengeId,
     response_capability: [u8; 32],
     content_type: Option<&str>,
+    accept: Option<&str>,
     body: Vec<u8>,
 ) -> Result<axum::response::Response, Box<dyn Error>> {
     let mut builder = Request::builder()
@@ -207,10 +259,12 @@ async fn send_status_custom(
         .header(
             RECOVERY_RESPONSE_CAPABILITY_HEADER,
             Base64UrlUnpadded::encode_string(&response_capability),
-        )
-        .header(header::ACCEPT, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
+        );
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    if let Some(accept) = accept {
+        builder = builder.header(header::ACCEPT, accept);
     }
     Ok(app.oneshot(builder.body(Body::from(body))?).await?)
 }
@@ -228,7 +282,7 @@ async fn send_provider_response(
         session,
         request_id,
         RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE),
         None,
         body,
     )
@@ -241,7 +295,7 @@ async fn send_provider_response_custom(
     session: &Session,
     request_id: dtx_domain::DeviceEnrollmentChallengeId,
     content_type: &str,
-    accept: &str,
+    accept: Option<&str>,
     declared_length: Option<&str>,
     body: Vec<u8>,
 ) -> Result<axum::response::Response, Box<dyn Error>> {
@@ -252,9 +306,11 @@ async fn send_provider_response_custom(
                 .replace("{request_id}", &request_id.to_string()),
         )
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::ACCEPT, accept)
         .header("idempotency-key", idempotency)
         .header(header::AUTHORIZATION, authorization(session));
+    if let Some(accept) = accept {
+        builder = builder.header(header::ACCEPT, accept);
+    }
     if let Some(length) = declared_length {
         builder = builder.header(header::CONTENT_LENGTH, length);
     }

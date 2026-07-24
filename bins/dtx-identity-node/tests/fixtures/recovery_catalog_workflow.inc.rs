@@ -127,6 +127,25 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     let second_head = to_bytes(second.into_body(), 16_384).await?.to_vec();
     assert_eq!(first_head, second_head);
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 0, 0));
+    for (case, accept) in [
+        ("catalog-publish-missing-accept", None),
+        ("catalog-publish-wrong-accept", Some("application/cbor")),
+    ] {
+        let replay = send_catalog_custom(
+            app.clone(),
+            "catalog-publish-0001",
+            &authority_session,
+            1,
+            RECOVERY_SCOPE_CATALOG_CONTENT_TYPE,
+            accept,
+            None,
+            catalog.clone(),
+        )
+        .await?;
+        assert_eq!(replay.status(), StatusCode::OK, "{case}");
+        assert_catalog_headers(&replay, RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE);
+        assert_eq!(to_bytes(replay.into_body(), 16_384).await?, first_head);
+    }
     let catalog_head_digest = Sha256Digest::hash_domain(
         dtx_identity_persistence::CATALOG_HEAD_DIGEST_DOMAIN,
         &first_head,
@@ -192,7 +211,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         &authority_session,
         2,
         RECOVERY_SCOPE_CATALOG_CONTENT_TYPE,
-        vec![0; MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES + 1],
+        vec![0; MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES + 1],
     )
     .await?;
     assert_error(
@@ -286,6 +305,59 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     assert_catalog_headers(&prepare_first, RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE);
     let preparation_receipt_bytes = to_bytes(prepare_first.into_body(), 16_384).await?.to_vec();
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 0));
+    for (case, accept) in [
+        ("preparation-missing-accept", None),
+        ("preparation-wrong-accept", Some("application/cbor")),
+    ] {
+        let replay = send_preparation_custom(
+            app.clone(),
+            "catalog-preparation-0001",
+            enrollment_capability,
+            response_capability,
+            RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
+            accept,
+            None,
+            preparation.clone(),
+        )
+        .await?;
+        assert_eq!(replay.status(), StatusCode::OK, "{case}");
+        assert_catalog_headers(&replay, RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE);
+        assert_eq!(to_bytes(replay.into_body(), 16_384).await?, preparation_receipt_bytes);
+    }
+    let preparation_wrong_media = send_preparation_custom(
+        app.clone(),
+        "catalog-preparation-wrong-media",
+        enrollment_capability,
+        response_capability,
+        "application/cbor",
+        None,
+        None,
+        preparation.clone(),
+    )
+    .await?;
+    assert_error(
+        preparation_wrong_media,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "RECOVERY_HANDOFF_UNSUPPORTED_MEDIA_TYPE",
+    )
+    .await?;
+    let preparation_oversized = send_preparation_custom(
+        app.clone(),
+        "catalog-preparation-oversized",
+        enrollment_capability,
+        response_capability,
+        RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
+        None,
+        None,
+        vec![0; MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES + 1],
+    )
+    .await?;
+    assert_error(
+        preparation_oversized,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "RECOVERY_HANDOFF_TOO_LARGE",
+    )
+    .await?;
 
     let wrong_capability = send_status(app.clone(), challenge.challenge_id(), [62; 32]).await?;
     assert_error(
@@ -298,12 +370,29 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     assert_eq!(pending.status(), StatusCode::OK);
     assert_catalog_headers(&pending, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
     assert_redacted_status(pending, 1).await?;
+    for (case, accept) in [
+        ("status-missing-accept", None),
+        ("status-wrong-accept", Some("application/cbor")),
+    ] {
+        let rejected = send_status_custom(
+            app.clone(),
+            challenge.challenge_id(),
+            response_capability,
+            None,
+            accept,
+            Vec::new(),
+        )
+        .await?;
+        assert_eq!(rejected.status(), StatusCode::NOT_ACCEPTABLE, "{case}");
+        assert_catalog_headers(&rejected, "application/json");
+    }
 
     let get_with_content_type = send_status_custom(
         app.clone(),
         challenge.challenge_id(),
         response_capability,
         Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE),
+        None,
         Vec::new(),
     )
     .await?;
@@ -318,6 +407,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         challenge.challenge_id(),
         response_capability,
         None,
+        Some(RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE),
         vec![0],
     )
     .await?;
@@ -450,7 +540,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         &provider_session,
         challenge.challenge_id(),
         "application/cbor",
-        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE),
         None,
         provider_response_body.clone(),
     )
@@ -467,12 +557,25 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         &provider_session,
         challenge.challenge_id(),
         RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-        "application/cbor",
+        Some("application/cbor"),
         None,
         provider_response_body.clone(),
     )
     .await?;
     assert_error(wrong_accept, StatusCode::NOT_ACCEPTABLE, "RECOVERY_HANDOFF_NOT_ACCEPTABLE")
+        .await?;
+    let missing_accept = send_provider_response_custom(
+        app.clone(),
+        "catalog-provider-missing-accept",
+        &provider_session,
+        challenge.challenge_id(),
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        None,
+        None,
+        provider_response_body.clone(),
+    )
+    .await?;
+    assert_error(missing_accept, StatusCode::NOT_ACCEPTABLE, "RECOVERY_HANDOFF_NOT_ACCEPTABLE")
         .await?;
     let wrong_key = send_provider_response_custom(
         app.clone(),
@@ -480,7 +583,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         &authority_session,
         challenge.challenge_id(),
         RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE),
         None,
         provider_response_body.clone(),
     )
@@ -492,7 +595,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         &provider_session,
         challenge.challenge_id(),
         RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE),
         None,
         vec![0xff],
     )
@@ -505,7 +608,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         &provider_session,
         challenge.challenge_id(),
         RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE),
         Some("1"),
         vec![0; MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES + 1],
     )
