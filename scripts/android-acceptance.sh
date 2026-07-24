@@ -13,67 +13,108 @@ readonly AVD_A="${RUN_PREFIX}-a" AVD_B="${RUN_PREFIX}-b"
 readonly COMPOSE_PROJECT="dtx-android-accept-${RUN_ID}"
 readonly STATE_ROOT="$REPOSITORY_ROOT/.android-acceptance" RUN_ROOT="$REPOSITORY_ROOT/.android-acceptance/$RUN_ID"
 readonly EVIDENCE_ROOT="$REPOSITORY_ROOT/artifacts/android-acceptance/$RUN_ID"
-CLAIMED=0 COMPOSE_UP=0 AVD_A_CREATED=0 AVD_B_CREATED=0 REVERSE_A=0 REVERSE_B=0
+CLAIMED=0 COMPOSE_OWNED=0 AVD_A_CREATED=0 AVD_B_CREATED=0 REVERSE_A=0 REVERSE_B=0
 PID_A='' PID_B='' PROXY_A_PID='' PROXY_B_PID=''
-SERIAL_A='' SERIAL_B='' PROXY_A_PORT='' CONTROL_A_PORT='' PROXY_B_PORT='' CONTROL_B_PORT='' NODE_A_PORT='' NODE_B_PORT=''
+SERIAL_A='' SERIAL_B='' PROXY_A_PORT='' CONTROL_A_PORT='' PROXY_B_PORT='' CONTROL_B_PORT='' NODE_A_PORT='' NODE_B_PORT='' EMULATOR_A_PORT='' EMULATOR_B_PORT='' ALLOCATOR_LOCK_FD=''
 
 die() { printf '%s\n' "android-acceptance: $*" >&2; exit 1; }
 valid_run_id() { [[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,47}$ ]]; }
 safe_run_root() { [[ "$RUN_ROOT" == "$STATE_ROOT/$RUN_ID" && "$RUN_ID" != *'/'* ]]; }
 safe_avd() { [[ "$1" == "$RUN_PREFIX"-* && "$1" != "$RUN_PREFIX" ]]; }
 safe_project() { [[ "$COMPOSE_PROJECT" == "dtx-android-accept-$RUN_ID" ]]; }
-port_free() { ! ss -ltnH "sport = :$1" | grep -q .; }
 record() { printf '%s=%s\n' "$1" "$2" >>"$RUN_ROOT/resources"; }
 
+safe_state_tree() {
+  local current="$REPOSITORY_ROOT" part relative
+  [[ "$STATE_ROOT" == "$REPOSITORY_ROOT/.android-acceptance" ]] || return 1
+  relative="${STATE_ROOT#"$REPOSITORY_ROOT"/}"
+  IFS=/ read -r -a parts <<<"$relative"
+  for part in "${parts[@]}"; do current="$current/$part"; [[ ! -L "$current" ]] || return 1; done
+  [[ ! -e "$STATE_ROOT" || -d "$STATE_ROOT" ]]
+}
+
+claim_allocator() {
+  safe_state_tree || die 'state root or parent is a symlink or outside repository'
+  mkdir -- "$STATE_ROOT" 2>/dev/null || [[ -d "$STATE_ROOT" ]] || die 'cannot create state root'
+  safe_state_tree || die 'unsafe state root after creation'
+  exec {ALLOCATOR_LOCK_FD}>"$STATE_ROOT/.allocator.lock"
+  flock -n "$ALLOCATOR_LOCK_FD" || die 'another Android acceptance run owns the allocator'
+}
+
+release_allocator() {
+  [[ -z "$ALLOCATOR_LOCK_FD" ]] || eval "exec ${ALLOCATOR_LOCK_FD}>&-"
+  ALLOCATOR_LOCK_FD=''
+}
+
 claim() {
-  mkdir -p -- "$STATE_ROOT"
+  claim_allocator
   valid_run_id && safe_run_root && safe_project || die 'unsafe run identity'
   (umask 077; mkdir -- "$RUN_ROOT") 2>/dev/null || die 'run id already claimed or unsafe state exists'
   CLAIMED=1
   : >"$RUN_ROOT/resources"
   record run_id "$RUN_ID"; record compose_project "$COMPOSE_PROJECT"
+  allocate_ports
+  # Allocation is serialized with every live run's durable reservation, but the
+  # lock is not held while Android work executes: independent RUN_IDs can run
+  # concurrently without selecting the same ports or serials.
+  release_allocator
 }
 
 allocate_ports() {
-  local seed candidate offset
+  local seed candidate offset resources
   seed=$(printf '%s' "$RUN_ID" | cksum | awk '{print $1}')
-  candidate=$((20000 + seed % 20000))
+  resources=$(find "$STATE_ROOT" -mindepth 2 -maxdepth 2 -name resources -type f -print0 2>/dev/null | xargs -0r cat 2>/dev/null || true)
   for offset in $(seq 0 999); do
-    candidate=$((20000 + (candidate - 20000 + offset * 8) % 20000))
-    if port_free "$candidate" && port_free "$((candidate+1))" && port_free "$((candidate+2))" && port_free "$((candidate+3))" && port_free "$((candidate+4))" && port_free "$((candidate+5))"; then
-      NODE_A_PORT=$candidate; NODE_B_PORT=$((candidate+1)); PROXY_A_PORT=$((candidate+2)); CONTROL_A_PORT=$((candidate+3)); PROXY_B_PORT=$((candidate+4)); CONTROL_B_PORT=$((candidate+5))
-      record node_a_port "$NODE_A_PORT"; record node_b_port "$NODE_B_PORT"
-      record proxy_a_port "$PROXY_A_PORT"; record control_a_port "$CONTROL_A_PORT"; record proxy_b_port "$PROXY_B_PORT"; record control_b_port "$CONTROL_B_PORT"
-      return
+    candidate=$((20000 + ((seed % 10000 + offset * 3) % 10000)))
+    # Emulator console ports are restricted to the documented even 5554-5682
+    # range.  A/B consume adjacent even slots; the durable reservation scan
+    # below makes the finite range fail closed instead of reusing a serial.
+    EMULATOR_A_PORT=$((5554 + ((seed % 64 + offset) % 64) * 2)); EMULATOR_B_PORT=$((EMULATOR_A_PORT + 2))
+    if printf '%s\n' "$resources" | grep -Eq "^(node_a_port|node_b_port|proxy_a_port|control_a_port|proxy_b_port|control_b_port)=(${candidate}|$((candidate+1))|$((candidate+2))|$((candidate+3))|$((candidate+4))|$((candidate+5)))$|^(emulator_a_port|emulator_b_port)=(${EMULATOR_A_PORT}|${EMULATOR_B_PORT})$"; then
+      continue
     fi
+    break
   done
-  die 'no exclusive loopback proxy ports available'
+  (( offset < 999 )) || die 'no exclusive Android acceptance port reservation available'
+  NODE_A_PORT=$candidate; NODE_B_PORT=$((candidate+1)); PROXY_A_PORT=$((candidate+2)); CONTROL_A_PORT=$((candidate+3)); PROXY_B_PORT=$((candidate+4)); CONTROL_B_PORT=$((candidate+5))
+  SERIAL_A="emulator-$EMULATOR_A_PORT"; SERIAL_B="emulator-$EMULATOR_B_PORT"
+  record node_a_port "$NODE_A_PORT"; record node_b_port "$NODE_B_PORT"
+  record proxy_a_port "$PROXY_A_PORT"; record control_a_port "$CONTROL_A_PORT"; record proxy_b_port "$PROXY_B_PORT"; record control_b_port "$CONTROL_B_PORT"
+  record emulator_a_port "$EMULATOR_A_PORT"; record emulator_b_port "$EMULATOR_B_PORT"; record emulator_a_serial "$SERIAL_A"; record emulator_b_serial "$SERIAL_B"
 }
 
 stop_pid() {
   local pid=$1 port=$2
-  [[ -n "$pid" ]] || return
+  [[ -n "$pid" ]] || return 0
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  ! kill -0 "$pid" 2>/dev/null || die 'child process survived teardown'
-  port_free "$port" || die 'proxy port remained allocated'
+  ! kill -0 "$pid" 2>/dev/null || return 1
+  ! ss -ltnH "sport = :$port" | grep -q . || return 1
 }
 cleanup() {
-  local status=$?
+  local status=$? cleanup_failed=0
   set +e
   [[ "$MODE" == run ]] || exit "$status"
-  [[ "$REVERSE_A" == 1 ]] && adb -s "$SERIAL_A" reverse --remove tcp:8443 >/dev/null 2>&1
-  [[ "$REVERSE_B" == 1 ]] && adb -s "$SERIAL_B" reverse --remove tcp:8443 >/dev/null 2>&1
-  stop_pid "$PROXY_A_PID" "$PROXY_A_PORT"; stop_pid "$PROXY_B_PID" "$PROXY_B_PORT"
-  [[ -n "$PID_A" ]] && kill "$PID_A" 2>/dev/null; [[ -n "$PID_B" ]] && kill "$PID_B" 2>/dev/null
-  [[ -n "$PID_A" ]] && wait "$PID_A" 2>/dev/null; [[ -n "$PID_B" ]] && wait "$PID_B" 2>/dev/null
-  [[ "$AVD_A_CREATED" == 1 ]] && safe_avd "$AVD_A" && avdmanager delete avd --name "$AVD_A" >/dev/null 2>&1
-  [[ "$AVD_B_CREATED" == 1 ]] && safe_avd "$AVD_B" && avdmanager delete avd --name "$AVD_B" >/dev/null 2>&1
-  [[ "$COMPOSE_UP" == 1 ]] && safe_project && docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" down --volumes --remove-orphans >/dev/null 2>&1
-  [[ "$CLAIMED" == 1 ]] && safe_run_root && rm -rf -- "$RUN_ROOT"
+  [[ "$REVERSE_A" != 1 ]] || adb -s "$SERIAL_A" reverse --remove tcp:8443 >/dev/null 2>&1 || cleanup_failed=1
+  [[ "$REVERSE_B" != 1 ]] || adb -s "$SERIAL_B" reverse --remove tcp:8443 >/dev/null 2>&1 || cleanup_failed=1
+  stop_pid "$PROXY_A_PID" "$PROXY_A_PORT" || cleanup_failed=1; stop_pid "$PROXY_B_PID" "$PROXY_B_PORT" || cleanup_failed=1
+  [[ -z "$PID_A" ]] || kill "$PID_A" 2>/dev/null || cleanup_failed=1; [[ -z "$PID_B" ]] || kill "$PID_B" 2>/dev/null || cleanup_failed=1
+  [[ -z "$PID_A" ]] || wait "$PID_A" 2>/dev/null || true; [[ -z "$PID_B" ]] || wait "$PID_B" 2>/dev/null || true
+  [[ "$AVD_A_CREATED" != 1 ]] || { safe_avd "$AVD_A" && avdmanager delete avd --name "$AVD_A" >/dev/null 2>&1 && ! avdmanager list avd | grep -Fqx "    Name: $AVD_A"; } || cleanup_failed=1
+  [[ "$AVD_B_CREATED" != 1 ]] || { safe_avd "$AVD_B" && avdmanager delete avd --name "$AVD_B" >/dev/null 2>&1 && ! avdmanager list avd | grep -Fqx "    Name: $AVD_B"; } || cleanup_failed=1
+  [[ "$COMPOSE_OWNED" != 1 ]] || { safe_project && docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" down --volumes --remove-orphans >/dev/null 2>&1; } || cleanup_failed=1
+  if [[ "$cleanup_failed" == 1 ]]; then
+    [[ "$CLAIMED" != 1 ]] || printf '%s\n' 'cleanup=failed' >"$RUN_ROOT/cleanup-status"
+    [[ "$status" != 0 ]] || status=1
+    exit "$status"
+  fi
+  [[ "$CLAIMED" != 1 ]] || { safe_state_tree && safe_run_root && rm -rf -- "$RUN_ROOT"; } || exit 1
   exit "$status"
 }
-trap cleanup EXIT INT TERM
+on_signal() { exit "$1"; }
+trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 preflight() {
   valid_run_id && safe_run_root && safe_project || die 'unsafe run identity'
@@ -102,21 +143,24 @@ start_proxy() {
   local listen=$1 upstream=$2 control=$3 variable=$4
   "$REPOSITORY_ROOT/target/debug/dtx-android-response-loss-proxy" "127.0.0.1:$listen" "127.0.0.1:$upstream" "127.0.0.1:$control" >/dev/null 2>&1 &
   local pid=$!
-  sleep 0.1; kill -0 "$pid" || die 'proxy exited during startup'
-  ss -ltnH "sport = :$listen" | grep -q . && ss -ltnH "sport = :$control" | grep -q . || die 'proxy listeners not ready'
+  # Record ownership before the first readiness probe: startup can fail after
+  # fork but before either listener exists.
   printf -v "$variable" '%s' "$pid"
   record "$variable" "$pid"
+  sleep 0.1; kill -0 "$pid" || die 'proxy exited during startup'
+  ss -ltnH "sport = :$listen" | grep -q . && ss -ltnH "sport = :$control" | grep -q . || die 'proxy listeners not ready'
 }
 real_run() {
-  claim; allocate_ports; preflight
+  claim; preflight
   cargo build --locked -p dtx-android-response-loss-proxy
-  DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" up --detach --wait; COMPOSE_UP=1
+  COMPOSE_OWNED=1; record compose_owned 1
+  DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" up --detach --wait
   mkdir -p -- "$RUN_ROOT/tls"
   DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" cp tls-bootstrap:/run/dtx-local-tls/ca.pem "$RUN_ROOT/tls/ca.pem"
   avdmanager create avd --name "$AVD_A" --package "$DTX_ANDROID_SYSTEM_IMAGE" >/dev/null; AVD_A_CREATED=1
   avdmanager create avd --name "$AVD_B" --package "$DTX_ANDROID_SYSTEM_IMAGE" >/dev/null; AVD_B_CREATED=1
-  emulator -avd "$AVD_A" -port 5554 -no-snapshot -wipe-data -no-window >/dev/null 2>&1 & PID_A=$!; SERIAL_A=emulator-5554; record emulator_a_pid "$PID_A"; record emulator_a_serial "$SERIAL_A"
-  emulator -avd "$AVD_B" -port 5556 -no-snapshot -wipe-data -no-window >/dev/null 2>&1 & PID_B=$!; SERIAL_B=emulator-5556; record emulator_b_pid "$PID_B"; record emulator_b_serial "$SERIAL_B"
+  emulator -avd "$AVD_A" -port "$EMULATOR_A_PORT" -no-snapshot -wipe-data -no-window >/dev/null 2>&1 & PID_A=$!; record emulator_a_pid "$PID_A"
+  emulator -avd "$AVD_B" -port "$EMULATOR_B_PORT" -no-snapshot -wipe-data -no-window >/dev/null 2>&1 & PID_B=$!; record emulator_b_pid "$PID_B"
   verify_emulator "$SERIAL_A" "$PID_A" "$AVD_A"; verify_emulator "$SERIAL_B" "$PID_B" "$AVD_B"
   install_ca_system_store "$SERIAL_A" "$RUN_ROOT/tls/ca.pem"; install_ca_system_store "$SERIAL_B" "$RUN_ROOT/tls/ca.pem"
   start_proxy "$PROXY_A_PORT" "$NODE_A_PORT" "$CONTROL_A_PORT" PROXY_A_PID; start_proxy "$PROXY_B_PORT" "$NODE_B_PORT" "$CONTROL_B_PORT" PROXY_B_PID

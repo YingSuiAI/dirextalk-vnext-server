@@ -381,45 +381,31 @@ fn has_expected_server_sans(
     let Ok(Some(subject_alternative_name)) = certificate.subject_alternative_name() else {
         return false;
     };
-    let names = &subject_alternative_name.value.general_names;
-    let has_node_name = names
-        .iter()
-        .any(|name| matches!(name, GeneralName::DNSName(value) if *value == node_name));
-    let has_localhost = names
-        .iter()
-        .any(|name| matches!(name, GeneralName::DNSName(value) if *value == "localhost"));
-    let has_loopback = names
-        .iter()
-        .any(|name| matches!(name, GeneralName::IPAddress(value) if *value == [127, 0, 0, 1]));
-    let android_loopback_names = names
-        .iter()
-        .filter_map(|name| match name {
-            GeneralName::DNSName(value)
-                if *value == "node-a.localhost" || *value == "node-b.localhost" =>
-            {
-                Some(*value)
+    let mut actual = Vec::new();
+    for name in &subject_alternative_name.value.general_names {
+        match name {
+            GeneralName::DNSName(value) => actual.push(format!("dns:{value}")),
+            GeneralName::IPAddress(value) if *value == [127, 0, 0, 1] => {
+                actual.push("ip:127.0.0.1".to_owned());
             }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let expected_android_loopback_names: &[&str] = match node_name {
-        "node-a" => &["node-a.localhost"],
-        "node-b" => &["node-b.localhost"],
-        _ => &[],
-    };
-    let allowed_dns_names: Vec<&str> = [node_name, "localhost"]
-        .into_iter()
-        .chain(expected_android_loopback_names.iter().copied())
-        .collect();
-    let has_only_expected_dns_names = names.iter().all(|name| match name {
-        GeneralName::DNSName(value) => allowed_dns_names.contains(value),
-        _ => true,
-    });
-    has_node_name
-        && has_localhost
-        && has_loopback
-        && android_loopback_names == expected_android_loopback_names
-        && has_only_expected_dns_names
+            // This rejects every non-DNS GeneralName, non-loopback IP, and
+            // duplicate/extra entry once compared as a multiset below.
+            _ => return false,
+        }
+    }
+    let mut expected = vec![
+        format!("dns:{node_name}"),
+        "dns:localhost".to_owned(),
+        "ip:127.0.0.1".to_owned(),
+    ];
+    match node_name {
+        "node-a" => expected.push("dns:node-a.localhost".to_owned()),
+        "node-b" => expected.push("dns:node-b.localhost".to_owned()),
+        _ => {}
+    }
+    actual.sort_unstable();
+    expected.sort_unstable();
+    actual == expected
 }
 
 struct GeneratedArtifacts {
@@ -615,11 +601,13 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use rcgen::{CertificateParams, KeyPair};
     use x509_parser::{extensions::GeneralName, parse_x509_certificate, pem::parse_x509_pem};
 
     use super::{
         BootstrapError, BootstrapOutcome, CA_CERTIFICATE_FILE, LOCAL_NODE_NAMES,
-        MAX_OUTPUT_DIRECTORY_BYTES, artifact_paths, bootstrap, parse_output_directory,
+        MAX_OUTPUT_DIRECTORY_BYTES, artifact_paths, bootstrap, has_expected_server_sans,
+        parse_output_directory,
     };
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -734,6 +722,39 @@ mod tests {
             fs::read(&paths.node_c.private_key).expect("node-c key is readable"),
         ];
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn rejects_reused_leaf_with_an_extra_or_duplicate_san() {
+        for names in [
+            vec![
+                "node-a",
+                "localhost",
+                "127.0.0.1",
+                "node-a.localhost",
+                "evil.test",
+            ],
+            vec![
+                "node-a",
+                "localhost",
+                "127.0.0.1",
+                "node-a.localhost",
+                "localhost",
+            ],
+        ] {
+            let params =
+                CertificateParams::new(names.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .expect("test SAN parameters are valid");
+            let key = KeyPair::generate_for(super::LOCAL_TLS_SIGNING_ALGORITHM)
+                .expect("test key is generated");
+            let certificate = params
+                .self_signed(&key)
+                .expect("test certificate is generated");
+            let der = certificate.der();
+            let (_, certificate) =
+                parse_x509_certificate(der.as_ref()).expect("certificate parses");
+            assert!(!has_expected_server_sans(&certificate, "node-a"));
+        }
     }
 
     #[test]
