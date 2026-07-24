@@ -152,6 +152,11 @@ impl PgStore {
 
     /// Checks the immutable Product Core schema epoch on an already-authorized
     /// pool.  Service stores use this after their own exact role validators.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `PostgreSQL` error when the applied-version or schema-epoch
+    /// facts cannot be read through the supplied runtime role.
     pub async fn readiness_check_schema(pool: &PgPool) -> Result<bool, sqlx::Error> {
         let applied = sqlx::query_as::<_, (i64, bool, Vec<u8>)>(
             "SELECT version, success, checksum FROM system.schema_versions",
