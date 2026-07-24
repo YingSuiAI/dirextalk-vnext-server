@@ -88,19 +88,83 @@ mod responses;
 #[path = "http/sessions_enrollment.rs"]
 mod sessions_enrollment;
 
-pub(crate) use auth::*;
-pub(crate) use contacts::*;
+pub(crate) use auth::{
+    client_binding_id, expected_device_revoke_head_hash, expected_genesis_hash,
+    has_exact_content_type, has_exact_event_content_type, has_exact_header,
+    has_exact_json_content_type, idempotency_key_hash, idempotency_key_hash_binding,
+    single_graphic_header, take_client_binding_authorization_digest,
+};
+pub(crate) use contacts::{
+    create_contact_invite, get_contact_receipt, pending_contact_requests, review_contact_request,
+    revoke_contact_invite, submit_contact_request,
+};
 pub use enrollment_codec::parse_device_session_authorization;
-pub(crate) use enrollment_codec::*;
-pub(crate) use error_types::*;
-pub(crate) use errors::*;
-pub(crate) use identity::*;
-pub(crate) use identity_codec::*;
-pub(crate) use key_package_codec::*;
-pub(crate) use key_packages::*;
-pub(crate) use recovery::*;
-pub(crate) use responses::*;
-pub(crate) use sessions_enrollment::*;
+pub(crate) use enrollment_codec::{
+    DeviceSessionAuthorizationError, decode_base64url_32, parse_device_enrollment_candidate,
+    parse_device_enrollment_completion, parse_device_enrollment_status_request,
+    parse_history_recovery_request, parse_json_body,
+};
+pub(crate) use error_types::map_client_binding_error;
+pub(crate) use error_types::{
+    BootstrapErrorBody, BootstrapErrorCode, BootstrapErrorEnvelope, BootstrapFailure,
+    BootstrapSuccess, ClientBindingFailure, DeviceEnrollmentApprovalSuccess,
+    DeviceEnrollmentChallengeSuccess, DeviceEnrollmentErrorCode, DeviceEnrollmentFailure,
+    DeviceRevokeErrorCode, DeviceRevokeFailure, DeviceRevokeSuccess, DeviceSessionChallengeRequest,
+    DeviceSessionChallengeResponse, DeviceSessionCompletionRequest, DeviceSessionErrorCode,
+    DeviceSessionFailure, DeviceSessionSuccess, IdentityLogPageErrorCode, IdentityLogPageFailure,
+    InitialDeviceErrorCode, InitialDeviceFailure, InitialDeviceSuccess, KeyPackageClaimSuccess,
+    KeyPackageErrorCode, KeyPackageFailure, KeyPackagePublishSuccess,
+    MlsV5RecoveryAuthorizationErrorCode, MlsV5RecoveryAuthorizationFailure,
+    RecoveryCatalogErrorCode, RecoveryCatalogFailure, RecoveryCatalogHeadSuccess,
+    RecoveryCatalogStatusSuccess, SafeErrorBody, SafeErrorEnvelope,
+};
+pub(crate) use errors::{
+    map_device_enrollment_persistence_error, map_device_revoke_persistence_error,
+    map_device_session_persistence_error, map_federated_identity_error,
+    map_identity_log_page_persistence_error, map_initial_device_persistence_error,
+    map_key_package_persistence_error, map_persistence_error, map_recovery_catalog_prepare_error,
+    map_recovery_catalog_provider_error, map_recovery_catalog_publish_error,
+    map_recovery_catalog_status_error,
+};
+pub(crate) use identity::{
+    bootstrap_identity, deployment_bootstrap_identity, deployment_initial_device,
+    enroll_initial_device, get_identity_log_page, get_mls_v5_recovery_authorization,
+};
+pub(crate) use identity_codec::{
+    is_base64url_byte, load_mls_v5_recovery_authorization_projection,
+    parse_identity_log_page_request, parse_mls_v5_recovery_authorization_query,
+    parse_positive_safe_uint_path, parse_recovery_enrollment_capability,
+    parse_recovery_response_capability,
+};
+pub(crate) use key_package_codec::{
+    parse_federated_key_package_claim_proof, parse_key_package_claim, parse_key_package_publish,
+};
+pub(crate) use key_packages::{
+    claim_key_package, claim_key_package_federated, publish_key_package,
+};
+pub(crate) use recovery::{
+    get_recovery_scope_catalog_preparation, prepare_recovery_scope_catalog,
+    publish_recovery_scope_catalog, put_recovery_scope_catalog_provider_response,
+};
+pub(crate) use responses::{
+    bootstrap_failure_response, bootstrap_success_response, client_binding_failure_response,
+    contact_failure, contact_secret, device_enrollment_approval_success_response,
+    device_enrollment_challenge_success_response, device_enrollment_failure_response,
+    device_enrollment_status_response, device_revoke_failure_response,
+    device_revoke_success_response, device_session_challenge_success_response,
+    device_session_failure_response, device_session_success_response, encode_pending,
+    exact_cbor_response, identity_log_page_failure_response, identity_log_page_success_response,
+    initial_device_failure_response, initial_device_success_response,
+    key_package_claim_success_response, key_package_failure_response,
+    key_package_publish_success_response, mls_v5_recovery_authorization_failure_response,
+    recovery_catalog_failure_response, recovery_catalog_head_response,
+    recovery_catalog_status_response,
+};
+pub(crate) use sessions_enrollment::{
+    approve_device_enrollment, cancel_device_enrollment_challenge, complete_device_session,
+    create_device_enrollment_challenge, create_device_session_challenge,
+    get_device_enrollment_challenge, revoke_device,
+};
 
 /// Route for the self-authenticated identity genesis request.
 pub const IDENTITY_BOOTSTRAP_PATH: &str = "/v1/identity/bootstrap";
@@ -449,7 +513,21 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::enrollment_codec::{
+        cbor_field, exact_cbor_fields, parse_device_enrollment_candidate,
+    };
+    use super::responses::{
+        client_binding_failure_response, encode_device_enrollment_status_fields,
+    };
+    use super::{
+        CLIENT_BINDING_HEADER, CanonicalValue, ClientBindingAuthorization, ClientBindingFailure,
+        DeviceEnrollmentChallengeId, DeviceId, HTTP_IDEMPOTENCY_KEY_HASH_DOMAIN, HeaderMap,
+        HeaderValue, IDEMPOTENCY_KEY_HEADER, IDENTITY_LOG_EVENT_CONTENT_TYPE, IdentityId,
+        RequestId, SigningPublicKey, StatusCode, UtcMillis, decode_deterministic_cbor,
+        encode_deterministic_cbor, has_exact_event_content_type, idempotency_key_hash_binding,
+        take_client_binding_authorization_digest,
+    };
+    use axum::http::header;
 
     use ed25519_dalek::SigningKey;
 

@@ -1,4 +1,8 @@
-use super::*;
+use super::{
+    BootstrapFailure, DeviceEnrollmentFailure, DeviceRevokeFailure, DeviceSessionFailure,
+    FederatedIdentityError, IdentityLogPageFailure, IdentityPersistenceError, InitialDeviceFailure,
+    KeyPackageFailure, RecoveryCatalogFailure,
+};
 
 pub(crate) fn map_identity_log_page_persistence_error(
     error: &IdentityPersistenceError,

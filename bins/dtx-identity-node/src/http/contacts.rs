@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    CONTACT_INVITE_CONTENT_TYPE, CONTACT_INVITE_RECEIPT_CONTENT_TYPE, CONTACT_INVITE_SECRET_HEADER,
+    CONTACT_PENDING_CONTENT_TYPE, CONTACT_RECEIPT_CONTENT_TYPE, CONTACT_RECEIPT_SECRET_HEADER,
+    CONTACT_REQUEST_CONTENT_TYPE, CONTACT_REVIEW_CONTENT_TYPE, ContactInviteV1, ContactRequestV1,
+    ContactReviewV1, ContactStoreError, HeaderMap, IdentityBootstrapState, InviteCapabilityId,
+    Path, Request, RequestId, Response, State, StatusCode, contact_failure, contact_secret,
+    encode_pending, exact_cbor_response, has_exact_content_type, header, idempotency_key_hash,
+    parse_device_session_authorization, to_bytes,
+};
 
 pub(crate) async fn create_contact_invite(
     State(state): State<IdentityBootstrapState>,
@@ -11,30 +19,26 @@ pub(crate) async fn create_contact_invite(
     {
         return contact_failure(ContactStoreError::Invalid, request_id);
     }
-    let credential = match parse_device_session_authorization(&parts.headers) {
-        Ok(v) => v,
-        Err(_) => return contact_failure(ContactStoreError::Authentication, request_id),
+    let Ok(credential) = parse_device_session_authorization(&parts.headers) else {
+        return contact_failure(ContactStoreError::Authentication, request_id);
     };
-    let idempotency =
-        match idempotency_key_hash(&parts.headers, b"dirextalk.contact-invite-http.v1\0") {
-            Ok(v) => v,
-            Err(_) => return contact_failure(ContactStoreError::Invalid, request_id),
-        };
+    let Ok(idempotency) =
+        idempotency_key_hash(&parts.headers, b"dirextalk.contact-invite-http.v1\0")
+    else {
+        return contact_failure(ContactStoreError::Invalid, request_id);
+    };
     let secret = match contact_secret(&parts.headers, CONTACT_INVITE_SECRET_HEADER) {
         Ok(v) => v,
         Err(e) => return contact_failure(e, request_id),
     };
-    let bytes = match to_bytes(body, 65_536).await {
-        Ok(v) => v,
-        Err(_) => return contact_failure(ContactStoreError::Invalid, request_id),
+    let Ok(bytes) = to_bytes(body, 65_536).await else {
+        return contact_failure(ContactStoreError::Invalid, request_id);
     };
-    let invite = match ContactInviteV1::decode(&bytes) {
-        Ok(v) => v,
-        Err(_) => return contact_failure(ContactStoreError::Invalid, request_id),
+    let Ok(invite) = ContactInviteV1::decode(&bytes) else {
+        return contact_failure(ContactStoreError::Invalid, request_id);
     };
-    let now = match state.committed_at() {
-        Ok(v) => v,
-        Err(()) => return contact_failure(ContactStoreError::Unavailable, request_id),
+    let Ok(now) = state.committed_at() else {
+        return contact_failure(ContactStoreError::Unavailable, request_id);
     };
     match state
         .contacts
