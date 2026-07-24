@@ -198,15 +198,6 @@ DO $grants$ BEGIN
         ) ON identity.recovery_scope_catalog_preparations TO dtx_identity_runtime;
     END IF;
 END $grants$;
-CREATE FUNCTION identity.enforce_history_recovery_request_v4_immutable()
-RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-    RAISE EXCEPTION 'history recovery request is immutable' USING ERRCODE='23514';
-END
-$$;
-CREATE TRIGGER identity_history_recovery_request_v4_immutable
-BEFORE UPDATE OR DELETE ON identity.history_recovery_requests
-FOR EACH ROW EXECUTE FUNCTION identity.enforce_history_recovery_request_v4_immutable();
 -- V42 immutable candidate Request V4 admission. Raw capabilities and
 -- idempotency keys are represented only by domain-separated digests.
 CREATE TABLE identity.history_recovery_requests (
@@ -246,6 +237,15 @@ DO $grants$ BEGIN
         GRANT SELECT,INSERT ON identity.history_recovery_requests TO dtx_identity_runtime;
     END IF;
 END $grants$;
+CREATE FUNCTION identity.enforce_history_recovery_request_v4_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'history recovery request is immutable' USING ERRCODE='23514';
+END
+$$;
+CREATE TRIGGER identity_history_recovery_request_v4_immutable
+BEFORE UPDATE OR DELETE ON identity.history_recovery_requests
+FOR EACH ROW EXECUTE FUNCTION identity.enforce_history_recovery_request_v4_immutable();
 
 -- V43 opaque push is a wake hint only.  Mailbox Pull/ACK and account read
 -- cursors remain authoritative; this relation never contains a provider body.
