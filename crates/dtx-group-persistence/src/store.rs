@@ -48,6 +48,11 @@ impl GroupPgStore {
     }
 
     /// Revalidates the current role and the exact fresh-only schema epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database is unavailable, the group runtime
+    /// role is invalid, or the schema epoch differs from the Alpha baseline.
     pub async fn readiness_check(&self) -> Result<bool, GroupPersistenceError> {
         validate_group_runtime_role(&self.pool).await?;
         dtx_storage::PgStore::readiness_check_schema(&self.pool)

@@ -363,7 +363,7 @@ async fn owner_removal_atomically_advances_mls_and_policy_and_replays_exact_rece
 #[allow(clippy::too_many_lines)]
 async fn bootstrap_replay_confirmation_and_concurrent_device_add_are_fenced()
 -> Result<(), Box<dyn Error>> {
-    let (_harness, store) = seeded_store().await?;
+    let (_harness, store) = Box::pin(seeded_store()).await?;
     let repository = MlsCommitSequencerRepository;
     let signer = signing_key();
     let signer_public = public_key(&signer);
@@ -670,7 +670,7 @@ async fn bootstrap_replay_confirmation_and_concurrent_device_add_are_fenced()
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn bootstrap_and_proof_failures_leave_no_sequencer_facts() -> Result<(), Box<dyn Error>> {
-    let (_harness, store) = seeded_store().await?;
+    let (_harness, store) = Box::pin(seeded_store()).await?;
     let repository = MlsCommitSequencerRepository;
     let signer = signing_key();
     let public = public_key(&signer);
@@ -778,7 +778,7 @@ async fn bootstrap_and_proof_failures_leave_no_sequencer_facts() -> Result<(), B
 #[tokio::test]
 async fn exact_device_fact_without_identity_membership_is_not_router_eligible()
 -> Result<(), Box<dyn Error>> {
-    let (harness, store) = seeded_store().await?;
+    let (harness, store) = Box::pin(seeded_store()).await?;
     let outsider = IdentityId::from_str(&format!("dtxi1c{}", "a".repeat(51)))?;
     let outsider_device = device("0190f2a5-7b1c-7abc-8def-0123456789a6");
     let mut transaction = harness.admin_pool().begin().await?;

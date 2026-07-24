@@ -46,6 +46,12 @@ impl IdentityPgStore {
     }
 
     /// Revalidates the current role and the exact fresh-only schema epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database cannot be reached, the runtime role
+    /// no longer satisfies the identity boundary, or the schema epoch differs
+    /// from the Product Core Alpha baseline.
     pub async fn readiness_check(&self) -> Result<bool, IdentityPersistenceError> {
         validate_identity_runtime_role(&self.pool).await?;
         dtx_storage::PgStore::readiness_check_schema(&self.pool)

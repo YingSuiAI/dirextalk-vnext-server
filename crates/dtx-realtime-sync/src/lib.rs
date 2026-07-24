@@ -220,6 +220,11 @@ impl RealtimeSyncStore {
     }
 
     /// Revalidates the runtime role and exact fresh-only schema epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database is unavailable, the Realtime role
+    /// lacks its exact grants, or the schema epoch differs from the baseline.
     pub async fn readiness_check(&self) -> Result<bool, RealtimeSyncError> {
         let authorized: bool = sqlx::query_scalar(
             "SELECT realtime.runtime_authorized()

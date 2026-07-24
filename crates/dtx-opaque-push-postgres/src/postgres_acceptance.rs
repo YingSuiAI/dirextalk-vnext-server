@@ -91,7 +91,6 @@ struct ContextBindingSealer;
 
 impl ContextBindingSealer {
     fn open(
-        &self,
         binding: RegistrationBinding,
         secret_id: SecretId,
         envelope: &TokenEnvelope,
@@ -598,6 +597,98 @@ async fn postgres_registration_put_replays_bytes_without_resealing_and_rejects_b
     Ok(())
 }
 
+async fn assert_registration_id_mismatch_is_rejected(
+    harness: &support::PostgresHarness,
+    fixture: &Fixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rejected = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT messaging.opaque_push_commit_put($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
+    )
+    .bind(Uuid::from(fixture.credential.session_id()))
+    .bind(fixture.credential.database_secret_hash().for_database_binding().to_vec())
+    .bind(Uuid::now_v7())
+    .bind("PUT")
+    .bind("/v43/push")
+    .bind(b"context-mismatch".to_vec())
+    .bind(1_i64)
+    .bind(vec![5_u8; 32])
+    .bind(i16::try_from(fixture.head.wire().protocol.major())?)
+    .bind(i16::try_from(fixture.head.wire().protocol.minor())?)
+    .bind(i16::try_from(fixture.head.wire().minimum_reader.major())?)
+    .bind(i16::try_from(fixture.head.wire().minimum_reader.minor())?)
+    .bind("active")
+    .bind(i64::try_from(fixture.head.sequence().get())?)
+    .bind(fixture.head.hash().as_bytes().to_vec())
+    .bind(vec![8_u8; 17])
+    .bind(vec![7_u8; 24])
+    .bind(vec![9_u8])
+    .bind("context.binding.v1")
+    .bind(vec![1_u8])
+    .fetch_one(
+        RegistrationPool::connect(
+            harness.push_registration_options(),
+            1,
+            "dtx_push_registration_only_test",
+        )
+        .await?
+        .pool(),
+    )
+    .await
+    .expect_err("commit must reject a registration ID that differs from the durable row");
+    assert_eq!(
+        rejected
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("40001")
+    );
+    Ok(())
+}
+
+async fn assert_replacement_delivery_succeeds(
+    harness: &support::PostgresHarness,
+    fixture: &Fixture,
+    replacement: (Uuid, i64),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let delivery_id =
+        insert_delivery(harness, fixture, replacement.0, replacement.1, 59_000).await?;
+    let persistence = PostgresPushPersistence::new(
+        BrokerPool::connect(
+            harness.push_broker_options(),
+            2,
+            "dtx_push_broker_only_test",
+        )
+        .await?,
+        fixture.tenant_id,
+    );
+    let claim = persistence.claim(1).await?.pop().unwrap();
+    ContextBindingSealer::open(
+        claim.registration(),
+        claim.registration_id(),
+        claim.envelope(),
+    )?;
+    assert!(
+        ContextBindingSealer::open(claim.registration(), SecretId::new(), claim.envelope())
+            .is_err()
+    );
+    assert!(persistence.authorize_send(&claim).await?.is_some());
+    assert!(
+        persistence
+            .finish_accepted(claim.delivery_id(), claim.claim_token())
+            .await?
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM messaging.opaque_push_deliveries WHERE delivery_id=$1",
+        )
+        .bind(delivery_id)
+        .fetch_one(harness.admin_pool())
+        .await?,
+        "delivered"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn postgres_registration_replacement_reuses_durable_kms_secret_id()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -628,49 +719,7 @@ async fn postgres_registration_replacement_reuses_durable_kms_secret_id()
     .bind(Uuid::from(fixture.device_id))
     .fetch_one(harness.admin_pool())
     .await?;
-    let mismatched_id = Uuid::now_v7();
-    let rejected = sqlx::query_scalar::<_, Vec<u8>>(
-        "SELECT messaging.opaque_push_commit_put($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
-    )
-    .bind(Uuid::from(fixture.credential.session_id()))
-    .bind(fixture.credential.database_secret_hash().for_database_binding().to_vec())
-    .bind(mismatched_id)
-    .bind("PUT")
-    .bind("/v43/push")
-    .bind(b"context-mismatch".to_vec())
-    .bind(1_i64)
-    .bind(vec![5_u8; 32])
-    .bind(i16::try_from(fixture.head.wire().protocol.major())?)
-    .bind(i16::try_from(fixture.head.wire().protocol.minor())?)
-    .bind(i16::try_from(fixture.head.wire().minimum_reader.major())?)
-    .bind(i16::try_from(fixture.head.wire().minimum_reader.minor())?)
-    .bind("active")
-    .bind(i64::try_from(fixture.head.sequence().get())?)
-    .bind(fixture.head.hash().as_bytes().to_vec())
-    .bind(vec![8_u8; 17])
-    .bind(vec![7_u8; 24])
-    .bind(vec![9_u8])
-    .bind("context.binding.v1")
-    .bind(vec![1_u8])
-    .fetch_one(
-        RegistrationPool::connect(
-            harness.push_registration_options(),
-            1,
-            "dtx_push_registration_only_test",
-        )
-        .await?
-        .pool(),
-    )
-    .await;
-    let rejected = rejected
-        .expect_err("commit must reject a registration ID that differs from the durable row");
-    assert_eq!(
-        rejected
-            .as_database_error()
-            .and_then(sqlx::error::DatabaseError::code)
-            .as_deref(),
-        Some("40001")
-    );
+    assert_registration_id_mismatch_is_rejected(&harness, &fixture).await?;
     service
         .register(RegistrationRequest::put(
             DeviceSessionCredential::new(fixture.credential.session_id(), fixture.secret)?,
@@ -689,45 +738,7 @@ async fn postgres_registration_replacement_reuses_durable_kms_secret_id()
     .fetch_one(harness.admin_pool())
     .await?;
     assert_eq!(replacement, (created_id, 2));
-
-    let delivery_id =
-        insert_delivery(&harness, &fixture, replacement.0, replacement.1, 59_000).await?;
-    let persistence = PostgresPushPersistence::new(
-        BrokerPool::connect(
-            harness.push_broker_options(),
-            2,
-            "dtx_push_broker_only_test",
-        )
-        .await?,
-        fixture.tenant_id,
-    );
-    let claim = persistence.claim(1).await?.pop().unwrap();
-    let binding_sealer = ContextBindingSealer;
-    binding_sealer.open(
-        claim.registration(),
-        claim.registration_id(),
-        claim.envelope(),
-    )?;
-    assert!(
-        binding_sealer
-            .open(claim.registration(), SecretId::new(), claim.envelope())
-            .is_err()
-    );
-    assert!(persistence.authorize_send(&claim).await?.is_some());
-    assert!(
-        persistence
-            .finish_accepted(claim.delivery_id(), claim.claim_token())
-            .await?
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT state FROM messaging.opaque_push_deliveries WHERE delivery_id=$1",
-        )
-        .bind(delivery_id)
-        .fetch_one(harness.admin_pool())
-        .await?,
-        "delivered"
-    );
+    assert_replacement_delivery_succeeds(&harness, &fixture, replacement).await?;
     Ok(())
 }
 
