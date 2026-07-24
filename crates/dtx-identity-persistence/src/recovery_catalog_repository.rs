@@ -740,36 +740,72 @@ async fn current_preparation_status(
     .into_iter()
     .flatten()
     .min();
-    let invalidation_at = match invalid {
-        Some(reason) => Some(
-            invalidation_observed_at(connection, &row, challenge, reason, now).await?,
-        ),
-        None => None,
-    };
+    let mut invalidation_options = Vec::new();
+    if now < row.expires_at {
+        for reason in [
+            CatalogStatusInvalidation::Identity,
+            CatalogStatusInvalidation::Catalog,
+            CatalogStatusInvalidation::Authority,
+            CatalogStatusInvalidation::Candidate,
+            CatalogStatusInvalidation::Provider,
+            CatalogStatusInvalidation::IndependentAuthority,
+        ] {
+            let observed_at = match reason {
+                CatalogStatusInvalidation::Catalog => {
+                    catalog_invalidation_observed_at(connection, &row).await?
+                }
+                _ => first_identity_log_invalidation_at(connection, &row, reason)
+                    .await?
+                    .map(utc)
+                    .transpose()?,
+            };
+            if let Some(observed_at) = observed_at {
+                invalidation_options.push((reason, observed_at));
+            }
+        }
+    }
+    if let Some(reason) = invalid {
+        if !invalidation_options.iter().any(|(candidate, _)| *candidate == reason) {
+            invalidation_options.push((
+                reason,
+                invalidation_observed_at(connection, &row, challenge, reason, now).await?,
+            ));
+        }
+    }
+    let selected_invalidation = invalidation_options
+        .iter()
+        .copied()
+        .min_by_key(|(reason, at)| (*at, *reason as u8));
     // Terminal state is the earliest authoritative event.  Equal timestamps
     // are deterministic: cancelled, invalidated, then expired.  This keeps
     // repeated GETs byte-identical and avoids deriving state from request-now.
-    let mut terminal: Option<(UtcMillis, u8, CatalogStatus)> = None;
+    let mut terminal: Option<(UtcMillis, u8, u8, CatalogStatus)> = None;
     if let Some(at) = challenge.cancelled_at {
-        terminal = Some((at, 0, CatalogStatus::Cancelled));
+        terminal = Some((at, 0, 0, CatalogStatus::Cancelled));
     }
-    if let (Some(reason), Some(at)) = (invalid, invalidation_at) {
-        let candidate = (at, 1, CatalogStatus::Invalidated(reason));
-        if terminal.as_ref().is_none_or(|current| (candidate.0, candidate.1) < (current.0, current.1)) {
+    if let Some((reason, at)) = selected_invalidation {
+        let candidate = (at, 1, reason as u8, CatalogStatus::Invalidated(reason));
+        if terminal.as_ref().is_none_or(|current| {
+            (candidate.0, candidate.1, candidate.2) < (current.0, current.1, current.2)
+        }) {
             terminal = Some(candidate);
         }
     }
     if let Some(at) = expiry {
-        let candidate = (at, 2, CatalogStatus::Expired);
-        if terminal.as_ref().is_none_or(|current| (candidate.0, candidate.1) < (current.0, current.1)) {
+        let candidate = (at, 2, 0, CatalogStatus::Expired);
+        if terminal.as_ref().is_none_or(|current| {
+            (candidate.0, candidate.1, candidate.2) < (current.0, current.1, current.2)
+        }) {
             terminal = Some(candidate);
         }
     }
-    let status = if let Some((at, _, status)) = terminal.filter(|(at, _, _)| now >= *at) {
+    let status = if let Some((at, _, _, status)) = terminal.filter(|(at, _, _, _)| now >= *at) {
         let _ = at;
         status
-    } else if invalid.zip(invalidation_at).is_some_and(|(_, at)| now >= at) {
-        let reason = invalid.expect("invalidation checked above");
+    } else if selected_invalidation.is_some_and(|(_, at)| now >= at) {
+        let reason = selected_invalidation
+            .expect("invalidation checked above")
+            .0;
         CatalogStatus::Invalidated(reason)
     } else if row.provider_response.is_some() {
         CatalogStatus::ResponseAvailable
@@ -789,7 +825,10 @@ async fn current_preparation_status(
             CatalogStatus::Cancelled => challenge.cancelled_at.ok_or_else(|| corrupt("cancellation time"))?,
             CatalogStatus::Pending => row.accepted_at,
             CatalogStatus::ResponseAvailable => row.provider_recorded_at.ok_or_else(|| corrupt("provider acceptance time"))?,
-            CatalogStatus::Invalidated(_) => invalidation_at.ok_or_else(|| corrupt("invalidation time"))?,
+            CatalogStatus::Invalidated(reason) => selected_invalidation
+                .filter(|(candidate, _)| *candidate == reason)
+                .map(|(_, at)| at)
+                .ok_or_else(|| corrupt("invalidation time"))?,
         },
         receipt_bytes: None,
         created: false,
@@ -808,26 +847,8 @@ async fn invalidation_observed_at(
             return Ok(catalog.created_at);
         }
     }
-    if reason == CatalogStatusInvalidation::Identity
-        || reason == CatalogStatusInvalidation::Candidate
-        || reason == CatalogStatusInvalidation::Provider
-        || reason == CatalogStatusInvalidation::IndependentAuthority
-    {
-        if let Some(recorded) = sqlx::query_scalar::<_, i64>(
-            "SELECT recorded_at_ms FROM identity.log_entries WHERE identity_id=$1 AND sequence>$2 ORDER BY sequence LIMIT 1",
-        )
-        .bind(row.identity_id.to_string())
-        .bind(i64::try_from(row.observed_head.sequence().get()).map_err(|_| corrupt("identity sequence"))?)
-        .fetch_optional(&mut *connection)
-        .await?
-        {
-            return utc(recorded);
-        }
-    }
-    if reason == CatalogStatusInvalidation::Authority {
-        if let Some(catalog) = load_current_catalog(connection, row.identity_id).await? {
-            return Ok(catalog.created_at);
-        }
+    if let Some(recorded) = first_identity_log_invalidation_at(connection, row, reason).await? {
+        return utc(recorded);
     }
     if challenge.state == "cancelled" {
         if let Some(cancelled_at) = challenge.cancelled_at {
@@ -835,9 +856,119 @@ async fn invalidation_observed_at(
         }
     }
     // A terminal transition must have a persisted authoritative timestamp;
-    // request-now is never a valid substitute.  The acceptance timestamp is
-    // the durable lower-bound fallback for legacy rows created before the
-    // event projection existed and remains stable across GET retries.
+    // request-now is never a valid substitute.
     let _ = now;
-    Ok(row.accepted_at)
+    Err(corrupt("missing invalidating identity event"))
+}
+
+async fn catalog_invalidation_observed_at(
+    connection: &mut PgConnection,
+    row: &StoredPreparation,
+) -> Result<Option<UtcMillis>, IdentityPersistenceError> {
+    let Some(current) = load_current_catalog(connection, row.identity_id).await? else {
+        return Ok(None);
+    };
+    if current.catalog_id != row.catalog_id
+        || current.generation != row.catalog_generation
+        || current.head_digest != row.catalog_head_digest
+        || current.observed_head != row.observed_head
+        || current.authority_key != row.authority_key
+        || current.authority_key_id != row.authority_key_id
+        || current.authority_device_id != row.authority_device_id
+    {
+        return Ok(Some(current.created_at));
+    }
+    Ok(None)
+}
+
+/// Returns the first persisted identity-log event that actually causes the
+/// requested invalidation. GET status must not use request-now or a generic
+/// first post-H event as a substitute for the real transition.
+async fn first_identity_log_invalidation_at(
+    connection: &mut PgConnection,
+    row: &StoredPreparation,
+    reason: CatalogStatusInvalidation,
+) -> Result<Option<i64>, IdentityPersistenceError> {
+    let observed = i64::try_from(row.observed_head.sequence().get())
+        .map_err(|_| corrupt("identity sequence"))?;
+    let entries = sqlx::query(
+        "SELECT sequence,event_bytes,recorded_at_ms
+           FROM identity.log_entries
+          WHERE identity_id=$1 AND sequence>$2
+          ORDER BY sequence ASC",
+    )
+    .bind(row.identity_id.to_string())
+    .bind(observed)
+    .fetch_all(&mut *connection)
+    .await?;
+    let provider_response = row
+        .provider_response
+        .as_deref()
+        .map(|bytes| {
+            CatalogProviderResponseCommand::parse_v2(
+                row.provider_idempotency_key_hash
+                    .unwrap_or(row.catalog_head_digest),
+                row.request_id,
+                bytes.to_vec(),
+            )
+            .map_err(|_| corrupt("provider response"))
+        })
+        .transpose()?;
+    let provider_at = row.provider_recorded_at.map(UtcMillis::get);
+    let first_successor = observed.saturating_add(1);
+
+    for entry in entries {
+        let sequence: i64 = entry.try_get("sequence")?;
+        let recorded_at: i64 = entry.try_get("recorded_at_ms")?;
+        let event_bytes: Vec<u8> = entry.try_get("event_bytes")?;
+        let event = IdentityLogEventV1::decode_and_verify(&event_bytes)
+            .map_err(|_| corrupt("identity invalidation event"))?;
+        let candidate_matches = matches!(
+            event.payload(),
+            IdentityLogEventPayloadV1::DeviceAdd { certificate }
+                if certificate.device_id() == row.candidate_device_id
+                    && certificate.device_signing_key() == row.candidate_signing_key
+                    && certificate.device_encryption_key() == row.candidate_recipient_key
+        );
+        let invalidates = match reason {
+            CatalogStatusInvalidation::Identity => sequence != first_successor || !candidate_matches,
+            CatalogStatusInvalidation::Candidate => sequence == first_successor && !candidate_matches,
+            CatalogStatusInvalidation::Provider => provider_response.as_ref().is_some_and(|response| {
+                provider_at.is_none_or(|accepted| recorded_at >= accepted)
+                    && matches!(
+                        event.payload(),
+                        IdentityLogEventPayloadV1::DeviceRevoke { device_id }
+                            if *device_id == response.provider_device_id
+                    )
+            }),
+            CatalogStatusInvalidation::IndependentAuthority => {
+                provider_response.as_ref().is_some_and(|response| {
+                    provider_at.is_none_or(|accepted| recorded_at >= accepted)
+                        && match response.authority_kind {
+                            2 => matches!(
+                                event.payload(),
+                                IdentityLogEventPayloadV1::RootRotate { .. }
+                                    | IdentityLogEventPayloadV1::RecoveryRestore { .. }
+                            ),
+                            3 => matches!(
+                                event.payload(),
+                                IdentityLogEventPayloadV1::RecoveryRotate { .. }
+                                    | IdentityLogEventPayloadV1::RecoveryRestore { .. }
+                            ),
+                            _ => false,
+                        }
+                })
+            }
+            CatalogStatusInvalidation::Authority => matches!(
+                event.payload(),
+                IdentityLogEventPayloadV1::DeviceRevoke { device_id }
+                    if *device_id == row.authority_device_id
+            ),
+            CatalogStatusInvalidation::Catalog => false,
+        };
+        if invalidates {
+            return Ok(Some(recorded_at));
+        }
+    }
+    Ok(None)
 }

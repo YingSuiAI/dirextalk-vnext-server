@@ -280,6 +280,15 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        // Media negotiation is the first boundary: a provider request with a
+        // wrong entity type is always 415, even when Accept/authentication or
+        // another header is also malformed.
+        if !has_exact_content_type(
+            headers,
+            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        ) {
+            return Err(RecoveryCatalogFailure::UnsupportedMedia);
+        }
         if !has_exact_header(
             headers,
             header::ACCEPT,
@@ -287,10 +296,7 @@ impl IdentityBootstrapState {
         ) {
             return Err(RecoveryCatalogFailure::NotAcceptable);
         }
-        if !has_exact_content_type(
-            headers,
-            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-        ) || headers.contains_key(header::CONTENT_ENCODING)
+        if headers.contains_key(header::CONTENT_ENCODING)
             || !has_exact_header(
                 headers,
                 header::ACCEPT,

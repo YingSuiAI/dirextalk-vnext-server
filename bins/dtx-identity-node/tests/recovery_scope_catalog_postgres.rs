@@ -41,11 +41,11 @@ use dtx_identity_persistence::{
     DeviceEnrollmentRepository, DeviceSessionCompletionCommand, DeviceSessionCredential,
     DeviceSessionOutcome, DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome,
     IdentityLogHead, IdentityLogRepository, IdentityPgStore,
-    MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES, PREPARATION_DIGEST_DOMAIN,
-    PREPARATION_SIGNATURE_DOMAIN, PROVIDER_AAD_DIGEST_DOMAIN, PROVIDER_AUTHORITY_SIGNATURE_DOMAIN,
-    PROVIDER_CIPHERTEXT_HASH_DOMAIN, PROVIDER_PACKAGE_DIGEST_DOMAIN,
-    PROVIDER_RESPONSE_SIGNATURE_DOMAIN, RECIPIENT_KEY_HASH_DOMAIN, RESPONSE_CAPABILITY_HASH_DOMAIN,
-    device_session_proof_input,
+    MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES, MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES,
+    PREPARATION_DIGEST_DOMAIN, PREPARATION_SIGNATURE_DOMAIN, PROVIDER_AAD_DIGEST_DOMAIN,
+    PROVIDER_AUTHORITY_SIGNATURE_DOMAIN, PROVIDER_CIPHERTEXT_HASH_DOMAIN,
+    PROVIDER_PACKAGE_DIGEST_DOMAIN, PROVIDER_RESPONSE_SIGNATURE_DOMAIN, RECIPIENT_KEY_HASH_DOMAIN,
+    RESPONSE_CAPABILITY_HASH_DOMAIN, device_session_proof_input,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -188,22 +188,31 @@ async fn send_status(
     request_id: dtx_domain::DeviceEnrollmentChallengeId,
     response_capability: [u8; 32],
 ) -> Result<axum::response::Response, Box<dyn Error>> {
-    Ok(app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(
-                    RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE
-                        .replace("{request_id}", &request_id.to_string()),
-                )
-                .header(
-                    RECOVERY_RESPONSE_CAPABILITY_HEADER,
-                    Base64UrlUnpadded::encode_string(&response_capability),
-                )
-                .header(header::ACCEPT, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE)
-                .body(Body::empty())?,
+    send_status_custom(app, request_id, response_capability, None, Vec::new()).await
+}
+
+async fn send_status_custom(
+    app: axum::Router,
+    request_id: dtx_domain::DeviceEnrollmentChallengeId,
+    response_capability: [u8; 32],
+    content_type: Option<&str>,
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(
+            RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE
+                .replace("{request_id}", &request_id.to_string()),
         )
-        .await?)
+        .header(
+            RECOVERY_RESPONSE_CAPABILITY_HEADER,
+            Base64UrlUnpadded::encode_string(&response_capability),
+        )
+        .header(header::ACCEPT, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    Ok(app.oneshot(builder.body(Body::from(body))?).await?)
 }
 
 async fn send_provider_response(
@@ -213,27 +222,43 @@ async fn send_provider_response(
     request_id: dtx_domain::DeviceEnrollmentChallengeId,
     body: Vec<u8>,
 ) -> Result<axum::response::Response, Box<dyn Error>> {
-    Ok(app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(
-                    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_PATH_TEMPLATE
-                        .replace("{request_id}", &request_id.to_string()),
-                )
-                .header(
-                    header::CONTENT_TYPE,
-                    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-                )
-                .header(
-                    header::ACCEPT,
-                    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
-                )
-                .header("idempotency-key", idempotency)
-                .header(header::AUTHORIZATION, authorization(session))
-                .body(Body::from(body))?,
+    send_provider_response_custom(
+        app,
+        idempotency,
+        session,
+        request_id,
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        None,
+        body,
+    )
+    .await
+}
+
+async fn send_provider_response_custom(
+    app: axum::Router,
+    idempotency: &str,
+    session: &Session,
+    request_id: dtx_domain::DeviceEnrollmentChallengeId,
+    content_type: &str,
+    accept: &str,
+    declared_length: Option<&str>,
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    let mut builder = Request::builder()
+        .method("PUT")
+        .uri(
+            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_PATH_TEMPLATE
+                .replace("{request_id}", &request_id.to_string()),
         )
-        .await?)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ACCEPT, accept)
+        .header("idempotency-key", idempotency)
+        .header(header::AUTHORIZATION, authorization(session));
+    if let Some(length) = declared_length {
+        builder = builder.header(header::CONTENT_LENGTH, length);
+    }
+    Ok(app.oneshot(builder.body(Body::from(body))?).await?)
 }
 
 fn authorization(session: &Session) -> String {

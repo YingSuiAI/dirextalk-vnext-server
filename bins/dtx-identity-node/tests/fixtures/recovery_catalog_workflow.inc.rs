@@ -299,6 +299,35 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     assert_catalog_headers(&pending, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
     assert_redacted_status(pending, 1).await?;
 
+    let get_with_content_type = send_status_custom(
+        app.clone(),
+        challenge.challenge_id(),
+        response_capability,
+        Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE),
+        Vec::new(),
+    )
+    .await?;
+    assert_error(
+        get_with_content_type,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "RECOVERY_HANDOFF_UNSUPPORTED_MEDIA_TYPE",
+    )
+    .await?;
+    let get_with_body = send_status_custom(
+        app.clone(),
+        challenge.challenge_id(),
+        response_capability,
+        None,
+        vec![0],
+    )
+    .await?;
+    assert_error(
+        get_with_body,
+        StatusCode::UNAUTHORIZED,
+        "RECOVERY_RESPONSE_CAPABILITY_REJECTED",
+    )
+    .await?;
+
     let candidate_add = device_add(
         &root,
         identity_id,
@@ -414,6 +443,79 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         to_bytes(provider_second.into_body(), 1_100_000).await?
     );
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 1));
+
+    let wrong_media = send_provider_response_custom(
+        app.clone(),
+        "catalog-provider-wrong-media",
+        &provider_session,
+        challenge.challenge_id(),
+        "application/cbor",
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        None,
+        provider_response_body.clone(),
+    )
+    .await?;
+    assert_error(
+        wrong_media,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "RECOVERY_HANDOFF_UNSUPPORTED_MEDIA_TYPE",
+    )
+    .await?;
+    let wrong_accept = send_provider_response_custom(
+        app.clone(),
+        "catalog-provider-wrong-accept",
+        &provider_session,
+        challenge.challenge_id(),
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        "application/cbor",
+        None,
+        provider_response_body.clone(),
+    )
+    .await?;
+    assert_error(wrong_accept, StatusCode::NOT_ACCEPTABLE, "RECOVERY_HANDOFF_NOT_ACCEPTABLE")
+        .await?;
+    let wrong_key = send_provider_response_custom(
+        app.clone(),
+        "catalog-provider-0001",
+        &authority_session,
+        challenge.challenge_id(),
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        None,
+        provider_response_body.clone(),
+    )
+    .await?;
+    assert_error(wrong_key, StatusCode::UNAUTHORIZED, "DEVICE_AUTHENTICATION_FAILED").await?;
+    let wrong_body = send_provider_response_custom(
+        app.clone(),
+        "catalog-provider-wrong-body",
+        &provider_session,
+        challenge.challenge_id(),
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        None,
+        vec![0xff],
+    )
+    .await?;
+    assert_error(wrong_body, StatusCode::UNPROCESSABLE_ENTITY, "EXACT_CBOR_INVALID")
+        .await?;
+    let declared_small_stream_large = send_provider_response_custom(
+        app.clone(),
+        "catalog-provider-stream-large",
+        &provider_session,
+        challenge.challenge_id(),
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        Some("1"),
+        vec![0; MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES + 1],
+    )
+    .await?;
+    assert_error(
+        declared_small_stream_large,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "RECOVERY_HANDOFF_TOO_LARGE",
+    )
+    .await?;
     let ready = send_status(app.clone(), challenge.challenge_id(), response_capability).await?;
     assert_eq!(ready.status(), StatusCode::OK);
     assert_catalog_headers(&ready, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE);
