@@ -51,11 +51,12 @@ rg -F -- '--project-name dtx-android-accept-compose-partial down' "$fixture/log"
 # Proxy PID ownership is recorded before readiness failure, and cleanup keeps
 # removing later resources even when AVD deletion fails.
 fixture="$tmp/proxy"; make_fixture "$fixture"
-printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; control=${3##*:}; printf "%s\n" "$listen" >"$DTX_TEST_PROXY_PORTS/$listen"; printf "%s\n" "$control" >"$DTX_TEST_PROXY_PORTS/$control"' 'trap '\''echo "proxy-term $listen $control" >>"$DTX_TEST_LOG"; rm -f "$DTX_TEST_PROXY_PORTS/$listen" "$DTX_TEST_PROXY_PORTS/$control"; exit 0'\'' TERM' 'while :; do sleep 1; done' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; control=${3##*:}; printf "%s\n" "$listen" >"$DTX_TEST_PROXY_PORTS/$listen"' 'trap '\''echo "proxy-term $listen $control" >>"$DTX_TEST_LOG"; rm -f "$DTX_TEST_PROXY_PORTS/$listen"; exit 0'\'' TERM' 'while :; do sleep 1; done' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
 if DTX_TEST_AVD_DELETE=fail run_fixture "$fixture" proxy-partial env; then exit 1; fi
 proxy_root="$fixture/.android-acceptance/proxy-partial"; proxy_pid="$(awk -F= '$1 == "PROXY_A_PID" { print $2 }' "$proxy_root/resources")"
 [[ "$proxy_pid" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$proxy_pid" 2>/dev/null
 [[ ! -e "$fixture/proxy-ports/$(awk -F= '$1 == "proxy_a_port" { print $2 }' "$proxy_root/resources")" ]]
+[[ ! -e "$fixture/proxy-ports/$(awk -F= '$1 == "control_a_port" { print $2 }' "$proxy_root/resources")" ]]
 rg -F 'proxy-term ' "$fixture/log" >/dev/null
 rg -F -- 'delete avd --name dirextalk-accept-proxy-partial-a' "$fixture/log" >/dev/null
 rg -F -- 'delete avd --name dirextalk-accept-proxy-partial-b' "$fixture/log" >/dev/null
@@ -121,6 +122,13 @@ for malformed in '20000-corrupt' '1x' 'emulator-5556'; do
   printf 'run_id=stale\ncompose_project=dtx-android-accept-stale\nnode_a_port=20000\nnode_b_port=20001\nproxy_a_port=20002\ncontrol_a_port=20003\nproxy_b_port=20004\ncontrol_b_port=20005\nemulator_a_port=5554\nemulator_b_port=5556\nemulator_a_serial=emulator-5554\nemulator_b_serial=emulator-5556\n' >"$fixture/.android-acceptance/stale/resources"
   case "$malformed" in 20000-corrupt) sed -i 's/node_a_port=20000/node_a_port=20000-corrupt/' "$fixture/.android-acceptance/stale/resources";; 1x) sed -i 's/PROXY_A_PID=/PROXY_A_PID=1x/' "$fixture/.android-acceptance/stale/resources"; printf 'PROXY_A_PID=1x\n' >>"$fixture/.android-acceptance/stale/resources";; emulator-5556) sed -i 's/emulator_a_serial=emulator-5554/emulator_a_serial=emulator-5556/' "$fixture/.android-acceptance/stale/resources";; esac
   if run_fixture "$fixture" "corrupt-${malformed//[^A-Za-z0-9]/-}" env >/dev/null 2>&1; then exit 1; fi
+  [[ ! -e "$fixture/log" ]]
+done
+for topology in service-gap emulator-gap; do
+  fixture="$tmp/topology-$topology"; make_fixture "$fixture"; mkdir -p "$fixture/.android-acceptance/stale"
+  printf 'run_id=stale\ncompose_project=dtx-android-accept-stale\nnode_a_port=20000\nnode_b_port=20001\nproxy_a_port=20002\ncontrol_a_port=20003\nproxy_b_port=20004\ncontrol_b_port=20005\nemulator_a_port=5554\nemulator_b_port=5556\nemulator_a_serial=emulator-5554\nemulator_b_serial=emulator-5556\n' >"$fixture/.android-acceptance/stale/resources"
+  case "$topology" in service-gap) sed -i 's/control_b_port=20005/control_b_port=20006/' "$fixture/.android-acceptance/stale/resources";; emulator-gap) sed -i 's/emulator_b_port=5556/emulator_b_port=5558/; s/emulator_b_serial=emulator-5556/emulator_b_serial=emulator-5558/' "$fixture/.android-acceptance/stale/resources";; esac
+  if run_fixture "$fixture" "topology-$topology" env >/dev/null 2>&1; then exit 1; fi
   [[ ! -e "$fixture/log" ]]
 done
 

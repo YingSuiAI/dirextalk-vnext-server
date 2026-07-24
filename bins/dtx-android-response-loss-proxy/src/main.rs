@@ -292,7 +292,7 @@ mod tests {
         let relay_gate = Arc::clone(&gate);
         tokio::spawn(async move {
             let (client, _) = proxy.accept().await.unwrap();
-            relay(client, backend_address, relay_gate).await;
+            Box::pin(relay(client, backend_address, relay_gate)).await;
         });
         let mut client = TcpStream::connect(proxy_address).await.unwrap();
         client.write_all(b"x").await.unwrap();
@@ -326,7 +326,9 @@ mod tests {
             for _ in 0..2 {
                 let (client, _) = proxy.accept().await.unwrap();
                 let relay_gate = Arc::clone(&relay_gate);
-                tokio::spawn(async move { relay(client, backend_address, relay_gate).await });
+                tokio::spawn(async move {
+                    Box::pin(relay(client, backend_address, relay_gate)).await;
+                });
             }
         });
         let mut first = TcpStream::connect(proxy_address).await.unwrap();

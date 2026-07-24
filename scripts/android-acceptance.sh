@@ -119,7 +119,10 @@ validate_reservation_file() {
   done <"$file"
   [[ -n "$run_id" && "$compose_project" == "dtx-android-accept-$run_id" ]] || return 1
   [[ -n "$node_a_port" && -n "$node_b_port" && -n "$proxy_a_port" && -n "$control_a_port" && -n "$proxy_b_port" && -n "$control_b_port" ]] || return 1
-  [[ -n "$emulator_a_port" && -n "$emulator_b_port" && "$emulator_a_port" != "$emulator_b_port" ]] || return 1
+  (( 10#$node_a_port >= 20000 && 10#$node_a_port <= 29999 )) || return 1
+  (( 10#$node_b_port == 10#$node_a_port + 1 && 10#$proxy_a_port == 10#$node_a_port + 2 && 10#$control_a_port == 10#$node_a_port + 3 && 10#$proxy_b_port == 10#$node_a_port + 4 && 10#$control_b_port == 10#$node_a_port + 5 )) || return 1
+  [[ -n "$emulator_a_port" && -n "$emulator_b_port" ]] || return 1
+  (( 10#$emulator_b_port == 10#$emulator_a_port + 2 )) || return 1
   [[ "$emulator_a_serial" == "emulator-$emulator_a_port" && "$emulator_b_serial" == "emulator-$emulator_b_port" ]]
 }
 
