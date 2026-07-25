@@ -311,6 +311,37 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
+mod route_health_config_tests {
+    use super::*;
+
+    #[test]
+    fn route_health_resolves_its_dedicated_client_roots_path() {
+        let mut json = include_str!("../config.example.json").to_owned();
+        let marker = "    \"client_ca_bundle_pem\": \"tls/connector-client-roots.pem\",\n    \"receipt_private_key_pkcs8_pem\"";
+        let replacement = "    \"client_ca_bundle_pem\": \"tls/route-health-client-roots.pem\",\n    \"receipt_private_key_pkcs8_pem\"";
+        assert!(json.contains(marker));
+        json = json.replacen(marker, replacement, 1);
+        let path = std::env::temp_dir().join(format!(
+            "dtx-agent-control-config-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).expect("config fixture");
+        let config = BootstrapConfig::load(&path).expect("config loads");
+        let _ = std::fs::remove_file(&path);
+        assert_ne!(
+            config.control.client_ca_bundle_pem,
+            config.route_health.client_ca_bundle_pem
+        );
+        assert!(
+            config
+                .route_health
+                .client_ca_bundle_pem
+                .ends_with("tls/route-health-client-roots.pem")
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

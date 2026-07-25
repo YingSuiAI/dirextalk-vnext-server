@@ -111,8 +111,46 @@ pub async fn record_route_health(
         .await
         .map_err(|_| RouteHealthParseError::InvalidShape)?;
     let result = async {
+        let request_digest = Sha256Digest::hash_domain(ROUTE_HEALTH_SIGNATURE_DOMAIN, exact_request);
+
+        // Durable replay is authenticated by the request signature and tenant
+        // peer binding above. Resolve it before consulting mutable route,
+        // bootstrap, lease or approval state so an exact committed receipt
+        // remains replayable after those facts are later retired.
+        let existing_nonce = sqlx::query(
+            "SELECT request_digest, receipt_bytes, observation_revision
+               FROM agent.agent_route_health_receipts
+              WHERE tenant_id=$1 AND route_id=$2 AND nonce=$3
+              FOR UPDATE",
+        )
+        .bind(Uuid::from(request.tenant_id))
+        .bind(Uuid::from(request.route_id))
+        .bind(request.nonce.to_vec())
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| RouteHealthParseError::InvalidShape)?;
+        if let Some(row) = existing_nonce {
+            return replay_receipt(row, request_digest);
+        }
+        let existing_request_id = sqlx::query(
+            "SELECT request_digest, receipt_bytes, observation_revision
+               FROM agent.agent_route_health_receipts
+              WHERE tenant_id=$1 AND request_id=$2
+              FOR UPDATE",
+        )
+        .bind(Uuid::from(request.tenant_id))
+        .bind(Uuid::from(request.request_id))
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| RouteHealthParseError::InvalidShape)?;
+        if let Some(row) = existing_request_id {
+            return replay_receipt(row, request_digest);
+        }
+
         let route = sqlx::query(
-            "SELECT h.route_fence, b.route_health_key_id, b.route_health_public_key, b.connector_id
+            "SELECT h.route_fence, h.bootstrap_id, h.expires_at_ms AS binding_expires_at_ms,
+                    b.expires_at_ms AS bootstrap_expires_at_ms, b.state,
+                    b.route_health_key_id, b.route_health_public_key, b.connector_id
                FROM agent.agent_route_binding_heads h
                JOIN agent.agent_route_bootstraps b
                  ON b.tenant_id=h.tenant_id AND b.bootstrap_id=h.bootstrap_id
@@ -126,10 +164,19 @@ pub async fn record_route_health(
         .fetch_optional(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?
         .ok_or(RouteHealthParseError::InvalidShape)?;
         let route_fence: Vec<u8> = route.try_get("route_fence").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let stored_bootstrap: Uuid = route.try_get("bootstrap_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let binding_expires_at_ms: i64 = route.try_get("binding_expires_at_ms").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let bootstrap_expires_at_ms: i64 = route.try_get("bootstrap_expires_at_ms").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let bootstrap_state: String = route.try_get("state").map_err(|_| RouteHealthParseError::InvalidShape)?;
         let route_connector: Uuid = route.try_get("connector_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
         let stored_key: Uuid = route.try_get("route_health_key_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
         let stored_public: Vec<u8> = route.try_get("route_health_public_key").map_err(|_| RouteHealthParseError::InvalidShape)?;
-        if route_fence.as_slice() != request.route_fence || route_connector != Uuid::from(request.connector_id)
+        if route_fence.as_slice() != request.route_fence
+            || stored_bootstrap != Uuid::from(request.bootstrap_id)
+            || binding_expires_at_ms <= now_ms
+            || bootstrap_expires_at_ms <= now_ms
+            || bootstrap_state != "installed"
+            || route_connector != Uuid::from(request.connector_id)
             || stored_key != Uuid::from(request.health_key_id) || stored_public.len() != 32 { return Err(RouteHealthParseError::InvalidShape); }
         let active: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM agent.connector_leases l JOIN agent.connector_control_credentials c
@@ -157,16 +204,6 @@ pub async fn record_route_health(
             .bind(Uuid::from(request.tenant_id)).bind(Uuid::from(request.installation_id))
             .bind(Uuid::from(request.binding_id)).bind(Uuid::from(request.agent_device_id))
             .fetch_one(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let existing = sqlx::query("SELECT request_digest, receipt_bytes, observation_revision FROM agent.agent_route_health_receipts WHERE tenant_id=$1 AND route_id=$2 AND nonce=$3 FOR UPDATE")
-            .bind(Uuid::from(request.tenant_id)).bind(Uuid::from(request.route_id)).bind(request.nonce.to_vec()).fetch_optional(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let request_digest = Sha256Digest::hash_domain(ROUTE_HEALTH_SIGNATURE_DOMAIN, exact_request);
-        if let Some(row) = existing {
-            let digest: Vec<u8> = row.try_get("request_digest").map_err(|_| RouteHealthParseError::InvalidShape)?;
-            if digest.as_slice() != request_digest.as_bytes() { return Err(RouteHealthParseError::InvalidShape); }
-            let receipt_bytes: Vec<u8> = row.try_get("receipt_bytes").map_err(|_| RouteHealthParseError::InvalidShape)?;
-            let revision: i64 = row.try_get("observation_revision").map_err(|_| RouteHealthParseError::InvalidShape)?;
-            return Ok(RouteHealthReceipt { exact_cbor: receipt_bytes, replayed: true, observation_revision: Revision::new(u64::try_from(revision).map_err(|_| RouteHealthParseError::InvalidShape)?).map_err(|_| RouteHealthParseError::InvalidShape)? });
-        }
         let head: Option<(i64, i64)> = sqlx::query_as("SELECT observation_revision, status_revision FROM agent.agent_route_health_heads WHERE tenant_id=$1 AND route_id=$2 FOR UPDATE")
             .bind(Uuid::from(request.tenant_id)).bind(Uuid::from(request.route_id)).fetch_optional(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
         if let Some((_, current_status)) = head {
@@ -194,6 +231,32 @@ pub async fn record_route_health(
             Err(error)
         }
     }
+}
+
+fn replay_receipt(
+    row: sqlx::postgres::PgRow,
+    request_digest: Sha256Digest,
+) -> Result<RouteHealthReceipt, RouteHealthParseError> {
+    let digest: Vec<u8> = row
+        .try_get("request_digest")
+        .map_err(|_| RouteHealthParseError::InvalidShape)?;
+    if digest.as_slice() != request_digest.as_bytes() {
+        return Err(RouteHealthParseError::InvalidShape);
+    }
+    let receipt_bytes: Vec<u8> = row
+        .try_get("receipt_bytes")
+        .map_err(|_| RouteHealthParseError::InvalidShape)?;
+    let revision: i64 = row
+        .try_get("observation_revision")
+        .map_err(|_| RouteHealthParseError::InvalidShape)?;
+    Ok(RouteHealthReceipt {
+        exact_cbor: receipt_bytes,
+        replayed: true,
+        observation_revision: Revision::new(
+            u64::try_from(revision).map_err(|_| RouteHealthParseError::InvalidShape)?,
+        )
+        .map_err(|_| RouteHealthParseError::InvalidShape)?,
+    })
 }
 
 fn sign_receipt(
@@ -443,7 +506,7 @@ async fn route_health_handler(
         Ok(session) => session,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "unavailable\n").into_response(),
     };
-    let key = sqlx::query_scalar::<_, Vec<u8>>("SELECT route_health_public_key FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND route_id=$2 AND state='installed' ORDER BY updated_at_ms DESC LIMIT 1")
+    let key = sqlx::query_scalar::<_, Vec<u8>>("SELECT route_health_public_key FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND route_id=$2 AND route_health_public_key IS NOT NULL ORDER BY updated_at_ms DESC LIMIT 1")
         .bind(Uuid::from(tenant_id)).bind(Uuid::from(route_id)).fetch_optional(session.connection()).await.ok().flatten();
     let _ = session.rollback().await;
     let Some(key) = key.and_then(|key| <[u8; 32]>::try_from(key).ok()) else {

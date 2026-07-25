@@ -154,6 +154,14 @@ const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.connector_control_stream_heads", "UPDATE"),
     ("agent.connector_control_commands", "SELECT"),
     ("agent.connector_control_commands", "INSERT"),
+    ("agent.agent_route_binding_heads", "SELECT"),
+    ("agent.agent_route_bootstraps", "SELECT"),
+    ("agent.agent_route_health_receipts", "SELECT"),
+    ("agent.agent_route_health_receipts", "INSERT"),
+    ("agent.agent_route_health_receipts", "UPDATE"),
+    ("agent.agent_route_health_heads", "SELECT"),
+    ("agent.agent_route_health_heads", "INSERT"),
+    ("agent.agent_route_health_heads", "UPDATE"),
     ("agent.agent_runs", "SELECT"),
     ("agent.agent_runs", "INSERT"),
     ("agent.agent_runs", "UPDATE"),
@@ -228,17 +236,20 @@ async fn run() -> Result<(), BootstrapError> {
 
     let authorization_index = Arc::new(ConnectorCredentialAuthorizationIndex::new());
     let authorizer: Arc<dyn ConnectorCredentialAuthorizer> = authorization_index.clone();
-    let connector_roots = Arc::new(load_root_store(&config.control.client_ca_bundle_pem)?);
-    let verifier = ConnectorMtlsClientVerifier::new(connector_roots, authorizer)
+    let control_roots = Arc::new(load_root_store(&config.control.client_ca_bundle_pem)?);
+    let control_verifier = ConnectorMtlsClientVerifier::new(control_roots, Arc::clone(&authorizer))
+        .map_err(|_| BootstrapError::Tls)?;
+    let route_health_roots = Arc::new(load_root_store(&config.route_health.client_ca_bundle_pem)?);
+    let route_health_verifier = ConnectorMtlsClientVerifier::new(route_health_roots, authorizer)
         .map_err(|_| BootstrapError::Tls)?;
     let control_server_config = build_connector_mtls_server_config(
-        verifier.clone(),
+        control_verifier.clone(),
         load_certificate_chain(&config.control.certificate_chain_pem)?,
         load_private_key(&config.control.private_key_pkcs8_pem)?,
     )
     .map_err(|_| BootstrapError::Tls)?;
     let route_health_server_config = build_connector_mtls_server_config(
-        verifier.clone(),
+        route_health_verifier.clone(),
         load_certificate_chain(&config.route_health.certificate_chain_pem)?,
         load_private_key(&config.route_health.private_key_pkcs8_pem)?,
     )
@@ -248,8 +259,9 @@ async fn run() -> Result<(), BootstrapError> {
     // included in readiness output or diagnostics.
     let _route_health_receipt_key =
         load_private_key(&config.route_health.receipt_private_key_pkcs8_pem)?;
-    let route_health_receipt_public_key = derive_ed25519_public_key(&_route_health_receipt_key)?;
-    let route_health_receipt_seed = derive_ed25519_seed(&_route_health_receipt_key)?;
+    let route_health_receipt_key = parse_ed25519_pkcs8(&_route_health_receipt_key)?;
+    let route_health_receipt_public_key = route_health_receipt_key.public_key;
+    let route_health_receipt_seed = route_health_receipt_key.seed;
     let gateway_roots = Arc::new(load_root_store(
         &config.legacy_gateway.client_ca_bundle_pem,
     )?);
@@ -268,7 +280,8 @@ async fn run() -> Result<(), BootstrapError> {
         load_certificate_chain(&config.enrollment.certificate_chain_pem)?,
         load_private_key(&config.enrollment.private_key_pkcs8_pem)?,
     )?;
-    let verifier = Arc::new(verifier);
+    let control_verifier = Arc::new(control_verifier);
+    let route_health_verifier = Arc::new(route_health_verifier);
     let gateway_verifier = Arc::new(gateway_verifier);
 
     let issuer_certificate = load_single_certificate(&config.connector_issuer.certificate)?;
@@ -316,7 +329,7 @@ async fn run() -> Result<(), BootstrapError> {
         },
     );
     let control_server = Server::builder().serve_with_incoming_shutdown(
-        connector_control_service(control_application, Arc::clone(&verifier)),
+        connector_control_service(control_application, Arc::clone(&control_verifier)),
         connector_tls_incoming(control_listener, Arc::new(control_server_config)),
         async {
             let _ = control_shutdown_rx.await;
@@ -348,7 +361,7 @@ async fn run() -> Result<(), BootstrapError> {
             RouteHealthTlsListener::new(
                 route_health_listener,
                 Arc::new(route_health_server_config),
-                Arc::clone(&verifier),
+                Arc::clone(&route_health_verifier),
             ),
             route_health_router_with_state(dtx_agent_control_server::RouteHealthHttpState {
                 store: route_health_store,
@@ -654,34 +667,91 @@ fn load_private_key(path: &Path) -> Result<SecretBytes, BootstrapError> {
     secret
 }
 
-fn derive_ed25519_public_key(key: &SecretBytes) -> Result<[u8; 32], BootstrapError> {
-    let mut public = Err(BootstrapError::Tls);
-    key.expose(|der| {
-        // RFC 8410 Ed25519 PKCS#8 carries the 32-byte seed as the final
-        // primitive. Deriving through dalek also validates the exact key shape.
-        if der.len() < 32 {
-            return;
-        }
-        let mut seed = [0_u8; 32];
-        seed.copy_from_slice(&der[der.len() - 32..]);
-        public = Ok(ed25519_dalek::SigningKey::from_bytes(&seed)
-            .verifying_key()
-            .to_bytes());
-        seed.zeroize();
-    });
-    public
+#[derive(Clone, Copy)]
+struct ParsedEd25519Key {
+    seed: [u8; 32],
+    public_key: [u8; 32],
 }
 
-fn derive_ed25519_seed(key: &SecretBytes) -> Result<[u8; 32], BootstrapError> {
-    let mut seed = Err(BootstrapError::Tls);
+fn parse_ed25519_pkcs8(key: &SecretBytes) -> Result<ParsedEd25519Key, BootstrapError> {
+    let mut parsed = Err(BootstrapError::Tls);
     key.expose(|der| {
-        if der.len() >= 32 {
-            let mut value = [0_u8; 32];
-            value.copy_from_slice(&der[der.len() - 32..]);
-            seed = Ok(value);
-        }
+        parsed = parse_ed25519_pkcs8_der(der);
     });
-    seed
+    parsed
+}
+
+fn parse_ed25519_pkcs8_der(der: &[u8]) -> Result<ParsedEd25519Key, BootstrapError> {
+    let (outer, outer_end) = der_tlv(der, 0, 0x30)?;
+    if outer_end != der.len() {
+        return Err(BootstrapError::Tls);
+    }
+    let (version, offset) = der_tlv(outer, 0, 0x02)?;
+    if version != [0] {
+        return Err(BootstrapError::Tls);
+    }
+    let (algorithm, offset) = der_tlv(outer, offset, 0x30)?;
+    if algorithm != [0x06, 0x03, 0x2b, 0x65, 0x70] {
+        return Err(BootstrapError::Tls);
+    }
+    let (private_key, offset) = der_tlv(outer, offset, 0x04)?;
+    if offset != outer.len() {
+        return Err(BootstrapError::Tls);
+    }
+    let (seed_bytes, seed_end) = der_tlv(private_key, 0, 0x04)?;
+    if seed_end != private_key.len() || seed_bytes.len() != 32 {
+        return Err(BootstrapError::Tls);
+    }
+    let mut seed = [0_u8; 32];
+    seed.copy_from_slice(seed_bytes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let public_key = signing_key.verifying_key().to_bytes();
+    Ok(ParsedEd25519Key { seed, public_key })
+}
+
+fn der_tlv(
+    input: &[u8],
+    offset: usize,
+    expected_tag: u8,
+) -> Result<(&[u8], usize), BootstrapError> {
+    let tag = *input.get(offset).ok_or(BootstrapError::Tls)?;
+    if tag != expected_tag {
+        return Err(BootstrapError::Tls);
+    }
+    let length_byte = *input.get(offset + 1).ok_or(BootstrapError::Tls)?;
+    let (length, header_len) = if length_byte & 0x80 == 0 {
+        (usize::from(length_byte), 2)
+    } else {
+        let count = usize::from(length_byte & 0x7f);
+        if count == 0 || count > std::mem::size_of::<usize>() {
+            return Err(BootstrapError::Tls);
+        }
+        let end = offset.checked_add(2 + count).ok_or(BootstrapError::Tls)?;
+        let bytes = input.get(offset + 2..end).ok_or(BootstrapError::Tls)?;
+        if bytes.first() == Some(&0) {
+            return Err(BootstrapError::Tls);
+        }
+        let length = bytes
+            .iter()
+            .try_fold(0usize, |value, byte| {
+                value.checked_mul(256)?.checked_add(usize::from(*byte))
+            })
+            .ok_or(BootstrapError::Tls)?;
+        if length < 128 {
+            return Err(BootstrapError::Tls);
+        }
+        (length, 2 + count)
+    };
+    let content_start = offset.checked_add(header_len).ok_or(BootstrapError::Tls)?;
+    let content_end = content_start
+        .checked_add(length)
+        .ok_or(BootstrapError::Tls)?;
+    Ok((
+        input
+            .get(content_start..content_end)
+            .ok_or(BootstrapError::Tls)?,
+        content_end,
+    ))
 }
 
 fn build_server_auth_tls_config(
@@ -797,3 +867,61 @@ impl fmt::Display for BootstrapError {
 }
 
 impl std::error::Error for BootstrapError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ed25519_pkcs8(seed: [u8; 32]) -> Vec<u8> {
+        let mut der = vec![
+            0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
+            0x04, 0x20,
+        ];
+        der.extend_from_slice(&seed);
+        der
+    }
+
+    #[test]
+    fn parses_rfc8410_ed25519_seed_and_pins_public_key() {
+        let seed = [7_u8; 32];
+        let key = SecretBytes::new(ed25519_pkcs8(seed)).expect("secret");
+        let parsed = parse_ed25519_pkcs8(&key).expect("strict RFC 8410 key");
+        assert_eq!(parsed.seed, seed);
+        assert_eq!(
+            parsed.public_key,
+            ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes()
+        );
+    }
+
+    #[test]
+    fn rejects_non_ed25519_and_trailing_pkcs8_fields() {
+        let seed = [9_u8; 32];
+        let mut non_ed = ed25519_pkcs8(seed);
+        non_ed[9] = 0x2a;
+        let non_ed = SecretBytes::new(non_ed).expect("secret");
+        assert!(parse_ed25519_pkcs8(&non_ed).is_err());
+
+        let mut trailing = ed25519_pkcs8(seed);
+        trailing.push(0);
+        let trailing = SecretBytes::new(trailing).expect("secret");
+        assert!(parse_ed25519_pkcs8(&trailing).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_pkcs8_length_and_seed_shape() {
+        let mut malformed = ed25519_pkcs8([1_u8; 32]);
+        malformed[1] = 0x2f;
+        let malformed = SecretBytes::new(malformed).expect("secret");
+        assert!(parse_ed25519_pkcs8(&malformed).is_err());
+
+        let mut short_seed = vec![
+            0x30, 0x2d, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x21,
+            0x04, 0x1f,
+        ];
+        short_seed.extend_from_slice(&[2_u8; 31]);
+        let short_seed = SecretBytes::new(short_seed).expect("secret");
+        assert!(parse_ed25519_pkcs8(&short_seed).is_err());
+    }
+}

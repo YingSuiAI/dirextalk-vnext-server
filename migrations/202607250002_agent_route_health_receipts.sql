@@ -22,6 +22,8 @@ CREATE TABLE agent.agent_route_health_receipts (
         ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
     CONSTRAINT agent_route_health_receipts_request_unique
         UNIQUE (tenant_id, route_id, request_id, status_revision),
+    CONSTRAINT agent_route_health_receipts_request_id_unique
+        UNIQUE (tenant_id, request_id),
     CONSTRAINT agent_route_health_receipts_shape CHECK (
         system.is_uuid_v7(tenant_id)
         AND system.is_uuid_v7(route_id)
@@ -81,7 +83,7 @@ REVOKE ALL ON agent.agent_route_health_receipts, agent.agent_route_health_heads 
 DO $grant$
 BEGIN
     IF to_regrole('dtx_agent_runtime') IS NOT NULL THEN
-        GRANT SELECT, INSERT ON agent.agent_route_health_receipts TO dtx_agent_runtime;
+        GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_receipts TO dtx_agent_runtime;
         GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_agent_runtime;
     END IF;
 END

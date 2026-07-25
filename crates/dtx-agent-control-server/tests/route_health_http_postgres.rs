@@ -275,6 +275,99 @@ async fn route_health_http_rejects_nonce_conflicts_and_preserves_ledger()
 }
 
 #[tokio::test]
+async fn route_health_http_replays_exact_receipt_after_route_expiry_and_fences_request_id()
+-> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let receipt_key_id = dtx_domain::RouteHealthKeyId::new();
+    let seed = [0xE4; 32];
+    let request_id = dtx_domain::RequestId::new();
+    let body =
+        fixture.signed_request_with_nonce(request_id, dtx_domain::Revision::INITIAL, [3; 32]);
+    let first = post_status(&fixture, body.clone(), receipt_key_id, seed).await?;
+    assert_eq!(first.0, axum::http::StatusCode::CREATED);
+    assert_eq!(route_health_counts(&fixture).await?, (1, Some((1, 1))));
+
+    // Mutable route/bootstrap expiry cannot invalidate an already committed
+    // authenticated receipt replay.
+    sqlx::query(
+        "UPDATE agent.agent_route_binding_heads SET expires_at_ms=installed_at_ms + 1
+          WHERE tenant_id=$1 AND route_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant_id))
+    .bind(uuid::Uuid::from(fixture.route_id))
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::query(
+        "UPDATE agent.agent_route_bootstraps SET expires_at_ms=created_at_ms + 1
+          WHERE tenant_id=$1 AND route_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant_id))
+    .bind(uuid::Uuid::from(fixture.route_id))
+    .execute(harness.admin_pool())
+    .await?;
+    let replay = post_status(&fixture, body.clone(), receipt_key_id, seed).await?;
+    assert_eq!(replay.0, axum::http::StatusCode::OK);
+    assert_eq!(replay.1, first.1);
+    assert_eq!(route_health_counts(&fixture).await?, (1, Some((1, 1))));
+
+    // A request id is a global idempotency fence: changing nonce/body cannot
+    // create another receipt, even if the current route is no longer active.
+    let changed = fixture.resign_request(&body, |fields| {
+        for (key, value) in fields {
+            if *key == support::agent_provisioning::u(22) {
+                *value = support::agent_provisioning::bytes(&[4; 32]);
+            }
+        }
+    });
+    assert_eq!(
+        post_status(&fixture, changed, receipt_key_id, seed)
+            .await?
+            .0,
+        axum::http::StatusCode::CONFLICT
+    );
+    assert_eq!(route_health_counts(&fixture).await?, (1, Some((1, 1))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_health_http_rejects_bootstrap_id_mismatch_without_mutation()
+-> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let body = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [5; 32],
+    );
+    let mismatched = fixture.resign_request(&body, |fields| {
+        for (key, value) in fields {
+            if *key == support::agent_provisioning::u(8) {
+                *value =
+                    support::agent_provisioning::text(dtx_domain::AgentRouteBootstrapId::new());
+            }
+        }
+    });
+    assert_eq!(
+        post_status(
+            &fixture,
+            mismatched,
+            dtx_domain::RouteHealthKeyId::new(),
+            [0xE5; 32]
+        )
+        .await?
+        .0,
+        axum::http::StatusCode::CONFLICT
+    );
+    assert_eq!(route_health_counts(&fixture).await?, (0, None));
+    Ok(())
+}
+
+#[tokio::test]
 async fn route_health_http_concurrent_exact_requests_allocate_one_observation()
 -> Result<(), Box<dyn Error>> {
     let harness = PostgresHarness::start().await?;
