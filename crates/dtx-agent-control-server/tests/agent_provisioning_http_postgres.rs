@@ -25,9 +25,9 @@ use dtx_agent_control_server::{
     ConnectorControlApplication, ConnectorControlApplicationError, ConnectorControlPolicy,
     ConnectorCredentialAuthorizationIndex, CreateConnectorEnrollmentRequest,
     MAX_CONNECTOR_PROJECTION_BINDINGS, ParsedAgentProvisioningInstalled,
-    ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteRecipientReady, ParsedCapacity,
-    ParsedCommandAcknowledgement, ParsedEnrollment, ParsedHello, ParsedLeaseFence,
-    ParsedProtocolRange, ParsedProvisioningRecipientAnnouncement,
+    ParsedAgentRouteBootstrapInstalled, ParsedAgentRouteBootstrapRejected,
+    ParsedAgentRouteRecipientReady, ParsedCapacity, ParsedCommandAcknowledgement, ParsedEnrollment,
+    ParsedHello, ParsedLeaseFence, ParsedProtocolRange, ParsedProvisioningRecipientAnnouncement,
     PostgresAgentProvisioningOwnerBackend, PostgresConnectorControlApplication,
     ProtobufDurableCommandDecoder, agent_provisioning_installed_receipt_digest,
     agent_provisioning_owner_router,
@@ -104,6 +104,7 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
         .expect("current time fits i64")
     });
     let harness = PostgresHarness::start().await?;
+    grant_agent_route_run_runtime_access(&harness).await?;
     let store = harness.runtime_store(12).await?;
     let tenant_id = TenantId::new();
     provision_tenant(&store, tenant_id).await?;
@@ -157,6 +158,8 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
         &connector,
     )
     .await?;
+    provision_private_conversation_owner(&harness, tenant_id, ConversationId::new(), owner_id)
+        .await?;
 
     let (issuer, ca_der) = certificate_issuer(now())?;
     let index = Arc::new(ConnectorCredentialAuthorizationIndex::new());
@@ -651,6 +654,7 @@ async fn owner_connector_projection_v3_shows_owner_visible_binding_state_and_rem
         .expect("current time fits i64")
     });
     let harness = PostgresHarness::start().await?;
+    grant_agent_route_run_runtime_access(&harness).await?;
     let store = harness.runtime_store(12).await?;
     let tenant_id = TenantId::new();
     provision_tenant(&store, tenant_id).await?;
@@ -955,6 +959,7 @@ async fn owner_connector_binding_state_http_is_exact_authorized_and_fenced()
         .expect("current time fits i64")
     });
     let harness = PostgresHarness::start().await?;
+    grant_agent_route_run_runtime_access(&harness).await?;
     let store = harness.runtime_store(12).await?;
     let tenant_id = TenantId::new();
     provision_tenant(&store, tenant_id).await?;
@@ -3007,6 +3012,307 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
 }
 
 #[tokio::test]
+async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), Box<dyn Error>> {
+    TEST_NOW.get_or_init(|| {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock")
+                .as_millis(),
+        )
+        .expect("current time fits i64")
+    });
+    let harness = PostgresHarness::start().await?;
+    grant_agent_route_run_runtime_access(&harness).await?;
+    let store = harness.runtime_store(12).await?;
+    let tenant_id = TenantId::new();
+    provision_tenant(&store, tenant_id).await?;
+    let owner_root = key(130);
+    let owner_device_key = key(131);
+    let owner_device_id = DeviceId::new();
+    let (owner_id, owner_head, _) = provision_identity(
+        &harness,
+        &owner_root,
+        &owner_device_key,
+        owner_device_id,
+        132,
+    )
+    .await?;
+    let (_, owner_authorization) =
+        provision_owner_session(&harness, owner_id, owner_device_id, owner_head, [0x91; 32])
+            .await?;
+    let agent_identity_device_id = DeviceId::new();
+    let (_, _, agent_certificate) = provision_identity(
+        &harness,
+        &key(133),
+        &key(134),
+        agent_identity_device_id,
+        135,
+    )
+    .await?;
+    let (host, connector) = provision_host_and_connector(&store, tenant_id, owner_id).await?;
+    let installation_id = InstallationId::new();
+    let agent_device_id = AgentDeviceId::new();
+    let binding_id = BindingId::new();
+    let fingerprint = DeviceCredentialFingerprint::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-device-credential-fingerprint.v1\0",
+            &agent_certificate.to_deterministic_cbor()?,
+        )
+        .as_bytes(),
+    );
+    provision_installation_binding(
+        &store,
+        tenant_id,
+        owner_id,
+        installation_id,
+        agent_device_id,
+        agent_identity_device_id,
+        fingerprint,
+        binding_id,
+        &connector,
+    )
+    .await?;
+    let (issuer, ca_der) = certificate_issuer(now())?;
+    let index = Arc::new(ConnectorCredentialAuthorizationIndex::new());
+    let app = Arc::new(application(store.clone(), issuer, index.clone()));
+    let enrollment = app
+        .create_enrollment_intent(CreateConnectorEnrollmentRequest::new(
+            tenant_id,
+            connector.connector_id(),
+            RequestId::new(),
+            EnrollmentToken::from_bytes([0x92; 32]),
+            None,
+        )?)
+        .await?;
+    let completion = app
+        .enroll(ParsedEnrollment {
+            token: EnrollmentToken::from_bytes([0x92; 32]),
+            request: signed_enrollment_request(&enrollment, &[0x92; 32], 136, 137)?,
+        })
+        .await?;
+    app.hydrate_connector_authorization(tenant_id, connector.connector_id())
+        .await?;
+    let auth_time = current_store_timestamp()?;
+    let opened = app
+        .open_control(
+            authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
+            ParsedHello {
+                tenant_id,
+                connector_id: connector.connector_id(),
+                host_id: host.host_id(),
+                boot_id: BootId::new(),
+                connector_generation: completion.credential.generation(),
+                spec_revision: completion.credential.revision(),
+                protocol: ParsedProtocolRange {
+                    minimum_major: 1,
+                    minimum_minor: 6,
+                    maximum_major: 1,
+                    maximum_minor: 6,
+                },
+                runtime_claims: claims()?,
+                capacity: capacity(),
+                last_applied_command_sequence: 0,
+                required_server_capabilities: vec!["agent-route-health.v1".into()],
+            },
+        )
+        .await?;
+    let fence = opened.lease.fence();
+    let router = agent_provisioning_owner_router(Arc::new(
+        PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app.clone()),
+    ));
+    let bootstrap_id = AgentRouteBootstrapId::new();
+    assert_eq!(
+        owner_post(
+            router.clone(),
+            "/v1/agent-route-bootstraps",
+            &owner_authorization,
+            "route_rejected_begin",
+            "application/vnd.dirextalk.agent-route-bootstrap.v1+cbor",
+            agent_route_bootstrap_begin_body(
+                bootstrap_id,
+                tenant_id,
+                installation_id,
+                binding_id,
+                agent_device_id,
+                owner_id,
+                owner_device_id,
+                now() + 300_000,
+                vec![0xa1; 128],
+                &owner_device_key,
+            )?,
+        )
+        .await?
+        .0,
+        StatusCode::CREATED
+    );
+    let prepare = app.poll_commands(
+        authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?, fence, 0,
+    ).await?.into_iter().find(|c| matches!(c.payload(),
+        ServerCommandPayload::PrepareAgentRouteRecipient(v) if v.bootstrap_id == bootstrap_id
+    )).expect("Prepare #1");
+    let recipient_id = AgentRouteRecipientId::new();
+    let recipient_capsule = vec![0xa2; 256];
+    let recipient_digest = ControlDigest::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-route-recipient-capsule.v1\0",
+            &recipient_capsule,
+        )
+        .as_bytes(),
+    );
+    let key_id = RouteHealthKeyId::new();
+    let public_key = Ed25519PublicKey::try_from(key(138).verifying_key().to_bytes())?;
+    app.record_agent_route_recipient_ready(
+        authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
+        ParsedAgentRouteRecipientReady {
+            connector_fence: parsed_fence(fence),
+            bootstrap_id,
+            command_sequence: prepare.sequence(),
+            command_payload_digest: prepare.payload_digest(),
+            encoded_command_digest: prepare.encoded_command_digest(),
+            installation_id,
+            binding_id,
+            agent_control_device_id: agent_device_id,
+            recipient_id,
+            recipient_capsule_digest: recipient_digest,
+            opaque_recipient_capsule: recipient_capsule,
+            expires_at_millis: now() + 300_000,
+            result_digest: route_bootstrap_recipient_ready_result_digest(
+                bootstrap_id,
+                tenant_id,
+                installation_id,
+                binding_id,
+                agent_device_id,
+                recipient_id,
+                prepare.sequence(),
+                recipient_digest,
+                now() + 300_000,
+            ),
+            route_health_key_id: Some(key_id),
+            route_health_public_key: Some(public_key),
+        },
+    )
+    .await?;
+    let delivery_id = AgentRouteDeliveryId::new();
+    let route_id = ConversationId::new();
+    let sealed = vec![0xa3; 256];
+    let sealed_digest =
+        Sha256Digest::hash_domain(b"dirextalk.agent-route-bootstrap-capsule.v1\0", &sealed);
+    assert_eq!(
+        owner_agent_route_bootstrap_delivery(
+            router.clone(),
+            &format!("/v1/agent-route-bootstraps/{bootstrap_id}/deliveries/{delivery_id}"),
+            &owner_authorization,
+            agent_route_bootstrap_delivery_body(
+                bootstrap_id,
+                delivery_id,
+                tenant_id,
+                installation_id,
+                binding_id,
+                agent_device_id,
+                owner_id,
+                owner_device_id,
+                recipient_id,
+                route_id,
+                sealed_digest,
+                sealed,
+                now() + 300_000,
+                &owner_device_key,
+            )?,
+        )
+        .await?
+        .0,
+        StatusCode::CREATED
+    );
+    let deliver = app.poll_commands(
+        authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
+        fence, prepare.sequence(),
+    ).await?.into_iter().find(|c| matches!(c.payload(),
+        ServerCommandPayload::DeliverAgentRouteBootstrap(v) if v.bootstrap_id == bootstrap_id
+    )).expect("Deliver #2");
+    let health_digest = ControlDigest::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-route-health-public-key.v1\0",
+            public_key.as_bytes(),
+        )
+        .as_bytes(),
+    );
+    let rejected_at = now();
+    let code = "INVALID_CAPSULE".to_owned();
+    let rejected = ParsedAgentRouteBootstrapRejected {
+        connector_fence: parsed_fence(fence),
+        bootstrap_id,
+        delivery_id,
+        route_id,
+        command_sequence: deliver.sequence(),
+        command_payload_digest: deliver.payload_digest(),
+        encoded_command_digest: deliver.encoded_command_digest(),
+        installation_id,
+        binding_id,
+        agent_control_device_id: agent_device_id,
+        recipient_id,
+        capsule_digest: ControlDigest::from_bytes(*sealed_digest.as_bytes()),
+        stable_error_code: code.clone(),
+        rejected_at_millis: rejected_at,
+        result_digest: route_bootstrap_rejected_result_digest(
+            bootstrap_id,
+            delivery_id,
+            route_id,
+            installation_id,
+            binding_id,
+            agent_device_id,
+            recipient_id,
+            deliver.sequence(),
+            ControlDigest::from_bytes(*sealed_digest.as_bytes()),
+            &code,
+            rejected_at,
+        ),
+        route_health_key_id: Some(key_id),
+        route_health_public_key_digest: Some(health_digest),
+    };
+    app.reject_agent_route_bootstrap(
+        authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
+        rejected.clone(),
+    )
+    .await?;
+    let mut session = store.begin_tenant(tenant_id).await?;
+    let row: (String, Uuid, Vec<u8>, i64) = sqlx::query_as(
+        "SELECT state, route_health_key_id, route_health_public_key, updated_at_ms FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND bootstrap_id=$2",
+    ).bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(session.connection()).await?;
+    assert_eq!(row.0, "rejected");
+    assert_eq!(row.1, Uuid::from(key_id));
+    assert_eq!(row.2, public_key.as_bytes());
+    let updated_at_before_replay = row.3;
+    session.rollback().await?;
+    assert!(
+        app.reject_agent_route_bootstrap(
+            authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
+            rejected.clone(),
+        )
+        .await
+        .is_ok()
+    );
+    let mut replay_session = store.begin_tenant(tenant_id).await?;
+    let updated_at_after_replay: i64 = sqlx::query_scalar(
+        "SELECT updated_at_ms FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND bootstrap_id=$2",
+    ).bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id))
+    .fetch_one(replay_session.connection()).await?;
+    assert_eq!(updated_at_after_replay, updated_at_before_replay);
+    replay_session.rollback().await?;
+    let mut mismatch = rejected;
+    mismatch.route_health_public_key_digest = Some(ControlDigest::from_bytes([0xa4; 32]));
+    assert_eq!(
+        app.reject_agent_route_bootstrap(
+            authenticate_at(index, &ca_der, &completion.credential, auth_time)?,
+            mismatch,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn owner_agent_route_target_resolves_only_one_active_owned_binding()
 -> Result<(), Box<dyn Error>> {
     TEST_NOW.get_or_init(|| {
@@ -4476,6 +4782,37 @@ fn route_bootstrap_installed_result_digest(
             &u64::try_from(installed_at_millis)
                 .expect("positive RouteBootstrap installed timestamp")
                 .to_be_bytes(),
+        ],
+    )
+}
+
+fn route_bootstrap_rejected_result_digest(
+    bootstrap_id: AgentRouteBootstrapId,
+    delivery_id: AgentRouteDeliveryId,
+    route_id: ConversationId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    recipient_id: AgentRouteRecipientId,
+    command_sequence: u64,
+    capsule_digest: ControlDigest,
+    code: &str,
+    at: i64,
+) -> ControlDigest {
+    provisioning_commit(
+        b"dirextalk.agent-route-bootstrap-rejected.v1",
+        &[
+            Uuid::from(bootstrap_id).as_bytes(),
+            Uuid::from(delivery_id).as_bytes(),
+            Uuid::from(route_id).as_bytes(),
+            Uuid::from(installation_id).as_bytes(),
+            Uuid::from(binding_id).as_bytes(),
+            Uuid::from(agent_control_device_id).as_bytes(),
+            Uuid::from(recipient_id).as_bytes(),
+            &command_sequence.to_be_bytes(),
+            &capsule_digest.as_bytes(),
+            code.as_bytes(),
+            &u64::try_from(at).expect("positive timestamp").to_be_bytes(),
         ],
     )
 }
