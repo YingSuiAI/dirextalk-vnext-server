@@ -21,13 +21,14 @@ fi
 make_fixture() {
   local fixture=$1
   mkdir -p "$fixture/scripts" "$fixture/bin" "$fixture/target/debug" "$fixture/maps" "$fixture/proxy-ports"
+  printf dex >"$fixture/trust-probe.dex"
   cp "$script" "$fixture/scripts/android-acceptance.sh"
   : >"$fixture/docker-compose.local.yml"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "cargo $*" >>"$DTX_TEST_LOG"' 'exit 0' >"$fixture/bin/cargo"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "docker $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" up "*) if [[ "${DTX_TEST_COMPOSE_UP:-ok}" == fail ]]; then exit 1; fi; sleep "${DTX_TEST_COMPOSE_SLEEP:-0}";; *" cp "*) dest="${*: -1}"; mkdir -p "$(dirname "$dest")"; printf ca-fixture >"$dest";; esac' 'exit 0' >"$fixture/bin/docker"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "avdmanager $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" list avd "*) [[ "${DTX_TEST_AVD_PRESENT:-}" == 1 ]] && printf "    Name: %s\n" "${DTX_TEST_AVD_NAME:-}";; *" create avd "*) [[ "${DTX_TEST_AVD_CREATE:-ok}" == ok ]] || exit 1;; *" delete avd "*) [[ "${DTX_TEST_AVD_DELETE:-ok}" == ok ]] || exit 1;; esac' 'exit 0' >"$fixture/bin/avdmanager"
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "adb $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'serial=""; [[ "${1:-}" != -s ]] || { serial=$2; shift 2; }' 'case " $* " in *" devices "*) printf "%s" "${DTX_TEST_ADB_DEVICES:-}";; *" wait-for-device "*) for _ in $(seq 1 50); do [[ -f "$DTX_TEST_MAP/$serial" ]] && exit 0; sleep 0.02; done; exit 1;; *" emu avd name "*) cat "$DTX_TEST_MAP/$serial"; printf "OK\n";; *" remount "*) marker="$DTX_TEST_ROOT/remount-$DTX_TEST_RUN_ID-$serial"; if [[ ! -e "$marker" ]]; then : >"$marker"; printf "Successfully disabled verity\n"; else printf "remount succeeded\n"; fi;; *" reboot "*) :;; *" root "*) [[ -f "$DTX_TEST_MAP/$serial" ]] || exit 1;; *" shell "*) if [[ "$*" == *sha256sum* ]]; then sha256sum "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/tls/ca.pem"; elif [[ "$*" == *stat* ]]; then printf "644 0 0\n"; elif [[ "$*" == *ls*Z* ]]; then printf "u:object_r:system_file:s0 root root\n"; elif [[ "$*" == *getprop* ]]; then printf "1\n"; elif [[ "$*" == *id* ]]; then printf "0\n"; fi;; *" push "*) [[ -f "$DTX_TEST_MAP/$serial" ]] || exit 1;; *" reverse tcp:8443 "*) if [[ "${DTX_TEST_REVERSE_FAIL_AFTER:-}" == 1 && "$serial" == "$(awk -F= '\''$1 == "emulator_a_serial" { print $2 }'\'' "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/resources")" ]]; then echo "reverse-side-effect $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG"; exit 1; fi; [[ "${DTX_TEST_REVERSE:-ok}" == ok ]] || exit 1; [[ "${DTX_TEST_REVERSE_SLEEP:-0}" == 0 ]] || sleep "$DTX_TEST_REVERSE_SLEEP";; *" reverse --remove tcp:8443 "*) echo "reverse-remove $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG";; esac' >"$fixture/bin/adb"
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "emulator $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'avd=""; port=""; while (($#)); do case "$1" in -avd) avd=$2; shift 2;; -port) port=$2; shift 2;; *) shift;; esac; done' 'printf "%s\n" "$avd" >"$DTX_TEST_MAP/emulator-$port"' 'trap '\''echo "emulator-term $DTX_TEST_RUN_ID $avd" >>"$DTX_TEST_LOG"; rm -f "$DTX_TEST_MAP/emulator-$port"; exit 0'\'' TERM' 'while :; do sleep 1; done' >"$fixture/bin/emulator"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "adb $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'serial=""; [[ "${1:-}" != -s ]] || { serial=$2; shift 2; }' 'case " $* " in *" devices "*) printf "%s" "${DTX_TEST_ADB_DEVICES:-}";; *" wait-for-device "*) for _ in $(seq 1 50); do [[ -f "$DTX_TEST_MAP/$serial" ]] && exit 0; sleep 0.02; done; exit 1;; *" emu avd name "*) if [[ "${DTX_TEST_CONSOLE_EXTRA:-}" == 1 ]]; then cat "$DTX_TEST_MAP/$serial"; printf "WRONG\nOK\n"; elif [[ "${DTX_TEST_CONSOLE_CRLF:-}" == 1 ]]; then cat "$DTX_TEST_MAP/$serial" | tr "\n" "\r\n"; printf "\r\nOK\r\n"; else cat "$DTX_TEST_MAP/$serial"; printf "OK\n"; fi;; *" remount "*) marker="$DTX_TEST_ROOT/remount-$DTX_TEST_RUN_ID-$serial"; if [[ ! -e "$marker" ]]; then : >"$marker"; printf "Successfully disabled verity\n"; else printf "remount succeeded\n"; fi;; *" reboot "*) :;; *" root "*) [[ -f "$DTX_TEST_MAP/$serial" ]] || exit 1;; *" shell "*) if [[ "$*" == *app_process* ]]; then trust="$DTX_TEST_ROOT/trust-$serial"; [[ "${DTX_TEST_TRUST_FAIL:-}" != 1 && -f "$trust" ]] && printf "TRUSTED\n" || exit 1; elif [[ "$*" == *cp* && "$*" == *cacerts* ]]; then : >"$DTX_TEST_ROOT/trust-$serial"; elif [[ "$*" == *sha256sum* ]]; then sha256sum "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/tls/ca.pem"; elif [[ "$*" == *stat* ]]; then printf "644 0 0\n"; elif [[ "$*" == *ls*Z* ]]; then printf "u:object_r:system_file:s0 root root\n"; elif [[ "$*" == *getprop* ]]; then printf "1\n"; elif [[ "$*" == *id* ]]; then printf "0\n"; fi;; *" push "*) [[ -f "$DTX_TEST_MAP/$serial" ]] || exit 1;; *" reverse tcp:8443 "*) if [[ "${DTX_TEST_REVERSE_FAIL_AFTER:-}" == 1 && "$serial" == "$(awk -F= '\''$1 == "emulator_a_serial" { print $2 }'\'' "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/resources")" ]]; then echo "reverse-side-effect $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG"; exit 1; fi; [[ "${DTX_TEST_REVERSE:-ok}" == ok ]] || exit 1; [[ "${DTX_TEST_REVERSE_SLEEP:-0}" == 0 ]] || sleep "$DTX_TEST_REVERSE_SLEEP";; *" reverse --remove tcp:8443 "*) echo "reverse-remove $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG";; esac' >"$fixture/bin/adb"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "emulator $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'avd=""; port=""; while (($#)); do case "$1" in -avd) avd=$2; shift 2;; -port) port=$2; shift 2;; *) shift;; esac; done' 'printf "%s\n" "$avd" >"$DTX_TEST_MAP/emulator-$port"' 'exec python3 -c '\''import signal,time,sys; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(3600)'\'' emulator -avd "$avd" -port "$port"' >"$fixture/bin/emulator"
   printf '%s\n' '#!/usr/bin/env bash' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'port="${*: -1}"; port="${port##*:}"; [[ -f "${DTX_TEST_PROXY_PORTS:-/nonexistent}/$port" ]] && printf "LISTEN\n"' >"$fixture/bin/ss"
   chmod +x "$fixture/bin"/*
@@ -37,9 +38,9 @@ run_fixture() {
   local fixture=$1 run_id=$2
   shift 2
   if [[ "${DTX_TEST_EXEC:-}" == 1 ]]; then
-    exec env PATH="$fixture/bin:$PATH" DTX_TEST_LOG="$fixture/log" DTX_TEST_RUN_ID="$run_id" DTX_TEST_ROOT="$fixture" DTX_TEST_MAP="$fixture/maps" DTX_TEST_PROXY_PORTS="$fixture/proxy-ports" DTX_ANDROID_SYSTEM_IMAGE='system-images;android-35;aosp_atd;x86_64' DTX_ANDROID_ACCEPTANCE_RUN_ID="$run_id" "$@" "$fixture/scripts/android-acceptance.sh" --run
+    exec env PATH="$fixture/bin:$PATH" DTX_TEST_LOG="$fixture/log" DTX_TEST_RUN_ID="$run_id" DTX_TEST_ROOT="$fixture" DTX_TEST_MAP="$fixture/maps" DTX_TEST_PROXY_PORTS="$fixture/proxy-ports" DTX_ANDROID_SYSTEM_IMAGE='system-images;android-35;aosp_atd;x86_64' DTX_ANDROID_TRUST_PROBE_DEX="$fixture/trust-probe.dex" DTX_ANDROID_ACCEPTANCE_RUN_ID="$run_id" "$@" "$fixture/scripts/android-acceptance.sh" --run
   fi
-  PATH="$fixture/bin:$PATH" DTX_TEST_LOG="$fixture/log" DTX_TEST_RUN_ID="$run_id" DTX_TEST_ROOT="$fixture" DTX_TEST_MAP="$fixture/maps" DTX_TEST_PROXY_PORTS="$fixture/proxy-ports" DTX_ANDROID_SYSTEM_IMAGE='system-images;android-35;aosp_atd;x86_64' DTX_ANDROID_ACCEPTANCE_RUN_ID="$run_id" "$@" "$fixture/scripts/android-acceptance.sh" --run
+  PATH="$fixture/bin:$PATH" DTX_TEST_LOG="$fixture/log" DTX_TEST_RUN_ID="$run_id" DTX_TEST_ROOT="$fixture" DTX_TEST_MAP="$fixture/maps" DTX_TEST_PROXY_PORTS="$fixture/proxy-ports" DTX_ANDROID_SYSTEM_IMAGE='system-images;android-35;aosp_atd;x86_64' DTX_ANDROID_TRUST_PROBE_DEX="$fixture/trust-probe.dex" DTX_ANDROID_ACCEPTANCE_RUN_ID="$run_id" "$@" "$fixture/scripts/android-acceptance.sh" --run
 }
 
 # A partially-started compose project is owned before `up`; failure therefore
@@ -94,6 +95,7 @@ printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; contro
 for _ in $(seq 1 30); do [[ -f "$fixture/.android-acceptance/concurrent-a/resources" ]] && break; sleep 0.1; done
 (trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_REVERSE_SLEEP=1 run_fixture "$fixture" concurrent-b env) & second=$!
 for _ in $(seq 1 100); do [[ $(rg -c '^adb concurrent-[ab] .* reverse tcp:8443 ' "$fixture/log" 2>/dev/null || true) -ge 2 ]] && break; sleep 0.1; done
+for _ in $(seq 1 100); do [[ $(rg -c '^adb concurrent-[ab] .* shell app_process ' "$fixture/log" 2>/dev/null || true) -ge 4 ]] && break; sleep 0.1; done
 for run in concurrent-a concurrent-b; do
   resource="$fixture/.android-acceptance/$run/resources"; [[ -f "$resource" ]]
   serial_a="$(awk -F= '$1 == "emulator_a_serial" { print $2 }' "$resource")"; serial_b="$(awk -F= '$1 == "emulator_b_serial" { print $2 }' "$resource")"
@@ -124,13 +126,24 @@ fixture="$tmp/config"; make_fixture "$fixture"
 if DTX_ANDROID_ACCELERATION=turbo run_fixture "$fixture" config-invalid env >/dev/null 2>&1; then exit 1; fi
 [[ ! -e "$fixture/log" ]]
 
+# Console parsing ignores CR/empty lines but rejects divergent extra payload.
+fixture="$tmp/console-extra"; make_fixture "$fixture"
+if DTX_TEST_CONSOLE_EXTRA=1 run_fixture "$fixture" console-extra env >/dev/null 2>&1; then exit 1; fi
+rg -F 'emu avd name' "$fixture/log" >/dev/null
+fixture="$tmp/console-crlf"; make_fixture "$fixture"
+if DTX_TEST_CONSOLE_CRLF=1 run_fixture "$fixture" console-crlf env >/dev/null 2>&1; then exit 1; fi
+rg -F 'shell app_process' "$fixture/log" >/dev/null
+fixture="$tmp/trust-failure"; make_fixture "$fixture"
+if DTX_TEST_TRUST_FAIL=1 run_fixture "$fixture" trust-failure env >/dev/null 2>&1; then exit 1; fi
+rg -F 'shell app_process' "$fixture/log" >/dev/null
+
 # A malformed durable reservation rejects allocation instead of being skipped.
 fixture="$tmp/corrupt"; make_fixture "$fixture"; mkdir -p "$fixture/.android-acceptance/stale"; printf 'node_a_port=not-a-port\n' >"$fixture/.android-acceptance/stale/resources"
 if run_fixture "$fixture" corrupt-scan env >/dev/null 2>&1; then exit 1; fi
-for malformed in '20000-corrupt' '1x' 'emulator-5556'; do
+for malformed in '20000-corrupt' '1x' 'emulator-5556' 'pid'; do
   fixture="$tmp/corrupt-${malformed//[^A-Za-z0-9]/-}"; make_fixture "$fixture"; mkdir -p "$fixture/.android-acceptance/stale"
   printf 'run_id=stale\ncompose_project=dtx-android-accept-stale\nandroid_system_image=system-images;android-35;aosp_atd;x86_64\nandroid_acceleration=off\nandroid_gpu=swiftshader_indirect\nandroid_cores=2\nandroid_memory_mib=2048\nandroid_boot_timeout_seconds=180\nandroid_avd_count=2\nandroid_avd_rss_mib=4300\nandroid_rss_reservation_mib=8600\nnode_a_port=20000\nnode_b_port=20001\nproxy_a_port=20002\ncontrol_a_port=20003\nproxy_b_port=20004\ncontrol_b_port=20005\nemulator_a_port=5554\nemulator_b_port=5556\nemulator_a_serial=emulator-5554\nemulator_b_serial=emulator-5556\n' >"$fixture/.android-acceptance/stale/resources"
-  case "$malformed" in 20000-corrupt) sed -i 's/node_a_port=20000/node_a_port=20000-corrupt/' "$fixture/.android-acceptance/stale/resources";; 1x) sed -i 's/PROXY_A_PID=/PROXY_A_PID=1x/' "$fixture/.android-acceptance/stale/resources"; printf 'PROXY_A_PID=1x\n' >>"$fixture/.android-acceptance/stale/resources";; emulator-5556) sed -i 's/emulator_a_serial=emulator-5554/emulator_a_serial=emulator-5556/' "$fixture/.android-acceptance/stale/resources";; esac
+  case "$malformed" in 20000-corrupt) sed -i 's/node_a_port=20000/node_a_port=20000-corrupt/' "$fixture/.android-acceptance/stale/resources";; 1x) sed -i 's/PROXY_A_PID=/PROXY_A_PID=1x/' "$fixture/.android-acceptance/stale/resources"; printf 'PROXY_A_PID=1x\n' >>"$fixture/.android-acceptance/stale/resources";; emulator-5556) sed -i 's/emulator_a_serial=emulator-5554/emulator_a_serial=emulator-5556/' "$fixture/.android-acceptance/stale/resources";; pid) printf 'emulator_a_pid=not-a-pid\nemulator_b_pid=321\n' >>"$fixture/.android-acceptance/stale/resources";; esac
   if run_fixture "$fixture" "corrupt-${malformed//[^A-Za-z0-9]/-}" env >/dev/null 2>&1; then exit 1; fi
   [[ ! -e "$fixture/log" ]]
 done
