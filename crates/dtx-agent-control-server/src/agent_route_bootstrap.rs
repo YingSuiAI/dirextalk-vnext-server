@@ -16,7 +16,7 @@ use dtx_agent_persistence::{AgentPersistenceError, CommandLogRepository};
 use dtx_domain::{
     AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId, BindingId,
     ConnectorId, ConversationId, DeviceId, IdentityId, InstallationId, OutboxId, RequestId,
-    Revision, TenantId,
+    Revision, RouteHealthKeyId, TenantId,
 };
 use dtx_identity_persistence::{DeviceSessionCredential, DeviceSessionRepository};
 use dtx_storage::PgStore;
@@ -52,6 +52,8 @@ pub const AGENT_ROUTE_BOOTSTRAP_CAPSULE_DOMAIN: &[u8] =
     b"dirextalk.agent-route-bootstrap-capsule.v1\0";
 pub const AGENT_ROUTE_BOOTSTRAP_OUTBOX_DOMAIN: &[u8] =
     b"dirextalk.agent-route-bootstrap-outbox.v1\0";
+pub const AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN: &[u8] =
+    b"dirextalk.agent-route-health-public-key.v1\0";
 
 const MAX_OPAQUE_BYTES: usize = 196_608;
 const MAX_RECEIPT_BYTES: usize = 65_536;
@@ -269,6 +271,8 @@ struct RouteBootstrapRecord {
     binding_id: BindingId,
     agent_control_device_id: AgentDeviceId,
     connector_id: ConnectorId,
+    route_health_key_id: Option<RouteHealthKeyId>,
+    route_health_public_key: Option<[u8; 32]>,
     route_fence: Option<[u8; 32]>,
     state: AgentRouteBootstrapState,
     recipient_id: Option<AgentRouteRecipientId>,
@@ -1030,6 +1034,13 @@ async fn deliver_in_transaction(
             installation_id: command.installation_id,
             binding_id: command.binding_id,
             agent_control_device_id: command.agent_control_device_id,
+            route_health_key_id: row.route_health_key_id,
+            route_health_public_key_digest: row.route_health_public_key.map(|value| {
+                ControlSha256Digest::from_bytes(
+                    *Sha256Digest::hash_domain(AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN, &value)
+                        .as_bytes(),
+                )
+            }),
         });
     let durable = append_route_bootstrap_command(
         connection,
@@ -1419,7 +1430,8 @@ async fn load_bootstrap_for_update(
                 binding_id, agent_control_device_id, connector_id, route_fence, state,
                 recipient_id, recipient_capsule_digest, opaque_recipient_capsule, route_id,
                 delivery_id, bootstrap_capsule_digest, rejection_code, expires_at_ms,
-                created_at_ms, updated_at_ms
+                created_at_ms, updated_at_ms, route_health_key_id,
+                route_health_public_key
            FROM agent.agent_route_bootstraps
           WHERE tenant_id=$1 AND bootstrap_id=$2 FOR UPDATE",
     )
@@ -1476,6 +1488,16 @@ fn route_bootstrap_record_from_row(
                 .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
         )
         .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        route_health_key_id: optional_uuid(row, "route_health_key_id")?
+            .map(RouteHealthKeyId::try_from)
+            .transpose()
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        route_health_public_key: row
+            .try_get::<Option<Vec<u8>>, _>("route_health_public_key")
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?
+            .map(|value| value.try_into())
+            .transpose()
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
         route_fence: optional_bytes32(row, "route_fence")?,
         state: AgentRouteBootstrapState::parse(
             &row.try_get::<String, _>("state")

@@ -65,12 +65,13 @@ use crate::{
     ParsedRunCheckpoint, ParsedRunClaim, ParsedRunCompleted, ParsedRunExecutionFence,
     ParsedRunFailed, ParsedRunOutput, ParsedRunRelease, ProtobufDurableCommandEncoder,
     RunAvailableWire, RunCancelRequestedWire, RunLeaseGrantedWire,
-    RunOfferNotificationSubscription, command_notifications::ConnectorCommandNotifications,
+    RunOfferNotificationSubscription, agent_route_bootstrap::AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN,
+    command_notifications::ConnectorCommandNotifications,
     is_owned_agent_route_bootstrap_target_live, run_notifications::ConnectorRunOfferNotifications,
 };
 
 const PROTOCOL_MAJOR: u32 = 1;
-const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 5;
+const DEFAULT_MAXIMUM_PROTOCOL_MINOR: u32 = 6;
 const EXPIRED_AGENT_ROUTE_PREPARE_ACK_PROTOCOL_MINOR: u32 = 5;
 const DEFAULT_HEARTBEAT_INTERVAL_MILLIS: u32 = 10_000;
 const DEFAULT_HEARTBEAT_TTL_MILLIS: u32 = 30_000;
@@ -134,6 +135,13 @@ impl ConnectorControlPolicy {
             supported_server_capabilities,
         })
     }
+
+    fn negotiated_server_capabilities(&self, protocol_minor: u32) -> Vec<String> {
+        if protocol_minor < 6 {
+            return Vec::new();
+        }
+        self.supported_server_capabilities.iter().cloned().collect()
+    }
 }
 
 impl Default for ConnectorControlPolicy {
@@ -147,6 +155,7 @@ impl Default for ConnectorControlPolicy {
                 "durable-command-replay".to_owned(),
                 "run-routing".to_owned(),
                 "opaque-agent-provisioning".to_owned(),
+                "agent-route-health.v1".to_owned(),
                 "runtime-claims".to_owned(),
             ],
         )
@@ -2654,6 +2663,7 @@ impl PostgresConnectorControlApplication {
         Ok(OpenControlCompletion {
             lease,
             protocol_minor,
+            server_capabilities: self.policy.negotiated_server_capabilities(protocol_minor),
             heartbeat_interval_millis: self.policy.heartbeat_interval_millis,
             heartbeat_ttl_millis: self.policy.heartbeat_ttl_millis,
             acknowledged_command_sequence: command_head.acknowledged_sequence(),
@@ -3179,7 +3189,8 @@ impl PostgresConnectorControlApplication {
                     b.state AS bootstrap_state, b.recipient_id, b.recipient_capsule_digest,
                     b.opaque_recipient_capsule, o.operation_id, o.command_sequence,
                     o.command_payload_digest, o.encoded_command_digest, o.state AS outbox_state,
-                    o.result_digest
+                    o.result_digest, b.route_health_key_id, b.route_health_public_key,
+                    b.route_health_key_purpose
                FROM agent.agent_route_bootstraps AS b
                JOIN agent.agent_route_bootstrap_outbox AS o
                  ON o.tenant_id=b.tenant_id AND o.bootstrap_id=b.bootstrap_id
@@ -3304,6 +3315,38 @@ impl PostgresConnectorControlApplication {
         let outbox_state: String = row
             .try_get("outbox_state")
             .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_health_key_id = row
+            .try_get::<Option<Uuid>, _>("route_health_key_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .map(dtx_domain::RouteHealthKeyId::try_from)
+            .transpose()
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_health_public_key = row
+            .try_get::<Option<Vec<u8>>, _>("route_health_public_key")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_health_purpose: Option<String> = row
+            .try_get("route_health_key_purpose")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let ready_health_key = ready.route_health_key_id;
+        let ready_health_public_key = ready
+            .route_health_public_key
+            .map(|value| value.as_bytes().to_vec());
+        let health_key_matches = ready_health_key.is_some() == ready_health_public_key.is_some()
+            && stored_health_key_id == ready_health_key
+            && stored_health_public_key.as_ref() == ready_health_public_key.as_ref()
+            && (ready_health_key.is_none()
+                || stored_health_purpose.as_deref() == Some("agent-route-health"));
+        if !health_key_matches {
+            // Only a genuinely fresh pending row may establish its health
+            // key. Once any key is durable, every retry must match exactly.
+            let fresh_pending = bootstrap_state == "pending_recipient"
+                && stored_health_key_id.is_none()
+                && stored_health_public_key.is_none()
+                && stored_health_purpose.is_none();
+            if !fresh_pending {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+        }
         if bootstrap_state == "recipient_ready" && outbox_state == "acknowledged" {
             let stored_recipient = row
                 .try_get::<Option<Uuid>, _>("recipient_id")
@@ -3321,6 +3364,8 @@ impl PostgresConnectorControlApplication {
                     .map_err(|_| ConnectorControlApplicationError::Internal)?
                     .as_deref()
                     != Some(ready.result_digest.as_bytes().as_slice())
+                || stored_health_key_id != ready.route_health_key_id
+                || stored_health_public_key.as_deref() != ready_health_public_key.as_deref()
             {
                 return Err(ConnectorControlApplicationError::Conflict);
             }
@@ -3424,7 +3469,8 @@ impl PostgresConnectorControlApplication {
             "UPDATE agent.agent_route_bootstraps
                 SET state='recipient_ready', recipient_id=$3,
                     recipient_capsule_digest=$4, opaque_recipient_capsule=$5,
-                    updated_at_ms=$6
+                    route_health_key_id=$6, route_health_public_key=$7,
+                    route_health_key_purpose=$8, updated_at_ms=$9
               WHERE tenant_id=$1 AND bootstrap_id=$2 AND state='pending_recipient'",
         )
         .bind(Uuid::from(fence.tenant_id))
@@ -3432,6 +3478,13 @@ impl PostgresConnectorControlApplication {
         .bind(Uuid::from(ready.recipient_id))
         .bind(ready.recipient_capsule_digest.as_bytes().as_slice())
         .bind(&ready.opaque_recipient_capsule)
+        .bind(ready.route_health_key_id.map(|value| Uuid::from(value)))
+        .bind(
+            ready
+                .route_health_public_key
+                .map(|value| value.as_bytes().to_vec()),
+        )
+        .bind(ready.route_health_key_id.map(|_| "agent-route-health"))
         .bind(now)
         .execute(session.connection())
         .await
@@ -3510,7 +3563,8 @@ impl PostgresConnectorControlApplication {
             "SELECT b.owner_identity_id, b.owner_device_id, b.installation_id, b.binding_id,
                     b.agent_control_device_id, b.expires_at_ms, b.state AS bootstrap_state,
                     b.recipient_id, b.route_id, b.bootstrap_capsule_digest,
-                    b.opaque_sealed_bootstrap, b.route_fence, o.operation_id,
+                    b.opaque_sealed_bootstrap, b.route_fence, b.route_health_key_id,
+                    b.route_health_public_key, o.operation_id,
                     o.command_sequence, o.command_payload_digest, o.encoded_command_digest,
                     o.state AS outbox_state, o.result_digest, o.rejection_code
                FROM agent.agent_route_bootstraps AS b
@@ -3577,6 +3631,21 @@ impl PostgresConnectorControlApplication {
             .map_err(|_| ConnectorControlApplicationError::Internal)?
             .ok_or(ConnectorControlApplicationError::Internal)?;
         let stored_route_fence = optional_bytes32(&row, "route_fence")?;
+        let stored_health_key_id = row
+            .try_get::<Option<Uuid>, _>("route_health_key_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .map(dtx_domain::RouteHealthKeyId::try_from)
+            .transpose()
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_health_key_digest = row
+            .try_get::<Option<Vec<u8>>, _>("route_health_public_key")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .map(|value| {
+                Sha256Digest::from_bytes(
+                    *WireSha256Digest::hash_domain(AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN, &value)
+                        .as_bytes(),
+                )
+            });
         let expires_at = row
             .try_get::<i64, _>("expires_at_ms")
             .map_err(|_| ConnectorControlApplicationError::Internal)?;
@@ -3629,6 +3698,10 @@ impl PostgresConnectorControlApplication {
             || command.installation_id != installation_id
             || command.binding_id != binding_id
             || command.agent_control_device_id != agent_control_device_id
+            || command.route_health_key_id != stored_health_key_id
+            || command.route_health_public_key_digest != stored_health_key_digest
+            || resolution.route_health_key_id() != stored_health_key_id
+            || resolution.route_health_public_key_digest() != stored_health_key_digest
         {
             return Err(ConnectorControlApplicationError::Conflict);
         }
@@ -4648,6 +4721,7 @@ impl PostgresConnectorControlApplication {
                 .supported_server_capabilities
                 .contains(capability)
                 || (capability == "run-routing" && negotiated_minor < 1)
+                || (capability == "agent-route-health.v1" && negotiated_minor < 6)
         }) {
             Err(ConnectorControlApplicationError::PermissionDenied)
         } else {
@@ -5235,6 +5309,20 @@ impl RouteBootstrapTerminalResolution {
         match self {
             Self::Installed(value) => value.capsule_digest,
             Self::Rejected(value) => value.capsule_digest,
+        }
+    }
+
+    fn route_health_key_id(&self) -> Option<dtx_domain::RouteHealthKeyId> {
+        match self {
+            Self::Installed(value) => value.route_health_key_id,
+            Self::Rejected(value) => value.route_health_key_id,
+        }
+    }
+
+    fn route_health_public_key_digest(&self) -> Option<Sha256Digest> {
+        match self {
+            Self::Installed(value) => value.route_health_public_key_digest,
+            Self::Rejected(value) => value.route_health_public_key_digest,
         }
     }
 

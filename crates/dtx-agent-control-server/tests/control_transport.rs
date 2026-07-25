@@ -319,6 +319,11 @@ impl ConnectorControlApplication for FakeApplication {
             Ok(OpenControlCompletion {
                 lease,
                 protocol_minor: negotiated_protocol_minor,
+                server_capabilities: if negotiated_protocol_minor >= 6 {
+                    vec!["agent-route-health.v1".to_owned()]
+                } else {
+                    Vec::new()
+                },
                 heartbeat_interval_millis: HEARTBEAT_INTERVAL_MILLIS,
                 heartbeat_ttl_millis: HEARTBEAT_TTL_MILLIS,
                 acknowledged_command_sequence: state.command_log.acknowledged_sequence(),

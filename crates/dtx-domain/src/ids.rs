@@ -201,6 +201,7 @@ define_uuid_v7_id!(
 define_uuid_v7_id!(AgentRouteBootstrapId, "agent route bootstrap ID");
 define_uuid_v7_id!(AgentRouteRecipientId, "agent route recipient ID");
 define_uuid_v7_id!(AgentRouteDeliveryId, "agent route bootstrap delivery ID");
+define_uuid_v7_id!(RouteHealthKeyId, "Agent Route health key ID");
 define_uuid_v7_id!(RunId, "agent run ID");
 define_uuid_v7_id!(RunOfferId, "agent run offer ID");
 define_uuid_v7_id!(RunLeaseId, "agent run lease ID");

@@ -9,7 +9,7 @@ use std::fmt;
 
 use dtx_domain::{
     AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId, BindingId,
-    ConversationId, DeviceId, IdentityId, InstallationId, TenantId,
+    ConversationId, DeviceId, IdentityId, InstallationId, RouteHealthKeyId, TenantId,
 };
 
 use crate::{CommandError, Sha256Digest};
@@ -116,6 +116,10 @@ pub struct DeliverAgentRouteBootstrap {
     pub binding_id: BindingId,
     /// Exact Agent Control device that must import this isolated route.
     pub agent_control_device_id: AgentDeviceId,
+    /// Exact health signing key selected by the recipient sidecar.  The
+    /// private key never enters this command or the control plane.
+    pub route_health_key_id: Option<RouteHealthKeyId>,
+    pub route_health_public_key_digest: Option<Sha256Digest>,
 }
 
 impl DeliverAgentRouteBootstrap {
@@ -127,7 +131,11 @@ impl DeliverAgentRouteBootstrap {
     ///
     /// Rejects an empty or oversized opaque bootstrap, or a non-positive expiry.
     pub fn validate(&self) -> Result<(), CommandError> {
-        validate_opaque_command_payload(&self.opaque_sealed_bootstrap, self.expires_at_millis)
+        validate_opaque_command_payload(&self.opaque_sealed_bootstrap, self.expires_at_millis)?;
+        if self.route_health_key_id.is_some() != self.route_health_public_key_digest.is_some() {
+            return Err(CommandError::InvalidCommandPayload);
+        }
+        Ok(())
     }
 }
 

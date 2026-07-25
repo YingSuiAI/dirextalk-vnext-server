@@ -3,7 +3,7 @@ mod support;
 use dtx_storage::MigrationRunner;
 use support::PostgresHarness;
 
-const CURRENT_BASELINE_COUNT: i64 = 21;
+const CURRENT_BASELINE_COUNT: i64 = 22;
 const LOCAL_RUNTIME_GRANTS: &str =
     include_str!("../../../docker/local/postgres/20-local-runtime-grants.sql");
 

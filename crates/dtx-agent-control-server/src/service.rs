@@ -13,11 +13,12 @@ use crate::{
     ConnectorControlApplication, ConnectorControlApplicationError, ConnectorHelloAdmissionPermit,
     ConnectorTransportAdmission, ConnectorTransportAdmissionConfig, ParsedClientFrame,
     SourceTransportAdmission, SourceTransportAdmissionConfig, authenticate_control_request,
-    build_connect_lease, build_credential_reissue_response, build_credential_rotation_result,
-    build_durable_command_frame, build_enrollment_response, build_heartbeat_acknowledgement,
-    build_run_available, build_run_checkpoint_ack, build_run_completed_ack, build_run_failed_ack,
-    build_run_lease_granted, build_run_output_ack, parse_client_frame,
-    parse_credential_reissue_request, parse_enrollment_request, unix_time_from_millis,
+    build_connect_lease_with_capabilities, build_credential_reissue_response,
+    build_credential_rotation_result, build_durable_command_frame, build_enrollment_response,
+    build_heartbeat_acknowledgement, build_run_available, build_run_checkpoint_ack,
+    build_run_completed_ack, build_run_failed_ack, build_run_lease_granted, build_run_output_ack,
+    parse_client_frame, parse_credential_reissue_request, parse_enrollment_request,
+    unix_time_from_millis,
 };
 
 /// Maximum time an authenticated control RPC may remain silent before its first `Hello`.
@@ -400,6 +401,11 @@ async fn drive_control(
     let execution_reporting_enabled = protocol_minor >= 2;
     let agent_provisioning_enabled = protocol_minor >= 3;
     let agent_route_bootstrap_enabled = protocol_minor >= 4;
+    let agent_route_health_enabled = protocol_minor >= 6
+        && opened
+            .server_capabilities
+            .iter()
+            .any(|capability| capability == "agent-route-health.v1");
     // Subscribe before the final durable suffix query. This ordering closes the
     // commit-between-replay-and-wait race while allowing lossy/coalesced hints.
     let mut command_notifications =
@@ -409,12 +415,13 @@ async fn drive_control(
     } else {
         crate::RunOfferNotificationSubscription::never()
     };
-    let lease = match build_connect_lease(
+    let lease = match build_connect_lease_with_capabilities(
         opened.lease,
         protocol_minor,
         opened.heartbeat_interval_millis,
         opened.heartbeat_ttl_millis,
         opened.acknowledged_command_sequence,
+        &opened.server_capabilities,
     ) {
         Ok(lease) => lease,
         Err(error) => {
@@ -707,21 +714,30 @@ async fn drive_control(
                         }
                     }
                     ParsedClientFrame::AgentRouteRecipientReady(ready) => {
-                        if agent_route_bootstrap_enabled {
+                        if agent_route_bootstrap_enabled
+                            && (ready.route_health_key_id.is_some() == agent_route_health_enabled)
+                            && (ready.route_health_public_key.is_some() == agent_route_health_enabled)
+                        {
                             application.record_agent_route_recipient_ready(peer, ready).await
                         } else {
                             Err(ConnectorControlApplicationError::PermissionDenied)
                         }
                     }
                     ParsedClientFrame::AgentRouteBootstrapInstalled(installed) => {
-                        if agent_route_bootstrap_enabled {
+                        if agent_route_bootstrap_enabled
+                            && (installed.route_health_key_id.is_some() == agent_route_health_enabled)
+                            && (installed.route_health_public_key_digest.is_some() == agent_route_health_enabled)
+                        {
                             application.complete_agent_route_bootstrap(peer, installed).await
                         } else {
                             Err(ConnectorControlApplicationError::PermissionDenied)
                         }
                     }
                     ParsedClientFrame::AgentRouteBootstrapRejected(rejected) => {
-                        if agent_route_bootstrap_enabled {
+                        if agent_route_bootstrap_enabled
+                            && (rejected.route_health_key_id.is_some() == agent_route_health_enabled)
+                            && (rejected.route_health_public_key_digest.is_some() == agent_route_health_enabled)
+                        {
                             application.reject_agent_route_bootstrap(peer, rejected).await
                         } else {
                             Err(ConnectorControlApplicationError::PermissionDenied)

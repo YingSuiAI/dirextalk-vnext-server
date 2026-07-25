@@ -125,6 +125,8 @@ fn v1_4_route_bootstrap_messages_keep_exact_names_numbers_and_types() {
             ("opaque_recipient_capsule", 11, Type::Bytes),
             ("expires_at_millis", 12, Type::Uint64),
             ("result_digest", 13, Type::Bytes),
+            ("route_health_key_id", 14, Type::String),
+            ("route_health_public_key", 15, Type::Bytes),
         ],
     );
     assert_fields(
@@ -146,6 +148,8 @@ fn v1_4_route_bootstrap_messages_keep_exact_names_numbers_and_types() {
             ("route_fence", 13, Type::Bytes),
             ("installed_at_millis", 14, Type::Uint64),
             ("result_digest", 15, Type::Bytes),
+            ("route_health_key_id", 16, Type::String),
+            ("route_health_public_key_digest", 17, Type::Bytes),
         ],
     );
     assert_fields(
@@ -167,6 +171,8 @@ fn v1_4_route_bootstrap_messages_keep_exact_names_numbers_and_types() {
             ("stable_error_code", 13, Type::String),
             ("rejected_at_millis", 14, Type::Uint64),
             ("result_digest", 15, Type::Bytes),
+            ("route_health_key_id", 16, Type::String),
+            ("route_health_public_key_digest", 17, Type::Bytes),
         ],
     );
     assert_fields(
@@ -198,6 +204,8 @@ fn v1_4_route_bootstrap_messages_keep_exact_names_numbers_and_types() {
             ("installation_id", 8, Type::String),
             ("binding_id", 9, Type::String),
             ("agent_control_device_id", 10, Type::String),
+            ("route_health_key_id", 11, Type::String),
+            ("route_health_public_key_digest", 12, Type::Bytes),
         ],
     );
 

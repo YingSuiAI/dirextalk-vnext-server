@@ -42,6 +42,7 @@ pub struct CredentialReissueCompletion {
 pub struct OpenControlCompletion {
     pub lease: ConnectorLease,
     pub protocol_minor: u32,
+    pub server_capabilities: Vec<String>,
     pub heartbeat_interval_millis: u32,
     pub heartbeat_ttl_millis: u32,
     pub acknowledged_command_sequence: u64,

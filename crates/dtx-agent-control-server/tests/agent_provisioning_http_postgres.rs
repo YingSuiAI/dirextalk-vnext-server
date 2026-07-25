@@ -2507,6 +2507,8 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         opaque_recipient_capsule,
         expires_at_millis: bootstrap_expires_at,
         result_digest: recipient_result_digest,
+        route_health_key_id: None,
+        route_health_public_key: None,
     };
     let mut changed_ready = ready.clone();
     changed_ready.result_digest = ControlDigest::from_bytes([0x77; 32]);
@@ -2682,6 +2684,8 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
             route_fence,
             installed_at,
         ),
+        route_health_key_id: None,
+        route_health_public_key_digest: None,
     };
     app.complete_agent_route_bootstrap(
         authenticate_at(

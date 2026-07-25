@@ -14,7 +14,8 @@ use dtx_connect_registry::{
 use dtx_domain::{
     AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId, ArtifactId,
     BindingId, BootId, ConnectorCredentialId, ConnectorId, ConversationId, Ed25519PublicKey,
-    EventId, HostId, InstallationId, LeaseId, RequestId, Revision, RunId, RunLeaseId, TenantId,
+    EventId, HostId, InstallationId, LeaseId, RequestId, Revision, RouteHealthKeyId, RunId,
+    RunLeaseId, TenantId,
 };
 use zeroize::Zeroize as _;
 
@@ -304,6 +305,8 @@ pub struct ParsedAgentRouteRecipientReady {
     pub opaque_recipient_capsule: Vec<u8>,
     pub expires_at_millis: i64,
     pub result_digest: Sha256Digest,
+    pub route_health_key_id: Option<RouteHealthKeyId>,
+    pub route_health_public_key: Option<Ed25519PublicKey>,
 }
 
 impl fmt::Debug for ParsedAgentRouteRecipientReady {
@@ -341,6 +344,8 @@ pub struct ParsedAgentRouteBootstrapInstalled {
     pub route_fence: [u8; 32],
     pub installed_at_millis: i64,
     pub result_digest: Sha256Digest,
+    pub route_health_key_id: Option<RouteHealthKeyId>,
+    pub route_health_public_key_digest: Option<Sha256Digest>,
 }
 
 /// Exact category-only terminal refusal for one RouteBootstrap delivery.
@@ -361,6 +366,8 @@ pub struct ParsedAgentRouteBootstrapRejected {
     pub stable_error_code: String,
     pub rejected_at_millis: i64,
     pub result_digest: Sha256Digest,
+    pub route_health_key_id: Option<RouteHealthKeyId>,
+    pub route_health_public_key_digest: Option<Sha256Digest>,
 }
 
 /// Validated first control-stream frame.
@@ -1174,6 +1181,8 @@ fn parse_agent_route_recipient_ready(
     {
         return Err(invalid_value("opaque_recipient_capsule"));
     }
+    let (route_health_key_id, route_health_public_key) =
+        parse_route_health_key_fields(&value.route_health_key_id, value.route_health_public_key)?;
     Ok(ParsedAgentRouteRecipientReady {
         connector_fence: parse_required_lease_fence(value.connector_fence)?,
         bootstrap_id: parse_id(&value.bootstrap_id, "bootstrap_id")?,
@@ -1200,6 +1209,8 @@ fn parse_agent_route_recipient_ready(
         opaque_recipient_capsule: value.opaque_recipient_capsule,
         expires_at_millis: parse_wire_timestamp(value.expires_at_millis, "expires_at_millis")?,
         result_digest: parse_digest(value.result_digest, "result_digest")?,
+        route_health_key_id,
+        route_health_public_key,
     })
 }
 
@@ -1210,6 +1221,10 @@ fn parse_agent_route_bootstrap_installed(
     if route_fence.iter().all(|byte| *byte == 0) {
         return Err(invalid_value("route_fence"));
     }
+    let (route_health_key_id, route_health_public_key_digest) = parse_route_health_digest_fields(
+        &value.route_health_key_id,
+        value.route_health_public_key_digest,
+    )?;
     Ok(ParsedAgentRouteBootstrapInstalled {
         connector_fence: parse_required_lease_fence(value.connector_fence)?,
         bootstrap_id: parse_id(&value.bootstrap_id, "bootstrap_id")?,
@@ -1238,6 +1253,8 @@ fn parse_agent_route_bootstrap_installed(
             "installed_at_millis",
         )?,
         result_digest: parse_digest(value.result_digest, "result_digest")?,
+        route_health_key_id,
+        route_health_public_key_digest,
     })
 }
 
@@ -1247,6 +1264,10 @@ fn parse_agent_route_bootstrap_rejected(
     if !valid_upper_stable_code(&value.stable_error_code) {
         return Err(invalid_value("stable_error_code"));
     }
+    let (route_health_key_id, route_health_public_key_digest) = parse_route_health_digest_fields(
+        &value.route_health_key_id,
+        value.route_health_public_key_digest,
+    )?;
     Ok(ParsedAgentRouteBootstrapRejected {
         connector_fence: parse_required_lease_fence(value.connector_fence)?,
         bootstrap_id: parse_id(&value.bootstrap_id, "bootstrap_id")?,
@@ -1272,6 +1293,8 @@ fn parse_agent_route_bootstrap_rejected(
         stable_error_code: value.stable_error_code,
         rejected_at_millis: parse_wire_timestamp(value.rejected_at_millis, "rejected_at_millis")?,
         result_digest: parse_digest(value.result_digest, "result_digest")?,
+        route_health_key_id,
+        route_health_public_key_digest,
     })
 }
 
@@ -1374,6 +1397,25 @@ pub fn build_connect_lease(
     heartbeat_ttl_millis: u32,
     acknowledged_command_sequence: u64,
 ) -> Result<v1::ConnectLease, WireError> {
+    build_connect_lease_with_capabilities(
+        lease,
+        protocol_minor,
+        heartbeat_interval_millis,
+        heartbeat_ttl_millis,
+        acknowledged_command_sequence,
+        &[],
+    )
+}
+
+/// Builds a ConnectLease with the canonical sorted capability echo.
+pub fn build_connect_lease_with_capabilities(
+    lease: ConnectorLease,
+    protocol_minor: u32,
+    heartbeat_interval_millis: u32,
+    heartbeat_ttl_millis: u32,
+    acknowledged_command_sequence: u64,
+    server_capabilities: &[String],
+) -> Result<v1::ConnectLease, WireError> {
     if lease.status() != LeaseStatus::Active {
         return Err(invalid_value("lease.status"));
     }
@@ -1389,6 +1431,8 @@ pub fn build_connect_lease(
     if expires_at_millis <= issued_at_millis {
         return Err(invalid_value("expires_at_millis"));
     }
+    let mut server_capabilities = server_capabilities.to_vec();
+    normalize_capabilities(&mut server_capabilities)?;
     Ok(v1::ConnectLease {
         fence: Some(build_lease_fence(lease.fence())),
         protocol_major: 1,
@@ -1401,6 +1445,7 @@ pub fn build_connect_lease(
             acknowledged_command_sequence,
             "acknowledged_command_sequence",
         )?,
+        server_capabilities,
     })
 }
 
@@ -1565,6 +1610,40 @@ fn parse_digest(value: Vec<u8>, field: &'static str) -> Result<Sha256Digest, Wir
     exact_array(value, field).map(Sha256Digest::from_bytes)
 }
 
+fn parse_route_health_key_fields(
+    key_id: &str,
+    public_key: Vec<u8>,
+) -> Result<(Option<RouteHealthKeyId>, Option<Ed25519PublicKey>), WireError> {
+    if key_id.is_empty() && public_key.is_empty() {
+        return Ok((None, None));
+    }
+    if key_id.is_empty() || public_key.is_empty() {
+        return Err(invalid_value("route_health_key_id"));
+    }
+    let key_id = parse_id(key_id, "route_health_key_id")?;
+    let public_key = parse_public_key(&public_key, "route_health_public_key")?;
+    if public_key.as_bytes().iter().all(|byte| *byte == 0) {
+        return Err(invalid_value("route_health_public_key"));
+    }
+    Ok((Some(key_id), Some(public_key)))
+}
+
+fn parse_route_health_digest_fields(
+    key_id: &str,
+    digest: Vec<u8>,
+) -> Result<(Option<RouteHealthKeyId>, Option<Sha256Digest>), WireError> {
+    if key_id.is_empty() && digest.is_empty() {
+        return Ok((None, None));
+    }
+    if key_id.is_empty() || digest.is_empty() {
+        return Err(invalid_value("route_health_key_id"));
+    }
+    Ok((
+        Some(parse_id(key_id, "route_health_key_id")?),
+        Some(parse_digest(digest, "route_health_public_key_digest")?),
+    ))
+}
+
 fn exact_array<const LENGTH: usize>(
     value: Vec<u8>,
     field: &'static str,
@@ -1697,6 +1776,7 @@ const fn invalid_value(field: &'static str) -> WireError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
 
     const TENANT_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a1";
     const CONNECTOR_ID: &str = "0190f2a5-7b1c-7abc-8def-0123456789a2";
@@ -1731,6 +1811,54 @@ mod tests {
             .expect_err("missing oneof must be rejected");
         assert_eq!(error.kind(), WireErrorKind::MissingField);
         assert_eq!(error.field(), "client_frame.kind");
+    }
+
+    #[test]
+    fn route_health_key_fields_are_optional_but_strictly_co_present() {
+        assert_eq!(
+            parse_route_health_key_fields("", Vec::new()).unwrap(),
+            (None, None)
+        );
+        assert!(
+            parse_route_health_key_fields("0190f2a5-7b1c-7abc-8def-0123456789a1", Vec::new(),)
+                .is_err()
+        );
+        assert!(
+            parse_route_health_key_fields("0190f2a5-7b1c-7abc-8def-0123456789a1", vec![0; 32],)
+                .is_err()
+        );
+        let parsed = parse_route_health_key_fields(
+            "0190f2a5-7b1c-7abc-8def-0123456789a1",
+            SigningKey::from_bytes(&[7; 32])
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("a canonical UUIDv7 and nonzero Ed25519 key are accepted");
+        assert!(parsed.0.is_some() && parsed.1.is_some());
+    }
+
+    #[test]
+    fn route_health_digest_fields_reject_partial_or_malformed_bindings() {
+        assert!(
+            parse_route_health_digest_fields("0190f2a5-7b1c-7abc-8def-0123456789a1", Vec::new(),)
+                .is_err()
+        );
+        assert!(parse_route_health_digest_fields("not-a-uuid", vec![1; 32]).is_err());
+        assert!(
+            parse_route_health_digest_fields("0190f2a5-7b1c-7abc-8def-0123456789a1", vec![1; 32],)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn connect_lease_capability_echo_is_canonical_and_sorted() {
+        let mut capabilities = vec![
+            "runtime-claims".to_owned(),
+            "agent-route-health.v1".to_owned(),
+        ];
+        normalize_capabilities(&mut capabilities).expect("capabilities are valid");
+        assert_eq!(capabilities, ["agent-route-health.v1", "runtime-claims"]);
     }
 
     #[test]

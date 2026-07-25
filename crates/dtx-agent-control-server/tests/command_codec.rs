@@ -284,6 +284,8 @@ fn production_encoder_round_trips_every_closed_command_without_reconstruction() 
             agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5"
                 .parse::<AgentDeviceId>()
                 .unwrap(),
+            route_health_key_id: None,
+            route_health_public_key_digest: None,
         }),
     ];
     for payload in payloads {
@@ -319,6 +321,8 @@ fn rejects_malformed_route_bootstrap_payloads_without_logging_opaque_bytes() {
         installation_id: "01890f47-3a5b-7c1d-8e2f-123456789ab4".to_owned(),
         binding_id: "01890f47-3a5b-7c1d-8e2f-123456789ab3".to_owned(),
         agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5".to_owned(),
+        route_health_key_id: String::new(),
+        route_health_public_key_digest: Vec::new(),
     }
     .encode_to_vec();
     let invalid_digest = command_payload_digest(&invalid_digest_payload)

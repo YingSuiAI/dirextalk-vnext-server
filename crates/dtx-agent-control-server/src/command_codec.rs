@@ -13,7 +13,7 @@ use dtx_connect_registry::ConnectorDesiredState;
 use dtx_domain::{
     AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId, ApprovalId,
     BindingId, ConversationId, DeviceId, IdentityId, InstallationId, ProvisioningDeliveryId,
-    ProvisioningRecipientKeyId, RequestId, Revision, TenantId,
+    ProvisioningRecipientKeyId, RequestId, Revision, RouteHealthKeyId, TenantId,
 };
 use prost::Message as _;
 
@@ -96,6 +96,8 @@ const DELIVER_AGENT_ROUTE_BOOTSTRAP_RULES: &[FieldRule] = &[
     FieldRule::singular(8, WireType::LengthDelimited),
     FieldRule::singular(9, WireType::LengthDelimited),
     FieldRule::singular(10, WireType::LengthDelimited),
+    FieldRule::singular(11, WireType::LengthDelimited),
+    FieldRule::singular(12, WireType::LengthDelimited),
 ];
 
 /// Canonical protobuf encoding needed by [`dtx_agent_control::CommandLog::append`].
@@ -279,6 +281,12 @@ fn encode_payload(
                 installation_id: command.installation_id.to_string(),
                 binding_id: command.binding_id.to_string(),
                 agent_control_device_id: command.agent_control_device_id.to_string(),
+                route_health_key_id: command
+                    .route_health_key_id
+                    .map_or_else(String::new, |value| value.to_string()),
+                route_health_public_key_digest: command
+                    .route_health_public_key_digest
+                    .map_or_else(Vec::new, |value| value.as_bytes().to_vec()),
             };
             let exact = encoded.encode_to_vec();
             Ok((
@@ -535,44 +543,53 @@ fn decode_payload(
         (16, Some(v1::durable_command::Command::DeliverAgentRouteBootstrap(command))) => {
             validate_wire_schema(exact_payload, DELIVER_AGENT_ROUTE_BOOTSTRAP_RULES)?;
             let expires_at_millis = positive_expiry(command.expires_at_millis)?;
-            Ok(ServerCommandPayload::DeliverAgentRouteBootstrap(
-                DeliverAgentRouteBootstrap {
-                    bootstrap_id: command
-                        .bootstrap_id
-                        .parse::<AgentRouteBootstrapId>()
-                        .map_err(|_| DurableCommandDecodeError)?,
-                    delivery_id: command
-                        .delivery_id
-                        .parse::<AgentRouteDeliveryId>()
-                        .map_err(|_| DurableCommandDecodeError)?,
-                    route_id: command
-                        .route_id
-                        .parse::<ConversationId>()
-                        .map_err(|_| DurableCommandDecodeError)?,
-                    recipient_id: command
-                        .recipient_id
-                        .parse::<AgentRouteRecipientId>()
-                        .map_err(|_| DurableCommandDecodeError)?,
-                    capsule_digest: digest(command.capsule_digest)?,
-                    opaque_sealed_bootstrap: OpaqueAgentRouteBytes::new(
-                        command.opaque_sealed_bootstrap,
-                    )
+            let payload = DeliverAgentRouteBootstrap {
+                bootstrap_id: command
+                    .bootstrap_id
+                    .parse::<AgentRouteBootstrapId>()
                     .map_err(|_| DurableCommandDecodeError)?,
-                    expires_at_millis,
-                    installation_id: command
-                        .installation_id
-                        .parse::<InstallationId>()
-                        .map_err(|_| DurableCommandDecodeError)?,
-                    binding_id: command
-                        .binding_id
-                        .parse::<BindingId>()
-                        .map_err(|_| DurableCommandDecodeError)?,
-                    agent_control_device_id: command
-                        .agent_control_device_id
-                        .parse::<AgentDeviceId>()
-                        .map_err(|_| DurableCommandDecodeError)?,
-                },
-            ))
+                delivery_id: command
+                    .delivery_id
+                    .parse::<AgentRouteDeliveryId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                route_id: command
+                    .route_id
+                    .parse::<ConversationId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                recipient_id: command
+                    .recipient_id
+                    .parse::<AgentRouteRecipientId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                capsule_digest: digest(command.capsule_digest)?,
+                opaque_sealed_bootstrap: OpaqueAgentRouteBytes::new(
+                    command.opaque_sealed_bootstrap,
+                )
+                .map_err(|_| DurableCommandDecodeError)?,
+                expires_at_millis,
+                installation_id: command
+                    .installation_id
+                    .parse::<InstallationId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                binding_id: command
+                    .binding_id
+                    .parse::<BindingId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                agent_control_device_id: command
+                    .agent_control_device_id
+                    .parse::<AgentDeviceId>()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                route_health_key_id: (!command.route_health_key_id.is_empty())
+                    .then(|| command.route_health_key_id.parse::<RouteHealthKeyId>())
+                    .transpose()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                route_health_public_key_digest: (!command
+                    .route_health_public_key_digest
+                    .is_empty())
+                .then(|| digest(command.route_health_public_key_digest))
+                .transpose()?,
+            };
+            payload.validate().map_err(|_| DurableCommandDecodeError)?;
+            Ok(ServerCommandPayload::DeliverAgentRouteBootstrap(payload))
         }
         _ => Err(DurableCommandDecodeError),
     }

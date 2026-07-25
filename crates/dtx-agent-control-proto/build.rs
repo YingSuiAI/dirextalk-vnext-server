@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed={}", proto_root.display());
 
     compile_contract(
-        proto_root.join("dirextalk/agent_control/v1_5/agent_control.proto"),
+        proto_root.join("dirextalk/agent_control/v1_6/agent_control.proto"),
         out_dir.join("agent_control_descriptor.bin"),
         &proto_root,
     )?;
