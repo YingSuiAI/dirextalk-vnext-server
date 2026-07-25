@@ -1661,6 +1661,33 @@ mod tests {
             9_000,
         );
         assert!(validate_request_v4(&bad_manifest_request).is_err());
+        let bad_offer = offer_v3(
+            request_id,
+            *Sha256Digest::hash_domain(
+                dtx_history_recovery_protocol::REQUEST_DIGEST_DOMAIN,
+                &request,
+            )
+            .as_bytes(),
+            *manifest_digest.as_bytes(),
+            catalog_id,
+            1,
+            *Sha256Digest::hash_domain(
+                dtx_history_recovery_protocol::CATALOG_HEAD_DIGEST_DOMAIN,
+                &mismatched_head,
+            )
+            .as_bytes(),
+            *leaf_set_digest.as_bytes(),
+            [7; 32],
+            *Sha256Digest::hash_domain(
+                dtx_history_recovery_protocol::RECIPIENT_KEY_DIGEST_DOMAIN,
+                &[21; 32],
+            )
+            .as_bytes(),
+            b"opaque-offer",
+            [9; 32],
+            1_000,
+            8_000,
+        );
         let bad_grant = grant_v5(
             identity,
             request_id,
@@ -1700,12 +1727,17 @@ mod tests {
             8_000,
             &provider,
             &authority,
-            &grant_offer,
+            &bad_offer,
             [44; 32],
             1_000,
             8_000,
         );
-        assert!(validate_grant_v5(&bad_grant).is_err());
+        assert_eq!(
+            validate_grant_v5(&bad_grant)
+                .expect_err("head/grant leaf-set mismatch")
+                .to_string(),
+            "grant catalog coordinates"
+        );
         let mut tampered_grant = grant;
         tampered_grant[20] ^= 1;
         assert!(validate_grant_v5(&tampered_grant).is_err());
