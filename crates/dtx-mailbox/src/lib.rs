@@ -41,3 +41,4 @@ pub use types::{
     MailboxAcknowledgementCommand, MailboxEnvelopeCommand, MailboxOperationOutcome,
     MailboxPullRequest, MailboxRegistrationCommand, MailboxWriteCapability,
 };
+pub(crate) use types::{MAX_HISTORY_OFFER_BYTES, MAX_PULL_RECEIPT_BYTES};

@@ -10,9 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     MAX_ACTIVE_ENVELOPE_BYTES, MAX_ACTIVE_ENVELOPES, MAX_ENVELOPE_TTL_MILLIS,
-    MailboxAcknowledgementCommand, MailboxEnvelopeCommand, MailboxOperationOutcome,
-    MailboxPersistenceError, MailboxPgStore, MailboxPullRequest, MailboxRegistrationCommand,
-    MailboxWriteCapability, types::receipt_hash,
+    MAX_HISTORY_OFFER_BYTES, MailboxAcknowledgementCommand, MailboxEnvelopeCommand,
+    MailboxOperationOutcome, MailboxPersistenceError, MailboxPgStore, MailboxPullRequest,
+    MailboxRegistrationCommand, MailboxWriteCapability, types::receipt_hash,
 };
 
 mod codec;
@@ -372,13 +372,15 @@ impl MailboxRepository {
                 "SELECT delivery_sequence, envelope_id, opaque_ciphertext, expires_at_ms, state
                    FROM messaging.mailbox_envelopes
                   WHERE mailbox_id=$1 AND delivery_sequence > $2
-                  ORDER BY delivery_sequence",
+                  ORDER BY delivery_sequence
+                  LIMIT $3",
             )
             .bind(*mailbox_id.as_uuid())
             .bind(
                 i64::try_from(request.after_sequence().get())
                     .map_err(|_| MailboxPersistenceError::InvalidCommand("mailbox pull cursor"))?,
             )
+            .bind(i64::from(request.limit()))
             .fetch_all(&mut *session.connection())
             .await?;
 
@@ -392,7 +394,7 @@ impl MailboxRepository {
                         let envelope_id = parse_envelope_id(row.try_get("envelope_id")?)?;
                         let opaque_ciphertext: Vec<u8> = row.try_get("opaque_ciphertext")?;
                         if opaque_ciphertext.is_empty()
-                            || opaque_ciphertext.len() > crate::MAX_OPAQUE_CIPHERTEXT_BYTES
+                            || opaque_ciphertext.len() > MAX_HISTORY_OFFER_BYTES
                         {
                             return Err(MailboxPersistenceError::CorruptData(
                                 "mailbox opaque ciphertext",

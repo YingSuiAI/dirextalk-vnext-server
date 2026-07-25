@@ -18,6 +18,7 @@
   "idempotency_key_max_bytes": 128,
   "mailbox_capability_bytes": 32,
   "max_opaque_ciphertext_bytes": 262144,
+  "max_pull_ciphertext_bytes": 1049093,
   "max_envelopes_per_page": 100,
   "max_envelopes_per_ack": 100,
   "max_ttl_ms": 604800000,

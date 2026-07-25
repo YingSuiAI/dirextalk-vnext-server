@@ -5,11 +5,13 @@ use dtx_identity_persistence::{
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, SafeUint, Sha256Digest, UtcMillis, encode_deterministic_cbor,
+    encode_deterministic_cbor_with_limit,
 };
 use sqlx::{PgConnection, Row};
 
 use crate::{
-    MAX_OPAQUE_CIPHERTEXT_BYTES, MailboxOperationOutcome, MailboxPersistenceError, MailboxPgStore,
+    MAX_ACTIVE_ENVELOPE_BYTES, MAX_PULL_RECEIPT_BYTES, MailboxOperationOutcome,
+    MailboxPersistenceError, MailboxPgStore,
     repository::{authenticate, finish_transaction},
     types::receipt_hash,
 };
@@ -205,7 +207,7 @@ impl crate::MailboxRepository {
                 let expires_at = parse_time(row.try_get("expires_at_ms")?)?;
                 let ciphertext: Option<Vec<u8>> = row.try_get("opaque_ciphertext")?;
                 if let Some(ciphertext) = ciphertext {
-                    if ciphertext.is_empty() || ciphertext.len() > MAX_OPAQUE_CIPHERTEXT_BYTES {
+                    if ciphertext.is_empty() || ciphertext.len() > crate::MAX_HISTORY_OFFER_BYTES {
                         return Err(MailboxPersistenceError::CorruptData(
                             "identity mailbox ciphertext",
                         ));
@@ -359,6 +361,23 @@ fn encode_pull_v3_receipt(
     resumable_floor: SafeUint,
     segments: &[IdentityDeliverySegment],
 ) -> Result<Vec<u8>, MailboxPersistenceError> {
+    if segments.len() > usize::from(MAX_IDENTITY_PULL_ENTRIES) + 1 {
+        return Err(MailboxPersistenceError::InvalidCommand(
+            "identity mailbox pull page entries",
+        ));
+    }
+    let ciphertext_bytes = segments.iter().try_fold(0usize, |total, segment| {
+        let bytes = match segment {
+            IdentityDeliverySegment::Envelope(entry) => entry.opaque_ciphertext.len(),
+            IdentityDeliverySegment::TerminalRange { .. } => 0,
+        };
+        total
+            .checked_add(bytes)
+            .ok_or(MailboxPersistenceError::CapacityExceeded)
+    })?;
+    if ciphertext_bytes > MAX_ACTIVE_ENVELOPE_BYTES {
+        return Err(MailboxPersistenceError::CapacityExceeded);
+    }
     let segments = segments
         .iter()
         .map(|segment| match segment {
@@ -394,26 +413,29 @@ fn encode_pull_v3_receipt(
             ]),
         })
         .collect();
-    encode_deterministic_cbor(&CanonicalValue::Map(vec![
-        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
-        (
-            CanonicalValue::Unsigned(2),
-            CanonicalValue::Text(identity_id.to_string()),
-        ),
-        (
-            CanonicalValue::Unsigned(3),
-            CanonicalValue::Text(device_id.to_string()),
-        ),
-        (
-            CanonicalValue::Unsigned(4),
-            CanonicalValue::Unsigned(highwater.get()),
-        ),
-        (
-            CanonicalValue::Unsigned(5),
-            CanonicalValue::Unsigned(resumable_floor.get()),
-        ),
-        (CanonicalValue::Unsigned(6), CanonicalValue::Array(segments)),
-    ]))
+    encode_deterministic_cbor_with_limit(
+        &CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(identity_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Text(device_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                CanonicalValue::Unsigned(highwater.get()),
+            ),
+            (
+                CanonicalValue::Unsigned(5),
+                CanonicalValue::Unsigned(resumable_floor.get()),
+            ),
+            (CanonicalValue::Unsigned(6), CanonicalValue::Array(segments)),
+        ]),
+        MAX_PULL_RECEIPT_BYTES,
+    )
     .map_err(|_| MailboxPersistenceError::CorruptData("identity pull V3 receipt"))
 }
 

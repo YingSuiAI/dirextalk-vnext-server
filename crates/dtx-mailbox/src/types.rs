@@ -36,12 +36,19 @@ pub const MAILBOX_OPERATION_REPLAY_RETENTION_MILLIS: i64 = 15 * 60 * 1_000;
 pub const MAILBOX_ENQUEUE_REPLAY_RETENTION_MILLIS: i64 = MAILBOX_OPERATION_REPLAY_RETENTION_MILLIS;
 /// Maximum entries in a pull page or acknowledgement command.
 pub const MAX_PAGE_ENTRIES: usize = 100;
+/// Maximum exact opaque OfferV3 bytes admitted by the history grant path.
+pub(crate) const MAX_HISTORY_OFFER_BYTES: usize = 1_049_093;
+/// Maximum encoded pull receipt/page budget. This permits a full history Offer
+/// while retaining the mailbox's aggregate retained-byte quota as the memory
+/// bound for larger pages.
+pub(crate) const MAX_PULL_RECEIPT_BYTES: usize =
+    MAX_ACTIVE_ENVELOPE_BYTES + MAX_HISTORY_GRANT_ENVELOPE_BYTES;
 
 const MAX_REGISTER_COMMAND_BYTES: usize = 16_384;
 const MAX_ENVELOPE_COMMAND_BYTES: usize = 262_400;
 // Canonical mailbox-envelope map overhead is 52 bytes for the frozen
 // History OfferV3 boundary (1_049_093 + 52 = 1_049_145).
-pub(crate) const MAX_HISTORY_GRANT_ENVELOPE_BYTES: usize = 1_049_145;
+pub(crate) const MAX_HISTORY_GRANT_ENVELOPE_BYTES: usize = MAX_HISTORY_OFFER_BYTES + 52;
 const MAX_ACK_COMMAND_BYTES: usize = 8_192;
 
 /// A raw 256-bit mailbox write capability held only at the sender boundary.
@@ -280,7 +287,7 @@ impl MailboxEnvelopeCommand {
         exact_bytes: Vec<u8>,
     ) -> Result<Self, MailboxPersistenceError> {
         validate_exact_command_bytes(&exact_bytes, MAX_HISTORY_GRANT_ENVELOPE_BYTES)?;
-        if opaque_ciphertext.is_empty() || opaque_ciphertext.len() > 1_049_093 {
+        if opaque_ciphertext.is_empty() || opaque_ciphertext.len() > MAX_HISTORY_OFFER_BYTES {
             return Err(MailboxPersistenceError::InvalidCommand(
                 "history grant opaque ciphertext byte length",
             ));

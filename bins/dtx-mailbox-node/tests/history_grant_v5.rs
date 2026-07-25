@@ -646,6 +646,118 @@ async fn history_grant_v5_http_success_replays_exactly_and_rejects_mismatch()
             .await?;
     assert_eq!((grant_count, envelope_count), (1, 1));
 
+    let pull_body = mailbox_pull_body(SafeUint::new(0)?, 100)?;
+    let pulled = send_pull(
+        mailbox_app.clone(),
+        owner.session_id,
+        owner.session_secret,
+        mailbox_id,
+        pull_body.clone(),
+    )
+    .await?;
+    assert_eq!(pulled.status(), StatusCode::OK);
+    let pulled_bytes = response_bytes(pulled).await?;
+    assert_pull_receipt(&pulled_bytes, mailbox_id, envelope_id, &offer)?;
+    let pulled_replay = send_pull(
+        mailbox_app.clone(),
+        owner.session_id,
+        owner.session_secret,
+        mailbox_id,
+        pull_body.clone(),
+    )
+    .await?;
+    assert_eq!(response_bytes(pulled_replay).await?, pulled_bytes);
+    let ack_body = mailbox_ack_body(&[envelope_id])?;
+    let ack = send_acknowledgement(
+        mailbox_app.clone(),
+        "mailbox-grant-ack-0001",
+        owner.session_id,
+        owner.session_secret,
+        mailbox_id,
+        ack_body.clone(),
+    )
+    .await?;
+    assert_eq!(ack.status(), StatusCode::CREATED);
+    let ack_replay = send_acknowledgement(
+        mailbox_app.clone(),
+        "mailbox-grant-ack-0001",
+        owner.session_id,
+        owner.session_secret,
+        mailbox_id,
+        ack_body,
+    )
+    .await?;
+    assert_eq!(ack_replay.status(), StatusCode::OK);
+    let post_ack_pull = send_pull(
+        mailbox_app.clone(),
+        owner.session_id,
+        owner.session_secret,
+        mailbox_id,
+        mailbox_pull_body(SafeUint::new(0)?, 100)?,
+    )
+    .await?;
+    assert_eq!(post_ack_pull.status(), StatusCode::OK);
+    assert_empty_pull_receipt(&response_bytes(post_ack_pull).await?, mailbox_id)?;
+
+    let identity_pull_body = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+        (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(0)),
+        (CanonicalValue::Unsigned(3), CanonicalValue::Unsigned(100)),
+    ]))?;
+    let identity_pulled = send_v2(
+        mailbox_app.clone(),
+        IDENTITY_MAILBOX_PULL_V3_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        owner.session_id,
+        owner.session_secret,
+        identity_pull_body.clone(),
+    )
+    .await?;
+    assert_eq!(identity_pulled.status(), StatusCode::OK);
+    let identity_pulled_bytes = response_bytes(identity_pulled).await?;
+    assert_v3_single_envelope(&identity_pulled_bytes, 1, 0, envelope_id, &offer)?;
+    let identity_pull_replay = send_v2(
+        mailbox_app.clone(),
+        IDENTITY_MAILBOX_PULL_V3_PATH,
+        IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
+        None,
+        owner.session_id,
+        owner.session_secret,
+        identity_pull_body,
+    )
+    .await?;
+    assert_eq!(
+        response_bytes(identity_pull_replay).await?,
+        identity_pulled_bytes
+    );
+    let identity_ack_body = encode_deterministic_cbor(&CanonicalValue::Map(vec![
+        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+        (CanonicalValue::Unsigned(2), CanonicalValue::Unsigned(1)),
+    ]))?;
+    let identity_ack = send_v2(
+        mailbox_app.clone(),
+        IDENTITY_MAILBOX_ACK_V2_PATH,
+        IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
+        Some("mailbox-grant-identity-ack-0001"),
+        owner.session_id,
+        owner.session_secret,
+        identity_ack_body.clone(),
+    )
+    .await?;
+    assert_eq!(identity_ack.status(), StatusCode::CREATED);
+    let identity_ack_replay = send_v2(
+        mailbox_app.clone(),
+        IDENTITY_MAILBOX_ACK_V2_PATH,
+        IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
+        Some("mailbox-grant-identity-ack-0001"),
+        owner.session_id,
+        owner.session_secret,
+        identity_ack_body,
+    )
+    .await?;
+    assert_eq!(identity_ack_replay.status(), StatusCode::OK);
+
     let mismatch = history_testkit::grant_v5(
         owner.identity_id,
         recovered.request_id,

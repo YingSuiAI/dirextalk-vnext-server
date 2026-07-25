@@ -1161,7 +1161,7 @@ pub(crate) fn assert_content_type(response: &axum::response::Response, expected:
 pub(crate) async fn response_bytes(
     response: axum::response::Response,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    Ok(to_bytes(response.into_body(), 300_000).await?.to_vec())
+    Ok(to_bytes(response.into_body(), 1_100_000).await?.to_vec())
 }
 
 pub(crate) async fn assert_mailbox_error(
