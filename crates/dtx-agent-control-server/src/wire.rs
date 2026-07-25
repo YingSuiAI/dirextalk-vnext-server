@@ -307,6 +307,8 @@ pub struct ParsedAgentRouteRecipientReady {
     pub result_digest: Sha256Digest,
     pub route_health_key_id: Option<RouteHealthKeyId>,
     pub route_health_public_key: Option<Ed25519PublicKey>,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key: Option<Ed25519PublicKey>,
 }
 
 impl fmt::Debug for ParsedAgentRouteRecipientReady {
@@ -346,6 +348,8 @@ pub struct ParsedAgentRouteBootstrapInstalled {
     pub result_digest: Sha256Digest,
     pub route_health_key_id: Option<RouteHealthKeyId>,
     pub route_health_public_key_digest: Option<Sha256Digest>,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key_digest: Option<Sha256Digest>,
 }
 
 /// Exact category-only terminal refusal for one RouteBootstrap delivery.
@@ -368,6 +372,8 @@ pub struct ParsedAgentRouteBootstrapRejected {
     pub result_digest: Sha256Digest,
     pub route_health_key_id: Option<RouteHealthKeyId>,
     pub route_health_public_key_digest: Option<Sha256Digest>,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key_digest: Option<Sha256Digest>,
 }
 
 /// Validated first control-stream frame.
@@ -1183,6 +1189,10 @@ fn parse_agent_route_recipient_ready(
     }
     let (route_health_key_id, route_health_public_key) =
         parse_route_health_key_fields(&value.route_health_key_id, value.route_health_public_key)?;
+    let (server_receipt_key_id, server_receipt_public_key) = parse_route_health_key_fields(
+        &value.server_receipt_key_id,
+        value.server_receipt_public_key,
+    )?;
     Ok(ParsedAgentRouteRecipientReady {
         connector_fence: parse_required_lease_fence(value.connector_fence)?,
         bootstrap_id: parse_id(&value.bootstrap_id, "bootstrap_id")?,
@@ -1211,6 +1221,8 @@ fn parse_agent_route_recipient_ready(
         result_digest: parse_digest(value.result_digest, "result_digest")?,
         route_health_key_id,
         route_health_public_key,
+        server_receipt_key_id,
+        server_receipt_public_key,
     })
 }
 
@@ -1225,6 +1237,11 @@ fn parse_agent_route_bootstrap_installed(
         &value.route_health_key_id,
         value.route_health_public_key_digest,
     )?;
+    let (server_receipt_key_id, server_receipt_public_key_digest) =
+        parse_route_health_digest_fields(
+            &value.server_receipt_key_id,
+            value.server_receipt_public_key_digest,
+        )?;
     Ok(ParsedAgentRouteBootstrapInstalled {
         connector_fence: parse_required_lease_fence(value.connector_fence)?,
         bootstrap_id: parse_id(&value.bootstrap_id, "bootstrap_id")?,
@@ -1255,6 +1272,8 @@ fn parse_agent_route_bootstrap_installed(
         result_digest: parse_digest(value.result_digest, "result_digest")?,
         route_health_key_id,
         route_health_public_key_digest,
+        server_receipt_key_id,
+        server_receipt_public_key_digest,
     })
 }
 
@@ -1268,6 +1287,11 @@ fn parse_agent_route_bootstrap_rejected(
         &value.route_health_key_id,
         value.route_health_public_key_digest,
     )?;
+    let (server_receipt_key_id, server_receipt_public_key_digest) =
+        parse_route_health_digest_fields(
+            &value.server_receipt_key_id,
+            value.server_receipt_public_key_digest,
+        )?;
     Ok(ParsedAgentRouteBootstrapRejected {
         connector_fence: parse_required_lease_fence(value.connector_fence)?,
         bootstrap_id: parse_id(&value.bootstrap_id, "bootstrap_id")?,
@@ -1295,6 +1319,8 @@ fn parse_agent_route_bootstrap_rejected(
         result_digest: parse_digest(value.result_digest, "result_digest")?,
         route_health_key_id,
         route_health_public_key_digest,
+        server_receipt_key_id,
+        server_receipt_public_key_digest,
     })
 }
 

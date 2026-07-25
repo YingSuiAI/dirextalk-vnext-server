@@ -49,6 +49,8 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
         "connector_enrollment_intents_receipt_pin_shape",
         "connector_control_credentials_receipt_pin_shape",
         "connector_credential_reissue_intents_receipt_pin_shape",
+        "agent_route_bootstraps_server_receipt_pin_shape",
+        "agent_route_binding_heads_server_receipt_pin_shape",
     ] {
         let definition: String = sqlx::query_scalar(
             "SELECT pg_get_constraintdef(oid)

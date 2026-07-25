@@ -2478,6 +2478,8 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         result_digest: recipient_result_digest,
         route_health_key_id: Some(route_health_key_id),
         route_health_public_key: Some(route_health_public_key),
+        server_receipt_key_id: None,
+        server_receipt_public_key: None,
     };
     let competing_recipient_id = AgentRouteRecipientId::new();
     let competing_capsule = vec![0x79; 256];
@@ -2749,6 +2751,8 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         ),
         route_health_key_id: ready.route_health_key_id,
         route_health_public_key_digest: Some(route_health_public_key_digest),
+        server_receipt_key_id: None,
+        server_receipt_public_key_digest: None,
     };
     let mut changed_installed = installed.clone();
     changed_installed.route_health_public_key_digest = Some(ControlDigest::from_bytes([0x7a; 32]));
@@ -3169,6 +3173,8 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
             ),
             route_health_key_id: Some(key_id),
             route_health_public_key: Some(public_key),
+            server_receipt_key_id: None,
+            server_receipt_public_key: None,
         },
     )
     .await?;
@@ -3248,6 +3254,8 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
         ),
         route_health_key_id: Some(key_id),
         route_health_public_key_digest: Some(health_digest),
+        server_receipt_key_id: None,
+        server_receipt_public_key_digest: None,
     };
     app.reject_agent_route_bootstrap(
         authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,

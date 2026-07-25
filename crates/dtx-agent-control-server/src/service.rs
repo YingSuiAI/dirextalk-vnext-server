@@ -740,6 +740,8 @@ async fn drive_control(
                         if agent_route_bootstrap_enabled
                             && (ready.route_health_key_id.is_some() == agent_route_health_enabled)
                             && (ready.route_health_public_key.is_some() == agent_route_health_enabled)
+                            && (ready.server_receipt_key_id.is_some()
+                                == ready.server_receipt_public_key.is_some())
                         {
                             application.record_agent_route_recipient_ready(peer, ready).await
                         } else {
@@ -750,6 +752,8 @@ async fn drive_control(
                         if agent_route_bootstrap_enabled
                             && (installed.route_health_key_id.is_some() == agent_route_health_enabled)
                             && (installed.route_health_public_key_digest.is_some() == agent_route_health_enabled)
+                            && (installed.server_receipt_key_id.is_some()
+                                == installed.server_receipt_public_key_digest.is_some())
                         {
                             application.complete_agent_route_bootstrap(peer, installed).await
                         } else {
@@ -760,6 +764,8 @@ async fn drive_control(
                         if agent_route_bootstrap_enabled
                             && (rejected.route_health_key_id.is_some() == agent_route_health_enabled)
                             && (rejected.route_health_public_key_digest.is_some() == agent_route_health_enabled)
+                            && (rejected.server_receipt_key_id.is_some()
+                                == rejected.server_receipt_public_key_digest.is_some())
                         {
                             application.reject_agent_route_bootstrap(peer, rejected).await
                         } else {
@@ -1204,6 +1210,8 @@ mod tests {
                 owner_signed_intent: OpaqueAgentRouteBytes::new(b"opaque-owner-intent".to_vec())
                     .expect("fixture opaque intent is bounded"),
                 expires_at_millis: 2_000,
+                server_receipt_key_id: None,
+                server_receipt_public_key: None,
             }),
         )
     }

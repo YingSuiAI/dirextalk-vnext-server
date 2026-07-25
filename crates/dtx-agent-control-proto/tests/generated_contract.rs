@@ -254,6 +254,8 @@ fn enrollment_result_contains_only_public_credential_material() {
         }),
         request_digest: vec![13; 32],
         result_digest: vec![14; 32],
+        route_health_receipt_key_id: String::new(),
+        route_health_receipt_public_key: Vec::new(),
     };
 
     assert!(request.encoded_len() > 0);

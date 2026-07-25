@@ -3237,7 +3237,8 @@ impl PostgresConnectorControlApplication {
                     b.opaque_recipient_capsule, o.operation_id, o.command_sequence,
                     o.command_payload_digest, o.encoded_command_digest, o.state AS outbox_state,
                     o.result_digest, b.route_health_key_id, b.route_health_public_key,
-                    b.route_health_key_purpose
+                    b.route_health_key_purpose, b.server_receipt_key_id,
+                    b.server_receipt_public_key, b.server_receipt_public_key_digest
                FROM agent.agent_route_bootstraps AS b
                JOIN agent.agent_route_bootstrap_outbox AS o
                  ON o.tenant_id=b.tenant_id AND o.bootstrap_id=b.bootstrap_id
@@ -3339,6 +3340,19 @@ impl PostgresConnectorControlApplication {
             || command.owner_device_id != owner_device_id
             || command.owner_signed_intent.as_slice() != stored_intent.as_slice()
             || command.expires_at_millis != expires_at
+            || command.server_receipt_key_id
+                != row
+                    .try_get::<Option<Uuid>, _>("server_receipt_key_id")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?
+                    .map(dtx_domain::RouteHealthKeyId::try_from)
+                    .transpose()
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?
+            || command
+                .server_receipt_public_key
+                .map(|value| value.to_vec())
+                != row
+                    .try_get::<Option<Vec<u8>>, _>("server_receipt_public_key")
+                    .map_err(|_| ConnectorControlApplicationError::Internal)?
         {
             return Err(ConnectorControlApplicationError::Conflict);
         }
@@ -3394,6 +3408,38 @@ impl PostgresConnectorControlApplication {
                 return Err(ConnectorControlApplicationError::Conflict);
             }
         }
+        let stored_server_receipt_key_id = row
+            .try_get::<Option<Uuid>, _>("server_receipt_key_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .map(dtx_domain::RouteHealthKeyId::try_from)
+            .transpose()
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_server_receipt_public_key = row
+            .try_get::<Option<Vec<u8>>, _>("server_receipt_public_key")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .map(|value| value.try_into())
+            .transpose()
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_server_receipt_public_key_digest =
+            optional_digest_vec(&row, "server_receipt_public_key_digest")?;
+        let ready_server_receipt_public_key = ready
+            .server_receipt_public_key
+            .map(|value| *value.as_bytes());
+        let ready_server_receipt_public_key_digest = ready_server_receipt_public_key.map(|value| {
+            Sha256Digest::from_bytes(
+                *WireSha256Digest::hash_domain(
+                    crate::agent_route_bootstrap::AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN,
+                    &value,
+                )
+                .as_bytes(),
+            )
+        });
+        if ready.server_receipt_key_id != stored_server_receipt_key_id
+            || ready_server_receipt_public_key != stored_server_receipt_public_key
+            || ready_server_receipt_public_key_digest != stored_server_receipt_public_key_digest
+        {
+            return Err(ConnectorControlApplicationError::Conflict);
+        }
         if bootstrap_state == "recipient_ready" && outbox_state == "acknowledged" {
             let stored_recipient = row
                 .try_get::<Option<Uuid>, _>("recipient_id")
@@ -3413,6 +3459,8 @@ impl PostgresConnectorControlApplication {
                     != Some(ready.result_digest.as_bytes().as_slice())
                 || stored_health_key_id != ready.route_health_key_id
                 || stored_health_public_key.as_deref() != ready_health_public_key.as_deref()
+                || stored_server_receipt_key_id != ready.server_receipt_key_id
+                || stored_server_receipt_public_key != ready_server_receipt_public_key
             {
                 return Err(ConnectorControlApplicationError::Conflict);
             }
@@ -3518,6 +3566,9 @@ impl PostgresConnectorControlApplication {
                     recipient_capsule_digest=$4, opaque_recipient_capsule=$5,
                     route_health_key_id=$6, route_health_public_key=$7,
                     route_health_key_purpose=$8, updated_at_ms=$9
+                    , server_receipt_key_id=$10,
+                    server_receipt_public_key=$11,
+                    server_receipt_public_key_digest=$12
               WHERE tenant_id=$1 AND bootstrap_id=$2 AND state='pending_recipient'",
         )
         .bind(Uuid::from(fence.tenant_id))
@@ -3533,6 +3584,16 @@ impl PostgresConnectorControlApplication {
         )
         .bind(ready.route_health_key_id.map(|_| "agent-route-health"))
         .bind(now)
+        .bind(ready.server_receipt_key_id.map(Uuid::from))
+        .bind(ready_server_receipt_public_key.map(|value| value.to_vec()))
+        .bind(ready.server_receipt_public_key.map(|value| {
+            WireSha256Digest::hash_domain(
+                crate::agent_route_bootstrap::AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN,
+                value.as_bytes(),
+            )
+            .as_bytes()
+            .to_vec()
+        }))
         .execute(session.connection())
         .await
         .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
@@ -3611,7 +3672,8 @@ impl PostgresConnectorControlApplication {
                     b.agent_control_device_id, b.expires_at_ms, b.state AS bootstrap_state,
                     b.recipient_id, b.route_id, b.bootstrap_capsule_digest,
                     b.opaque_sealed_bootstrap, b.route_fence, b.route_health_key_id,
-                    b.route_health_public_key, o.operation_id,
+                    b.route_health_public_key, b.server_receipt_key_id,
+                    b.server_receipt_public_key_digest, o.operation_id,
                     o.command_sequence, o.command_payload_digest, o.encoded_command_digest,
                     o.state AS outbox_state, o.result_digest, o.rejection_code
                FROM agent.agent_route_bootstraps AS b
@@ -3693,6 +3755,14 @@ impl PostgresConnectorControlApplication {
                         .as_bytes(),
                 )
             });
+        let stored_server_receipt_key_id = row
+            .try_get::<Option<Uuid>, _>("server_receipt_key_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?
+            .map(dtx_domain::RouteHealthKeyId::try_from)
+            .transpose()
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let stored_server_receipt_public_key_digest =
+            optional_digest_vec(&row, "server_receipt_public_key_digest")?;
         let expires_at = row
             .try_get::<i64, _>("expires_at_ms")
             .map_err(|_| ConnectorControlApplicationError::Internal)?;
@@ -3749,6 +3819,11 @@ impl PostgresConnectorControlApplication {
             || command.route_health_public_key_digest != stored_health_key_digest
             || resolution.route_health_key_id() != stored_health_key_id
             || resolution.route_health_public_key_digest() != stored_health_key_digest
+            || command.server_receipt_key_id != stored_server_receipt_key_id
+            || command.server_receipt_public_key_digest != stored_server_receipt_public_key_digest
+            || resolution.server_receipt_key_id() != stored_server_receipt_key_id
+            || resolution.server_receipt_public_key_digest()
+                != stored_server_receipt_public_key_digest
         {
             return Err(ConnectorControlApplicationError::Conflict);
         }
@@ -3921,8 +3996,10 @@ impl PostgresConnectorControlApplication {
                     "INSERT INTO agent.agent_route_binding_heads (
                          tenant_id, owner_identity_id, owner_device_id, installation_id, binding_id,
                          agent_control_device_id, bootstrap_id, delivery_id, route_id, route_fence,
-                         capsule_digest, expires_at_ms, installed_at_ms
-                     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                         capsule_digest, expires_at_ms, installed_at_ms,
+                         server_receipt_key_id, server_receipt_public_key,
+                         server_receipt_public_key_digest
+                     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
                      ON CONFLICT (tenant_id, owner_identity_id, owner_device_id, installation_id,
                                   binding_id, agent_control_device_id)
                      DO UPDATE SET bootstrap_id=EXCLUDED.bootstrap_id,
@@ -3931,7 +4008,10 @@ impl PostgresConnectorControlApplication {
                                    route_fence=EXCLUDED.route_fence,
                                    capsule_digest=EXCLUDED.capsule_digest,
                                    expires_at_ms=EXCLUDED.expires_at_ms,
-                                   installed_at_ms=EXCLUDED.installed_at_ms
+                                   installed_at_ms=EXCLUDED.installed_at_ms,
+                                   server_receipt_key_id=EXCLUDED.server_receipt_key_id,
+                                   server_receipt_public_key=EXCLUDED.server_receipt_public_key,
+                                   server_receipt_public_key_digest=EXCLUDED.server_receipt_public_key_digest
                      WHERE agent.agent_route_binding_heads.bootstrap_id=EXCLUDED.bootstrap_id
                         OR agent.agent_route_binding_heads.expires_at_ms <= EXCLUDED.installed_at_ms",
                 )
@@ -3948,6 +4028,12 @@ impl PostgresConnectorControlApplication {
                 .bind(capsule_digest.as_bytes().as_slice())
                 .bind(expires_at)
                 .bind(now)
+                .bind(stored_server_receipt_key_id.map(Uuid::from))
+                .bind(
+                    row.try_get::<Option<Vec<u8>>, _>("server_receipt_public_key")
+                        .map_err(|_| ConnectorControlApplicationError::Internal)?,
+                )
+                .bind(stored_server_receipt_public_key_digest.map(|value| value.as_bytes().to_vec()))
                 .execute(session.connection())
                 .await
                 .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
@@ -5419,6 +5505,20 @@ impl RouteBootstrapTerminalResolution {
         match self {
             Self::Installed(value) => value.route_health_public_key_digest,
             Self::Rejected(value) => value.route_health_public_key_digest,
+        }
+    }
+
+    fn server_receipt_key_id(&self) -> Option<dtx_domain::RouteHealthKeyId> {
+        match self {
+            Self::Installed(value) => value.server_receipt_key_id,
+            Self::Rejected(value) => value.server_receipt_key_id,
+        }
+    }
+
+    fn server_receipt_public_key_digest(&self) -> Option<Sha256Digest> {
+        match self {
+            Self::Installed(value) => value.server_receipt_public_key_digest,
+            Self::Rejected(value) => value.server_receipt_public_key_digest,
         }
     }
 

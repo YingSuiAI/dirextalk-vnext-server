@@ -84,6 +84,8 @@ const PREPARE_AGENT_ROUTE_RECIPIENT_RULES: &[FieldRule] = &[
     FieldRule::singular(7, WireType::LengthDelimited),
     FieldRule::singular(8, WireType::LengthDelimited),
     FieldRule::singular(9, WireType::Varint),
+    FieldRule::singular(10, WireType::LengthDelimited),
+    FieldRule::singular(11, WireType::LengthDelimited),
 ];
 const DELIVER_AGENT_ROUTE_BOOTSTRAP_RULES: &[FieldRule] = &[
     FieldRule::singular(1, WireType::LengthDelimited),
@@ -98,6 +100,8 @@ const DELIVER_AGENT_ROUTE_BOOTSTRAP_RULES: &[FieldRule] = &[
     FieldRule::singular(10, WireType::LengthDelimited),
     FieldRule::singular(11, WireType::LengthDelimited),
     FieldRule::singular(12, WireType::LengthDelimited),
+    FieldRule::singular(13, WireType::LengthDelimited),
+    FieldRule::singular(14, WireType::LengthDelimited),
 ];
 
 /// Canonical protobuf encoding needed by [`dtx_agent_control::CommandLog::append`].
@@ -259,6 +263,12 @@ fn encode_payload(
                 owner_device_id: command.owner_device_id.to_string(),
                 owner_signed_intent: command.owner_signed_intent.as_slice().to_vec(),
                 expires_at_millis,
+                server_receipt_key_id: command
+                    .server_receipt_key_id
+                    .map_or_else(String::new, |value| value.to_string()),
+                server_receipt_public_key: command
+                    .server_receipt_public_key
+                    .map_or_else(Vec::new, |value| value.to_vec()),
             };
             let exact = encoded.encode_to_vec();
             Ok((
@@ -286,6 +296,12 @@ fn encode_payload(
                     .map_or_else(String::new, |value| value.to_string()),
                 route_health_public_key_digest: command
                     .route_health_public_key_digest
+                    .map_or_else(Vec::new, |value| value.as_bytes().to_vec()),
+                server_receipt_key_id: command
+                    .server_receipt_key_id
+                    .map_or_else(String::new, |value| value.to_string()),
+                server_receipt_public_key_digest: command
+                    .server_receipt_public_key_digest
                     .map_or_else(Vec::new, |value| value.as_bytes().to_vec()),
             };
             let exact = encoded.encode_to_vec();
@@ -537,6 +553,18 @@ fn decode_payload(
                     owner_signed_intent: OpaqueAgentRouteBytes::new(command.owner_signed_intent)
                         .map_err(|_| DurableCommandDecodeError)?,
                     expires_at_millis,
+                    server_receipt_key_id: (!command.server_receipt_key_id.is_empty())
+                        .then(|| command.server_receipt_key_id.parse::<RouteHealthKeyId>())
+                        .transpose()
+                        .map_err(|_| DurableCommandDecodeError)?,
+                    server_receipt_public_key: (!command.server_receipt_public_key.is_empty())
+                        .then(|| {
+                            command
+                                .server_receipt_public_key
+                                .try_into()
+                                .map_err(|_| DurableCommandDecodeError)
+                        })
+                        .transpose()?,
                 },
             ))
         }
@@ -586,6 +614,15 @@ fn decode_payload(
                     .route_health_public_key_digest
                     .is_empty())
                 .then(|| digest(command.route_health_public_key_digest))
+                .transpose()?,
+                server_receipt_key_id: (!command.server_receipt_key_id.is_empty())
+                    .then(|| command.server_receipt_key_id.parse::<RouteHealthKeyId>())
+                    .transpose()
+                    .map_err(|_| DurableCommandDecodeError)?,
+                server_receipt_public_key_digest: (!command
+                    .server_receipt_public_key_digest
+                    .is_empty())
+                .then(|| digest(command.server_receipt_public_key_digest))
                 .transpose()?,
             };
             payload.validate().map_err(|_| DurableCommandDecodeError)?;

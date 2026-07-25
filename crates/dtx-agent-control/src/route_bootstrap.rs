@@ -75,6 +75,8 @@ pub struct PrepareAgentRouteRecipient {
     pub owner_device_id: DeviceId,
     pub owner_signed_intent: OpaqueAgentRouteBytes,
     pub expires_at_millis: i64,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key: Option<[u8; 32]>,
 }
 
 impl PrepareAgentRouteRecipient {
@@ -98,6 +100,10 @@ pub struct AgentRouteRecipientReady {
     pub recipient_capsule_digest: Sha256Digest,
     pub opaque_recipient_capsule: OpaqueAgentRouteBytes,
     pub expires_at_millis: i64,
+    pub route_health_key_id: Option<RouteHealthKeyId>,
+    pub route_health_public_key: Option<[u8; 32]>,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key: Option<[u8; 32]>,
 }
 
 /// Owner-authorized opaque route bootstrap delivery to Agent-Control.
@@ -120,6 +126,8 @@ pub struct DeliverAgentRouteBootstrap {
     /// private key never enters this command or the control plane.
     pub route_health_key_id: Option<RouteHealthKeyId>,
     pub route_health_public_key_digest: Option<Sha256Digest>,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key_digest: Option<Sha256Digest>,
 }
 
 impl DeliverAgentRouteBootstrap {
@@ -133,6 +141,9 @@ impl DeliverAgentRouteBootstrap {
     pub fn validate(&self) -> Result<(), CommandError> {
         validate_opaque_command_payload(&self.opaque_sealed_bootstrap, self.expires_at_millis)?;
         if self.route_health_key_id.is_some() != self.route_health_public_key_digest.is_some() {
+            return Err(CommandError::InvalidCommandPayload);
+        }
+        if self.server_receipt_key_id.is_some() != self.server_receipt_public_key_digest.is_some() {
             return Err(CommandError::InvalidCommandPayload);
         }
         Ok(())

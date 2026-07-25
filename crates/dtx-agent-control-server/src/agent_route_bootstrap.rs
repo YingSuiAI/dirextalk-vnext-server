@@ -223,6 +223,10 @@ pub struct AgentRouteRecipientReadyCommand {
     pub recipient_capsule_digest: Sha256Digest,
     pub opaque_recipient_capsule: Vec<u8>,
     pub expires_at: UtcMillis,
+    pub route_health_key_id: Option<RouteHealthKeyId>,
+    pub route_health_public_key: Option<[u8; 32]>,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key: Option<[u8; 32]>,
 }
 
 impl fmt::Debug for AgentRouteRecipientReadyCommand {
@@ -250,6 +254,10 @@ pub struct AgentRouteBootstrapTerminalCommand {
     /// fence produced by the local route import, never an owner echo.
     pub route_fence: Option<[u8; 32]>,
     pub stable_code: String,
+    pub route_health_key_id: Option<RouteHealthKeyId>,
+    pub route_health_public_key_digest: Option<Sha256Digest>,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key_digest: Option<Sha256Digest>,
 }
 
 /// Compact owner-visible response.  Only `Get` may include an opaque
@@ -273,6 +281,9 @@ struct RouteBootstrapRecord {
     connector_id: ConnectorId,
     route_health_key_id: Option<RouteHealthKeyId>,
     route_health_public_key: Option<[u8; 32]>,
+    server_receipt_key_id: Option<RouteHealthKeyId>,
+    server_receipt_public_key: Option<[u8; 32]>,
+    server_receipt_public_key_digest: Option<Sha256Digest>,
     route_fence: Option<[u8; 32]>,
     state: AgentRouteBootstrapState,
     recipient_id: Option<AgentRouteRecipientId>,
@@ -771,6 +782,10 @@ async fn begin_in_transaction(
         });
     }
     let connector_id = ensure_owner_target(connection, command).await?;
+    let (server_receipt_key_id, server_receipt_public_key) =
+        load_current_server_receipt_pin(connection, command.tenant_id, connector_id).await?;
+    let server_receipt_public_key_digest = server_receipt_public_key
+        .map(|value| Sha256Digest::hash_domain(AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN, &value));
     expire_live_tuple(connection, command, now).await?;
     let live: Option<Uuid> = sqlx::query_scalar(
         "SELECT bootstrap_id FROM agent.agent_route_bootstraps
@@ -799,6 +814,8 @@ async fn begin_in_transaction(
         None,
         None,
         None,
+        server_receipt_key_id,
+        server_receipt_public_key_digest,
         command.expires_at,
         now,
         None,
@@ -810,8 +827,9 @@ async fn begin_in_transaction(
              tenant_id, bootstrap_id, owner_identity_id, owner_device_id, installation_id,
              binding_id, agent_control_device_id, connector_id, owner_signed_intent,
              request_digest, begin_receipt_bytes, begin_receipt_digest, state, expires_at_ms,
-             created_at_ms, updated_at_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending_recipient',$13,$14,$14)",
+             created_at_ms, updated_at_ms, server_receipt_key_id,
+             server_receipt_public_key, server_receipt_public_key_digest
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending_recipient',$13,$14,$14,$15,$16,$17)",
     )
     .bind(Uuid::from(command.tenant_id))
     .bind(Uuid::from(command.bootstrap_id))
@@ -827,6 +845,9 @@ async fn begin_in_transaction(
     .bind(receipt_digest.as_bytes().as_slice())
     .bind(command.expires_at.get())
     .bind(now.get())
+    .bind(server_receipt_key_id.map(Uuid::from))
+    .bind(server_receipt_public_key.map(|value| value.to_vec()))
+    .bind(server_receipt_public_key_digest.map(|value| value.as_bytes().to_vec()))
     .execute(&mut *connection)
     .await
     .map_err(map_sql)?;
@@ -846,6 +867,8 @@ async fn begin_in_transaction(
             owner_signed_intent: OpaqueAgentRouteBytes::new(command.owner_signed_intent.clone())
                 .map_err(|_| AgentRouteBootstrapError::InvalidRequest)?,
             expires_at_millis: command.expires_at.get(),
+            server_receipt_key_id,
+            server_receipt_public_key,
         });
     let durable = append_route_bootstrap_command(
         connection,
@@ -987,6 +1010,8 @@ async fn deliver_in_transaction(
         Some(command.delivery_id),
         Some(command.route_id),
         None,
+        row.server_receipt_key_id,
+        row.server_receipt_public_key_digest,
         row.expires_at,
         now,
         None,
@@ -1041,6 +1066,10 @@ async fn deliver_in_transaction(
                         .as_bytes(),
                 )
             }),
+            server_receipt_key_id: row.server_receipt_key_id,
+            server_receipt_public_key_digest: row
+                .server_receipt_public_key_digest
+                .map(|value| ControlSha256Digest::from_bytes(*value.as_bytes())),
         });
     let durable = append_route_bootstrap_command(
         connection,
@@ -1101,6 +1130,8 @@ async fn revoke_delivery_for_invalid_target(
         Some(command.delivery_id),
         Some(command.route_id),
         None,
+        row.server_receipt_key_id,
+        row.server_receipt_public_key_digest,
         row.expires_at,
         now,
         None,
@@ -1308,6 +1339,55 @@ async fn ensure_owner_target(
     Ok(target.connector_id)
 }
 
+async fn load_current_server_receipt_pin(
+    connection: &mut sqlx::PgConnection,
+    tenant_id: TenantId,
+    connector_id: ConnectorId,
+) -> Result<(Option<RouteHealthKeyId>, Option<[u8; 32]>), AgentRouteBootstrapError> {
+    let row = match sqlx::query(
+        "SELECT route_health_receipt_key_id,
+                route_health_receipt_public_key
+           FROM agent.connector_control_credentials
+          WHERE tenant_id=$1 AND connector_id=$2
+          ORDER BY connector_generation DESC, credential_revision DESC
+          LIMIT 1",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(connector_id))
+    .fetch_optional(&mut *connection)
+    .await
+    {
+        Ok(row) => row,
+        Err(_) => return Ok((None, None)),
+    };
+    let Some(row) = row else {
+        // Legacy v1.5 fixtures may not materialize a credential revision row;
+        // preserve the absence of a receipt pin rather than inventing one.
+        return Ok((None, None));
+    };
+    let key_id: Option<Uuid> = row
+        .try_get("route_health_receipt_key_id")
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let public: Option<Vec<u8>> = row
+        .try_get("route_health_receipt_public_key")
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    match (key_id, public) {
+        (None, None) => Ok((None, None)),
+        (Some(key_id), Some(public)) => Ok((
+            Some(
+                RouteHealthKeyId::try_from(key_id)
+                    .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+            ),
+            Some(
+                public
+                    .try_into()
+                    .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+            ),
+        )),
+        _ => Err(AgentRouteBootstrapError::Unavailable),
+    }
+}
+
 async fn resolve_owned_agent_route_bootstrap_target(
     connection: &mut sqlx::PgConnection,
     tenant_id: TenantId,
@@ -1431,7 +1511,8 @@ async fn load_bootstrap_for_update(
                 recipient_id, recipient_capsule_digest, opaque_recipient_capsule, route_id,
                 delivery_id, bootstrap_capsule_digest, rejection_code, expires_at_ms,
                 created_at_ms, updated_at_ms, route_health_key_id,
-                route_health_public_key
+                route_health_public_key, server_receipt_key_id,
+                server_receipt_public_key, server_receipt_public_key_digest
            FROM agent.agent_route_bootstraps
           WHERE tenant_id=$1 AND bootstrap_id=$2 FOR UPDATE",
     )
@@ -1498,6 +1579,21 @@ fn route_bootstrap_record_from_row(
             .map(|value| value.try_into())
             .transpose()
             .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        server_receipt_key_id: optional_uuid(row, "server_receipt_key_id")?
+            .map(RouteHealthKeyId::try_from)
+            .transpose()
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        server_receipt_public_key: row
+            .try_get::<Option<Vec<u8>>, _>("server_receipt_public_key")
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?
+            .map(|value| value.try_into())
+            .transpose()
+            .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        server_receipt_public_key_digest: optional_bytes32(
+            row,
+            "server_receipt_public_key_digest",
+        )?
+        .map(Sha256Digest::from_bytes),
         route_fence: optional_bytes32(row, "route_fence")?,
         state: AgentRouteBootstrapState::parse(
             &row.try_get::<String, _>("state")
@@ -1551,11 +1647,13 @@ fn owner_receipt_cbor(
     delivery_id: Option<AgentRouteDeliveryId>,
     route_id: Option<ConversationId>,
     route_fence: Option<[u8; 32]>,
+    server_receipt_key_id: Option<RouteHealthKeyId>,
+    server_receipt_public_key_digest: Option<Sha256Digest>,
     expires_at: UtcMillis,
     updated_at: UtcMillis,
     opaque_recipient_capsule: Option<&[u8]>,
 ) -> Result<Vec<u8>, AgentRouteBootstrapError> {
-    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+    let mut fields = vec![
         (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
         (
             CanonicalValue::Unsigned(2),
@@ -1589,8 +1687,17 @@ fn owner_receipt_cbor(
                 CanonicalValue::Bytes(bytes.to_vec())
             }),
         ),
-    ]))
-    .map_err(|_| AgentRouteBootstrapError::Unavailable)
+    ];
+    if let (Some(key_id), Some(digest)) = (server_receipt_key_id, server_receipt_public_key_digest)
+    {
+        fields.push((CanonicalValue::Unsigned(12), optional_text(Some(key_id))));
+        fields.push((
+            CanonicalValue::Unsigned(13),
+            CanonicalValue::Bytes(digest.as_bytes().to_vec()),
+        ));
+    }
+    encode_deterministic_cbor(&CanonicalValue::Map(fields))
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)
 }
 
 fn owner_view_cbor(row: &RouteBootstrapRecord) -> Result<Vec<u8>, AgentRouteBootstrapError> {
@@ -1602,6 +1709,8 @@ fn owner_view_cbor(row: &RouteBootstrapRecord) -> Result<Vec<u8>, AgentRouteBoot
         row.delivery_id,
         row.route_id,
         row.route_fence,
+        row.server_receipt_key_id,
+        row.server_receipt_public_key_digest,
         row.expires_at,
         row.updated_at,
         row.opaque_recipient_capsule.as_deref(),

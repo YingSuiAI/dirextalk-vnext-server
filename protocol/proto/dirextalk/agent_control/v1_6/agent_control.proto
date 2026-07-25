@@ -437,6 +437,8 @@ message AgentRouteRecipientReady {
   // `agent-route-health.v1`; the private key never enters Agent Control.
   string route_health_key_id = 14; // Canonical lowercase UUIDv7 text.
   bytes route_health_public_key = 15; // Exactly 32 canonical Ed25519 bytes.
+  string server_receipt_key_id = 16; // Canonical lowercase UUIDv7 text.
+  bytes server_receipt_public_key = 17; // Exactly 32 canonical Ed25519 bytes.
 }
 
 // Terminal success for one durable DeliverAgentRouteBootstrap command. The
@@ -463,6 +465,8 @@ message AgentRouteBootstrapInstalled {
   string route_health_key_id = 16; // Canonical lowercase UUIDv7 text.
   // SHA-256("dirextalk.agent-route-health-public-key.v1\\0" || public key).
   bytes route_health_public_key_digest = 17; // Exactly 32 domain-separated bytes.
+  string server_receipt_key_id = 18; // Exact bootstrap server receipt signer.
+  bytes server_receipt_public_key_digest = 19; // SHA-256 domain digest of public key.
 }
 
 // Category-only terminal refusal for the same exact delivery. It preserves
@@ -487,6 +491,8 @@ message AgentRouteBootstrapRejected {
   string route_health_key_id = 16; // Exact command key ID when negotiated.
   // SHA-256("dirextalk.agent-route-health-public-key.v1\\0" || public key).
   bytes route_health_public_key_digest = 17; // Exactly 32 domain-separated bytes when negotiated.
+  string server_receipt_key_id = 18; // Exact bootstrap server receipt signer.
+  bytes server_receipt_public_key_digest = 19; // SHA-256 domain digest of public key.
 }
 
 message Hello {
@@ -652,6 +658,8 @@ message PrepareAgentRouteRecipient {
   string owner_device_id = 7;
   bytes owner_signed_intent = 8;
   uint64 expires_at_millis = 9;
+  string server_receipt_key_id = 10; // Credential-bound server receipt signer.
+  bytes server_receipt_public_key = 11; // Exactly 32 canonical Ed25519 bytes.
 }
 
 // Second phase. The Owner has already created and persisted a separate MLS
@@ -673,6 +681,8 @@ message DeliverAgentRouteBootstrap {
   string route_health_key_id = 11; // Canonical lowercase UUIDv7 text in minor 1.6.
   // SHA-256("dirextalk.agent-route-health-public-key.v1\\0" || public key).
   bytes route_health_public_key_digest = 12; // Exactly 32 domain-separated bytes in minor 1.6.
+  string server_receipt_key_id = 13; // Exact bootstrap server receipt signer.
+  bytes server_receipt_public_key_digest = 14; // SHA-256 domain digest of public key.
 }
 
 enum DesiredConnectorState {
