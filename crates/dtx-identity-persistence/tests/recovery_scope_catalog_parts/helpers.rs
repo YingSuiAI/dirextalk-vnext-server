@@ -26,25 +26,50 @@ async fn provider_response_rows(
         .bind(identity.to_string()).fetch_one(harness.admin_pool()).await
 }
 
-async fn wait_until_advisory_waiters(
+async fn wait_until_exact_advisory_waiters(
     pool: &sqlx::PgPool,
-    minimum: i64,
+    lock_key: i64,
+    applications: &[&str],
 ) -> Result<(), Box<dyn Error>> {
+    let class_id = i64::from((lock_key as u64 >> 32) as u32);
+    let object_id = i64::from(lock_key as u32);
+    let applications: Vec<String> = applications.iter().map(ToString::to_string).collect();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted",
+            let backends: Vec<(String, i32)> = sqlx::query_as(
+                "SELECT application_name,pid FROM pg_stat_activity WHERE datid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND application_name=ANY($1) ORDER BY application_name",
             )
-            .fetch_one(pool)
+            .bind(&applications)
+            .fetch_all(pool)
             .await?;
-            if waiting >= minimum {
+            let pids: Vec<i32> = backends.iter().map(|(_, pid)| *pid).collect();
+            let waiting: Vec<i32> = if pids.len() == applications.len()
+                && pids.iter().copied().collect::<std::collections::BTreeSet<_>>().len()
+                    == pids.len()
+            {
+                sqlx::query_scalar(
+                    "SELECT pid FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND classid=$1 AND objid=$2 AND objsubid=1 AND granted=false AND pid=ANY($3) ORDER BY pid",
+                )
+                .bind(class_id)
+                .bind(object_id)
+                .bind(&pids)
+                .fetch_all(pool)
+                .await?
+            } else {
+                Vec::new()
+            };
+            if pids.len() == applications.len()
+                && waiting.len() == pids.len()
+                && waiting.iter().copied().collect::<std::collections::BTreeSet<_>>()
+                    == pids.iter().copied().collect()
+            {
                 return Ok::<(), sqlx::Error>(());
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .map_err(|_| "advisory lock waiters did not reach the deterministic gate")??;
+    .map_err(|_| "exact advisory-lock gate did not observe all expected waiters")??;
     Ok(())
 }
 

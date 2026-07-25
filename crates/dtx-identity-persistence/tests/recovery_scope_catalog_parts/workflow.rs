@@ -116,7 +116,13 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         .bind(lock_key)
         .execute(&mut *identity_fence)
         .await?;
-    let first_store = store.clone();
+    let first_store = IdentityPgStore::connect(
+        harness
+            .identity_runtime_options()
+            .application_name("catalog-publish-first-gate"),
+        1,
+    )
+    .await?;
     let first_command = catalog.clone();
     let first_credential = authority_credential_b;
     let first_task = tokio::spawn(async move {
@@ -124,7 +130,13 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
             .publish(&first_store, &first_command, &first_credential, at(3_000))
             .await
     });
-    let second_store = store.clone();
+    let second_store = IdentityPgStore::connect(
+        harness
+            .identity_runtime_options()
+            .application_name("catalog-publish-second-gate"),
+        1,
+    )
+    .await?;
     let second_command = catalog.clone();
     let second_credential = authority_credential_c;
     let second_task = tokio::spawn(async move {
@@ -132,8 +144,14 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
             .publish(&second_store, &second_command, &second_credential, at(3_000))
             .await
     });
-    wait_until_advisory_waiters(harness.admin_pool(), 1).await?;
+    let publish_gate = wait_until_exact_advisory_waiters(
+        harness.admin_pool(),
+        lock_key,
+        &["catalog-publish-first-gate", "catalog-publish-second-gate"],
+    )
+    .await;
     identity_fence.rollback().await?;
+    publish_gate?;
     let first = first_task.await??;
     let second = second_task.await??;
     assert_ne!(first.created, second.created);
@@ -379,7 +397,13 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         .bind(other_lock_key)
         .execute(&mut *other_fence)
         .await?;
-    let mismatch_store = store.clone();
+    let mismatch_store = IdentityPgStore::connect(
+        harness
+            .identity_runtime_options()
+            .application_name("catalog-cross-identity-provider-gate"),
+        1,
+    )
+    .await?;
     let mismatch_task = tokio::spawn(async move {
         RecoveryScopeCatalogRepository
             .put_provider_response(
@@ -390,7 +414,13 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
             )
             .await
     });
-    let status_store = store.clone();
+    let status_store = IdentityPgStore::connect(
+        harness
+            .identity_runtime_options()
+            .application_name("catalog-target-status-gate"),
+        1,
+    )
+    .await?;
     let status_capability = RecoveryResponseCapability::new(response_capability_bytes)?;
     let status_request = challenge.challenge_id();
     let status_task = tokio::spawn(async move {
@@ -398,9 +428,22 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
             .status(&status_store, status_request, &status_capability, at(5_003))
             .await
     });
-    wait_until_advisory_waiters(harness.admin_pool(), 2).await?;
+    let target_gate = wait_until_exact_advisory_waiters(
+        harness.admin_pool(),
+        target_lock_key,
+        &["catalog-target-status-gate"],
+    )
+    .await;
+    let provider_gate = wait_until_exact_advisory_waiters(
+        harness.admin_pool(),
+        other_lock_key,
+        &["catalog-cross-identity-provider-gate"],
+    )
+    .await;
     target_fence.rollback().await?;
     other_fence.rollback().await?;
+    target_gate?;
+    provider_gate?;
     let mismatch = tokio::time::timeout(Duration::from_secs(5), mismatch_task)
         .await
         .map_err(|_| "cross-identity provider PUT deadlocked")??;

@@ -534,6 +534,34 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     );
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 1));
 
+    let provider_gate_store = IdentityPgStore::connect(
+        harness
+            .identity_runtime_options()
+            .application_name("catalog-http-provider-gate"),
+        1,
+    )
+    .await?;
+    let provider_gate_app = identity_bootstrap_router_with_state(
+        IdentityBootstrapState::with_clock_and_device_session_audience(
+            provider_gate_store,
+            clock.clone(),
+            AUDIENCE,
+        ),
+    );
+    let status_gate_store = IdentityPgStore::connect(
+        harness
+            .identity_runtime_options()
+            .application_name("catalog-http-status-gate"),
+        1,
+    )
+    .await?;
+    let status_gate_app = identity_bootstrap_router_with_state(
+        IdentityBootstrapState::with_clock_and_device_session_audience(
+            status_gate_store,
+            clock.clone(),
+            AUDIENCE,
+        ),
+    );
     let mut identity_fence = harness.admin_pool().begin().await?;
     let lock_key = i64::from_be_bytes(identity_id.digest_bytes()[..8].try_into()?);
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -541,21 +569,27 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         .execute(&mut *identity_fence)
         .await?;
     let gate = async {
-        wait_for_advisory_waiters(harness.admin_pool(), 2).await?;
+        let waiter_gate = wait_for_exact_advisory_waiters(
+            harness.admin_pool(),
+            lock_key,
+            &["catalog-http-provider-gate", "catalog-http-status-gate"],
+        )
+        .await;
         identity_fence.rollback().await?;
+        waiter_gate?;
         Ok::<(), Box<dyn Error>>(())
     };
     let ((provider_response, status_response), gate_result) = tokio::join!(
         async {
             tokio::join!(
                 send_provider_response(
-                    app.clone(),
+                    provider_gate_app,
                     "catalog-provider-0001",
                     &provider_session,
                     challenge.challenge_id(),
                     provider_response_body.clone(),
                 ),
-                send_status(app.clone(), challenge.challenge_id(), response_capability),
+                send_status(status_gate_app, challenge.challenge_id(), response_capability),
             )
         },
         gate,
