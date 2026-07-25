@@ -447,6 +447,59 @@ fn history_recovery_request_v4_body(
     Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
 }
 
+fn resign_history_recovery_request_v4(
+    value: CanonicalValue,
+    candidate: &SigningKey,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let CanonicalValue::Map(mut fields) = value else {
+        return Err("V4 request must be a map".into());
+    };
+    if fields.len() != 21 {
+        return Err("V4 request field count changed".into());
+    }
+    fields.truncate(20);
+    let unsigned = encode_deterministic_cbor(&CanonicalValue::Map(fields.clone()))?;
+    let mut input = HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN.to_vec();
+    input.extend_from_slice(&unsigned);
+    fields.push(field(21, signature(candidate, &input).to_canonical_value()));
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
+}
+
+fn history_recovery_request_v4_with_manifest_tamper(
+    bytes: &[u8],
+    candidate: &SigningKey,
+    field_index: usize,
+    replacement: CanonicalValue,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let CanonicalValue::Map(mut fields) = decode_deterministic_cbor(bytes)? else {
+        return Err("V4 request must be a map".into());
+    };
+    let CanonicalValue::Map(mut manifest) = fields[14].1.clone() else {
+        return Err("V4 manifest must be a map".into());
+    };
+    manifest[field_index - 1].1 = replacement;
+    let manifest_value = CanonicalValue::Map(manifest);
+    let manifest_bytes = encode_deterministic_cbor(&manifest_value)?;
+    fields[14].1 = manifest_value;
+    fields[15].1 =
+        Sha256Digest::hash_domain(b"dirextalk.history-recovery.manifest.v2\0", &manifest_bytes)
+            .to_canonical_value();
+    resign_history_recovery_request_v4(CanonicalValue::Map(fields), candidate)
+}
+
+fn history_recovery_request_v4_with_outer_tamper(
+    bytes: &[u8],
+    candidate: &SigningKey,
+    field_index: usize,
+    replacement: CanonicalValue,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let CanonicalValue::Map(mut fields) = decode_deterministic_cbor(bytes)? else {
+        return Err("V4 request must be a map".into());
+    };
+    fields[field_index - 1].1 = replacement;
+    resign_history_recovery_request_v4(CanonicalValue::Map(fields), candidate)
+}
+
 fn authorization(session: &Session) -> String {
     format!(
         "{DEVICE_SESSION_AUTHORIZATION_SCHEME} {}.{}",

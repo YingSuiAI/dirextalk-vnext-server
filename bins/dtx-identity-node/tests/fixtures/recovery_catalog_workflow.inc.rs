@@ -828,6 +828,93 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     .fetch_one(harness.admin_pool())
     .await?;
     assert_eq!(v4_rows, 1);
+    // Every manifest coordinate is independently authenticated and bound to
+    // the accepted Catalog V2 head. Re-sign each mutated outer request so a
+    // rejection cannot be attributed merely to the candidate signature.
+    for (field, replacement) in [
+        (1, CanonicalValue::Unsigned(3)),
+        (2, CanonicalValue::Text("not-the-identity".into())),
+        (3, CanonicalValue::Text("0190f2a5-7b1c-7abc-8def-0123456789ff".into())),
+        (4, CanonicalValue::Unsigned(2)),
+        (5, CanonicalValue::Bytes(vec![0])),
+        (6, CanonicalValue::Bytes(vec![0; 32])),
+        (7, CanonicalValue::Bytes(vec![0; 32])),
+        (8, CanonicalValue::Unsigned(2)),
+        (9, CanonicalValue::Bytes(vec![0; 32])),
+        (10, CanonicalValue::Array(Vec::new())),
+    ] {
+        let tampered = history_recovery_request_v4_with_manifest_tamper(
+            &v4_request,
+            &candidate,
+            field,
+            replacement,
+        )?;
+        let response = send_history_recovery_request_v4(
+            app.clone(),
+            request_idempotency,
+            enrollment_capability,
+            response_capability,
+            tampered,
+        )
+        .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "manifest field {field}",
+        );
+        assert_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        )
+        .await?;
+    }
+    let changed_signed_request = history_recovery_request_v4_with_outer_tamper(
+        &v4_request,
+        &candidate,
+        17,
+        at(5_301).to_canonical_value(),
+    )?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            request_idempotency,
+            enrollment_capability,
+            response_capability,
+            changed_signed_request,
+        )
+        .await?,
+        StatusCode::CONFLICT,
+        "IDEMPOTENCY_CONFLICT",
+    )
+    .await?;
+    for (case, idempotency, response) in [
+        ("idempotency", "history-recovery-v4-changed", response_capability),
+        ("response-capability", request_idempotency, [62; 32]),
+    ] {
+        let rejected = send_history_recovery_request_v4(
+            app.clone(),
+            idempotency,
+            enrollment_capability,
+            response,
+            v4_request.clone(),
+        )
+        .await?;
+        assert_error(
+            rejected,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        )
+        .await?;
+        assert_eq!(v4_rows, 1, "{case} must not create a request");
+    }
+    let rows_after_rejections: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM identity.history_recovery_requests WHERE request_id=$1",
+    )
+    .bind(*challenge.challenge_id().as_uuid())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(rows_after_rejections, 1);
 
     clock.set(5_400);
     let rotated = catalog_body(
@@ -861,7 +948,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         request_idempotency,
         enrollment_capability,
         response_capability,
-        v4_request,
+        v4_request.clone(),
     )
     .await?;
     assert_eq!(v4_drift_replay.status(), StatusCode::OK);
@@ -1070,6 +1157,25 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     assert_eq!(
         to_bytes(expired_replay.into_body(), 1_100_000).await?,
         preparation_receipt_bytes
+    );
+    // Replay is an immutable receipt lookup: it survives request expiry,
+    // catalog/provider drift, and the H+2 provider-revocation append above.
+    let v4_expired_replay = send_history_recovery_request_v4(
+        app.clone(),
+        request_idempotency,
+        enrollment_capability,
+        response_capability,
+        v4_request,
+    )
+    .await?;
+    assert_eq!(v4_expired_replay.status(), StatusCode::OK);
+    assert_catalog_headers(
+        &v4_expired_replay,
+        HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
+    );
+    assert_eq!(
+        to_bytes(v4_expired_replay.into_body(), 16_384).await?,
+        v4_receipt
     );
 
     sqlx::query("REVOKE SELECT ON identity.recovery_scope_catalogs FROM dtx_identity_runtime")
