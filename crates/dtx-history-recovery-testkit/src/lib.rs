@@ -1135,6 +1135,15 @@ pub fn completion_v2(input: &CompletionV2Input, candidate: &SigningKey) -> Vec<u
     )
 }
 
+// Short aliases mirror the protocol object names and keep fixtures readable.
+pub use catalog_leaf_v2 as leaf_v2;
+pub use completion_child_certificate_v1 as child_certificate_v1;
+pub use completion_entry_proof_v2 as proof_v2;
+pub use completion_entry_root as merkle_root_v2;
+pub use completion_entry_v2 as entry_v2;
+pub use completion_v2 as completion_command_v2;
+pub use redacted_completion_evidence_v1 as evidence_v1;
+
 #[cfg(test)]
 mod tests {
     use super::*;
