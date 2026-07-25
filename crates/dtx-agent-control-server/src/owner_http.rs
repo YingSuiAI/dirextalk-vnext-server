@@ -31,7 +31,8 @@ use dtx_connect_registry::{BindingError, BindingState, TenantRef};
 use dtx_domain::{
     AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, ApprovalId, BindingId, ConnectorId,
     ConversationId, DeviceId, DeviceSessionId, EventId, GrantId, IdentityId, InstallationId,
-    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, RunId, TenantId,
+    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, RouteHealthKeyId,
+    RunId, TenantId,
 };
 use dtx_identity_persistence::{DeviceSessionCredential, DeviceSessionRepository};
 use dtx_storage::PgStore;
@@ -904,6 +905,8 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                     installation_id,
                     binding_id,
                     target.agent_control_device_id,
+                    target.server_receipt_key_id,
+                    target.server_receipt_public_key,
                 )?,
             })
         })
@@ -1687,8 +1690,10 @@ fn agent_route_target_cbor(
     installation_id: InstallationId,
     binding_id: BindingId,
     agent_control_device_id: AgentDeviceId,
+    server_receipt_key_id: Option<RouteHealthKeyId>,
+    server_receipt_public_key: Option<[u8; 32]>,
 ) -> Result<Vec<u8>, AgentProvisioningOwnerError> {
-    encode_deterministic_cbor(&CanonicalValue::Map(vec![
+    let mut fields = vec![
         (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
         (
             CanonicalValue::Unsigned(2),
@@ -1706,8 +1711,19 @@ fn agent_route_target_cbor(
             CanonicalValue::Unsigned(5),
             CanonicalValue::Text(agent_control_device_id.to_string()),
         ),
-    ]))
-    .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
+    ];
+    if let (Some(key_id), Some(public_key)) = (server_receipt_key_id, server_receipt_public_key) {
+        fields.push((
+            CanonicalValue::Unsigned(6),
+            CanonicalValue::Text(key_id.to_string()),
+        ));
+        fields.push((
+            CanonicalValue::Unsigned(7),
+            CanonicalValue::Bytes(public_key.to_vec()),
+        ));
+    }
+    encode_deterministic_cbor(&CanonicalValue::Map(fields))
+        .map_err(|_| AgentProvisioningOwnerError::TemporarilyUnavailable)
 }
 
 fn agent_route_run_receipt_cbor(

@@ -138,6 +138,8 @@ impl std::error::Error for AgentRouteBootstrapError {}
 pub(crate) struct AgentRouteBootstrapTarget {
     pub connector_id: ConnectorId,
     pub agent_control_device_id: AgentDeviceId,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key: Option<[u8; 32]>,
 }
 
 /// Owner-signed Begin intent.  The MLS route fence does not exist yet at this
@@ -1429,13 +1431,23 @@ async fn resolve_owned_agent_route_bootstrap_target(
     installation_id: InstallationId,
     binding_id: BindingId,
 ) -> Result<AgentRouteBootstrapTarget, AgentRouteBootstrapError> {
-    let target: Option<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT b.connector_id, b.agent_device_id
+    let target = sqlx::query(
+        "SELECT b.connector_id, b.agent_device_id,
+                credential.route_health_receipt_key_id,
+                credential.route_health_receipt_public_key
            FROM agent.installations i
            JOIN agent.connector_bindings b
              ON b.tenant_id=i.tenant_id AND b.installation_id=i.installation_id
            JOIN agent.agent_devices d
              ON d.tenant_id=i.tenant_id AND d.agent_device_id=b.agent_device_id
+           JOIN LATERAL (
+                SELECT c.route_health_receipt_key_id,
+                       c.route_health_receipt_public_key
+                  FROM agent.connector_control_credentials c
+                 WHERE c.tenant_id=b.tenant_id AND c.connector_id=b.connector_id
+                 ORDER BY c.connector_generation DESC, c.credential_revision DESC
+                 LIMIT 1
+           ) credential ON TRUE
           WHERE i.tenant_id=$1 AND i.installation_id=$2 AND i.owner_id=$3
             AND i.desired_state = 'enabled'
             AND b.binding_id=$4 AND b.state='enabled'
@@ -1449,13 +1461,41 @@ async fn resolve_owned_agent_route_bootstrap_target(
     .fetch_optional(&mut *connection)
     .await
     .map_err(map_sql)?;
-    let (connector_id, agent_control_device_id) =
-        target.ok_or(AgentRouteBootstrapError::NotFound)?;
+    let row = target.ok_or(AgentRouteBootstrapError::NotFound)?;
+    let connector_id: Uuid = row
+        .try_get("connector_id")
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let agent_control_device_id: Uuid = row
+        .try_get("agent_device_id")
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let key_id: Option<Uuid> = row
+        .try_get("route_health_receipt_key_id")
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let public: Option<Vec<u8>> = row
+        .try_get("route_health_receipt_public_key")
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?;
+    let (server_receipt_key_id, server_receipt_public_key) = match (key_id, public) {
+        (None, None) => (None, None),
+        (Some(key_id), Some(public)) => (
+            Some(
+                RouteHealthKeyId::try_from(key_id)
+                    .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+            ),
+            Some(
+                public
+                    .try_into()
+                    .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+            ),
+        ),
+        _ => return Err(AgentRouteBootstrapError::Unavailable),
+    };
     Ok(AgentRouteBootstrapTarget {
         connector_id: ConnectorId::try_from(connector_id)
             .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
         agent_control_device_id: AgentDeviceId::try_from(agent_control_device_id)
             .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
+        server_receipt_key_id,
+        server_receipt_public_key,
     })
 }
 
