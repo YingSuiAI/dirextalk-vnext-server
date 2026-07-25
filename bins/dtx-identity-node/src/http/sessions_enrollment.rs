@@ -1,14 +1,15 @@
 use super::{
     Body, CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
     CreateHistoryRecoveryRequestV4Command, DEVICE_ENROLLMENT_CANDIDATE_CONTENT_TYPE,
-    DEVICE_ENROLLMENT_CAPABILITY_HEADER, DEVICE_ENROLLMENT_CONTENT_TYPE,
-    DeviceEnrollmentApprovalCommand, DeviceEnrollmentApprovalSuccess,
-    DeviceEnrollmentChallengeOutcome, DeviceEnrollmentChallengeStatus,
-    DeviceEnrollmentChallengeSuccess, DeviceEnrollmentFailure, DeviceId, DeviceRevokeCommand,
-    DeviceRevokeFailure, DeviceRevokeSuccess, DeviceSessionChallengeRequest,
-    DeviceSessionChallengeResponse, DeviceSessionCompletionCommand, DeviceSessionCompletionRequest,
-    DeviceSessionFailure, DeviceSessionOutcome, DeviceSessionSuccess, FromStr,
-    HISTORY_RECOVERY_REQUEST_CONTENT_TYPE, HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE,
+    DEVICE_ENROLLMENT_CAPABILITY_HASH_DOMAIN, DEVICE_ENROLLMENT_CAPABILITY_HEADER,
+    DEVICE_ENROLLMENT_CONTENT_TYPE, DeviceEnrollmentApprovalCommand,
+    DeviceEnrollmentApprovalSuccess, DeviceEnrollmentChallengeOutcome,
+    DeviceEnrollmentChallengeStatus, DeviceEnrollmentChallengeSuccess, DeviceEnrollmentFailure,
+    DeviceId, DeviceRevokeCommand, DeviceRevokeFailure, DeviceRevokeSuccess,
+    DeviceSessionChallengeRequest, DeviceSessionChallengeResponse, DeviceSessionCompletionCommand,
+    DeviceSessionCompletionRequest, DeviceSessionFailure, DeviceSessionOutcome,
+    DeviceSessionSuccess, FromStr, HISTORY_RECOVERY_REQUEST_CONTENT_TYPE,
+    HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE,
     HTTP_DEVICE_ENROLLMENT_APPROVAL_IDEMPOTENCY_KEY_HASH_DOMAIN,
     HTTP_DEVICE_ENROLLMENT_CHALLENGE_IDEMPOTENCY_KEY_HASH_DOMAIN,
     HTTP_DEVICE_REVOKE_IDEMPOTENCY_KEY_HASH_DOMAIN,
@@ -30,8 +31,8 @@ use super::{
     map_device_session_persistence_error, parse_device_enrollment_candidate,
     parse_device_enrollment_completion, parse_device_enrollment_status_request,
     parse_device_session_authorization, parse_history_recovery_request,
-    parse_history_recovery_request_v4, parse_json_body, parse_recovery_capability_header,
-    parse_recovery_enrollment_capability, to_bytes,
+    parse_history_recovery_request_v4, parse_history_recovery_request_v4_identity, parse_json_body,
+    parse_recovery_capability_header, parse_recovery_enrollment_capability, to_bytes,
 };
 
 pub(crate) async fn create_history_recovery_request_v4(
@@ -187,6 +188,19 @@ impl IdentityBootstrapState {
         let bytes = to_bytes(body, 37_114)
             .await
             .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+        let (request_id, identity_id) = parse_history_recovery_request_v4_identity(&bytes)?;
+        self.device_enrollments
+            .authenticate_history_recovery_request_v4_capability(
+                &self.store,
+                request_id,
+                identity_id,
+                Sha256Digest::hash_domain(
+                    DEVICE_ENROLLMENT_CAPABILITY_HASH_DOMAIN,
+                    &enrollment_raw,
+                ),
+            )
+            .await
+            .map_err(|error| map_device_enrollment_persistence_error(&error))?;
         let request = parse_history_recovery_request_v4(&bytes, enrollment, &response_capability)?;
         if request.response_capability_digest
             != Sha256Digest::hash_domain(

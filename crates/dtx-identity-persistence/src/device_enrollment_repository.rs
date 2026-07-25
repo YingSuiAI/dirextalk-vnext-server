@@ -1,4 +1,37 @@
 impl DeviceEnrollmentRepository {
+    /// Authenticates the candidate enrollment capability before the HTTP V4
+    /// decoder consumes nested preparation bytes.  Missing, wrong-identity,
+    /// and wrong-bound capabilities intentionally share one opaque rejection.
+    pub async fn authenticate_history_recovery_request_v4_capability(
+        self,
+        store: &IdentityPgStore,
+        request_id: DeviceEnrollmentChallengeId,
+        identity_id: IdentityId,
+        capability_hash: Sha256Digest,
+    ) -> Result<(), IdentityPersistenceError> {
+        let mut tx = store.begin().await?;
+        let row = sqlx::query(
+            "SELECT identity_id, capability_hash
+               FROM identity.device_enrollment_challenges
+              WHERE challenge_id=$1",
+        )
+        .bind(*request_id.as_uuid())
+        .fetch_optional(&mut *tx.connection())
+        .await?;
+        let Some(row) = row else {
+            return Err(IdentityPersistenceError::DeviceEnrollmentCapabilityRejected);
+        };
+        let stored_identity: String = row.try_get("identity_id")?;
+        let stored_capability_hash: Vec<u8> = row.try_get("capability_hash")?;
+        if stored_identity != identity_id.to_string()
+            || stored_capability_hash.as_slice() != capability_hash.as_bytes()
+        {
+            return Err(IdentityPersistenceError::DeviceEnrollmentCapabilityRejected);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Admits one immutable catalog-exhaustive History Recovery Request V4.
     pub async fn create_history_recovery_request_v4(
         self,

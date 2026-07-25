@@ -13,7 +13,7 @@ use std::{
 
 use axum::{
     body::{Body, to_bytes},
-    http::{Request, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{
@@ -329,31 +329,91 @@ async fn send_history_recovery_request_v4(
     response_capability: [u8; 32],
     body: Vec<u8>,
 ) -> Result<axum::response::Response, Box<dyn Error>> {
-    Ok(app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(HISTORY_RECOVERY_REQUEST_V4_PATH)
-                .header(
-                    header::CONTENT_TYPE,
-                    HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE,
-                )
-                .header(
-                    header::ACCEPT,
-                    HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
-                )
-                .header("idempotency-key", idempotency)
-                .header(
-                    DEVICE_ENROLLMENT_CAPABILITY_HEADER,
-                    Base64UrlUnpadded::encode_string(&enrollment_capability),
-                )
-                .header(
-                    RECOVERY_RESPONSE_CAPABILITY_HEADER,
-                    Base64UrlUnpadded::encode_string(&response_capability),
-                )
-                .body(Body::from(body))?,
-        )
-        .await?)
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE.parse()?,
+    );
+    headers.insert(
+        header::ACCEPT,
+        HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE.parse()?,
+    );
+    headers.insert("idempotency-key", idempotency.parse()?);
+    headers.insert(
+        DEVICE_ENROLLMENT_CAPABILITY_HEADER,
+        Base64UrlUnpadded::encode_string(&enrollment_capability).parse()?,
+    );
+    headers.insert(
+        RECOVERY_RESPONSE_CAPABILITY_HEADER,
+        Base64UrlUnpadded::encode_string(&response_capability).parse()?,
+    );
+    send_history_recovery_request_v4_custom(
+        app,
+        "POST",
+        HISTORY_RECOVERY_REQUEST_V4_PATH,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn send_history_recovery_request_v4_custom(
+    app: axum::Router,
+    method: &str,
+    path: &str,
+    headers: HeaderMap,
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Body::from(body))?;
+    *request.headers_mut() = headers;
+    Ok(app.oneshot(request).await?)
+}
+
+fn history_recovery_request_v4_headers(
+    content_type: Option<&str>,
+    accept: Option<&str>,
+    idempotency: Option<&str>,
+    enrollment_capability: Option<&[u8; 32]>,
+    response_capability: Option<&[u8; 32]>,
+    authorization: Option<&str>,
+    content_encoding: Option<&str>,
+    if_match: Option<&str>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(value) = content_type {
+        headers.insert(header::CONTENT_TYPE, value.parse().unwrap());
+    }
+    if let Some(value) = accept {
+        headers.insert(header::ACCEPT, value.parse().unwrap());
+    }
+    if let Some(value) = idempotency {
+        headers.insert("idempotency-key", value.parse().unwrap());
+    }
+    if let Some(value) = enrollment_capability {
+        headers.insert(
+            DEVICE_ENROLLMENT_CAPABILITY_HEADER,
+            Base64UrlUnpadded::encode_string(value).parse().unwrap(),
+        );
+    }
+    if let Some(value) = response_capability {
+        headers.insert(
+            RECOVERY_RESPONSE_CAPABILITY_HEADER,
+            Base64UrlUnpadded::encode_string(value).parse().unwrap(),
+        );
+    }
+    if let Some(value) = authorization {
+        headers.insert(header::AUTHORIZATION, value.parse().unwrap());
+    }
+    if let Some(value) = content_encoding {
+        headers.insert(header::CONTENT_ENCODING, value.parse().unwrap());
+    }
+    if let Some(value) = if_match {
+        headers.insert(header::IF_MATCH, value.parse().unwrap());
+    }
+    headers
 }
 
 async fn cancel_enrollment_challenge(
@@ -576,6 +636,21 @@ async fn assert_error(
     Ok(())
 }
 
+async fn assert_history_recovery_request_rows(
+    pool: &sqlx::PgPool,
+    request_id: dtx_domain::DeviceEnrollmentChallengeId,
+    expected: i64,
+) -> Result<(), Box<dyn Error>> {
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM identity.history_recovery_requests WHERE request_id=$1",
+    )
+    .bind(*request_id.as_uuid())
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(rows, expected);
+    Ok(())
+}
+
 fn assert_catalog_headers(response: &axum::response::Response, content_type: &str) {
     assert_eq!(response.headers()[header::CONTENT_TYPE], content_type);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
@@ -583,6 +658,33 @@ fn assert_catalog_headers(response: &axum::response::Response, content_type: &st
         response.headers()[header::X_CONTENT_TYPE_OPTIONS],
         "nosniff"
     );
+}
+
+fn assert_history_recovery_request_v4_response_headers(
+    response: &axum::response::Response,
+    status: StatusCode,
+) {
+    assert_eq!(response.status(), status);
+    assert_catalog_headers(response, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE);
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+    assert!(
+        response
+            .headers()
+            .get(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
+            .is_none()
+    );
+    assert!(
+        response
+            .headers()
+            .get(RECOVERY_RESPONSE_CAPABILITY_HEADER)
+            .is_none()
+    );
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("V4 receipt must carry a request ID");
+    assert!(uuid::Uuid::parse_str(request_id).is_ok());
 }
 
 fn assert_created_and_replayed(

@@ -96,6 +96,21 @@ pub(crate) struct HistoryRecoveryRequestV4 {
     pub(crate) request_digest: Sha256Digest,
 }
 
+pub(crate) fn parse_history_recovery_request_v4_identity(
+    bytes: &[u8],
+) -> Result<(DeviceEnrollmentChallengeId, IdentityId), DeviceEnrollmentFailure> {
+    if bytes.is_empty() || bytes.len() > 37_114 {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let value =
+        decode_deterministic_cbor(bytes).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let fields = exact_cbor_fields(&value, 21)?;
+    Ok((
+        parse_cbor_challenge_id(cbor_field(fields, 2)?)?,
+        parse_cbor_identity_id(cbor_field(fields, 3)?)?,
+    ))
+}
+
 pub(crate) fn parse_history_recovery_request_v4(
     bytes: &[u8],
     enrollment_capability: DeviceEnrollmentCapability,

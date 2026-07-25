@@ -820,6 +820,320 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         response_capability,
         request_idempotency,
     )?;
+
+    // The V4 boundary is fail-closed before repository admission.  Every
+    // malformed header/body shape below must share the safe error envelope and
+    // leave the immutable request table empty.
+    let valid_v4_headers = || {
+        history_recovery_request_v4_headers(
+            Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+            Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+            Some(request_idempotency),
+            Some(&enrollment_capability),
+            Some(&response_capability),
+            None,
+            None,
+            None,
+        )
+    };
+    let wrong_bound_enrollment_capability = [74; 32];
+    let mut header_rejections = vec![
+        (
+            "content-type",
+            {
+                let mut headers = valid_v4_headers();
+                headers.insert(header::CONTENT_TYPE, "application/cbor".parse()?);
+                headers
+            },
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "accept",
+            {
+                let mut headers = valid_v4_headers();
+                headers.insert(header::ACCEPT, "application/cbor".parse()?);
+                headers
+            },
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "missing enrollment capability",
+            history_recovery_request_v4_headers(
+                Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+                Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+                Some(request_idempotency),
+                None,
+                Some(&response_capability),
+                None,
+                None,
+                None,
+            ),
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_ENROLLMENT_CAPABILITY_INVALID",
+        ),
+        (
+            "invalid enrollment capability",
+            {
+                let mut headers = valid_v4_headers();
+                headers.insert(
+                    DEVICE_ENROLLMENT_CAPABILITY_HEADER,
+                    "not-a-capability".parse()?,
+                );
+                headers
+            },
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_ENROLLMENT_CAPABILITY_INVALID",
+        ),
+        (
+            "wrong-bound enrollment capability",
+            history_recovery_request_v4_headers(
+                Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+                Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+                Some(request_idempotency),
+                Some(&wrong_bound_enrollment_capability),
+                Some(&response_capability),
+                None,
+                None,
+                None,
+            ),
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_ENROLLMENT_CAPABILITY_INVALID",
+        ),
+        (
+            "missing response capability",
+            history_recovery_request_v4_headers(
+                Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+                Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+                Some(request_idempotency),
+                Some(&enrollment_capability),
+                None,
+                None,
+                None,
+                None,
+            ),
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_ENROLLMENT_CAPABILITY_INVALID",
+        ),
+        (
+            "short idempotency key",
+            history_recovery_request_v4_headers(
+                Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+                Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+                Some("short"),
+                Some(&enrollment_capability),
+                Some(&response_capability),
+                None,
+                None,
+                None,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "noncanonical idempotency key",
+            history_recovery_request_v4_headers(
+                Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+                Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+                Some("history recovery 0001"),
+                Some(&enrollment_capability),
+                Some(&response_capability),
+                None,
+                None,
+                None,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "oversize idempotency key",
+            history_recovery_request_v4_headers(
+                Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+                Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+                Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                Some(&enrollment_capability),
+                Some(&response_capability),
+                None,
+                None,
+                None,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "content encoding",
+            history_recovery_request_v4_headers(
+                Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+                Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+                Some(request_idempotency),
+                Some(&enrollment_capability),
+                Some(&response_capability),
+                None,
+                Some("gzip"),
+                None,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "if-match forbidden",
+            history_recovery_request_v4_headers(
+                Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+                Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+                Some(request_idempotency),
+                Some(&enrollment_capability),
+                Some(&response_capability),
+                None,
+                None,
+                Some("\"head\""),
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "authorization forbidden",
+            history_recovery_request_v4_headers(
+                Some(HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE),
+                Some(HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE),
+                Some(request_idempotency),
+                Some(&enrollment_capability),
+                Some(&response_capability),
+                Some("DTX-Device malformed"),
+                None,
+                None,
+            ),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+    ];
+    let mut duplicate_content_type = valid_v4_headers();
+    duplicate_content_type.append(
+        header::CONTENT_TYPE,
+        HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE.parse()?,
+    );
+    header_rejections.push((
+        "duplicate content-type",
+        duplicate_content_type,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DEVICE_ENROLLMENT_INVALID",
+    ));
+    let mut duplicate_accept = valid_v4_headers();
+    duplicate_accept.append(
+        header::ACCEPT,
+        HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE.parse()?,
+    );
+    header_rejections.push((
+        "duplicate accept",
+        duplicate_accept,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DEVICE_ENROLLMENT_INVALID",
+    ));
+    let mut duplicate_idempotency = valid_v4_headers();
+    duplicate_idempotency.append("idempotency-key", request_idempotency.parse()?);
+    header_rejections.push((
+        "duplicate idempotency-key",
+        duplicate_idempotency,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DEVICE_ENROLLMENT_INVALID",
+    ));
+    for (case, headers, status, code) in header_rejections {
+        let response = send_history_recovery_request_v4_custom(
+            app.clone(),
+            "POST",
+            HISTORY_RECOVERY_REQUEST_V4_PATH,
+            headers,
+            v4_request.clone(),
+        )
+        .await?;
+        assert_error(response, status, code).await?;
+        assert_history_recovery_request_rows(
+            harness.admin_pool(),
+            challenge.challenge_id(),
+            0,
+        )
+        .await
+        .map_err(|error| format!("{case}: {error}"))?;
+    }
+    for (case, body, status, code) in [
+        (
+            "empty body",
+            Vec::new(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "malformed cbor",
+            vec![0xff],
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "noncanonical cbor",
+            vec![0xa1, 0x02, 0x01],
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+        (
+            "oversize body",
+            vec![0; 37_115],
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        ),
+    ] {
+        let response = send_history_recovery_request_v4_custom(
+            app.clone(),
+            "POST",
+            HISTORY_RECOVERY_REQUEST_V4_PATH,
+            valid_v4_headers(),
+            body,
+        )
+        .await?;
+        assert_error(response, status, code).await?;
+        assert_history_recovery_request_rows(
+            harness.admin_pool(),
+            challenge.challenge_id(),
+            0,
+        )
+        .await
+        .map_err(|error| format!("{case}: {error}"))?;
+    }
+    for (case, method, path, expected_status) in [
+        (
+            "wrong method",
+            "PUT",
+            HISTORY_RECOVERY_REQUEST_V4_PATH,
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            "wrong path",
+            "POST",
+            "/v4/devices/history-recovery-requests/",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "version fallback",
+            "POST",
+            "/v3/devices/history-recovery-requests",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = send_history_recovery_request_v4_custom(
+            app.clone(),
+            method,
+            path,
+            valid_v4_headers(),
+            v4_request.clone(),
+        )
+        .await?;
+        assert_eq!(response.status(), expected_status, "{case}");
+        assert_history_recovery_request_rows(
+            harness.admin_pool(),
+            challenge.challenge_id(),
+            0,
+        )
+        .await?;
+    }
     let blocked = send_history_recovery_request_v4(
         app.clone(),
         request_idempotency,
@@ -856,8 +1170,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         v4_request.clone(),
     )
     .await?;
-    assert_eq!(v4_created.status(), StatusCode::CREATED);
-    assert_catalog_headers(&v4_created, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE);
+    assert_history_recovery_request_v4_response_headers(&v4_created, StatusCode::CREATED);
     let v4_receipt = to_bytes(v4_created.into_body(), 16_384).await?.to_vec();
     let v4_replay = send_history_recovery_request_v4(
         app.clone(),
@@ -867,8 +1180,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         v4_request.clone(),
     )
     .await?;
-    assert_eq!(v4_replay.status(), StatusCode::OK);
-    assert_catalog_headers(&v4_replay, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE);
+    assert_history_recovery_request_v4_response_headers(&v4_replay, StatusCode::OK);
     assert_eq!(to_bytes(v4_replay.into_body(), 16_384).await?, v4_receipt);
     let cancellation_replay = cancel_enrollment_challenge(
         app.clone(),
