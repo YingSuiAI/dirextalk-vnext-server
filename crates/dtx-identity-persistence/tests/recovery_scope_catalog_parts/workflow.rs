@@ -289,6 +289,155 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
     assert!(!prepare_replay?.0);
     assert_eq!(concurrent_status?.status, CatalogStatus::Pending);
 
+    // A valid provider session for a different identity must stop at the
+    // identity boundary before it can touch A's challenge/preparation rows.
+    // Hold both identity fences and A's target rows so the advisory-lock
+    // probe proves that the B PUT and A status have both reached their
+    // respective durable gates before either is allowed to continue.
+    let other_root = key(101);
+    let other_recovery = key(102);
+    let other_provider = key(103);
+    let other_genesis = super::genesis(&other_root, &other_recovery);
+    let other_identity_id = other_genesis.identity_id();
+    let other_head1 = committed(
+        identity_repository
+            .append(
+                &store,
+                &append_command(101, None, &other_genesis)?,
+                at(4_100),
+            )
+            .await?,
+    )?;
+    let other_provider_device = DeviceId::from_str(SECOND_CANDIDATE_DEVICE)?;
+    let other_provider_add = device_add(
+        &other_root,
+        other_identity_id,
+        other_provider_device,
+        &other_provider,
+        103,
+        2,
+        other_head1.hash(),
+        4_110,
+    );
+    let other_head2 = committed(
+        identity_repository
+            .append(
+                &store,
+                &append_command(102, Some(other_head1), &other_provider_add)?,
+                at(4_111),
+            )
+            .await?,
+    )?;
+    let other_provider_credential = session(
+        &store,
+        other_identity_id,
+        other_provider_device,
+        &other_provider,
+        104,
+        at(5_000),
+    )
+    .await?;
+    let cross_identity_provider = provider_command(
+        challenge.challenge_id(),
+        catalog.head_digest,
+        provider_device,
+        &provider,
+        Sha256Digest::hash_domain(
+            CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN,
+            public(&authority).as_bytes(),
+        ),
+        [55; 32],
+        Sha256Digest::from_bytes([69; 32]),
+        identity_id,
+        catalog.catalog_id,
+        catalog.generation,
+        prepare_a.digest,
+        head3,
+        IdentityLogHead::observed(identity_id, safe(4), Sha256Digest::from_bytes([99; 32]))?,
+        candidate_device,
+        &candidate,
+        &device_add(&root, identity_id, candidate_device, &candidate, 55, 4, head3.hash(), 7_101)
+            .to_deterministic_cbor()?,
+    )?;
+    let mut target_fence = harness.admin_pool().begin().await?;
+    let target_lock_key = i64::from_be_bytes(identity_id.digest_bytes()[..8].try_into()?);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(target_lock_key)
+        .execute(&mut *target_fence)
+        .await?;
+    sqlx::query("SELECT 1 FROM identity.device_enrollment_challenges WHERE challenge_id=$1 FOR UPDATE")
+        .bind(*challenge.challenge_id().as_uuid())
+        .fetch_one(&mut *target_fence)
+        .await?;
+    sqlx::query("SELECT 1 FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR UPDATE")
+        .bind(*challenge.challenge_id().as_uuid())
+        .fetch_one(&mut *target_fence)
+        .await?;
+    let mut other_fence = harness.admin_pool().begin().await?;
+    let other_lock_key = i64::from_be_bytes(other_identity_id.digest_bytes()[..8].try_into()?);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(other_lock_key)
+        .execute(&mut *other_fence)
+        .await?;
+    let mismatch_store = store.clone();
+    let mismatch_task = tokio::spawn(async move {
+        RecoveryScopeCatalogRepository
+            .put_provider_response(
+                &mismatch_store,
+                &cross_identity_provider,
+                &other_provider_credential,
+                at(5_003),
+            )
+            .await
+    });
+    let status_store = store.clone();
+    let status_capability = RecoveryResponseCapability::new(response_capability_bytes)?;
+    let status_request = challenge.challenge_id();
+    let status_task = tokio::spawn(async move {
+        RecoveryScopeCatalogRepository
+            .status(&status_store, status_request, &status_capability, at(5_003))
+            .await
+    });
+    wait_until_advisory_waiters(harness.admin_pool(), 2).await?;
+    target_fence.rollback().await?;
+    other_fence.rollback().await?;
+    let mismatch = tokio::time::timeout(Duration::from_secs(5), mismatch_task)
+        .await
+        .map_err(|_| "cross-identity provider PUT deadlocked")??;
+    assert!(matches!(
+        mismatch,
+        Err(IdentityPersistenceError::RecoveryProviderMismatch)
+    ));
+    let target_status = tokio::time::timeout(Duration::from_secs(5), status_task)
+        .await
+        .map_err(|_| "target catalog status deadlocked")???;
+    assert_eq!(target_status.status, CatalogStatus::Pending);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM identity.device_enrollment_challenges WHERE challenge_id=$1",
+        )
+        .bind(*challenge.challenge_id().as_uuid())
+        .fetch_one(harness.admin_pool())
+        .await?,
+        "open"
+    );
+    assert_eq!(
+        identity_repository.load(&store, identity_id).await?.expect("A active").head(),
+        head3
+    );
+    assert_eq!(
+        identity_repository
+            .load(&store, other_identity_id)
+            .await?
+            .expect("B active")
+            .head(),
+        other_head2
+    );
+    assert_eq!(provider_response_rows(&harness, identity_id).await?, 0);
+    assert_eq!(catalog_rows(&harness, other_identity_id).await?, 0);
+    assert_eq!(preparation_rows(&harness, other_identity_id).await?, 0);
+    assert_eq!(provider_response_rows(&harness, other_identity_id).await?, 0);
+
     let wrong_capability = RecoveryResponseCapability::new([62; 32])?;
     assert!(matches!(
         catalog_repository
