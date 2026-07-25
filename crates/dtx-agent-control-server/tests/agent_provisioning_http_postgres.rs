@@ -2826,8 +2826,8 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     let before_bootstrap: (i64, Vec<u8>) = sqlx::query_as(
         "SELECT updated_at_ms, delivery_receipt_digest FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND bootstrap_id=$2",
     ).bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(replay_before.connection()).await?;
-    let before_outbox: (String, Vec<u8>) = sqlx::query_as(
-        "SELECT state, result_digest FROM agent.agent_route_bootstrap_outbox WHERE tenant_id=$1 AND bootstrap_id=$2 AND command_kind='deliver_bootstrap'",
+    let before_outbox: (String, Vec<u8>, Option<i64>) = sqlx::query_as(
+        "SELECT state, result_digest, resolved_at_ms FROM agent.agent_route_bootstrap_outbox WHERE tenant_id=$1 AND bootstrap_id=$2 AND command_kind='deliver_bootstrap'",
     ).bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(replay_before.connection()).await?;
     let before_head: (Uuid, Uuid, Uuid, Vec<u8>, Vec<u8>, i64) = sqlx::query_as(
         "SELECT bootstrap_id, delivery_id, route_id, route_fence, capsule_digest, installed_at_ms FROM agent.agent_route_binding_heads WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3 AND installation_id=$4 AND binding_id=$5 AND agent_control_device_id=$6",
@@ -2846,7 +2846,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     .await?;
     let mut replay_after = store.begin_tenant(tenant_id).await?;
     let after_bootstrap: (i64, Vec<u8>) = sqlx::query_as("SELECT updated_at_ms, delivery_receipt_digest FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND bootstrap_id=$2").bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(replay_after.connection()).await?;
-    let after_outbox: (String, Vec<u8>) = sqlx::query_as("SELECT state, result_digest FROM agent.agent_route_bootstrap_outbox WHERE tenant_id=$1 AND bootstrap_id=$2 AND command_kind='deliver_bootstrap'").bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(replay_after.connection()).await?;
+    let after_outbox: (String, Vec<u8>, Option<i64>) = sqlx::query_as("SELECT state, result_digest, resolved_at_ms FROM agent.agent_route_bootstrap_outbox WHERE tenant_id=$1 AND bootstrap_id=$2 AND command_kind='deliver_bootstrap'").bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(replay_after.connection()).await?;
     let after_head: (Uuid, Uuid, Uuid, Vec<u8>, Vec<u8>, i64) = sqlx::query_as("SELECT bootstrap_id, delivery_id, route_id, route_fence, capsule_digest, installed_at_ms FROM agent.agent_route_binding_heads WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3 AND installation_id=$4 AND binding_id=$5 AND agent_control_device_id=$6").bind(Uuid::from(tenant_id)).bind(owner_id.to_string()).bind(Uuid::from(owner_device_id)).bind(Uuid::from(installation_id)).bind(Uuid::from(binding_id)).bind(Uuid::from(agent_control_device_id)).fetch_one(replay_after.connection()).await?;
     let after_cursor: i64 = sqlx::query_scalar("SELECT acknowledged_command_sequence FROM agent.connector_control_stream_heads WHERE tenant_id=$1 AND connector_id=$2").bind(Uuid::from(tenant_id)).bind(Uuid::from(connector.connector_id())).fetch_one(replay_after.connection()).await?;
     assert_eq!(after_bootstrap, before_bootstrap);
@@ -3317,6 +3317,11 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
     assert_eq!(row.2, public_key.as_bytes());
     let updated_at_before_replay = row.3;
     session.rollback().await?;
+    let mut head_before = store.begin_tenant(tenant_id).await?;
+    let head_count_before: i64 = sqlx::query_scalar("SELECT count(*) FROM agent.agent_route_binding_heads WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3 AND installation_id=$4 AND binding_id=$5 AND agent_control_device_id=$6")
+        .bind(Uuid::from(tenant_id)).bind(owner_id.to_string()).bind(Uuid::from(owner_device_id)).bind(Uuid::from(installation_id)).bind(Uuid::from(binding_id)).bind(Uuid::from(agent_device_id)).fetch_one(head_before.connection()).await?;
+    assert_eq!(head_count_before, 0);
+    head_before.rollback().await?;
     assert!(
         app.reject_agent_route_bootstrap(
             authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
@@ -3332,6 +3337,11 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
     .fetch_one(replay_session.connection()).await?;
     assert_eq!(updated_at_after_replay, updated_at_before_replay);
     replay_session.rollback().await?;
+    let mut head_after = store.begin_tenant(tenant_id).await?;
+    let head_count_after: i64 = sqlx::query_scalar("SELECT count(*) FROM agent.agent_route_binding_heads WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3 AND installation_id=$4 AND binding_id=$5 AND agent_control_device_id=$6")
+        .bind(Uuid::from(tenant_id)).bind(owner_id.to_string()).bind(Uuid::from(owner_device_id)).bind(Uuid::from(installation_id)).bind(Uuid::from(binding_id)).bind(Uuid::from(agent_device_id)).fetch_one(head_after.connection()).await?;
+    assert_eq!(head_count_after, 0);
+    head_after.rollback().await?;
     let mut mismatch = rejected;
     mismatch.route_health_public_key_digest = Some(ControlDigest::from_bytes([0xa4; 32]));
     assert_eq!(
