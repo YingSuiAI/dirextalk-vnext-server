@@ -6,37 +6,190 @@ impl DeviceEnrollmentRepository {
         command: CreateHistoryRecoveryRequestV4Command,
         now: UtcMillis,
     ) -> Result<(bool, Vec<u8>), IdentityPersistenceError> {
-        if now < command.issued_at || now >= command.expires_at {
-            return Err(IdentityPersistenceError::DeviceEnrollmentChallengeExpired);
-        }
         let mut tx = store.begin().await?;
         let result = async {
-            if let Some(row) = sqlx::query("SELECT request_digest,request_bytes,receipt_bytes FROM identity.history_recovery_requests WHERE request_id=$1 FOR UPDATE")
+            // Replay is resolved before any mutable validity checks.  A
+            // committed receipt therefore remains replayable after expiry,
+            // cancellation, rotation, or catalog/head drift.
+            if let Some(row) = sqlx::query("SELECT request_digest,request_bytes,idempotency_digest,receipt_bytes FROM identity.history_recovery_requests WHERE request_id=$1 FOR UPDATE")
                 .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await? {
                 let digest: Vec<u8> = row.try_get("request_digest")?;
                 let bytes: Vec<u8> = row.try_get("request_bytes")?;
-                if digest.as_slice() == command.request_digest.as_bytes() && bytes == command.exact_request_bytes {
+                let idempotency: Vec<u8> = row.try_get("idempotency_digest")?;
+                if digest.as_slice() == command.request_digest.as_bytes()
+                    && bytes == command.exact_request_bytes
+                    && idempotency.as_slice() == command.idempotency_digest.as_bytes()
+                {
                     return Ok((false, row.try_get("receipt_bytes")?));
                 }
                 return Err(IdentityPersistenceError::IdempotencyConflict);
             }
-            let prep = sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,expires_at_ms,provider_response_bytes,enrollment_capability_hash FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR UPDATE")
+
+            // All first-admission paths use identity -> challenge ->
+            // preparation ordering, matching the enrollment and Catalog V2
+            // writers and avoiding cross-path deadlocks.
+            let identity_hint = command.identity_id;
+            lock_identity(tx.connection(), identity_hint).await?;
+            if sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM identity.history_recovery_requests WHERE identity_id=$1 AND idempotency_digest=$2 AND request_id<>$3)")
+                .bind(command.identity_id.to_string())
+                .bind(command.idempotency_digest.as_bytes().as_slice())
+                .bind(*command.request_id.as_uuid())
+                .fetch_one(&mut *tx.connection())
+                .await?
+            {
+                return Err(IdentityPersistenceError::IdempotencyConflict);
+            }
+            let challenge = lock_challenge(tx.connection(), command.request_id).await?;
+            if challenge.identity_id != identity_hint
+                || challenge.protocol_version != 1
+                || challenge.state != DurableChallengeState::Approved
+                || challenge.cancelled_at.is_some()
+                || challenge.approved_head
+                    != Some(IdentityLogHead::observed(
+                        command.identity_id,
+                        command.post_head_sequence,
+                        command.post_head_hash,
+                    )?)
+                || challenge.target_device_id != command.target_device_id
+                || challenge.target_device_signing_key != command.target_device_signing_key
+                || challenge.target_device_encryption_key != command.recipient_encryption_key
+                || challenge.capability_hash != command.enrollment_capability_digest
+            {
+                return Err(IdentityPersistenceError::RecoveryPreparationInvalidated);
+            }
+            if sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM identity.device_enrollment_challenges WHERE identity_id=$1 AND target_device_id=$2 AND state='open' AND expires_at_ms>$3 AND challenge_id<>$4)")
+                .bind(command.identity_id.to_string())
+                .bind(*command.target_device_id.as_uuid())
+                .bind(now.get())
+                .bind(*command.request_id.as_uuid())
+                .fetch_one(&mut *tx.connection())
+                .await?
+            {
+                return Err(IdentityPersistenceError::RecoveryCandidateKeyChanged);
+            }
+            let prep = sqlx::query("SELECT identity_id,catalog_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,issued_at_ms,expires_at_ms,response_capability_hash,enrollment_capability_hash,catalog_generation,catalog_head_digest,authority_device_id,authority_key_id,authority_signing_key,preparation_bytes,preparation_digest,provider_response_bytes,provider_response_digest,provider_device_id,provider_signing_key,provider_ciphertext_digest,provider_expires_at_ms,provider_idempotency_key_hash,provider_recorded_at_ms FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR UPDATE")
                 .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?
                 .ok_or(IdentityPersistenceError::RecoveryPreparationRevoked)?;
             let identity: String = prep.try_get("identity_id")?;
-            if identity != command.identity_id.to_string() || prep.try_get::<uuid::Uuid,_>("candidate_device_id")? != *command.target_device_id.as_uuid()
+            let preparation_bytes: Vec<u8> = prep.try_get("preparation_bytes")?;
+            let preparation_digest: Vec<u8> = prep.try_get("preparation_digest")?;
+            let provider_bytes: Vec<u8> = prep.try_get::<Option<Vec<u8>>,_>("provider_response_bytes")?
+                .ok_or(IdentityPersistenceError::RecoveryPreparationRevoked)?;
+            let provider_digest: Vec<u8> = prep.try_get::<Option<Vec<u8>>,_>("provider_response_digest")?
+                .ok_or(IdentityPersistenceError::RecoveryPreparationInvalidated)?;
+            if identity != command.identity_id.to_string()
+                || prep.try_get::<uuid::Uuid,_>("candidate_device_id")? != *command.target_device_id.as_uuid()
                 || prep.try_get::<Vec<u8>,_>("candidate_signing_key")?.as_slice() != command.target_device_signing_key.as_bytes()
                 || prep.try_get::<Vec<u8>,_>("candidate_recipient_key")?.as_slice() != command.recipient_encryption_key.as_bytes()
                 || prep.try_get::<i64,_>("observed_head_sequence")? != i64::try_from(command.pre_head_sequence.get()).unwrap_or(i64::MAX)
                 || prep.try_get::<Vec<u8>,_>("observed_head_hash")?.as_slice() != command.pre_head_hash.as_bytes()
-                || prep.try_get::<Option<Vec<u8>>,_>("provider_response_bytes")?.is_none()
+                || preparation_bytes != command.preparation_bytes
+                || preparation_digest.as_slice() != command.preparation_digest.as_bytes()
                 || prep.try_get::<Vec<u8>,_>("enrollment_capability_hash")?.as_slice() != command.enrollment_capability_digest.as_bytes()
-            { return Err(IdentityPersistenceError::RecoveryPreparationInvalidated); }
-            let head = sqlx::query("SELECT head_sequence,head_hash FROM identity.log_heads WHERE identity_id=$1 FOR UPDATE")
-                .bind(command.identity_id.to_string()).fetch_one(&mut *tx.connection()).await?;
-            if head.try_get::<i64,_>("head_sequence")? != i64::try_from(command.post_head_sequence.get()).unwrap_or(i64::MAX)
-                || head.try_get::<Vec<u8>,_>("head_hash")?.as_slice() != command.post_head_hash.as_bytes()
-            { return Err(IdentityPersistenceError::HeadConflict { current: None }); }
+                || now < command.issued_at
+                || now >= command.expires_at
+                || now.get() < prep.try_get::<i64,_>("issued_at_ms")?
+                || now.get() >= prep.try_get::<i64,_>("expires_at_ms")?
+                || command.issued_at.get() < prep.try_get::<i64,_>("issued_at_ms")?
+                || command.expires_at.get() > prep.try_get::<i64,_>("expires_at_ms")?
+            {
+                return Err(IdentityPersistenceError::RecoveryPreparationInvalidated);
+            }
+
+            let catalog = sqlx::query("SELECT catalog_id,generation,head_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_signing_key,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
+                .bind(command.identity_id.to_string())
+                .fetch_optional(&mut *tx.connection())
+                .await?
+                .ok_or(IdentityPersistenceError::RecoveryCatalogHeadChanged)?;
+            if catalog.try_get::<uuid::Uuid,_>("catalog_id")?
+                    != prep.try_get::<uuid::Uuid,_>("catalog_id")?
+                || catalog.try_get::<i64,_>("generation")?
+                    != prep.try_get::<i64,_>("catalog_generation")?
+                || catalog.try_get::<Vec<u8>,_>("head_digest")?.as_slice()
+                    != prep.try_get::<Vec<u8>,_>("catalog_head_digest")?.as_slice()
+                || catalog.try_get::<i64,_>("observed_head_sequence")?
+                    != command.pre_head_sequence.get() as i64
+                || catalog.try_get::<Vec<u8>,_>("observed_head_hash")?.as_slice()
+                    != command.pre_head_hash.as_bytes()
+                || now.get() >= catalog.try_get::<i64,_>("expires_at_ms")?
+                || catalog.try_get::<uuid::Uuid,_>("authority_device_id")?
+                    != prep.try_get::<uuid::Uuid,_>("authority_device_id")?
+                || catalog.try_get::<Vec<u8>,_>("authority_signing_key")?.as_slice()
+                    != prep.try_get::<Vec<u8>,_>("authority_signing_key")?.as_slice()
+            {
+                return Err(IdentityPersistenceError::RecoveryCatalogHeadChanged);
+            }
+
+            // The persisted provider response is reparsed through the owner
+            // Catalog V2 validator; supplied digests and byte shapes are not
+            // accepted as a substitute for signatures and coordinates.
+            let provider = CatalogProviderResponseCommand::parse_v2(
+                digest(&prep.try_get::<Vec<u8>,_>("provider_idempotency_key_hash")?, "provider idempotency key")?,
+                command.request_id,
+                provider_bytes.clone(),
+            )?;
+            if Sha256Digest::from_bytes(provider_digest.try_into().map_err(|_| IdentityPersistenceError::CorruptData("provider response digest"))?) != provider.digest
+                || provider.identity_id != command.identity_id
+                || provider.catalog_id != prep.try_get::<uuid::Uuid,_>("catalog_id")?
+                || provider.catalog_generation != safe_uint(prep.try_get::<i64,_>("catalog_generation")?, "catalog generation")?
+                || provider.catalog_head_digest != digest(&prep.try_get::<Vec<u8>,_>("catalog_head_digest")?, "catalog head digest")?
+                || provider.candidate_device_id != command.target_device_id
+                || provider.device_add_digest != command.device_add_digest
+                || provider.device_add_bytes != command.device_add_bytes
+                || provider.successor_head != IdentityLogHead::observed(command.identity_id, command.post_head_sequence, command.post_head_hash)?
+                || provider.recipient_key_digest != Sha256Digest::hash_domain(RECIPIENT_KEY_HASH_DOMAIN, command.recipient_encryption_key.as_bytes())
+                || provider.expires_at > command.expires_at
+                || now >= provider.expires_at
+                || (provider.authority_kind == 1
+                    && (provider.authority_device_id
+                        != Some(parse_device_id(catalog.try_get::<uuid::Uuid,_>("authority_device_id")?)?)
+                        || provider.authority_signing_key.as_bytes()
+                            != catalog.try_get::<Vec<u8>,_>("authority_signing_key")?.as_slice()))
+            {
+                return Err(IdentityPersistenceError::RecoveryPreparationInvalidated);
+            }
+
+            let snapshot = lock_and_load_active_snapshot(tx.connection(), command.identity_id).await?;
+            let pre_head = IdentityLogHead::observed(command.identity_id, command.pre_head_sequence, command.pre_head_hash)?;
+            let post_head = IdentityLogHead::observed(command.identity_id, command.post_head_sequence, command.post_head_hash)?;
+            if snapshot.head() != post_head || challenge.approved_head != Some(snapshot.head()) {
+                return Err(IdentityPersistenceError::HeadConflict { current: Some(snapshot.head()) });
+            }
+            let catalog_authority = parse_device_id(catalog.try_get::<uuid::Uuid,_>("authority_device_id")?)?;
+            let catalog_authority_key = parse_signing_key(&catalog.try_get::<Vec<u8>,_>("authority_signing_key")?, "catalog authority key")?;
+            if snapshot.projection().device_status(catalog_authority) != Some(DeviceStatusV1::Active)
+                || snapshot
+                    .projection()
+                    .device_certificate(catalog_authority)
+                    .is_none_or(|certificate| certificate.device_signing_key() != catalog_authority_key)
+            {
+                return Err(IdentityPersistenceError::RecoveryAuthorityChanged);
+            }
+            let event = IdentityLogEventV1::decode_and_verify(&command.device_add_bytes)?;
+            validate_device_add_matches(&event, &challenge, pre_head, Some(snapshot.projection().current_root_key()))?;
+            if snapshot.exact_events().last().is_none_or(|bytes| bytes.as_slice() != command.device_add_bytes.as_slice()) {
+                return Err(IdentityPersistenceError::RecoveryPreparationInvalidated);
+            }
+            if snapshot.projection().device_status(provider.provider_device_id) != Some(DeviceStatusV1::Active)
+                || snapshot.projection().device_certificate(provider.provider_device_id)
+                    .is_none_or(|certificate| certificate.device_signing_key() != provider.provider_signing_key)
+            {
+                return Err(IdentityPersistenceError::RecoveryPreparationInvalidated);
+            }
+            if provider.authority_kind == 1 {
+                let authority_device = provider.authority_device_id.ok_or(IdentityPersistenceError::RecoveryAuthorityChanged)?;
+                if snapshot.projection().device_status(authority_device) != Some(DeviceStatusV1::Active)
+                    || snapshot.projection().device_certificate(authority_device)
+                        .is_none_or(|certificate| certificate.device_signing_key() != provider.authority_signing_key)
+                {
+                    return Err(IdentityPersistenceError::RecoveryAuthorityChanged);
+                }
+            }
+            if provider.authority_kind == 2 && provider.authority_signing_key != snapshot.projection().current_root_key()
+                || provider.authority_kind == 3 && provider.authority_signing_key != snapshot.projection().current_recovery_key()
+            {
+                return Err(IdentityPersistenceError::RecoveryAuthorityChanged);
+            }
             let receipt = encode_v4_request_receipt(command.request_id, command.request_digest, command.response_capability_digest, now)?;
             sqlx::query("INSERT INTO identity.history_recovery_requests(request_id,identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_bytes,device_add_digest,preparation_bytes,preparation_digest,manifest_bytes,manifest_digest,issued_at_ms,expires_at_ms,response_capability_digest,idempotency_digest,candidate_signature,request_bytes,request_digest,receipt_bytes,accepted_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)")
                 .bind(*command.request_id.as_uuid()).bind(command.identity_id.to_string()).bind(*command.target_device_id.as_uuid())

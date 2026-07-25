@@ -7,8 +7,10 @@ use super::{
     Sha256Digest, SigningPublicKey, UtcMillis, Zeroize, decode_deterministic_cbor,
     encode_deterministic_cbor, header, is_base64url_byte, to_bytes,
 };
+use dtx_identity_log::{IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1, IdentityLogEventV1};
 use dtx_identity_persistence::{
-    HISTORY_RECOVERY_REQUEST_V4_DIGEST_DOMAIN, HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN,
+    CatalogPreparationCommand, HISTORY_RECOVERY_REQUEST_V4_DIGEST_DOMAIN,
+    HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN, RecoveryResponseCapability,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
@@ -93,6 +95,8 @@ pub(crate) struct HistoryRecoveryRequestV4 {
 
 pub(crate) fn parse_history_recovery_request_v4(
     bytes: &[u8],
+    enrollment_capability: DeviceEnrollmentCapability,
+    response_capability: &RecoveryResponseCapability,
 ) -> Result<HistoryRecoveryRequestV4, DeviceEnrollmentFailure> {
     if bytes.is_empty() || bytes.len() > 37_114 {
         return Err(DeviceEnrollmentFailure::InvalidRequest);
@@ -151,6 +155,29 @@ pub(crate) fn parse_history_recovery_request_v4(
     if device_add_digest != expected_device_add {
         return Err(DeviceEnrollmentFailure::InvalidRequest);
     }
+    let device_add = IdentityLogEventV1::decode_and_verify(&device_add_bytes)
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    if device_add.wire() != IDENTITY_LOG_WIRE_VERSION
+        || device_add.identity_id() != identity_id
+        || device_add.sequence().get()
+            != pre_head_sequence
+                .get()
+                .checked_add(1)
+                .ok_or(DeviceEnrollmentFailure::InvalidRequest)?
+        || device_add.previous_event_hash() != Some(pre_head_hash)
+    {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let IdentityLogEventPayloadV1::DeviceAdd { certificate } = device_add.payload() else {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    };
+    if certificate.identity_id() != identity_id
+        || certificate.device_id() != target_device_id
+        || certificate.device_signing_key() != target_device_signing_key
+        || certificate.device_encryption_key() != recipient_encryption_key
+    {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
     let preparation_bytes = parse_cbor_bounded_bytes(cbor_field(fields, 13)?, 532)?;
     if preparation_bytes.is_empty() || preparation_bytes.len() > 532 {
         return Err(DeviceEnrollmentFailure::InvalidRequest);
@@ -163,6 +190,18 @@ pub(crate) fn parse_history_recovery_request_v4(
     if preparation_digest != expected_preparation {
         return Err(DeviceEnrollmentFailure::InvalidRequest);
     }
+    let preparation_value = decode_deterministic_cbor(&preparation_bytes)
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let preparation_fields = exact_cbor_fields(&preparation_value, 17)?;
+    let preparation_idempotency =
+        Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(preparation_fields, 14)?)?);
+    let preparation = CatalogPreparationCommand::parse_v2(
+        preparation_idempotency,
+        preparation_bytes.clone(),
+        enrollment_capability,
+        response_capability,
+    )
+    .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
     let manifest_value = cbor_field(fields, 15)?;
     let manifest_fields = exact_cbor_fields(&manifest_value, 10)?;
     if cbor_field(manifest_fields, 1)? != &CanonicalValue::Unsigned(2) {
@@ -182,6 +221,24 @@ pub(crate) fn parse_history_recovery_request_v4(
     let issued_at = parse_cbor_utc_nonnegative(cbor_field(fields, 17)?)?;
     let expires_at = parse_cbor_utc_nonnegative(cbor_field(fields, 18)?)?;
     if issued_at >= expires_at {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    if preparation.request_id != request_id
+        || preparation.identity_id != identity_id
+        || preparation.candidate_device_id != target_device_id
+        || preparation.candidate_signing_key != target_device_signing_key
+        || preparation.candidate_recipient_key != recipient_encryption_key
+        || preparation.observed_head
+            != dtx_identity_persistence::IdentityLogHead::observed(
+                identity_id,
+                pre_head_sequence,
+                pre_head_hash,
+            )
+            .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
+        || preparation.issued_at != issued_at
+        || preparation.expires_at != expires_at
+        || preparation.digest != preparation_digest
+    {
         return Err(DeviceEnrollmentFailure::InvalidRequest);
     }
     let response_capability_digest =

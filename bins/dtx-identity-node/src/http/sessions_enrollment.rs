@@ -16,15 +16,16 @@ use super::{
     HTTP_HISTORY_RECOVERY_REQUEST_V4_IDEMPOTENCY_KEY_HASH_DOMAIN, HeaderMap,
     HistoryRecoveryRequestV4Success, IDEMPOTENCY_KEY_HEADER, IdentityAppendOutcome,
     IdentityBootstrapState, IdentityId, IdentityLogHead, MAX_DEVICE_ENROLLMENT_CANDIDATE_BYTES,
-    MAX_DEVICE_ENROLLMENT_COMPLETION_BYTES, MAX_IDENTITY_BOOTSTRAP_EVENT_BYTES, Path, Request,
-    RequestId, Response, Sha256Digest, State, StatusCode, Zeroize, decode_base64url_32,
-    device_enrollment_approval_success_response, device_enrollment_challenge_success_response,
-    device_enrollment_failure_response, device_enrollment_status_response,
-    device_revoke_failure_response, device_revoke_success_response,
-    device_session_challenge_success_response, device_session_failure_response,
-    device_session_success_response, expected_device_revoke_head_hash, expected_genesis_hash,
-    fill_random, has_exact_content_type, has_exact_event_content_type, has_exact_json_content_type,
-    header, history_recovery_request_v4_success_response, idempotency_key_hash,
+    MAX_DEVICE_ENROLLMENT_COMPLETION_BYTES, MAX_IDENTITY_BOOTSTRAP_EVENT_BYTES, Path,
+    RecoveryResponseCapability, Request, RequestId, Response, Sha256Digest, State, StatusCode,
+    Zeroize, decode_base64url_32, device_enrollment_approval_success_response,
+    device_enrollment_challenge_success_response, device_enrollment_failure_response,
+    device_enrollment_status_response, device_revoke_failure_response,
+    device_revoke_success_response, device_session_challenge_success_response,
+    device_session_failure_response, device_session_success_response,
+    expected_device_revoke_head_hash, expected_genesis_hash, fill_random, has_exact_content_type,
+    has_exact_event_content_type, has_exact_header, has_exact_json_content_type, header,
+    history_recovery_request_v4_success_response, idempotency_key_hash,
     map_device_enrollment_persistence_error, map_device_revoke_persistence_error,
     map_device_session_persistence_error, parse_device_enrollment_candidate,
     parse_device_enrollment_completion, parse_device_enrollment_status_request,
@@ -157,8 +158,14 @@ impl IdentityBootstrapState {
         body: Body,
     ) -> Result<HistoryRecoveryRequestV4Success, DeviceEnrollmentFailure> {
         if !has_exact_content_type(headers, HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE)
+            || !has_exact_header(
+                headers,
+                header::ACCEPT,
+                super::HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
+            )
             || headers.contains_key(super::header::CONTENT_ENCODING)
             || headers.contains_key(super::header::AUTHORIZATION)
+            || headers.contains_key(super::header::IF_MATCH)
         {
             return Err(DeviceEnrollmentFailure::InvalidRequest);
         }
@@ -170,6 +177,8 @@ impl IdentityBootstrapState {
         let response_raw =
             parse_recovery_capability_header(headers, super::RECOVERY_RESPONSE_CAPABILITY_HEADER)
                 .map_err(|_| DeviceEnrollmentFailure::CapabilityRejected)?;
+        let response_capability = RecoveryResponseCapability::new(response_raw)
+            .map_err(|_| DeviceEnrollmentFailure::CapabilityRejected)?;
         let idempotency_digest = idempotency_key_hash(
             headers,
             HTTP_HISTORY_RECOVERY_REQUEST_V4_IDEMPOTENCY_KEY_HASH_DOMAIN,
@@ -178,7 +187,7 @@ impl IdentityBootstrapState {
         let bytes = to_bytes(body, 37_114)
             .await
             .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
-        let request = parse_history_recovery_request_v4(&bytes)?;
+        let request = parse_history_recovery_request_v4(&bytes, enrollment, &response_capability)?;
         if request.response_capability_digest
             != Sha256Digest::hash_domain(
                 b"dirextalk.recovery-response-capability.v1\0",
@@ -224,7 +233,6 @@ impl IdentityBootstrapState {
             .create_history_recovery_request_v4(&self.store, command, now)
             .await
             .map_err(|e| map_device_enrollment_persistence_error(&e))?;
-        drop(enrollment);
         Ok(HistoryRecoveryRequestV4Success {
             status: if created {
                 StatusCode::CREATED

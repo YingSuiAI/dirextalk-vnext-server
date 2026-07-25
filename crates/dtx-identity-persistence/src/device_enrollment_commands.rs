@@ -2,7 +2,7 @@ use std::fmt;
 
 use dtx_domain::{DeviceEnrollmentChallengeId, DeviceId, DeviceSessionId, IdentityId};
 use dtx_identity_log::{
-    DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1,
+    DeviceEncryptionPublicKey, DeviceStatusV1, IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1,
     IdentityLogEventV1,
 };
 use dtx_wire::{
@@ -18,6 +18,7 @@ use zeroize::Zeroize;
 use crate::device_session::DeviceSessionRepository;
 use crate::repository::{lock_and_load_active_snapshot, lock_identity};
 use crate::{
+    CatalogProviderResponseCommand, RECIPIENT_KEY_HASH_DOMAIN,
     DeviceSessionCredential, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead,
     IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
 };
