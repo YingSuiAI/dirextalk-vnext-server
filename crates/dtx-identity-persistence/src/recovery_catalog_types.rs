@@ -25,6 +25,8 @@ pub const CATALOG_CIPHERTEXT_HASH_DOMAIN: &[u8] =
 pub const CATALOG_HEAD_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-head-signature.v2\0";
 pub const CATALOG_HEAD_DIGEST_DOMAIN: &[u8] = b"dirextalk.recovery-scope-catalog-head.v2\0";
+pub const CATALOG_MERKLE_NODE_DOMAIN: &[u8] =
+    b"dirextalk.recovery-scope-catalog-node.v2\0";
 pub const PREPARATION_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-handoff-preparation-signature.v2\0";
 pub const PREPARATION_DIGEST_DOMAIN: &[u8] =
@@ -57,6 +59,26 @@ pub const MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES: usize =
     MAX_RECOVERY_SCOPE_CATALOG_CIPHERTEXT_BYTES
         + MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES
         + 1_024;
+
+/// Computes the duplicate-last binary Merkle root over ordered leaf digests.
+/// A single leaf is already the root; each internal node hashes the exact
+/// left/right 32-byte digests under the Catalog V2 node domain.
+pub fn catalog_merkle_root(leaves: &[Sha256Digest]) -> Option<Sha256Digest> {
+    leaves.first()?;
+    let mut level: Vec<[u8; 32]> = leaves.iter().map(|leaf| *leaf.as_bytes()).collect();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            let mut input = [0_u8; 64];
+            input[..32].copy_from_slice(&pair[0]);
+            input[32..].copy_from_slice(right);
+            next.push(*Sha256Digest::hash_domain(CATALOG_MERKLE_NODE_DOMAIN, &input).as_bytes());
+        }
+        level = next;
+    }
+    Some(Sha256Digest::from_bytes(level[0]))
+}
 
 /// Parsed exact signed Catalog V2 head coordinates reused by exhaustive
 /// recovery manifests. The head remains opaque on the wire, but every signed
@@ -882,7 +904,22 @@ fn validate_x25519_public_key(key: &[u8]) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_x25519_public_key;
+    use dtx_wire::Sha256Digest;
+
+    use super::{catalog_merkle_root, validate_x25519_public_key};
+
+    #[test]
+    fn catalog_merkle_root_is_ordered_and_duplicate_last() {
+        let a = Sha256Digest::from_bytes([1; 32]);
+        let b = Sha256Digest::from_bytes([2; 32]);
+        let c = Sha256Digest::from_bytes([3; 32]);
+        assert_eq!(catalog_merkle_root(&[a]), Some(a));
+        let ordered = catalog_merkle_root(&[a, b, c]).expect("non-empty Merkle root");
+        let reordered = catalog_merkle_root(&[a, c, b]).expect("non-empty Merkle root");
+        assert_ne!(ordered, reordered);
+        let duplicated = catalog_merkle_root(&[a, b, c, c]).expect("non-empty Merkle root");
+        assert_eq!(ordered, duplicated);
+    }
 
     #[test]
     fn x25519_validation_rejects_canonical_low_order_encodings_and_aliases() {

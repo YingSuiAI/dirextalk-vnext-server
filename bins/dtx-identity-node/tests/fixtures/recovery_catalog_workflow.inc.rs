@@ -913,8 +913,8 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
                 None,
                 None,
             ),
-            StatusCode::UNAUTHORIZED,
-            "DEVICE_ENROLLMENT_CAPABILITY_INVALID",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
         ),
         (
             "short idempotency key",
@@ -1144,8 +1144,8 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     .await?;
     assert_error(
         blocked,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "IDENTITY_SERVICE_UNAVAILABLE",
+        StatusCode::PRECONDITION_FAILED,
+        "CANDIDATE_KEY_CHANGED",
     )
     .await?;
     let blocked_rows: i64 = sqlx::query_scalar(
@@ -1437,6 +1437,49 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         )
         .await?;
     }
+    let substituted_leaf = history_recovery_request_v4_with_manifest_leaf_substitution(
+        &v4_request,
+        &candidate,
+        [32; 32],
+    )?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            request_idempotency,
+            enrollment_capability,
+            response_capability,
+            substituted_leaf,
+        )
+        .await?,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DEVICE_ENROLLMENT_INVALID",
+    )
+    .await?;
+    let uppercase_catalog_id = history_recovery_request_v4_with_manifest_tamper(
+        &v4_request,
+        &candidate,
+        3,
+        CanonicalValue::Text("0190f2a5-7b1c-7abc-8def-0123456789B1".into()),
+    )?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            request_idempotency,
+            enrollment_capability,
+            response_capability,
+            uppercase_catalog_id,
+        )
+        .await?,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DEVICE_ENROLLMENT_INVALID",
+    )
+    .await?;
+    assert_history_recovery_request_rows(
+        harness.admin_pool(),
+        challenge.challenge_id(),
+        1,
+    )
+    .await?;
     let changed_signed_request = history_recovery_request_v4_with_outer_tamper(
         &v4_request,
         &candidate,

@@ -10,7 +10,7 @@ use super::{
 use dtx_identity_log::{IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1, IdentityLogEventV1};
 use dtx_identity_persistence::{
     CatalogPreparationCommand, HISTORY_RECOVERY_REQUEST_V4_DIGEST_DOMAIN,
-    HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN, RecoveryResponseCapability,
+    HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN, RecoveryResponseCapability, catalog_merkle_root,
     parse_signed_catalog_head_v2,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -229,9 +229,7 @@ pub(crate) fn parse_history_recovery_request_v4(
         return Err(DeviceEnrollmentFailure::InvalidRequest);
     }
     let manifest_catalog_id = match cbor_field(manifest_fields, 3)? {
-        CanonicalValue::Text(value) => {
-            Uuid::parse_str(value).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
-        }
+        CanonicalValue::Text(value) => parse_uuid_v7_text(value)?,
         _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
     };
     let manifest_generation = match cbor_field(manifest_fields, 4)? {
@@ -262,6 +260,7 @@ pub(crate) fn parse_history_recovery_request_v4(
         return Err(DeviceEnrollmentFailure::InvalidRequest);
     }
     let mut seen = HashSet::with_capacity(leaf_set.len());
+    let mut leaf_digests = Vec::with_capacity(leaf_set.len());
     for leaf in leaf_set {
         let CanonicalValue::Bytes(bytes) = leaf else {
             return Err(DeviceEnrollmentFailure::InvalidRequest);
@@ -269,6 +268,12 @@ pub(crate) fn parse_history_recovery_request_v4(
         if bytes.len() != 32 || !seen.insert(bytes.as_slice()) {
             return Err(DeviceEnrollmentFailure::InvalidRequest);
         }
+        leaf_digests.push(Sha256Digest::from_bytes(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?,
+        ));
     }
     let leaf_set_bytes = encode_deterministic_cbor(cbor_field(manifest_fields, 10)?)
         .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
@@ -277,6 +282,7 @@ pub(crate) fn parse_history_recovery_request_v4(
         || manifest_catalog_id != signed_head.catalog_id
         || manifest_generation != signed_head.generation
         || signed_head_digest != signed_head.digest
+        || catalog_merkle_root(&leaf_digests) != Some(merkle_root)
         || merkle_root != signed_head.merkle_root
         || signed_head.identity_id != identity_id
         || manifest_catalog_id != preparation.catalog_id
@@ -371,6 +377,14 @@ fn parse_cbor_utc_nonnegative(
         }
         _ => Err(DeviceEnrollmentFailure::InvalidRequest),
     }
+}
+
+fn parse_uuid_v7_text(value: &str) -> Result<Uuid, DeviceEnrollmentFailure> {
+    let uuid = Uuid::parse_str(value).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    if uuid.to_string() != value || uuid.get_version_num() != 7 {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    Ok(uuid)
 }
 
 pub(crate) struct DeviceEnrollmentCompletionRequest {

@@ -756,6 +756,7 @@ fn validate_history_recovery_manifest_v2(
         return Err(IdentityPersistenceError::InvalidCommand("manifest leaf count"));
     }
     let mut seen = HashSet::with_capacity(leaf_set.len());
+    let mut leaf_digests = Vec::with_capacity(leaf_set.len());
     for leaf in leaf_set {
         let CanonicalValue::Bytes(value) = leaf else {
             return Err(IdentityPersistenceError::InvalidCommand("manifest leaf digest"));
@@ -763,6 +764,11 @@ fn validate_history_recovery_manifest_v2(
         if value.len() != 32 || !seen.insert(value.as_slice()) {
             return Err(IdentityPersistenceError::InvalidCommand("manifest leaf digest"));
         }
+        leaf_digests.push(Sha256Digest::from_bytes(
+            value.as_slice().try_into().map_err(|_| {
+                IdentityPersistenceError::InvalidCommand("manifest leaf digest")
+            })?,
+        ));
     }
     let leaf_set_bytes = encode_deterministic_cbor(&fields[9].1)
         .map_err(|_| IdentityPersistenceError::InvalidCommand("manifest leaf set"))?;
@@ -771,6 +777,7 @@ fn validate_history_recovery_manifest_v2(
         || catalog_id != head.catalog_id
         || generation != head.generation
         || head_digest != head.digest
+        || crate::catalog_merkle_root(&leaf_digests) != Some(merkle_root)
         || merkle_root != head.merkle_root
         || head.identity_id != command.identity_id
         || catalog_id != preparation.try_get::<uuid::Uuid, _>("catalog_id")?

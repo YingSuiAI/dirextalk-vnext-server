@@ -495,7 +495,7 @@ fn history_recovery_request_v4_body(
     response_capability: [u8; 32],
     idempotency: &str,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let leaves = CanonicalValue::Array(vec![CanonicalValue::Bytes(vec![0x91; 32])]);
+    let leaves = CanonicalValue::Array(vec![CanonicalValue::Bytes(vec![31; 32])]);
     let leaf_bytes = encode_deterministic_cbor(&leaves)?;
     let manifest = CanonicalValue::Map(vec![
         field(1, CanonicalValue::Unsigned(2)),
@@ -601,6 +601,39 @@ fn history_recovery_request_v4_with_manifest_tamper(
         return Err("V4 manifest must be a map".into());
     };
     manifest[field_index - 1].1 = replacement;
+    let manifest_value = CanonicalValue::Map(manifest);
+    let manifest_bytes = encode_deterministic_cbor(&manifest_value)?;
+    fields[14].1 = manifest_value;
+    fields[15].1 =
+        Sha256Digest::hash_domain(b"dirextalk.history-recovery.manifest.v2\0", &manifest_bytes)
+            .to_canonical_value();
+    resign_history_recovery_request_v4(CanonicalValue::Map(fields), candidate)
+}
+
+fn history_recovery_request_v4_with_manifest_leaf_substitution(
+    bytes: &[u8],
+    candidate: &SigningKey,
+    replacement: [u8; 32],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let CanonicalValue::Map(mut fields) = decode_deterministic_cbor(bytes)? else {
+        return Err("V4 request must be a map".into());
+    };
+    let CanonicalValue::Map(mut manifest) = fields[14].1.clone() else {
+        return Err("V4 manifest must be a map".into());
+    };
+    let CanonicalValue::Array(mut leaves) = manifest[9].1.clone() else {
+        return Err("V4 manifest leaves must be an array".into());
+    };
+    let Some(first) = leaves.first_mut() else {
+        return Err("V4 manifest leaves must be non-empty".into());
+    };
+    *first = CanonicalValue::Bytes(replacement.to_vec());
+    let leaf_set = CanonicalValue::Array(leaves);
+    let leaf_set_bytes = encode_deterministic_cbor(&leaf_set)?;
+    manifest[8].1 =
+        Sha256Digest::hash_domain(b"dirextalk.history-recovery.leaf-set.v2\0", &leaf_set_bytes)
+            .to_canonical_value();
+    manifest[9].1 = leaf_set;
     let manifest_value = CanonicalValue::Map(manifest);
     let manifest_bytes = encode_deterministic_cbor(&manifest_value)?;
     fields[14].1 = manifest_value;
