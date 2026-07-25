@@ -403,16 +403,6 @@ impl crate::MailboxRepository {
                 }
                 return Ok(MailboxOperationOutcome::new(receipt, true));
             }
-            let (expired_count, expired_bytes) =
-                expire_available(tx.connection(), command.mailbox_id, now).await?;
-            mailbox.active_envelope_count = mailbox
-                .active_envelope_count
-                .checked_sub(expired_count)
-                .ok_or(MailboxPersistenceError::CorruptData("mailbox envelope count"))?;
-            mailbox.active_envelope_bytes = mailbox
-                .active_envelope_bytes
-                .checked_sub(expired_bytes)
-                .ok_or(MailboxPersistenceError::CorruptData("mailbox envelope bytes"))?;
             if command.issued_at > now
                 || command.offer_issued_at > now
                 || now >= command.expires_at
@@ -558,6 +548,18 @@ impl crate::MailboxRepository {
             verify(provider_key, GRANT_SIGNATURE_DOMAIN, &unsigned, command.provider_signature)?;
             verify(authority_key, AUTHORITY_SIGNATURE_DOMAIN, &unsigned, command.authority_signature)?;
             if command.recipient_key_digest != Sha256Digest::hash_domain(RECIPIENT_KEY_DOMAIN, &command.candidate_recipient_key) { return Err(MailboxPersistenceError::DeviceAuthenticationRejected); }
+            // Expiration is the first durable mutation. All currentness,
+            // persisted Ready evidence, and both signatures have succeeded.
+            let (expired_count, expired_bytes) =
+                expire_available(tx.connection(), command.mailbox_id, now).await?;
+            mailbox.active_envelope_count = mailbox
+                .active_envelope_count
+                .checked_sub(expired_count)
+                .ok_or(MailboxPersistenceError::CorruptData("mailbox envelope count"))?;
+            mailbox.active_envelope_bytes = mailbox
+                .active_envelope_bytes
+                .checked_sub(expired_bytes)
+                .ok_or(MailboxPersistenceError::CorruptData("mailbox envelope bytes"))?;
             if command.mailbox_highwater.get() != mailbox.next_delivery_sequence as u64 { return Err(MailboxPersistenceError::MailboxConflict); }
             let offer_len = i64::try_from(command.exact_offer.len())
                 .map_err(|_| MailboxPersistenceError::CapacityExceeded)?;
