@@ -5,7 +5,8 @@ use super::{
     to_bytes,
 };
 use dtx_identity_persistence::{
-    CompletionSignerMetadata, HistoryRecoveryCompletionCommand, is_canonical_https_origin,
+    CompletionKeyDescriptor, CompletionSignerMetadata, HistoryRecoveryCompletionCommand,
+    is_canonical_https_origin,
 };
 use dtx_wire::Sha256Digest;
 
@@ -142,17 +143,11 @@ pub(crate) async fn complete_history_recovery(
         expires_at: config.expires_at,
         previous_descriptor_digest: config.previous_descriptor_digest,
     };
-    let descriptor = match state
-        .completion
-        .ensure_descriptor(
-            &state.store,
-            &state.public_origin,
-            metadata,
-            &config.signing_key,
-            now,
-        )
-        .await
-    {
+    let descriptor = match CompletionKeyDescriptor::from_signer(
+        metadata,
+        &state.public_origin,
+        &config.signing_key,
+    ) {
         Ok(v) => v,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };

@@ -24,6 +24,8 @@ pub const COMPLETION_RECEIPT_SIGNATURE_DOMAIN: &[u8] =
 const COMPLETION_DESCRIPTOR_HEAD_LOCK_DOMAIN: &str =
     "dirextalk.history-recovery.completion-descriptor-head.v2";
 const COMPLETION_REQUEST_LOCK_DOMAIN: &str = "dirextalk.history-recovery.completion-request.v2";
+const COMPLETION_IDEMPOTENCY_LOCK_DOMAIN: &str =
+    "dirextalk.history-recovery.completion-idempotency.v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletionKeyDescriptor {
@@ -50,6 +52,24 @@ pub struct CompletionSignerMetadata {
 }
 
 impl CompletionKeyDescriptor {
+    fn origin(&self) -> Result<String, IdentityPersistenceError> {
+        let value = dtx_wire::decode_deterministic_cbor(&self.exact_bytes)
+            .map_err(|_| IdentityPersistenceError::CorruptData("completion descriptor"))?;
+        let fields = numbered(&value, 10)?;
+        text_field(&fields[1])
+    }
+
+    fn signer_metadata(&self) -> CompletionSignerMetadata {
+        CompletionSignerMetadata {
+            key_id: self.key_id,
+            epoch: self.epoch,
+            rollback_floor_epoch: self.rollback_floor_epoch,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+            previous_descriptor_digest: self.previous_descriptor_digest,
+        }
+    }
+
     pub fn from_signer(
         metadata: CompletionSignerMetadata,
         origin: &str,
@@ -357,6 +377,29 @@ impl HistoryRecoveryCompletionCommand {
             || digest_field(&request_fields[9])? != final_head_hash
             || digest_field(&request_fields[13])? != preparation_digest
             || digest_field(&request_fields[15])? != manifest_digest
+            || fixed32(&request_fields[5])? == [0; 32]
+            || uint_field(&request_fields[16])? > issued_at.get() as u64
+            || uint_field(&request_fields[17])? < expires_at.get() as u64
+        {
+            return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
+        }
+        let preparation_value = dtx_wire::decode_deterministic_cbor(&preparation)
+            .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+        let preparation_fields = numbered(&preparation_value, 17)?;
+        if uint_field(&preparation_fields[0])? != 2
+            || uuid_field(&preparation_fields[1])? != uuid_from_request(&request)?
+            || text_field(&preparation_fields[2])? != identity_id
+            || uuid_field(&preparation_fields[3])? != catalog_id
+            || uint_field(&preparation_fields[4])? != catalog_generation
+            || digest_field(&preparation_fields[5])? != catalog_head_digest
+            || uuid_field(&preparation_fields[6])? != device_id
+            || fixed32(&preparation_fields[7])? != candidate_key
+            || fixed32(&preparation_fields[8])? != fixed32(&request_fields[5])?
+            || uint_field(&preparation_fields[9])? != highwater
+            || digest_field(&preparation_fields[10])? != head_at_highwater
+            || digest_field(&preparation_fields[12])? != digest_field(&request_fields[18])?
+            || uint_field(&preparation_fields[14])? > issued_at.get() as u64
+            || uint_field(&preparation_fields[15])? < expires_at.get() as u64
         {
             return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
         }
@@ -376,9 +419,83 @@ impl HistoryRecoveryCompletionCommand {
         )?;
         let head = recovery_protocol::validate_catalog_head_v2(&head_bytes)
             .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+        if text_field(&manifest_fields[1])? != identity_id
+            || uuid_field(&manifest_fields[2])? != catalog_id
+            || uint_field(&manifest_fields[3])? != catalog_generation
+            || digest_field(&manifest_fields[5])? != catalog_head_digest
+            || digest_field(&manifest_fields[6])? != catalog_root_digest
+            || uint_field(&manifest_fields[7])? != catalog_leaf_count
+            || digest_field(&manifest_fields[8])? != leaf_set_digest
+            || head_bytes != catalog_head
+            || head.catalog_id() != catalog_id
+            || head.generation() != catalog_generation
+            || head.digest() != catalog_head_digest
+            || head.merkle_root() != catalog_root_digest
+            || head.leaf_count() != catalog_leaf_count
+            || head.identity_id().to_string() != identity_id
+        {
+            return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
+        }
         let grant_value = dtx_wire::decode_deterministic_cbor(&grant)
             .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
         let grant_fields = numbered(&grant_value, 36)?;
+        let offer_value = dtx_wire::decode_deterministic_cbor(&offer)
+            .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+        let offer_fields = numbered(&offer_value, 16)?;
+        let delivery_value = dtx_wire::decode_deterministic_cbor(&delivery)
+            .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+        let delivery_fields = numbered(&delivery_value, 12)?;
+        if text_field(&grant_fields[1])? != identity_id
+            || uuid_field(&grant_fields[2])? != uuid_from_request(&request)?
+            || digest_field(&grant_fields[3])? != request_digest
+            || digest_field(&grant_fields[4])? != manifest_digest
+            || uuid_field(&grant_fields[5])? != catalog_id
+            || uint_field(&grant_fields[6])? != catalog_generation
+            || bytes_field(&grant_fields[7], recovery_protocol::MAX_CATALOG_HEAD_BYTES)?
+                != catalog_head
+            || digest_field(&grant_fields[8])? != catalog_head_digest
+            || digest_field(&grant_fields[9])? != catalog_root_digest
+            || uint_field(&grant_fields[10])? != catalog_leaf_count
+            || digest_field(&grant_fields[11])? != leaf_set_digest
+            || uuid_field(&grant_fields[12])? != device_id
+            || fixed32(&grant_fields[13])? != candidate_key
+            || fixed32(&grant_fields[14])? != fixed32(&request_fields[5])?
+            || uint_field(&grant_fields[15])? != highwater
+            || digest_field(&grant_fields[16])? != head_at_highwater
+            || uint_field(&grant_fields[17])? != highwater_next
+            || digest_field(&grant_fields[18])? != final_head_hash
+            || digest_field(&grant_fields[19])? != digest_field(&request_fields[11])?
+            || digest_field(&grant_fields[20])? != preparation_digest
+            || digest_field(&grant_fields[24])? != offer_digest
+            || uuid_field(&grant_fields[29])? != uuid_field(&delivery_fields[1])?
+            || uint_field(&grant_fields[30])? > issued_at.get() as u64
+            || uint_field(&grant_fields[31])? < expires_at.get() as u64
+            || uint_field(&offer_fields[0])? != 3
+            || uuid_field(&offer_fields[1])? != uuid_from_request(&request)?
+            || digest_field(&offer_fields[2])? != request_digest
+            || digest_field(&offer_fields[3])? != manifest_digest
+            || uuid_field(&offer_fields[4])? != catalog_id
+            || uint_field(&offer_fields[5])? != catalog_generation
+            || digest_field(&offer_fields[6])? != catalog_head_digest
+            || digest_field(&offer_fields[7])? != leaf_set_digest
+            || digest_field(&offer_fields[14])? != digest_field(&grant_fields[23])?
+            || uint_field(&offer_fields[12])? > issued_at.get() as u64
+            || uint_field(&offer_fields[13])? < expires_at.get() as u64
+            || digest_field(&offer_fields[15])?
+                != recovery_protocol::validate_offer_v3(&offer)
+                    .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?
+                    .provider_response_digest()
+            || uint_field(&delivery_fields[0])? != 2
+            || uuid_field(&delivery_fields[2])? != uuid_field(&grant_fields[25])?
+            || uuid_field(&delivery_fields[3])? != uuid_field(&grant_fields[26])?
+            || uint_field(&delivery_fields[4])? != uint_field(&grant_fields[28])?
+            || digest_field(&delivery_fields[5])? != grant_digest
+            || digest_field(&delivery_fields[6])? != offer_digest
+            || uuid_field(&delivery_fields[7])? != uuid_from_request(&request)?
+            || uuid_field(&delivery_fields[8])? != device_id
+        {
+            return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
+        }
         let context_digest = digest_field(&fields[34])?;
         for (offset, entry) in entries.iter().enumerate() {
             let index = (offset + 1) as u64;
@@ -628,6 +745,12 @@ impl HistoryRecoveryCompletionRepository {
         let result = async {
             let authenticated = crate::DeviceSessionRepository::authenticate_with_signing_key_in_transaction(tx.connection(), credential, now).await?;
             if authenticated.session().identity_id().to_string() != command.identity_id || authenticated.session().device_id().as_uuid() != &command.device_id || authenticated.signing_key().as_bytes() != &command.candidate_signing_key { return Err(IdentityPersistenceError::DeviceAuthenticationRejected); }
+            completion_advisory_lock(
+                tx.connection(),
+                COMPLETION_IDEMPOTENCY_LOCK_DOMAIN,
+                &format!("{}:{}", authenticated.session().identity_id(), command.idempotency_digest),
+            )
+            .await?;
             if let Some(row) = sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND completion_id=$2").bind(&command.identity_id).bind(command.completion_id).fetch_optional(&mut *tx.connection()).await? {
                 let bytes: Vec<u8> = row.try_get("receipt_bytes")?; if row.try_get::<Vec<u8>,_>("completion_digest")? != Sha256Digest::hash_domain(b"dirextalk.history-recovery.completion-command.v2\0", &command.exact_bytes).as_bytes() { return Err(IdentityPersistenceError::IdempotencyConflict); } return Ok(CompletionReceiptOutcome { created:false, receipt_bytes:bytes });
             }
@@ -640,7 +763,6 @@ impl HistoryRecoveryCompletionRepository {
                 return Ok(CompletionReceiptOutcome { created:false, receipt_bytes:row.try_get("receipt_bytes")? });
             }
             if command.issued_at > now || now >= command.expires_at { return Err(IdentityPersistenceError::RecoveryCompletionExpired); }
-            if now < descriptor.issued_at || now >= descriptor.expires_at || command.issued_at < descriptor.issued_at || command.expires_at > descriptor.expires_at { return Err(IdentityPersistenceError::RecoveryCompletionExpired); }
             // Serialize terminal consumption on the immutable candidate request. The
             // completion uniqueness fence below remains authoritative, but the
             // transaction-scoped advisory lock lets the runtime role retain only
@@ -651,8 +773,13 @@ impl HistoryRecoveryCompletionRepository {
                 &format!("{}:{}", authenticated.session().identity_id(), command.request_id),
             )
             .await?;
-            let request = sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,request_digest,manifest_digest,preparation_digest,post_head_hash,post_head_sequence,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1").bind(command.request_id).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::RecoveryCompletionInvalid)?;
-            if request.try_get::<String,_>("identity_id")? != command.identity_id || request.try_get::<Uuid,_>("candidate_device_id")? != command.device_id || request.try_get::<Vec<u8>,_>("candidate_signing_key")? != command.candidate_signing_key || request.try_get::<Vec<u8>,_>("request_digest")? != command.request_digest.as_bytes() || request.try_get::<Vec<u8>,_>("manifest_digest")? != command.manifest_digest.as_bytes() || request.try_get::<Vec<u8>,_>("preparation_digest")? != command.preparation_digest.as_bytes() || request.try_get::<Vec<u8>,_>("post_head_hash")? != command.final_head_hash.as_bytes() || request.try_get::<i64,_>("post_head_sequence")? as u64 != command.highwater_next || request.try_get::<i64,_>("expires_at_ms")? <= now.get() { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
+            let request_bytes = extract_bytes(&command.exact_bytes, 18)?;
+            let request_value = dtx_wire::decode_deterministic_cbor(&request_bytes)
+                .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+            let request_fields = numbered(&request_value, 21)?;
+            let request_recipient_key = fixed32(&request_fields[5])?;
+            let request = sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,request_digest,manifest_digest,preparation_digest,post_head_hash,post_head_sequence,issued_at_ms,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1").bind(command.request_id).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::RecoveryCompletionInvalid)?;
+            if request.try_get::<String,_>("identity_id")? != command.identity_id || request.try_get::<Uuid,_>("candidate_device_id")? != command.device_id || request.try_get::<Vec<u8>,_>("candidate_signing_key")? != command.candidate_signing_key || request.try_get::<Vec<u8>,_>("candidate_recipient_key")? != request_recipient_key || request.try_get::<Vec<u8>,_>("request_digest")? != command.request_digest.as_bytes() || request.try_get::<Vec<u8>,_>("manifest_digest")? != command.manifest_digest.as_bytes() || request.try_get::<Vec<u8>,_>("preparation_digest")? != command.preparation_digest.as_bytes() || request.try_get::<Vec<u8>,_>("post_head_hash")? != command.final_head_hash.as_bytes() || request.try_get::<i64,_>("post_head_sequence")? as u64 != command.highwater_next || request.try_get::<i64,_>("issued_at_ms")? > command.issued_at.get() || request.try_get::<i64,_>("expires_at_ms")? < command.expires_at.get() || request.try_get::<i64,_>("expires_at_ms")? <= now.get() { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
             // A competing transaction may have committed while this request row was
             // waiting for its lock. Re-read the terminal fence after the lock so the
             // same request+grant pair is an exact replay, never a second receipt.
@@ -667,6 +794,16 @@ impl HistoryRecoveryCompletionRepository {
             if uint_field(&delivery_fields[0])? != 2 || uuid_field(&delivery_fields[2])? != uuid_field(&grant_fields[25])? || uuid_field(&delivery_fields[3])? != uuid_field(&grant_fields[26])? || uint_field(&delivery_fields[4])? != uint_field(&grant_fields[28])? || digest_field(&delivery_fields[5])? != command.grant_digest || digest_field(&delivery_fields[6])? != command.offer_digest || uuid_field(&delivery_fields[7])? != command.request_id || uuid_field(&delivery_fields[8])? != command.device_id || uint_field(&delivery_fields[9])? < uint_field(&grant_fields[30])? || uint_field(&delivery_fields[9])? > uint_field(&grant_fields[31])? { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
             let offer_value = dtx_wire::decode_deterministic_cbor(&extract_bytes(&command.exact_bytes,24)?).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?; let offer_fields = numbered(&offer_value,16)?;
             if uint_field(&offer_fields[0])? != 3 || uuid_field(&offer_fields[1])? != command.request_id || digest_field(&offer_fields[2])? != command.request_digest || digest_field(&offer_fields[3])? != command.manifest_digest || uuid_field(&offer_fields[4])? != command.catalog_id || uint_field(&offer_fields[5])? != command.catalog_generation || digest_field(&offer_fields[6])? != command.catalog_head_digest || digest_field(&offer_fields[7])? != command.leaf_set_digest { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
+            let descriptor = self
+                .ensure_descriptor_tx(
+                    tx.connection(),
+                    &descriptor.origin()?,
+                    descriptor.signer_metadata(),
+                    signing_key,
+                    now,
+                )
+                .await?;
+            if now < descriptor.issued_at || now >= descriptor.expires_at || command.issued_at < descriptor.issued_at || command.expires_at > descriptor.expires_at { return Err(IdentityPersistenceError::RecoveryCompletionExpired); }
             let context_digest = digest_field(&extract_value(&command.exact_bytes,35)?)?;
             let ack = CanonicalValue::Map(vec![(k(1),u(2)),(k(2),CanonicalValue::Text(command.completion_id.to_string())),(k(3),CanonicalValue::Text(command.request_id.to_string())),(k(4),CanonicalValue::Text(delivery_fact_id.to_string())),(k(5),command.delivery_digest.to_canonical_value()),(k(6),command.offer_digest.to_canonical_value()),(k(7),context_digest.to_canonical_value()),(k(8),accepted_at.to_canonical_value())]);
             let ack_bytes=encode_deterministic_cbor(&ack).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?; let complete=CanonicalValue::Map(vec![(k(1),u(2)),(k(2),CanonicalValue::Text(command.identity_id.clone())),(k(3),CanonicalValue::Text(command.completion_id.to_string())),(k(4),CanonicalValue::Text(command.request_id.to_string())),(k(5),CanonicalValue::Text(command.device_id.to_string())),(k(6),command.request_digest.to_canonical_value()),(k(7),context_digest.to_canonical_value()),(k(8),u(command.catalog_leaf_count)),(k(9),command.entry_root.to_canonical_value()),(k(10),accepted_at.to_canonical_value()),(k(11),u(1))]); let complete_bytes=encode_deterministic_cbor(&complete).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?;

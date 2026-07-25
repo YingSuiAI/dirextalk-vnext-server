@@ -2449,11 +2449,12 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     };
     let request_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.request.v4\0", &request);
     let manifest_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.manifest.v2\0", &manifest);
+    let device_add_digest = Sha256Digest::hash_domain(history_testkit::IDENTITY_DEVICE_ADD_DOMAIN, &candidate_add.to_deterministic_cbor()?);
     let request_id_uuid: Uuid = request_id.into();
     let request_challenge_id = request_id;
     let request_id = request_id_uuid;
     let request_value = sqlx::query("INSERT INTO identity.history_recovery_requests(request_id,identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_bytes,device_add_digest,preparation_bytes,preparation_digest,manifest_bytes,manifest_digest,issued_at_ms,expires_at_ms,response_capability_digest,idempotency_digest,candidate_signature,request_bytes,request_digest,receipt_bytes,accepted_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)")
-        .bind(request_id).bind(identity.to_string()).bind(*candidate_device.as_uuid()).bind(candidate.verifying_key().to_bytes().to_vec()).bind(vec![51_u8;32]).bind(head1.sequence().get() as i64).bind(head1.hash().as_bytes().to_vec()).bind(head2.sequence().get() as i64).bind(head2.hash().as_bytes().to_vec()).bind(candidate_add.to_deterministic_cbor()?).bind(vec![53_u8;32]).bind(&preparation).bind(Sha256Digest::hash_domain(history_testkit::PREPARATION_DIGEST_DOMAIN,&preparation).as_bytes().to_vec()).bind(&manifest).bind(manifest_digest.as_bytes().to_vec()).bind(2_500_i64).bind(250_000_i64).bind(vec![52_u8;32]).bind(vec![54_u8;32]).bind(vec![0_u8;64]).bind(&request).bind(request_digest.as_bytes().to_vec()).bind(vec![1_u8]).bind(2_500_i64).execute(harness.identity_runtime_pool()).await?;
+        .bind(request_id).bind(identity.to_string()).bind(*candidate_device.as_uuid()).bind(candidate.verifying_key().to_bytes().to_vec()).bind(vec![51_u8;32]).bind(head1.sequence().get() as i64).bind(head1.hash().as_bytes().to_vec()).bind(head2.sequence().get() as i64).bind(head2.hash().as_bytes().to_vec()).bind(candidate_add.to_deterministic_cbor()?).bind(device_add_digest.as_bytes().to_vec()).bind(&preparation).bind(Sha256Digest::hash_domain(history_testkit::PREPARATION_DIGEST_DOMAIN,&preparation).as_bytes().to_vec()).bind(&manifest).bind(manifest_digest.as_bytes().to_vec()).bind(2_500_i64).bind(250_000_i64).bind(vec![52_u8;32]).bind(vec![54_u8;32]).bind(vec![0_u8;64]).bind(&request).bind(request_digest.as_bytes().to_vec()).bind(vec![1_u8]).bind(2_500_i64).execute(harness.identity_runtime_pool()).await?;
     assert_eq!(request_value.rows_affected(), 1);
 
     let offer = history_testkit::offer_v3(request_challenge_id, *request_digest.as_bytes(), *manifest_digest.as_bytes(), catalog_id, 1, *catalog_head_digest.as_bytes(), leaf_set_digest, [32;32], *Sha256Digest::hash_domain(b"dirextalk.recovery-recipient-key.v1\0", &[51;32]).as_bytes(), b"opaque-offer", [61;32], 2_500, 250_000);
@@ -2464,7 +2465,7 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     let authority = key(105);
     let provider_descriptor = CanonicalValue::Map(vec![field(1, CanonicalValue::Unsigned(2)), field(2, CanonicalValue::Text(Uuid::now_v7().to_string())), field(3, public(&provider).to_canonical_value())]);
     let authority_descriptor = CanonicalValue::Map(vec![field(1, CanonicalValue::Unsigned(1)), field(2, CanonicalValue::Text(Uuid::now_v7().to_string())), field(3, public(&authority).to_canonical_value())]);
-    let grant = history_testkit::grant_v5(identity, request_challenge_id, *request_digest.as_bytes(), *manifest_digest.as_bytes(), catalog_id, 1, &catalog_head, *catalog_head_digest.as_bytes(), *leaf_digest.as_bytes(), 1, leaf_set_digest, candidate_device, &candidate, [51;32], head1.sequence().get(), *head1.hash().as_bytes(), head2.sequence().get(), *head2.hash().as_bytes(), [53;32], *Sha256Digest::hash_domain(history_testkit::PREPARATION_DIGEST_DOMAIN,&preparation).as_bytes(), provider_descriptor, authority_descriptor, mailbox_id, envelope_id, 0, delivery_fact_id, 2_500, 250_000, &provider, &authority, &offer, [54;32], 2_500, 250_000);
+    let grant = history_testkit::grant_v5(identity, request_challenge_id, *request_digest.as_bytes(), *manifest_digest.as_bytes(), catalog_id, 1, &catalog_head, *catalog_head_digest.as_bytes(), *leaf_digest.as_bytes(), 1, leaf_set_digest, candidate_device, &candidate, [51;32], head1.sequence().get(), *head1.hash().as_bytes(), head2.sequence().get(), *head2.hash().as_bytes(), *device_add_digest.as_bytes(), *Sha256Digest::hash_domain(history_testkit::PREPARATION_DIGEST_DOMAIN,&preparation).as_bytes(), provider_descriptor, authority_descriptor, mailbox_id, envelope_id, 0, delivery_fact_id, 2_500, 250_000, &provider, &authority, &offer, [54;32], 2_500, 250_000);
     let grant_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.grant.v5\0", &grant);
     let offer_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.recipient-offer.v3\0", &offer);
     let delivery = history_testkit::delivery_v2(delivery_fact_id, mailbox_id, envelope_id, 1, *grant_digest.as_bytes(), *offer_digest.as_bytes(), request_id, *candidate_device.as_uuid(), 3_000, Uuid::now_v7(), Uuid::now_v7());
@@ -2513,23 +2514,22 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     )
     .expect("completion fixture parses");
     let config = CompletionSignerConfig { key_id: Uuid::now_v7(), epoch: 1, rollback_floor_epoch: 1, issued_at: at(2_000), expires_at: at(9_000), previous_descriptor_digest: None, signing_key: signer };
-    let descriptor1 = dtx_identity_persistence::HistoryRecoveryCompletionRepository
-        .ensure_descriptor(
-            &store,
-            AUDIENCE,
-            dtx_identity_persistence::CompletionSignerMetadata {
-                key_id: config.key_id,
-                epoch: config.epoch,
-                rollback_floor_epoch: config.rollback_floor_epoch,
-                issued_at: config.issued_at,
-                expires_at: config.expires_at,
-                previous_descriptor_digest: config.previous_descriptor_digest,
-            },
-            &config.signing_key,
-            at(5_000),
-        )
-        .await?;
+    let descriptor1 = dtx_identity_persistence::CompletionKeyDescriptor::from_signer(
+        dtx_identity_persistence::CompletionSignerMetadata {
+            key_id: config.key_id,
+            epoch: config.epoch,
+            rollback_floor_epoch: config.rollback_floor_epoch,
+            issued_at: config.issued_at,
+            expires_at: config.expires_at,
+            previous_descriptor_digest: config.previous_descriptor_digest,
+        },
+        AUDIENCE,
+        &config.signing_key,
+    )?;
     let app = identity_bootstrap_router_with_state(IdentityBootstrapState::with_clock_and_device_session_audience(store.clone(), clock.clone(), AUDIENCE).with_completion_signer_config(config.clone())?);
+    let invalid = app.clone().oneshot(Request::builder().method("POST").uri(HISTORY_RECOVERY_COMPLETION_PATH.replace("{completion_id}", &completion_id.to_string())).header(header::CONTENT_TYPE, HISTORY_RECOVERY_COMPLETION_CONTENT_TYPE).header("idempotency-key", "completion-invalid").header(header::AUTHORIZATION, super::authorization(&candidate_session)).body(Body::from(vec![0_u8]))?).await?;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(dtx_identity_persistence::HistoryRecoveryCompletionRepository.current_descriptor(&store).await?.is_none());
     let current_descriptor = app.clone().oneshot(Request::builder().method("GET").uri(HISTORY_RECOVERY_COMPLETION_KEY_PATH).body(Body::empty())?).await?;
     assert_eq!(current_descriptor.status(), StatusCode::OK);
     assert_eq!(to_bytes(current_descriptor.into_body(), 16_384).await?.as_ref(), descriptor1.exact_bytes.as_slice());
