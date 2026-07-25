@@ -3058,7 +3058,19 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
     .await?;
     let (issuer, ca_der) = certificate_issuer(now())?;
     let index = Arc::new(ConnectorCredentialAuthorizationIndex::new());
-    let app = Arc::new(application(store.clone(), issuer, index.clone()));
+    let server_pin_a = RouteHealthKeyId::new();
+    let server_public_a = [0x3a; 32];
+    let server_digest_a = ControlDigest::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-route-health-public-key.v1\0",
+            &server_public_a,
+        )
+        .as_bytes(),
+    );
+    let app = Arc::new(
+        application(store.clone(), issuer, index.clone())
+            .with_route_health_receipt_pin(server_pin_a, server_public_a),
+    );
     let enrollment = app
         .create_enrollment_intent(CreateConnectorEnrollmentRequest::new(
             tenant_id,
@@ -3173,8 +3185,8 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
             ),
             route_health_key_id: Some(key_id),
             route_health_public_key: Some(public_key),
-            server_receipt_key_id: None,
-            server_receipt_public_key: None,
+            server_receipt_key_id: Some(server_pin_a),
+            server_receipt_public_key: Some(Ed25519PublicKey::try_from(server_public_a)?),
         },
     )
     .await?;
@@ -3183,32 +3195,32 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
     let sealed = vec![0xa3; 256];
     let sealed_digest =
         Sha256Digest::hash_domain(b"dirextalk.agent-route-bootstrap-capsule.v1\0", &sealed);
-    assert_eq!(
-        owner_agent_route_bootstrap_delivery(
-            router.clone(),
-            &format!("/v1/agent-route-bootstraps/{bootstrap_id}/deliveries/{delivery_id}"),
-            &owner_authorization,
-            agent_route_bootstrap_delivery_body(
-                bootstrap_id,
-                delivery_id,
-                tenant_id,
-                installation_id,
-                binding_id,
-                agent_device_id,
-                owner_id,
-                owner_device_id,
-                recipient_id,
-                route_id,
-                sealed_digest,
-                sealed,
-                now() + 300_000,
-                &owner_device_key,
-            )?,
-        )
-        .await?
-        .0,
-        StatusCode::CREATED
-    );
+    let delivery_request_body = agent_route_bootstrap_delivery_body_v2(
+        bootstrap_id,
+        delivery_id,
+        tenant_id,
+        installation_id,
+        binding_id,
+        agent_device_id,
+        owner_id,
+        owner_device_id,
+        recipient_id,
+        route_id,
+        sealed_digest,
+        sealed.clone(),
+        now() + 300_000,
+        &owner_device_key,
+        server_pin_a,
+        Sha256Digest::from_bytes(server_digest_a.as_bytes()),
+    )?;
+    let delivery_response = owner_agent_route_bootstrap_delivery(
+        router.clone(),
+        &format!("/v1/agent-route-bootstraps/{bootstrap_id}/deliveries/{delivery_id}"),
+        &owner_authorization,
+        delivery_request_body,
+    )
+    .await?;
+    assert_eq!(delivery_response.0, StatusCode::CREATED);
     let deliver = app.poll_commands(
         authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
         fence, prepare.sequence(),
@@ -3254,8 +3266,8 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
         ),
         route_health_key_id: Some(key_id),
         route_health_public_key_digest: Some(health_digest),
-        server_receipt_key_id: None,
-        server_receipt_public_key_digest: None,
+        server_receipt_key_id: Some(server_pin_a),
+        server_receipt_public_key_digest: Some(server_digest_a),
     };
     app.reject_agent_route_bootstrap(
         authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
@@ -3296,12 +3308,139 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
         .bind(Uuid::from(tenant_id)).bind(owner_id.to_string()).bind(Uuid::from(owner_device_id)).bind(Uuid::from(installation_id)).bind(Uuid::from(binding_id)).bind(Uuid::from(agent_device_id)).fetch_one(head_after.connection()).await?;
     assert_eq!(head_count_after, 0);
     head_after.rollback().await?;
-    let mut mismatch = rejected;
+    let mut mismatch = rejected.clone();
     mismatch.route_health_public_key_digest = Some(ControlDigest::from_bytes([0xa4; 32]));
     assert_eq!(
         app.reject_agent_route_bootstrap(
-            authenticate_at(index, &ca_der, &completion.credential, auth_time)?,
+            authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
             mismatch,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict)
+    );
+
+    let mut pin_session = store.begin_tenant(tenant_id).await?;
+    let stored_pin: (Uuid, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT server_receipt_key_id, server_receipt_public_key,
+                server_receipt_public_key_digest
+           FROM agent.agent_route_bootstraps
+          WHERE tenant_id=$1 AND bootstrap_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(bootstrap_id))
+    .fetch_one(pin_session.connection())
+    .await?;
+    assert_eq!(stored_pin.0, Uuid::from(server_pin_a));
+    assert_eq!(stored_pin.1, server_public_a);
+    assert_eq!(stored_pin.2, server_digest_a.as_bytes());
+    pin_session.rollback().await?;
+
+    let old_receipt = owner_get(
+        router.clone(),
+        &format!("/v1/agent-route-bootstraps/{bootstrap_id}"),
+        &owner_authorization,
+    )
+    .await?;
+    assert_eq!(old_receipt.0, StatusCode::OK);
+    assert!(
+        old_receipt
+            .1
+            .windows(server_pin_a.to_string().len())
+            .any(|window| { window == server_pin_a.to_string().as_bytes() })
+    );
+
+    let server_pin_b = RouteHealthKeyId::new();
+    let server_public_b = [0x3b; 32];
+    let server_digest_b = ControlDigest::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-route-health-public-key.v1\0",
+            &server_public_b,
+        )
+        .as_bytes(),
+    );
+    let mut rotation_tx = harness.admin_pool().begin().await?;
+    sqlx::query("ALTER TABLE agent.connector_control_credentials DISABLE TRIGGER USER")
+        .execute(&mut *rotation_tx)
+        .await?;
+    sqlx::query(
+        "UPDATE agent.connector_control_credentials
+            SET route_health_receipt_key_id = $3,
+                route_health_receipt_public_key = $4
+          WHERE tenant_id = $1 AND connector_id = $2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(connector.connector_id()))
+    .bind(Uuid::from(server_pin_b))
+    .bind(server_public_b.to_vec())
+    .execute(&mut *rotation_tx)
+    .await?;
+    sqlx::query("ALTER TABLE agent.connector_control_credentials ENABLE TRIGGER USER")
+        .execute(&mut *rotation_tx)
+        .await?;
+    rotation_tx.commit().await?;
+
+    let old_receipt_after_rotation = owner_get(
+        router.clone(),
+        &format!("/v1/agent-route-bootstraps/{bootstrap_id}"),
+        &owner_authorization,
+    )
+    .await?;
+    assert_eq!(old_receipt_after_rotation.0, StatusCode::OK);
+    assert_eq!(old_receipt_after_rotation.1, old_receipt.1);
+
+    let (restart_issuer, _) = certificate_issuer(now())?;
+    let restarted_app = Arc::new(
+        application(store.clone(), restart_issuer, index.clone())
+            .with_route_health_receipt_pin(server_pin_b, server_public_b),
+    );
+    let restarted_router = agent_provisioning_owner_router(Arc::new(
+        PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, restarted_app),
+    ));
+    let old_receipt_after_restart = owner_get(
+        restarted_router,
+        &format!("/v1/agent-route-bootstraps/{bootstrap_id}"),
+        &owner_authorization,
+    )
+    .await?;
+    assert_eq!(old_receipt_after_restart.0, StatusCode::OK);
+    assert_eq!(old_receipt_after_restart.1, old_receipt.1);
+
+    let successor_id = AgentRouteBootstrapId::new();
+    let successor = owner_post(
+        router.clone(),
+        "/v1/agent-route-bootstraps",
+        &owner_authorization,
+        "route_successor_begin",
+        "application/vnd.dirextalk.agent-route-bootstrap.v1+cbor",
+        agent_route_bootstrap_begin_body(
+            successor_id,
+            tenant_id,
+            installation_id,
+            binding_id,
+            agent_device_id,
+            owner_id,
+            owner_device_id,
+            now() + 300_000,
+            vec![0xa5; 128],
+            &owner_device_key,
+        )?,
+    )
+    .await?;
+    assert_eq!(successor.0, StatusCode::CREATED);
+    assert!(
+        successor
+            .1
+            .windows(server_pin_b.to_string().len())
+            .any(|window| window == server_pin_b.to_string().as_bytes())
+    );
+
+    let mut wrong_pin = rejected;
+    wrong_pin.server_receipt_key_id = Some(server_pin_b);
+    wrong_pin.server_receipt_public_key_digest = Some(server_digest_b);
+    assert_eq!(
+        app.reject_agent_route_bootstrap(
+            authenticate_at(index, &ca_der, &completion.credential, auth_time)?,
+            wrong_pin,
         )
         .await,
         Err(ConnectorControlApplicationError::Conflict)

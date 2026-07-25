@@ -1091,7 +1091,11 @@ fn agent_route_bootstrap_delivery_body_with_pin(
         ),
     ]);
     let binding = if server_receipt_key_id.is_some() && server_receipt_public_key_digest.is_some() {
-        binding
+        let CanonicalValue::Map(mut fields) = binding else {
+            unreachable!()
+        };
+        fields[0].1 = u(2);
+        CanonicalValue::Map(fields)
     } else {
         let CanonicalValue::Map(mut fields) = binding else {
             unreachable!()
@@ -1103,7 +1107,7 @@ fn agent_route_bootstrap_delivery_body_with_pin(
         if server_receipt_key_id.is_some() && server_receipt_public_key_digest.is_some() {
             (
                 b"dirextalk.agent-route-bootstrap-delivery-binding.v2\0".as_slice(),
-                b"dirextalk.agent-route-bootstrap-delivery-signature.v2\0".as_slice(),
+                b"dirextalk.agent-route-bootstrap-delivery-signature.v1\0".as_slice(),
             )
         } else {
             (
