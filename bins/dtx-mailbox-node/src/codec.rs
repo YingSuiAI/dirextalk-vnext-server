@@ -351,4 +351,14 @@ use dtx_wire::{
     CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, UtcMillis, decode_deterministic_cbor,
 };
 
+use dtx_mailbox::DeviceHistoryGrantV4Command;
+
+pub(crate) fn parse_device_history_grant_v4(
+    bytes: &[u8],
+    idempotency_key_hash: Sha256Digest,
+) -> Result<DeviceHistoryGrantV4Command, MailboxFailure> {
+    DeviceHistoryGrantV4Command::parse(bytes.to_vec(), idempotency_key_hash)
+        .map_err(|_| MailboxFailure::InvalidRequest)
+}
+
 use super::errors::{MailboxFailure, map_persistence_error};

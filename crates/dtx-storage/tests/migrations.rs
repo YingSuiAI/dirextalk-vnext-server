@@ -3,7 +3,7 @@ mod support;
 use dtx_storage::MigrationRunner;
 use support::PostgresHarness;
 
-const CURRENT_BASELINE_COUNT: i64 = 21;
+const CURRENT_BASELINE_COUNT: i64 = 23;
 const LOCAL_RUNTIME_GRANTS: &str =
     include_str!("../../../docker/local/postgres/20-local-runtime-grants.sql");
 
@@ -40,7 +40,13 @@ async fn fresh_baseline_installs_current_schema_and_reruns_idempotently()
             .await?;
     assert_eq!(applied, CURRENT_BASELINE_COUNT);
     assert_eq!(visible, CURRENT_BASELINE_COUNT);
-    assert_eq!(epoch, ("product-core-alpha-20260724".to_owned(), 32));
+    assert_eq!(
+        epoch,
+        (
+            "product-core-alpha-20260724-history-recovery-catalog-v2".to_owned(),
+            32
+        )
+    );
     assert_eq!(before_rerun.0, applied);
     assert_eq!(before_rerun.1, epoch.0);
     assert_eq!(before_rerun.2, digest_after_rerun);

@@ -15,13 +15,15 @@ use super::{
     ACCOUNT_READ_CURSOR_QUERY_RECEIPT_V1_CONTENT_TYPE, ACCOUNT_READ_CURSOR_QUERY_V1_CONTENT_TYPE,
     ACCOUNT_READ_CURSOR_WRITE_RECEIPT_V1_CONTENT_TYPE, ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE,
     DEVICE_HISTORY_GRANT_RECEIPT_V1_CONTENT_TYPE, DEVICE_HISTORY_GRANT_RECEIPT_V2_CONTENT_TYPE,
-    DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
+    DEVICE_HISTORY_GRANT_RECEIPT_V5_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE,
+    DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V5_CONTENT_TYPE,
     HTTP_ACCOUNT_READ_CURSOR_IDEMPOTENCY_HASH_DOMAIN, HTTP_ACK_IDEMPOTENCY_HASH_DOMAIN,
     HTTP_ENQUEUE_IDEMPOTENCY_HASH_DOMAIN, HTTP_HISTORY_GRANT_V2_IDEMPOTENCY_HASH_DOMAIN,
-    HTTP_IDENTITY_ACK_V2_IDEMPOTENCY_HASH_DOMAIN, HTTP_REGISTER_IDEMPOTENCY_HASH_DOMAIN,
-    IDENTITY_MAILBOX_ACK_RECEIPT_V2_CONTENT_TYPE, IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
-    IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE, IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
-    MAILBOX_ACK_CONTENT_TYPE, MAILBOX_ACK_RECEIPT_CONTENT_TYPE, MAILBOX_ENVELOPE_CONTENT_TYPE,
+    HTTP_HISTORY_GRANT_V5_IDEMPOTENCY_HASH_DOMAIN, HTTP_IDENTITY_ACK_V2_IDEMPOTENCY_HASH_DOMAIN,
+    HTTP_REGISTER_IDEMPOTENCY_HASH_DOMAIN, IDENTITY_MAILBOX_ACK_RECEIPT_V2_CONTENT_TYPE,
+    IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE, IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE,
+    IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE, MAILBOX_ACK_CONTENT_TYPE,
+    MAILBOX_ACK_RECEIPT_CONTENT_TYPE, MAILBOX_ENVELOPE_CONTENT_TYPE,
     MAILBOX_ENVELOPE_RECEIPT_CONTENT_TYPE, MAILBOX_PULL_CONTENT_TYPE,
     MAILBOX_PULL_RECEIPT_CONTENT_TYPE, MAILBOX_REGISTER_CONTENT_TYPE,
     MAILBOX_REGISTER_RECEIPT_CONTENT_TYPE, MAX_ACK_BODY_BYTES, MAX_ENVELOPE_BODY_BYTES,
@@ -35,9 +37,9 @@ use crate::{
     codec::{
         parse_account_read_cursor_query, parse_account_read_cursor_write,
         parse_acknowledgement_request, parse_device_history_grant, parse_device_history_grant_v2,
-        parse_envelope_id, parse_envelope_request, parse_identity_ack_v2_request,
-        parse_identity_pull_v3_request, parse_mailbox_id, parse_pull_request,
-        parse_registration_request,
+        parse_device_history_grant_v4, parse_envelope_id, parse_envelope_request,
+        parse_identity_ack_v2_request, parse_identity_pull_v3_request, parse_mailbox_id,
+        parse_pull_request, parse_registration_request,
     },
     errors::{MailboxFailure, MailboxSuccess, map_persistence_error},
 };
@@ -320,6 +322,32 @@ impl MailboxNodeState {
         Ok(MailboxSuccess::write(
             &outcome,
             DEVICE_HISTORY_GRANT_RECEIPT_V2_CONTENT_TYPE,
+        ))
+    }
+
+    pub(crate) async fn grant_device_history_v5(
+        &self,
+        headers: &HeaderMap,
+        body: Body,
+    ) -> Result<MailboxSuccess, MailboxFailure> {
+        if !has_exact_content_type(headers, DEVICE_HISTORY_GRANT_V5_CONTENT_TYPE)
+            || headers.contains_key(header::CONTENT_ENCODING)
+        {
+            return Err(MailboxFailure::InvalidRequest);
+        }
+        let credential = parse_device_session_authorization(headers)?;
+        let idempotency_key_hash =
+            idempotency_key_hash(headers, HTTP_HISTORY_GRANT_V5_IDEMPOTENCY_HASH_DOMAIN)?;
+        let bytes = read_exact_body(body, 1_050_699).await?;
+        let command = parse_device_history_grant_v4(&bytes, idempotency_key_hash)?;
+        let outcome = self
+            .repository
+            .grant_device_history_v4(&self.store, &credential, &command, self.now()?)
+            .await
+            .map_err(|error| map_persistence_error(&error))?;
+        Ok(MailboxSuccess::write(
+            &outcome,
+            DEVICE_HISTORY_GRANT_RECEIPT_V5_CONTENT_TYPE,
         ))
     }
 
