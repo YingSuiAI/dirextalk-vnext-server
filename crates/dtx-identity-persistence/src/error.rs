@@ -85,6 +85,12 @@ pub enum IdentityPersistenceError {
     RecoveryPreparationInvalidated,
     /// An authenticated provider session did not match the request provider.
     RecoveryProviderMismatch,
+    /// Completion signer configuration or durable descriptor chain mismatched.
+    RecoveryCompletionSignerMismatch,
+    /// Completion command or immutable receipt failed its bound checks.
+    RecoveryCompletionInvalid,
+    /// Completion has expired or was explicitly invalidated.
+    RecoveryCompletionExpired,
     /// Stored rows did not rehydrate to one exact valid identity-log projection.
     CorruptData(&'static str),
 }
@@ -141,6 +147,9 @@ impl fmt::Display for IdentityPersistenceError {
             Self::RecoveryCandidateKeyChanged => "recovery candidate key changed",
             Self::RecoveryPreparationInvalidated => "recovery catalog preparation invalidated",
             Self::RecoveryProviderMismatch => "recovery catalog provider mismatch",
+            Self::RecoveryCompletionSignerMismatch => "history recovery completion signer mismatch",
+            Self::RecoveryCompletionInvalid => "history recovery completion is invalid",
+            Self::RecoveryCompletionExpired => "history recovery completion expired",
             Self::CorruptData(_) => "identity persistence contained invalid durable data",
         })
     }
@@ -186,6 +195,9 @@ impl Error for IdentityPersistenceError {
             | Self::RecoveryCandidateKeyChanged
             | Self::RecoveryPreparationInvalidated
             | Self::RecoveryProviderMismatch
+            | Self::RecoveryCompletionSignerMismatch
+            | Self::RecoveryCompletionInvalid
+            | Self::RecoveryCompletionExpired
             | Self::CorruptData(_) => None,
         }
     }

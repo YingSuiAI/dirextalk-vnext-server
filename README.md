@@ -1,5 +1,14 @@
 # Dirextalk vNext Server
 
+The identity node's Completion V2 authority is opt-in and fail-closed. When
+enabled, provision all of `DTX_IDENTITY_COMPLETION_KEY_FILE` (an absolute
+owner-only 32-byte seed path), `DTX_IDENTITY_COMPLETION_KEY_ID` (UUIDv7),
+`DTX_IDENTITY_COMPLETION_EPOCH`, `DTX_IDENTITY_COMPLETION_ROLLBACK_FLOOR`,
+`DTX_IDENTITY_COMPLETION_ISSUED_AT_MS`, and
+`DTX_IDENTITY_COMPLETION_EXPIRES_AT_MS`. Rotation additionally requires
+`DTX_IDENTITY_COMPLETION_PREVIOUS_DIGEST` (lower-case hex); no ephemeral key
+or default signer is generated.
+
 Rust workspace for the Matrix-independent Dirextalk Product Core Alpha server.
 
 The current server contract is [`docs/product-core-alpha.md`](docs/product-core-alpha.md).

@@ -3,7 +3,7 @@ use sqlx::{PgPool, migrate::MigrateError};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
-pub const SCHEMA_EPOCH: &str = "product-core-alpha-20260724-history-recovery-catalog-v2";
+pub const SCHEMA_EPOCH: &str = "product-core-alpha-20260725-history-recovery-completion-v2";
 
 pub(crate) fn baseline_digest() -> Vec<u8> {
     let mut digest = Sha256::new();

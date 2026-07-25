@@ -153,6 +153,9 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
              AND has_table_privilege(current_user, 'identity.recovery_scope_catalogs', 'SELECT,INSERT') \
              AND has_table_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'SELECT,INSERT') \
              AND has_table_privilege(current_user, 'identity.history_recovery_requests', 'SELECT,INSERT') \
+             AND has_table_privilege(current_user, 'identity.history_recovery_completion_descriptors', 'SELECT,INSERT') \
+             AND has_table_privilege(current_user, 'identity.history_recovery_completion_key_head', 'SELECT,INSERT,UPDATE') \
+             AND has_table_privilege(current_user, 'identity.history_recovery_completions_v2', 'SELECT,INSERT') \
              AND has_table_privilege(current_user, 'identity.client_bindings', 'SELECT,INSERT,UPDATE') \
              AND has_schema_privilege(current_user, 'messaging', 'USAGE') \
              AND has_function_privilege(current_user, 'messaging.is_uuid_v7(uuid)', 'EXECUTE') \
@@ -417,6 +420,13 @@ async fn role_has_excess_identity_privileges(
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
                         )) \
+                        OR (relation.relname = 'history_recovery_completion_key_head' AND (\
+                            has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
+                            OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
+                        )) \
                         OR (relation.relname = 'client_bindings' AND (\
                             has_table_privilege(current_user, relation.oid, 'DELETE') \
                             OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
@@ -466,6 +476,10 @@ async fn role_has_excess_identity_privileges(
                             'recovery_scope_catalogs', \
                             'recovery_scope_catalog_preparations', \
                             'history_recovery_requests', \
+                            'history_recovery_completion_descriptors', \
+                            'history_recovery_completion_key_head', \
+                            'history_recovery_completions_v2', \
+                            'history_recovery_completion_key_head', \
                             'client_bindings', \
                             'fork_evidence', 'log_outbox'\
                         ) AND (\

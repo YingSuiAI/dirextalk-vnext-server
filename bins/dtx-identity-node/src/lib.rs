@@ -47,11 +47,11 @@ use dtx_identity_persistence::{
     DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository, DeviceRevokeCommand,
     DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
     DeviceSessionRepository, FEDERATED_KEY_PACKAGE_CLAIM_PATH, FederatedKeyPackageClaimProof,
-    HistoryRecoveryKeyPackageScope, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead,
-    IdentityLogPageReadOutcome, IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
-    KeyPackageClaimCommand, KeyPackageClaimOutcome, KeyPackagePublishCommand,
-    KeyPackagePublishOutcome, KeyPackageRepository, MAX_KEY_PACKAGE_PUBLISH_BYTES,
-    MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
+    HistoryRecoveryCompletionRepository, HistoryRecoveryKeyPackageScope, IdentityAppendCommand,
+    IdentityAppendOutcome, IdentityLogHead, IdentityLogPageReadOutcome, IdentityLogRepository,
+    IdentityPersistenceError, IdentityPgStore, KeyPackageClaimCommand, KeyPackageClaimOutcome,
+    KeyPackagePublishCommand, KeyPackagePublishOutcome, KeyPackageRepository,
+    MAX_KEY_PACKAGE_PUBLISH_BYTES, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
     MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES,
     RecoveryResponseCapability, RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository,
     RecoveryScopeCatalogStatusOutcome, lock_and_load_active_snapshot,
@@ -67,6 +67,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 #[path = "http/auth.rs"]
 mod auth;
+#[path = "http/completion.rs"]
+mod completion;
+mod completion_key;
 #[path = "http/contacts.rs"]
 mod contacts;
 #[path = "http/enrollment_codec.rs"]
@@ -96,6 +99,11 @@ pub(crate) use auth::{
     has_exact_json_content_type, idempotency_key_hash, idempotency_key_hash_binding,
     single_graphic_header, take_client_binding_authorization_digest,
 };
+pub(crate) use completion::{
+    complete_history_recovery, get_completion_key, get_historical_completion_key,
+    get_history_recovery_completion,
+};
+pub use completion_key::load_completion_signing_key;
 pub(crate) use contacts::{
     create_contact_invite, get_contact_receipt, pending_contact_requests, review_contact_request,
     revoke_contact_invite, submit_contact_request,
@@ -171,6 +179,34 @@ pub(crate) use sessions_enrollment::{
     create_history_recovery_request_v4, get_device_enrollment_challenge, revoke_device,
 };
 
+/// Externally provisioned Completion V2 signing authority.  The seed is
+/// retained only in process memory; descriptor bytes and the monotonic chain
+/// are persisted by the identity writer role.
+#[derive(Clone)]
+pub struct CompletionSignerConfig {
+    pub key_id: uuid::Uuid,
+    pub epoch: u64,
+    pub rollback_floor_epoch: u64,
+    pub issued_at: UtcMillis,
+    pub expires_at: UtcMillis,
+    pub previous_descriptor_digest: Option<Sha256Digest>,
+    pub signing_key: ed25519_dalek::SigningKey,
+}
+
+impl CompletionSignerConfig {
+    pub fn validate(&self) -> Result<(), IdentityNodeConfigurationError> {
+        if self.key_id.get_version_num() != 7
+            || self.epoch == 0
+            || self.rollback_floor_epoch == 0
+            || self.rollback_floor_epoch > self.epoch
+            || self.expires_at <= self.issued_at
+        {
+            return Err(IdentityNodeConfigurationError::InvalidCompletionSigner);
+        }
+        Ok(())
+    }
+}
+
 /// Route for the self-authenticated identity genesis request.
 pub const IDENTITY_BOOTSTRAP_PATH: &str = "/v1/identity/bootstrap";
 /// Route for the root-authorized first device after genesis.
@@ -220,6 +256,16 @@ pub const CONTACT_INVITE_PATH: &str = "/v1/contact-invites/{invite_id}";
 pub const CONTACT_REQUESTS_PATH: &str = "/v1/contact-requests";
 pub const CONTACT_REVIEW_PATH: &str = "/v1/contact-requests/{request_id}/review";
 pub const CONTACT_RECEIPT_PATH: &str = "/v1/contact-requests/{request_id}/receipt";
+pub const HISTORY_RECOVERY_COMPLETION_KEY_PATH: &str =
+    "/v2/identity-home/history-recovery-completion-key";
+pub const HISTORY_RECOVERY_COMPLETION_KEY_HISTORICAL_PATH: &str =
+    "/v2/identity-home/history-recovery-completion-keys/{descriptor_digest}";
+pub const HISTORY_RECOVERY_COMPLETION_PATH: &str =
+    "/v2/identity-home/history-recovery-completions/{completion_id}";
+pub const HISTORY_RECOVERY_COMPLETION_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.history-recovery-completion-command.v2+cbor";
+pub const HISTORY_RECOVERY_COMPLETION_RECEIPT_CONTENT_TYPE: &str =
+    "application/vnd.dirextalk.history-recovery-completion-receipt.v2+cbor";
 /// Required media type for exact signed V1.1 identity-log events.
 pub const IDENTITY_LOG_EVENT_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.identity-log.v1.1+cbor";
@@ -366,6 +412,8 @@ pub struct IdentityBootstrapState {
     public_origin: Arc<str>,
     clock: Arc<dyn Clock>,
     device_session_audience: Arc<str>,
+    completion_signer: Option<Arc<CompletionSignerConfig>>,
+    completion: HistoryRecoveryCompletionRepository,
 }
 
 impl IdentityBootstrapState {
@@ -412,7 +460,21 @@ impl IdentityBootstrapState {
             public_origin: device_session_audience.clone(),
             clock,
             device_session_audience,
+            completion_signer: None,
+            completion: HistoryRecoveryCompletionRepository,
         }
+    }
+
+    /// Installs the explicit externally provisioned Completion V2 signer.
+    /// Without this configuration completion-key and completion routes fail
+    /// closed with service-unavailable semantics.
+    pub fn with_completion_signer_config(
+        mut self,
+        config: CompletionSignerConfig,
+    ) -> Result<Self, IdentityNodeConfigurationError> {
+        config.validate()?;
+        self.completion_signer = Some(Arc::new(config));
+        Ok(self)
     }
 
     /// Installs the canonical public origin, development-only HTTP allowlist,
@@ -434,7 +496,7 @@ impl IdentityBootstrapState {
                 allowed_http_origins,
                 additional_trust_root_pem,
             )
-            .map_err(IdentityNodeConfigurationError)?;
+            .map_err(IdentityNodeConfigurationError::Federated)?;
         self.federated_identity = federated_identity;
         self.public_origin = Arc::from(public_origin);
         Ok(self)
@@ -443,11 +505,19 @@ impl IdentityBootstrapState {
 
 /// Invalid federated identity configuration for the identity node.
 #[derive(Clone, Copy, Debug)]
-pub struct IdentityNodeConfigurationError(FederatedIdentityError);
+pub enum IdentityNodeConfigurationError {
+    Federated(FederatedIdentityError),
+    InvalidCompletionSigner,
+}
 
 impl std::fmt::Display for IdentityNodeConfigurationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
+        match self {
+            Self::Federated(error) => error.fmt(formatter),
+            Self::InvalidCompletionSigner => {
+                formatter.write_str("invalid Completion V2 signer configuration")
+            }
+        }
     }
 }
 
@@ -514,6 +584,18 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
         .route(
             HISTORY_RECOVERY_REQUEST_V4_PATH,
             post(create_history_recovery_request_v4),
+        )
+        .route(
+            HISTORY_RECOVERY_COMPLETION_KEY_PATH,
+            get(get_completion_key),
+        )
+        .route(
+            HISTORY_RECOVERY_COMPLETION_KEY_HISTORICAL_PATH,
+            get(get_historical_completion_key),
+        )
+        .route(
+            HISTORY_RECOVERY_COMPLETION_PATH,
+            post(complete_history_recovery).get(get_history_recovery_completion),
         )
         .route(KEY_PACKAGE_PUBLISH_PATH_TEMPLATE, put(publish_key_package))
         .route(KEY_PACKAGE_CLAIM_PATH, post(claim_key_package))

@@ -2,8 +2,12 @@
 
 use std::{env, fs, net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
 
-use dtx_identity_node::{IdentityBootstrapState, identity_bootstrap_router_with_state};
+use dtx_identity_node::{
+    CompletionSignerConfig, IdentityBootstrapState, identity_bootstrap_router_with_state,
+    load_completion_signing_key,
+};
 use dtx_identity_persistence::IdentityPgStore;
+use dtx_wire::{Sha256Digest, UtcMillis};
 use sqlx::postgres::PgConnectOptions;
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
@@ -35,15 +39,92 @@ async fn run() -> Result<(), NodeError> {
     let listener = TcpListener::bind(listen)
         .await
         .map_err(|_| NodeError::Bind)?;
-    let state = IdentityBootstrapState::with_clock_and_device_session_audience(
+    let mut state = IdentityBootstrapState::with_clock_and_device_session_audience(
         store,
         std::sync::Arc::new(dtx_domain::SystemClock),
         device_session_audience,
     );
+    if let Some(config) = load_completion_signer_config()? {
+        state = state
+            .with_completion_signer_config(config)
+            .map_err(|_| NodeError::Configuration)?;
+    }
     axum::serve(listener, identity_bootstrap_router_with_state(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|_| NodeError::Serve)
+}
+
+fn load_completion_signer_config() -> Result<Option<CompletionSignerConfig>, NodeError> {
+    let Some(path) = env::var_os("DTX_IDENTITY_COMPLETION_KEY_FILE") else {
+        let any = [
+            "DTX_IDENTITY_COMPLETION_KEY_ID",
+            "DTX_IDENTITY_COMPLETION_EPOCH",
+            "DTX_IDENTITY_COMPLETION_ROLLBACK_FLOOR",
+            "DTX_IDENTITY_COMPLETION_ISSUED_AT_MS",
+            "DTX_IDENTITY_COMPLETION_EXPIRES_AT_MS",
+            "DTX_IDENTITY_COMPLETION_PREVIOUS_DIGEST",
+        ]
+        .iter()
+        .any(|name| env::var_os(name).is_some());
+        if any {
+            return Err(NodeError::Configuration);
+        }
+        return Ok(None);
+    };
+    let key_id = env::var("DTX_IDENTITY_COMPLETION_KEY_ID")
+        .map_err(|_| NodeError::Configuration)?
+        .parse()
+        .map_err(|_| NodeError::Configuration)?;
+    let epoch = env::var("DTX_IDENTITY_COMPLETION_EPOCH")
+        .map_err(|_| NodeError::Configuration)?
+        .parse()
+        .map_err(|_| NodeError::Configuration)?;
+    let rollback_floor_epoch = env::var("DTX_IDENTITY_COMPLETION_ROLLBACK_FLOOR")
+        .map_err(|_| NodeError::Configuration)?
+        .parse()
+        .map_err(|_| NodeError::Configuration)?;
+    let issued_at = UtcMillis::new(
+        env::var("DTX_IDENTITY_COMPLETION_ISSUED_AT_MS")
+            .map_err(|_| NodeError::Configuration)?
+            .parse()
+            .map_err(|_| NodeError::Configuration)?,
+    )
+    .map_err(|_| NodeError::Configuration)?;
+    let expires_at = UtcMillis::new(
+        env::var("DTX_IDENTITY_COMPLETION_EXPIRES_AT_MS")
+            .map_err(|_| NodeError::Configuration)?
+            .parse()
+            .map_err(|_| NodeError::Configuration)?,
+    )
+    .map_err(|_| NodeError::Configuration)?;
+    let previous_descriptor_digest = env::var("DTX_IDENTITY_COMPLETION_PREVIOUS_DIGEST")
+        .ok()
+        .map(|value| parse_hex_digest(&value))
+        .transpose()
+        .map_err(|_| NodeError::Configuration)?;
+    let signing_key =
+        load_completion_signing_key(&PathBuf::from(path)).map_err(|_| NodeError::Configuration)?;
+    Ok(Some(CompletionSignerConfig {
+        key_id,
+        epoch,
+        rollback_floor_epoch,
+        issued_at,
+        expires_at,
+        previous_descriptor_digest,
+        signing_key,
+    }))
+}
+
+fn parse_hex_digest(value: &str) -> Result<Sha256Digest, ()> {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16).map_err(|_| ())?;
+    }
+    Ok(Sha256Digest::from_bytes(out))
 }
 
 fn load_device_session_audience(listen: SocketAddr) -> Result<String, NodeError> {

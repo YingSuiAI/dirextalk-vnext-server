@@ -6,6 +6,7 @@ mod client_binding;
 mod device_enrollment;
 mod device_session;
 mod error;
+mod history_completion;
 mod key_package;
 mod recovery_scope_catalog;
 mod repository;
@@ -43,6 +44,12 @@ pub use device_session::{
     PushIdentityAuthObservation, device_session_proof_canonical_bytes, device_session_proof_input,
 };
 pub use error::IdentityPersistenceError;
+pub use history_completion::{
+    COMPLETION_DESCRIPTOR_DOMAIN, COMPLETION_DESCRIPTOR_SIGNATURE_DOMAIN,
+    COMPLETION_RECEIPT_DOMAIN, COMPLETION_RECEIPT_SIGNATURE_DOMAIN, CompletionKeyDescriptor,
+    CompletionReceiptOutcome, CompletionSignerMetadata, HistoryRecoveryCompletionCommand,
+    HistoryRecoveryCompletionRepository,
+};
 pub use key_package::{
     FEDERATED_KEY_PACKAGE_CLAIM_BINDING_HASH_DOMAIN, FEDERATED_KEY_PACKAGE_CLAIM_BODY_HASH_DOMAIN,
     FEDERATED_KEY_PACKAGE_CLAIM_METHOD, FEDERATED_KEY_PACKAGE_CLAIM_PATH,
