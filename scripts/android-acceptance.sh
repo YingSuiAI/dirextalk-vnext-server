@@ -387,8 +387,14 @@ start_proxy() {
   # fork but before either listener exists.
   printf -v "$variable" '%s' "$pid"
   record "$variable" "$pid"
-  sleep 0.1; kill -0 "$pid" || die 'proxy exited during startup'
-  ss -ltnH "sport = :$listen" | grep -q . && ss -ltnH "sport = :$control" | grep -q . || die 'proxy listeners not ready'
+  local deadline=$((SECONDS + ANDROID_BOOT_TIMEOUT_SECONDS))
+  while :; do
+    kill -0 "$pid" 2>/dev/null || die 'proxy exited during startup'
+    if ss -ltnH "sport = :$listen" | grep -q . && ss -ltnH "sport = :$control" | grep -q .; then
+      return 0
+    fi
+    (( SECONDS < deadline )) || die 'proxy listeners not ready'
+  done
 }
 real_run() {
   claim; preflight

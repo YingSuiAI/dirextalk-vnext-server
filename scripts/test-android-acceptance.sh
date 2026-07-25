@@ -4,7 +4,20 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 script="$root/scripts/android-acceptance.sh"
 tmp="$(mktemp -d)"
 test_shell_pid=$BASHPID
-cleanup_test_tmp() { [[ $BASHPID != "$test_shell_pid" ]] || rm -rf -- "$tmp"; }
+cleanup_test_tmp() {
+  local status=$?
+  [[ $BASHPID == "$test_shell_pid" ]] || return "$status"
+  if (( status != 0 )); then
+    printf 'android self-test diagnostics (status=%s, tmp=%s)\n' "$status" "$tmp" >&2
+    while IFS= read -r log; do
+      printf '%s\n' "--- $log (tail)" >&2
+      tail -40 "$log" >&2 || true
+    done < <(find "$tmp" -type f -name log -print 2>/dev/null)
+    ps -eo pid,ppid,stat,cmd | rg -F "$tmp" >&2 || true
+  fi
+  rm -rf -- "$tmp"
+  return "$status"
+}
 trap cleanup_test_tmp EXIT
 
 dry_run_id="dry-run-no-mutation-$$"
@@ -31,7 +44,7 @@ make_fixture() {
     'serial=""; [[ "${1:-}" != -s ]] || { serial=$2; shift 2; }' \
     'case " $* " in' \
     ' *" devices "*) printf "%s" "${DTX_TEST_ADB_DEVICES:-}";;' \
-    ' *" wait-for-device "*) for _ in $(seq 1 50); do [[ -f "$DTX_TEST_MAP/$serial" ]] && exit 0; sleep 0.02; done; exit 1;;' \
+    ' *" wait-for-device "*) while [[ ! -f "$DTX_TEST_MAP/$serial" ]]; do :; done; exit 0;;' \
     ' *" emu avd name "*) if [[ "${DTX_TEST_CONSOLE_EXTRA:-}" == 1 ]]; then cat "$DTX_TEST_MAP/$serial"; printf "WRONG\nOK\n"; elif [[ "${DTX_TEST_CONSOLE_CRLF:-}" == 1 ]]; then cat "$DTX_TEST_MAP/$serial" | tr "\n" "\r\n"; printf "\r\nOK\r\n"; else cat "$DTX_TEST_MAP/$serial"; printf "OK\n"; fi;;' \
     ' *" remount "*) marker="$DTX_TEST_ROOT/remount-$DTX_TEST_RUN_ID-$serial"; if [[ ! -e "$marker" ]]; then : >"$marker"; printf "Successfully disabled verity\n"; else printf "remount succeeded\n"; fi;;' \
     ' *" reboot "*) :;;' \
@@ -41,7 +54,7 @@ make_fixture() {
     ' *" reverse tcp:8443 "*) if [[ "${DTX_TEST_REVERSE_FAIL_AFTER:-}" == 1 && "$serial" == "$(awk -F= '\''$1 == "emulator_a_serial" { print $2 }'\'' "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/resources")" ]]; then echo "reverse-side-effect $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG"; exit 1; fi; [[ "${DTX_TEST_REVERSE:-ok}" == ok ]] || exit 1; [[ "${DTX_TEST_REVERSE_SLEEP:-0}" == 0 ]] || sleep "${DTX_TEST_REVERSE_SLEEP}";;' \
     ' *" reverse --remove tcp:8443 "*) echo "reverse-remove $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG";;' \
     'esac' >"$fixture/bin/adb"
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "emulator $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'avd=""; port=""; while (($#)); do case "$1" in -avd) avd=$2; shift 2;; -port) port=$2; shift 2;; *) shift;; esac; done' 'printf "%s\n" "$avd" >"$DTX_TEST_MAP/emulator-$port"' 'exec python3 -c '\''import signal,time,sys; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); time.sleep(3600)'\'' emulator -avd "$avd" -port "$port"' >"$fixture/bin/emulator"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "emulator $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'avd=""; port=""; while (($#)); do case "$1" in -avd) avd=$2; shift 2;; -port) port=$2; shift 2;; *) shift;; esac; done' 'tmp_map="$DTX_TEST_MAP/.emulator-$port.$$"; printf "%s\n" "$avd" >"$tmp_map"; mv -f -- "$tmp_map" "$DTX_TEST_MAP/emulator-$port"' 'exec python3 -c '\''import signal,sys; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.pause()'\'' emulator -avd "$avd" -port "$port"' >"$fixture/bin/emulator"
   printf '%s\n' '#!/usr/bin/env bash' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'port="${*: -1}"; port="${port##*:}"; [[ -f "${DTX_TEST_PROXY_PORTS:-/nonexistent}/$port" ]] && printf "LISTEN\n"' >"$fixture/bin/ss"
   chmod +x "$fixture/bin"/*
@@ -54,6 +67,53 @@ run_fixture() {
     exec env PATH="$fixture/bin:$PATH" DTX_ANDROID_TEST_MODE=1 DTX_TEST_LOG="$fixture/log" DTX_TEST_RUN_ID="$run_id" DTX_TEST_ROOT="$fixture" DTX_TEST_MAP="$fixture/maps" DTX_TEST_PROXY_PORTS="$fixture/proxy-ports" DTX_ANDROID_SYSTEM_IMAGE='system-images;android-35;aosp_atd;x86_64' DTX_ANDROID_ACCEPTANCE_RUN_ID="$run_id" "$@" "$fixture/scripts/android-acceptance.sh" --run
   fi
   PATH="$fixture/bin:$PATH" DTX_ANDROID_TEST_MODE=1 DTX_TEST_LOG="$fixture/log" DTX_TEST_RUN_ID="$run_id" DTX_TEST_ROOT="$fixture" DTX_TEST_MAP="$fixture/maps" DTX_TEST_PROXY_PORTS="$fixture/proxy-ports" DTX_ANDROID_SYSTEM_IMAGE='system-images;android-35;aosp_atd;x86_64' DTX_ANDROID_ACCEPTANCE_RUN_ID="$run_id" "$@" "$fixture/scripts/android-acceptance.sh" --run
+}
+run_fixture_isolated() {
+  local fixture=$1 run_id=$2
+  shift 2
+  trap - EXIT
+  exec setsid env PATH="$fixture/bin:$PATH" DTX_ANDROID_TEST_MODE=1 DTX_TEST_LOG="$fixture/log" DTX_TEST_RUN_ID="$run_id" DTX_TEST_ROOT="$fixture" DTX_TEST_MAP="$fixture/maps" DTX_TEST_PROXY_PORTS="$fixture/proxy-ports" DTX_ANDROID_SYSTEM_IMAGE='system-images;android-35;aosp_atd;x86_64' DTX_ANDROID_ACCEPTANCE_RUN_ID="$run_id" "$@" "$fixture/scripts/android-acceptance.sh" --run
+}
+
+wait_until() {
+  local timeout_seconds=$1 label=$2
+  shift 2
+  local deadline=$((SECONDS + timeout_seconds))
+  while ! "$@"; do
+    if (( SECONDS >= deadline )); then
+      printf 'android self-test: timed out waiting for %s\n' "$label" >&2
+      return 1
+    fi
+    # Readiness predicates, not this yield interval, determine progress.  The
+    # bounded yield keeps repeated self-tests from monopolizing a CPU.
+    sleep 0.01
+  done
+}
+
+path_exists() { [[ -e "$1" ]]; }
+dir_exists() { [[ -d "$1" ]]; }
+log_count_at_least() {
+  local pattern=$1 minimum=$2 log=$3 count
+  count=$(rg -c "$pattern" "$log" 2>/dev/null || true)
+  [[ "$count" =~ ^[0-9]+$ ]] && (( count >= minimum ))
+}
+log_contains() { rg -F -- "$1" "$2" >/dev/null 2>&1; }
+pid_gone() { ! kill -0 "$1" 2>/dev/null; }
+kill_descendants() {
+  local root=$1 child
+  while read -r child; do
+    [[ -n "$child" ]] || continue
+    kill_descendants "$child"
+    kill -TERM "$child" 2>/dev/null || true
+    kill -KILL "$child" 2>/dev/null || true
+  done < <(pgrep -P "$root" 2>/dev/null || true)
+}
+concurrent_remounts_ready() {
+  local log=$1 run ready
+  for run in concurrent-a concurrent-b; do
+    [[ $(rg -c "^adb $run -s .* remount$" "$log" 2>/dev/null || true) -ge 4 ]] || return 1
+  done
+  return 0
 }
 
 # A partially-started compose project is owned before `up`; failure therefore
@@ -86,10 +146,11 @@ if run_fixture "$fixture" symlink-root env >/dev/null 2>&1; then exit 1; fi
 # Different live RUN_IDs reserve disjoint port/serial blocks under the global
 # allocator lock; a duplicate RUN_ID is rejected while its reservation exists.
 fixture="$tmp/allocator"; make_fixture "$fixture"
-(trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_COMPOSE_SLEEP=3 run_fixture "$fixture" allocator-a env) & first=$!
-for _ in $(seq 1 30); do [[ -f "$fixture/.android-acceptance/allocator-a/resources" ]] && break; sleep 0.1; done
-(trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_COMPOSE_SLEEP=3 run_fixture "$fixture" allocator-b env) & second=$!
-for _ in $(seq 1 30); do [[ -f "$fixture/.android-acceptance/allocator-b/resources" ]] && break; sleep 0.1; done
+DTX_TEST_COMPOSE_SLEEP=3 run_fixture_isolated "$fixture" allocator-a env & first=$!
+wait_until 30 allocator-a-resources path_exists "$fixture/.android-acceptance/allocator-a/resources"
+wait_until 30 allocator-a-compose-start log_contains "docker compose --project-directory $fixture -f $fixture/docker-compose.local.yml --project-name dtx-android-accept-allocator-a up --detach --wait" "$fixture/log"
+DTX_TEST_COMPOSE_SLEEP=3 run_fixture_isolated "$fixture" allocator-b env & second=$!
+wait_until 30 allocator-b-resources path_exists "$fixture/.android-acceptance/allocator-b/resources"
 if DTX_TEST_COMPOSE_SLEEP=3 run_fixture "$fixture" allocator-a env >/dev/null 2>&1; then exit 1; fi
 ! cmp -s "$fixture/.android-acceptance/allocator-a/resources" "$fixture/.android-acceptance/allocator-b/resources"
 for field in node_a_port node_b_port proxy_a_port control_a_port proxy_b_port control_b_port emulator_a_port emulator_b_port emulator_a_serial emulator_b_serial; do
@@ -97,24 +158,24 @@ for field in node_a_port node_b_port proxy_a_port control_a_port proxy_b_port co
   second_value="$(awk -F= -v field="$field" '$1 == field { print $2 }' "$fixture/.android-acceptance/allocator-b/resources")"
   [[ -n "$first_value" && "$first_value" != "$second_value" ]]
 done
-kill -TERM "$first" "$second"; wait "$first" || true; wait "$second" || true
+kill -TERM "$first" "$second"
+if wait "$first"; then allocator_first_status=0; else allocator_first_status=$?; fi
+if wait "$second"; then allocator_second_status=0; else allocator_second_status=$?; fi
+[[ "$allocator_first_status" == 0 || "$allocator_first_status" == 143 || "$allocator_first_status" == 1 ]] &&
+  [[ "$allocator_second_status" == 0 || "$allocator_second_status" == 143 || "$allocator_second_status" == 1 ]]
 [[ ! -e "$fixture/.android-acceptance/allocator-a" && ! -e "$fixture/.android-acceptance/allocator-b" ]]
 
 # Two live runs reach emulator ownership verification, root/CA installation and
 # proxy mapping concurrently.  Every adb target remains owned by its RUN_ID.
 fixture="$tmp/concurrent"; make_fixture "$fixture"
 printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; control=${3##*:}; : >"$DTX_TEST_PROXY_PORTS/$listen"; : >"$DTX_TEST_PROXY_PORTS/$control"' 'trap '\''rm -f "$DTX_TEST_PROXY_PORTS/$listen" "$DTX_TEST_PROXY_PORTS/$control"; exit 0'\'' TERM' 'while :; do sleep 1; done' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
-(trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_REVERSE_SLEEP=1 run_fixture "$fixture" concurrent-a env) & first=$!
-for _ in $(seq 1 30); do [[ -f "$fixture/.android-acceptance/concurrent-a/resources" ]] && break; sleep 0.1; done
-(trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_REVERSE_SLEEP=1 run_fixture "$fixture" concurrent-b env) & second=$!
-for _ in $(seq 1 300); do [[ $(rg -c '^adb concurrent-[ab] .* reverse tcp:8443 ' "$fixture/log" 2>/dev/null || true) -ge 2 ]] && break; sleep 0.1; done
-for _ in $(seq 1 300); do [[ $(rg -c '^adb concurrent-[ab] .* shell app_process ' "$fixture/log" 2>/dev/null || true) -ge 4 ]] && break; sleep 0.1; done
-for _ in $(seq 1 300); do
-  ready=1
-  for run in concurrent-a concurrent-b; do [[ $(rg -c "^adb $run -s .* remount$" "$fixture/log" 2>/dev/null || true) -ge 4 ]] || ready=0; done
-  [[ "$ready" == 1 ]] && break
-  sleep 0.1
-done
+DTX_TEST_REVERSE_SLEEP=1 run_fixture_isolated "$fixture" concurrent-a env & first=$!
+wait_until 30 concurrent-a-resources path_exists "$fixture/.android-acceptance/concurrent-a/resources"
+wait_until 30 concurrent-a-compose-start log_contains "docker compose --project-directory $fixture -f $fixture/docker-compose.local.yml --project-name dtx-android-accept-concurrent-a up --detach --wait" "$fixture/log"
+DTX_TEST_REVERSE_SLEEP=1 run_fixture_isolated "$fixture" concurrent-b env & second=$!
+wait_until 30 concurrent-reverse log_count_at_least '^adb concurrent-[ab] .* reverse tcp:8443 ' 2 "$fixture/log"
+wait_until 30 concurrent-trust-probes log_count_at_least '^adb concurrent-[ab] .* shell app_process ' 4 "$fixture/log"
+wait_until 30 concurrent-remounts concurrent_remounts_ready "$fixture/log"
 for run in concurrent-a concurrent-b; do
   resource="$fixture/.android-acceptance/$run/resources"; [[ -f "$resource" ]]
   serial_a="$(awk -F= '$1 == "emulator_a_serial" { print $2 }' "$resource")"; serial_b="$(awk -F= '$1 == "emulator_b_serial" { print $2 }' "$resource")"
@@ -133,8 +194,12 @@ done
 serials="$(awk -F= '/^emulator_[ab]_serial=/ { print $2 }' "$fixture/.android-acceptance/concurrent-a/resources" "$fixture/.android-acceptance/concurrent-b/resources")"
 [[ "$(printf '%s\n' "$serials" | sort -u | wc -l)" == 4 ]]
 for job in "$first" "$second"; do
-  for _ in $(seq 1 600); do kill -0 "$job" 2>/dev/null || break; sleep 0.1; done
-  if kill -0 "$job" 2>/dev/null; then kill -TERM "$job"; fi
+  wait_until 60 "job-$job-exit" pid_gone "$job" || true
+  if kill -0 "$job" 2>/dev/null; then
+    kill -TERM "$job" 2>/dev/null || true
+    wait_until 10 "job-$job-final-exit" pid_gone "$job" || true
+  fi
+  kill_descendants "$job"
 done
 if wait "$first"; then first_status=0; else first_status=$?; fi
 if wait "$second"; then second_status=0; else second_status=$?; fi
@@ -208,10 +273,11 @@ rg -F -- '--project-name dtx-android-accept-reverse-retained down' "$fixture/log
 
 # Signals preserve conventional status while running all owned cleanup.
 fixture="$tmp/signals"; make_fixture "$fixture"
-(trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_COMPOSE_SLEEP=1 run_fixture "$fixture" signal-int env) & child=$!
-for _ in $(seq 1 30); do [[ -d "$fixture/.android-acceptance/signal-int" ]] && break; sleep 0.1; done
+DTX_TEST_COMPOSE_SLEEP=1 run_fixture_isolated "$fixture" signal-int env & child=$!
+wait_until 30 signal-int-resources dir_exists "$fixture/.android-acceptance/signal-int"
+wait_until 30 signal-int-cargo-start log_contains 'cargo build --locked -p dtx-android-response-loss-proxy' "$fixture/log"
 kill -INT "$child"
-for _ in $(seq 1 50); do kill -0 "$child" 2>/dev/null || break; sleep 0.1; done
+wait_until 10 signal-int-exit pid_gone "$child" || true
 if kill -0 "$child" 2>/dev/null; then kill -TERM "$child"; fi
 if wait "$child"; then child_status=0; else child_status=$?; fi
 [[ "$child_status" == 0 || "$child_status" == 130 || "$child_status" == 143 || "$child_status" == 1 ]]
