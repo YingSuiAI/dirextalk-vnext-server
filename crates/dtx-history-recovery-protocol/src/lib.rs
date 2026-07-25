@@ -7,7 +7,8 @@ use std::{fmt, str::FromStr};
 
 use dtx_domain::{DeviceId, IdentityId};
 use dtx_wire::{
-    CanonicalValue, Sha256Digest, decode_deterministic_cbor, encode_deterministic_cbor,
+    CanonicalEncode, CanonicalValue, Sha256Digest, decode_deterministic_cbor,
+    encode_deterministic_cbor,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use uuid::Uuid;
@@ -35,6 +36,8 @@ pub const LEAF_SET_DOMAIN: &[u8] = b"dirextalk.history-recovery.leaf-set.v2\0";
 pub const CATALOG_NODE_DOMAIN: &[u8] = b"dirextalk.recovery-scope-catalog-node.v2\0";
 pub const OFFER_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.recipient-offer.v3\0";
 pub const OFFER_CIPHERTEXT_DOMAIN: &[u8] = b"dirextalk.history-recovery.offer-ciphertext.v3\0";
+pub const RECIPIENT_KEY_DIGEST_DOMAIN: &[u8] = b"dirextalk.recovery-recipient-key.v1\0";
+pub const AUTHORITY_ID_DOMAIN: &[u8] = b"dirextalk.device-history-authority-id.v1\0";
 pub const GRANT_PROVIDER_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.history-recovery.grant-provider-signature.v5\0";
 pub const GRANT_AUTHORITY_SIGNATURE_DOMAIN: &[u8] =
@@ -287,6 +290,20 @@ fn digest(v: &CanonicalValue) -> Result<Sha256Digest, ProtocolError> {
         fixed::<32>(v).map_err(|_| err("digest bytes"))?,
     ))
 }
+fn nonzero_digest(v: &CanonicalValue) -> Result<Sha256Digest, ProtocolError> {
+    let value = digest(v)?;
+    if value.as_bytes() == &[0; 32] {
+        return Err(err("zero digest"));
+    }
+    Ok(value)
+}
+fn signing_key(v: &CanonicalValue) -> Result<[u8; 32], ProtocolError> {
+    let key = fixed::<32>(v)?;
+    if key == [0; 32] || VerifyingKey::from_bytes(&key).is_err() {
+        return Err(err("signing key"));
+    }
+    Ok(key)
+}
 fn uuid(v: &CanonicalValue) -> Result<Uuid, ProtocolError> {
     let CanonicalValue::Text(s) = v else {
         return Err(err("uuid"));
@@ -535,16 +552,37 @@ pub fn validate_offer_v3(raw: &[u8]) -> Result<OfferV3, ProtocolError> {
         return Err(err("offer version"));
     };
     let request_id = uuid(&fields[1])?;
+    let _request_digest = nonzero_digest(&fields[2])?;
+    let _manifest_digest = nonzero_digest(&fields[3])?;
+    let _catalog_id = uuid(&fields[4])?;
+    let _generation = uint(&fields[5], true)?;
+    let _head_digest = nonzero_digest(&fields[6])?;
+    let _leaf_set_digest = nonzero_digest(&fields[7])?;
+    let _allowed_snapshot_digest = nonzero_digest(&fields[8])?;
     let cipher = bytes(&fields[9], 1_048_576)?;
-    if digest(&fields[10])? != Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, &cipher) {
+    let cipher_digest = nonzero_digest(&fields[10])?;
+    if cipher_digest != Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, &cipher) {
         return Err(err("offer ciphertext"));
     };
+    match &fields[11] {
+        CanonicalValue::Null => {}
+        value => {
+            let attachment = map(value, 4)?;
+            let _object_id = uuid(&attachment[0])?;
+            let _attachment_digest = nonzero_digest(&attachment[1])?;
+            if uint(&attachment[2], true)? == 0 {
+                return Err(err("attachment size"));
+            }
+            let _attachment_key = nonzero_digest(&attachment[3])?;
+        }
+    }
     let issued = uint(&fields[12], false)?;
     let expires = uint(&fields[13], false)?;
     if issued >= expires {
         return Err(err("offer interval"));
     };
-    let provider = digest(&fields[15])?;
+    let _recipient_key_digest = nonzero_digest(&fields[14])?;
+    let provider = nonzero_digest(&fields[15])?;
     Ok(OfferV3 {
         request_id,
         digest: Sha256Digest::hash_domain(OFFER_DIGEST_DOMAIN, raw),
@@ -563,12 +601,22 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
     if uint(&fields[0], false)? != 5 {
         return Err(err("grant version"));
     };
+    let _identity = identity(&fields[1])?;
+    let request_id = uuid(&fields[2])?;
+    let _request_digest = nonzero_digest(&fields[3])?;
+    let _manifest_digest = nonzero_digest(&fields[4])?;
+    let _catalog_id = uuid(&fields[5])?;
+    let _generation = uint(&fields[6], true)?;
     let head = bytes(&fields[7], MAX_CATALOG_HEAD_BYTES)?;
     let head = validate_catalog_head_v2(&head)?;
-    if digest(&fields[8])? != head.digest()
+    let head_digest = nonzero_digest(&fields[8])?;
+    let root_digest = nonzero_digest(&fields[9])?;
+    let _leaf_set_digest = nonzero_digest(&fields[11])?;
+    if head_digest != head.digest()
         || uuid(&fields[5])? != head.catalog_id()
         || uint(&fields[6], true)? != head.generation()
         || uint(&fields[10], true)? != head.leaf_count()
+        || root_digest != head.merkle_root()
     {
         return Err(err("grant catalog coordinates"));
     }
@@ -579,15 +627,37 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
     }
     let provider_device = device(&provider[1])?;
     let candidate_device = device(&fields[12])?;
+    if provider_device == candidate_device {
+        return Err(err("provider device separation"));
+    }
+    let candidate_key = signing_key(&fields[13])?;
+    let candidate_recipient_key = fixed::<32>(&fields[14])?;
+    if candidate_recipient_key == [0; 32] {
+        return Err(err("recipient key"));
+    }
+    if nonzero_digest(&fields[16]).is_err()
+        || uint(&fields[17], false)?
+            != uint(&fields[15], false)?
+                .checked_add(1)
+                .ok_or(err("highwater"))?
+        || nonzero_digest(&fields[18]).is_err()
+        || nonzero_digest(&fields[19]).is_err()
+        || nonzero_digest(&fields[20]).is_err()
+    {
+        return Err(err("grant coordinates"));
+    }
     let authority_kind = uint(&authority[0], false)?;
     if !(1..=3).contains(&authority_kind)
         || (authority_kind == 1 && device(&authority[1]).is_err())
-        || (authority_kind != 1 && digest(&authority[1]).is_err())
+        || (authority_kind != 1 && nonzero_digest(&authority[1]).is_err())
     {
         return Err(err("authority descriptor"));
     }
-    let provider_key = fixed::<32>(&provider[2]).map_err(|_| err("provider key bytes"))?;
-    let authority_key = fixed::<32>(&authority[2]).map_err(|_| err("authority key bytes"))?;
+    let provider_key = signing_key(&provider[2])?;
+    let authority_key = signing_key(&authority[2])?;
+    if provider_key == candidate_key || authority_key == candidate_key {
+        return Err(err("candidate signer separation"));
+    }
     if provider_key == authority_key {
         return Err(err("signer separation"));
     };
@@ -596,20 +666,31 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
         if authority_device == provider_device || authority_device == candidate_device {
             return Err(err("authority device separation"));
         }
+    } else if nonzero_digest(&authority[1])?
+        != Sha256Digest::hash_domain(AUTHORITY_ID_DOMAIN, &authority_key)
+    {
+        return Err(err("authority identifier"));
+    }
+    let grant_issued = uint(&fields[30], false)?;
+    let grant_expires = uint(&fields[31], false)?;
+    if grant_issued >= grant_expires
+        || uint(&fields[28], false)?
+            != uint(&fields[27], false)?
+                .checked_add(1)
+                .ok_or(err("mailbox highwater"))?
+    {
+        return Err(err("grant interval"));
     }
     let offer = encode_deterministic_cbor(&fields[35]).map_err(|_| err("offer"))?;
     let offer_parsed = validate_offer_v3(&offer)?;
-    if digest(&fields[23])?
-        != Sha256Digest::hash_domain(
-            b"dirextalk.recovery-recipient-key.v1\0",
-            &fixed::<32>(&fields[14]).map_err(|_| err("candidate key bytes"))?,
-        )
-        || digest(&fields[24])? != offer_parsed.digest()
+    if nonzero_digest(&fields[23])?
+        != Sha256Digest::hash_domain(RECIPIENT_KEY_DIGEST_DOMAIN, &candidate_recipient_key)
+        || nonzero_digest(&fields[24])? != offer_parsed.digest()
     {
         return Err(err("grant offer coordinates"));
     }
     let offer_fields = map(&fields[35], 16)?;
-    if offer_fields[1] != fields[2]
+    if uuid(&offer_fields[1])? != request_id
         || offer_fields[2] != fields[3]
         || offer_fields[3] != fields[4]
         || offer_fields[4] != fields[5]
@@ -619,6 +700,12 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
         || offer_fields[14] != fields[23]
     {
         return Err(err("offer coordinates"));
+    }
+    let offer_issued = uint(&offer_fields[12], false)?;
+    let offer_expires = uint(&offer_fields[13], false)?;
+    if grant_issued > offer_issued || offer_issued >= offer_expires || offer_expires > grant_expires
+    {
+        return Err(err("grant offer interval"));
     }
     verify(
         provider_key,
@@ -941,5 +1028,92 @@ mod tests {
         )]);
         let bytes = encode_deterministic_cbor(&value).expect("canonical cbor");
         assert!(validate_delivery_v2(&bytes).is_err());
+    }
+
+    #[test]
+    fn offer_rejects_client_forbidden_digest_and_attachment_shapes() {
+        let request = Uuid::now_v7();
+        let catalog = Uuid::now_v7();
+        let ciphertext = b"opaque-offer";
+        let mut fields = vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(3)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(request.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Bytes([1; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                CanonicalValue::Bytes([2; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(5),
+                CanonicalValue::Text(catalog.to_string()),
+            ),
+            (CanonicalValue::Unsigned(6), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(7),
+                CanonicalValue::Bytes([3; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(8),
+                CanonicalValue::Bytes([4; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(9),
+                CanonicalValue::Bytes([5; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(10),
+                CanonicalValue::Bytes(ciphertext.to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(11),
+                Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, ciphertext).to_canonical_value(),
+            ),
+            (CanonicalValue::Unsigned(12), CanonicalValue::Null),
+            (CanonicalValue::Unsigned(13), CanonicalValue::Unsigned(10)),
+            (CanonicalValue::Unsigned(14), CanonicalValue::Unsigned(20)),
+            (
+                CanonicalValue::Unsigned(15),
+                CanonicalValue::Bytes([6; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(16),
+                CanonicalValue::Bytes([7; 32].to_vec()),
+            ),
+        ];
+        let encode_offer = |fields: &Vec<(CanonicalValue, CanonicalValue)>| {
+            encode_deterministic_cbor(&CanonicalValue::Map(fields.clone())).expect("offer")
+        };
+        assert!(validate_offer_v3(&encode_offer(&fields)).is_ok());
+        for (index, value) in [
+            (2, CanonicalValue::Bytes([0; 32].to_vec())),
+            (8, CanonicalValue::Bytes([0; 32].to_vec())),
+            (10, CanonicalValue::Bytes([0; 32].to_vec())),
+            (14, CanonicalValue::Bytes([0; 32].to_vec())),
+            (15, CanonicalValue::Bytes([0; 32].to_vec())),
+        ] {
+            fields[index].1 = value;
+            assert!(
+                validate_offer_v3(&encode_offer(&fields)).is_err(),
+                "offer field {} accepted",
+                index + 1
+            );
+            fields[index].1 = match index {
+                2 => CanonicalValue::Bytes([1; 32].to_vec()),
+                8 => CanonicalValue::Bytes([5; 32].to_vec()),
+                10 => Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, ciphertext)
+                    .to_canonical_value(),
+                14 => CanonicalValue::Bytes([6; 32].to_vec()),
+                15 => CanonicalValue::Bytes([7; 32].to_vec()),
+                _ => unreachable!(),
+            };
+        }
+        fields[11].1 = CanonicalValue::Unsigned(1);
+        assert!(validate_offer_v3(&encode_offer(&fields)).is_err());
     }
 }
