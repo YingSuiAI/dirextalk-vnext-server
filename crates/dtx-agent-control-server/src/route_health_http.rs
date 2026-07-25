@@ -112,7 +112,7 @@ pub async fn record_route_health(
         .map_err(|_| RouteHealthParseError::InvalidShape)?;
     let result = async {
         let route = sqlx::query(
-            "SELECT h.route_fence, b.route_health_key_id, b.route_health_public_key, h.connector_id\
+            "SELECT h.route_fence, b.route_health_key_id, b.route_health_public_key, b.connector_id\
              FROM agent.agent_route_binding_heads h JOIN agent.agent_route_bootstraps b\
              ON b.tenant_id=h.tenant_id AND b.bootstrap_id=h.bootstrap_id\
              WHERE h.tenant_id=$1 AND h.route_id=$2 AND h.installation_id=$3 AND h.binding_id=$4\
