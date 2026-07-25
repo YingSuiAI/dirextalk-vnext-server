@@ -40,12 +40,18 @@ pub const AGENT_ROUTE_BOOTSTRAP_BEGIN_RECEIPT_DOMAIN: &[u8] =
     b"dirextalk.agent-route-bootstrap-begin-receipt.v1\0";
 pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_BINDING_DOMAIN: &[u8] =
     b"dirextalk.agent-route-bootstrap-delivery-binding.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_BINDING_DOMAIN_V2: &[u8] =
+    b"dirextalk.agent-route-bootstrap-delivery-binding.v2\0";
 pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.agent-route-bootstrap-delivery-signature.v1\0";
 pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_REQUEST_DOMAIN: &[u8] =
     b"dirextalk.agent-route-bootstrap-delivery-request.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_REQUEST_DOMAIN_V2: &[u8] =
+    b"dirextalk.agent-route-bootstrap-delivery-request.v2\0";
 pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN: &[u8] =
     b"dirextalk.agent-route-bootstrap-delivery-receipt.v1\0";
+pub const AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN_V2: &[u8] =
+    b"dirextalk.agent-route-bootstrap-delivery-receipt.v2\0";
 pub const AGENT_ROUTE_RECIPIENT_CAPSULE_DOMAIN: &[u8] =
     b"dirextalk.agent-route-recipient-capsule.v1\0";
 pub const AGENT_ROUTE_BOOTSTRAP_CAPSULE_DOMAIN: &[u8] =
@@ -191,6 +197,8 @@ pub struct AgentRouteBootstrapDeliveryCommand {
     pub expires_at: UtcMillis,
     pub binding_digest: Sha256Digest,
     pub owner_signature: Ed25519Signature,
+    pub server_receipt_key_id: Option<RouteHealthKeyId>,
+    pub server_receipt_public_key_digest: Option<Sha256Digest>,
 }
 
 impl fmt::Debug for AgentRouteBootstrapDeliveryCommand {
@@ -435,8 +443,14 @@ pub async fn deliver_agent_route_bootstrap(
     now: UtcMillis,
 ) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
     validate_delivery(&command, &exact_body, now)?;
-    let request_digest =
-        Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_DELIVERY_REQUEST_DOMAIN, &exact_body);
+    let request_digest = Sha256Digest::hash_domain(
+        if command.server_receipt_key_id.is_some() {
+            AGENT_ROUTE_BOOTSTRAP_DELIVERY_REQUEST_DOMAIN_V2
+        } else {
+            AGENT_ROUTE_BOOTSTRAP_DELIVERY_REQUEST_DOMAIN
+        },
+        &exact_body,
+    );
     let mut session = store
         .begin_tenant(command.tenant_id)
         .await
@@ -941,6 +955,11 @@ async fn deliver_in_transaction(
     {
         return Err(AgentRouteBootstrapError::Forbidden);
     }
+    if command.server_receipt_key_id != row.server_receipt_key_id
+        || command.server_receipt_public_key_digest != row.server_receipt_public_key_digest
+    {
+        return Err(AgentRouteBootstrapError::Conflict);
+    }
     if let Some(delivery_id) = row.delivery_id {
         if delivery_id != command.delivery_id {
             return Err(AgentRouteBootstrapError::Conflict);
@@ -968,9 +987,12 @@ async fn deliver_in_transaction(
                 .try_get("delivery_receipt_digest")
                 .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
         )?;
-        if Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN, &exact_cbor)
-            .as_bytes()
-            != &digest
+        let receipt_domain = if row.server_receipt_key_id.is_some() {
+            AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN_V2
+        } else {
+            AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN
+        };
+        if Sha256Digest::hash_domain(receipt_domain, &exact_cbor).as_bytes() != &digest
             || decode_deterministic_cbor(&exact_cbor).is_err()
         {
             return Err(AgentRouteBootstrapError::Unavailable);
@@ -1016,8 +1038,14 @@ async fn deliver_in_transaction(
         now,
         None,
     )?;
-    let receipt_digest =
-        Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN, &receipt);
+    let receipt_digest = Sha256Digest::hash_domain(
+        if row.server_receipt_key_id.is_some() {
+            AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN_V2
+        } else {
+            AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN
+        },
+        &receipt,
+    );
     let changed = sqlx::query(
         "UPDATE agent.agent_route_bootstraps
             SET state='pending_delivery', route_id=$3, delivery_id=$4,
@@ -1136,8 +1164,14 @@ async fn revoke_delivery_for_invalid_target(
         now,
         None,
     )?;
-    let receipt_digest =
-        Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN, &receipt);
+    let receipt_digest = Sha256Digest::hash_domain(
+        if row.server_receipt_key_id.is_some() {
+            AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN_V2
+        } else {
+            AGENT_ROUTE_BOOTSTRAP_DELIVERY_RECEIPT_DOMAIN
+        },
+        &receipt,
+    );
     let changed = sqlx::query(
         "UPDATE agent.agent_route_bootstraps
             SET state='revoked', route_fence=NULL,
@@ -1831,6 +1865,10 @@ fn validate_delivery(
             AGENT_ROUTE_BOOTSTRAP_CAPSULE_DOMAIN,
             &command.opaque_sealed_bootstrap,
         ) != command.capsule_digest
+    {
+        return Err(AgentRouteBootstrapError::InvalidRequest);
+    }
+    if command.server_receipt_key_id.is_some() != command.server_receipt_public_key_digest.is_some()
     {
         return Err(AgentRouteBootstrapError::InvalidRequest);
     }

@@ -3763,17 +3763,36 @@ fn parse_agent_route_bootstrap_delivery(
         3,
     )?;
     let binding = map_value(&request, 1)?.clone();
-    let fields = exact_map(binding.clone(), 14)?;
-    expect_version(&fields)?;
+    let fields = match binding.clone() {
+        CanonicalValue::Map(fields) if fields.len() == 14 => {
+            if unsigned_int(&fields, 1)? != 1 {
+                return Err(AgentProvisioningOwnerError::InvalidRequest);
+            }
+            fields
+        }
+        CanonicalValue::Map(fields) if fields.len() == 16 => {
+            if unsigned_int(&fields, 1)? != 2 {
+                return Err(AgentProvisioningOwnerError::InvalidRequest);
+            }
+            fields
+        }
+        _ => return Err(AgentProvisioningOwnerError::InvalidRequest),
+    };
     let binding_digest = digest(map_value(&request, 2)?)?;
-    if binding_digest
-        != binding_hash(
-            crate::AGENT_ROUTE_BOOTSTRAP_DELIVERY_BINDING_DOMAIN,
-            &binding,
-        )?
-    {
+    let binding_domain = if fields.len() == 16 {
+        crate::agent_route_bootstrap::AGENT_ROUTE_BOOTSTRAP_DELIVERY_BINDING_DOMAIN_V2
+    } else {
+        crate::AGENT_ROUTE_BOOTSTRAP_DELIVERY_BINDING_DOMAIN
+    };
+    if binding_digest != binding_hash(binding_domain, &binding)? {
         return Err(AgentProvisioningOwnerError::InvalidRequest);
     }
+    let server_receipt_key_id = (fields.len() == 16)
+        .then(|| text_id(&fields, 15))
+        .transpose()?;
+    let server_receipt_public_key_digest = (fields.len() == 16)
+        .then(|| digest(map_value(&fields, 16)?))
+        .transpose()?;
     Ok(AgentRouteBootstrapDeliveryCommand {
         bootstrap_id: text_id(&fields, 2)?,
         delivery_id: text_id(&fields, 3)?,
@@ -3790,6 +3809,8 @@ fn parse_agent_route_bootstrap_delivery(
         expires_at: utc(&fields, 14)?,
         binding_digest,
         owner_signature: Ed25519Signature::from_bytes(bytes_array(map_value(&request, 3)?)?),
+        server_receipt_key_id,
+        server_receipt_public_key_digest,
     })
 }
 
