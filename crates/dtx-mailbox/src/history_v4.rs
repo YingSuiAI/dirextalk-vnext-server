@@ -353,13 +353,19 @@ impl crate::MailboxRepository {
             {
                 return Err(MailboxPersistenceError::ProviderAuthorizationRejected);
             }
+            let grant_digest = command.grant_digest();
+            advisory_lock(
+                tx.connection(),
+                "history-recovery-grant-idempotency",
+                &format!("{}:{}", command.identity_id, command.idempotency_digest),
+            )
+            .await?;
             advisory_lock(
                 tx.connection(),
                 "history-recovery-grant-request",
                 &format!("{}:{}", command.identity_id, command.request_id),
             )
             .await?;
-            let grant_digest = command.grant_digest();
             if let Some(row) = sqlx::query("SELECT grant_digest,receipt_bytes,receipt_hash FROM messaging.history_recovery_grants_v4 WHERE identity_id=$1 AND request_id=$2")
                 .bind(command.identity_id.to_string()).bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await? {
                 if row.try_get::<Vec<u8>,_>("grant_digest")?.as_slice() != grant_digest.as_bytes() { return Err(MailboxPersistenceError::IdempotencyConflict); }
@@ -595,8 +601,48 @@ impl crate::MailboxRepository {
             {
                 return Err(MailboxPersistenceError::CorruptData("grant outbox binding"));
             }
-            sqlx::query("INSERT INTO messaging.history_recovery_grants_v4(identity_id,request_id,request_digest,manifest_digest,catalog_id,generation,catalog_head_bytes,catalog_head_digest,catalog_merkle_root,catalog_leaf_count,catalog_leaf_set_digest,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_digest,preparation_digest,provider_device_id,provider_descriptor,authority_descriptor,recipient_key_digest,offer_digest,mailbox_id,envelope_id,mailbox_highwater,earliest_sequence,delivery_fact_id,issued_at_ms,expires_at_ms,idempotency_digest,provider_signature,authority_signature,exact_offer,exact_grant,grant_digest,delivery_fact_bytes,delivery_fact_digest,receipt_bytes,receipt_hash,accepted_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43)")
-                .bind(command.identity_id.to_string()).bind(*command.request_id.as_uuid()).bind(command.request_digest.as_bytes()).bind(command.manifest_digest.as_bytes()).bind(command.catalog_id).bind(command.generation.get() as i64).bind(&command.catalog_head_bytes).bind(command.catalog_head_digest.as_bytes()).bind(command.catalog_merkle_root.as_bytes()).bind(command.catalog_leaf_count.get() as i64).bind(command.catalog_leaf_set_digest.as_bytes()).bind(*command.candidate_device_id.as_uuid()).bind(command.candidate_signing_key.as_bytes()).bind(command.candidate_recipient_key.as_slice()).bind(command.pre_head_sequence.get() as i64).bind(command.pre_head_hash.as_bytes()).bind(command.post_head_sequence.get() as i64).bind(command.post_head_hash.as_bytes()).bind(command.device_add_digest.as_bytes()).bind(command.preparation_digest.as_bytes()).bind(*command.provider_device_id.as_uuid()).bind(&command.provider_descriptor).bind(&command.authority_descriptor).bind(command.recipient_key_digest.as_bytes()).bind(command.offer_digest.as_bytes()).bind(*command.mailbox_id.as_uuid()).bind(*command.envelope_id.as_uuid()).bind(command.mailbox_highwater.get() as i64).bind(command.earliest_sequence.get() as i64).bind(command.delivery_fact_id).bind(command.issued_at.get()).bind(command.expires_at.get()).bind(command.idempotency_digest.as_bytes()).bind(command.provider_signature.as_bytes()).bind(command.authority_signature.as_bytes()).bind(&command.exact_offer).bind(&command.exact_grant).bind(grant_digest.as_bytes()).bind(&fact).bind(Sha256Digest::hash_domain(DELIVERY_FACT_DOMAIN,&fact).as_bytes()).bind(&receipt).bind(Sha256Digest::hash_domain(DELIVERY_RECEIPT_DOMAIN,&receipt).as_bytes()).bind(now.get()).execute(&mut *tx.connection()).await?;
+            let inserted = sqlx::query("INSERT INTO messaging.history_recovery_grants_v4(identity_id,request_id,request_digest,manifest_digest,catalog_id,generation,catalog_head_bytes,catalog_head_digest,catalog_merkle_root,catalog_leaf_count,catalog_leaf_set_digest,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_digest,preparation_digest,provider_device_id,provider_descriptor,authority_descriptor,recipient_key_digest,offer_digest,mailbox_id,envelope_id,mailbox_highwater,earliest_sequence,delivery_fact_id,issued_at_ms,expires_at_ms,idempotency_digest,provider_signature,authority_signature,exact_offer,exact_grant,grant_digest,delivery_fact_bytes,delivery_fact_digest,receipt_bytes,receipt_hash,accepted_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43) ON CONFLICT DO NOTHING RETURNING grant_digest")
+                .bind(command.identity_id.to_string()).bind(*command.request_id.as_uuid()).bind(command.request_digest.as_bytes()).bind(command.manifest_digest.as_bytes()).bind(command.catalog_id).bind(command.generation.get() as i64).bind(&command.catalog_head_bytes).bind(command.catalog_head_digest.as_bytes()).bind(command.catalog_merkle_root.as_bytes()).bind(command.catalog_leaf_count.get() as i64).bind(command.catalog_leaf_set_digest.as_bytes()).bind(*command.candidate_device_id.as_uuid()).bind(command.candidate_signing_key.as_bytes()).bind(command.candidate_recipient_key.as_slice()).bind(command.pre_head_sequence.get() as i64).bind(command.pre_head_hash.as_bytes()).bind(command.post_head_sequence.get() as i64).bind(command.post_head_hash.as_bytes()).bind(command.device_add_digest.as_bytes()).bind(command.preparation_digest.as_bytes()).bind(*command.provider_device_id.as_uuid()).bind(&command.provider_descriptor).bind(&command.authority_descriptor).bind(command.recipient_key_digest.as_bytes()).bind(command.offer_digest.as_bytes()).bind(*command.mailbox_id.as_uuid()).bind(*command.envelope_id.as_uuid()).bind(command.mailbox_highwater.get() as i64).bind(command.earliest_sequence.get() as i64).bind(command.delivery_fact_id).bind(command.issued_at.get()).bind(command.expires_at.get()).bind(command.idempotency_digest.as_bytes()).bind(command.provider_signature.as_bytes()).bind(command.authority_signature.as_bytes()).bind(&command.exact_offer).bind(&command.exact_grant).bind(grant_digest.as_bytes()).bind(&fact).bind(Sha256Digest::hash_domain(DELIVERY_FACT_DOMAIN,&fact).as_bytes()).bind(&receipt).bind(Sha256Digest::hash_domain(DELIVERY_RECEIPT_DOMAIN,&receipt).as_bytes()).bind(now.get()).fetch_optional(&mut *tx.connection()).await?;
+            if inserted.is_none() {
+                if let Some(row) = sqlx::query("SELECT grant_digest,receipt_bytes,receipt_hash FROM messaging.history_recovery_grants_v4 WHERE identity_id=$1 AND request_id=$2")
+                    .bind(command.identity_id.to_string())
+                    .bind(*command.request_id.as_uuid())
+                    .fetch_optional(&mut *tx.connection())
+                    .await?
+                {
+                    let existing: Vec<u8> = row.try_get("grant_digest")?;
+                    if existing.as_slice() == grant_digest.as_bytes() {
+                        let receipt: Vec<u8> = row.try_get("receipt_bytes")?;
+                        let hash: Vec<u8> = row.try_get("receipt_hash")?;
+                        if Sha256Digest::hash_domain(DELIVERY_RECEIPT_DOMAIN, &receipt).as_bytes()
+                            != hash.as_slice()
+                        {
+                            return Err(MailboxPersistenceError::ReceiptIntegrity);
+                        }
+                        return Ok(MailboxOperationOutcome::new(receipt, true));
+                    }
+                }
+                if let Some(row) = sqlx::query("SELECT grant_digest,receipt_bytes,receipt_hash FROM messaging.history_recovery_grants_v4 WHERE identity_id=$1 AND provider_device_id=$2 AND idempotency_digest=$3")
+                    .bind(command.identity_id.to_string())
+                    .bind(*command.provider_device_id.as_uuid())
+                    .bind(command.idempotency_digest.as_bytes())
+                    .fetch_optional(&mut *tx.connection())
+                    .await?
+                {
+                    if row.try_get::<Vec<u8>, _>("grant_digest")?.as_slice() != grant_digest.as_bytes() {
+                        return Err(MailboxPersistenceError::IdempotencyConflict);
+                    }
+                    let receipt: Vec<u8> = row.try_get("receipt_bytes")?;
+                    let hash: Vec<u8> = row.try_get("receipt_hash")?;
+                    if Sha256Digest::hash_domain(DELIVERY_RECEIPT_DOMAIN, &receipt).as_bytes()
+                        != hash.as_slice()
+                    {
+                        return Err(MailboxPersistenceError::ReceiptIntegrity);
+                    }
+                    return Ok(MailboxOperationOutcome::new(receipt, true));
+                }
+                return Err(MailboxPersistenceError::CorruptData("grant unique conflict"));
+            }
             Ok(MailboxOperationOutcome::new(receipt, false))
         }.await;
         finish_transaction(tx, result).await

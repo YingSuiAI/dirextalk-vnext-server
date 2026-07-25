@@ -264,7 +264,13 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, MailboxPersi
                   WHERE namespace.nspname = 'identity'
                     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
                     AND (
-                        (relation.relname NOT IN ('device_sessions', 'log_heads', 'log_entries')
+                        (relation.relname NOT IN (
+                             'device_sessions', 'log_heads', 'log_entries',
+                             'device_enrollment_challenges',
+                             'history_recovery_requests',
+                             'recovery_scope_catalogs',
+                             'recovery_scope_catalog_preparations'
+                         )
                          AND has_table_privilege(current_user, relation.oid, 'SELECT'))
                         OR has_table_privilege(current_user, relation.oid, 'INSERT')
                         OR has_table_privilege(current_user, relation.oid, 'UPDATE')

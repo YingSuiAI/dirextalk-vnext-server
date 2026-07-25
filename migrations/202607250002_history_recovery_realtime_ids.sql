@@ -19,3 +19,6 @@ BEGIN
     END IF;
 END
 $grants$;
+
+REVOKE ALL ON FUNCTION identity.enforce_history_recovery_request_v4_immutable()
+    FROM PUBLIC;
