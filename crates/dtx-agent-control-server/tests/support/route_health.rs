@@ -1,6 +1,12 @@
 //! Shared Route Health HTTP fixture support.
 
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use axum::{body::Body, http::Request};
 use dtx_agent_control::EnrollmentToken;
@@ -22,6 +28,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use super::{PostgresHarness, agent_provisioning as fixture};
+
+static FIXTURE_SEED: AtomicU8 = AtomicU8::new(201);
 
 /// All durable facts needed to exercise the Route Health HTTP boundary.
 pub struct RouteHealthFixture {
@@ -59,7 +67,7 @@ impl<'a> RouteHealthFixtureBuilder<'a> {
         fixture::init_test_clock();
         fixture::grant_agent_route_run_runtime_access(self.harness).await?;
         sqlx::raw_sql(
-            "GRANT SELECT, INSERT ON agent.agent_route_health_receipts TO dtx_runtime_test;
+            "GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_receipts TO dtx_runtime_test;
              GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_runtime_test;",
         )
         .execute(self.harness.admin_pool())
@@ -67,9 +75,10 @@ impl<'a> RouteHealthFixtureBuilder<'a> {
         let store = self.harness.runtime_store(12).await?;
         let tenant_id = TenantId::new();
         fixture::provision_tenant(&store, tenant_id).await?;
+        let seed = FIXTURE_SEED.fetch_add(10, Ordering::Relaxed);
 
-        let owner_root = fixture::key(201);
-        let owner_device_key = fixture::key(202);
+        let owner_root = fixture::key(seed);
+        let owner_device_key = fixture::key(seed.wrapping_add(1));
         let owner_device_id = DeviceId::new();
         let (owner_identity_id, owner_head, _) = fixture::provision_identity(
             self.harness,
@@ -87,7 +96,10 @@ impl<'a> RouteHealthFixtureBuilder<'a> {
             [0xD1; 32],
         )
         .await?;
-        let (agent_root, agent_device_key) = (fixture::key(204), fixture::key(205));
+        let (agent_root, agent_device_key) = (
+            fixture::key(seed.wrapping_add(3)),
+            fixture::key(seed.wrapping_add(4)),
+        );
         let identity_device_id = DeviceId::new();
         let (agent_identity_id, agent_head, agent_certificate) = fixture::provision_identity(
             self.harness,
@@ -130,15 +142,19 @@ impl<'a> RouteHealthFixtureBuilder<'a> {
                 tenant_id,
                 connector.connector_id(),
                 RequestId::new(),
-                EnrollmentToken::from_bytes([0xD2; 32]),
+                EnrollmentToken::from_bytes([seed.wrapping_add(6); 32]),
                 None,
             )?)
             .await?;
-        let enrollment_request =
-            fixture::signed_enrollment_request(&enrollment, &[0xD2; 32], 207, 208)?;
+        let enrollment_request = fixture::signed_enrollment_request(
+            &enrollment,
+            &[seed.wrapping_add(6); 32],
+            seed.wrapping_add(7),
+            seed.wrapping_add(8),
+        )?;
         let completion = app
             .enroll(ParsedEnrollment {
-                token: EnrollmentToken::from_bytes([0xD2; 32]),
+                token: EnrollmentToken::from_bytes([seed.wrapping_add(6); 32]),
                 request: enrollment_request,
             })
             .await?;
@@ -236,7 +252,7 @@ impl<'a> RouteHealthFixtureBuilder<'a> {
         let bootstrap_id = dtx_domain::AgentRouteBootstrapId::try_from(bootstrap_id)?;
         let delivery_id = dtx_domain::AgentRouteDeliveryId::try_from(delivery_id)?;
         let route_health_key_id = RouteHealthKeyId::new();
-        let route_health_key = fixture::key(209);
+        let route_health_key = fixture::key(seed.wrapping_add(9));
         let mut route_session = store.begin_tenant(tenant_id).await?;
         sqlx::query(
             "UPDATE agent.agent_route_bootstraps
@@ -278,8 +294,16 @@ impl<'a> RouteHealthFixtureBuilder<'a> {
 
 impl RouteHealthFixture {
     pub fn signed_request(&self, request_id: RequestId, status_revision: Revision) -> Vec<u8> {
+        self.signed_request_with_nonce(request_id, status_revision, [0xD4; 32])
+    }
+
+    pub fn signed_request_with_nonce(
+        &self,
+        request_id: RequestId,
+        status_revision: Revision,
+        nonce: [u8; 32],
+    ) -> Vec<u8> {
         let now = fixture::now();
-        let nonce = [0xD4; 32];
         let mut fields = vec![
             (fixture::u(1), fixture::u(1)),
             (fixture::u(2), fixture::text(request_id)),
@@ -319,6 +343,29 @@ impl RouteHealthFixture {
         encode_deterministic_cbor(&CanonicalValue::Map(fields)).unwrap()
     }
 
+    pub fn resign_request<F>(&self, bytes: &[u8], mutate: F) -> Vec<u8>
+    where
+        F: FnOnce(&mut Vec<(CanonicalValue, CanonicalValue)>),
+    {
+        let CanonicalValue::Map(mut fields) =
+            dtx_wire::decode_deterministic_cbor(bytes).expect("fixture request cbor")
+        else {
+            panic!("fixture request map")
+        };
+        fields.retain(|(key, _)| *key != fixture::u(23));
+        mutate(&mut fields);
+        let signed = encode_deterministic_cbor(&CanonicalValue::Map(fields.clone())).unwrap();
+        let signature = self.route_health_key.sign(
+            Sha256Digest::hash_domain(
+                dtx_agent_control_server::ROUTE_HEALTH_SIGNATURE_DOMAIN,
+                &signed,
+            )
+            .as_bytes(),
+        );
+        fields.push((fixture::u(23), fixture::bytes(&signature.to_bytes())));
+        encode_deterministic_cbor(&CanonicalValue::Map(fields)).unwrap()
+    }
+
     pub fn connect_info(&self) -> RouteHealthConnectInfo {
         RouteHealthConnectInfo(self.peer)
     }
@@ -331,11 +378,31 @@ impl RouteHealthFixture {
         receipt_seed: [u8; 32],
     ) -> Result<axum::response::Response, Box<dyn Error>> {
         let body = self.signed_request(request_id, status_revision);
+        self.post_body(body, receipt_key_id, receipt_seed).await
+    }
+
+    pub async fn post_body(
+        &self,
+        body: Vec<u8>,
+        receipt_key_id: RouteHealthKeyId,
+        receipt_seed: [u8; 32],
+    ) -> Result<axum::response::Response, Box<dyn Error>> {
+        self.post_body_as_peer(body, receipt_key_id, receipt_seed, self.peer)
+            .await
+    }
+
+    pub async fn post_body_as_peer(
+        &self,
+        body: Vec<u8>,
+        receipt_key_id: RouteHealthKeyId,
+        receipt_seed: [u8; 32],
+        peer: AuthenticatedConnectorPeer,
+    ) -> Result<axum::response::Response, Box<dyn Error>> {
         let mut request = Request::post("/agent-route/health").body(Body::from(body))?;
         request
             .extensions_mut()
             .insert(axum::extract::connect_info::ConnectInfo(
-                self.connect_info(),
+                RouteHealthConnectInfo(peer),
             ));
         Ok(dtx_agent_control_server::route_health_router_with_state(
             dtx_agent_control_server::RouteHealthHttpState {

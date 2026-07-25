@@ -112,11 +112,14 @@ pub async fn record_route_health(
         .map_err(|_| RouteHealthParseError::InvalidShape)?;
     let result = async {
         let route = sqlx::query(
-            "SELECT h.route_fence, b.route_health_key_id, b.route_health_public_key, b.connector_id\
-             FROM agent.agent_route_binding_heads h JOIN agent.agent_route_bootstraps b\
-             ON b.tenant_id=h.tenant_id AND b.bootstrap_id=h.bootstrap_id\
-             WHERE h.tenant_id=$1 AND h.route_id=$2 AND h.installation_id=$3 AND h.binding_id=$4\
-               AND h.agent_control_device_id=$5 AND h.delivery_id=$6 FOR UPDATE",
+            "SELECT h.route_fence, b.route_health_key_id, b.route_health_public_key, b.connector_id
+               FROM agent.agent_route_binding_heads h
+               JOIN agent.agent_route_bootstraps b
+                 ON b.tenant_id=h.tenant_id AND b.bootstrap_id=h.bootstrap_id
+              WHERE h.tenant_id=$1 AND h.route_id=$2 AND h.installation_id=$3
+                AND h.binding_id=$4 AND h.agent_control_device_id=$5
+                AND h.delivery_id=$6
+              FOR UPDATE",
         )
         .bind(Uuid::from(request.tenant_id)).bind(Uuid::from(request.route_id)).bind(Uuid::from(request.installation_id))
         .bind(Uuid::from(request.binding_id)).bind(Uuid::from(request.agent_device_id)).bind(Uuid::from(request.delivery_id))
@@ -147,7 +150,7 @@ pub async fn record_route_health(
              JOIN agent.agent_devices d ON d.tenant_id=a.tenant_id
                AND d.installation_id=a.installation_id AND d.agent_device_id=a.agent_device_id
              JOIN identity.log_heads h ON h.identity_id=a.agent_identity_id
-             AND h.sequence=a.identity_head_sequence AND h.head_hash=a.identity_head_hash
+             AND h.head_sequence=a.identity_head_sequence AND h.head_hash=a.identity_head_hash
              WHERE a.tenant_id=$1 AND a.installation_id=$2 AND a.binding_id=$3
                AND a.agent_device_id=$4 AND a.credential_fingerprint=d.credential_fingerprint
                AND d.state='active')")

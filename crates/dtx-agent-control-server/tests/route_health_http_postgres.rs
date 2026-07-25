@@ -8,6 +8,8 @@ mod support;
 
 use std::error::Error;
 
+use dtx_wire::{CanonicalValue, decode_deterministic_cbor, encode_deterministic_cbor};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sqlx::Executor;
 use support::PostgresHarness;
 
@@ -20,7 +22,7 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
     // Test-only privilege expansion is limited to the two Route Health
     // ledger relations; production grants and tenant RLS remain unchanged.
     sqlx::raw_sql(
-        "GRANT SELECT, INSERT ON agent.agent_route_health_receipts TO dtx_runtime_test;
+        "GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_receipts TO dtx_runtime_test;
          GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_runtime_test;",
     )
     .execute(harness.admin_pool())
@@ -99,5 +101,412 @@ async fn route_health_fixture_establishes_installed_route_and_runtime_visibility
     .await?;
     assert_eq!(current_approval, 1);
     session.rollback().await?;
+    Ok(())
+}
+
+async fn route_health_counts(
+    fixture: &support::route_health::RouteHealthFixture,
+) -> Result<(i64, Option<(i64, i64)>), Box<dyn Error>> {
+    let mut session = fixture.store.begin_tenant(fixture.tenant_id).await?;
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.agent_route_health_receipts
+          WHERE tenant_id=$1 AND route_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant_id))
+    .bind(uuid::Uuid::from(fixture.route_id))
+    .fetch_one(session.connection())
+    .await?;
+    let head: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT observation_revision, status_revision
+           FROM agent.agent_route_health_heads
+          WHERE tenant_id=$1 AND route_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant_id))
+    .bind(uuid::Uuid::from(fixture.route_id))
+    .fetch_optional(session.connection())
+    .await?;
+    session.rollback().await?;
+    Ok((receipts, head))
+}
+
+fn verify_receipt(
+    bytes: &[u8],
+    receipt_key_id: dtx_domain::RouteHealthKeyId,
+    receipt_seed: [u8; 32],
+) -> Result<bool, Box<dyn Error>> {
+    let CanonicalValue::Map(fields) = decode_deterministic_cbor(bytes)? else {
+        return Err("receipt must be a canonical map".into());
+    };
+    let key_id = fields
+        .iter()
+        .find_map(|(key, value)| (*key == CanonicalValue::Unsigned(5)).then(|| value))
+        .ok_or("receipt key id missing")?;
+    assert_eq!(key_id, &CanonicalValue::Text(receipt_key_id.to_string()));
+    let signature = fields
+        .iter()
+        .find_map(|(key, value)| (*key == CanonicalValue::Unsigned(12)).then(|| value))
+        .and_then(|value| match value {
+            CanonicalValue::Bytes(bytes) => <[u8; 64]>::try_from(bytes.as_slice()).ok(),
+            _ => None,
+        })
+        .ok_or("receipt signature missing")?;
+    let signed_fields = fields
+        .iter()
+        .filter(|(key, _)| *key != CanonicalValue::Unsigned(12))
+        .cloned()
+        .collect::<Vec<_>>();
+    let signed = encode_deterministic_cbor(&CanonicalValue::Map(signed_fields))?;
+    let verifying = VerifyingKey::from_bytes(
+        &ed25519_dalek::SigningKey::from_bytes(&receipt_seed)
+            .verifying_key()
+            .to_bytes(),
+    )?;
+    verifying.verify(
+        dtx_wire::Sha256Digest::hash_domain(
+            dtx_agent_control_server::ROUTE_HEALTH_RECEIPT_DOMAIN,
+            &signed,
+        )
+        .as_bytes(),
+        &Signature::from_bytes(&signature),
+    )?;
+    Ok(fields
+        .iter()
+        .find_map(|(key, value)| {
+            (*key == CanonicalValue::Unsigned(11)).then(|| value == &CanonicalValue::Bool(true))
+        })
+        .unwrap_or(false))
+}
+
+#[tokio::test]
+async fn route_health_http_accepts_replays_and_pins_signed_receipts() -> Result<(), Box<dyn Error>>
+{
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let receipt_key_id = dtx_domain::RouteHealthKeyId::new();
+    let receipt_seed = [0xE1; 32];
+    let body = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [1; 32],
+    );
+    let first = fixture
+        .post_body(body.clone(), receipt_key_id, receipt_seed)
+        .await?;
+    let first_status = first.status();
+    let first_content_type = first
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let first_bytes = axum::body::to_bytes(first.into_body(), 1_000_000)
+        .await?
+        .to_vec();
+    assert_eq!(first_status, axum::http::StatusCode::CREATED);
+    assert_eq!(
+        first_content_type.as_deref(),
+        Some(dtx_agent_control_server::ROUTE_HEALTH_MEDIA_TYPE_V1)
+    );
+    assert!(verify_receipt(&first_bytes, receipt_key_id, receipt_seed)?);
+    let replay = fixture
+        .post_body(body, receipt_key_id, receipt_seed)
+        .await?;
+    assert_eq!(replay.status(), axum::http::StatusCode::OK);
+    let replay_bytes = axum::body::to_bytes(replay.into_body(), 1_000_000)
+        .await?
+        .to_vec();
+    assert_eq!(replay_bytes, first_bytes);
+    assert_eq!(route_health_counts(&fixture).await?, (1, Some((1, 1))));
+    Ok(())
+}
+
+async fn post_status(
+    fixture: &support::route_health::RouteHealthFixture,
+    body: Vec<u8>,
+    receipt_key_id: dtx_domain::RouteHealthKeyId,
+    receipt_seed: [u8; 32],
+) -> Result<(axum::http::StatusCode, Vec<u8>), Box<dyn Error>> {
+    let response = fixture
+        .post_body(body, receipt_key_id, receipt_seed)
+        .await?;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1_000_000)
+        .await?
+        .to_vec();
+    Ok((status, body))
+}
+
+#[tokio::test]
+async fn route_health_http_rejects_nonce_conflicts_and_preserves_ledger()
+-> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let receipt_key_id = dtx_domain::RouteHealthKeyId::new();
+    let seed = [0xE2; 32];
+    let body = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [2; 32],
+    );
+    assert_eq!(
+        post_status(&fixture, body.clone(), receipt_key_id, seed)
+            .await?
+            .0,
+        axum::http::StatusCode::CREATED
+    );
+    let changed = fixture.resign_request(&body, |fields| {
+        for (key, value) in fields {
+            if *key == support::agent_provisioning::u(16) {
+                *value = support::agent_provisioning::u(2);
+            }
+        }
+    });
+    assert_eq!(
+        post_status(&fixture, changed, receipt_key_id, seed)
+            .await?
+            .0,
+        axum::http::StatusCode::CONFLICT
+    );
+    assert_eq!(route_health_counts(&fixture).await?, (1, Some((1, 1))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_health_http_concurrent_exact_requests_allocate_one_observation()
+-> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let receipt_key_id = dtx_domain::RouteHealthKeyId::new();
+    let seed = [0xE3; 32];
+    let body = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [3; 32],
+    );
+    let (left, right) = tokio::join!(
+        post_status(&fixture, body.clone(), receipt_key_id, seed),
+        post_status(&fixture, body, receipt_key_id, seed)
+    );
+    let left = left?;
+    let right = right?;
+    assert!(matches!(
+        (left.0, right.0),
+        (axum::http::StatusCode::CREATED, axum::http::StatusCode::OK)
+            | (axum::http::StatusCode::OK, axum::http::StatusCode::CREATED)
+    ));
+    assert_eq!(left.1, right.1);
+    assert_eq!(route_health_counts(&fixture).await?, (1, Some((1, 1))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_health_http_enforces_strict_status_monotonicity() -> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let receipt_key_id = dtx_domain::RouteHealthKeyId::new();
+    let seed = [0xE4; 32];
+    let first = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [4; 32],
+    );
+    assert_eq!(
+        post_status(&fixture, first, receipt_key_id, seed).await?.0,
+        axum::http::StatusCode::CREATED
+    );
+    let stale = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [5; 32],
+    );
+    assert_eq!(
+        post_status(&fixture, stale, receipt_key_id, seed).await?.0,
+        axum::http::StatusCode::CONFLICT
+    );
+    let next = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::new(2)?,
+        [6; 32],
+    );
+    assert_eq!(
+        post_status(&fixture, next, receipt_key_id, seed).await?.0,
+        axum::http::StatusCode::CREATED
+    );
+    assert_eq!(route_health_counts(&fixture).await?, (2, Some((2, 2))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_health_http_fences_stale_route_and_connector_facts() -> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let receipt_key_id = dtx_domain::RouteHealthKeyId::new();
+    let seed = [0xE5; 32];
+    let cases = vec![
+        ([10; 32], 11_u64, support::agent_provisioning::u(999)),
+        ([11; 32], 13_u64, support::agent_provisioning::u(999)),
+        (
+            [12; 32],
+            14_u64,
+            support::agent_provisioning::bytes(&[0xFA; 32]),
+        ),
+        (
+            [13; 32],
+            15_u64,
+            support::agent_provisioning::text(dtx_domain::RouteHealthKeyId::new()),
+        ),
+    ];
+    for (nonce, key, value) in cases {
+        let body = fixture.signed_request_with_nonce(
+            dtx_domain::RequestId::new(),
+            dtx_domain::Revision::INITIAL,
+            nonce,
+        );
+        let changed = fixture.resign_request(&body, |fields| {
+            for (field, current) in fields {
+                if *field == support::agent_provisioning::u(key) {
+                    *current = value.clone();
+                }
+            }
+        });
+        assert_eq!(
+            post_status(&fixture, changed, receipt_key_id, seed)
+                .await?
+                .0,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(route_health_counts(&fixture).await?, (0, None));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_health_http_marks_stale_agent_approval_without_rejecting_connector()
+-> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    support::agent_provisioning::revoke_agent_device(
+        &fixture.store,
+        fixture.tenant_id,
+        fixture.installation_id,
+        fixture.agent_device_id,
+    )
+    .await?;
+    let receipt_key_id = dtx_domain::RouteHealthKeyId::new();
+    let seed = [0xE6; 32];
+    let body = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [20; 32],
+    );
+    let response = post_status(&fixture, body, receipt_key_id, seed).await?;
+    assert_eq!(response.0, axum::http::StatusCode::CREATED);
+    assert!(!verify_receipt(&response.1, receipt_key_id, seed)?);
+    assert_eq!(route_health_counts(&fixture).await?, (1, Some((1, 1))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_health_http_rejects_authenticated_peer_for_another_connector()
+-> Result<(), Box<dyn Error>> {
+    let harness_a = PostgresHarness::start().await?;
+    let fixture_a = support::route_health::RouteHealthFixtureBuilder::new(&harness_a)
+        .establish()
+        .await?;
+    let harness_b = PostgresHarness::start().await?;
+    let fixture_b = support::route_health::RouteHealthFixtureBuilder::new(&harness_b)
+        .establish()
+        .await?;
+    let body = fixture_b.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [23; 32],
+    );
+    let response = fixture_b
+        .post_body_as_peer(
+            body,
+            dtx_domain::RouteHealthKeyId::new(),
+            [0xE9; 32],
+            fixture_a.peer,
+        )
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(route_health_counts(&fixture_b).await?, (0, None));
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_health_http_rejects_retired_route_and_cross_tenant_request_without_mutation()
+-> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let body = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [21; 32],
+    );
+    let foreign_tenant = dtx_domain::TenantId::new();
+    let isolated = fixture.resign_request(&body, |fields| {
+        for (key, value) in fields {
+            if *key == support::agent_provisioning::u(3) {
+                *value = support::agent_provisioning::text(foreign_tenant);
+            }
+        }
+    });
+    assert_eq!(
+        post_status(
+            &fixture,
+            isolated,
+            dtx_domain::RouteHealthKeyId::new(),
+            [0xE7; 32]
+        )
+        .await?
+        .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(route_health_counts(&fixture).await?, (0, None));
+
+    let mut admin_tx = harness.admin_pool().begin().await?;
+    sqlx::query("DELETE FROM agent.agent_route_binding_heads WHERE tenant_id=$1 AND route_id=$2")
+        .bind(uuid::Uuid::from(fixture.tenant_id))
+        .bind(uuid::Uuid::from(fixture.route_id))
+        .execute(&mut *admin_tx)
+        .await?;
+    sqlx::query("DELETE FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND route_id=$2")
+        .bind(uuid::Uuid::from(fixture.tenant_id))
+        .bind(uuid::Uuid::from(fixture.route_id))
+        .execute(&mut *admin_tx)
+        .await?;
+    admin_tx.commit().await?;
+    let retired = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [22; 32],
+    );
+    assert_eq!(
+        post_status(
+            &fixture,
+            retired,
+            dtx_domain::RouteHealthKeyId::new(),
+            [0xE8; 32]
+        )
+        .await?
+        .0,
+        axum::http::StatusCode::NOT_FOUND
+    );
+    assert_eq!(route_health_counts(&fixture).await?, (0, None));
     Ok(())
 }
