@@ -73,9 +73,11 @@ make_fixture() {
     ' *" reverse --remove tcp:8443 "*) echo "reverse-remove $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG";;' \
     'esac' >"$fixture/bin/adb"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "emulator $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'avd=""; port=""; while (($#)); do case "$1" in -avd) avd=$2; shift 2;; -port) port=$2; shift 2;; *) shift;; esac; done' 'tmp_map="$DTX_TEST_MAP/.emulator-$port.$$"; printf "%s\n" "$avd" >"$tmp_map"; mv -f -- "$tmp_map" "$DTX_TEST_MAP/emulator-$port"' 'exec python3 -c '\''import signal,sys; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.pause()'\'' emulator -avd "$avd" -port "$port"' >"$fixture/bin/emulator"
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_OPENSSL_SLEEP:-0}" == 1 ]] && sleep 5' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_OPENSSL_SLEEP:-0}" == 1 ]] && sleep 5' '[[ "${1:-}" != rand ]] || { printf "0123456789abcdef0123456789abcdef\n"; exit 0; }' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_SHA256_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/sha256sum "$@"' >"$fixture/bin/sha256sum"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_STAT_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/stat "$@"' >"$fixture/bin/stat"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_MKDIR_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/mkdir "$@"' >"$fixture/bin/mkdir"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_SORT_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/sort "$@"' >"$fixture/bin/sort"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "javac $*" >>"$DTX_TEST_LOG"' 'if [[ "$*" == *"-version"* ]]; then [[ "${DTX_TEST_JAVAC_VERSION_SLEEP:-0}" == 1 ]] && sleep 5; printf "javac 17.0.0\n" >&2; exit 0; fi' '[[ "${DTX_TEST_JAVAC_COMPILE_SLEEP:-0}" == 1 ]] && sleep 5' 'while (($#)); do if [[ "$1" == -d ]]; then mkdir -p "$2"; : >"$2/PlatformTrustProbe.class"; break; fi; shift; done' >"$fixture/bin/javac"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "d8 $*" >>"$DTX_TEST_LOG"' '[[ "${DTX_TEST_D8_SLEEP:-0}" == 1 ]] && sleep 5' 'while (($#)); do if [[ "$1" == --output ]]; then mkdir -p "$2"; : >"$2/classes.dex"; break; fi; shift; done' >"$fixture/sdk/build-tools/35.0.0/d8"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'if [[ "${DTX_TEST_PS_SLEEP_ON_MARKER:-0}" == 1 && -e "$DTX_TEST_ROOT/cleanup-probe-marker" ]]; then echo "ps cleanup probe" >>"$DTX_TEST_LOG"; sleep 5; fi' 'exec /usr/bin/ps "$@"' >"$fixture/bin/ps"
@@ -159,6 +161,28 @@ rg -F -- 'delete avd --name dirextalk-accept-proxy-partial-a' "$fixture/log" >/d
 rg -F -- 'delete avd --name dirextalk-accept-proxy-partial-b' "$fixture/log" >/dev/null
 rg -F -- '--project-name dtx-android-accept-proxy-partial down' "$fixture/log" >/dev/null
 [[ "$(<"$proxy_root/cleanup-status")" == cleanup=failed ]]
+
+# A guardian is durable cleanup state before child PID readiness.  Missing and
+# delayed PID files, and an immediately exiting child, must leave neither a
+# live guardian nor a claimed run root behind.
+for startup_case in missing-pid-file delayed-pid-file child-exits; do
+  fixture="$tmp/$startup_case"; make_fixture "$fixture"
+  case "$startup_case" in
+    missing-pid-file) if DTX_TEST_GUARDIAN_PID_LOG="$fixture/guardian-pids" DTX_TEST_GUARDIAN_PID_FILE_MISSING=1 run_fixture "$fixture" "$startup_case" env >/dev/null 2>&1; then exit 1; fi ;;
+    delayed-pid-file) if DTX_TEST_GUARDIAN_PID_LOG="$fixture/guardian-pids" DTX_TEST_GUARDIAN_PID_FILE_DELAY=10 run_fixture "$fixture" "$startup_case" env >/dev/null 2>&1; then exit 1; fi ;;
+    child-exits) printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$fixture/bin/emulator"; chmod +x "$fixture/bin/emulator"; if DTX_TEST_GUARDIAN_PID_LOG="$fixture/guardian-pids" run_fixture "$fixture" "$startup_case" env >/dev/null 2>&1; then exit 1; fi ;;
+  esac
+  [[ -s "$fixture/guardian-pids" && ! -e "$fixture/.android-acceptance/$startup_case" ]]
+  while IFS= read -r guardian_pid; do [[ "$guardian_pid" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$guardian_pid" 2>/dev/null; done <"$fixture/guardian-pids"
+done
+
+# Readiness itself has the same bounded cleanup path after a fully recorded
+# proxy starts but never binds either owned listener.
+fixture="$tmp/proxy-readiness"; make_fixture "$fixture"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'while :; do sleep 1; done' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
+if DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 DTX_TEST_GUARDIAN_PID_LOG="$fixture/guardian-pids" run_fixture "$fixture" proxy-readiness env >/dev/null 2>&1; then exit 1; fi
+[[ -s "$fixture/guardian-pids" && ! -e "$fixture/.android-acceptance/proxy-readiness" ]]
+while IFS= read -r guardian_pid; do [[ "$guardian_pid" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$guardian_pid" 2>/dev/null; done <"$fixture/guardian-pids"
 
 # A symlinked state root is rejected before any external command and never
 # turns cleanup into an outside-tree deletion.
@@ -325,6 +349,12 @@ fixture="$tmp/hung-d8"; make_fixture "$fixture"
 if DTX_TEST_NATIVE_TRUST_PROBE=1 DTX_TEST_D8_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 ANDROID_SDK_ROOT="$fixture/sdk" run_fixture "$fixture" hung-d8 env >/dev/null 2>&1; then exit 1; fi
 rg -F 'd8 --lib ' "$fixture/log" >/dev/null
 [[ ! -e "$fixture/.android-acceptance/hung-d8" ]]
+fixture="$tmp/hung-filter"; make_fixture "$fixture"
+if DTX_TEST_NATIVE_TRUST_PROBE=1 DTX_TEST_SORT_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 ANDROID_SDK_ROOT="$fixture/sdk" run_fixture "$fixture" hung-filter env >/dev/null 2>&1; then exit 1; fi
+[[ ! -e "$fixture/.android-acceptance/hung-filter" ]]
+fixture="$tmp/hung-mkdir"; make_fixture "$fixture"
+if DTX_TEST_MKDIR_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 run_fixture "$fixture" hung-mkdir env >/dev/null 2>&1; then exit 1; fi
+[[ ! -e "$fixture/.android-acceptance/hung-mkdir" ]]
 
 # Cleanup inspection commands cannot make owned teardown wait forever.  ps is
 # checked before signalling, while ss is checked after the process has exited.

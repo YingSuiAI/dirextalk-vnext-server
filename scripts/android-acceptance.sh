@@ -32,6 +32,7 @@ GUARDIAN_A_PID='' GUARDIAN_B_PID='' PROXY_A_GUARDIAN_PID='' PROXY_B_GUARDIAN_PID
 GUARDIAN_A_START='' GUARDIAN_B_START='' PROXY_A_GUARDIAN_START='' PROXY_B_GUARDIAN_START=''
 PID_A_START='' PID_B_START='' PROXY_A_PID_START='' PROXY_B_PID_START=''
 OWNED_GUARDIAN_PID='' OWNED_GUARDIAN_START='' OWNED_CHILD_PID='' OWNED_CHILD_START='' OWNED_PROCESS_INDEX=0
+PENDING_GUARDIAN_PID='' PENDING_GUARDIAN_START='' RUN_SCRATCH_ROOT='' RUN_SCRATCH_INDEX=0 PRIVATE_DIR=''
 SERIAL_A='' SERIAL_B='' PROXY_A_PORT='' CONTROL_A_PORT='' PROXY_B_PORT='' CONTROL_B_PORT='' NODE_A_PORT='' NODE_B_PORT='' EMULATOR_A_PORT='' EMULATOR_B_PORT='' ALLOCATOR_LOCK_FD='' CA_HASH=''
 readonly PROCESS_KILL_GRACE_SECONDS=5
 
@@ -42,6 +43,13 @@ bounded_seconds() {
     seconds=$DTX_TEST_COMMAND_TIMEOUT_SECONDS
   fi
   printf '%s' "$seconds"
+}
+startup_deadline_seconds() {
+  if [[ "${DTX_ANDROID_TEST_MODE:-}" == 1 && "${DTX_TEST_COMMAND_TIMEOUT_SECONDS:-}" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$DTX_TEST_COMMAND_TIMEOUT_SECONDS"
+  else
+    printf '%s' "$ANDROID_BOOT_TIMEOUT_SECONDS"
+  fi
 }
 run_bounded() {
   local label=$1
@@ -66,6 +74,20 @@ ps_bounded() { run_bounded 'ps' ps "$@"; }
 ss_bounded() { run_bounded 'ss' ss "$@"; }
 stat_bounded() { run_bounded 'stat' stat "$@"; }
 sha256_bounded() { run_bounded 'sha256sum' sha256sum "$@"; }
+mkdir_bounded() { run_bounded 'mkdir' mkdir "$@"; }
+cp_bounded() { run_bounded 'cp' cp "$@"; }
+first_field() { local value=$1; value=${value%%[[:space:]]*}; printf '%s' "$value"; }
+strip_cr() { local value=$1; value=${value//$'\r'/}; printf '%s' "$value"; }
+has_exact_line() { local expected=$1 line; while IFS= read -r line; do [[ "$line" == "$expected" ]] && return 0; done <<<"$2"; return 1; }
+has_listener() { local output; output="$(ss_bounded -ltnH "sport = :$1")" || return 1; [[ -n "$output" ]]; }
+make_private_dir() {
+  local path
+  [[ -n "$RUN_SCRATCH_ROOT" && "$RUN_SCRATCH_ROOT" == "$RUN_ROOT/.scratch" ]] || return 1
+  ((RUN_SCRATCH_INDEX += 1))
+  path="$RUN_SCRATCH_ROOT/$RUN_SCRATCH_INDEX"
+  mkdir_bounded -- "$path" || return 1
+  PRIVATE_DIR=$path
+}
 start_owned_process() {
   local label=$1 child_file deadline
   shift
@@ -73,8 +95,12 @@ start_owned_process() {
   child_file="$RUN_ROOT/.guardian-child-$OWNED_PROCESS_INDEX"
   # The guardian is the stable, harness-owned group leader.  It ignores TERM
   # while its child receives the group signal, and survives until verified KILL.
-  setsid bash -c 'child_file=$1; shift; trap ":" TERM; "$@" & child=$!; printf "%s" "$child" >"$child_file"; while :; do wait "$child" || :; sleep 2147483647 & wait "$!" || :; done' bash "$child_file" "$@" >/dev/null 2>&1 &
+  setsid bash -c 'child_file=$1; shift; trap ":" TERM; [[ -z "${DTX_TEST_GUARDIAN_PID_LOG:-}" ]] || printf "%s\n" "$$" >>"$DTX_TEST_GUARDIAN_PID_LOG"; "$@" & child=$!; if [[ "${DTX_TEST_GUARDIAN_PID_FILE_MISSING:-0}" != 1 ]]; then [[ "${DTX_TEST_GUARDIAN_PID_FILE_DELAY:-0}" == 0 ]] || sleep "$DTX_TEST_GUARDIAN_PID_FILE_DELAY"; printf "%s" "$child" >"$child_file"; fi; while :; do wait "$child" || :; sleep 2147483647 & wait "$!" || :; done' bash "$child_file" "$@" >/dev/null 2>&1 &
   OWNED_GUARDIAN_PID=$!
+  PENDING_GUARDIAN_PID=$OWNED_GUARDIAN_PID
+  PENDING_GUARDIAN_START="$(proc_start_identity "$PENDING_GUARDIAN_PID")" || return 1
+  guardian_matches "$PENDING_GUARDIAN_PID" "$PENDING_GUARDIAN_START" || return 1
+  printf '%s=%s\n%s=%s\n' pending_guardian_pid "$PENDING_GUARDIAN_PID" pending_guardian_start "$PENDING_GUARDIAN_START" >"$RUN_ROOT/pending-guardian"
   deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
   while [[ ! -s "$child_file" && SECONDS -lt deadline ]]; do :; done
   [[ -s "$child_file" ]] || return 1
@@ -82,6 +108,8 @@ start_owned_process() {
   valid_pid "$OWNED_CHILD_PID" || return 1
   OWNED_GUARDIAN_START="$(proc_start_identity "$OWNED_GUARDIAN_PID")" || return 1
   OWNED_CHILD_START="$(proc_start_identity "$OWNED_CHILD_PID")" || return 1
+  PENDING_GUARDIAN_PID=''; PENDING_GUARDIAN_START=''
+  rm -f -- "$RUN_ROOT/pending-guardian"
 }
 proc_start_identity() {
   local pid=$1 stat rest; local -a fields=()
@@ -122,7 +150,7 @@ safe_state_tree() {
 
 claim_allocator() {
   safe_state_tree || die 'state root or parent is a symlink or outside repository'
-  mkdir -- "$STATE_ROOT" 2>/dev/null || [[ -d "$STATE_ROOT" ]] || die 'cannot create state root'
+  mkdir_bounded -- "$STATE_ROOT" 2>/dev/null || [[ -d "$STATE_ROOT" ]] || die 'cannot create state root'
   safe_state_tree || die 'unsafe state root after creation'
   exec {ALLOCATOR_LOCK_FD}>"$STATE_ROOT/.allocator.lock"
   flock -n "$ALLOCATOR_LOCK_FD" || die 'another Android acceptance run owns the allocator'
@@ -136,8 +164,10 @@ release_allocator() {
 claim() {
   claim_allocator
   valid_run_id && safe_run_root && safe_project || die 'unsafe run identity'
-  (umask 077; mkdir -- "$RUN_ROOT") 2>/dev/null || die 'run id already claimed or unsafe state exists'
+  (umask 077; mkdir_bounded -- "$RUN_ROOT") 2>/dev/null || die 'run id already claimed or unsafe state exists'
   CLAIMED=1
+  RUN_SCRATCH_ROOT="$RUN_ROOT/.scratch"
+  mkdir_bounded -- "$RUN_SCRATCH_ROOT" || die 'cannot create private scratch root'
   : >"$RUN_ROOT/resources"
   record run_id "$RUN_ID"; record compose_project "$COMPOSE_PROJECT"
   record android_system_image "$ANDROID_SYSTEM_IMAGE"; record android_acceleration "$ANDROID_ACCELERATION"
@@ -297,6 +327,21 @@ guardian_is_gone() {
   current="$(proc_start_identity "$pid" 2>/dev/null || true)"
   [[ "$current" != "$start" ]]
 }
+stop_guardian() {
+  local guardian=$1 guardian_start=$2 pgid deadline
+  guardian_matches "$guardian" "$guardian_start" || return 1
+  pgid=$guardian
+  kill -TERM -- "-$pgid" 2>/dev/null || return 1
+  deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
+  wait_for_group_exit "$pgid" "$deadline"; local group_status=$?
+  [[ "$group_status" == 0 || "$group_status" == 1 ]] || return 1
+  guardian_matches "$guardian" "$guardian_start" || return 1
+  kill -KILL -- "-$pgid" 2>/dev/null || return 1
+  deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
+  wait_for_group_exit "$pgid" "$deadline" || return 1
+  ! group_has_live_members "$pgid" || return 1
+  guardian_is_gone "$guardian" "$guardian_start"
+}
 stop_pid() {
   local pid=$1 child_start=$2 guardian=$3 guardian_start=$4 port=$5 kind=${6:-proxy} first=${7:-} second=${8:-} third=${9:-} serial=${10:-} pgid
   [[ -n "$pid" ]] || return 0
@@ -321,7 +366,7 @@ stop_pid() {
   ! group_has_live_members "$pgid" || return 1
   guardian_is_gone "$guardian" "$guardian_start" || return 1
   wait "$pid" 2>/dev/null || true
-  ! ss_bounded -ltnH "sport = :$port" | grep -q . || return 1
+  ! has_listener "$port" || return 1
 }
 cleanup_probe_remote() {
   local serial=$1 pid=$2 avd=$3 port=$4 result_path=$5
@@ -348,6 +393,9 @@ cleanup() {
   local status=$? cleanup_failed=0
   set +e
   [[ "$MODE" == run ]] || exit "$status"
+  if [[ -n "$PENDING_GUARDIAN_PID" || -n "$PENDING_GUARDIAN_START" ]]; then
+    stop_guardian "$PENDING_GUARDIAN_PID" "$PENDING_GUARDIAN_START" || cleanup_failed=1
+  fi
   if [[ "$CA_A_TOUCHED" == 1 || "$TRUST_PROBE_A_TOUCHED" == 1 || "$REVERSE_A" == 1 ]]; then
     cleanup_remote_serial "$SERIAL_A" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT" "$TRUST_RESULT_A_PATH" "$CA_A_TOUCHED" "$TRUST_PROBE_A_TOUCHED" "$REVERSE_A" || cleanup_failed=1
   fi
@@ -358,8 +406,8 @@ cleanup() {
   stop_pid "$PROXY_B_PID" "$PROXY_B_PID_START" "$PROXY_B_GUARDIAN_PID" "$PROXY_B_GUARDIAN_START" "$PROXY_B_PORT" proxy "127.0.0.1:$PROXY_B_PORT" "127.0.0.1:$NODE_B_PORT" "127.0.0.1:$CONTROL_B_PORT" || cleanup_failed=1
   stop_pid "$PID_A" "$PID_A_START" "$GUARDIAN_A_PID" "$GUARDIAN_A_START" "$EMULATOR_A_PORT" emulator "$AVD_A" "$EMULATOR_A_PORT" '' "$SERIAL_A" || cleanup_failed=1
   stop_pid "$PID_B" "$PID_B_START" "$GUARDIAN_B_PID" "$GUARDIAN_B_START" "$EMULATOR_B_PORT" emulator "$AVD_B" "$EMULATOR_B_PORT" '' "$SERIAL_B" || cleanup_failed=1
-  [[ "$AVD_A_CREATED" != 1 ]] || { safe_avd "$AVD_A" && avd_bounded 'delete AVD A' delete avd --name "$AVD_A" >/dev/null 2>&1 && ! avd_bounded 'list AVDs' list avd | grep -Fqx "    Name: $AVD_A"; } || cleanup_failed=1
-  [[ "$AVD_B_CREATED" != 1 ]] || { safe_avd "$AVD_B" && avd_bounded 'delete AVD B' delete avd --name "$AVD_B" >/dev/null 2>&1 && ! avd_bounded 'list AVDs' list avd | grep -Fqx "    Name: $AVD_B"; } || cleanup_failed=1
+  [[ "$AVD_A_CREATED" != 1 ]] || { safe_avd "$AVD_A" && avd_bounded 'delete AVD A' delete avd --name "$AVD_A" >/dev/null 2>&1 && ! has_exact_line "    Name: $AVD_A" "$(avd_bounded 'list AVDs' list avd)"; } || cleanup_failed=1
+  [[ "$AVD_B_CREATED" != 1 ]] || { safe_avd "$AVD_B" && avd_bounded 'delete AVD B' delete avd --name "$AVD_B" >/dev/null 2>&1 && ! has_exact_line "    Name: $AVD_B" "$(avd_bounded 'list AVDs' list avd)"; } || cleanup_failed=1
   if [[ "$COMPOSE_OWNED" == 1 ]]; then
     if ! safe_project; then
       cleanup_failed=1
@@ -386,16 +434,17 @@ preflight() {
   valid_config || die 'invalid Android acceptance configuration'
   command -v docker >/dev/null || die 'docker is required'; command -v adb >/dev/null || die 'adb is required'; command -v timeout >/dev/null || die 'timeout is required'; command -v setsid >/dev/null || die 'setsid is required'
   command -v emulator >/dev/null || die 'emulator is required'; command -v avdmanager >/dev/null || die 'avdmanager is required'; command -v ss >/dev/null || die 'ss is required'
-  ! avd_bounded 'list AVDs' list avd | grep -Fqx "    Name: $AVD_A" || die 'AVD A already exists'
-  ! avd_bounded 'list AVDs' list avd | grep -Fqx "    Name: $AVD_B" || die 'AVD B already exists'
-  ! adb_bounded 'devices' devices | grep -Eq "^(${SERIAL_A}|${SERIAL_B})[[:space:]]" || die 'reserved emulator serial is already active'
+  ! has_exact_line "    Name: $AVD_A" "$(avd_bounded 'list AVDs' list avd)" || die 'AVD A already exists'
+  ! has_exact_line "    Name: $AVD_B" "$(avd_bounded 'list AVDs' list avd)" || die 'AVD B already exists'
+  local devices; devices="$(adb_bounded 'devices' devices)" || die 'unable to list adb devices'
+  [[ "$devices" != "$SERIAL_A"$' '* && "$devices" != "$SERIAL_B"$' '* ]] || die 'reserved emulator serial is already active'
 }
 prepare_trust_probe() {
   local source="$SCRIPT_DIR/android-platform-trust-probe.java" android_jar d8 javac_version probe_dir classes_dir dex_output dex_size source_copy
   if [[ "${DTX_ANDROID_TEST_MODE:-}" == 1 && "${DTX_TEST_NATIVE_TRUST_PROBE:-}" != 1 ]]; then
-    probe_dir="$(mktemp -d "$RUN_ROOT/trust-probe.XXXXXX")" || die 'unable to create private trust probe directory'
+    make_private_dir || die 'unable to create private trust probe directory'; probe_dir=$PRIVATE_DIR
     TRUST_PROBE_DEX="$probe_dir/classes.dex"; printf test-dex >"$TRUST_PROBE_DEX"
-    TRUST_PROBE_HASH="$(sha256_bounded "$TRUST_PROBE_DEX" | awk '{print $1}')"
+    TRUST_PROBE_HASH="$(first_field "$(sha256_bounded "$TRUST_PROBE_DEX")")"
     return 0
   fi
   [[ -f "$source" && ! -L "$source" ]] || die 'fixed trust probe source is missing or symlinked'
@@ -411,10 +460,10 @@ prepare_trust_probe() {
     printf "%s\\n" "${candidates[@]}" | sort -V | tail -n 1
   ' bash "$ANDROID_SDK_ROOT_VALUE")" || die 'Android SDK d8 is unavailable'
   [[ -n "$d8" && -f "$d8" && -x "$d8" && ! -L "$d8" && ! -L "${d8%/d8}" ]] || die 'Android SDK d8 is unavailable'
-  probe_dir="$(mktemp -d "$RUN_ROOT/trust-probe.XXXXXX")" || die 'unable to create private trust probe directory'
-  classes_dir="$probe_dir/classes"; dex_output="$probe_dir/dex"; mkdir -- "$classes_dir" "$dex_output"
+  make_private_dir || die 'unable to create private trust probe directory'; probe_dir=$PRIVATE_DIR
+  classes_dir="$probe_dir/classes"; dex_output="$probe_dir/dex"; mkdir_bounded -- "$classes_dir" "$dex_output" || die 'unable to create trust probe directories'
   source_copy="$probe_dir/PlatformTrustProbe.java"
-  cp -- "$source" "$source_copy"
+  cp_bounded -- "$source" "$source_copy" || die 'unable to copy trust probe source'
   [[ -f "$source_copy" && ! -L "$source_copy" ]] || die 'private trust probe source copy is unsafe'
   run_bounded 'javac trust probe' javac -source 8 -target 8 -cp "$android_jar" -d "$classes_dir" "$source_copy" || die 'trust probe compilation failed'
   run_bounded 'd8 trust probe' "$d8" --lib "$android_jar" --output "$dex_output" "$classes_dir" || die 'trust probe dex compilation failed'
@@ -422,7 +471,7 @@ prepare_trust_probe() {
   [[ -f "$TRUST_PROBE_DEX" && ! -L "$TRUST_PROBE_DEX" ]] || die 'trust probe dex output is missing or symlinked'
   dex_size="$(stat_bounded -c '%s' "$TRUST_PROBE_DEX")"
   [[ "$dex_size" =~ ^[0-9]+$ && dex_size -le 4194304 ]] || die 'trust probe dex output exceeds bound'
-  TRUST_PROBE_HASH="$(sha256_bounded "$TRUST_PROBE_DEX" | awk '{print $1}')"
+  TRUST_PROBE_HASH="$(first_field "$(sha256_bounded "$TRUST_PROBE_DEX")")"
   [[ "$TRUST_PROBE_HASH" =~ ^[0-9a-f]{64}$ ]] || die 'trust probe dex hash is invalid'
 }
 verify_emulator() {
@@ -430,8 +479,8 @@ verify_emulator() {
   verify_emulator_identity "$serial" "$pid" "$avd" "$port"
   adb_bounded 'root' -s "$serial" root >/dev/null || die 'adb root failed'
   verify_emulator_identity "$serial" "$pid" "$avd" "$port"
-  [[ "$(adb_bounded 'getprop' -s "$serial" shell 'getprop ro.kernel.qemu' | tr -d '\r')" == 1 ]] || die 'image is not rooted emulator'
-  [[ "$(adb_bounded 'id' -s "$serial" shell 'id -u' | tr -d '\r')" == 0 ]] || die 'emulator root uid is not zero'
+  [[ "$(strip_cr "$(adb_bounded 'getprop' -s "$serial" shell 'getprop ro.kernel.qemu')")" == 1 ]] || die 'image is not rooted emulator'
+  [[ "$(strip_cr "$(adb_bounded 'id' -s "$serial" shell 'id -u')")" == 0 ]] || die 'emulator root uid is not zero'
 }
 verify_emulator_identity() {
   local serial=$1 pid=$2 avd=$3 port=$4
@@ -460,21 +509,22 @@ verify_emulator_identity() {
   done <<<"$avd_reply"
   (( ${#console_lines[@]} == 2 )) || die 'serial does not map to this AVD'
   [[ "${console_lines[0]}" == "$avd" && "${console_lines[1]}" == OK ]] || die 'serial does not map to this AVD'
-  [[ "$(adb_bounded 'getprop' -s "$serial" shell 'getprop ro.kernel.qemu' | tr -d '\r')" == 1 ]] || die 'image is not rooted emulator'
+  [[ "$(strip_cr "$(adb_bounded 'getprop' -s "$serial" shell 'getprop ro.kernel.qemu')")" == 1 ]] || die 'image is not rooted emulator'
 }
 assert_emulator_ports_free() {
   local console_port=$1 adb_port
   adb_port=$((console_port + 1))
   valid_emulator_port "$console_port" || die 'invalid emulator console port'
   valid_port "$adb_port" || die 'invalid emulator adb port'
-  ! ss_bounded -ltnH "sport = :$console_port" | grep -q . || die "emulator console port $console_port is already listening"
-  ! ss_bounded -ltnH "sport = :$adb_port" | grep -q . || die "emulator adb port $adb_port is already listening"
-  ! adb_bounded 'devices' devices | grep -Eq "^emulator-($console_port|$adb_port)[[:space:]]" || die "emulator port $console_port is already owned by adb"
+  ! has_listener "$console_port" || die "emulator console port $console_port is already listening"
+  ! has_listener "$adb_port" || die "emulator adb port $adb_port is already listening"
+  local devices; devices="$(adb_bounded 'devices' devices)" || die 'unable to list adb devices'
+  [[ "$devices" != "emulator-$console_port"$' '* && "$devices" != "emulator-$adb_port"$' '* ]] || die "emulator port $console_port is already owned by adb"
 }
 adb_shell_ok() { local serial=$1 command=$2; adb_bounded "shell $command" -s "$serial" shell "$command" >/dev/null; }
 new_nonce() {
   local nonce
-  nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  nonce="$(run_bounded 'nonce' openssl rand -hex 16)" || return 1
   [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
   printf '%s' "$nonce"
 }
@@ -491,7 +541,7 @@ platform_trust_probe() {
     if adb_bounded 'trust-probe app_process' -s "$serial" shell "app_process -Djava.class.path=/data/local/tmp/dtx-platform-trust-probe.dex /system/bin com.dirextalk.android.PlatformTrustProbe '$endpoint' '$nonce' '$result_path'" >/dev/null 2>&1; then :; else app_status=$?; fi
   fi
   (verify_emulator "$serial" "$pid" "$avd" "$port") || return 1
-  result="$(adb_bounded 'trust-result read' -s "$serial" shell "cat '$result_path'" 2>/dev/null | tr -d '\r')" || result=''
+  result="$(adb_bounded 'trust-result read' -s "$serial" shell "cat '$result_path'" 2>/dev/null)" || result=''; result="$(strip_cr "$result")"
   [[ "$result" == "$expected $nonce" ]] || return 1
   [[ "$app_status" == 0 ]] || return 1
 }
@@ -503,12 +553,12 @@ verify_system_rw() {
 verify_ca_file() {
   local serial=$1 ca_file=$2 target=$3 local_digest remote_digest stat mode uid gid context
   adb_shell_ok "$serial" "test -f '$target' && test -r '$target'" || die 'installed CA is absent or unreadable'
-  local_digest="$(sha256_bounded "$ca_file" | awk '{print $1}')" || die 'unable to hash CA file'
-  remote_digest="$(adb_bounded 'CA digest' -s "$serial" shell "sha256sum '$target'" | awk '{print $1}' | tr -d '\r')" || die 'unable to hash installed CA'
+  local_digest="$(first_field "$(sha256_bounded "$ca_file")")" || die 'unable to hash CA file'
+  remote_digest="$(first_field "$(strip_cr "$(adb_bounded 'CA digest' -s "$serial" shell "sha256sum '$target'")")")" || die 'unable to hash installed CA'
   [[ "$remote_digest" == "$local_digest" ]] || die 'installed CA content mismatch'
-  IFS=' ' read -r mode uid gid <<<"$(adb_bounded 'CA stat' -s "$serial" shell "stat -c '%a %u %g' '$target'" | tr -d '\r')"
+  IFS=' ' read -r mode uid gid <<<"$(strip_cr "$(adb_bounded 'CA stat' -s "$serial" shell "stat -c '%a %u %g' '$target'")")"
   [[ "$mode" == 644 && "$uid" == 0 && "$gid" == 0 ]] || die "installed CA mode or owner mismatch: mode=$mode uid=$uid gid=$gid"
-  context="$(adb_bounded 'CA context' -s "$serial" shell "ls -Z '$target'" | awk '{print $1}' | tr -d '\r')"
+  context="$(first_field "$(strip_cr "$(adb_bounded 'CA context' -s "$serial" shell "ls -Z '$target'")")")"
   [[ "$context" == u:object_r:system_file:s0 ]] || die 'installed CA SELinux context mismatch'
 }
 remount_system() {
@@ -524,7 +574,7 @@ remount_system() {
 }
 install_ca_system_store() {
   local serial=$1 ca_file=$2 pid=$3 avd=$4 port=$5 hash target
-  hash="$(run_bounded 'openssl CA hash' openssl x509 -hash -noout -in "$ca_file" | tr -d '\r\n')"
+  hash="$(strip_cr "$(run_bounded 'openssl CA hash' openssl x509 -hash -noout -in "$ca_file")")"; hash=${hash//$'\n'/}
   [[ "$hash" =~ ^[0-9a-fA-F]{8}$ ]] || die 'unexpected CA subject hash'
   CA_HASH="$hash"; target="/system/etc/security/cacerts/$hash.0"
   if [[ "$serial" == "$SERIAL_A" ]]; then CA_A_TOUCHED=1; else CA_B_TOUCHED=1; fi
@@ -558,10 +608,10 @@ start_proxy() {
   local guardian_variable="${variable%_PID}_GUARDIAN_PID" child_start_variable="${variable}_START" guardian_start_variable="${variable%_PID}_GUARDIAN_START"
   printf -v "$guardian_variable" '%s' "$guardian"; printf -v "$child_start_variable" '%s' "$OWNED_CHILD_START"; printf -v "$guardian_start_variable" '%s' "$OWNED_GUARDIAN_START"
   record "$guardian_variable" "$guardian"; record "$child_start_variable" "$OWNED_CHILD_START"; record "$guardian_start_variable" "$OWNED_GUARDIAN_START"
-  local deadline=$((SECONDS + ANDROID_BOOT_TIMEOUT_SECONDS))
+  local deadline=$((SECONDS + $(startup_deadline_seconds)))
   while :; do
     kill -0 "$pid" 2>/dev/null || die 'proxy exited during startup'
-    if ss_bounded -ltnH "sport = :$listen" | grep -q . && ss_bounded -ltnH "sport = :$control" | grep -q .; then
+    if has_listener "$listen" && has_listener "$control"; then
       return 0
     fi
     (( SECONDS < deadline )) || die 'proxy listeners not ready'
@@ -573,7 +623,7 @@ real_run() {
   run_bounded 'cargo build response-loss proxy' cargo build --locked -p dtx-android-response-loss-proxy
   COMPOSE_OWNED=1; record compose_owned 1
   DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" compose_bounded 'up' --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" up --detach --wait
-  mkdir -p -- "$RUN_ROOT/tls"
+  mkdir_bounded -p -- "$RUN_ROOT/tls" || die 'cannot create TLS directory'
   DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" compose_bounded 'copy bootstrap CA' --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" cp tls-bootstrap:/run/dtx-local-tls/ca.pem "$RUN_ROOT/tls/ca.pem"
   AVD_A_CREATED=1; avd_bounded 'create AVD A' create avd --name "$AVD_A" --package "$ANDROID_SYSTEM_IMAGE" >/dev/null
   AVD_B_CREATED=1; avd_bounded 'create AVD B' create avd --name "$AVD_B" --package "$ANDROID_SYSTEM_IMAGE" >/dev/null
