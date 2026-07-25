@@ -131,9 +131,11 @@ claim() {
 }
 
 allocate_ports() {
-  local seed candidate offset resources='' resource_file
-  command -v cksum >/dev/null && command -v awk >/dev/null && command -v seq >/dev/null && command -v grep >/dev/null || die 'reservation allocator tools are unavailable'
-  seed=$(printf '%s' "$RUN_ID" | cksum | awk '{print $1}')
+  local seed candidate offset resources='' resource_file resource_line conflict
+  command -v cksum >/dev/null || die 'reservation allocator tool is unavailable'
+  seed="$(run_bounded 'allocator seed' cksum <<<"$RUN_ID")" || die 'unable to seed reservation allocator'
+  seed=${seed%% *}
+  [[ "$seed" =~ ^[0-9]+$ ]] || die 'invalid reservation allocator seed'
   shopt -s nullglob
   for resource_file in "$STATE_ROOT"/*/resources; do
     [[ "$resource_file" == "$RUN_ROOT/resources" ]] && continue
@@ -142,13 +144,20 @@ allocate_ports() {
     resources+="$(<"$resource_file")"$'\n'
   done
   shopt -u nullglob
-  for offset in $(seq 0 999); do
+  for ((offset=0; offset<1000; offset++)); do
     candidate=$((20000 + ((seed % 10000 + offset * 3) % 10000)))
     # Emulator console ports are restricted to the documented even 5554-5682
     # range.  A/B consume adjacent even slots; the durable reservation scan
     # below makes the finite range fail closed instead of reusing a serial.
     EMULATOR_A_PORT=$((5554 + ((seed % 64 + offset) % 64) * 2)); EMULATOR_B_PORT=$((EMULATOR_A_PORT + 2))
-    if printf '%s\n' "$resources" | grep -Eq "^(node_a_port|node_b_port|proxy_a_port|control_a_port|proxy_b_port|control_b_port)=(${candidate}|$((candidate+1))|$((candidate+2))|$((candidate+3))|$((candidate+4))|$((candidate+5)))$|^(emulator_a_port|emulator_b_port)=(${EMULATOR_A_PORT}|${EMULATOR_B_PORT})$"; then
+    conflict=0
+    while IFS= read -r resource_line; do
+      if [[ "$resource_line" =~ ^(node_a_port|node_b_port|proxy_a_port|control_a_port|proxy_b_port|control_b_port)=(${candidate}|$((candidate+1))|$((candidate+2))|$((candidate+3))|$((candidate+4))|$((candidate+5)))$ || "$resource_line" =~ ^(emulator_a_port|emulator_b_port)=(${EMULATOR_A_PORT}|${EMULATOR_B_PORT})$ ]]; then
+        conflict=1
+        break
+      fi
+    done <<<"$resources"
+    if (( conflict )); then
       continue
     fi
     break
@@ -224,7 +233,8 @@ pid_cmdline_matches() {
 }
 process_group_pgid() {
   local pid=$1 pgid
-  pgid="$(ps_bounded -o pgid= -p "$pid" | tr -d ' ')"
+  pgid="$(ps_bounded -o pgid= -p "$pid")"
+  pgid=${pgid//[[:space:]]/}
   [[ "$pgid" =~ ^[1-9][0-9]*$ && "$pgid" == "$pid" ]] || return 1
   printf '%s' "$pgid"
 }
