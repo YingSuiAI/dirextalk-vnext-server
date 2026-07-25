@@ -1100,6 +1100,100 @@ mod tests {
     }
 
     #[test]
+    fn maximum_valid_offer_v3_fits_history_envelope_boundary() {
+        let mut fields = match offer(3, &vec![0; 1_048_575], [16; 32]) {
+            CanonicalValue::Map(fields) => fields,
+            _ => unreachable!(),
+        };
+        fields[5].1 = CanonicalValue::Unsigned(9_007_199_254_740_991);
+        fields[11].1 = CanonicalValue::Map(vec![
+            (
+                CanonicalValue::Unsigned(1),
+                CanonicalValue::Text(Uuid::now_v7().to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Bytes(vec![22; 32]),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Unsigned(9_007_199_254_740_991),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                CanonicalValue::Bytes(vec![44; 32]),
+            ),
+        ]);
+        fields[12].1 = CanonicalValue::Unsigned(253_402_300_799_998);
+        fields[13].1 = CanonicalValue::Unsigned(253_402_300_799_999);
+        let offer = CanonicalValue::Map(fields);
+        let exact_offer = encode_deterministic_cbor_with_limit(&offer, MAX_EXACT_OFFER_BYTES)
+            .expect("maximum OfferV3 remains encodable");
+        assert_eq!(exact_offer.len(), MAX_EXACT_OFFER_BYTES);
+        parse_offer_v3(&offer).expect("maximum OfferV3 remains valid");
+
+        let envelope_id = EnvelopeId::new();
+        let expires_at = UtcMillis::new(6_000).expect("valid envelope expiry");
+        let exact_envelope = encode_deterministic_cbor_with_limit(
+            &CanonicalValue::Map(vec![
+                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+                (
+                    CanonicalValue::Unsigned(2),
+                    CanonicalValue::Text(envelope_id.to_string()),
+                ),
+                (
+                    CanonicalValue::Unsigned(3),
+                    CanonicalValue::Bytes(exact_offer.clone()),
+                ),
+                (CanonicalValue::Unsigned(4), expires_at.to_canonical_value()),
+            ]),
+            MAX_HISTORY_GRANT_ENVELOPE_BYTES,
+        )
+        .expect("maximum history envelope remains encodable");
+        assert_eq!(exact_envelope.len(), MAX_HISTORY_GRANT_ENVELOPE_BYTES);
+        MailboxEnvelopeCommand::new_history_grant(
+            Sha256Digest::from_bytes([9; 32]),
+            MailboxId::new(),
+            envelope_id,
+            exact_offer.clone(),
+            expires_at,
+            exact_envelope,
+        )
+        .expect("maximum OfferV3 admits through the history envelope constructor");
+
+        let mut over_offer = exact_offer;
+        over_offer.push(0);
+        let over_envelope = encode_deterministic_cbor_with_limit(
+            &CanonicalValue::Map(vec![
+                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+                (
+                    CanonicalValue::Unsigned(2),
+                    CanonicalValue::Text(envelope_id.to_string()),
+                ),
+                (
+                    CanonicalValue::Unsigned(3),
+                    CanonicalValue::Bytes(over_offer.clone()),
+                ),
+                (CanonicalValue::Unsigned(4), expires_at.to_canonical_value()),
+            ]),
+            MAX_HISTORY_GRANT_ENVELOPE_BYTES + 1,
+        )
+        .expect("one-byte-over history envelope remains encodable");
+        assert_eq!(over_envelope.len(), MAX_HISTORY_GRANT_ENVELOPE_BYTES + 1);
+        assert!(
+            MailboxEnvelopeCommand::new_history_grant(
+                Sha256Digest::from_bytes([9; 32]),
+                MailboxId::new(),
+                envelope_id,
+                over_offer,
+                expires_at,
+                over_envelope,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn exact_offer_and_grant_size_boundaries_are_inclusive() {
         assert!(
             validate_bounded_bytes(

@@ -151,6 +151,18 @@ async fn history_grant_v5_http_success_replays_exactly_and_rejects_mismatch()
             .any(|definition| definition.contains("exact_grant") && definition.contains("1050733")),
         "history grant migration must retain the exact GrantV5 ceiling"
     );
+    let envelope_constraint: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid)
+           FROM pg_constraint
+          WHERE conrelid = 'messaging.mailbox_envelopes'::regclass
+            AND conname = 'messaging_envelopes_ciphertext_bounded'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(
+        envelope_constraint.contains("1049093"),
+        "history migration must admit the exact OfferV3 ceiling in mailbox envelopes"
+    );
     let identity_app = identity_bootstrap_router_with_state(
         IdentityBootstrapState::with_clock_and_device_session_audience(
             identity_store.clone(),

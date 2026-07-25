@@ -2,6 +2,16 @@
 -- delivery fact are immutable append-only receipts.  Raw capabilities,
 -- prompts, decrypted history, MLS private state, and provider bodies are not
 -- stored here; the only opaque payload is the recipient ciphertext offer.
+-- History OfferV3 bytes are larger than the generic mailbox enqueue contract.
+-- Keep the generic application validator at 262144 bytes while allowing the
+-- immutable history projection to persist its frozen exact Offer ceiling.
+ALTER TABLE messaging.mailbox_envelopes
+    DROP CONSTRAINT messaging_envelopes_ciphertext_bounded,
+    ADD CONSTRAINT messaging_envelopes_ciphertext_bounded CHECK (
+        (state IN ('available','acked') AND octet_length(opaque_ciphertext) BETWEEN 1 AND 1049093)
+        OR (state='expired' AND opaque_ciphertext IS NULL)
+    );
+
 CREATE TABLE messaging.history_recovery_grants_v4 (
     identity_id text NOT NULL,
     request_id uuid NOT NULL CHECK (messaging.is_uuid_v7(request_id)),
