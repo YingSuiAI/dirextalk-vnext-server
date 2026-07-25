@@ -380,8 +380,8 @@ mod route_health_config_tests {
     #[test]
     fn route_health_rejects_duplicate_current_and_retained_receipt_key_ids() {
         let mut json = include_str!("../config.example.json").to_owned();
-        let marker = "    \"receipt_key_id\": \"01890f47-3a5b-7c1d-8e2f-123456789abd\"";
-        let replacement = "    \"receipt_key_id\": \"01890f47-3a5b-7c1d-8e2f-123456789abd\",\n    \"retained_receipt_keys\": [{\"key_id\": \"01890f47-3a5b-7c1d-8e2f-123456789abd\", \"private_key_pkcs8_pem\": \"secrets/old.pem\"}]";
+        let marker = "    \"retained_receipt_keys\": []";
+        let replacement = "    \"retained_receipt_keys\": [{\"key_id\": \"01890f47-3a5b-7c1d-8e2f-123456789abd\", \"private_key_pkcs8_pem\": \"secrets/old.pem\"}]";
         assert!(json.contains(marker));
         json = json.replacen(marker, replacement, 1);
         let path = std::env::temp_dir().join(format!(

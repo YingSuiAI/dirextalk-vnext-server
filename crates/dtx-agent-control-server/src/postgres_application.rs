@@ -2445,7 +2445,7 @@ impl PostgresConnectorControlApplication {
         request
             .verify(current.control_key())
             .map_err(|_| ConnectorControlApplicationError::AuthenticationFailed)?;
-        let credential = self.issue_credential(
+        let credential = self.issue_credential_raw(
             tenant_id,
             request.connector_id(),
             request.generation(),
@@ -4551,7 +4551,7 @@ impl PostgresConnectorControlApplication {
                 {
                     return Err(ConnectorControlApplicationError::AuthenticationFailed);
                 }
-                let credential = self.issue_credential(
+                let credential = self.issue_credential_raw(
                     proof_fence.tenant_id,
                     proof_fence.connector_id,
                     request.transcript().successor_generation(),
@@ -4721,6 +4721,34 @@ impl PostgresConnectorControlApplication {
         refresh_key: Ed25519PublicKey,
         now: i64,
     ) -> Result<ConnectorCredential, ConnectorControlApplicationError> {
+        let credential = self.issue_credential_raw(
+            tenant_id,
+            connector_id,
+            generation,
+            revision,
+            control_key,
+            refresh_key,
+            now,
+        )?;
+        Ok(match self.route_health_receipt_pin {
+            Some((key_id, public_key)) => {
+                credential.with_route_health_receipt_pin(key_id, public_key)
+            }
+            None => credential,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // All certificate binding coordinates are explicit security inputs.
+    fn issue_credential_raw(
+        &self,
+        tenant_id: TenantId,
+        connector_id: ConnectorId,
+        generation: u64,
+        revision: Revision,
+        control_key: Ed25519PublicKey,
+        refresh_key: Ed25519PublicKey,
+        now: i64,
+    ) -> Result<ConnectorCredential, ConnectorControlApplicationError> {
         let credential_uuid = self.next_uuid()?;
         let credential_id = ConnectorCredentialId::try_from(credential_uuid)
             .map_err(|_| ConnectorControlApplicationError::Internal)?;
@@ -4756,12 +4784,7 @@ impl PostgresConnectorControlApplication {
             valid_until,
         )
         .map_err(|_| ConnectorControlApplicationError::Internal)?;
-        Ok(match self.route_health_receipt_pin {
-            Some((key_id, public_key)) => {
-                credential.with_route_health_receipt_pin(key_id, public_key)
-            }
-            None => credential,
-        })
+        Ok(credential)
     }
 
     fn validate_hello_policy(

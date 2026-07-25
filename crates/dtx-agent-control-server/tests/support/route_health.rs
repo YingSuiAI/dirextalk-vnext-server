@@ -29,7 +29,9 @@ use uuid::Uuid;
 
 use super::{PostgresHarness, agent_provisioning as fixture};
 
-static FIXTURE_SEED: AtomicU8 = AtomicU8::new(201);
+// Keep fixture signing seeds disjoint from the fixed receipt-signing seeds in
+// the HTTP matrix so domain-separation tests do not depend on parallel order.
+static FIXTURE_SEED: AtomicU8 = AtomicU8::new(1);
 
 /// All durable facts needed to exercise the Route Health HTTP boundary.
 pub struct RouteHealthFixture {
@@ -303,6 +305,16 @@ impl RouteHealthFixture {
         status_revision: Revision,
         nonce: [u8; 32],
     ) -> Vec<u8> {
+        self.signed_request_with_key(&self.route_health_key, request_id, status_revision, nonce)
+    }
+
+    pub fn signed_request_with_key(
+        &self,
+        signing_key: &SigningKey,
+        request_id: RequestId,
+        status_revision: Revision,
+        nonce: [u8; 32],
+    ) -> Vec<u8> {
         let now = fixture::now();
         let mut fields = vec![
             (fixture::u(1), fixture::u(1)),
@@ -332,7 +344,7 @@ impl RouteHealthFixture {
             (fixture::u(22), fixture::bytes(&nonce)),
         ];
         let signed = encode_deterministic_cbor(&CanonicalValue::Map(fields.clone())).unwrap();
-        let signature = self.route_health_key.sign(
+        let signature = signing_key.sign(
             Sha256Digest::hash_domain(
                 dtx_agent_control_server::ROUTE_HEALTH_SIGNATURE_DOMAIN,
                 &signed,

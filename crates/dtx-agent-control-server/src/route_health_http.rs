@@ -20,7 +20,7 @@ use dtx_wire::{
     CanonicalValue, Ed25519Signature, Sha256Digest, decode_deterministic_cbor,
     encode_deterministic_cbor,
 };
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -251,6 +251,14 @@ pub async fn record_route_health(
             }
             _ => return Err(RouteHealthParseError::InvalidShape),
         };
+        // Agent Route Health requests and Connector receipts use separate key
+        // domains.  A configured receipt signer may never be the route's
+        // request-verification key, even when the public bytes happen to
+        // match through legacy or retained-key resolution.
+        let receipt_public = SigningKey::from_bytes(&receipt_seed).verifying_key();
+        if receipt_public.as_bytes() == stored_public.as_slice() {
+            return Err(RouteHealthParseError::InvalidShape);
+        }
         let approval_current: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM agent.agent_identity_approvals a
              JOIN agent.agent_devices d ON d.tenant_id=a.tenant_id

@@ -9,7 +9,7 @@ mod support;
 use std::{error::Error, sync::Arc};
 
 use dtx_wire::{CanonicalValue, decode_deterministic_cbor, encode_deterministic_cbor};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use sqlx::Executor;
 use support::PostgresHarness;
 use tokio::sync::Barrier;
@@ -35,6 +35,16 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
     .fetch_one(harness.admin_pool())
     .await?;
     assert!(!receipt_update, "receipt ledger must remain immutable");
+    let credential_update: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege(
+             'dtx_runtime_test', 'agent.connector_control_credentials', 'UPDATE')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(
+        !credential_update,
+        "credential snapshots must remain append-only for the runtime role"
+    );
     for constraint in [
         "connector_enrollment_intents_receipt_pin_shape",
         "connector_control_credentials_receipt_pin_shape",
@@ -244,6 +254,40 @@ async fn route_health_http_accepts_replays_and_pins_signed_receipts() -> Result<
         .to_vec();
     assert_eq!(replay_bytes, first_bytes);
     assert_eq!(route_health_counts(&fixture).await?, (1, Some((1, 1))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn route_health_http_rejects_receipt_signer_reused_as_route_request_key()
+-> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let receipt_key_id = dtx_domain::RouteHealthKeyId::new();
+    let receipt_seed = [0xE3; 32];
+    let receipt_key = SigningKey::from_bytes(&receipt_seed);
+    sqlx::query(
+        "UPDATE agent.agent_route_bootstraps
+            SET route_health_public_key=$3
+          WHERE tenant_id=$1 AND route_id=$2 AND state='installed'",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant_id))
+    .bind(uuid::Uuid::from(fixture.route_id))
+    .bind(receipt_key.verifying_key().to_bytes().to_vec())
+    .execute(harness.admin_pool())
+    .await?;
+    let body = fixture.signed_request_with_key(
+        &receipt_key,
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [0xE4; 32],
+    );
+    let response = fixture
+        .post_body(body, receipt_key_id, receipt_seed)
+        .await?;
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(route_health_counts(&fixture).await?, (0, None));
     Ok(())
 }
 

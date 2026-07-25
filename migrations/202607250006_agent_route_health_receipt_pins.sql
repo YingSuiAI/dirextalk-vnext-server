@@ -44,8 +44,8 @@ DO $grant$
 BEGIN
     IF to_regrole('dtx_agent_runtime') IS NOT NULL THEN
         GRANT SELECT, INSERT, UPDATE ON agent.connector_enrollment_intents,
-            agent.connector_control_credentials,
             agent.connector_credential_reissue_intents TO dtx_agent_runtime;
+        GRANT SELECT, INSERT ON agent.connector_control_credentials TO dtx_agent_runtime;
     END IF;
 END
 $grant$;
