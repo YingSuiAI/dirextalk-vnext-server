@@ -32,6 +32,7 @@ pub const REQUEST_SIGNATURE_DOMAIN: &[u8] = b"dirextalk.history-recovery.request
 pub const REQUEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.request.v4\0";
 pub const MANIFEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.manifest.v2\0";
 pub const LEAF_SET_DOMAIN: &[u8] = b"dirextalk.history-recovery.leaf-set.v2\0";
+pub const CATALOG_NODE_DOMAIN: &[u8] = b"dirextalk.recovery-scope-catalog-node.v2\0";
 pub const OFFER_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.recipient-offer.v3\0";
 pub const OFFER_CIPHERTEXT_DOMAIN: &[u8] = b"dirextalk.history-recovery.offer-ciphertext.v3\0";
 pub const GRANT_PROVIDER_SIGNATURE_DOMAIN: &[u8] =
@@ -70,6 +71,9 @@ pub struct CatalogHeadV2 {
     catalog_id: Uuid,
     generation: u64,
     leaf_count: u64,
+    merkle_root: Sha256Digest,
+    issued_at: u64,
+    expires_at: u64,
     digest: Sha256Digest,
 }
 impl CatalogHeadV2 {
@@ -87,6 +91,15 @@ impl CatalogHeadV2 {
     }
     pub fn digest(&self) -> Sha256Digest {
         self.digest
+    }
+    pub fn merkle_root(&self) -> Sha256Digest {
+        self.merkle_root
+    }
+    pub fn issued_at(&self) -> u64 {
+        self.issued_at
+    }
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
     }
 }
 
@@ -127,6 +140,8 @@ pub struct ManifestV2 {
     head_digest: Sha256Digest,
     leaf_count: u64,
     leaf_set_digest: Sha256Digest,
+    catalog_root_digest: Sha256Digest,
+    leaves: Vec<Sha256Digest>,
     digest: Sha256Digest,
 }
 impl ManifestV2 {
@@ -147,6 +162,12 @@ impl ManifestV2 {
     }
     pub fn digest(&self) -> Sha256Digest {
         self.digest
+    }
+    pub fn catalog_root_digest(&self) -> Sha256Digest {
+        self.catalog_root_digest
+    }
+    pub fn leaves(&self) -> &[Sha256Digest] {
+        &self.leaves
     }
 }
 
@@ -191,6 +212,8 @@ pub struct DeliveryV2 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CertificateV1 {
+    issuer_key: [u8; 32],
+    authorization_digest: Sha256Digest,
     child_key: [u8; 32],
     digest: Sha256Digest,
     context_digest: Sha256Digest,
@@ -201,6 +224,25 @@ pub struct CertificateV1 {
     leaf_digest: Sha256Digest,
     issued_at: u64,
     expires_at: u64,
+}
+
+/// Server-derived, signed coordinates an exhaustive Completion entry must bind.
+#[derive(Clone, Copy, Debug)]
+pub struct CompletionEntryExpectations {
+    pub catalog_id: Uuid,
+    pub generation: u64,
+    pub index: u64,
+    pub completion_id: Uuid,
+    pub count: u64,
+    pub leaf_digest: Sha256Digest,
+    pub context_digest: Sha256Digest,
+    pub head_digest: Sha256Digest,
+    pub request_issued_at: u64,
+    pub request_expires_at: u64,
+    pub head_issued_at: u64,
+    pub head_expires_at: u64,
+    pub grant_issued_at: u64,
+    pub grant_expires_at: u64,
 }
 impl CertificateV1 {
     pub fn child_key(&self) -> &[u8; 32] {
@@ -326,7 +368,7 @@ pub fn validate_catalog_head_v2(raw: &[u8]) -> Result<CatalogHeadV2, ProtocolErr
         return Err(err("leaf count"));
     };
     let _head_digest = digest(&fields[9])?;
-    let _merkle_root = digest(&fields[6])?;
+    let merkle_root = digest(&fields[6])?;
     let _ciphertext_digest = digest(&fields[7])?;
     let _observed_sequence = uint(&fields[8], false)?;
     let _authority_device = uuid(&fields[10])?;
@@ -348,6 +390,9 @@ pub fn validate_catalog_head_v2(raw: &[u8]) -> Result<CatalogHeadV2, ProtocolErr
         catalog_id,
         generation,
         leaf_count,
+        merkle_root,
+        issued_at: issued,
+        expires_at: expires,
         digest: Sha256Digest::hash_domain(CATALOG_HEAD_DIGEST_DOMAIN, raw),
     })
 }
@@ -369,7 +414,7 @@ pub fn validate_manifest_v2(raw: &[u8]) -> Result<ManifestV2, ProtocolError> {
     let head_bytes = bytes(&fields[4], MAX_CATALOG_HEAD_BYTES)?;
     let head = validate_catalog_head_v2(&head_bytes)?;
     let head_digest = digest(&fields[5])?;
-    let _root = digest(&fields[6])?;
+    let root = digest(&fields[6])?;
     let leaf_count = uint(&fields[7], true)?;
     if leaf_count > 1023
         || head.catalog_id() != catalog_id
@@ -387,24 +432,51 @@ pub fn validate_manifest_v2(raw: &[u8]) -> Result<ManifestV2, ProtocolError> {
         return Err(err("leaf count"));
     };
     let mut seen = std::collections::HashSet::new();
+    let mut leaf_digests = Vec::with_capacity(leaves.len());
     for leaf in leaves {
         let d = digest(leaf)?;
         if !seen.insert(d) {
             return Err(err("leaf duplicate"));
         }
+        leaf_digests.push(d);
     }
     let leaf_bytes = encode_deterministic_cbor(&fields[9]).map_err(|_| err("leaf set"))?;
     if Sha256Digest::hash_domain(LEAF_SET_DOMAIN, &leaf_bytes) != leaf_set {
         return Err(err("leaf set digest"));
     };
+    if catalog_merkle_root(&leaf_digests) != Some(root) || head.merkle_root() != root {
+        return Err(err("manifest root"));
+    }
     Ok(ManifestV2 {
         catalog_id,
         generation,
         head_digest,
         leaf_count,
         leaf_set_digest: leaf_set,
+        catalog_root_digest: root,
+        leaves: leaf_digests,
         digest: Sha256Digest::hash_domain(MANIFEST_DIGEST_DOMAIN, raw),
     })
+}
+
+/// Ordered catalog tree root with the frozen duplicate-last rule.
+pub fn catalog_merkle_root(leaves: &[Sha256Digest]) -> Option<Sha256Digest> {
+    let mut level = leaves.to_vec();
+    if level.is_empty() {
+        return None;
+    }
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            let mut bytes = Vec::with_capacity(64);
+            bytes.extend_from_slice(pair[0].as_bytes());
+            bytes.extend_from_slice(right.as_bytes());
+            next.push(Sha256Digest::hash_domain(CATALOG_NODE_DOMAIN, &bytes));
+        }
+        level = next;
+    }
+    Some(level[0])
 }
 
 pub fn validate_request_v4(raw: &[u8]) -> Result<RequestV4, ProtocolError> {
@@ -589,10 +661,14 @@ pub fn validate_delivery_v2(raw: &[u8]) -> Result<DeliveryV2, ProtocolError> {
 
 pub fn validate_completion_entry_v2(
     raw: &[u8],
-    completion_id: Uuid,
-    count: u64,
-    index: u64,
+    expected: CompletionEntryExpectations,
 ) -> Result<Sha256Digest, ProtocolError> {
+    let CompletionEntryExpectations {
+        completion_id,
+        count,
+        index,
+        ..
+    } = expected;
     if !(1..=1023).contains(&count) || !(1..=count).contains(&index) {
         return Err(err("entry bounds"));
     }
@@ -612,8 +688,8 @@ pub fn validate_completion_entry_v2(
         12,
     )?;
     if uint(&lf[0], false)? != 2
-        || uuid(&lf[1]).is_err()
-        || uint(&lf[2], true).is_err()
+        || uuid(&lf[1])? != expected.catalog_id
+        || uint(&lf[2], true)? != expected.generation
         || uint(&lf[3], true)? != index
         || digest(&lf[4]).is_err()
         || digest(&lf[5]).is_err()
@@ -629,11 +705,13 @@ pub fn validate_completion_entry_v2(
     if uint(&lf[9], false)? >= uint(&lf[10], false)? {
         return Err(err("leaf interval"));
     }
-    if digest(&f[3])?
-        != Sha256Digest::hash_domain(
-            b"dirextalk.recovery-scope-catalog-leaf-commitment.v2\0",
-            &leaf,
-        )
+    let leaf_digest = digest(&f[3])?;
+    if leaf_digest != expected.leaf_digest
+        || leaf_digest
+            != Sha256Digest::hash_domain(
+                b"dirextalk.recovery-scope-catalog-leaf-commitment.v2\0",
+                &leaf,
+            )
     {
         return Err(err("leaf digest"));
     };
@@ -674,11 +752,35 @@ pub fn validate_completion_entry_v2(
     }
     let cert = bytes(&f[5], MAX_CERTIFICATE_BYTES)?;
     let cert_parsed = validate_certificate(&cert)?;
+    if cert_parsed.issuer_key != fixed::<32>(&lf[8])?
+        || cert_parsed.authorization_digest != digest(&lf[11])?
+        || cert_parsed.generation != expected.generation
+        || cert_parsed.index != expected.index
+        || cert_parsed.leaf_digest != leaf_digest
+        || cert_parsed.context_digest != expected.context_digest
+        || cert_parsed.issued_at < uint(&lf[9], false)?
+        || cert_parsed.expires_at > uint(&lf[10], false)?
+        || cert_parsed.issued_at < expected.request_issued_at
+        || cert_parsed.expires_at > expected.request_expires_at
+        || cert_parsed.issued_at < expected.head_issued_at
+        || cert_parsed.expires_at > expected.head_expires_at
+        || cert_parsed.issued_at < expected.grant_issued_at
+        || cert_parsed.expires_at > expected.grant_expires_at
+    {
+        return Err(err("certificate expectations"));
+    }
     if digest(&f[6])? != cert_parsed.digest() {
         return Err(err("certificate digest"));
     };
     let evidence = bytes(&f[7], MAX_EVIDENCE_BYTES)?;
     validate_evidence(&evidence, &cert_parsed)?;
+    let evidence_fields = map(
+        &decode_deterministic_cbor(&evidence).map_err(|_| err("evidence cbor"))?,
+        12,
+    )?;
+    if digest(&evidence_fields[4])? != expected.head_digest {
+        return Err(err("evidence head"));
+    }
     if digest(&f[8])? != Sha256Digest::hash_domain(EVIDENCE_DIGEST_DOMAIN, &evidence) {
         return Err(err("evidence digest"));
     };
@@ -716,7 +818,7 @@ fn validate_certificate(raw: &[u8]) -> Result<CertificateV1, ProtocolError> {
         return Err(err("certificate version"));
     };
     let issuer = fixed::<32>(&f[1])?;
-    let _ = digest(&f[2])?;
+    let authorization_digest = digest(&f[2])?;
     let _ = uint(&f[3], true)?;
     let _ = digest(&f[4])?;
     let cert_count = uint(&f[5], true)?;
@@ -748,6 +850,8 @@ fn validate_certificate(raw: &[u8]) -> Result<CertificateV1, ProtocolError> {
         signature(&f[15])?,
     )?;
     Ok(CertificateV1 {
+        issuer_key: issuer,
+        authorization_digest,
         child_key: child,
         digest: Sha256Digest::hash_domain(CERTIFICATE_DIGEST_DOMAIN, raw),
         context_digest: digest(&f[8])?,
@@ -798,6 +902,25 @@ fn validate_evidence(raw: &[u8], cert: &CertificateV1) -> Result<(), ProtocolErr
 mod tests {
     use super::*;
 
+    fn entry_expectations() -> CompletionEntryExpectations {
+        CompletionEntryExpectations {
+            catalog_id: Uuid::now_v7(),
+            generation: 1,
+            index: 1,
+            completion_id: Uuid::now_v7(),
+            count: 1,
+            leaf_digest: Sha256Digest::from_bytes([1; 32]),
+            context_digest: Sha256Digest::from_bytes([2; 32]),
+            head_digest: Sha256Digest::from_bytes([3; 32]),
+            request_issued_at: 1,
+            request_expires_at: 2,
+            head_issued_at: 1,
+            head_expires_at: 2,
+            grant_issued_at: 1,
+            grant_expires_at: 2,
+        }
+    }
+
     #[test]
     fn every_boundary_rejects_empty_and_noncanonical_payloads() {
         let malformed = [0xff, 0x00];
@@ -807,7 +930,7 @@ mod tests {
         assert!(validate_offer_v3(&malformed).is_err());
         assert!(validate_grant_v5(&malformed).is_err());
         assert!(validate_delivery_v2(&malformed).is_err());
-        assert!(validate_completion_entry_v2(&malformed, Uuid::now_v7(), 1, 1).is_err());
+        assert!(validate_completion_entry_v2(&malformed, entry_expectations()).is_err());
     }
 
     #[test]

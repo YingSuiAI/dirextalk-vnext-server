@@ -289,9 +289,6 @@ impl HistoryRecoveryCompletionCommand {
             CanonicalValue::Array(v) if v.len() == entry_count as usize => v,
             _ => return Err(IdentityPersistenceError::RecoveryCompletionInvalid),
         };
-        for (index, entry) in entries.iter().enumerate() {
-            validate_entry(entry, completion_id, catalog_leaf_count, (index + 1) as u64)?;
-        }
         let computed = merkle_entries(entries)?;
         if computed != entry_root {
             return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
@@ -361,6 +358,48 @@ impl HistoryRecoveryCompletionCommand {
             || digest_field(&request_fields[15])? != manifest_digest
         {
             return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
+        }
+        let manifest_parsed = recovery_protocol::validate_manifest_v2(&manifest)
+            .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+        if manifest_parsed.catalog_root_digest() != catalog_root_digest
+            || manifest_parsed.leaves().len() != entries.len()
+        {
+            return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
+        }
+        let manifest_value = dtx_wire::decode_deterministic_cbor(&manifest)
+            .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+        let manifest_fields = numbered(&manifest_value, 10)?;
+        let head_bytes = bytes_field(
+            &manifest_fields[4],
+            recovery_protocol::MAX_CATALOG_HEAD_BYTES,
+        )?;
+        let head = recovery_protocol::validate_catalog_head_v2(&head_bytes)
+            .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+        let grant_value = dtx_wire::decode_deterministic_cbor(&grant)
+            .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+        let grant_fields = numbered(&grant_value, 36)?;
+        let context_digest = digest_field(&fields[34])?;
+        for (offset, entry) in entries.iter().enumerate() {
+            let index = (offset + 1) as u64;
+            validate_entry(
+                entry,
+                recovery_protocol::CompletionEntryExpectations {
+                    catalog_id,
+                    generation: catalog_generation,
+                    index,
+                    completion_id,
+                    count: catalog_leaf_count,
+                    leaf_digest: manifest_parsed.leaves()[offset],
+                    context_digest,
+                    head_digest: catalog_head_digest,
+                    request_issued_at: uint_field(&request_fields[16])?,
+                    request_expires_at: uint_field(&request_fields[17])?,
+                    head_issued_at: head.issued_at(),
+                    head_expires_at: head.expires_at(),
+                    grant_issued_at: uint_field(&grant_fields[30])?,
+                    grant_expires_at: uint_field(&grant_fields[31])?,
+                },
+            )?;
         }
         let signature = fixed64(&fields[35])?;
         let unsigned = dtx_wire::encode_deterministic_cbor(&CanonicalValue::Map(
@@ -516,13 +555,11 @@ fn merkle_entries(entries: &[CanonicalValue]) -> Result<Sha256Digest, IdentityPe
 }
 fn validate_entry(
     value: &CanonicalValue,
-    completion_id: Uuid,
-    count: u64,
-    index: u64,
+    expected: recovery_protocol::CompletionEntryExpectations,
 ) -> Result<(), IdentityPersistenceError> {
     let encoded = encode_deterministic_cbor(value)
         .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
-    recovery_protocol::validate_completion_entry_v2(&encoded, completion_id, count, index)
+    recovery_protocol::validate_completion_entry_v2(&encoded, expected)
         .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
     Ok(())
 }
@@ -597,7 +634,7 @@ impl HistoryRecoveryCompletionRepository {
                 if row.try_get::<Vec<u8>,_>("completion_digest")? != Sha256Digest::hash_domain(b"dirextalk.history-recovery.completion-command.v2\0", &command.exact_bytes).as_bytes() { return Err(IdentityPersistenceError::IdempotencyConflict); }
                 return Ok(CompletionReceiptOutcome { created:false, receipt_bytes:row.try_get("receipt_bytes")? });
             }
-            if let Some(row) = sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND request_id=$2 AND grant_digest=$3").bind(&command.identity_id).bind(command.request_id).bind(command.grant_digest.as_bytes()).fetch_optional(&mut *tx.connection()).await? {
+            if let Some(row) = sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND request_id=$2").bind(&command.identity_id).bind(command.request_id).fetch_optional(&mut *tx.connection()).await? {
                 if row.try_get::<Vec<u8>,_>("completion_digest")? != Sha256Digest::hash_domain(b"dirextalk.history-recovery.completion-command.v2\0", &command.exact_bytes).as_bytes() { return Err(IdentityPersistenceError::IdempotencyConflict); }
                 return Ok(CompletionReceiptOutcome { created:false, receipt_bytes:row.try_get("receipt_bytes")? });
             }
@@ -618,7 +655,7 @@ impl HistoryRecoveryCompletionRepository {
             // A competing transaction may have committed while this request row was
             // waiting for its lock. Re-read the terminal fence after the lock so the
             // same request+grant pair is an exact replay, never a second receipt.
-            if let Some(row) = sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND request_id=$2 AND grant_digest=$3").bind(&command.identity_id).bind(command.request_id).bind(command.grant_digest.as_bytes()).fetch_optional(&mut *tx.connection()).await? {
+            if let Some(row) = sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND request_id=$2").bind(&command.identity_id).bind(command.request_id).fetch_optional(&mut *tx.connection()).await? {
                 if row.try_get::<Vec<u8>,_>("completion_digest")? != Sha256Digest::hash_domain(b"dirextalk.history-recovery.completion-command.v2\0", &command.exact_bytes).as_bytes() { return Err(IdentityPersistenceError::IdempotencyConflict); }
                 return Ok(CompletionReceiptOutcome { created:false, receipt_bytes:row.try_get("receipt_bytes")? });
             }
@@ -638,7 +675,7 @@ impl HistoryRecoveryCompletionRepository {
                 let row = sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND completion_id=$2").bind(&command.identity_id).bind(command.completion_id).fetch_optional(&mut *tx.connection()).await?;
                 let row = match row {
                     Some(row) => row,
-                    None => sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND request_id=$2 AND grant_digest=$3").bind(&command.identity_id).bind(command.request_id).bind(command.grant_digest.as_bytes()).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::CorruptData("completion conflict"))?,
+                    None => sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND request_id=$2").bind(&command.identity_id).bind(command.request_id).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::CorruptData("completion conflict"))?,
                 };
                 if row.try_get::<Vec<u8>,_>("completion_digest")? != Sha256Digest::hash_domain(b"dirextalk.history-recovery.completion-command.v2\0", &command.exact_bytes).as_bytes() { return Err(IdentityPersistenceError::IdempotencyConflict); }
                 return Ok(CompletionReceiptOutcome { created:false, receipt_bytes:row.try_get("receipt_bytes")? });
@@ -732,6 +769,7 @@ impl HistoryRecoveryCompletionRepository {
         let descriptor_digest = descriptor.digest;
         let existing = sqlx::query("SELECT descriptor_bytes,descriptor_digest,epoch,rollback_floor_epoch FROM identity.history_recovery_completion_descriptors WHERE descriptor_digest=$1").bind(descriptor_digest.as_bytes()).fetch_optional(&mut *connection).await?;
         let head = sqlx::query("SELECT d.descriptor_digest,d.epoch,d.rollback_floor_epoch FROM identity.history_recovery_completion_key_head h JOIN identity.history_recovery_completion_descriptors d ON d.descriptor_digest=h.descriptor_digest WHERE h.singleton=true").fetch_optional(&mut *connection).await?;
+        let has_head = head.is_some();
         if let Some(row) = head {
             let current_digest = digest32(&row.try_get::<Vec<u8>, _>("descriptor_digest")?)?;
             let current_epoch = row.try_get::<i64, _>("epoch")? as u64;
@@ -755,7 +793,7 @@ impl HistoryRecoveryCompletionRepository {
                 return Err(IdentityPersistenceError::RecoveryCompletionSignerMismatch);
             }
             return decode_descriptor(descriptor_bytes, descriptor_digest.as_bytes().to_vec());
-        } else if config.epoch != 1 || config.previous_descriptor_digest.is_some() {
+        } else if !has_head && (config.epoch != 1 || config.previous_descriptor_digest.is_some()) {
             return Err(IdentityPersistenceError::RecoveryCompletionSignerMismatch);
         }
         sqlx::query("INSERT INTO identity.history_recovery_completion_descriptors(descriptor_digest,key_id,public_key,epoch,rollback_floor_epoch,issued_at_ms,expires_at_ms,previous_descriptor_digest,signature,descriptor_bytes,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)").bind(descriptor_digest.as_bytes()).bind(config.key_id).bind(descriptor.public_key.as_bytes()).bind(config.epoch as i64).bind(config.rollback_floor_epoch as i64).bind(config.issued_at.get()).bind(config.expires_at.get()).bind(config.previous_descriptor_digest.map(|d| d.as_bytes().to_vec())).bind(descriptor.signature.as_bytes()).bind(&descriptor_bytes).bind(now.get()).execute(&mut *connection).await?;

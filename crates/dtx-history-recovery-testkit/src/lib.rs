@@ -291,7 +291,52 @@ pub fn request_v4(
     issued_at: i64,
     expires_at: i64,
 ) -> Vec<u8> {
-    let leaves = CanonicalValue::Array(vec![CanonicalValue::Bytes(vec![31; 32])]);
+    request_v4_with_leaf_digest(
+        request,
+        identity,
+        candidate_device,
+        candidate,
+        recipient_key,
+        pre_head_sequence,
+        pre_head_hash,
+        post_head_sequence,
+        post_head_hash,
+        device_add,
+        preparation,
+        catalog_id,
+        catalog_head,
+        catalog_head_digest,
+        [31; 32],
+        response_capability,
+        idempotency,
+        issued_at,
+        expires_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn request_v4_with_leaf_digest(
+    request: DeviceEnrollmentChallengeId,
+    identity: IdentityId,
+    candidate_device: DeviceId,
+    candidate: &SigningKey,
+    recipient_key: [u8; 32],
+    pre_head_sequence: u64,
+    pre_head_hash: [u8; 32],
+    post_head_sequence: u64,
+    post_head_hash: [u8; 32],
+    device_add: &[u8],
+    preparation: &[u8],
+    catalog_id: Uuid,
+    catalog_head: &[u8],
+    catalog_head_digest: [u8; 32],
+    leaf_digest: [u8; 32],
+    response_capability: [u8; 32],
+    idempotency: &str,
+    issued_at: i64,
+    expires_at: i64,
+) -> Vec<u8> {
+    let leaves = CanonicalValue::Array(vec![CanonicalValue::Bytes(leaf_digest.to_vec())]);
     let leaf_bytes = encode(&leaves);
     let manifest = CanonicalValue::Map(vec![
         field(1, CanonicalValue::Unsigned(2)),
@@ -300,7 +345,7 @@ pub fn request_v4(
         field(4, CanonicalValue::Unsigned(1)),
         field(5, CanonicalValue::Bytes(catalog_head.to_vec())),
         field(6, digest(catalog_head_digest)),
-        field(7, digest([31; 32])),
+        field(7, digest(leaf_digest)),
         field(8, CanonicalValue::Unsigned(1)),
         field(
             9,
@@ -1148,9 +1193,33 @@ pub use redacted_completion_evidence_v1 as evidence_v1;
 mod tests {
     use super::*;
     use dtx_history_recovery_protocol::{
-        validate_catalog_head_v2, validate_completion_entry_v2, validate_delivery_v2,
-        validate_grant_v5, validate_offer_v3, validate_request_v4,
+        CompletionEntryExpectations, validate_catalog_head_v2, validate_completion_entry_v2,
+        validate_delivery_v2, validate_grant_v5, validate_offer_v3, validate_request_v4,
     };
+
+    fn entry_expectations(
+        catalog_id: Uuid,
+        completion_id: Uuid,
+        leaf_digest: Sha256Digest,
+        context_digest: Sha256Digest,
+    ) -> CompletionEntryExpectations {
+        CompletionEntryExpectations {
+            catalog_id,
+            generation: 7,
+            index: 1,
+            completion_id,
+            count: 1,
+            leaf_digest,
+            context_digest,
+            head_digest: Sha256Digest::from_bytes([5; 32]),
+            request_issued_at: 1_000,
+            request_expires_at: 9_000,
+            head_issued_at: 1_000,
+            head_expires_at: 9_000,
+            grant_issued_at: 1_000,
+            grant_expires_at: 9_000,
+        }
+    }
 
     #[test]
     fn signing_key_is_not_exposed_by_artifact_builders() {
@@ -1251,7 +1320,11 @@ mod tests {
         let entry_without_proof = completion_entry_v2(1, &leaf, &[], &certificate, &evidence);
         let proof = completion_entry_proof_v2(completion_id, 1, 1, &entry_without_proof, &[]);
         let entry = completion_entry_v2(1, &leaf, &proof, &certificate, &evidence);
-        validate_completion_entry_v2(&entry, completion_id, 1, 1).expect("golden entry");
+        validate_completion_entry_v2(
+            &entry,
+            entry_expectations(catalog_id, completion_id, leaf_digest, context_digest),
+        )
+        .expect("golden entry");
         assert!(!certificate.is_empty());
         assert!(!evidence.is_empty());
         let delivery = delivery_v2(
@@ -1270,7 +1343,13 @@ mod tests {
         validate_delivery_v2(&delivery).expect("golden delivery");
         let mut tampered = entry.clone();
         *tampered.last_mut().expect("entry bytes") ^= 1;
-        assert!(validate_completion_entry_v2(&tampered, completion_id, 1, 1).is_err());
+        assert!(
+            validate_completion_entry_v2(
+                &tampered,
+                entry_expectations(catalog_id, completion_id, leaf_digest, context_digest)
+            )
+            .is_err()
+        );
     }
 
     #[test]

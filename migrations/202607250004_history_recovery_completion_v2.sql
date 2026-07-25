@@ -37,7 +37,7 @@ CREATE TABLE identity.history_recovery_completions_v2 (
     PRIMARY KEY(identity_id,completion_id),
     UNIQUE(identity_id,idempotency_digest),
     UNIQUE(identity_id,completion_digest),
-    UNIQUE(identity_id,request_id,grant_digest),
+    UNIQUE(identity_id,request_id),
     FOREIGN KEY(descriptor_digest) REFERENCES identity.history_recovery_completion_descriptors(descriptor_digest)
 );
 ALTER TABLE identity.history_recovery_completion_descriptors ENABLE ROW LEVEL SECURITY;
