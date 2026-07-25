@@ -662,8 +662,20 @@ pub fn grant_v5(
         field(19, digest(post_hash)),
         field(20, digest(device_add_digest)),
         field(21, digest(preparation_digest)),
-        field(22, provider_descriptor),
-        field(23, authority_descriptor),
+        field(
+            22,
+            CanonicalValue::Bytes(
+                dtx_wire::encode_deterministic_cbor(&provider_descriptor)
+                    .expect("provider descriptor"),
+            ),
+        ),
+        field(
+            23,
+            CanonicalValue::Bytes(
+                dtx_wire::encode_deterministic_cbor(&authority_descriptor)
+                    .expect("authority descriptor"),
+            ),
+        ),
         field(24, recipient_digest.to_canonical_value()),
         field(25, offer_digest.to_canonical_value()),
         field(26, CanonicalValue::Text(mailbox_id.to_string())),

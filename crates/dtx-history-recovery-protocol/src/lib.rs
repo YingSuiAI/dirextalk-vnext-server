@@ -7,8 +7,7 @@ use std::{fmt, str::FromStr};
 
 use dtx_domain::{DeviceId, IdentityId};
 use dtx_wire::{
-    CanonicalEncode, CanonicalValue, Sha256Digest, decode_deterministic_cbor,
-    encode_deterministic_cbor,
+    CanonicalValue, Sha256Digest, decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use uuid::Uuid;
@@ -297,7 +296,7 @@ fn nonzero_digest(v: &CanonicalValue) -> Result<Sha256Digest, ProtocolError> {
     }
     Ok(value)
 }
-fn signing_key(v: &CanonicalValue) -> Result<[u8; 32], ProtocolError> {
+fn descriptor_signing_key(v: &CanonicalValue) -> Result<[u8; 32], ProtocolError> {
     let key = fixed::<32>(v)?;
     if key == [0; 32] || VerifyingKey::from_bytes(&key).is_err() {
         return Err(err("signing key"));
@@ -552,15 +551,15 @@ pub fn validate_offer_v3(raw: &[u8]) -> Result<OfferV3, ProtocolError> {
         return Err(err("offer version"));
     };
     let request_id = uuid(&fields[1])?;
-    let _request_digest = nonzero_digest(&fields[2])?;
-    let _manifest_digest = nonzero_digest(&fields[3])?;
+    let _request_digest = digest(&fields[2])?;
+    let _manifest_digest = digest(&fields[3])?;
     let _catalog_id = uuid(&fields[4])?;
     let _generation = uint(&fields[5], true)?;
-    let _head_digest = nonzero_digest(&fields[6])?;
-    let _leaf_set_digest = nonzero_digest(&fields[7])?;
-    let _allowed_snapshot_digest = nonzero_digest(&fields[8])?;
+    let _head_digest = digest(&fields[6])?;
+    let _leaf_set_digest = digest(&fields[7])?;
+    let _allowed_snapshot_digest = digest(&fields[8])?;
     let cipher = bytes(&fields[9], 1_048_576)?;
-    let cipher_digest = nonzero_digest(&fields[10])?;
+    let cipher_digest = digest(&fields[10])?;
     if cipher_digest != Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, &cipher) {
         return Err(err("offer ciphertext"));
     };
@@ -569,11 +568,11 @@ pub fn validate_offer_v3(raw: &[u8]) -> Result<OfferV3, ProtocolError> {
         value => {
             let attachment = map(value, 4)?;
             let _object_id = uuid(&attachment[0])?;
-            let _attachment_digest = nonzero_digest(&attachment[1])?;
+            let _attachment_digest = digest(&attachment[1])?;
             if uint(&attachment[2], true)? == 0 {
                 return Err(err("attachment size"));
             }
-            let _attachment_key = nonzero_digest(&attachment[3])?;
+            let _attachment_key = digest(&attachment[3])?;
         }
     }
     let issued = uint(&fields[12], false)?;
@@ -581,7 +580,7 @@ pub fn validate_offer_v3(raw: &[u8]) -> Result<OfferV3, ProtocolError> {
     if issued >= expires {
         return Err(err("offer interval"));
     };
-    let _recipient_key_digest = nonzero_digest(&fields[14])?;
+    let _recipient_key_digest = digest(&fields[14])?;
     let provider = nonzero_digest(&fields[15])?;
     Ok(OfferV3 {
         request_id,
@@ -603,15 +602,15 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
     };
     let _identity = identity(&fields[1])?;
     let request_id = uuid(&fields[2])?;
-    let _request_digest = nonzero_digest(&fields[3])?;
-    let _manifest_digest = nonzero_digest(&fields[4])?;
+    let _request_digest = digest(&fields[3])?;
+    let _manifest_digest = digest(&fields[4])?;
     let _catalog_id = uuid(&fields[5])?;
     let _generation = uint(&fields[6], true)?;
     let head = bytes(&fields[7], MAX_CATALOG_HEAD_BYTES)?;
     let head = validate_catalog_head_v2(&head)?;
-    let head_digest = nonzero_digest(&fields[8])?;
-    let root_digest = nonzero_digest(&fields[9])?;
-    let _leaf_set_digest = nonzero_digest(&fields[11])?;
+    let head_digest = digest(&fields[8])?;
+    let root_digest = digest(&fields[9])?;
+    let _leaf_set_digest = digest(&fields[11])?;
     if head_digest != head.digest()
         || uuid(&fields[5])? != head.catalog_id()
         || uint(&fields[6], true)? != head.generation()
@@ -620,8 +619,14 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
     {
         return Err(err("grant catalog coordinates"));
     }
-    let provider = map(&fields[21], 3)?;
-    let authority = map(&fields[22], 3)?;
+    let provider_bytes = bytes(&fields[21], 77)?;
+    let provider_value =
+        decode_deterministic_cbor(&provider_bytes).map_err(|_| err("provider descriptor"))?;
+    let provider = map(&provider_value, 3)?;
+    let authority_bytes = bytes(&fields[22], 77)?;
+    let authority_value =
+        decode_deterministic_cbor(&authority_bytes).map_err(|_| err("authority descriptor"))?;
+    let authority = map(&authority_value, 3)?;
     if uint(&provider[0], false)? != 2 || device(&provider[1]).is_err() {
         return Err(err("provider descriptor"));
     }
@@ -630,19 +635,23 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
     if provider_device == candidate_device {
         return Err(err("provider device separation"));
     }
-    let candidate_key = signing_key(&fields[13])?;
-    let candidate_recipient_key = fixed::<32>(&fields[14])?;
-    if candidate_recipient_key == [0; 32] {
-        return Err(err("recipient key"));
+    let candidate_key = fixed::<32>(&fields[13])?;
+    if candidate_key == [0; 32] {
+        return Err(err("candidate key"));
     }
-    if nonzero_digest(&fields[16]).is_err()
-        || uint(&fields[17], false)?
-            != uint(&fields[15], false)?
-                .checked_add(1)
-                .ok_or(err("highwater"))?
-        || nonzero_digest(&fields[18]).is_err()
-        || nonzero_digest(&fields[19]).is_err()
-        || nonzero_digest(&fields[20]).is_err()
+    let candidate_recipient_key = fixed::<32>(&fields[14])?;
+    let _mailbox_id = uuid(&fields[25])?;
+    let _envelope_id = uuid(&fields[26])?;
+    let _delivery_fact_id = uuid(&fields[29])?;
+    let _grant_idempotency_digest = digest(&fields[32])?;
+    if uint(&fields[17], false)?
+        != uint(&fields[15], false)?
+            .checked_add(1)
+            .ok_or(err("highwater"))?
+        || digest(&fields[16]).is_err()
+        || digest(&fields[18]).is_err()
+        || digest(&fields[19]).is_err()
+        || digest(&fields[20]).is_err()
     {
         return Err(err("grant coordinates"));
     }
@@ -653,8 +662,8 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
     {
         return Err(err("authority descriptor"));
     }
-    let provider_key = signing_key(&provider[2])?;
-    let authority_key = signing_key(&authority[2])?;
+    let provider_key = descriptor_signing_key(&provider[2])?;
+    let authority_key = descriptor_signing_key(&authority[2])?;
     if provider_key == candidate_key || authority_key == candidate_key {
         return Err(err("candidate signer separation"));
     }
@@ -683,9 +692,9 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
     }
     let offer = encode_deterministic_cbor(&fields[35]).map_err(|_| err("offer"))?;
     let offer_parsed = validate_offer_v3(&offer)?;
-    if nonzero_digest(&fields[23])?
+    if digest(&fields[23])?
         != Sha256Digest::hash_domain(RECIPIENT_KEY_DIGEST_DOMAIN, &candidate_recipient_key)
-        || nonzero_digest(&fields[24])? != offer_parsed.digest()
+        || digest(&fields[24])? != offer_parsed.digest()
     {
         return Err(err("grant offer coordinates"));
     }
@@ -1072,7 +1081,11 @@ mod tests {
             ),
             (
                 CanonicalValue::Unsigned(11),
-                Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, ciphertext).to_canonical_value(),
+                CanonicalValue::Bytes(
+                    Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, ciphertext)
+                        .as_bytes()
+                        .to_vec(),
+                ),
             ),
             (CanonicalValue::Unsigned(12), CanonicalValue::Null),
             (CanonicalValue::Unsigned(13), CanonicalValue::Unsigned(10)),
@@ -1090,28 +1103,19 @@ mod tests {
             encode_deterministic_cbor(&CanonicalValue::Map(fields.clone())).expect("offer")
         };
         assert!(validate_offer_v3(&encode_offer(&fields)).is_ok());
-        for (index, value) in [
-            (2, CanonicalValue::Bytes([0; 32].to_vec())),
-            (8, CanonicalValue::Bytes([0; 32].to_vec())),
-            (10, CanonicalValue::Bytes([0; 32].to_vec())),
-            (14, CanonicalValue::Bytes([0; 32].to_vec())),
-            (15, CanonicalValue::Bytes([0; 32].to_vec())),
-        ] {
+        for (index, value) in [(15, CanonicalValue::Bytes([0; 32].to_vec()))] {
             fields[index].1 = value;
             assert!(
                 validate_offer_v3(&encode_offer(&fields)).is_err(),
                 "offer field {} accepted",
                 index + 1
             );
-            fields[index].1 = match index {
-                2 => CanonicalValue::Bytes([1; 32].to_vec()),
-                8 => CanonicalValue::Bytes([5; 32].to_vec()),
-                10 => Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, ciphertext)
-                    .to_canonical_value(),
-                14 => CanonicalValue::Bytes([6; 32].to_vec()),
-                15 => CanonicalValue::Bytes([7; 32].to_vec()),
-                _ => unreachable!(),
-            };
+            fields[index].1 = CanonicalValue::Bytes([7; 32].to_vec());
+        }
+        for index in [2, 8, 14] {
+            fields[index].1 = CanonicalValue::Bytes([0; 32].to_vec());
+            assert!(validate_offer_v3(&encode_offer(&fields)).is_ok());
+            fields[index].1 = CanonicalValue::Bytes([1; 32].to_vec());
         }
         fields[11].1 = CanonicalValue::Unsigned(1);
         assert!(validate_offer_v3(&encode_offer(&fields)).is_err());
