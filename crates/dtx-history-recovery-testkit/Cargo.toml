@@ -9,9 +9,7 @@ publish = false
 dtx-domain = { path = "../dtx-domain" }
 dtx-identity-log = { path = "../dtx-identity-log" }
 dtx-wire = { path = "../dtx-wire" }
+dtx-history-recovery-protocol = { path = "../dtx-history-recovery-protocol" }
 ed25519-dalek.workspace = true
 sha2.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-dtx-history-recovery-protocol = { path = "../dtx-history-recovery-protocol" }

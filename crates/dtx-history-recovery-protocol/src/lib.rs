@@ -51,6 +51,9 @@ pub const CERTIFICATE_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.mls-recovery.completion-child-certificate-signature.v1\0";
 pub const EVIDENCE_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.mls-recovery.redacted-evidence-signature.v1\0";
+pub const COMPLETION_CONTEXT_DOMAIN: &[u8] = b"dirextalk.history-recovery-completion-context.v2\0";
+pub const COMPLETION_SIGNATURE_DOMAIN: &[u8] =
+    b"dirextalk.history-recovery.completion-command-signature.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolError(&'static str);
@@ -646,7 +649,10 @@ pub fn validate_completion_entry_v2(
     {
         return Err(err("proof coordinates"));
     };
-    let entry_digest = Sha256Digest::hash_domain(COMPLETION_ENTRY_DOMAIN, raw);
+    // The proof commits to the canonical entry preimage before field 5 is
+    // populated.  This avoids a self-referential hash while the Completion
+    // Merkle tree still commits the final entry bytes below.
+    let entry_digest = completion_entry_preimage_digest(raw)?;
     if digest(&pf[4])? != entry_digest {
         return Err(err("proof entry digest"));
     };
@@ -677,6 +683,28 @@ pub fn validate_completion_entry_v2(
         return Err(err("evidence digest"));
     };
     Ok(entry_digest)
+}
+
+/// Digest the canonical Completion entry preimage used by proof field 5.
+/// The entry map is decoded, field 5 (the exact proof bytes) is replaced by an
+/// empty byte string, and the resulting canonical map is domain-hashed.
+pub fn completion_entry_preimage_digest(raw: &[u8]) -> Result<Sha256Digest, ProtocolError> {
+    let value = decode_deterministic_cbor(raw).map_err(|_| err("entry preimage cbor"))?;
+    let CanonicalValue::Map(mut fields) = value else {
+        return Err(err("entry preimage map"));
+    };
+    if fields.len() != 9
+        || fields
+            .iter()
+            .enumerate()
+            .any(|(i, (key, _))| *key != CanonicalValue::Unsigned((i + 1) as u64))
+    {
+        return Err(err("entry preimage fields"));
+    }
+    fields[4].1 = CanonicalValue::Bytes(Vec::new());
+    let encoded = encode_deterministic_cbor(&CanonicalValue::Map(fields))
+        .map_err(|_| err("entry preimage encode"))?;
+    Ok(Sha256Digest::hash_domain(COMPLETION_ENTRY_DOMAIN, &encoded))
 }
 
 fn validate_certificate(raw: &[u8]) -> Result<CertificateV1, ProtocolError> {

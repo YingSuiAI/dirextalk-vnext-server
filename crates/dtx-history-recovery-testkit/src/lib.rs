@@ -647,11 +647,499 @@ pub fn grant_v5(
     encode_with_limit(&CanonicalValue::Map(fields), MAX_EXACT_GRANT_BYTES)
 }
 
+/// Build the exact immutable Delivery V2 fact emitted by the mailbox owner.
+#[allow(clippy::too_many_arguments)]
+pub fn delivery_v2(
+    delivery_fact_id: Uuid,
+    mailbox_id: Uuid,
+    envelope_id: Uuid,
+    delivery_sequence: u64,
+    grant_digest: [u8; 32],
+    offer_digest: [u8; 32],
+    request_id: Uuid,
+    candidate_device_id: Uuid,
+    committed_at: i64,
+    event_id: Uuid,
+    outbox_id: Uuid,
+) -> Vec<u8> {
+    encode_with_limit(
+        &CanonicalValue::Map(vec![
+            field(1, CanonicalValue::Unsigned(2)),
+            field(2, CanonicalValue::Text(delivery_fact_id.to_string())),
+            field(3, CanonicalValue::Text(mailbox_id.to_string())),
+            field(4, CanonicalValue::Text(envelope_id.to_string())),
+            field(5, CanonicalValue::Unsigned(delivery_sequence)),
+            field(6, digest(grant_digest)),
+            field(7, digest(offer_digest)),
+            field(8, CanonicalValue::Text(request_id.to_string())),
+            field(9, CanonicalValue::Text(candidate_device_id.to_string())),
+            field(10, CanonicalValue::Unsigned(committed_at as u64)),
+            field(11, CanonicalValue::Text(event_id.to_string())),
+            field(12, CanonicalValue::Text(outbox_id.to_string())),
+        ]),
+        dtx_history_recovery_protocol::MAX_DELIVERY_BYTES,
+    )
+}
+
+/// Build one Catalog public leaf commitment (the exact map nested in an entry).
+#[allow(clippy::too_many_arguments)]
+pub fn catalog_leaf_v2(
+    catalog_id: Uuid,
+    generation: u64,
+    index: u64,
+    private_body_digest: [u8; 32],
+    verifier_binding_digest: [u8; 32],
+    issuer_key: [u8; 32],
+    authorization_not_before: i64,
+    authorization_expires: i64,
+    authorization_digest: [u8; 32],
+) -> Vec<u8> {
+    encode_with_limit(
+        &CanonicalValue::Map(vec![
+            field(1, CanonicalValue::Unsigned(2)),
+            field(2, CanonicalValue::Text(catalog_id.to_string())),
+            field(3, CanonicalValue::Unsigned(generation)),
+            field(4, CanonicalValue::Unsigned(index)),
+            field(5, digest(private_body_digest)),
+            field(6, digest(verifier_binding_digest)),
+            field(7, CanonicalValue::Unsigned(1)),
+            field(8, CanonicalValue::Unsigned(1)),
+            field(9, CanonicalValue::Bytes(issuer_key.to_vec())),
+            field(
+                10,
+                CanonicalValue::Unsigned(authorization_not_before as u64),
+            ),
+            field(11, CanonicalValue::Unsigned(authorization_expires as u64)),
+            field(12, digest(authorization_digest)),
+        ]),
+        dtx_history_recovery_protocol::MAX_LEAF_BYTES,
+    )
+}
+
+/// Return the completion-entry domain digest used as a Merkle leaf.
+pub fn completion_entry_digest(entry: &[u8]) -> Sha256Digest {
+    Sha256Digest::hash_domain(
+        dtx_history_recovery_protocol::COMPLETION_ENTRY_DOMAIN,
+        entry,
+    )
+}
+
+/// Return the proof field's pre-proof digest (field 5 replaced by an empty
+/// byte string), matching the neutral validator's anti-cycle rule.
+pub fn completion_entry_preimage_digest(entry: &[u8]) -> Sha256Digest {
+    dtx_history_recovery_protocol::completion_entry_preimage_digest(entry)
+        .expect("canonical completion entry preimage")
+}
+
+/// Compute the exhaustive Completion entry Merkle root. Odd nodes are
+/// duplicated exactly as required by the wire protocol.
+pub fn completion_entry_root(entries: &[Vec<u8>]) -> Sha256Digest {
+    assert!(
+        !entries.is_empty(),
+        "Completion requires at least one entry"
+    );
+    let mut level: Vec<Sha256Digest> = entries
+        .iter()
+        .map(|entry| completion_entry_digest(entry))
+        .collect();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            let mut bytes = Vec::with_capacity(64);
+            bytes.extend_from_slice(pair[0].as_bytes());
+            bytes.extend_from_slice(right.as_bytes());
+            next.push(Sha256Digest::hash_domain(
+                dtx_history_recovery_protocol::COMPLETION_ENTRY_NODE_DOMAIN,
+                &bytes,
+            ));
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// Build the exact proof map for one entry. `siblings` must contain only real
+/// partners; an odd final node is represented by the verifier's duplicate-last
+/// rule and therefore consumes no sibling.
+pub fn completion_entry_proof_v2(
+    completion_id: Uuid,
+    count: u64,
+    index: u64,
+    entry: &[u8],
+    siblings: &[[u8; 32]],
+) -> Vec<u8> {
+    encode_with_limit(
+        &CanonicalValue::Map(vec![
+            field(1, CanonicalValue::Unsigned(2)),
+            field(2, CanonicalValue::Text(completion_id.to_string())),
+            field(3, CanonicalValue::Unsigned(count)),
+            field(4, CanonicalValue::Unsigned(index)),
+            field(
+                5,
+                completion_entry_preimage_digest(entry).to_canonical_value(),
+            ),
+            field(
+                6,
+                CanonicalValue::Array(
+                    siblings
+                        .iter()
+                        .map(|sibling| CanonicalValue::Bytes(sibling.to_vec()))
+                        .collect(),
+                ),
+            ),
+        ]),
+        dtx_history_recovery_protocol::MAX_PROOF_BYTES,
+    )
+}
+
+/// Build proof siblings for `index` from an ordered exact entry chain.
+pub fn completion_entry_siblings(entries: &[Vec<u8>], index: u64) -> Vec<[u8; 32]> {
+    assert!(!entries.is_empty());
+    assert!((1..=entries.len() as u64).contains(&index));
+    let mut level: Vec<Sha256Digest> = entries
+        .iter()
+        .map(|entry| completion_entry_digest(entry))
+        .collect();
+    let mut position = index as usize - 1;
+    let mut siblings = Vec::new();
+    while level.len() > 1 {
+        if position % 2 == 0 {
+            if let Some(right) = level.get(position + 1) {
+                siblings.push(*right.as_bytes());
+            }
+        } else {
+            siblings.push(*level[position - 1].as_bytes());
+        }
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            let mut bytes = Vec::with_capacity(64);
+            bytes.extend_from_slice(pair[0].as_bytes());
+            bytes.extend_from_slice(right.as_bytes());
+            next.push(Sha256Digest::hash_domain(
+                dtx_history_recovery_protocol::COMPLETION_ENTRY_NODE_DOMAIN,
+                &bytes,
+            ));
+        }
+        position /= 2;
+        level = next;
+    }
+    siblings
+}
+
+/// Build the child certificate owned by MLS Sequencer V7. Both signatures are
+/// over the exact unsigned prefixes (fields 1..14 and 1..15 respectively).
+#[allow(clippy::too_many_arguments)]
+pub fn completion_child_certificate_v1(
+    issuer: &SigningKey,
+    child: &SigningKey,
+    context_digest: [u8; 32],
+    generation: u64,
+    head_digest: [u8; 32],
+    count: u64,
+    index: u64,
+    leaf_digest: [u8; 32],
+    issued_at: i64,
+    expires_at: i64,
+) -> Vec<u8> {
+    let unsigned = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(1)),
+        field(
+            2,
+            CanonicalValue::Bytes(issuer.verifying_key().to_bytes().to_vec()),
+        ),
+        field(3, digest(context_digest)),
+        field(4, CanonicalValue::Unsigned(generation)),
+        field(5, digest(head_digest)),
+        field(6, CanonicalValue::Unsigned(count)),
+        field(7, CanonicalValue::Unsigned(index)),
+        field(8, digest(leaf_digest)),
+        field(9, digest(context_digest)),
+        field(10, CanonicalValue::Unsigned(1)),
+        field(11, CanonicalValue::Unsigned(1)),
+        field(
+            12,
+            CanonicalValue::Bytes(child.verifying_key().to_bytes().to_vec()),
+        ),
+        field(13, CanonicalValue::Unsigned(issued_at as u64)),
+        field(14, CanonicalValue::Unsigned(expires_at as u64)),
+    ]);
+    let child_signature = signature(
+        child,
+        dtx_history_recovery_protocol::CHILD_POP_DOMAIN,
+        &unsigned,
+    );
+    let mut fields = match unsigned {
+        CanonicalValue::Map(fields) => fields,
+        _ => unreachable!(),
+    };
+    fields.push(field(15, child_signature.to_canonical_value()));
+    let issuer_signature = signature(
+        issuer,
+        dtx_history_recovery_protocol::CERTIFICATE_SIGNATURE_DOMAIN,
+        &CanonicalValue::Map(fields.clone()),
+    );
+    fields.push(field(16, issuer_signature.to_canonical_value()));
+    encode_with_limit(
+        &CanonicalValue::Map(fields),
+        dtx_history_recovery_protocol::MAX_CERTIFICATE_BYTES,
+    )
+}
+
+/// Build the redacted child-signed evidence map (state 3 = activated-fenced).
+#[allow(clippy::too_many_arguments)]
+pub fn redacted_completion_evidence_v1(
+    certificate: &[u8],
+    child: &SigningKey,
+    context_digest: [u8; 32],
+    generation: u64,
+    head_digest: [u8; 32],
+    count: u64,
+    index: u64,
+    leaf_digest: [u8; 32],
+    issued_at: i64,
+    expires_at: i64,
+) -> Vec<u8> {
+    let cert_digest = Sha256Digest::hash_domain(
+        dtx_history_recovery_protocol::CERTIFICATE_DIGEST_DOMAIN,
+        certificate,
+    );
+    let unsigned = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(1)),
+        field(2, cert_digest.to_canonical_value()),
+        field(3, digest(context_digest)),
+        field(4, CanonicalValue::Unsigned(generation)),
+        field(5, digest(head_digest)),
+        field(6, CanonicalValue::Unsigned(count)),
+        field(7, CanonicalValue::Unsigned(index)),
+        field(8, digest(leaf_digest)),
+        field(9, CanonicalValue::Unsigned(3)),
+        field(10, CanonicalValue::Unsigned(issued_at as u64)),
+        field(11, CanonicalValue::Unsigned(expires_at as u64)),
+    ]);
+    let mut fields = match unsigned {
+        CanonicalValue::Map(fields) => fields,
+        _ => unreachable!(),
+    };
+    fields.push(field(
+        12,
+        signature(
+            child,
+            dtx_history_recovery_protocol::EVIDENCE_SIGNATURE_DOMAIN,
+            &CanonicalValue::Map(fields.clone()),
+        )
+        .to_canonical_value(),
+    ));
+    encode_with_limit(
+        &CanonicalValue::Map(fields),
+        dtx_history_recovery_protocol::MAX_EVIDENCE_BYTES,
+    )
+}
+
+/// Build one exhaustive Completion entry from its exact leaf, proof,
+/// certificate and evidence bytes.
+pub fn completion_entry_v2(
+    index: u64,
+    leaf: &[u8],
+    proof: &[u8],
+    certificate: &[u8],
+    evidence: &[u8],
+) -> Vec<u8> {
+    encode_with_limit(
+        &CanonicalValue::Map(vec![
+            field(1, CanonicalValue::Unsigned(2)),
+            field(2, CanonicalValue::Unsigned(index)),
+            field(3, CanonicalValue::Bytes(leaf.to_vec())),
+            field(
+                4,
+                Sha256Digest::hash_domain(
+                    b"dirextalk.recovery-scope-catalog-leaf-commitment.v2\0",
+                    leaf,
+                )
+                .to_canonical_value(),
+            ),
+            field(5, CanonicalValue::Bytes(proof.to_vec())),
+            field(6, CanonicalValue::Bytes(certificate.to_vec())),
+            field(
+                7,
+                Sha256Digest::hash_domain(
+                    dtx_history_recovery_protocol::CERTIFICATE_DIGEST_DOMAIN,
+                    certificate,
+                )
+                .to_canonical_value(),
+            ),
+            field(8, CanonicalValue::Bytes(evidence.to_vec())),
+            field(
+                9,
+                Sha256Digest::hash_domain(
+                    dtx_history_recovery_protocol::EVIDENCE_DIGEST_DOMAIN,
+                    evidence,
+                )
+                .to_canonical_value(),
+            ),
+        ]),
+        dtx_history_recovery_protocol::MAX_ENTRY_BYTES,
+    )
+}
+
+/// Exact pre-issuance completion context (field 34 of Completion V2).
+#[allow(clippy::too_many_arguments)]
+pub fn completion_context_v2(
+    nonce: [u8; 32],
+    completion_id: Uuid,
+    request_id: Uuid,
+    request_digest: [u8; 32],
+    identity: IdentityId,
+    candidate_device: Uuid,
+    catalog_id: Uuid,
+    generation: u64,
+    catalog_head_digest: [u8; 32],
+    leaf_count: u64,
+    leaf_set_digest: [u8; 32],
+) -> Vec<u8> {
+    encode_with_limit(
+        &CanonicalValue::Map(vec![
+            field(1, CanonicalValue::Unsigned(2)),
+            field(2, CanonicalValue::Bytes(nonce.to_vec())),
+            field(3, CanonicalValue::Text(completion_id.to_string())),
+            field(4, CanonicalValue::Text(request_id.to_string())),
+            field(5, digest(request_digest)),
+            field(6, CanonicalValue::Text(identity.to_string())),
+            field(7, CanonicalValue::Text(candidate_device.to_string())),
+            field(8, CanonicalValue::Text(catalog_id.to_string())),
+            field(9, CanonicalValue::Unsigned(generation)),
+            field(10, digest(catalog_head_digest)),
+            field(11, CanonicalValue::Unsigned(leaf_count)),
+            field(12, digest(leaf_set_digest)),
+        ]),
+        373,
+    )
+}
+
+/// Owned inputs for a strict Completion V2 command. Nested artifacts remain
+/// opaque exact bytes; this builder only links their public digests and
+/// coordinates, then signs fields 1..35 with the candidate key.
+#[derive(Clone, Debug)]
+pub struct CompletionV2Input {
+    pub completion_id: Uuid,
+    pub identity: IdentityId,
+    pub candidate_device: Uuid,
+    pub highwater: u64,
+    pub head_at_highwater: [u8; 32],
+    pub highwater_next: u64,
+    pub final_head_hash: [u8; 32],
+    pub catalog_id: Uuid,
+    pub catalog_generation: u64,
+    pub catalog_head: Vec<u8>,
+    pub catalog_head_digest: [u8; 32],
+    pub catalog_root_digest: [u8; 32],
+    pub leaf_set_digest: [u8; 32],
+    pub preparation: Vec<u8>,
+    pub request: Vec<u8>,
+    pub request_digest: [u8; 32],
+    pub manifest: Vec<u8>,
+    pub manifest_digest: [u8; 32],
+    pub grant: Vec<u8>,
+    pub grant_digest: [u8; 32],
+    pub offer: Vec<u8>,
+    pub offer_digest: [u8; 32],
+    pub delivery: Vec<u8>,
+    pub delivery_digest: [u8; 32],
+    pub entries: Vec<Vec<u8>>,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub idempotency_digest: [u8; 32],
+    pub context: Vec<u8>,
+}
+
+pub fn completion_v2(input: &CompletionV2Input, candidate: &SigningKey) -> Vec<u8> {
+    assert!(!input.entries.is_empty());
+    let entry_count = input.entries.len() as u64;
+    let context_digest = Sha256Digest::hash_domain(
+        dtx_history_recovery_protocol::COMPLETION_CONTEXT_DOMAIN,
+        &input.context,
+    );
+    let unsigned = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(input.completion_id.to_string())),
+        field(3, CanonicalValue::Text(input.identity.to_string())),
+        field(4, CanonicalValue::Text(input.candidate_device.to_string())),
+        field(5, CanonicalValue::Unsigned(input.highwater)),
+        field(6, digest(input.head_at_highwater)),
+        field(7, CanonicalValue::Unsigned(input.highwater_next)),
+        field(8, digest(input.final_head_hash)),
+        field(9, CanonicalValue::Text(input.catalog_id.to_string())),
+        field(10, CanonicalValue::Unsigned(input.catalog_generation)),
+        field(11, CanonicalValue::Bytes(input.catalog_head.clone())),
+        field(12, digest(input.catalog_head_digest)),
+        field(13, digest(input.catalog_root_digest)),
+        field(14, CanonicalValue::Unsigned(entry_count)),
+        field(15, digest(input.leaf_set_digest)),
+        field(16, CanonicalValue::Bytes(input.preparation.clone())),
+        field(
+            17,
+            Sha256Digest::hash_domain(PREPARATION_DIGEST_DOMAIN, &input.preparation)
+                .to_canonical_value(),
+        ),
+        field(18, CanonicalValue::Bytes(input.request.clone())),
+        field(19, digest(input.request_digest)),
+        field(20, CanonicalValue::Bytes(input.manifest.clone())),
+        field(21, digest(input.manifest_digest)),
+        field(22, CanonicalValue::Bytes(input.grant.clone())),
+        field(23, digest(input.grant_digest)),
+        field(24, CanonicalValue::Bytes(input.offer.clone())),
+        field(25, digest(input.offer_digest)),
+        field(26, CanonicalValue::Bytes(input.delivery.clone())),
+        field(27, digest(input.delivery_digest)),
+        field(28, CanonicalValue::Unsigned(entry_count)),
+        field(
+            29,
+            completion_entry_root(&input.entries).to_canonical_value(),
+        ),
+        field(
+            30,
+            CanonicalValue::Array(
+                input
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        dtx_wire::decode_deterministic_cbor(entry).expect("canonical entry")
+                    })
+                    .collect(),
+            ),
+        ),
+        field(31, CanonicalValue::Unsigned(input.issued_at as u64)),
+        field(32, CanonicalValue::Unsigned(input.expires_at as u64)),
+        field(33, digest(input.idempotency_digest)),
+        field(34, CanonicalValue::Bytes(input.context.clone())),
+        field(35, context_digest.to_canonical_value()),
+    ]);
+    let mut fields = match unsigned {
+        CanonicalValue::Map(fields) => fields,
+        _ => unreachable!(),
+    };
+    fields.push(field(
+        36,
+        signature(
+            candidate,
+            dtx_history_recovery_protocol::COMPLETION_SIGNATURE_DOMAIN,
+            &CanonicalValue::Map(fields.clone()),
+        )
+        .to_canonical_value(),
+    ));
+    encode_with_limit(
+        &CanonicalValue::Map(fields),
+        dtx_history_recovery_protocol::MAX_COMPLETION_BYTES,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use dtx_history_recovery_protocol::{
-        validate_catalog_head_v2, validate_grant_v5, validate_offer_v3, validate_request_v4,
+        validate_catalog_head_v2, validate_completion_entry_v2, validate_delivery_v2,
+        validate_grant_v5, validate_offer_v3, validate_request_v4,
     };
 
     #[test]
@@ -701,6 +1189,94 @@ mod tests {
         assert_eq!(fields[8].1, digest([7; 32]));
         assert_eq!(fields[14].1, digest([8; 32]));
         assert_eq!(fields[15].1, digest([9; 32]));
+    }
+
+    #[test]
+    fn completion_entry_materials_are_canonical_and_delivery_is_golden() {
+        let issuer = SigningKey::from_bytes(&[41; 32]);
+        let child = SigningKey::from_bytes(&[42; 32]);
+        let catalog_id = Uuid::now_v7();
+        let completion_id = Uuid::now_v7();
+        let leaf = catalog_leaf_v2(
+            catalog_id,
+            7,
+            1,
+            [1; 32],
+            [2; 32],
+            issuer.verifying_key().to_bytes(),
+            1_000,
+            9_000,
+            [3; 32],
+        );
+        let leaf_digest = Sha256Digest::hash_domain(
+            b"dirextalk.recovery-scope-catalog-leaf-commitment.v2\0",
+            &leaf,
+        );
+        let context_digest = Sha256Digest::from_bytes([4; 32]);
+        let certificate = completion_child_certificate_v1(
+            &issuer,
+            &child,
+            *context_digest.as_bytes(),
+            7,
+            [5; 32],
+            1,
+            1,
+            *leaf_digest.as_bytes(),
+            2_000,
+            8_000,
+        );
+        let evidence = redacted_completion_evidence_v1(
+            &certificate,
+            &child,
+            *context_digest.as_bytes(),
+            7,
+            [5; 32],
+            1,
+            1,
+            *leaf_digest.as_bytes(),
+            2_000,
+            8_000,
+        );
+        let entry_without_proof = completion_entry_v2(1, &leaf, &[], &certificate, &evidence);
+        let proof = completion_entry_proof_v2(completion_id, 1, 1, &entry_without_proof, &[]);
+        let entry = completion_entry_v2(1, &leaf, &proof, &certificate, &evidence);
+        validate_completion_entry_v2(&entry, completion_id, 1, 1).expect("golden entry");
+        assert!(!certificate.is_empty());
+        assert!(!evidence.is_empty());
+        let delivery = delivery_v2(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            4,
+            [6; 32],
+            [7; 32],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            3_000,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        validate_delivery_v2(&delivery).expect("golden delivery");
+        let mut tampered = entry.clone();
+        *tampered.last_mut().expect("entry bytes") ^= 1;
+        assert!(validate_completion_entry_v2(&tampered, completion_id, 1, 1).is_err());
+    }
+
+    #[test]
+    fn completion_merkle_duplicates_odd_last_without_a_proof_sibling() {
+        let entries = vec![
+            b"entry-a".to_vec(),
+            b"entry-b".to_vec(),
+            b"entry-c".to_vec(),
+        ];
+        let left_siblings = completion_entry_siblings(&entries, 1);
+        let odd_last_siblings = completion_entry_siblings(&entries, 3);
+        assert_eq!(left_siblings.len(), 2);
+        assert_eq!(odd_last_siblings.len(), 1);
+        assert_ne!(
+            completion_entry_root(&entries),
+            Sha256Digest::from_bytes([0; 32])
+        );
     }
 
     #[test]
