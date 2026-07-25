@@ -277,7 +277,7 @@ impl MailboxEnvelopeCommand {
         exact_bytes: Vec<u8>,
     ) -> Result<Self, MailboxPersistenceError> {
         validate_exact_command_bytes(&exact_bytes, MAX_HISTORY_GRANT_ENVELOPE_BYTES)?;
-        if opaque_ciphertext.is_empty() || opaque_ciphertext.len() > 1_049_059 {
+        if opaque_ciphertext.is_empty() || opaque_ciphertext.len() > 1_049_093 {
             return Err(MailboxPersistenceError::InvalidCommand(
                 "history grant opaque ciphertext byte length",
             ));

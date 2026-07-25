@@ -134,6 +134,23 @@ async fn history_grant_v5_http_success_replays_exactly_and_rejects_mismatch()
         !identity_update,
         "mailbox runtime identity evidence must remain SELECT-only"
     );
+    let grant_constraints: Vec<String> = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid)\n           FROM pg_constraint\n          WHERE conrelid = 'messaging.history_recovery_grants_v4'::regclass\n            AND contype = 'c'",
+    )
+    .fetch_all(harness.admin_pool())
+    .await?;
+    assert!(
+        grant_constraints
+            .iter()
+            .any(|definition| definition.contains("exact_offer") && definition.contains("1049093")),
+        "history grant migration must retain the exact OfferV3 ceiling"
+    );
+    assert!(
+        grant_constraints
+            .iter()
+            .any(|definition| definition.contains("exact_grant") && definition.contains("1050733")),
+        "history grant migration must retain the exact GrantV5 ceiling"
+    );
     let identity_app = identity_bootstrap_router_with_state(
         IdentityBootstrapState::with_clock_and_device_session_audience(
             identity_store.clone(),
@@ -443,7 +460,14 @@ async fn history_grant_v5_http_success_replays_exactly_and_rejects_mismatch()
         catalog_id,
         1,
         *catalog_head_digest.as_bytes(),
-        recovered.active.device_id,
+        *Sha256Digest::hash_domain(
+            history_testkit::HISTORY_LEAF_SET_DOMAIN,
+            &encode_deterministic_cbor(&CanonicalValue::Array(vec![CanonicalValue::Bytes(
+                vec![31; 32],
+            )]))?,
+        )
+        .as_bytes(),
+        [42; 32],
         *Sha256Digest::hash_domain(history_testkit::RECIPIENT_KEY_HASH_DOMAIN, &[218; 32])
             .as_bytes(),
         b"opaque-recipient-offer",

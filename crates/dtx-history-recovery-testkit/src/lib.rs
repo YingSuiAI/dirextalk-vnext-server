@@ -129,6 +129,8 @@ pub const GRANT_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.history-recovery.grant-provider-signature.v5\0";
 pub const AUTHORITY_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.history-recovery.grant-authority-signature.v5\0";
+pub const MAX_EXACT_OFFER_BYTES: usize = 1_049_093;
+pub const MAX_EXACT_GRANT_BYTES: usize = 1_050_733;
 
 fn field(key: u64, value: CanonicalValue) -> (CanonicalValue, CanonicalValue) {
     (CanonicalValue::Unsigned(key), value)
@@ -150,6 +152,11 @@ fn signature(key: &SigningKey, domain: &[u8], unsigned: &CanonicalValue) -> Ed25
 
 fn encode(value: &CanonicalValue) -> Vec<u8> {
     dtx_wire::encode_deterministic_cbor(value).expect("canonical test artifact")
+}
+
+fn encode_with_limit(value: &CanonicalValue, maximum: usize) -> Vec<u8> {
+    dtx_wire::encode_deterministic_cbor_with_limit(value, maximum)
+        .expect("bounded canonical test artifact")
 }
 
 /// Build the exact CatalogV2 envelope accepted by the identity service.
@@ -513,34 +520,38 @@ pub fn offer_v3(
     catalog_id: Uuid,
     generation: u64,
     catalog_head_digest: [u8; 32],
-    candidate_device: DeviceId,
+    leaf_set_digest: [u8; 32],
+    allowed_snapshot_plaintext_digest: [u8; 32],
     recipient_key_digest: [u8; 32],
     ciphertext: &[u8],
     provider_response_digest: [u8; 32],
     issued_at: i64,
     expires_at: i64,
 ) -> Vec<u8> {
-    encode(&CanonicalValue::Map(vec![
-        field(1, CanonicalValue::Unsigned(3)),
-        field(2, CanonicalValue::Text(request.to_string())),
-        field(3, digest(request_digest)),
-        field(4, digest(manifest_digest)),
-        field(5, CanonicalValue::Text(catalog_id.to_string())),
-        field(6, CanonicalValue::Unsigned(generation)),
-        field(7, digest(catalog_head_digest)),
-        field(8, CanonicalValue::Text(candidate_device.to_string())),
-        field(9, digest(recipient_key_digest)),
-        field(10, CanonicalValue::Bytes(ciphertext.to_vec())),
-        field(
-            11,
-            Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, ciphertext).to_canonical_value(),
-        ),
-        field(12, CanonicalValue::Null),
-        field(13, CanonicalValue::Unsigned(issued_at as u64)),
-        field(14, CanonicalValue::Unsigned(expires_at as u64)),
-        field(15, digest(recipient_key_digest)),
-        field(16, digest(provider_response_digest)),
-    ]))
+    encode_with_limit(
+        &CanonicalValue::Map(vec![
+            field(1, CanonicalValue::Unsigned(3)),
+            field(2, CanonicalValue::Text(request.to_string())),
+            field(3, digest(request_digest)),
+            field(4, digest(manifest_digest)),
+            field(5, CanonicalValue::Text(catalog_id.to_string())),
+            field(6, CanonicalValue::Unsigned(generation)),
+            field(7, digest(catalog_head_digest)),
+            field(8, digest(leaf_set_digest)),
+            field(9, digest(allowed_snapshot_plaintext_digest)),
+            field(10, CanonicalValue::Bytes(ciphertext.to_vec())),
+            field(
+                11,
+                Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, ciphertext).to_canonical_value(),
+            ),
+            field(12, CanonicalValue::Null),
+            field(13, CanonicalValue::Unsigned(issued_at as u64)),
+            field(14, CanonicalValue::Unsigned(expires_at as u64)),
+            field(15, digest(recipient_key_digest)),
+            field(16, digest(provider_response_digest)),
+        ]),
+        MAX_EXACT_OFFER_BYTES,
+    )
 }
 
 /// Build the canonical GrantV5 envelope from exact opaque offer bytes.
@@ -629,10 +640,11 @@ pub fn grant_v5(
     fields.push(field(35, authority_sig.to_canonical_value()));
     fields.push(field(
         36,
-        dtx_wire::decode_deterministic_cbor(offer).expect("canonical offer"),
+        dtx_wire::decode_deterministic_cbor_with_limit(offer, MAX_EXACT_OFFER_BYTES)
+            .expect("canonical offer"),
     ));
     let _ = (offer_issued_at, offer_expires_at);
-    encode(&CanonicalValue::Map(fields))
+    encode_with_limit(&CanonicalValue::Map(fields), MAX_EXACT_GRANT_BYTES)
 }
 
 #[cfg(test)]
@@ -658,5 +670,33 @@ mod tests {
             2,
         );
         assert!(!body.is_empty());
+    }
+
+    #[test]
+    fn offer_v3_keeps_digest_slots_independent() {
+        let request = DeviceEnrollmentChallengeId::new();
+        let offer = offer_v3(
+            request,
+            [3; 32],
+            [4; 32],
+            Uuid::now_v7(),
+            1,
+            [5; 32],
+            [6; 32],
+            [7; 32],
+            [8; 32],
+            b"opaque-offer",
+            [9; 32],
+            1_000,
+            2_000,
+        );
+        let CanonicalValue::Map(fields) = dtx_wire::decode_deterministic_cbor(&offer).unwrap()
+        else {
+            panic!("offer map");
+        };
+        assert_eq!(fields[7].1, digest([6; 32]));
+        assert_eq!(fields[8].1, digest([7; 32]));
+        assert_eq!(fields[14].1, digest([8; 32]));
+        assert_eq!(fields[15].1, digest([9; 32]));
     }
 }

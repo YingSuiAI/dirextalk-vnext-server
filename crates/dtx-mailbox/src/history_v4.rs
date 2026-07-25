@@ -14,7 +14,8 @@ use dtx_identity_persistence::{
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
-    UtcMillis, decode_deterministic_cbor, encode_deterministic_cbor,
+    UtcMillis, decode_deterministic_cbor, decode_deterministic_cbor_with_limit,
+    encode_deterministic_cbor, encode_deterministic_cbor_with_limit,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sqlx::Row;
@@ -43,6 +44,8 @@ pub const OFFER_CIPHERTEXT_DOMAIN: &[u8] = b"dirextalk.history-recovery.offer-ci
 pub const PROVIDER_RESPONSE_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-handoff-provider-response.v2\0";
 pub const MANIFEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.manifest.v2\0";
+const MAX_EXACT_OFFER_BYTES: usize = 1_049_093;
+const MAX_EXACT_GRANT_BYTES: usize = 1_050_733;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceHistoryGrantV5Command {
@@ -93,21 +96,23 @@ impl DeviceHistoryGrantV5Command {
         bytes: Vec<u8>,
         idempotency_digest: Sha256Digest,
     ) -> Result<Self, MailboxPersistenceError> {
-        if bytes.is_empty() || bytes.len() > 1_050_699 {
-            return Err(invalid("grant bytes"));
-        }
-        let value = decode_deterministic_cbor(&bytes).map_err(|_| invalid("grant cbor"))?;
+        validate_bounded_bytes(&bytes, MAX_EXACT_GRANT_BYTES, "grant bytes")?;
+        let value = decode_deterministic_cbor_with_limit(&bytes, MAX_EXACT_GRANT_BYTES)
+            .map_err(|_| invalid("grant cbor"))?;
         let fields = numbered(&value, 36)?;
         if fields[0] != CanonicalValue::Unsigned(5) {
             return Err(invalid("grant version"));
         }
-        let unsigned = encode_deterministic_cbor(&CanonicalValue::Map(
-            fields[..33]
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (CanonicalValue::Unsigned((i + 1) as u64), v.clone()))
-                .collect(),
-        ))
+        let unsigned = encode_deterministic_cbor_with_limit(
+            &CanonicalValue::Map(
+                fields[..33]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (CanonicalValue::Unsigned((i + 1) as u64), v.clone()))
+                    .collect(),
+            ),
+            MAX_EXACT_GRANT_BYTES,
+        )
         .map_err(|_| invalid("grant unsigned"))?;
         let identity_id = parse_identity(&fields[1])?;
         let request_id = parse_challenge(&fields[2])?;
@@ -147,10 +152,12 @@ impl DeviceHistoryGrantV5Command {
         }
         let offer = match &fields[35] {
             CanonicalValue::Map(_) => {
-                encode_deterministic_cbor(&fields[35]).map_err(|_| invalid("offer"))?
+                encode_deterministic_cbor_with_limit(&fields[35], MAX_EXACT_OFFER_BYTES)
+                    .map_err(|_| invalid("offer"))?
             }
             _ => return Err(invalid("offer")),
         };
+        validate_bounded_bytes(&offer, MAX_EXACT_OFFER_BYTES, "offer bytes")?;
         let offer_fields = numbered(&fields[35], 16)?;
         let (offer_ciphertext, provider_response_digest, offer_issued, offer_expires) =
             parse_offer_v3(&fields[35])?;
@@ -161,8 +168,7 @@ impl DeviceHistoryGrantV5Command {
             || offer_fields[4] != fields[5]
             || offer_fields[5] != fields[6]
             || offer_fields[6] != fields[8]
-            || offer_fields[7] != fields[12]
-            || parse_digest(&offer_fields[8])? != parse_digest(&fields[23])?
+            || offer_fields[7] != fields[11]
             || parse_digest(&offer_fields[14])? != parse_digest(&fields[23])?
         {
             return Err(invalid("offer coordinates"));
@@ -322,7 +328,7 @@ impl DeviceHistoryGrantV5Command {
             CanonicalValue::Unsigned(36),
             decode_bytes(&self.exact_offer),
         ));
-        encode_deterministic_cbor(&CanonicalValue::Map(fields))
+        encode_deterministic_cbor_with_limit(&CanonicalValue::Map(fields), MAX_EXACT_GRANT_BYTES)
             .map_err(|_| invalid("grant canonical"))
     }
     pub fn grant_digest(&self) -> Sha256Digest {
@@ -570,7 +576,7 @@ impl crate::MailboxRepository {
                 return Err(MailboxPersistenceError::CapacityExceeded);
             }
             let sequence = mailbox.next_delivery_sequence.checked_add(1).ok_or(MailboxPersistenceError::CapacityExceeded)?;
-            let envelope_exact = encode_deterministic_cbor(&CanonicalValue::Map(vec![(CanonicalValue::Unsigned(1),CanonicalValue::Unsigned(1)),(CanonicalValue::Unsigned(2),CanonicalValue::Text(command.envelope_id.to_string())),(CanonicalValue::Unsigned(3),CanonicalValue::Bytes(command.exact_offer.clone())),(CanonicalValue::Unsigned(4),command.expires_at.to_canonical_value())])).map_err(|_| invalid("envelope"))?;
+            let envelope_exact = encode_deterministic_cbor_with_limit(&CanonicalValue::Map(vec![(CanonicalValue::Unsigned(1),CanonicalValue::Unsigned(1)),(CanonicalValue::Unsigned(2),CanonicalValue::Text(command.envelope_id.to_string())),(CanonicalValue::Unsigned(3),CanonicalValue::Bytes(command.exact_offer.clone())),(CanonicalValue::Unsigned(4),command.expires_at.to_canonical_value())]), 1_049_100).map_err(|_| invalid("envelope"))?;
             let envelope = MailboxEnvelopeCommand::new_history_grant(command.idempotency_digest, command.mailbox_id, command.envelope_id, command.exact_offer.clone(), command.expires_at, envelope_exact)?;
             let fact_id = command.delivery_fact_id;
             let event_id = Uuid::now_v7(); let outbox_id = Uuid::now_v7();
@@ -737,6 +743,8 @@ fn parse_offer_v3(
     if issued >= expires {
         return Err(invalid("offer interval"));
     }
+    parse_digest(&fields[7])?;
+    parse_digest(&fields[8])?;
     parse_digest(&fields[14])?;
     let provider_response_digest = parse_digest(&fields[15])?;
     if provider_response_digest
@@ -768,6 +776,16 @@ fn numbered(
 }
 fn invalid(s: &'static str) -> MailboxPersistenceError {
     MailboxPersistenceError::InvalidCommand(s)
+}
+fn validate_bounded_bytes(
+    bytes: &[u8],
+    maximum: usize,
+    label: &'static str,
+) -> Result<(), MailboxPersistenceError> {
+    if bytes.is_empty() || bytes.len() > maximum {
+        return Err(invalid(label));
+    }
+    Ok(())
 }
 fn parse_digest(v: &CanonicalValue) -> Result<Sha256Digest, MailboxPersistenceError> {
     match v {
@@ -1064,6 +1082,11 @@ mod tests {
     fn offer_v3_round_trips_exact_canonical_bytes() {
         let value = offer(3, b"opaque-history", [16; 32]);
         let exact = encode_deterministic_cbor(&value).expect("canonical offer");
+        let max_offer = encode_deterministic_cbor_with_limit(
+            &offer(3, &vec![0; 1_048_576], [16; 32]),
+            MAX_EXACT_OFFER_BYTES,
+        )
+        .unwrap();
         let decoded = decode_deterministic_cbor(&exact).expect("decode offer");
         let (ciphertext, provider_digest, issued, expires) =
             parse_offer_v3(&decoded).expect("offer v3");
@@ -1072,6 +1095,43 @@ mod tests {
         assert_eq!(issued, UtcMillis::new(1_000).unwrap());
         assert_eq!(expires, UtcMillis::new(2_000).unwrap());
         assert_eq!(encode_deterministic_cbor(&decoded).unwrap(), exact);
+        assert!(max_offer.len() <= MAX_EXACT_OFFER_BYTES);
+    }
+
+    #[test]
+    fn exact_offer_and_grant_size_boundaries_are_inclusive() {
+        assert!(
+            validate_bounded_bytes(
+                &vec![0; MAX_EXACT_OFFER_BYTES],
+                MAX_EXACT_OFFER_BYTES,
+                "offer bytes"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_bounded_bytes(
+                &vec![0; MAX_EXACT_OFFER_BYTES + 1],
+                MAX_EXACT_OFFER_BYTES,
+                "offer bytes"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_bounded_bytes(
+                &vec![0; MAX_EXACT_GRANT_BYTES],
+                MAX_EXACT_GRANT_BYTES,
+                "grant bytes"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_bounded_bytes(
+                &vec![0; MAX_EXACT_GRANT_BYTES + 1],
+                MAX_EXACT_GRANT_BYTES,
+                "grant bytes"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1093,5 +1153,21 @@ mod tests {
         }
         assert!(parse_offer_v3(&tampered).is_err());
         assert!(parse_offer_v3(&offer(3, b"opaque-history", [0; 32])).is_err());
+    }
+
+    #[test]
+    fn offer_v3_rejects_each_independent_digest_slot_tamper() {
+        for field_index in [7_usize, 8, 14, 15] {
+            let mut tampered = offer(3, b"opaque-history", [16; 32]);
+            let CanonicalValue::Map(fields) = &mut tampered else {
+                unreachable!();
+            };
+            fields[field_index].1 = CanonicalValue::Bytes(vec![0; 31]);
+            assert!(
+                parse_offer_v3(&tampered).is_err(),
+                "OfferV3 digest field {} accepted malformed bytes",
+                field_index + 1
+            );
+        }
     }
 }
