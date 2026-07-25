@@ -113,15 +113,23 @@ pub async fn record_route_health(
     let result = async {
         let request_digest = Sha256Digest::hash_domain(ROUTE_HEALTH_SIGNATURE_DOMAIN, exact_request);
 
+        // Serialize first-time observations on a stable route-scoped fence.
+        // This fence is independent of the immutable receipt ledger, so an
+        // exact retry can safely observe the committed byte-identical row.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("{}:{}", request.tenant_id, request.route_id))
+            .execute(session.connection())
+            .await
+            .map_err(|_| RouteHealthParseError::InvalidShape)?;
+
         // Durable replay is authenticated by the request signature and tenant
         // peer binding above. Resolve it before consulting mutable route,
         // bootstrap, lease or approval state so an exact committed receipt
         // remains replayable after those facts are later retired.
         let existing_nonce = sqlx::query(
             "SELECT request_digest, receipt_bytes, observation_revision
-               FROM agent.agent_route_health_receipts
-              WHERE tenant_id=$1 AND route_id=$2 AND nonce=$3
-              FOR UPDATE",
+              FROM agent.agent_route_health_receipts
+              WHERE tenant_id=$1 AND route_id=$2 AND nonce=$3",
         )
         .bind(Uuid::from(request.tenant_id))
         .bind(Uuid::from(request.route_id))
@@ -134,9 +142,8 @@ pub async fn record_route_health(
         }
         let existing_request_id = sqlx::query(
             "SELECT request_digest, receipt_bytes, observation_revision
-               FROM agent.agent_route_health_receipts
-              WHERE tenant_id=$1 AND request_id=$2
-              FOR UPDATE",
+              FROM agent.agent_route_health_receipts
+              WHERE tenant_id=$1 AND request_id=$2",
         )
         .bind(Uuid::from(request.tenant_id))
         .bind(Uuid::from(request.request_id))
@@ -171,6 +178,38 @@ pub async fn record_route_health(
         let route_connector: Uuid = route.try_get("connector_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
         let stored_key: Uuid = route.try_get("route_health_key_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
         let stored_public: Vec<u8> = route.try_get("route_health_public_key").map_err(|_| RouteHealthParseError::InvalidShape)?;
+
+        // A concurrent first-time request may have committed while this
+        // transaction waited for the route row. Recheck the immutable ledger
+        // before evaluating mutable route/lease/approval state.
+        let replay_nonce = sqlx::query(
+            "SELECT request_digest, receipt_bytes, observation_revision
+               FROM agent.agent_route_health_receipts
+              WHERE tenant_id=$1 AND route_id=$2 AND nonce=$3",
+        )
+        .bind(Uuid::from(request.tenant_id))
+        .bind(Uuid::from(request.route_id))
+        .bind(request.nonce.to_vec())
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| RouteHealthParseError::InvalidShape)?;
+        if let Some(row) = replay_nonce {
+            return replay_receipt(row, request_digest);
+        }
+        let replay_request_id = sqlx::query(
+            "SELECT request_digest, receipt_bytes, observation_revision
+               FROM agent.agent_route_health_receipts
+              WHERE tenant_id=$1 AND request_id=$2",
+        )
+        .bind(Uuid::from(request.tenant_id))
+        .bind(Uuid::from(request.request_id))
+        .fetch_optional(session.connection())
+        .await
+        .map_err(|_| RouteHealthParseError::InvalidShape)?;
+        if let Some(row) = replay_request_id {
+            return replay_receipt(row, request_digest);
+        }
+
         if route_fence.as_slice() != request.route_fence
             || stored_bootstrap != Uuid::from(request.bootstrap_id)
             || binding_expires_at_ms <= now_ms
@@ -496,7 +535,7 @@ async fn route_health_handler(
         Ok(bytes) => bytes,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request too large\n").into_response(),
     };
-    let (tenant_id, route_id) = match route_health_hint(&bytes) {
+    let (tenant_id, route_id, bootstrap_id, health_key_id) = match route_health_hint(&bytes) {
         Ok(value) => value,
         Err(_) => {
             return (StatusCode::BAD_REQUEST, "invalid route health request\n").into_response();
@@ -506,8 +545,37 @@ async fn route_health_handler(
         Ok(session) => session,
         Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "unavailable\n").into_response(),
     };
-    let key = sqlx::query_scalar::<_, Vec<u8>>("SELECT route_health_public_key FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND route_id=$2 AND route_health_public_key IS NOT NULL ORDER BY updated_at_ms DESC LIMIT 1")
-        .bind(Uuid::from(tenant_id)).bind(Uuid::from(route_id)).fetch_optional(session.connection()).await.ok().flatten();
+    let key = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT route_health_public_key
+          FROM agent.agent_route_bootstraps
+         WHERE tenant_id=$1 AND route_id=$2 AND bootstrap_id=$3
+           AND route_health_key_id=$4 AND route_health_public_key IS NOT NULL",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(route_id))
+    .bind(Uuid::from(bootstrap_id))
+    .bind(Uuid::from(health_key_id))
+    .fetch_optional(session.connection())
+    .await
+    .ok()
+    .flatten();
+    let key = match key {
+        Some(key) => Some(key),
+        None => sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT b.route_health_public_key
+               FROM agent.agent_route_binding_heads h
+               JOIN agent.agent_route_bootstraps b
+                 ON b.tenant_id=h.tenant_id AND b.bootstrap_id=h.bootstrap_id
+              WHERE h.tenant_id=$1 AND h.route_id=$2
+                AND b.route_health_public_key IS NOT NULL",
+        )
+        .bind(Uuid::from(tenant_id))
+        .bind(Uuid::from(route_id))
+        .fetch_optional(session.connection())
+        .await
+        .ok()
+        .flatten(),
+    };
     let _ = session.rollback().await;
     let Some(key) = key.and_then(|key| <[u8; 32]>::try_from(key).ok()) else {
         return (StatusCode::NOT_FOUND, "not found\n").into_response();
@@ -547,7 +615,17 @@ async fn route_health_handler(
     }
 }
 
-fn route_health_hint(bytes: &[u8]) -> Result<(TenantId, ConversationId), RouteHealthParseError> {
+fn route_health_hint(
+    bytes: &[u8],
+) -> Result<
+    (
+        TenantId,
+        ConversationId,
+        AgentRouteBootstrapId,
+        RouteHealthKeyId,
+    ),
+    RouteHealthParseError,
+> {
     let CanonicalValue::Map(entries) =
         decode_deterministic_cbor(bytes).map_err(|_| RouteHealthParseError::InvalidCbor)?
     else {
@@ -555,6 +633,8 @@ fn route_health_hint(bytes: &[u8]) -> Result<(TenantId, ConversationId), RouteHe
     };
     let mut tenant = None;
     let mut route = None;
+    let mut bootstrap = None;
+    let mut health_key = None;
     for (key, value) in entries {
         if let CanonicalValue::Unsigned(key) = key {
             if key == 3 {
@@ -563,9 +643,20 @@ fn route_health_hint(bytes: &[u8]) -> Result<(TenantId, ConversationId), RouteHe
             if key == 10 {
                 route = Some(id(&value)?);
             }
+            if key == 8 {
+                bootstrap = Some(id(&value)?);
+            }
+            if key == 15 {
+                health_key = Some(id(&value)?);
+            }
         }
     }
-    tenant.zip(route).ok_or(RouteHealthParseError::InvalidShape)
+    tenant
+        .zip(route)
+        .zip(bootstrap)
+        .zip(health_key)
+        .map(|(((tenant, route), bootstrap), health_key)| (tenant, route, bootstrap, health_key))
+        .ok_or(RouteHealthParseError::InvalidShape)
 }
 
 async fn route_health_unavailable(request: Request<Body>) -> Response {

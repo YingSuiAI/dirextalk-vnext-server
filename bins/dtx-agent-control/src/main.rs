@@ -158,7 +158,6 @@ const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.agent_route_bootstraps", "SELECT"),
     ("agent.agent_route_health_receipts", "SELECT"),
     ("agent.agent_route_health_receipts", "INSERT"),
-    ("agent.agent_route_health_receipts", "UPDATE"),
     ("agent.agent_route_health_heads", "SELECT"),
     ("agent.agent_route_health_heads", "INSERT"),
     ("agent.agent_route_health_heads", "UPDATE"),

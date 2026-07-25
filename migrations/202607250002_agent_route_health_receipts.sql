@@ -83,7 +83,7 @@ REVOKE ALL ON agent.agent_route_health_receipts, agent.agent_route_health_heads 
 DO $grant$
 BEGIN
     IF to_regrole('dtx_agent_runtime') IS NOT NULL THEN
-        GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_receipts TO dtx_agent_runtime;
+        GRANT SELECT, INSERT ON agent.agent_route_health_receipts TO dtx_agent_runtime;
         GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_agent_runtime;
     END IF;
 END

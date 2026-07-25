@@ -6,12 +6,13 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 
 use dtx_wire::{CanonicalValue, decode_deterministic_cbor, encode_deterministic_cbor};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sqlx::Executor;
 use support::PostgresHarness;
+use tokio::sync::Barrier;
 
 #[tokio::test]
 async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<dyn Error>> {
@@ -22,11 +23,18 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
     // Test-only privilege expansion is limited to the two Route Health
     // ledger relations; production grants and tenant RLS remain unchanged.
     sqlx::raw_sql(
-        "GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_receipts TO dtx_runtime_test;
+        "GRANT SELECT, INSERT ON agent.agent_route_health_receipts TO dtx_runtime_test;
          GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_runtime_test;",
     )
     .execute(harness.admin_pool())
     .await?;
+    let receipt_update: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege(
+             'dtx_runtime_test', 'agent.agent_route_health_receipts', 'UPDATE')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(!receipt_update, "receipt ledger must remain immutable");
     Ok(())
 }
 
@@ -221,6 +229,110 @@ async fn route_health_http_accepts_replays_and_pins_signed_receipts() -> Result<
     Ok(())
 }
 
+#[tokio::test]
+async fn route_health_http_replays_against_historical_bootstrap_after_successor_head()
+-> Result<(), Box<dyn Error>> {
+    let harness = PostgresHarness::start().await?;
+    let fixture = support::route_health::RouteHealthFixtureBuilder::new(&harness)
+        .establish()
+        .await?;
+    let receipt_key_id = dtx_domain::RouteHealthKeyId::new();
+    let seed = [0xF1; 32];
+    let body = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::INITIAL,
+        [31; 32],
+    );
+    assert_eq!(
+        post_status(&fixture, body.clone(), receipt_key_id, seed)
+            .await?
+            .0,
+        axum::http::StatusCode::CREATED
+    );
+
+    let successor_bootstrap = dtx_domain::AgentRouteBootstrapId::new();
+    let successor_delivery = dtx_domain::AgentRouteDeliveryId::new();
+    let successor_key = dtx_domain::RouteHealthKeyId::new();
+    sqlx::query(
+        "UPDATE agent.agent_route_bootstraps SET state='expired'
+          WHERE tenant_id=$1 AND bootstrap_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant_id))
+    .bind(uuid::Uuid::from(fixture.bootstrap_id))
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.agent_route_bootstraps (
+             tenant_id, bootstrap_id, owner_identity_id, owner_device_id,
+             installation_id, binding_id, agent_control_device_id, connector_id,
+             route_fence, owner_signed_intent, request_digest, begin_receipt_bytes,
+             begin_receipt_digest, recipient_id, recipient_capsule_digest,
+             opaque_recipient_capsule, route_id, delivery_id,
+             bootstrap_capsule_digest, opaque_sealed_bootstrap, delivery_request_digest,
+             delivery_receipt_bytes, delivery_receipt_digest, state, rejection_code,
+             expires_at_ms, created_at_ms, updated_at_ms,
+             route_health_key_id, route_health_public_key, route_health_key_purpose)
+         SELECT tenant_id, $3, owner_identity_id, owner_device_id,
+             installation_id, binding_id, agent_control_device_id, connector_id,
+             route_fence, owner_signed_intent, request_digest, begin_receipt_bytes,
+             begin_receipt_digest, recipient_id, recipient_capsule_digest,
+             opaque_recipient_capsule, route_id, $4,
+             bootstrap_capsule_digest, opaque_sealed_bootstrap, delivery_request_digest,
+             delivery_receipt_bytes, delivery_receipt_digest, state, rejection_code,
+             expires_at_ms, created_at_ms, updated_at_ms,
+             $5, CAST($6 AS bytea), 'agent-route-health'
+           FROM agent.agent_route_bootstraps
+          WHERE tenant_id=$1 AND bootstrap_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant_id))
+    .bind(uuid::Uuid::from(fixture.bootstrap_id))
+    .bind(uuid::Uuid::from(successor_bootstrap))
+    .bind(uuid::Uuid::from(successor_delivery))
+    .bind(uuid::Uuid::from(successor_key))
+    .bind(vec![0xA7_u8; 32])
+    .execute(harness.admin_pool())
+    .await?;
+    sqlx::query(
+        "UPDATE agent.agent_route_binding_heads
+            SET bootstrap_id=$3, delivery_id=$4
+          WHERE tenant_id=$1 AND route_id=$2",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant_id))
+    .bind(uuid::Uuid::from(fixture.route_id))
+    .bind(uuid::Uuid::from(successor_bootstrap))
+    .bind(uuid::Uuid::from(successor_delivery))
+    .execute(harness.admin_pool())
+    .await?;
+
+    let replay = post_status(&fixture, body.clone(), receipt_key_id, seed).await?;
+    assert_eq!(replay.0, axum::http::StatusCode::OK);
+    assert_eq!(route_health_counts(&fixture).await?, (1, Some((1, 1))));
+
+    let changed = fixture.resign_request(&body, |fields| {
+        for (key, value) in fields {
+            if *key == support::agent_provisioning::u(22) {
+                *value = support::agent_provisioning::bytes(&[32; 32]);
+            }
+        }
+    });
+    assert_eq!(
+        post_status(&fixture, changed, receipt_key_id, seed)
+            .await?
+            .0,
+        axum::http::StatusCode::CONFLICT
+    );
+    let stale = fixture.signed_request_with_nonce(
+        dtx_domain::RequestId::new(),
+        dtx_domain::Revision::new(2)?,
+        [33; 32],
+    );
+    assert_eq!(
+        post_status(&fixture, stale, receipt_key_id, seed).await?.0,
+        axum::http::StatusCode::CONFLICT
+    );
+    Ok(())
+}
+
 async fn post_status(
     fixture: &support::route_health::RouteHealthFixture,
     body: Vec<u8>,
@@ -381,9 +493,18 @@ async fn route_health_http_concurrent_exact_requests_allocate_one_observation()
         dtx_domain::Revision::INITIAL,
         [3; 32],
     );
+    let barrier = Arc::new(Barrier::new(2));
+    let left_barrier = Arc::clone(&barrier);
+    let right_barrier = Arc::clone(&barrier);
     let (left, right) = tokio::join!(
-        post_status(&fixture, body.clone(), receipt_key_id, seed),
-        post_status(&fixture, body, receipt_key_id, seed)
+        async {
+            left_barrier.wait().await;
+            post_status(&fixture, body.clone(), receipt_key_id, seed).await
+        },
+        async {
+            right_barrier.wait().await;
+            post_status(&fixture, body.clone(), receipt_key_id, seed).await
+        }
     );
     let left = left?;
     let right = right?;
