@@ -101,6 +101,22 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     assert_eq!(runtime_acl, (true, true, true, true));
 
     let catalog = catalog_body(identity_id, head3, &authority, safe(1), None, [31; 32])?;
+    let shared_catalog = history_testkit::catalog_v2(
+        identity_id,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        1,
+        None,
+        head3.sequence().get(),
+        *head3.hash().as_bytes(),
+        authority_device,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b2")?,
+        &authority,
+        [31; 32],
+        b"opaque-encrypted-catalog-v2",
+        2_500,
+        250_000,
+    );
+    assert_eq!(shared_catalog, catalog);
     let (first, second) = tokio::join!(
         send_catalog(
             app.clone(),
@@ -283,6 +299,23 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         catalog_head_digest,
         "catalog-preparation-0001",
     )?;
+    let shared_preparation = history_testkit::preparation_v2(
+        challenge.challenge_id(),
+        identity_id,
+        candidate_device,
+        &candidate,
+        [55; 32],
+        head3.sequence().get(),
+        *head3.hash().as_bytes(),
+        response_capability,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        1,
+        *catalog_head_digest.as_bytes(),
+        "catalog-preparation-0001",
+        4_500,
+        200_000,
+    );
+    assert_eq!(shared_preparation, preparation);
     let (prepare_first, prepare_second) = tokio::join!(
         send_preparation(
             app.clone(),
@@ -528,6 +561,32 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         at(5_300),
         at(200_000),
     )?;
+    let shared_provider_response = history_testkit::ready_provider_response(
+        &history_testkit::ProviderResponseInput {
+            request: challenge.challenge_id(),
+            identity: identity_id,
+            catalog_id: uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+            generation: 1,
+            catalog_head_digest: *catalog_head_digest.as_bytes(),
+            preparation: &preparation,
+            signed_head: &first_head,
+            observed_head_sequence: head3.sequence().get(),
+            observed_head_hash: *head3.hash().as_bytes(),
+            successor_head_sequence: head4.sequence().get(),
+            successor_head_hash: *head4.hash().as_bytes(),
+            candidate_device,
+            candidate_recipient: [55; 32],
+            device_add: &candidate_add_bytes,
+            provider_device,
+            provider_signer: &provider,
+            authority_device,
+            authority_signer: &authority,
+            response_idempotency_key: "catalog-provider-0001",
+            issued_at: 5_300,
+            expires_at: 200_000,
+        },
+    );
+    assert_eq!(shared_provider_response, provider_response_body);
     let (provider_first, provider_second) = tokio::join!(
         send_provider_response(
             app.clone(),
@@ -820,6 +879,27 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         response_capability,
         request_idempotency,
     )?;
+    let shared_v4_request = history_testkit::request_v4(
+        challenge.challenge_id(),
+        identity_id,
+        candidate_device,
+        &candidate,
+        [55; 32],
+        head3.sequence().get(),
+        *head3.hash().as_bytes(),
+        head4.sequence().get(),
+        *head4.hash().as_bytes(),
+        &candidate_add_bytes,
+        &preparation,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        &first_head,
+        *catalog_head_digest.as_bytes(),
+        response_capability,
+        request_idempotency,
+        5_300,
+        200_000,
+    );
+    assert_eq!(shared_v4_request, v4_request);
 
     // The V4 boundary is fail-closed before repository admission.  Every
     // malformed header/body shape below must share the safe error envelope and

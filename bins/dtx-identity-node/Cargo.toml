@@ -37,6 +37,7 @@ zeroize.workspace = true
 rustix = { version = "1.1.4", features = ["process", "fs"] }
 
 [dev-dependencies]
+dtx-history-recovery-testkit = { path = "../../crates/dtx-history-recovery-testkit" }
 dtx-storage = { path = "../../crates/dtx-storage" }
 ed25519-dalek.workspace = true
 testcontainers-modules.workspace = true

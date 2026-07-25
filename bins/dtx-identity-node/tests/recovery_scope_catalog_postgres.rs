@@ -19,6 +19,7 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_domain::{
     Clock, ClockError, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionId, IdentityId,
 };
+use dtx_history_recovery_testkit as history_testkit;
 use dtx_identity_log::{
     DeviceCertificateV1, DeviceEncryptionPublicKey, IdentityLogEventPayloadV1, IdentityLogEventV1,
     UnsignedDeviceCertificateV1, UnsignedIdentityLogEventV1, device_certificate_signature_input,
