@@ -1320,11 +1320,40 @@ mod tests {
         let entry_without_proof = completion_entry_v2(1, &leaf, &[], &certificate, &evidence);
         let proof = completion_entry_proof_v2(completion_id, 1, 1, &entry_without_proof, &[]);
         let entry = completion_entry_v2(1, &leaf, &proof, &certificate, &evidence);
-        validate_completion_entry_v2(
-            &entry,
-            entry_expectations(catalog_id, completion_id, leaf_digest, context_digest),
-        )
-        .expect("golden entry");
+        let expected = entry_expectations(catalog_id, completion_id, leaf_digest, context_digest);
+        validate_completion_entry_v2(&entry, expected).expect("golden entry");
+        let mut variants = Vec::new();
+        macro_rules! reject {
+            ($field:ident, $value:expr) => {{
+                let mut changed = expected;
+                changed.$field = $value;
+                variants.push((stringify!($field), changed));
+            }};
+        }
+        reject!(catalog_id, Uuid::now_v7());
+        reject!(generation, 8);
+        reject!(index, 2);
+        reject!(completion_id, Uuid::now_v7());
+        reject!(count, 2);
+        reject!(leaf_digest, Sha256Digest::from_bytes([9; 32]));
+        reject!(context_digest, Sha256Digest::from_bytes([9; 32]));
+        reject!(head_digest, Sha256Digest::from_bytes([9; 32]));
+        reject!(request_issued_at, 3_000);
+        reject!(request_expires_at, 7_000);
+        reject!(head_issued_at, 3_000);
+        reject!(head_expires_at, 7_000);
+        reject!(grant_issued_at, 3_000);
+        reject!(grant_expires_at, 7_000);
+        for (field, changed) in variants {
+            assert!(
+                validate_completion_entry_v2(&entry, changed).is_err(),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            entry,
+            completion_entry_v2(1, &leaf, &proof, &certificate, &evidence)
+        );
         assert!(!certificate.is_empty());
         assert!(!evidence.is_empty());
         let delivery = delivery_v2(
