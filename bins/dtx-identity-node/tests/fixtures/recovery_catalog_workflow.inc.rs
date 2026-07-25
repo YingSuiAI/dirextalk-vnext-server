@@ -143,6 +143,28 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     let second_head = to_bytes(second.into_body(), 16_384).await?.to_vec();
     assert_eq!(first_head, second_head);
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 0, 0));
+
+    // The reusable testkit driver keeps transport details in this node test
+    // while still proving the exact replay bytes at the HTTP boundary.
+    let driver_request = history_testkit::HttpRequest::new(
+        "PUT",
+        RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE
+            .replace("{catalog_id}", "0190f2a5-7b1c-7abc-8def-0123456789b1")
+            .replace("{generation}", "1"),
+        catalog.clone(),
+    )
+    .header("content-type", RECOVERY_SCOPE_CATALOG_CONTENT_TYPE)
+    .header("accept", RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE)
+    .header("idempotency-key", "catalog-publish-0001")
+    .header("authorization", authorization(&authority_session));
+    let driver_responses = history_testkit::run_http_workflow(
+        [history_testkit::HttpStep::new("catalog-replay", driver_request)],
+        |request| send_history_testkit_request(app.clone(), request),
+    )
+    .await
+    .map_err(|error| format!("{}: {}", error.step, error.source))?;
+    assert_eq!(driver_responses[0].status, StatusCode::OK.as_u16());
+    assert_eq!(driver_responses[0].body, first_head);
     for (case, accept) in [
         ("catalog-publish-missing-accept", None),
         ("catalog-publish-wrong-accept", Some("application/cbor")),

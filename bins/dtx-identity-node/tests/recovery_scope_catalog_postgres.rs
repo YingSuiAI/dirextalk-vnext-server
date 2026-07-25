@@ -373,6 +373,33 @@ async fn send_history_recovery_request_v4_custom(
     Ok(app.oneshot(request).await?)
 }
 
+async fn send_history_testkit_request(
+    app: axum::Router,
+    request: history_testkit::HttpRequest,
+) -> Result<history_testkit::HttpResponse, Box<dyn Error>> {
+    let mut builder = Request::builder()
+        .method(request.method.as_str())
+        .uri(request.path);
+    for (name, value) in request.headers {
+        builder = builder.header(name, value);
+    }
+    let response = app.oneshot(builder.body(Body::from(request.body))?).await?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+        })
+        .collect();
+    let body = to_bytes(response.into_body(), 1_100_000).await?.to_vec();
+    Ok(history_testkit::HttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
 async fn send_four_history_recovery_request_v4(
     apps: &[axum::Router; 4],
     idempotency: &str,

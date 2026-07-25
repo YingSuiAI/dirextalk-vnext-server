@@ -6,10 +6,95 @@
 //! Callers provide the application factory and transport workflow; this layer
 //! only signs canonical CBOR and returns exact wire bytes.
 
+use std::future::Future;
+
 use dtx_domain::{DeviceEnrollmentChallengeId, DeviceId, IdentityId};
 use dtx_wire::{CanonicalEncode, CanonicalValue, Ed25519Signature, Sha256Digest, SigningPublicKey};
 use ed25519_dalek::{Signer, SigningKey};
 use uuid::Uuid;
+
+/// Provider-neutral HTTP request data used by the recovery workflow driver.
+///
+/// The testkit deliberately owns no HTTP client or server types.  Node tests
+/// translate this small value into an Axum, `reqwest`, or other request at
+/// their boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpRequest {
+    pub fn new(method: impl Into<String>, path: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+            headers: Vec::new(),
+            body,
+        }
+    }
+
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+}
+
+/// Provider-neutral HTTP response data returned by a node-owned adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// A named request in a recovery workflow.  Names are diagnostics only and
+/// never become wire data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpStep {
+    pub name: &'static str,
+    pub request: HttpRequest,
+}
+
+impl HttpStep {
+    pub const fn new(name: &'static str, request: HttpRequest) -> Self {
+        Self { name, request }
+    }
+}
+
+/// Error returned when a node-owned async request adapter fails at a step.
+#[derive(Debug)]
+pub struct HttpWorkflowError<E> {
+    pub step: &'static str,
+    pub source: E,
+}
+
+/// Execute a sequence of opaque HTTP steps through a node-owned async
+/// callback.  The callback owns all transport, router, session, and response
+/// decoding details; this crate only preserves ordering and exact bytes.
+pub async fn run_http_workflow<I, F, Fut, E>(
+    steps: I,
+    mut send: F,
+) -> Result<Vec<HttpResponse>, HttpWorkflowError<E>>
+where
+    I: IntoIterator<Item = HttpStep>,
+    F: FnMut(HttpRequest) -> Fut,
+    Fut: Future<Output = Result<HttpResponse, E>>,
+{
+    let mut responses = Vec::new();
+    for step in steps {
+        let response = send(step.request)
+            .await
+            .map_err(|source| HttpWorkflowError {
+                step: step.name,
+                source,
+            })?;
+        responses.push(response);
+    }
+    Ok(responses)
+}
 
 pub const CATALOG_CIPHERTEXT_HASH_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-ciphertext.v2\0";
@@ -453,7 +538,7 @@ pub fn offer_v3(
         field(12, CanonicalValue::Null),
         field(13, CanonicalValue::Unsigned(issued_at as u64)),
         field(14, CanonicalValue::Unsigned(expires_at as u64)),
-        field(15, digest([15; 32])),
+        field(15, digest(recipient_key_digest)),
         field(16, digest(provider_response_digest)),
     ]))
 }

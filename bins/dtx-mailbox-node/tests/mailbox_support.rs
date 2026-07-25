@@ -19,6 +19,7 @@ pub(crate) use dtx_domain::{
     Clock, ClockError, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionId, EnvelopeId,
     IdentityId, MailboxId,
 };
+pub(crate) use dtx_history_recovery_testkit as history_testkit;
 pub(crate) use dtx_identity_log::{
     DeviceCertificateV1, DeviceEncryptionPublicKey, IDENTITY_LOG_WIRE_VERSION,
     IdentityLogEventPayloadV1, IdentityLogEventV1, KeyAcceptancePurposeV1,
@@ -26,13 +27,27 @@ pub(crate) use dtx_identity_log::{
     genesis_recovery_acceptance_input, identity_log_signature_input, key_rotation_acceptance_input,
     recovery_rotation_authorization_input,
 };
+pub(crate) use dtx_identity_node::{
+    DEVICE_ENROLLMENT_CAPABILITY_HEADER, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
+    HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE, HISTORY_RECOVERY_REQUEST_V4_PATH,
+    IdentityBootstrapState, RECOVERY_RESPONSE_CAPABILITY_HEADER,
+    RECOVERY_SCOPE_CATALOG_CONTENT_TYPE, RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PREPARATIONS_PATH,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_PATH_TEMPLATE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+    identity_bootstrap_router_with_state,
+};
 pub(crate) use dtx_identity_persistence::{
-    CreateHistoryRecoveryRequestCommand, DEVICE_SESSION_SECRET_HASH_DOMAIN,
-    DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability, DeviceEnrollmentRepository,
-    DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
-    DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead,
-    IdentityLogRepository, IdentityPgStore, device_session_proof_input,
-    history_recovery_request_signature_input, history_recovery_request_unsigned_canonical_bytes,
+    CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
+    DEVICE_SESSION_SECRET_HASH_DOMAIN, DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability,
+    DeviceEnrollmentChallengeOutcome, DeviceEnrollmentRepository, DeviceSessionCompletionCommand,
+    DeviceSessionCredential, DeviceSessionOutcome, DeviceSessionRepository, IdentityAppendCommand,
+    IdentityAppendOutcome, IdentityLogHead, IdentityLogRepository, IdentityPgStore,
+    device_session_proof_input, history_recovery_request_signature_input,
+    history_recovery_request_unsigned_canonical_bytes,
 };
 pub(crate) use dtx_mailbox::{
     AttachmentCapability, AttachmentCreate, AttachmentError, AttachmentManifest,
@@ -43,19 +58,19 @@ pub(crate) use dtx_mailbox::{
 pub(crate) use dtx_mailbox_node::{
     ACCOUNT_READ_CURSOR_QUERY_V1_CONTENT_TYPE, ACCOUNT_READ_CURSOR_QUERY_V1_PATH,
     ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE, ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
-    DEVICE_HISTORY_GRANT_RECEIPT_V2_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE,
-    DEVICE_HISTORY_GRANT_V1_PATH, DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE,
-    DEVICE_HISTORY_GRANT_V2_PATH, DEVICE_HISTORY_GRANT_V5_CONTENT_TYPE,
-    DEVICE_HISTORY_GRANT_V5_PATH, DEVICE_SESSION_AUTHORIZATION_SCHEME,
-    IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE, IDENTITY_MAILBOX_ACK_V2_PATH,
-    IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE, IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE,
-    IDENTITY_MAILBOX_PULL_V3_PATH, MAILBOX_ACK_CONTENT_TYPE, MAILBOX_ACK_PATH_TEMPLATE,
-    MAILBOX_ACK_RECEIPT_CONTENT_TYPE, MAILBOX_CAPABILITY_AUTHORIZATION_SCHEME,
-    MAILBOX_ENQUEUE_PATH_TEMPLATE, MAILBOX_ENVELOPE_CONTENT_TYPE,
-    MAILBOX_ENVELOPE_RECEIPT_CONTENT_TYPE, MAILBOX_PULL_CONTENT_TYPE, MAILBOX_PULL_PATH_TEMPLATE,
-    MAILBOX_PULL_RECEIPT_CONTENT_TYPE, MAILBOX_REGISTER_CONTENT_TYPE,
-    MAILBOX_REGISTER_PATH_TEMPLATE, MAILBOX_REGISTER_RECEIPT_CONTENT_TYPE, MailboxNodeState,
-    mailbox_router_with_state,
+    DEVICE_HISTORY_GRANT_RECEIPT_V2_CONTENT_TYPE, DEVICE_HISTORY_GRANT_RECEIPT_V5_CONTENT_TYPE,
+    DEVICE_HISTORY_GRANT_V1_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V1_PATH,
+    DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V2_PATH,
+    DEVICE_HISTORY_GRANT_V5_CONTENT_TYPE, DEVICE_HISTORY_GRANT_V5_PATH,
+    DEVICE_SESSION_AUTHORIZATION_SCHEME, IDENTITY_MAILBOX_ACK_V2_CONTENT_TYPE,
+    IDENTITY_MAILBOX_ACK_V2_PATH, IDENTITY_MAILBOX_PULL_RECEIPT_V3_CONTENT_TYPE,
+    IDENTITY_MAILBOX_PULL_V3_CONTENT_TYPE, IDENTITY_MAILBOX_PULL_V3_PATH, MAILBOX_ACK_CONTENT_TYPE,
+    MAILBOX_ACK_PATH_TEMPLATE, MAILBOX_ACK_RECEIPT_CONTENT_TYPE,
+    MAILBOX_CAPABILITY_AUTHORIZATION_SCHEME, MAILBOX_ENQUEUE_PATH_TEMPLATE,
+    MAILBOX_ENVELOPE_CONTENT_TYPE, MAILBOX_ENVELOPE_RECEIPT_CONTENT_TYPE,
+    MAILBOX_PULL_CONTENT_TYPE, MAILBOX_PULL_PATH_TEMPLATE, MAILBOX_PULL_RECEIPT_CONTENT_TYPE,
+    MAILBOX_REGISTER_CONTENT_TYPE, MAILBOX_REGISTER_PATH_TEMPLATE,
+    MAILBOX_REGISTER_RECEIPT_CONTENT_TYPE, MailboxNodeState, mailbox_router_with_state,
 };
 pub(crate) use dtx_realtime_sync::{
     HEARTBEAT_INTERVAL_MILLIS, InvalidationKind, LEASE_TTL_MILLIS, OUTBOX_CLAIM_TTL_MILLIS,
@@ -67,7 +82,7 @@ pub(crate) use dtx_wire::{
 };
 pub(crate) use ed25519_dalek::{Signer, SigningKey};
 pub(crate) use sha2::{Digest, Sha256};
-pub(crate) use sqlx::{Connection, PgConnection, postgres::PgConnectOptions};
+pub(crate) use sqlx::{Connection, PgConnection, Row, postgres::PgConnectOptions};
 pub(crate) use tower::ServiceExt;
 pub(crate) use uuid::Uuid;
 

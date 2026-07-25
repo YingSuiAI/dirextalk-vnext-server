@@ -161,8 +161,8 @@ impl DeviceHistoryGrantV5Command {
             || offer_fields[4] != fields[5]
             || offer_fields[5] != fields[6]
             || offer_fields[6] != fields[8]
-            || offer_fields[7] != fields[11]
-            || parse_digest(&offer_fields[8]).is_err()
+            || offer_fields[7] != fields[12]
+            || parse_digest(&offer_fields[8])? != parse_digest(&fields[23])?
             || parse_digest(&offer_fields[14])? != parse_digest(&fields[23])?
         {
             return Err(invalid("offer coordinates"));

@@ -24,7 +24,9 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+dtx-history-recovery-testkit = { path = "../../crates/dtx-history-recovery-testkit" }
 dtx-identity-log = { path = "../../crates/dtx-identity-log" }
+dtx-identity-node = { path = "../dtx-identity-node" }
 dtx-realtime-sync = { path = "../../crates/dtx-realtime-sync" }
 dtx-storage = { path = "../../crates/dtx-storage" }
 ed25519-dalek.workspace = true
