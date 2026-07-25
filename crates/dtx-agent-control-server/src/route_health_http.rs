@@ -556,4 +556,56 @@ mod tests {
         *tampered.last_mut().expect("nonempty") ^= 1;
         assert!(RouteHealthRequest::parse(&tampered, key.verifying_key().as_bytes()).is_err());
     }
+
+    #[test]
+    fn receipt_is_signed_and_preserves_mailbox_observation() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let values = (1..=22)
+            .map(|field| {
+                let value = match field {
+                    1 | 11 | 13 | 16 | 19 | 20 | 21 => CanonicalValue::Unsigned(1),
+                    17 => CanonicalValue::Bool(true),
+                    14 | 18 | 22 => CanonicalValue::Bytes(vec![4; 32]),
+                    _ => CanonicalValue::Text(Uuid::now_v7().to_string()),
+                };
+                (CanonicalValue::Unsigned(field), value)
+            })
+            .collect::<Vec<_>>();
+        let signed = encode_deterministic_cbor(&CanonicalValue::Map(values.clone())).unwrap();
+        let signature =
+            key.sign(Sha256Digest::hash_domain(ROUTE_HEALTH_SIGNATURE_DOMAIN, &signed).as_bytes());
+        let mut complete = values;
+        complete.push((
+            CanonicalValue::Unsigned(23),
+            CanonicalValue::Bytes(signature.to_bytes().to_vec()),
+        ));
+        let bytes = encode_deterministic_cbor(&CanonicalValue::Map(complete)).unwrap();
+        let request = RouteHealthRequest::parse(&bytes, key.verifying_key().as_bytes()).unwrap();
+        let receipt_key = SigningKey::from_bytes(&[11; 32]);
+        let receipt = sign_receipt(
+            &request,
+            request.request_digest(&bytes),
+            RouteHealthKeyId::new(),
+            1,
+            2,
+            false,
+            &receipt_key.to_bytes(),
+        )
+        .unwrap();
+        let CanonicalValue::Map(fields) = decode_deterministic_cbor(&receipt).unwrap() else {
+            panic!("receipt map")
+        };
+        assert!(fields.iter().any(|(k,v)| *k == CanonicalValue::Unsigned(6) && *v == CanonicalValue::Bool(true)));
+        let signature = fields
+            .iter()
+            .find_map(|(k, v)| (*k == CanonicalValue::Unsigned(12)).then(|| v))
+            .expect("receipt signature");
+        assert!(matches!(signature, CanonicalValue::Bytes(value) if value.len() == 64));
+    }
+
+    #[test]
+    fn malformed_and_oversize_payloads_fail_closed_before_application() {
+        assert!(decode_deterministic_cbor(&[0xff]).is_err());
+        assert!(decode_deterministic_cbor(&vec![0u8; MAX_ROUTE_HEALTH_REQUEST_BYTES + 1]).is_err());
+    }
 }
