@@ -1,6 +1,6 @@
 //! Connector-mTLS Route Health HTTPS boundary and canonical signed contract.
 
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr, sync::Arc};
 
 use axum::{
     Router,
@@ -82,6 +82,7 @@ pub struct RouteHealthHttpState {
     pub store: PgStore,
     pub receipt_key_id: RouteHealthKeyId,
     pub receipt_seed: [u8; 32],
+    pub receipt_keyring: Option<Arc<BTreeMap<RouteHealthKeyId, [u8; 32]>>>,
 }
 
 /// Validates and durably records one Route Health observation. All relation
@@ -94,6 +95,7 @@ pub async fn record_route_health(
     exact_request: &[u8],
     receipt_key_id: RouteHealthKeyId,
     receipt_seed: &[u8; 32],
+    receipt_keyring: Option<&BTreeMap<RouteHealthKeyId, [u8; 32]>>,
     now_ms: i64,
 ) -> Result<RouteHealthReceipt, RouteHealthParseError> {
     if request.version != 1
@@ -217,8 +219,9 @@ pub async fn record_route_health(
             || bootstrap_state != "installed"
             || route_connector != Uuid::from(request.connector_id)
             || stored_key != Uuid::from(request.health_key_id) || stored_public.len() != 32 { return Err(RouteHealthParseError::InvalidShape); }
-        let active: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM agent.connector_leases l JOIN agent.connector_control_credentials c
+        let active = sqlx::query(
+            "SELECT c.route_health_receipt_key_id, c.route_health_receipt_public_key
+                FROM agent.connector_leases l JOIN agent.connector_control_credentials c
              ON c.tenant_id=l.tenant_id AND c.connector_id=l.connector_id
              AND c.connector_generation=l.generation
              WHERE l.tenant_id=$1 AND l.connector_id=$2 AND l.lease_id=$3
@@ -230,7 +233,24 @@ pub async fn record_route_health(
             .bind(i64::try_from(request.lease_epoch).map_err(|_| RouteHealthParseError::InvalidShape)?)
             .bind(now_ms).bind(peer.certificate_fingerprint().as_bytes().to_vec())
             .fetch_optional(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
-        if active.is_none() { return Err(RouteHealthParseError::InvalidShape); }
+        let Some(active) = active else { return Err(RouteHealthParseError::InvalidShape); };
+        let stored_receipt_key: Option<Uuid> = active.try_get("route_health_receipt_key_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let stored_receipt_public: Option<Vec<u8>> = active.try_get("route_health_receipt_public_key").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let (receipt_key_id, receipt_seed) = match (stored_receipt_key, stored_receipt_public) {
+            (None, None) if receipt_keyring.is_none() => (receipt_key_id, *receipt_seed),
+            (None, None) => return Err(RouteHealthParseError::InvalidShape),
+            (Some(key_id), Some(public_key)) => {
+                let key_id = RouteHealthKeyId::try_from(key_id).map_err(|_| RouteHealthParseError::InvalidShape)?;
+                let public_key: [u8; 32] = public_key.try_into().map_err(|_| RouteHealthParseError::InvalidShape)?;
+                let keyring = receipt_keyring.ok_or(RouteHealthParseError::InvalidShape)?;
+                let seed = *keyring.get(&key_id).ok_or(RouteHealthParseError::InvalidShape)?;
+                if ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes() != public_key {
+                    return Err(RouteHealthParseError::InvalidShape);
+                }
+                (key_id, seed)
+            }
+            _ => return Err(RouteHealthParseError::InvalidShape),
+        };
         let approval_current: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM agent.agent_identity_approvals a
              JOIN agent.agent_devices d ON d.tenant_id=a.tenant_id
@@ -249,10 +269,10 @@ pub async fn record_route_health(
             if i64::try_from(request.status_revision.get()).map_err(|_| RouteHealthParseError::InvalidShape)? <= current_status { return Err(RouteHealthParseError::InvalidShape); }
         }
         let next = head.map(|(revision, _)| revision).unwrap_or(0).checked_add(1).ok_or(RouteHealthParseError::InvalidShape)?;
-        let receipt = sign_receipt(&request, request_digest, receipt_key_id, next, now_ms, approval_current, receipt_seed)?;
+        let receipt = sign_receipt(&request, request_digest, receipt_key_id, next, now_ms, approval_current, &receipt_seed)?;
         let receipt_digest = Sha256Digest::hash_domain(ROUTE_HEALTH_RECEIPT_DOMAIN, &receipt);
-        sqlx::query("INSERT INTO agent.agent_route_health_receipts (tenant_id,route_id,nonce,request_id,status_revision,request_digest,receipt_bytes,receipt_digest,observation_revision,observed_at_ms,expires_at_ms,created_at_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$10)")
-            .bind(Uuid::from(request.tenant_id)).bind(Uuid::from(request.route_id)).bind(request.nonce.to_vec()).bind(Uuid::from(request.request_id)).bind(i64::try_from(request.status_revision.get()).map_err(|_| RouteHealthParseError::InvalidShape)?).bind(request_digest.as_bytes().to_vec()).bind(receipt.clone()).bind(receipt_digest.as_bytes().to_vec()).bind(next).bind(now_ms).bind(request.expires_at_ms).execute(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
+        sqlx::query("INSERT INTO agent.agent_route_health_receipts (tenant_id,route_id,nonce,request_id,status_revision,request_digest,receipt_bytes,receipt_digest,receipt_signer_key_id,observation_revision,observed_at_ms,expires_at_ms,created_at_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$11)")
+            .bind(Uuid::from(request.tenant_id)).bind(Uuid::from(request.route_id)).bind(request.nonce.to_vec()).bind(Uuid::from(request.request_id)).bind(i64::try_from(request.status_revision.get()).map_err(|_| RouteHealthParseError::InvalidShape)?).bind(request_digest.as_bytes().to_vec()).bind(receipt.clone()).bind(receipt_digest.as_bytes().to_vec()).bind(Uuid::from(receipt_key_id)).bind(next).bind(now_ms).bind(request.expires_at_ms).execute(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
         sqlx::query("INSERT INTO agent.agent_route_health_heads (tenant_id,route_id,observation_revision,status_revision,updated_at_ms) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (tenant_id,route_id) DO UPDATE SET observation_revision=EXCLUDED.observation_revision,status_revision=EXCLUDED.status_revision,updated_at_ms=EXCLUDED.updated_at_ms")
             .bind(Uuid::from(request.tenant_id)).bind(Uuid::from(request.route_id)).bind(next).bind(i64::try_from(request.status_revision.get()).map_err(|_| RouteHealthParseError::InvalidShape)?).bind(now_ms).execute(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
         Ok(RouteHealthReceipt { exact_cbor: receipt, replayed: false, observation_revision: Revision::new(u64::try_from(next).map_err(|_| RouteHealthParseError::InvalidShape)?).map_err(|_| RouteHealthParseError::InvalidShape)? })
@@ -597,6 +617,7 @@ async fn route_health_handler(
         &bytes,
         state.receipt_key_id,
         &state.receipt_seed,
+        state.receipt_keyring.as_deref(),
         now,
     )
     .await

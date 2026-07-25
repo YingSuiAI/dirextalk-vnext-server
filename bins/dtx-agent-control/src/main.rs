@@ -3,6 +3,7 @@
 mod config;
 
 use std::{
+    collections::BTreeMap,
     env, fmt, fs,
     io::{self, Write as _},
     net::SocketAddr,
@@ -256,7 +257,8 @@ async fn run() -> Result<(), BootstrapError> {
     // Load and validate the dedicated receipt signing key at startup. The key
     // is retained by the future receipt application boundary and is never
     // included in readiness output or diagnostics.
-    let route_health_receipt_key = load_receipt_keyring(&config.route_health)?;
+    let (route_health_receipt_key, route_health_keyring) =
+        load_receipt_keyring(&config.route_health)?;
     let route_health_receipt_public_key = route_health_receipt_key.public_key;
     let route_health_receipt_seed = route_health_receipt_key.seed;
     let gateway_roots = Arc::new(load_root_store(
@@ -370,6 +372,7 @@ async fn run() -> Result<(), BootstrapError> {
                 store: route_health_store,
                 receipt_key_id: config.route_health.receipt_key_id,
                 receipt_seed: route_health_receipt_seed,
+                receipt_keyring: Some(Arc::new(route_health_keyring)),
             })
             .into_make_service_with_connect_info::<RouteHealthConnectInfo>(),
         )
@@ -672,17 +675,27 @@ fn load_private_key(path: &Path) -> Result<SecretBytes, BootstrapError> {
 
 fn load_receipt_keyring(
     endpoint: &config::RouteHealthEndpoint,
-) -> Result<ParsedEd25519Key, BootstrapError> {
+) -> Result<
+    (
+        ParsedEd25519Key,
+        BTreeMap<dtx_domain::RouteHealthKeyId, [u8; 32]>,
+    ),
+    BootstrapError,
+> {
     let current_secret = load_private_key(&endpoint.receipt_private_key_pkcs8_pem)?;
     let current = parse_ed25519_pkcs8(&current_secret)?;
+    let mut keyring = BTreeMap::from([(endpoint.receipt_key_id, current.seed)]);
     for retained in &endpoint.retained_receipt_keys {
         let retained_secret = load_private_key(&retained.private_key_pkcs8_pem)?;
         let retained_key = parse_ed25519_pkcs8(&retained_secret)?;
         if retained_key.public_key == current.public_key {
             return Err(BootstrapError::Tls);
         }
+        if keyring.insert(retained.key_id, retained_key.seed).is_some() {
+            return Err(BootstrapError::Tls);
+        }
     }
-    Ok(current)
+    Ok((current, keyring))
 }
 
 #[derive(Clone, Copy)]

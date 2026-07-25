@@ -11,6 +11,7 @@ CREATE TABLE agent.agent_route_health_receipts (
     request_digest bytea NOT NULL,
     receipt_bytes bytea NOT NULL,
     receipt_digest bytea NOT NULL,
+    receipt_signer_key_id uuid NOT NULL,
     observation_revision bigint NOT NULL,
     observed_at_ms bigint NOT NULL,
     expires_at_ms bigint NOT NULL,
@@ -32,6 +33,7 @@ CREATE TABLE agent.agent_route_health_receipts (
         AND octet_length(request_digest) = 32
         AND octet_length(receipt_bytes) BETWEEN 1 AND 65536
         AND octet_length(receipt_digest) = 32
+        AND system.is_uuid_v7(receipt_signer_key_id)
         AND status_revision > 0
         AND observation_revision > 0
         AND observed_at_ms BETWEEN 0 AND 253402300799999

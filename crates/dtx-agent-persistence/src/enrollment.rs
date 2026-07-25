@@ -382,7 +382,8 @@ impl EnrollmentIntentRepository {
             "SELECT connector_id, host_id, request_id, connector_generation,
                     spec_revision, token_digest, status, expires_at_ms, created_at_ms,
                     transitioned_at_ms, enrollment_request_digest,
-                    enrollment_result_digest, credential_id
+                    enrollment_result_digest, credential_id,
+                    route_health_receipt_key_id, route_health_receipt_public_key
                FROM agent.connector_enrollment_intents
               WHERE tenant_id=$1 AND enrollment_intent_id=$2",
         )
@@ -427,6 +428,22 @@ impl EnrollmentIntentRepository {
                 let result = authorization.credential(id).cloned().ok_or(
                     AgentPersistenceError::CorruptData("Connector enrollment credential result"),
                 )?;
+                let stored_pin_id: Option<Uuid> = row.try_get("route_health_receipt_key_id")?;
+                let stored_pin_public: Option<Vec<u8>> =
+                    row.try_get("route_health_receipt_public_key")?;
+                if stored_pin_id.is_some() != stored_pin_public.is_some()
+                    || stored_pin_public
+                        .as_ref()
+                        .is_some_and(|value| value.len() != 32)
+                    || result
+                        .route_health_receipt_pin()
+                        .map(|(key_id, public_key)| (Uuid::from(key_id), public_key.to_vec()))
+                        != stored_pin_id.zip(stored_pin_public)
+                {
+                    return Err(AgentPersistenceError::CorruptData(
+                        "Connector enrollment receipt pin",
+                    ));
+                }
                 EnrollmentIntentSnapshotState::Consumed {
                     consumed_at_millis: transitioned_at.ok_or(
                         AgentPersistenceError::CorruptData("Connector enrollment consumption time"),

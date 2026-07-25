@@ -409,6 +409,7 @@ impl RouteHealthFixture {
                 store: self.store.clone(),
                 receipt_key_id,
                 receipt_seed,
+                receipt_keyring: None,
             },
         )
         .oneshot(request)

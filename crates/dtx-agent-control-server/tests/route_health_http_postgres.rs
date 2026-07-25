@@ -35,6 +35,24 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
     .fetch_one(harness.admin_pool())
     .await?;
     assert!(!receipt_update, "receipt ledger must remain immutable");
+    for constraint in [
+        "connector_enrollment_intents_receipt_pin_shape",
+        "connector_control_credentials_receipt_pin_shape",
+        "connector_credential_reissue_intents_receipt_pin_shape",
+    ] {
+        let definition: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid)
+               FROM pg_constraint
+              WHERE conname=$1",
+        )
+        .bind(constraint)
+        .fetch_one(harness.admin_pool())
+        .await?;
+        assert!(
+            definition.contains("IS NOT NULL"),
+            "half-null pin guard: {constraint}"
+        );
+    }
     Ok(())
 }
 

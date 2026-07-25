@@ -2307,7 +2307,8 @@ impl PostgresConnectorControlApplication {
         let row = sqlx::query(
             "SELECT host_id, connector_id, current_credential_id, current_leaf_fingerprint,
                     connector_generation, spec_revision, token_digest, status, expires_at_ms,
-                    request_digest, result_digest, credential_id
+                    request_digest, result_digest, credential_id,
+                    route_health_receipt_key_id, route_health_receipt_public_key
                FROM agent.connector_credential_reissue_intents
               WHERE tenant_id=$1 AND intent_id=$2 AND operation_id=$3 FOR UPDATE",
         )
@@ -2368,6 +2369,23 @@ impl PostgresConnectorControlApplication {
                 .await
                 .map_err(persistence_error)?
                 .ok_or(ConnectorControlApplicationError::Internal)?;
+            let stored_pin_id: Option<Uuid> = row
+                .try_get("route_health_receipt_key_id")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            let stored_pin_public: Option<Vec<u8>> = row
+                .try_get("route_health_receipt_public_key")
+                .map_err(|_| ConnectorControlApplicationError::Internal)?;
+            if stored_pin_id.is_some() != stored_pin_public.is_some()
+                || stored_pin_public
+                    .as_ref()
+                    .is_some_and(|value| value.len() != 32)
+                || credential
+                    .route_health_receipt_pin()
+                    .map(|(key_id, public_key)| (Uuid::from(key_id), public_key.to_vec()))
+                    != stored_pin_id.zip(stored_pin_public)
+            {
+                return Err(ConnectorControlApplicationError::Internal);
+            }
             let persisted_result = digest_from_row(&row, "result_digest")?;
             if persisted_result != credential.reissue_result_digest(&request) {
                 return Err(ConnectorControlApplicationError::Internal);
@@ -4542,6 +4560,12 @@ impl PostgresConnectorControlApplication {
                     current.refresh_key(),
                     now,
                 )?;
+                let credential = current.route_health_receipt_pin().map_or(
+                    credential.clone(),
+                    |(key_id, public_key)| {
+                        credential.with_route_health_receipt_pin(key_id, public_key)
+                    },
+                );
                 authorization
                     .propose_successor(&request, credential)
                     .map_err(|_| ConnectorControlApplicationError::AuthenticationFailed)?
@@ -4882,7 +4906,8 @@ impl PostgresConnectorControlApplication {
         }
         let credential = sqlx::query(
             "SELECT r.current_credential_id, r.connector_generation,
-                    c.online_public_key, c.certificate_fingerprint
+                    c.online_public_key, c.certificate_fingerprint,
+                    c.route_health_receipt_key_id, c.route_health_receipt_public_key
                FROM agent.connector_control_credential_heads h
                JOIN agent.connector_control_credential_revisions r
                  ON r.tenant_id=h.tenant_id AND r.connector_id=h.connector_id
@@ -4910,6 +4935,19 @@ impl PostgresConnectorControlApplication {
         let fingerprint: Vec<u8> = credential
             .try_get("certificate_fingerprint")
             .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let receipt_pin_id: Option<Uuid> = credential
+            .try_get("route_health_receipt_key_id")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        let receipt_pin_public: Option<Vec<u8>> = credential
+            .try_get("route_health_receipt_public_key")
+            .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        if receipt_pin_id.is_some() != receipt_pin_public.is_some()
+            || receipt_pin_public
+                .as_ref()
+                .is_some_and(|value| value.len() != 32)
+        {
+            return Err(ConnectorControlApplicationError::Internal);
+        }
         if credential_id != Uuid::from(announcement.credential_id)
             || generation
                 != i64::try_from(announcement.connector_fence.connector_generation)

@@ -710,7 +710,8 @@ async fn load_authorization_head_credentials(
     let rows = sqlx::query(
         "SELECT credential_id, connector_generation, credential_revision,
                 online_public_key, refresh_public_key, certificate_fingerprint,
-                certificate_chain_der, not_before_ms, not_after_ms
+                certificate_chain_der, not_before_ms, not_after_ms,
+                route_health_receipt_key_id, route_health_receipt_public_key
            FROM agent.connector_control_credentials
           WHERE tenant_id=$1 AND connector_id=$2 AND credential_id = ANY($3)
           ORDER BY connector_generation",
@@ -1701,10 +1702,8 @@ fn load_credential_row(
     connector_id: ConnectorId,
     row: &sqlx::postgres::PgRow,
 ) -> Result<ConnectorCredential, AgentPersistenceError> {
-    let receipt_pin_id: Option<Uuid> = row.try_get("route_health_receipt_key_id").unwrap_or(None);
-    let receipt_pin_public: Option<Vec<u8>> = row
-        .try_get("route_health_receipt_public_key")
-        .unwrap_or(None);
+    let receipt_pin_id: Option<Uuid> = row.try_get("route_health_receipt_key_id")?;
+    let receipt_pin_public: Option<Vec<u8>> = row.try_get("route_health_receipt_public_key")?;
     let receipt_pin = match (receipt_pin_id, receipt_pin_public) {
         (None, None) => None,
         (Some(key_id), Some(public_key)) => Some((
