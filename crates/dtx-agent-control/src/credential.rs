@@ -1,7 +1,8 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use dtx_domain::{
-    ConnectorCredentialId, ConnectorId, Ed25519PublicKey, RequestId, Revision, TenantId,
+    ConnectorCredentialId, ConnectorId, Ed25519PublicKey, RequestId, Revision, RouteHealthKeyId,
+    TenantId,
 };
 
 use crate::{
@@ -10,6 +11,7 @@ use crate::{
 };
 
 const CREDENTIAL_RESULT_DOMAIN: &[u8] = b"dirextalk.connector-credential-result.v1";
+const CREDENTIAL_RESULT_V2_DOMAIN: &[u8] = b"dirextalk.connector-credential-result.v2\0";
 const CREDENTIAL_REISSUE_RESULT_DOMAIN: &[u8] = b"dirextalk.connector-credential-reissue-result.v1";
 
 /// Maximum number of leaf-first DER certificates retained for one credential.
@@ -35,6 +37,7 @@ pub struct ConnectorCredential {
     certificate_chain: Vec<Vec<u8>>,
     not_before_millis: i64,
     not_after_millis: i64,
+    route_health_receipt_pin: Option<(RouteHealthKeyId, [u8; 32])>,
 }
 
 impl ConnectorCredential {
@@ -101,7 +104,25 @@ impl ConnectorCredential {
             certificate_chain,
             not_before_millis,
             not_after_millis,
+            route_health_receipt_pin: None,
         })
+    }
+
+    /// Binds the public Route Health receipt signer pin selected for this
+    /// credential. The pin is public and does not contain private key material.
+    #[must_use]
+    pub fn with_route_health_receipt_pin(
+        mut self,
+        key_id: RouteHealthKeyId,
+        public_key: [u8; 32],
+    ) -> Self {
+        self.route_health_receipt_pin = Some((key_id, public_key));
+        self
+    }
+
+    #[must_use]
+    pub fn route_health_receipt_pin(&self) -> Option<(RouteHealthKeyId, [u8; 32])> {
+        self.route_health_receipt_pin
     }
 
     /// Stable digest of the exact public enrollment/rotation result.
@@ -126,7 +147,15 @@ impl ConnectorCredential {
         ];
         parts.extend(self.certificate_chain.iter().map(Vec::as_slice));
         parts.extend([not_before.as_slice(), not_after.as_slice()]);
-        domain_digest(CREDENTIAL_RESULT_DOMAIN, &parts)
+        if let Some((key_id, public_key)) = self.route_health_receipt_pin {
+            let key_id = key_id.as_uuid().into_bytes();
+            let mut v2_parts = parts;
+            v2_parts.push(&key_id);
+            v2_parts.push(&public_key);
+            domain_digest(CREDENTIAL_RESULT_V2_DOMAIN, &v2_parts)
+        } else {
+            domain_digest(CREDENTIAL_RESULT_DOMAIN, &parts)
+        }
     }
 
     /// Commits the complete public certificate-reissue response without exposing the retained

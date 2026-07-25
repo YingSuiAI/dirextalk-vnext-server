@@ -59,6 +59,13 @@ pub struct RouteHealthEndpoint {
     pub client_ca_bundle_pem: PathBuf,
     pub receipt_private_key_pkcs8_pem: PathBuf,
     pub receipt_key_id: RouteHealthKeyId,
+    pub retained_receipt_keys: Vec<RetainedReceiptKey>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedReceiptKey {
+    pub key_id: RouteHealthKeyId,
+    pub private_key_pkcs8_pem: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,6 +136,15 @@ struct RawRouteHealthEndpoint {
     client_ca_bundle_pem: PathBuf,
     receipt_private_key_pkcs8_pem: PathBuf,
     receipt_key_id: String,
+    #[serde(default)]
+    retained_receipt_keys: Vec<RawRetainedReceiptKey>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRetainedReceiptKey {
+    key_id: String,
+    private_key_pkcs8_pem: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +203,30 @@ impl RawBootstrapConfig {
         ]) {
             return Err(ConfigError::ListenerCollision);
         }
+        let receipt_key_id = self
+            .route_health
+            .receipt_key_id
+            .parse()
+            .map_err(|_| ConfigError::RouteHealthKeyId)?;
+        let mut retained_receipt_keys =
+            Vec::with_capacity(self.route_health.retained_receipt_keys.len());
+        for retained in self.route_health.retained_receipt_keys {
+            let key_id = retained
+                .key_id
+                .parse()
+                .map_err(|_| ConfigError::RouteHealthKeyId)?;
+            if key_id == receipt_key_id
+                || retained_receipt_keys
+                    .iter()
+                    .any(|item: &RetainedReceiptKey| item.key_id == key_id)
+            {
+                return Err(ConfigError::RouteHealthKeyId);
+            }
+            retained_receipt_keys.push(RetainedReceiptKey {
+                key_id,
+                private_key_pkcs8_pem: resolve_path(base, retained.private_key_pkcs8_pem)?,
+            });
+        }
         Ok(BootstrapConfig {
             database_url_file: resolve_path(base, self.database_url_file)?,
             max_database_connections: self.max_database_connections,
@@ -217,11 +257,8 @@ impl RawBootstrapConfig {
                     base,
                     self.route_health.receipt_private_key_pkcs8_pem,
                 )?,
-                receipt_key_id: self
-                    .route_health
-                    .receipt_key_id
-                    .parse()
-                    .map_err(|_| ConfigError::RouteHealthKeyId)?,
+                receipt_key_id,
+                retained_receipt_keys,
             },
             legacy_gateway: InternalServiceTlsEndpoint {
                 listen: legacy_gateway_listen,
@@ -338,6 +375,25 @@ mod route_health_config_tests {
                 .client_ca_bundle_pem
                 .ends_with("tls/route-health-client-roots.pem")
         );
+    }
+
+    #[test]
+    fn route_health_rejects_duplicate_current_and_retained_receipt_key_ids() {
+        let mut json = include_str!("../config.example.json").to_owned();
+        let marker = "    \"receipt_key_id\": \"01890f47-3a5b-7c1d-8e2f-123456789abd\"";
+        let replacement = "    \"receipt_key_id\": \"01890f47-3a5b-7c1d-8e2f-123456789abd\",\n    \"retained_receipt_keys\": [{\"key_id\": \"01890f47-3a5b-7c1d-8e2f-123456789abd\", \"private_key_pkcs8_pem\": \"secrets/old.pem\"}]";
+        assert!(json.contains(marker));
+        json = json.replacen(marker, replacement, 1);
+        let path = std::env::temp_dir().join(format!(
+            "dtx-agent-control-config-duplicate-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json).expect("config fixture");
+        assert_eq!(
+            BootstrapConfig::load(&path),
+            Err(ConfigError::RouteHealthKeyId)
+        );
+        let _ = std::fs::remove_file(path);
     }
 }
 

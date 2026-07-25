@@ -116,7 +116,6 @@ pub struct ConnectorEnrollmentGrpc {
     application: Arc<dyn ConnectorControlApplication>,
     transport_admission: SourceTransportAdmission,
     operation_timeout: Duration,
-    route_health_receipt_pin: Option<(String, Vec<u8>)>,
 }
 
 impl ConnectorEnrollmentGrpc {
@@ -128,7 +127,6 @@ impl ConnectorEnrollmentGrpc {
                 SourceTransportAdmissionConfig::default(),
             ),
             operation_timeout: ENROLLMENT_OPERATION_TIMEOUT,
-            route_health_receipt_pin: None,
         }
     }
 
@@ -136,11 +134,10 @@ impl ConnectorEnrollmentGrpc {
     /// The private signing key remains outside the protocol object.
     #[must_use]
     pub fn with_route_health_receipt_pin(
-        mut self,
-        key_id: impl Into<String>,
-        public_key: [u8; 32],
+        self,
+        _key_id: impl Into<String>,
+        _public_key: [u8; 32],
     ) -> Self {
-        self.route_health_receipt_pin = Some((key_id.into(), public_key.to_vec()));
         self
     }
 
@@ -186,11 +183,7 @@ impl v1::connector_enrollment_server::ConnectorEnrollment for ConnectorEnrollmen
                 .await
                 .map_err(|_| Status::deadline_exceeded("ENROLLMENT_TIMEOUT"))?
                 .map_err(application_status)?;
-        let mut response = build_enrollment_response(&completion.request, &completion.credential);
-        if let Some((key_id, public_key)) = &self.route_health_receipt_pin {
-            response.route_health_receipt_key_id = key_id.clone();
-            response.route_health_receipt_public_key = public_key.clone();
-        }
+        let response = build_enrollment_response(&completion.request, &completion.credential);
         Ok(Response::new(response))
     }
 

@@ -256,9 +256,7 @@ async fn run() -> Result<(), BootstrapError> {
     // Load and validate the dedicated receipt signing key at startup. The key
     // is retained by the future receipt application boundary and is never
     // included in readiness output or diagnostics.
-    let _route_health_receipt_key =
-        load_private_key(&config.route_health.receipt_private_key_pkcs8_pem)?;
-    let route_health_receipt_key = parse_ed25519_pkcs8(&_route_health_receipt_key)?;
+    let route_health_receipt_key = load_receipt_keyring(&config.route_health)?;
     let route_health_receipt_public_key = route_health_receipt_key.public_key;
     let route_health_receipt_seed = route_health_receipt_key.seed;
     let gateway_roots = Arc::new(load_root_store(
@@ -299,12 +297,18 @@ async fn run() -> Result<(), BootstrapError> {
         )
         .map_err(|_| BootstrapError::Tls)?,
     );
-    let application = Arc::new(PostgresConnectorControlApplication::new(
-        store,
-        issuer,
-        authorization_index,
-        Arc::new(ProtobufDurableCommandDecoder),
-    ));
+    let application = Arc::new(
+        PostgresConnectorControlApplication::new(
+            store,
+            issuer,
+            authorization_index,
+            Arc::new(ProtobufDurableCommandDecoder),
+        )
+        .with_route_health_receipt_pin(
+            config.route_health.receipt_key_id,
+            route_health_receipt_key.public_key,
+        ),
+    );
     let enrollment_application: Arc<dyn ConnectorControlApplication> = application.clone();
     let control_application: Arc<dyn ConnectorControlApplication> = application.clone();
     let owner_application = application.clone();
@@ -664,6 +668,21 @@ fn load_private_key(path: &Path) -> Result<SecretBytes, BootstrapError> {
     let secret = SecretBytes::new(key.secret_pkcs8_der().to_vec()).map_err(|_| BootstrapError::Tls);
     key.zeroize();
     secret
+}
+
+fn load_receipt_keyring(
+    endpoint: &config::RouteHealthEndpoint,
+) -> Result<ParsedEd25519Key, BootstrapError> {
+    let current_secret = load_private_key(&endpoint.receipt_private_key_pkcs8_pem)?;
+    let current = parse_ed25519_pkcs8(&current_secret)?;
+    for retained in &endpoint.retained_receipt_keys {
+        let retained_secret = load_private_key(&retained.private_key_pkcs8_pem)?;
+        let retained_key = parse_ed25519_pkcs8(&retained_secret)?;
+        if retained_key.public_key == current.public_key {
+            return Err(BootstrapError::Tls);
+        }
+    }
+    Ok(current)
 }
 
 #[derive(Clone, Copy)]

@@ -205,7 +205,8 @@ impl EnrollmentIntentRepository {
             "UPDATE agent.connector_enrollment_intents
                 SET status='consumed', transitioned_at_ms=$3,
                     enrollment_request_digest=$4, enrollment_result_digest=$5,
-                    credential_id=$6
+                    credential_id=$6, route_health_receipt_key_id=$7,
+                    route_health_receipt_public_key=$8
               WHERE tenant_id=$1 AND enrollment_intent_id=$2 AND status='active'",
         )
         .bind(Uuid::from(proposed.tenant_id))
@@ -214,6 +215,16 @@ impl EnrollmentIntentRepository {
         .bind(request_digest.as_bytes().to_vec())
         .bind(result_digest.as_bytes().to_vec())
         .bind(Uuid::from(result.credential_id()))
+        .bind(
+            result
+                .route_health_receipt_pin()
+                .map(|(key_id, _)| Uuid::from(key_id)),
+        )
+        .bind(
+            result
+                .route_health_receipt_pin()
+                .map(|(_, public_key)| public_key.to_vec()),
+        )
         .execute(&mut *connection)
         .await?;
         if updated.rows_affected() != 1 {

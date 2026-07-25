@@ -5,7 +5,8 @@ use dtx_agent_control::{
     EnrollmentIntentSnapshotState, Sha256Digest,
 };
 use dtx_domain::{
-    ConnectorCredentialId, ConnectorId, Ed25519PublicKey, RequestId, Revision, TenantId,
+    ConnectorCredentialId, ConnectorId, Ed25519PublicKey, RequestId, Revision, RouteHealthKeyId,
+    TenantId,
 };
 use sqlx::{Connection, PgConnection, Row};
 use uuid::Uuid;
@@ -145,7 +146,8 @@ impl ConnectorCredentialAuthorizationRepository {
         sqlx::query(
             "SELECT credential_id, connector_generation, credential_revision,
                     online_public_key, refresh_public_key, certificate_fingerprint,
-                    certificate_chain_der, not_before_ms, not_after_ms
+                    certificate_chain_der, not_before_ms, not_after_ms,
+                    route_health_receipt_key_id, route_health_receipt_public_key
                FROM agent.connector_control_credentials
               WHERE tenant_id=$1 AND connector_id=$2 AND credential_id=$3",
         )
@@ -542,7 +544,8 @@ impl ConnectorCredentialAuthorizationRepository {
             "SELECT credential_id, connector_generation, credential_revision,
                     online_public_key, refresh_public_key, certificate_fingerprint,
                     certificate_chain_der, not_before_ms, not_after_ms,
-                    origin_kind, predecessor_credential_id, origin_operation_id
+                    origin_kind, predecessor_credential_id, origin_operation_id,
+                    route_health_receipt_key_id, route_health_receipt_public_key
                FROM agent.connector_control_credentials
               WHERE tenant_id=$1 AND connector_id=$2
               LIMIT $3",
@@ -1008,8 +1011,9 @@ async fn insert_credential(
              predecessor_credential_id, origin_operation_id,
              online_public_key, refresh_public_key, certificate_fingerprint,
              certificate_chain_der, not_before_ms, not_after_ms,
-             request_digest, result_digest, issued_at_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
+             request_digest, result_digest, issued_at_ms,
+             route_health_receipt_key_id, route_health_receipt_public_key
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
     )
     .bind(Uuid::from(credential.tenant_id()))
     .bind(Uuid::from(credential.connector_id()))
@@ -1029,6 +1033,16 @@ async fn insert_credential(
     .bind(request_digest.as_bytes().to_vec())
     .bind(result_digest.as_bytes().to_vec())
     .bind(stored_at_ms)
+    .bind(
+        credential
+            .route_health_receipt_pin()
+            .map(|(key_id, _)| Uuid::from(key_id)),
+    )
+    .bind(
+        credential
+            .route_health_receipt_pin()
+            .map(|(_, public_key)| public_key.to_vec()),
+    )
     .execute(&mut *connection)
     .await?;
     Ok(())
@@ -1687,6 +1701,20 @@ fn load_credential_row(
     connector_id: ConnectorId,
     row: &sqlx::postgres::PgRow,
 ) -> Result<ConnectorCredential, AgentPersistenceError> {
+    let receipt_pin_id: Option<Uuid> = row.try_get("route_health_receipt_key_id").unwrap_or(None);
+    let receipt_pin_public: Option<Vec<u8>> = row
+        .try_get("route_health_receipt_public_key")
+        .unwrap_or(None);
+    let receipt_pin = match (receipt_pin_id, receipt_pin_public) {
+        (None, None) => None,
+        (Some(key_id), Some(public_key)) => Some((
+            RouteHealthKeyId::try_from(key_id)
+                .map_err(|_| AgentPersistenceError::CorruptData("receipt pin key ID"))?,
+            <[u8; 32]>::try_from(public_key.as_slice())
+                .map_err(|_| AgentPersistenceError::CorruptData("receipt pin public key"))?,
+        )),
+        _ => return Err(AgentPersistenceError::CorruptData("receipt pin shape")),
+    };
     let control_key = Ed25519PublicKey::try_from(bytes_32(
         row.try_get("online_public_key")?,
         "Connector control public key",
@@ -1697,7 +1725,7 @@ fn load_credential_row(
         "Connector refresh public key",
     )?)
     .map_err(|_| AgentPersistenceError::CorruptData("Connector refresh public key"))?;
-    ConnectorCredential::new(
+    let credential = ConnectorCredential::new(
         credential_id(row.try_get("credential_id")?)?,
         tenant_id,
         connector_id,
@@ -1716,7 +1744,12 @@ fn load_credential_row(
         row.try_get("not_before_ms")?,
         row.try_get("not_after_ms")?,
     )
-    .map_err(|_| AgentPersistenceError::SnapshotRejected("Connector credential"))
+    .map_err(|_| AgentPersistenceError::SnapshotRejected("Connector credential"))?;
+    Ok(
+        receipt_pin.map_or(credential.clone(), |(key_id, public_key)| {
+            credential.with_route_health_receipt_pin(key_id, public_key)
+        }),
+    )
 }
 
 fn load_credential_audit_row(

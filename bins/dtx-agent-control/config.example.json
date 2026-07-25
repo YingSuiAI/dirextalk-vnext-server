@@ -25,7 +25,8 @@
     "private_key_pkcs8_pem": "secrets/route-health-server-key.pem",
     "client_ca_bundle_pem": "tls/connector-client-roots.pem",
     "receipt_private_key_pkcs8_pem": "secrets/route-health-receipt-key.pem",
-    "receipt_key_id": "01890f47-3a5b-7c1d-8e2f-123456789abd"
+    "receipt_key_id": "01890f47-3a5b-7c1d-8e2f-123456789abd",
+    "retained_receipt_keys": []
   },
   "legacy_gateway": {
     "listen": "0.0.0.0:9445",

@@ -803,6 +803,7 @@ pub struct PostgresConnectorControlApplication {
     command_notifications: Arc<ConnectorCommandNotifications>,
     run_offer_notifications: Arc<ConnectorRunOfferNotifications>,
     policy: ConnectorControlPolicy,
+    route_health_receipt_pin: Option<(dtx_domain::RouteHealthKeyId, [u8; 32])>,
 }
 
 impl PostgresConnectorControlApplication {
@@ -845,7 +846,18 @@ impl PostgresConnectorControlApplication {
             command_notifications: ConnectorCommandNotifications::new(),
             run_offer_notifications: ConnectorRunOfferNotifications::new(),
             policy,
+            route_health_receipt_pin: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_route_health_receipt_pin(
+        mut self,
+        key_id: dtx_domain::RouteHealthKeyId,
+        public_key: [u8; 32],
+    ) -> Self {
+        self.route_health_receipt_pin = Some((key_id, public_key));
+        self
     }
 
     /// Durably requests cancellation of one exact active execution lease.
@@ -2424,6 +2436,11 @@ impl PostgresConnectorControlApplication {
             current.refresh_key(),
             now,
         )?;
+        let credential = current
+            .route_health_receipt_pin()
+            .map_or(credential.clone(), |(key_id, public_key)| {
+                credential.with_route_health_receipt_pin(key_id, public_key)
+            });
         authorization
             .propose_reissue(credential.clone())
             .map_err(|_| ConnectorControlApplicationError::AuthenticationFailed)?;
@@ -2432,7 +2449,9 @@ impl PostgresConnectorControlApplication {
         let updated = sqlx::query(
             "UPDATE agent.connector_credential_reissue_intents
                 SET status='consumed', transitioned_at_ms=$4, request_digest=$5,
-                    result_digest=$6, credential_id=$7
+                    result_digest=$6, credential_id=$7,
+                    route_health_receipt_key_id=$8,
+                    route_health_receipt_public_key=$9
               WHERE tenant_id=$1 AND intent_id=$2 AND operation_id=$3 AND status='active'",
         )
         .bind(Uuid::from(tenant_id))
@@ -2447,6 +2466,16 @@ impl PostgresConnectorControlApplication {
                 .to_vec(),
         )
         .bind(Uuid::from(credential.credential_id()))
+        .bind(
+            credential
+                .route_health_receipt_pin()
+                .map(|(key_id, _)| Uuid::from(key_id)),
+        )
+        .bind(
+            credential
+                .route_health_receipt_pin()
+                .map(|(_, public_key)| public_key.to_vec()),
+        )
         .execute(session.connection())
         .await
         .map_err(|_| ConnectorControlApplicationError::Unavailable)?;
@@ -4689,7 +4718,7 @@ impl PostgresConnectorControlApplication {
                 valid_until,
             )
             .map_err(|_| ConnectorControlApplicationError::Internal)?;
-        ConnectorCredential::new(
+        let credential = ConnectorCredential::new(
             credential_id,
             tenant_id,
             connector_id,
@@ -4702,7 +4731,13 @@ impl PostgresConnectorControlApplication {
             valid_from,
             valid_until,
         )
-        .map_err(|_| ConnectorControlApplicationError::Internal)
+        .map_err(|_| ConnectorControlApplicationError::Internal)?;
+        Ok(match self.route_health_receipt_pin {
+            Some((key_id, public_key)) => {
+                credential.with_route_health_receipt_pin(key_id, public_key)
+            }
+            None => credential,
+        })
     }
 
     fn validate_hello_policy(
