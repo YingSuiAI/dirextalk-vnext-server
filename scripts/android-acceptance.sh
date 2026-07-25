@@ -111,11 +111,12 @@ start_owned_process() {
   child_file="$RUN_ROOT/.guardian-child-$OWNED_PROCESS_INDEX"
   # The guardian is the stable, harness-owned group leader.  It ignores TERM
   # while its child receives the group signal, and survives until verified KILL.
-  setsid bash -c 'child_file=$1; shift; trap ":" TERM; [[ -z "${DTX_TEST_GUARDIAN_PID_LOG:-}" ]] || printf "%s\n" "$$" >>"$DTX_TEST_GUARDIAN_PID_LOG"; "$@" & child=$!; if [[ "${DTX_TEST_GUARDIAN_PID_FILE_MISSING:-0}" != 1 ]]; then [[ "${DTX_TEST_GUARDIAN_PID_FILE_DELAY:-0}" == 0 ]] || sleep "$DTX_TEST_GUARDIAN_PID_FILE_DELAY"; printf "%s" "$child" >"$child_file"; fi; while :; do wait "$child" || :; sleep 2147483647 & wait "$!" || :; done' bash "$child_file" "$@" >/dev/null 2>&1 &
+  setsid bash -c 'child_file=$1; shift; trap ":" TERM; "$@" & child=$!; if [[ "${DTX_TEST_GUARDIAN_PID_FILE_MISSING:-0}" != 1 ]]; then [[ "${DTX_TEST_GUARDIAN_PID_FILE_DELAY:-0}" == 0 ]] || sleep "$DTX_TEST_GUARDIAN_PID_FILE_DELAY"; printf "%s" "$child" >"$child_file"; fi; while :; do wait "$child" || :; sleep 2147483647 & wait "$!" || :; done' bash "$child_file" "$@" >/dev/null 2>&1 &
   OWNED_GUARDIAN_PID=$!
   PENDING_GUARDIAN_PID=$OWNED_GUARDIAN_PID
   PENDING_GUARDIAN_START="$(proc_start_identity "$PENDING_GUARDIAN_PID")" || return 1
   guardian_matches "$PENDING_GUARDIAN_PID" "$PENDING_GUARDIAN_START" || return 1
+  [[ -z "${DTX_TEST_GUARDIAN_PID_LOG:-}" ]] || printf '%s %s\n' "$PENDING_GUARDIAN_PID" "$PENDING_GUARDIAN_START" >>"$DTX_TEST_GUARDIAN_PID_LOG"
   printf '%s=%s\n%s=%s\n' pending_guardian_pid "$PENDING_GUARDIAN_PID" pending_guardian_start "$PENDING_GUARDIAN_START" >"$RUN_ROOT/pending-guardian"
   deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
   while [[ ! -s "$child_file" && SECONDS -lt deadline ]]; do :; done
