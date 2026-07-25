@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dtx_domain::TenantId;
+use dtx_domain::{RouteHealthKeyId, TenantId};
 use serde::Deserialize;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1_024;
@@ -18,6 +18,9 @@ pub struct BootstrapConfig {
     pub owner_api: OwnerApiEndpoint,
     pub enrollment: PublicTlsEndpoint,
     pub control: ControlTlsEndpoint,
+    /// Dedicated HTTPS listener for Connector-originated Route Health receipts.
+    /// This is intentionally separate from the owner API and legacy probes.
+    pub route_health: RouteHealthEndpoint,
     pub legacy_gateway: InternalServiceTlsEndpoint,
     pub connector_issuer: ConnectorIssuer,
 }
@@ -49,6 +52,16 @@ pub struct ControlTlsEndpoint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouteHealthEndpoint {
+    pub listen: SocketAddr,
+    pub certificate_chain_pem: PathBuf,
+    pub private_key_pkcs8_pem: PathBuf,
+    pub client_ca_bundle_pem: PathBuf,
+    pub receipt_private_key_pkcs8_pem: PathBuf,
+    pub receipt_key_id: RouteHealthKeyId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InternalServiceTlsEndpoint {
     pub listen: SocketAddr,
     pub certificate_chain_pem: PathBuf,
@@ -72,6 +85,7 @@ struct RawBootstrapConfig {
     owner_api: RawOwnerApiEndpoint,
     enrollment: RawPublicTlsEndpoint,
     control: RawControlTlsEndpoint,
+    route_health: RawRouteHealthEndpoint,
     legacy_gateway: RawControlTlsEndpoint,
     connector_issuer: RawConnectorIssuer,
 }
@@ -108,6 +122,17 @@ struct RawControlTlsEndpoint {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawRouteHealthEndpoint {
+    listen: String,
+    certificate_chain_pem: PathBuf,
+    private_key_pkcs8_pem: PathBuf,
+    client_ca_bundle_pem: PathBuf,
+    receipt_private_key_pkcs8_pem: PathBuf,
+    receipt_key_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConnectorIssuer {
     #[serde(rename = "certificate_pem")]
     certificate: PathBuf,
@@ -140,6 +165,7 @@ impl RawBootstrapConfig {
         }
         let enrollment_listen = parse_listen(&self.enrollment.listen)?;
         let control_listen = parse_listen(&self.control.listen)?;
+        let route_health_listen = parse_listen(&self.route_health.listen)?;
         let legacy_gateway_listen = parse_listen(&self.legacy_gateway.listen)?;
         let health_listen = parse_listen(&self.health.listen)?;
         let owner_api_listen = parse_listen(&self.owner_api.listen)?;
@@ -155,6 +181,7 @@ impl RawBootstrapConfig {
             enrollment_listen,
             control_listen,
             legacy_gateway_listen,
+            route_health_listen,
             health_listen,
             owner_api_listen,
         ]) {
@@ -180,6 +207,21 @@ impl RawBootstrapConfig {
                 certificate_chain_pem: resolve_path(base, self.control.certificate_chain_pem)?,
                 private_key_pkcs8_pem: resolve_path(base, self.control.private_key_pkcs8_pem)?,
                 client_ca_bundle_pem: resolve_path(base, self.control.client_ca_bundle_pem)?,
+            },
+            route_health: RouteHealthEndpoint {
+                listen: route_health_listen,
+                certificate_chain_pem: resolve_path(base, self.route_health.certificate_chain_pem)?,
+                private_key_pkcs8_pem: resolve_path(base, self.route_health.private_key_pkcs8_pem)?,
+                client_ca_bundle_pem: resolve_path(base, self.route_health.client_ca_bundle_pem)?,
+                receipt_private_key_pkcs8_pem: resolve_path(
+                    base,
+                    self.route_health.receipt_private_key_pkcs8_pem,
+                )?,
+                receipt_key_id: self
+                    .route_health
+                    .receipt_key_id
+                    .parse()
+                    .map_err(|_| ConfigError::RouteHealthKeyId)?,
             },
             legacy_gateway: InternalServiceTlsEndpoint {
                 listen: legacy_gateway_listen,
@@ -246,6 +288,7 @@ pub enum ConfigError {
     OwnerApiExposure,
     TenantId,
     EmptyPath,
+    RouteHealthKeyId,
 }
 
 impl fmt::Display for ConfigError {
@@ -260,6 +303,7 @@ impl fmt::Display for ConfigError {
             Self::OwnerApiExposure => "Owner API listener must use a loopback address",
             Self::TenantId => "Owner API tenant ID must be canonical UUIDv7",
             Self::EmptyPath => "bootstrap path is empty",
+            Self::RouteHealthKeyId => "Route Health receipt key ID must be canonical UUIDv7",
         })
     }
 }
@@ -291,6 +335,14 @@ mod tests {
                 "certificate_chain_pem": "tls/control-chain.pem",
                 "private_key_pkcs8_pem": "tls/control-key.pem",
                 "client_ca_bundle_pem": "tls/connector-roots.pem"
+            },
+            "route_health": {
+                "listen": "127.0.0.1:9446",
+                "certificate_chain_pem": "tls/route-health-chain.pem",
+                "private_key_pkcs8_pem": "tls/route-health-key.pem",
+                "client_ca_bundle_pem": "tls/connector-roots.pem",
+                "receipt_private_key_pkcs8_pem": "secrets/route-health-receipt-key.pem",
+                "receipt_key_id": "01890f47-3a5b-7c1d-8e2f-123456789abd"
             },
             "legacy_gateway": {
                 "listen": "127.0.0.1:9445",
@@ -359,6 +411,13 @@ mod tests {
         assert_eq!(
             exposed_owner_api.resolve(Path::new(".")).unwrap_err(),
             ConfigError::OwnerApiExposure
+        );
+
+        let mut route_health_collision = raw("127.0.0.1:9443", "127.0.0.1:9444");
+        route_health_collision.route_health.listen = "127.0.0.1:9444".to_owned();
+        assert_eq!(
+            route_health_collision.resolve(Path::new(".")).unwrap_err(),
+            ConfigError::ListenerCollision
         );
     }
 }

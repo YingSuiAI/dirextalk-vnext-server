@@ -1321,6 +1321,8 @@ pub fn build_enrollment_response(
         credential: Some(build_credential_message(credential)),
         request_digest: request.request_digest().as_bytes().to_vec(),
         result_digest: credential.result_digest().as_bytes().to_vec(),
+        route_health_receipt_key_id: String::new(),
+        route_health_receipt_public_key: Vec::new(),
     }
 }
 

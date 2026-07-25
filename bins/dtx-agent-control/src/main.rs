@@ -25,9 +25,10 @@ use config::BootstrapConfig;
 use dtx_agent_control_server::{
     AgentRunIngressApplication, ConnectorCertificateAuthority, ConnectorControlApplication,
     ConnectorCredentialAuthorizationIndex, PostgresAgentProvisioningOwnerBackend,
-    PostgresConnectorControlApplication, ProtobufDurableCommandDecoder,
-    agent_provisioning_owner_router, agent_run_ingress_service, connector_control_service,
-    connector_enrollment_service, connector_tls_incoming, tls_incoming,
+    PostgresConnectorControlApplication, ProtobufDurableCommandDecoder, RouteHealthConnectInfo,
+    RouteHealthTlsListener, agent_provisioning_owner_router, agent_run_ingress_service,
+    connector_control_service, connector_enrollment_service_with_route_health_pin,
+    connector_tls_incoming, route_health_router_with_state, tls_incoming,
 };
 use dtx_security::{
     ConnectorCredentialAuthorizer, ConnectorMtlsClientVerifier, InternalServiceKind,
@@ -209,6 +210,9 @@ async fn run() -> Result<(), BootstrapError> {
     let health_listener = TcpListener::bind(config.health.listen)
         .await
         .map_err(|_| BootstrapError::Bind)?;
+    let route_health_listener = TcpListener::bind(config.route_health.listen)
+        .await
+        .map_err(|_| BootstrapError::Bind)?;
     let owner_api_listener = TcpListener::bind(config.owner_api.listen)
         .await
         .map_err(|_| BootstrapError::Bind)?;
@@ -218,6 +222,7 @@ async fn run() -> Result<(), BootstrapError> {
         .await
         .map_err(|_| BootstrapError::Database)?;
     let health_store = store.clone();
+    let route_health_store = store.clone();
     let owner_api_store = store.clone();
     let accepting_requests = Arc::new(AtomicBool::new(false));
 
@@ -232,6 +237,19 @@ async fn run() -> Result<(), BootstrapError> {
         load_private_key(&config.control.private_key_pkcs8_pem)?,
     )
     .map_err(|_| BootstrapError::Tls)?;
+    let route_health_server_config = build_connector_mtls_server_config(
+        verifier.clone(),
+        load_certificate_chain(&config.route_health.certificate_chain_pem)?,
+        load_private_key(&config.route_health.private_key_pkcs8_pem)?,
+    )
+    .map_err(|_| BootstrapError::Tls)?;
+    // Load and validate the dedicated receipt signing key at startup. The key
+    // is retained by the future receipt application boundary and is never
+    // included in readiness output or diagnostics.
+    let _route_health_receipt_key =
+        load_private_key(&config.route_health.receipt_private_key_pkcs8_pem)?;
+    let route_health_receipt_public_key = derive_ed25519_public_key(&_route_health_receipt_key)?;
+    let route_health_receipt_seed = derive_ed25519_seed(&_route_health_receipt_key)?;
     let gateway_roots = Arc::new(load_root_store(
         &config.legacy_gateway.client_ca_bundle_pem,
     )?);
@@ -284,16 +302,21 @@ async fn run() -> Result<(), BootstrapError> {
     let (control_shutdown_tx, control_shutdown_rx) = oneshot::channel();
     let (legacy_gateway_shutdown_tx, legacy_gateway_shutdown_rx) = oneshot::channel();
     let (health_shutdown_tx, health_shutdown_rx) = oneshot::channel();
+    let (route_health_shutdown_tx, route_health_shutdown_rx) = oneshot::channel();
     let (owner_api_shutdown_tx, owner_api_shutdown_rx) = oneshot::channel();
     let enrollment_server = Server::builder().serve_with_incoming_shutdown(
-        connector_enrollment_service(enrollment_application),
+        connector_enrollment_service_with_route_health_pin(
+            enrollment_application,
+            config.route_health.receipt_key_id.to_string(),
+            route_health_receipt_public_key,
+        ),
         tls_incoming(enrollment_listener, Arc::new(enrollment_server_config)),
         async {
             let _ = enrollment_shutdown_rx.await;
         },
     );
     let control_server = Server::builder().serve_with_incoming_shutdown(
-        connector_control_service(control_application, verifier),
+        connector_control_service(control_application, Arc::clone(&verifier)),
         connector_tls_incoming(control_listener, Arc::new(control_server_config)),
         async {
             let _ = control_shutdown_rx.await;
@@ -320,6 +343,25 @@ async fn run() -> Result<(), BootstrapError> {
             })
             .await
     };
+    let route_health_server = async move {
+        axum::serve(
+            RouteHealthTlsListener::new(
+                route_health_listener,
+                Arc::new(route_health_server_config),
+                Arc::clone(&verifier),
+            ),
+            route_health_router_with_state(dtx_agent_control_server::RouteHealthHttpState {
+                store: route_health_store,
+                receipt_key_id: config.route_health.receipt_key_id,
+                receipt_seed: route_health_receipt_seed,
+            })
+            .into_make_service_with_connect_info::<RouteHealthConnectInfo>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = route_health_shutdown_rx.await;
+        })
+        .await
+    };
     let owner_backend = Arc::new(PostgresAgentProvisioningOwnerBackend::new(
         owner_api_store,
         config.owner_api.tenant_id,
@@ -339,6 +381,7 @@ async fn run() -> Result<(), BootstrapError> {
     tokio::pin!(control_server);
     tokio::pin!(legacy_gateway_server);
     let mut health_server = tokio::spawn(health_server);
+    let mut route_health_server = tokio::spawn(route_health_server);
     let mut owner_api_server = tokio::spawn(owner_api_server);
 
     accepting_requests.store(true, Ordering::Release);
@@ -347,6 +390,7 @@ async fn run() -> Result<(), BootstrapError> {
         config.control.listen,
         config.legacy_gateway.listen,
         config.health.listen,
+        config.route_health.listen,
         config.owner_api.listen,
     )?;
     tokio::select! {
@@ -357,8 +401,9 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let _ = tokio::join!(control_server.as_mut(), legacy_gateway_server.as_mut());
                 let _ = health_shutdown_tx.send(());
+                let _ = route_health_shutdown_tx.send(());
                 let _ = owner_api_shutdown_tx.send(());
-                let _ = tokio::join!(&mut health_server, &mut owner_api_server);
+                let _ = tokio::join!(&mut health_server, &mut route_health_server, &mut owner_api_server);
             }).await;
             endpoint_result(&result)
         }
@@ -369,8 +414,9 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let _ = tokio::join!(enrollment_server.as_mut(), legacy_gateway_server.as_mut());
                 let _ = health_shutdown_tx.send(());
+                let _ = route_health_shutdown_tx.send(());
                 let _ = owner_api_shutdown_tx.send(());
-                let _ = tokio::join!(&mut health_server, &mut owner_api_server);
+                let _ = tokio::join!(&mut health_server, &mut route_health_server, &mut owner_api_server);
             }).await;
             endpoint_result(&result)
         }
@@ -381,8 +427,9 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let _ = tokio::join!(enrollment_server.as_mut(), control_server.as_mut());
                 let _ = health_shutdown_tx.send(());
+                let _ = route_health_shutdown_tx.send(());
                 let _ = owner_api_shutdown_tx.send(());
-                let _ = tokio::join!(&mut health_server, &mut owner_api_server);
+                let _ = tokio::join!(&mut health_server, &mut route_health_server, &mut owner_api_server);
             }).await;
             endpoint_result(&result)
         }
@@ -392,13 +439,14 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = control_shutdown_tx.send(());
             let _ = legacy_gateway_shutdown_tx.send(());
             let _ = owner_api_shutdown_tx.send(());
+            let _ = route_health_shutdown_tx.send(());
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let _ = tokio::join!(
                     enrollment_server.as_mut(),
                     control_server.as_mut(),
                     legacy_gateway_server.as_mut(),
                 );
-                let _ = (&mut owner_api_server).await;
+                let _ = tokio::join!(&mut route_health_server, &mut owner_api_server);
             }).await;
             health_task_result(&result)
         }
@@ -408,13 +456,14 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = control_shutdown_tx.send(());
             let _ = legacy_gateway_shutdown_tx.send(());
             let _ = health_shutdown_tx.send(());
+            let _ = route_health_shutdown_tx.send(());
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let _ = tokio::join!(
                     enrollment_server.as_mut(),
                     control_server.as_mut(),
                     legacy_gateway_server.as_mut(),
                 );
-                let _ = (&mut health_server).await;
+                let _ = tokio::join!(&mut health_server, &mut route_health_server);
             }).await;
             health_task_result(&result)
         }
@@ -425,6 +474,7 @@ async fn run() -> Result<(), BootstrapError> {
             let _ = control_shutdown_tx.send(());
             let _ = legacy_gateway_shutdown_tx.send(());
             let _ = owner_api_shutdown_tx.send(());
+            let _ = route_health_shutdown_tx.send(());
             tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
                 let (enrollment, control, legacy_gateway) = tokio::join!(
                     enrollment_server.as_mut(),
@@ -439,6 +489,10 @@ async fn run() -> Result<(), BootstrapError> {
                     .await
                     .map_err(|_| BootstrapError::Server)?;
                 health.map_err(|_| BootstrapError::Server)?;
+                let route_health = (&mut route_health_server)
+                    .await
+                    .map_err(|_| BootstrapError::Server)?;
+                route_health.map_err(|_| BootstrapError::Server)?;
                 let owner_api = (&mut owner_api_server)
                     .await
                     .map_err(|_| BootstrapError::Server)?;
@@ -600,6 +654,36 @@ fn load_private_key(path: &Path) -> Result<SecretBytes, BootstrapError> {
     secret
 }
 
+fn derive_ed25519_public_key(key: &SecretBytes) -> Result<[u8; 32], BootstrapError> {
+    let mut public = Err(BootstrapError::Tls);
+    key.expose(|der| {
+        // RFC 8410 Ed25519 PKCS#8 carries the 32-byte seed as the final
+        // primitive. Deriving through dalek also validates the exact key shape.
+        if der.len() < 32 {
+            return;
+        }
+        let mut seed = [0_u8; 32];
+        seed.copy_from_slice(&der[der.len() - 32..]);
+        public = Ok(ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes());
+        seed.zeroize();
+    });
+    public
+}
+
+fn derive_ed25519_seed(key: &SecretBytes) -> Result<[u8; 32], BootstrapError> {
+    let mut seed = Err(BootstrapError::Tls);
+    key.expose(|der| {
+        if der.len() >= 32 {
+            let mut value = [0_u8; 32];
+            value.copy_from_slice(&der[der.len() - 32..]);
+            seed = Ok(value);
+        }
+    });
+    seed
+}
+
 fn build_server_auth_tls_config(
     certificate_chain_der: Vec<Vec<u8>>,
     private_key: SecretBytes,
@@ -665,12 +749,13 @@ fn report_ready(
     control: SocketAddr,
     legacy_gateway: SocketAddr,
     health: SocketAddr,
+    route_health: SocketAddr,
     owner_api: SocketAddr,
 ) -> Result<(), BootstrapError> {
     let mut output = io::stdout().lock();
     writeln!(
         output,
-        "dtx-agent-control ready enrollment={enrollment} control={control} legacy_gateway={legacy_gateway} health={health} owner_api={owner_api}"
+        "dtx-agent-control ready enrollment={enrollment} control={control} legacy_gateway={legacy_gateway} health={health} route_health={route_health} owner_api={owner_api}"
     )
     .map_err(|_| BootstrapError::Ready)?;
     output.flush().map_err(|_| BootstrapError::Ready)

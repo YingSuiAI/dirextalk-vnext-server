@@ -19,6 +19,14 @@
     "private_key_pkcs8_pem": "secrets/control-key.pem",
     "client_ca_bundle_pem": "tls/connector-client-roots.pem"
   },
+  "route_health": {
+    "listen": "0.0.0.0:9446",
+    "certificate_chain_pem": "tls/route-health-server-chain.pem",
+    "private_key_pkcs8_pem": "secrets/route-health-server-key.pem",
+    "client_ca_bundle_pem": "tls/connector-client-roots.pem",
+    "receipt_private_key_pkcs8_pem": "secrets/route-health-receipt-key.pem",
+    "receipt_key_id": "01890f47-3a5b-7c1d-8e2f-123456789abd"
+  },
   "legacy_gateway": {
     "listen": "0.0.0.0:9445",
     "certificate_chain_pem": "tls/legacy-gateway-server-chain.pem",

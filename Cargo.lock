@@ -824,6 +824,7 @@ dependencies = [
  "dtx-domain",
  "dtx-security",
  "dtx-storage",
+ "ed25519-dalek",
  "getrandom 0.4.3",
  "rustix 1.1.4",
  "rustls",
@@ -832,6 +833,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlx",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "zeroize",
 ]

@@ -25,6 +25,8 @@ mod mcp;
 mod owner_http;
 mod postgres_application;
 mod provisioning;
+mod route_health_http;
+mod route_health_transport;
 mod run_notifications;
 mod service;
 mod transport_admission;
@@ -87,12 +89,19 @@ pub use postgres_application::{
     PrepareConnectorCredentialReissueRequest, RotateConnectorCredentialRequest,
 };
 pub use provisioning::*;
+pub use route_health_http::{
+    MAX_ROUTE_HEALTH_REQUEST_BYTES, ROUTE_HEALTH_MEDIA_TYPE_V1, ROUTE_HEALTH_RECEIPT_DOMAIN,
+    ROUTE_HEALTH_SIGNATURE_DOMAIN, RouteHealthHttpState, RouteHealthParseError, RouteHealthReceipt,
+    RouteHealthRequest, record_route_health, route_health_router, route_health_router_with_state,
+};
+pub use route_health_transport::{RouteHealthConnectInfo, RouteHealthTlsListener};
 pub use run_notifications::RunOfferNotificationSubscription;
 pub use service::{
     COMMAND_POLL_INTERVAL, COMMAND_RECONCILE_INTERVAL, COMMAND_RECONCILE_JITTER,
     CONTROL_RESPONSE_BUFFER, CONTROL_RESPONSE_SEND_TIMEOUT, CommandReconcilePolicy,
     ConnectorControlGrpc, ConnectorEnrollmentGrpc, ENROLLMENT_OPERATION_TIMEOUT,
     FIRST_HELLO_TIMEOUT, connector_control_service, connector_enrollment_service,
+    connector_enrollment_service_with_route_health_pin,
 };
 pub use transport_admission::{
     ConnectorHelloAdmissionPermit, ConnectorTransportAdmission, ConnectorTransportAdmissionConfig,

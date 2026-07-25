@@ -132,6 +132,10 @@ message EnrollConnectorResponse {
   ConnectorCredential credential = 1;
   bytes request_digest = 2; // Exactly 32 domain-separated SHA-256 bytes.
   bytes result_digest = 3; // Exactly 32 domain-separated SHA-256 bytes.
+  // Additive trust pin for fresh enrollment. This is a public receipt key,
+  // never a private key and never the sole transport trust root.
+  string route_health_receipt_key_id = 4; // Canonical lowercase UUIDv7 text.
+  bytes route_health_receipt_public_key = 5; // Exactly 32 Ed25519 bytes.
 }
 
 // One exact certificate-only recovery attempt. `reissue_token` is caller-held

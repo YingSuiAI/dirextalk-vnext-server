@@ -116,6 +116,7 @@ pub struct ConnectorEnrollmentGrpc {
     application: Arc<dyn ConnectorControlApplication>,
     transport_admission: SourceTransportAdmission,
     operation_timeout: Duration,
+    route_health_receipt_pin: Option<(String, Vec<u8>)>,
 }
 
 impl ConnectorEnrollmentGrpc {
@@ -127,7 +128,20 @@ impl ConnectorEnrollmentGrpc {
                 SourceTransportAdmissionConfig::default(),
             ),
             operation_timeout: ENROLLMENT_OPERATION_TIMEOUT,
+            route_health_receipt_pin: None,
         }
+    }
+
+    /// Adds the public Route Health receipt pin to fresh enrollment responses.
+    /// The private signing key remains outside the protocol object.
+    #[must_use]
+    pub fn with_route_health_receipt_pin(
+        mut self,
+        key_id: impl Into<String>,
+        public_key: [u8; 32],
+    ) -> Self {
+        self.route_health_receipt_pin = Some((key_id.into(), public_key.to_vec()));
+        self
     }
 
     /// Replaces the anonymous enrollment admission guard.
@@ -172,10 +186,12 @@ impl v1::connector_enrollment_server::ConnectorEnrollment for ConnectorEnrollmen
                 .await
                 .map_err(|_| Status::deadline_exceeded("ENROLLMENT_TIMEOUT"))?
                 .map_err(application_status)?;
-        Ok(Response::new(build_enrollment_response(
-            &completion.request,
-            &completion.credential,
-        )))
+        let mut response = build_enrollment_response(&completion.request, &completion.credential);
+        if let Some((key_id, public_key)) = &self.route_health_receipt_pin {
+            response.route_health_receipt_key_id = key_id.clone();
+            response.route_health_receipt_public_key = public_key.clone();
+        }
+        Ok(Response::new(response))
     }
 
     async fn reissue_connector_credential(
@@ -317,6 +333,20 @@ pub fn connector_enrollment_service(
     v1::connector_enrollment_server::ConnectorEnrollmentServer::new(ConnectorEnrollmentGrpc::new(
         application,
     ))
+    .max_decoding_message_size(MAX_AGENT_CONTROL_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_AGENT_CONTROL_MESSAGE_BYTES)
+}
+
+/// Builds enrollment with the additive public Route Health receipt pin.
+#[must_use]
+pub fn connector_enrollment_service_with_route_health_pin(
+    application: Arc<dyn ConnectorControlApplication>,
+    key_id: impl Into<String>,
+    public_key: [u8; 32],
+) -> v1::connector_enrollment_server::ConnectorEnrollmentServer<ConnectorEnrollmentGrpc> {
+    v1::connector_enrollment_server::ConnectorEnrollmentServer::new(
+        ConnectorEnrollmentGrpc::new(application).with_route_health_receipt_pin(key_id, public_key),
+    )
     .max_decoding_message_size(MAX_AGENT_CONTROL_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_AGENT_CONTROL_MESSAGE_BYTES)
 }
