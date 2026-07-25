@@ -77,6 +77,7 @@ make_fixture() {
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_SHA256_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/sha256sum "$@"' >"$fixture/bin/sha256sum"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_STAT_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/stat "$@"' >"$fixture/bin/stat"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_MKDIR_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/mkdir "$@"' >"$fixture/bin/mkdir"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'target="${!#}"' 'if [[ "${DTX_TEST_RM_PENDING_FAIL:-0}" == 1 && "$target" == */pending-guardian ]]; then exit 1; fi' 'if [[ "${DTX_TEST_RM_ROOT_FAIL:-0}" == 1 && "$target" == "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID" ]]; then exit 1; fi' 'if [[ "${DTX_TEST_RM_PENDING_SLEEP:-0}" == 1 && "$target" == */pending-guardian ]]; then sleep 5; fi' 'if [[ "${DTX_TEST_RM_ROOT_SLEEP:-0}" == 1 && "$target" == "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID" ]]; then sleep 5; fi' 'exec /usr/bin/rm "$@"' >"$fixture/bin/rm"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_SORT_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/sort "$@"' >"$fixture/bin/sort"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "javac $*" >>"$DTX_TEST_LOG"' 'if [[ "$*" == *"-version"* ]]; then [[ "${DTX_TEST_JAVAC_VERSION_SLEEP:-0}" == 1 ]] && sleep 5; printf "javac 17.0.0\n" >&2; exit 0; fi' '[[ "${DTX_TEST_JAVAC_COMPILE_SLEEP:-0}" == 1 ]] && sleep 5' 'while (($#)); do if [[ "$1" == -d ]]; then mkdir -p "$2"; : >"$2/PlatformTrustProbe.class"; break; fi; shift; done' >"$fixture/bin/javac"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "d8 $*" >>"$DTX_TEST_LOG"' '[[ "${DTX_TEST_D8_SLEEP:-0}" == 1 ]] && sleep 5' 'while (($#)); do if [[ "$1" == --output ]]; then mkdir -p "$2"; : >"$2/classes.dex"; break; fi; shift; done' >"$fixture/sdk/build-tools/35.0.0/d8"
@@ -183,6 +184,36 @@ printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'while :; do sleep 1; do
 if DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 DTX_TEST_GUARDIAN_PID_LOG="$fixture/guardian-pids" run_fixture "$fixture" proxy-readiness env >/dev/null 2>&1; then exit 1; fi
 [[ -s "$fixture/guardian-pids" && ! -e "$fixture/.android-acceptance/proxy-readiness" ]]
 while IFS= read -r guardian_pid; do [[ "$guardian_pid" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$guardian_pid" 2>/dev/null; done <"$fixture/guardian-pids"
+
+# A signal after formal slot recording but before pending removal has two
+# cleanup-visible owners for the same guardian; cleanup deduplicates them and
+# cannot leave the guardian running.
+fixture="$tmp/promotion-signal"; make_fixture "$fixture"
+if DTX_TEST_SIGNAL_AT_PROMOTION=1 DTX_TEST_GUARDIAN_PID_LOG="$fixture/guardian-pids" run_fixture "$fixture" promotion-signal env >/dev/null 2>&1; then exit 1; fi
+[[ -s "$fixture/guardian-pids" && ! -e "$fixture/.android-acceptance/promotion-signal" ]]
+while IFS= read -r guardian_pid; do [[ "$guardian_pid" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$guardian_pid" 2>/dev/null; done <"$fixture/guardian-pids"
+
+# Failure or timeout while removing the pending slot retains explicit state
+# after killing the authorized guardian; final root removal is never attempted.
+for rm_case in pending-rm-fail pending-rm-hung; do
+  fixture="$tmp/$rm_case"; make_fixture "$fixture"
+  case "$rm_case" in
+    pending-rm-fail) if DTX_TEST_RM_PENDING_FAIL=1 DTX_TEST_GUARDIAN_PID_LOG="$fixture/guardian-pids" run_fixture "$fixture" "$rm_case" env >/dev/null 2>&1; then exit 1; fi ;;
+    pending-rm-hung) if DTX_TEST_RM_PENDING_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 DTX_TEST_GUARDIAN_PID_LOG="$fixture/guardian-pids" run_fixture "$fixture" "$rm_case" env >/dev/null 2>&1; then exit 1; fi ;;
+  esac
+  rm_root="$fixture/.android-acceptance/$rm_case"
+  [[ -f "$rm_root/pending-guardian" && "$(<"$rm_root/cleanup-status")" == cleanup=failed ]]
+  while IFS= read -r guardian_pid; do [[ "$guardian_pid" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$guardian_pid" 2>/dev/null; done <"$fixture/guardian-pids"
+done
+
+# A final root removal failure leaves the narrow claimed root intact and never
+# reaches a sibling sentinel.
+fixture="$tmp/root-rm-fail"; make_fixture "$fixture"; mkdir "$fixture/sentinel"; printf keep >"$fixture/sentinel/keep"
+if DTX_TEST_RM_ROOT_FAIL=1 run_fixture "$fixture" root-rm-fail env >/dev/null 2>&1; then exit 1; fi
+[[ -d "$fixture/.android-acceptance/root-rm-fail" && "$(<"$fixture/sentinel/keep")" == keep ]]
+fixture="$tmp/root-rm-hung"; make_fixture "$fixture"; mkdir "$fixture/sentinel"; printf keep >"$fixture/sentinel/keep"
+if DTX_TEST_RM_ROOT_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 run_fixture "$fixture" root-rm-hung env >/dev/null 2>&1; then exit 1; fi
+[[ -d "$fixture/.android-acceptance/root-rm-hung" && "$(<"$fixture/sentinel/keep")" == keep ]]
 
 # A symlinked state root is rejected before any external command and never
 # turns cleanup into an outside-tree deletion.

@@ -76,10 +76,26 @@ stat_bounded() { run_bounded 'stat' stat "$@"; }
 sha256_bounded() { run_bounded 'sha256sum' sha256sum "$@"; }
 mkdir_bounded() { run_bounded 'mkdir' mkdir "$@"; }
 cp_bounded() { run_bounded 'cp' cp "$@"; }
+rm_bounded() { run_bounded 'rm' rm "$@"; }
 first_field() { local value=$1; value=${value%%[[:space:]]*}; printf '%s' "$value"; }
 strip_cr() { local value=$1; value=${value//$'\r'/}; printf '%s' "$value"; }
 has_exact_line() { local expected=$1 line; while IFS= read -r line; do [[ "$line" == "$expected" ]] && return 0; done <<<"$2"; return 1; }
 has_listener() { local output; output="$(ss_bounded -ltnH "sport = :$1")" || return 1; [[ -n "$output" ]]; }
+remove_run_file() {
+  local path=$1
+  [[ "$path" == "$RUN_ROOT/"* && "$path" != "$RUN_ROOT" ]] || return 1
+  rm_bounded -f -- "$path" || return 1
+  [[ ! -e "$path" ]]
+}
+remove_pending_guardian() {
+  remove_run_file "$RUN_ROOT/pending-guardian" || return 1
+  PENDING_GUARDIAN_PID=''; PENDING_GUARDIAN_START=''
+}
+remove_run_root() {
+  safe_state_tree && safe_run_root || return 1
+  rm_bounded -rf -- "$RUN_ROOT" || return 1
+  [[ ! -e "$RUN_ROOT" ]]
+}
 make_private_dir() {
   local path
   [[ -n "$RUN_SCRATCH_ROOT" && "$RUN_SCRATCH_ROOT" == "$RUN_ROOT/.scratch" ]] || return 1
@@ -104,12 +120,10 @@ start_owned_process() {
   deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
   while [[ ! -s "$child_file" && SECONDS -lt deadline ]]; do :; done
   [[ -s "$child_file" ]] || return 1
-  OWNED_CHILD_PID="$(<"$child_file")"; rm -f -- "$child_file"
+  OWNED_CHILD_PID="$(<"$child_file")"; remove_run_file "$child_file" || return 1
   valid_pid "$OWNED_CHILD_PID" || return 1
   OWNED_GUARDIAN_START="$(proc_start_identity "$OWNED_GUARDIAN_PID")" || return 1
   OWNED_CHILD_START="$(proc_start_identity "$OWNED_CHILD_PID")" || return 1
-  PENDING_GUARDIAN_PID=''; PENDING_GUARDIAN_START=''
-  rm -f -- "$RUN_ROOT/pending-guardian"
 }
 proc_start_identity() {
   local pid=$1 stat rest; local -a fields=()
@@ -327,6 +341,25 @@ guardian_is_gone() {
   current="$(proc_start_identity "$pid" 2>/dev/null || true)"
   [[ "$current" != "$start" ]]
 }
+resource_has() {
+  local key=$1 expected=$2 line
+  while IFS= read -r line; do [[ "$line" == "$key=$expected" ]] && return 0; done <"$RUN_ROOT/resources"
+  return 1
+}
+promote_owned_process() {
+  local child_variable=$1 guardian_variable=$2 child_start_variable=$3 guardian_start_variable=$4 child_record=$5 guardian_record=$6 child_start_record=$7 guardian_start_record=$8
+  local child=$OWNED_CHILD_PID guardian=$OWNED_GUARDIAN_PID child_start=$OWNED_CHILD_START guardian_start=$OWNED_GUARDIAN_START
+  [[ "$PENDING_GUARDIAN_PID" == "$guardian" && "$PENDING_GUARDIAN_START" == "$guardian_start" ]] || return 1
+  [[ "$(proc_start_identity "$child")" == "$child_start" ]] || return 1
+  guardian_matches "$guardian" "$guardian_start" || return 1
+  printf -v "$child_variable" '%s' "$child"; printf -v "$guardian_variable" '%s' "$guardian"
+  printf -v "$child_start_variable" '%s' "$child_start"; printf -v "$guardian_start_variable" '%s' "$guardian_start"
+  record "$child_record" "$child"; record "$child_start_record" "$child_start"
+  record "$guardian_record" "$guardian"; record "$guardian_start_record" "$guardian_start"
+  resource_has "$child_record" "$child" && resource_has "$child_start_record" "$child_start" && resource_has "$guardian_record" "$guardian" && resource_has "$guardian_start_record" "$guardian_start" || return 1
+  if [[ "${DTX_ANDROID_TEST_MODE:-}" == 1 && "${DTX_TEST_SIGNAL_AT_PROMOTION:-0}" == 1 ]]; then kill -TERM "$$"; fi
+  remove_pending_guardian
+}
 stop_guardian() {
   local guardian=$1 guardian_start=$2 pgid deadline
   guardian_matches "$guardian" "$guardian_start" || return 1
@@ -393,8 +426,10 @@ cleanup() {
   local status=$? cleanup_failed=0
   set +e
   [[ "$MODE" == run ]] || exit "$status"
-  if [[ -n "$PENDING_GUARDIAN_PID" || -n "$PENDING_GUARDIAN_START" ]]; then
+  local pending_guardian=$PENDING_GUARDIAN_PID pending_guardian_start=$PENDING_GUARDIAN_START
+  if [[ -n "$pending_guardian" || -n "$pending_guardian_start" ]]; then
     stop_guardian "$PENDING_GUARDIAN_PID" "$PENDING_GUARDIAN_START" || cleanup_failed=1
+    [[ "$cleanup_failed" == 1 ]] || remove_pending_guardian || cleanup_failed=1
   fi
   if [[ "$CA_A_TOUCHED" == 1 || "$TRUST_PROBE_A_TOUCHED" == 1 || "$REVERSE_A" == 1 ]]; then
     cleanup_remote_serial "$SERIAL_A" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT" "$TRUST_RESULT_A_PATH" "$CA_A_TOUCHED" "$TRUST_PROBE_A_TOUCHED" "$REVERSE_A" || cleanup_failed=1
@@ -402,10 +437,10 @@ cleanup() {
   if [[ "$CA_B_TOUCHED" == 1 || "$TRUST_PROBE_B_TOUCHED" == 1 || "$REVERSE_B" == 1 ]]; then
     cleanup_remote_serial "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT" "$TRUST_RESULT_B_PATH" "$CA_B_TOUCHED" "$TRUST_PROBE_B_TOUCHED" "$REVERSE_B" || cleanup_failed=1
   fi
-  stop_pid "$PROXY_A_PID" "$PROXY_A_PID_START" "$PROXY_A_GUARDIAN_PID" "$PROXY_A_GUARDIAN_START" "$PROXY_A_PORT" proxy "127.0.0.1:$PROXY_A_PORT" "127.0.0.1:$NODE_A_PORT" "127.0.0.1:$CONTROL_A_PORT" || cleanup_failed=1
-  stop_pid "$PROXY_B_PID" "$PROXY_B_PID_START" "$PROXY_B_GUARDIAN_PID" "$PROXY_B_GUARDIAN_START" "$PROXY_B_PORT" proxy "127.0.0.1:$PROXY_B_PORT" "127.0.0.1:$NODE_B_PORT" "127.0.0.1:$CONTROL_B_PORT" || cleanup_failed=1
-  stop_pid "$PID_A" "$PID_A_START" "$GUARDIAN_A_PID" "$GUARDIAN_A_START" "$EMULATOR_A_PORT" emulator "$AVD_A" "$EMULATOR_A_PORT" '' "$SERIAL_A" || cleanup_failed=1
-  stop_pid "$PID_B" "$PID_B_START" "$GUARDIAN_B_PID" "$GUARDIAN_B_START" "$EMULATOR_B_PORT" emulator "$AVD_B" "$EMULATOR_B_PORT" '' "$SERIAL_B" || cleanup_failed=1
+  [[ "$PROXY_A_GUARDIAN_PID" != "$pending_guardian" || "$PROXY_A_GUARDIAN_START" != "$pending_guardian_start" ]] && stop_pid "$PROXY_A_PID" "$PROXY_A_PID_START" "$PROXY_A_GUARDIAN_PID" "$PROXY_A_GUARDIAN_START" "$PROXY_A_PORT" proxy "127.0.0.1:$PROXY_A_PORT" "127.0.0.1:$NODE_A_PORT" "127.0.0.1:$CONTROL_A_PORT" || [[ -z "$PROXY_A_PID" || "$PROXY_A_GUARDIAN_PID" == "$pending_guardian" && "$PROXY_A_GUARDIAN_START" == "$pending_guardian_start" ]] || cleanup_failed=1
+  [[ "$PROXY_B_GUARDIAN_PID" != "$pending_guardian" || "$PROXY_B_GUARDIAN_START" != "$pending_guardian_start" ]] && stop_pid "$PROXY_B_PID" "$PROXY_B_PID_START" "$PROXY_B_GUARDIAN_PID" "$PROXY_B_GUARDIAN_START" "$PROXY_B_PORT" proxy "127.0.0.1:$PROXY_B_PORT" "127.0.0.1:$NODE_B_PORT" "127.0.0.1:$CONTROL_B_PORT" || [[ -z "$PROXY_B_PID" || "$PROXY_B_GUARDIAN_PID" == "$pending_guardian" && "$PROXY_B_GUARDIAN_START" == "$pending_guardian_start" ]] || cleanup_failed=1
+  [[ "$GUARDIAN_A_PID" != "$pending_guardian" || "$GUARDIAN_A_START" != "$pending_guardian_start" ]] && stop_pid "$PID_A" "$PID_A_START" "$GUARDIAN_A_PID" "$GUARDIAN_A_START" "$EMULATOR_A_PORT" emulator "$AVD_A" "$EMULATOR_A_PORT" '' "$SERIAL_A" || [[ -z "$PID_A" || "$GUARDIAN_A_PID" == "$pending_guardian" && "$GUARDIAN_A_START" == "$pending_guardian_start" ]] || cleanup_failed=1
+  [[ "$GUARDIAN_B_PID" != "$pending_guardian" || "$GUARDIAN_B_START" != "$pending_guardian_start" ]] && stop_pid "$PID_B" "$PID_B_START" "$GUARDIAN_B_PID" "$GUARDIAN_B_START" "$EMULATOR_B_PORT" emulator "$AVD_B" "$EMULATOR_B_PORT" '' "$SERIAL_B" || [[ -z "$PID_B" || "$GUARDIAN_B_PID" == "$pending_guardian" && "$GUARDIAN_B_START" == "$pending_guardian_start" ]] || cleanup_failed=1
   [[ "$AVD_A_CREATED" != 1 ]] || { safe_avd "$AVD_A" && avd_bounded 'delete AVD A' delete avd --name "$AVD_A" >/dev/null 2>&1 && ! has_exact_line "    Name: $AVD_A" "$(avd_bounded 'list AVDs' list avd)"; } || cleanup_failed=1
   [[ "$AVD_B_CREATED" != 1 ]] || { safe_avd "$AVD_B" && avd_bounded 'delete AVD B' delete avd --name "$AVD_B" >/dev/null 2>&1 && ! has_exact_line "    Name: $AVD_B" "$(avd_bounded 'list AVDs' list avd)"; } || cleanup_failed=1
   if [[ "$COMPOSE_OWNED" == 1 ]]; then
@@ -421,7 +456,7 @@ cleanup() {
     [[ "$status" != 0 ]] || status=1
     exit "$status"
   fi
-  [[ "$CLAIMED" != 1 ]] || { safe_state_tree && safe_run_root && rm -rf -- "$RUN_ROOT"; } || exit 1
+  [[ "$CLAIMED" != 1 ]] || remove_run_root || exit 1
   exit "$status"
 }
 on_signal() { exit "$1"; }
@@ -600,14 +635,12 @@ remove_ca_system_store() {
 start_proxy() {
   local listen=$1 upstream=$2 control=$3 variable=$4
   start_owned_process 'proxy' "$REPOSITORY_ROOT/target/debug/dtx-android-response-loss-proxy" "127.0.0.1:$listen" "127.0.0.1:$upstream" "127.0.0.1:$control"
-  local pid=$OWNED_CHILD_PID guardian=$OWNED_GUARDIAN_PID
+  local guardian_variable="${variable%_PID}_GUARDIAN_PID" child_start_variable="${variable}_START" guardian_start_variable="${variable%_PID}_GUARDIAN_START"
   # Record ownership before the first readiness probe: startup can fail after
   # fork but before either listener exists.
-  printf -v "$variable" '%s' "$pid"
-  record "$variable" "$pid"
-  local guardian_variable="${variable%_PID}_GUARDIAN_PID" child_start_variable="${variable}_START" guardian_start_variable="${variable%_PID}_GUARDIAN_START"
-  printf -v "$guardian_variable" '%s' "$guardian"; printf -v "$child_start_variable" '%s' "$OWNED_CHILD_START"; printf -v "$guardian_start_variable" '%s' "$OWNED_GUARDIAN_START"
-  record "$guardian_variable" "$guardian"; record "$child_start_variable" "$OWNED_CHILD_START"; record "$guardian_start_variable" "$OWNED_GUARDIAN_START"
+  promote_owned_process "$variable" "$guardian_variable" "$child_start_variable" "$guardian_start_variable" "$variable" "$guardian_variable" "$child_start_variable" "$guardian_start_variable" || die 'proxy guardian promotion failed'
+  local pid=$PROXY_A_PID
+  pid="${!variable}"
   local deadline=$((SECONDS + $(startup_deadline_seconds)))
   while :; do
     kill -0 "$pid" 2>/dev/null || die 'proxy exited during startup'
@@ -628,9 +661,9 @@ real_run() {
   AVD_A_CREATED=1; avd_bounded 'create AVD A' create avd --name "$AVD_A" --package "$ANDROID_SYSTEM_IMAGE" >/dev/null
   AVD_B_CREATED=1; avd_bounded 'create AVD B' create avd --name "$AVD_B" --package "$ANDROID_SYSTEM_IMAGE" >/dev/null
   assert_emulator_ports_free "$EMULATOR_A_PORT"; assert_emulator_ports_free "$EMULATOR_B_PORT"
-  start_owned_process 'emulator A' emulator -avd "$AVD_A" -port "$EMULATOR_A_PORT" -accel "$ANDROID_ACCELERATION" -cores "$ANDROID_CORES" -memory "$ANDROID_MEMORY_MIB" -gpu "$ANDROID_GPU" -writable-system -no-snapshot -wipe-data -no-window || die 'emulator A guardian failed'; PID_A=$OWNED_CHILD_PID; PID_A_START=$OWNED_CHILD_START; GUARDIAN_A_PID=$OWNED_GUARDIAN_PID; GUARDIAN_A_START=$OWNED_GUARDIAN_START; record emulator_a_pid "$PID_A"; record emulator_a_pid_start "$PID_A_START"; record emulator_a_guardian_pid "$GUARDIAN_A_PID"; record emulator_a_guardian_start "$GUARDIAN_A_START"
+  start_owned_process 'emulator A' emulator -avd "$AVD_A" -port "$EMULATOR_A_PORT" -accel "$ANDROID_ACCELERATION" -cores "$ANDROID_CORES" -memory "$ANDROID_MEMORY_MIB" -gpu "$ANDROID_GPU" -writable-system -no-snapshot -wipe-data -no-window || die 'emulator A guardian failed'; promote_owned_process PID_A GUARDIAN_A_PID PID_A_START GUARDIAN_A_START emulator_a_pid emulator_a_guardian_pid emulator_a_pid_start emulator_a_guardian_start || die 'emulator A guardian promotion failed'
   assert_emulator_ports_free "$EMULATOR_B_PORT"
-  start_owned_process 'emulator B' emulator -avd "$AVD_B" -port "$EMULATOR_B_PORT" -accel "$ANDROID_ACCELERATION" -cores "$ANDROID_CORES" -memory "$ANDROID_MEMORY_MIB" -gpu "$ANDROID_GPU" -writable-system -no-snapshot -wipe-data -no-window || die 'emulator B guardian failed'; PID_B=$OWNED_CHILD_PID; PID_B_START=$OWNED_CHILD_START; GUARDIAN_B_PID=$OWNED_GUARDIAN_PID; GUARDIAN_B_START=$OWNED_GUARDIAN_START; record emulator_b_pid "$PID_B"; record emulator_b_pid_start "$PID_B_START"; record emulator_b_guardian_pid "$GUARDIAN_B_PID"; record emulator_b_guardian_start "$GUARDIAN_B_START"
+  start_owned_process 'emulator B' emulator -avd "$AVD_B" -port "$EMULATOR_B_PORT" -accel "$ANDROID_ACCELERATION" -cores "$ANDROID_CORES" -memory "$ANDROID_MEMORY_MIB" -gpu "$ANDROID_GPU" -writable-system -no-snapshot -wipe-data -no-window || die 'emulator B guardian failed'; promote_owned_process PID_B GUARDIAN_B_PID PID_B_START GUARDIAN_B_START emulator_b_pid emulator_b_guardian_pid emulator_b_pid_start emulator_b_guardian_start || die 'emulator B guardian promotion failed'
   verify_emulator "$SERIAL_A" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT"; verify_emulator "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT"
   REVERSE_A=1; adb_bounded 'reverse A' -s "$SERIAL_A" reverse tcp:8443 "tcp:$NODE_A_PORT"
   REVERSE_B=1; adb_bounded 'reverse B' -s "$SERIAL_B" reverse tcp:8443 "tcp:$NODE_B_PORT"
