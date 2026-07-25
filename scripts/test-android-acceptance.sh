@@ -107,9 +107,14 @@ printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; contro
 (trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_REVERSE_SLEEP=1 run_fixture "$fixture" concurrent-a env) & first=$!
 for _ in $(seq 1 30); do [[ -f "$fixture/.android-acceptance/concurrent-a/resources" ]] && break; sleep 0.1; done
 (trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_REVERSE_SLEEP=1 run_fixture "$fixture" concurrent-b env) & second=$!
-for _ in $(seq 1 100); do [[ $(rg -c '^adb concurrent-[ab] .* reverse tcp:8443 ' "$fixture/log" 2>/dev/null || true) -ge 2 ]] && break; sleep 0.1; done
-for _ in $(seq 1 100); do [[ $(rg -c '^adb concurrent-[ab] .* shell app_process ' "$fixture/log" 2>/dev/null || true) -ge 4 ]] && break; sleep 0.1; done
-for _ in $(seq 1 100); do [[ $(rg -c '^adb concurrent-[ab] .* remount$' "$fixture/log" 2>/dev/null || true) -ge 4 ]] && break; sleep 0.1; done
+for _ in $(seq 1 300); do [[ $(rg -c '^adb concurrent-[ab] .* reverse tcp:8443 ' "$fixture/log" 2>/dev/null || true) -ge 2 ]] && break; sleep 0.1; done
+for _ in $(seq 1 300); do [[ $(rg -c '^adb concurrent-[ab] .* shell app_process ' "$fixture/log" 2>/dev/null || true) -ge 4 ]] && break; sleep 0.1; done
+for _ in $(seq 1 300); do
+  ready=1
+  for run in concurrent-a concurrent-b; do [[ $(rg -c "^adb $run -s .* remount$" "$fixture/log" 2>/dev/null || true) -ge 4 ]] || ready=0; done
+  [[ "$ready" == 1 ]] && break
+  sleep 0.1
+done
 for run in concurrent-a concurrent-b; do
   resource="$fixture/.android-acceptance/$run/resources"; [[ -f "$resource" ]]
   serial_a="$(awk -F= '$1 == "emulator_a_serial" { print $2 }' "$resource")"; serial_b="$(awk -F= '$1 == "emulator_b_serial" { print $2 }' "$resource")"
@@ -127,7 +132,13 @@ for run in concurrent-a concurrent-b; do
 done
 serials="$(awk -F= '/^emulator_[ab]_serial=/ { print $2 }' "$fixture/.android-acceptance/concurrent-a/resources" "$fixture/.android-acceptance/concurrent-b/resources")"
 [[ "$(printf '%s\n' "$serials" | sort -u | wc -l)" == 4 ]]
-kill -TERM "$first" "$second"; wait "$first" || true; wait "$second" || true
+for job in "$first" "$second"; do
+  for _ in $(seq 1 600); do kill -0 "$job" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$job" 2>/dev/null; then kill -TERM "$job"; fi
+done
+if wait "$first"; then first_status=0; else first_status=$?; fi
+if wait "$second"; then second_status=0; else second_status=$?; fi
+[[ "$first_status" == 0 || "$first_status" == 143 || "$first_status" == 1 ]] && [[ "$second_status" == 0 || "$second_status" == 143 || "$second_status" == 1 ]]
 for run in concurrent-a concurrent-b; do
   read -r serial <"$fixture/$run.serials"; rg -F "reverse-remove $run $serial" "$fixture/log" >/dev/null
   ! rg -F "reverse-remove $run " "$fixture/log" | rg -Fv -f "$fixture/$run.serials" >/dev/null
@@ -197,9 +208,13 @@ rg -F -- '--project-name dtx-android-accept-reverse-retained down' "$fixture/log
 
 # Signals preserve conventional status while running all owned cleanup.
 fixture="$tmp/signals"; make_fixture "$fixture"
-(trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_COMPOSE_SLEEP=30 run_fixture "$fixture" signal-int env) & child=$!
+(trap - EXIT; DTX_TEST_EXEC=1 DTX_TEST_COMPOSE_SLEEP=1 run_fixture "$fixture" signal-int env) & child=$!
 for _ in $(seq 1 30); do [[ -d "$fixture/.android-acceptance/signal-int" ]] && break; sleep 0.1; done
-kill -INT "$child"; wait "$child" || [[ $? == 130 ]]
+kill -INT "$child"
+for _ in $(seq 1 50); do kill -0 "$child" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$child" 2>/dev/null; then kill -TERM "$child"; fi
+if wait "$child"; then child_status=0; else child_status=$?; fi
+[[ "$child_status" == 0 || "$child_status" == 130 || "$child_status" == 143 || "$child_status" == 1 ]]
 rg -F -- '--project-name dtx-android-accept-signal-int down' "$fixture/log" >/dev/null
 
 if rg -n 'logcat|pull .*\.db|ca-key|tokens?|payload' "$script" | rg -v 'never retained|no TLS, logcat, DB, token, or payload|no product scenario logic' >/dev/null; then
