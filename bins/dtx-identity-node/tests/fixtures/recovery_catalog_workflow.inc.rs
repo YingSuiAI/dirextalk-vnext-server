@@ -1167,6 +1167,80 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     // nonterminal coordinate drift.  Each request uses a fresh idempotency
     // digest but the same approved challenge and artifacts, and every
     // rejected path is asserted before any request row can be written.
+    let revoked_capability = [81; 32];
+    let revoked_challenge = enrollment_repository
+        .create_challenge(
+            &store,
+            CreateDeviceEnrollmentChallengeCommand::new(
+                Sha256Digest::from_bytes([82; 32]),
+                identity_id,
+                candidate_device,
+                public(&candidate),
+                DeviceEncryptionPublicKey::try_from([55; 32])?,
+                DeviceEnrollmentCapability::new(revoked_capability)?,
+            )?,
+            at(5_300),
+        )
+        .await?;
+    let DeviceEnrollmentChallengeOutcome::Created(revoked_challenge) = revoked_challenge else {
+        return Err("revoked V4 challenge must be new".into());
+    };
+    let revoked_cancellation = cancel_enrollment_challenge(
+        app.clone(),
+        revoked_challenge.challenge_id(),
+        revoked_capability,
+    )
+    .await?;
+    assert_eq!(revoked_cancellation.status(), StatusCode::OK);
+    let revoked_preparation = preparation_body(
+        revoked_challenge.challenge_id(),
+        identity_id,
+        candidate_device,
+        &candidate,
+        [55; 32],
+        head3,
+        response_capability,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        safe(1),
+        catalog_head_digest,
+        "catalog-preparation-v4-revoked",
+    )?;
+    let revoked_request = history_recovery_request_v4_body(
+        revoked_challenge.challenge_id(),
+        identity_id,
+        candidate_device,
+        &candidate,
+        [55; 32],
+        head3,
+        head4,
+        &candidate_add_bytes,
+        &revoked_preparation,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        &first_head,
+        catalog_head_digest,
+        response_capability,
+        "history-recovery-v4-lifecycle-revoked",
+    )?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            "history-recovery-v4-lifecycle-revoked",
+            revoked_capability,
+            response_capability,
+            revoked_request,
+        )
+        .await?,
+        StatusCode::GONE,
+        "RECOVERY_PREPARATION_REVOKED",
+    )
+    .await?;
+    assert_history_recovery_request_rows(
+        harness.admin_pool(),
+        revoked_challenge.challenge_id(),
+        0,
+    )
+    .await?;
+
     let preparation_snapshot: (i64, Option<i64>) = sqlx::query_as(
         "SELECT expires_at_ms,provider_expires_at_ms
            FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1",
