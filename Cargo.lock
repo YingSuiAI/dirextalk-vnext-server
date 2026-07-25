@@ -1152,6 +1152,7 @@ dependencies = [
  "dtx-contact",
  "dtx-domain",
  "dtx-federated-identity",
+ "dtx-history-recovery-protocol",
  "dtx-history-recovery-testkit",
  "dtx-identity-log",
  "dtx-identity-persistence",

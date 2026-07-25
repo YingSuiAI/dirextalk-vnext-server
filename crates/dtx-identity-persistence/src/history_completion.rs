@@ -17,6 +17,14 @@ pub const COMPLETION_RECEIPT_DOMAIN: &[u8] = b"dirextalk.history-recovery.comple
 pub const COMPLETION_RECEIPT_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.history-recovery.completion-receipt-signature.v2\0";
 
+// These locks serialize the two mutable decisions around otherwise immutable
+// recovery artifacts. The values are constructed only from canonical command
+// coordinates after device authentication, and are released with the enclosing
+// transaction.
+const COMPLETION_DESCRIPTOR_HEAD_LOCK_DOMAIN: &str =
+    "dirextalk.history-recovery.completion-descriptor-head.v2";
+const COMPLETION_REQUEST_LOCK_DOMAIN: &str = "dirextalk.history-recovery.completion-request.v2";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletionKeyDescriptor {
     pub key_id: Uuid,
@@ -182,7 +190,7 @@ impl HistoryRecoveryCompletionCommand {
             }};
         }
         validate_nested!(11, recovery_protocol::validate_catalog_head_v2);
-        validate_nested!(16, recovery_protocol::validate_manifest_v2);
+        validate_nested!(20, recovery_protocol::validate_manifest_v2);
         validate_nested!(18, recovery_protocol::validate_request_v4);
         validate_nested!(22, recovery_protocol::validate_grant_v5);
         validate_nested!(24, recovery_protocol::validate_offer_v3);
@@ -595,11 +603,17 @@ impl HistoryRecoveryCompletionRepository {
             }
             if command.issued_at > now || now >= command.expires_at { return Err(IdentityPersistenceError::RecoveryCompletionExpired); }
             if now < descriptor.issued_at || now >= descriptor.expires_at || command.issued_at < descriptor.issued_at || command.expires_at > descriptor.expires_at { return Err(IdentityPersistenceError::RecoveryCompletionExpired); }
-            // Serialize terminal consumption on the immutable candidate request.  The
-            // completion uniqueness fence below remains authoritative, but this lock
-            // makes concurrent submissions observe the same request/grant state before
-            // either can construct a terminal receipt.
-            let request = sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,request_digest,manifest_digest,preparation_digest,post_head_hash,post_head_sequence,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1 FOR UPDATE").bind(command.request_id).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::RecoveryCompletionInvalid)?;
+            // Serialize terminal consumption on the immutable candidate request. The
+            // completion uniqueness fence below remains authoritative, but the
+            // transaction-scoped advisory lock lets the runtime role retain only
+            // SELECT/INSERT on the request relation.
+            completion_advisory_lock(
+                tx.connection(),
+                COMPLETION_REQUEST_LOCK_DOMAIN,
+                &format!("{}:{}", authenticated.session().identity_id(), command.request_id),
+            )
+            .await?;
+            let request = sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,request_digest,manifest_digest,preparation_digest,post_head_hash,post_head_sequence,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1").bind(command.request_id).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::RecoveryCompletionInvalid)?;
             if request.try_get::<String,_>("identity_id")? != command.identity_id || request.try_get::<Uuid,_>("candidate_device_id")? != command.device_id || request.try_get::<Vec<u8>,_>("candidate_signing_key")? != command.candidate_signing_key || request.try_get::<Vec<u8>,_>("request_digest")? != command.request_digest.as_bytes() || request.try_get::<Vec<u8>,_>("manifest_digest")? != command.manifest_digest.as_bytes() || request.try_get::<Vec<u8>,_>("preparation_digest")? != command.preparation_digest.as_bytes() || request.try_get::<Vec<u8>,_>("post_head_hash")? != command.final_head_hash.as_bytes() || request.try_get::<i64,_>("post_head_sequence")? as u64 != command.highwater_next || request.try_get::<i64,_>("expires_at_ms")? <= now.get() { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
             // A competing transaction may have committed while this request row was
             // waiting for its lock. Re-read the terminal fence after the lock so the
@@ -707,11 +721,17 @@ impl HistoryRecoveryCompletionRepository {
         signing_key: &SigningKey,
         now: UtcMillis,
     ) -> Result<CompletionKeyDescriptor, IdentityPersistenceError> {
+        completion_advisory_lock(
+            connection,
+            COMPLETION_DESCRIPTOR_HEAD_LOCK_DOMAIN,
+            "singleton",
+        )
+        .await?;
         let descriptor = CompletionKeyDescriptor::from_signer(config, origin, signing_key)?;
         let descriptor_bytes = descriptor.exact_bytes.clone();
         let descriptor_digest = descriptor.digest;
         let existing = sqlx::query("SELECT descriptor_bytes,descriptor_digest,epoch,rollback_floor_epoch FROM identity.history_recovery_completion_descriptors WHERE descriptor_digest=$1").bind(descriptor_digest.as_bytes()).fetch_optional(&mut *connection).await?;
-        let head = sqlx::query("SELECT d.descriptor_digest,d.epoch,d.rollback_floor_epoch FROM identity.history_recovery_completion_key_head h JOIN identity.history_recovery_completion_descriptors d ON d.descriptor_digest=h.descriptor_digest WHERE h.singleton=true FOR UPDATE").fetch_optional(&mut *connection).await?;
+        let head = sqlx::query("SELECT d.descriptor_digest,d.epoch,d.rollback_floor_epoch FROM identity.history_recovery_completion_key_head h JOIN identity.history_recovery_completion_descriptors d ON d.descriptor_digest=h.descriptor_digest WHERE h.singleton=true").fetch_optional(&mut *connection).await?;
         if let Some(row) = head {
             let current_digest = digest32(&row.try_get::<Vec<u8>, _>("descriptor_digest")?)?;
             let current_epoch = row.try_get::<i64, _>("epoch")? as u64;
@@ -742,6 +762,18 @@ impl HistoryRecoveryCompletionRepository {
         sqlx::query("INSERT INTO identity.history_recovery_completion_key_head(singleton,descriptor_digest,updated_at_ms) VALUES(true,$1,$2) ON CONFLICT(singleton) DO UPDATE SET descriptor_digest=EXCLUDED.descriptor_digest,updated_at_ms=EXCLUDED.updated_at_ms").bind(descriptor_digest.as_bytes()).bind(now.get()).execute(&mut *connection).await?;
         decode_descriptor(descriptor_bytes, descriptor_digest.as_bytes().to_vec())
     }
+}
+
+async fn completion_advisory_lock(
+    connection: &mut PgConnection,
+    domain: &str,
+    canonical_coordinates: &str,
+) -> Result<(), IdentityPersistenceError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("{domain}:{canonical_coordinates}"))
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
 }
 
 fn decode_descriptor(
