@@ -16,7 +16,9 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
-use dtx_domain::{Clock, ClockError, DeviceId, DeviceSessionId, IdentityId};
+use dtx_domain::{
+    Clock, ClockError, DeviceEnrollmentChallengeId, DeviceId, DeviceSessionId, IdentityId,
+};
 use dtx_identity_log::{
     DeviceCertificateV1, DeviceEncryptionPublicKey, IdentityLogEventPayloadV1, IdentityLogEventV1,
     UnsignedDeviceCertificateV1, UnsignedIdentityLogEventV1, device_certificate_signature_input,
@@ -782,6 +784,28 @@ fn safe(value: u64) -> SafeUint {
 
 fn at(value: i64) -> UtcMillis {
     UtcMillis::new(value).unwrap()
+}
+
+async fn wait_for_advisory_waiters(
+    pool: &sqlx::PgPool,
+    minimum: i64,
+) -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted",
+            )
+            .fetch_one(pool)
+            .await?;
+            if waiting >= minimum {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "advisory lock waiters did not reach the deterministic gate")??;
+    Ok(())
 }
 
 struct TestClock(AtomicI64);

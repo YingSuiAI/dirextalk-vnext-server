@@ -73,6 +73,24 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         at(2_000),
     )
     .await?;
+    let authority_credential_b = session(
+        &store,
+        identity_id,
+        authority_device,
+        &authority,
+        14,
+        at(20_000),
+    )
+    .await?;
+    let authority_credential_c = session(
+        &store,
+        identity_id,
+        authority_device,
+        &authority,
+        15,
+        at(30_000),
+    )
+    .await?;
     let provider_credential = session(
         &store,
         identity_id,
@@ -92,19 +110,32 @@ async fn postgres_catalog_preparation_and_provider_workflow_is_fenced_and_replay
         None,
         [31; 32],
     )?;
-    let (first, second) = tokio::time::timeout(
-        Duration::from_secs(5),
-        async {
-            tokio::join!(
-                catalog_repository.publish(&store, &catalog, &authority_credential, at(3_000)),
-                catalog_repository.publish(&store, &catalog, &authority_credential, at(3_000)),
-            )
-        },
-    )
-    .await
-    .map_err(|_| "concurrent first catalog publish deadlocked")?;
-    let first = first?;
-    let second = second?;
+    let mut identity_fence = harness.admin_pool().begin().await?;
+    let lock_key = i64::from_be_bytes(identity_id.digest_bytes()[..8].try_into()?);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *identity_fence)
+        .await?;
+    let first_store = store.clone();
+    let first_command = catalog.clone();
+    let first_credential = authority_credential_b;
+    let first_task = tokio::spawn(async move {
+        RecoveryScopeCatalogRepository
+            .publish(&first_store, &first_command, &first_credential, at(3_000))
+            .await
+    });
+    let second_store = store.clone();
+    let second_command = catalog.clone();
+    let second_credential = authority_credential_c;
+    let second_task = tokio::spawn(async move {
+        RecoveryScopeCatalogRepository
+            .publish(&second_store, &second_command, &second_credential, at(3_000))
+            .await
+    });
+    wait_until_advisory_waiters(harness.admin_pool(), 1).await?;
+    identity_fence.rollback().await?;
+    let first = first_task.await??;
+    let second = second_task.await??;
     assert_ne!(first.created, second.created);
     assert_eq!(first.exact_head_bytes, second.exact_head_bytes);
     assert_eq!(catalog_rows(&harness, identity_id).await?, 1);

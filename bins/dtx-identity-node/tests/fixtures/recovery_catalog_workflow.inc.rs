@@ -23,11 +23,11 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     let authority = key(3);
     let provider = key(4);
     let candidate = key(5);
-    let genesis = genesis(&root, &recovery);
-    let identity_id = genesis.identity_id();
+    let genesis_event = genesis(&root, &recovery);
+    let identity_id = genesis_event.identity_id();
     let head1 = committed(
         identity_repository
-            .append(&store, &append_command(1, None, &genesis)?, at(1_001))
+            .append(&store, &append_command(1, None, &genesis_event)?, at(1_001))
             .await?,
     )?;
     let authority_device = DeviceId::from_str(AUTHORITY_DEVICE)?;
@@ -476,7 +476,7 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         "catalog-provider-invalid",
         &provider_session,
         challenge.challenge_id(),
-        invalid_provider,
+        invalid_provider.clone(),
     )
     .await?;
     assert_error(
@@ -534,8 +534,18 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     );
     assert_eq!(recovery_rows(&harness, identity_id).await?, (1, 1, 1));
 
-    let (provider_replay, concurrent_status) = tokio::time::timeout(
-        Duration::from_secs(5),
+    let mut identity_fence = harness.admin_pool().begin().await?;
+    let lock_key = i64::from_be_bytes(identity_id.digest_bytes()[..8].try_into()?);
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *identity_fence)
+        .await?;
+    let gate = async {
+        wait_for_advisory_waiters(harness.admin_pool(), 2).await?;
+        identity_fence.rollback().await?;
+        Ok::<(), Box<dyn Error>>(())
+    };
+    let ((provider_response, status_response), gate_result) = tokio::join!(
         async {
             tokio::join!(
                 send_provider_response(
@@ -548,11 +558,11 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
                 send_status(app.clone(), challenge.challenge_id(), response_capability),
             )
         },
-    )
-    .await
-    .map_err(|_| "concurrent provider PUT/GET deadlocked")?;
-    assert_eq!(provider_replay?.status(), StatusCode::OK);
-    assert_eq!(concurrent_status?.status(), StatusCode::OK);
+        gate,
+    );
+    gate_result?;
+    assert_eq!(provider_response?.status(), StatusCode::OK);
+    assert_eq!(status_response?.status(), StatusCode::OK);
 
     let wrong_media = send_provider_response_custom(
         app.clone(),
@@ -631,6 +641,45 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     .await?;
     assert_error(
         invalid_credential_response,
+        StatusCode::UNAUTHORIZED,
+        "DEVICE_AUTHENTICATION_FAILED",
+    )
+    .await?;
+    let nonexistent_request = DeviceEnrollmentChallengeId::new();
+    let nonexistent_body = provider_body(
+        nonexistent_request,
+        identity_id,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        safe(1),
+        catalog_head_digest,
+        &preparation,
+        &first_head,
+        head3,
+        head4,
+        candidate_device,
+        [55; 32],
+        &candidate_add_bytes,
+        provider_device,
+        &provider,
+        authority_device,
+        &authority,
+        "catalog-provider-nonexistent",
+        at(5_300),
+        at(200_000),
+    )?;
+    let nonexistent_invalid_credential = send_provider_response_custom(
+        app.clone(),
+        "catalog-provider-nonexistent",
+        &invalid_credential,
+        nonexistent_request,
+        RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+        Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE),
+        None,
+        nonexistent_body,
+    )
+    .await?;
+    assert_error(
+        nonexistent_invalid_credential,
         StatusCode::UNAUTHORIZED,
         "DEVICE_AUTHENTICATION_FAILED",
     )

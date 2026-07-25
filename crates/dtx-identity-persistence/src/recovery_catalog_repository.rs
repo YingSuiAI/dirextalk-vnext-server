@@ -186,23 +186,23 @@ impl RecoveryScopeCatalogRepository {
     ) -> Result<RecoveryScopeCatalogStatusOutcome, IdentityPersistenceError> {
         let mut tx = store.begin().await?;
         let result = async {
-            // Derive the request identity before authenticating the bearer.
-            // This keeps provider/status lock acquisition identical even when
-            // a valid session is presented for another identity.
-            let identity_id =
-                load_linked_challenge_identity_hint(tx.connection(), command.request_id).await?;
-            if load_session_identity_hint(tx.connection(), credential).await? != identity_id {
-                return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
-            }
-            let _snapshot = lock_and_load_active_snapshot(tx.connection(), identity_id).await?;
+            // Authenticate and fence the presented session identity before
+            // revealing whether the request challenge exists.  This keeps a
+            // wrong secret at a real and nonexistent request ID on one 401
+            // path, while a valid session for another identity reaches the
+            // dedicated provider-mismatch contract below.
             let authenticated = DeviceSessionRepository::authenticate_with_signing_key_in_transaction(tx.connection(), credential, now).await?;
+            let identity_id = authenticated.session().identity_id();
+            let challenge_identity =
+                load_linked_challenge_identity_hint(tx.connection(), command.request_id).await?;
+            if challenge_identity != identity_id {
+                return Err(IdentityPersistenceError::RecoveryProviderMismatch);
+            }
             if authenticated.session().device_id() != command.provider_device_id || authenticated.signing_key() != command.provider_signing_key {
                 return Err(IdentityPersistenceError::RecoveryProviderMismatch);
             }
             let challenge = load_linked_challenge(tx.connection(), command.request_id, true).await?;
-            if challenge.identity_id != identity_id
-                || authenticated.session().identity_id() != identity_id
-            {
+            if challenge.identity_id != identity_id {
                 return Err(IdentityPersistenceError::DeviceAuthenticationRejected);
             }
             let row = load_preparation(tx.connection(), command.request_id, true).await?;
@@ -405,21 +405,6 @@ async fn load_linked_challenge_identity_hint(
     .await?
     .ok_or(IdentityPersistenceError::RecoveryResponseCapabilityRejected)?;
     IdentityId::from_str(&identity_id).map_err(|_| corrupt("linked enrollment identity"))
-}
-
-async fn load_session_identity_hint(
-    connection: &mut PgConnection,
-    credential: &DeviceSessionCredential,
-) -> Result<IdentityId, IdentityPersistenceError> {
-    let identity_id: String = sqlx::query_scalar(
-        "SELECT identity_id FROM identity.device_sessions WHERE session_id=$1",
-    )
-    .bind(*credential.session_id().as_uuid())
-    .fetch_optional(&mut *connection)
-    .await?
-    .ok_or(IdentityPersistenceError::DeviceAuthenticationRejected)?;
-    IdentityId::from_str(&identity_id)
-        .map_err(|_| IdentityPersistenceError::DeviceAuthenticationRejected)
 }
 
 async fn load_catalog_idempotency_replay(

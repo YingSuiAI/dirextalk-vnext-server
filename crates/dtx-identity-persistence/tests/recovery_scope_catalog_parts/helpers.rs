@@ -26,28 +26,25 @@ async fn provider_response_rows(
         .bind(identity.to_string()).fetch_one(harness.admin_pool()).await
 }
 
-async fn wait_until_identity_lock_is_held(
+async fn wait_until_advisory_waiters(
     pool: &sqlx::PgPool,
-    identity_id: IdentityId,
+    minimum: i64,
 ) -> Result<(), Box<dyn Error>> {
-    let bytes = identity_id.digest_bytes();
-    let lock_key = i64::from_be_bytes(bytes[..8].try_into()?);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let mut probe = pool.begin().await?;
-            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-                .bind(lock_key)
-                .fetch_one(&mut *probe)
-                .await?;
-            probe.rollback().await?;
-            if !acquired {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted",
+            )
+            .fetch_one(pool)
+            .await?;
+            if waiting >= minimum {
                 return Ok::<(), sqlx::Error>(());
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .map_err(|_| "identity advisory lock was not acquired in time")??;
+    .map_err(|_| "advisory lock waiters did not reach the deterministic gate")??;
     Ok(())
 }
 
