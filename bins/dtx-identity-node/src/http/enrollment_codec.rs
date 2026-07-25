@@ -11,8 +11,11 @@ use dtx_identity_log::{IDENTITY_LOG_WIRE_VERSION, IdentityLogEventPayloadV1, Ide
 use dtx_identity_persistence::{
     CatalogPreparationCommand, HISTORY_RECOVERY_REQUEST_V4_DIGEST_DOMAIN,
     HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN, RecoveryResponseCapability,
+    parse_signed_catalog_head_v2,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use std::collections::HashSet;
+use uuid::Uuid;
 
 pub(crate) async fn parse_json_body<T>(body: Body) -> Result<T, DeviceSessionFailure>
 where
@@ -210,6 +213,63 @@ pub(crate) fn parse_history_recovery_request_v4(
     if cbor_field(manifest_fields, 2)? != &CanonicalValue::Text(identity_id.to_string()) {
         return Err(DeviceEnrollmentFailure::InvalidRequest);
     }
+    let manifest_catalog_id = match cbor_field(manifest_fields, 3)? {
+        CanonicalValue::Text(value) => {
+            Uuid::parse_str(value).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
+        }
+        _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+    };
+    let manifest_generation = match cbor_field(manifest_fields, 4)? {
+        CanonicalValue::Unsigned(value) if *value > 0 => {
+            SafeUint::new(*value).map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
+        }
+        _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+    };
+    let signed_head_bytes = match cbor_field(manifest_fields, 5)? {
+        CanonicalValue::Bytes(value) if !value.is_empty() && value.len() <= 466 => value,
+        _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+    };
+    let signed_head = parse_signed_catalog_head_v2(signed_head_bytes)
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    let signed_head_digest =
+        Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(manifest_fields, 6)?)?);
+    let merkle_root = Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(manifest_fields, 7)?)?);
+    let leaf_count = match cbor_field(manifest_fields, 8)? {
+        CanonicalValue::Unsigned(value) if (1..=1023).contains(value) => *value as usize,
+        _ => return Err(DeviceEnrollmentFailure::InvalidRequest),
+    };
+    let leaf_set_digest =
+        Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(manifest_fields, 9)?)?);
+    let CanonicalValue::Array(leaf_set) = cbor_field(manifest_fields, 10)? else {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    };
+    if leaf_set.len() != leaf_count {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
+    let mut seen = HashSet::with_capacity(leaf_set.len());
+    for leaf in leaf_set {
+        let CanonicalValue::Bytes(bytes) = leaf else {
+            return Err(DeviceEnrollmentFailure::InvalidRequest);
+        };
+        if bytes.len() != 32 || !seen.insert(bytes.as_slice()) {
+            return Err(DeviceEnrollmentFailure::InvalidRequest);
+        }
+    }
+    let leaf_set_bytes = encode_deterministic_cbor(cbor_field(manifest_fields, 10)?)
+        .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
+    if leaf_set_digest
+        != Sha256Digest::hash_domain(b"dirextalk.history-recovery.leaf-set.v2\0", &leaf_set_bytes)
+        || manifest_catalog_id != signed_head.catalog_id
+        || manifest_generation != signed_head.generation
+        || signed_head_digest != signed_head.digest
+        || merkle_root != signed_head.merkle_root
+        || signed_head.identity_id != identity_id
+        || manifest_catalog_id != preparation.catalog_id
+        || manifest_generation != preparation.catalog_generation
+        || signed_head_digest != preparation.catalog_head_digest
+    {
+        return Err(DeviceEnrollmentFailure::InvalidRequest);
+    }
     let manifest_bytes = encode_deterministic_cbor(manifest_value)
         .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?;
     let manifest_digest = Sha256Digest::from_bytes(parse_cbor_bytes(cbor_field(fields, 16)?)?);
@@ -235,8 +295,8 @@ pub(crate) fn parse_history_recovery_request_v4(
                 pre_head_hash,
             )
             .map_err(|_| DeviceEnrollmentFailure::InvalidRequest)?
-        || preparation.issued_at != issued_at
-        || preparation.expires_at != expires_at
+        || issued_at < preparation.issued_at
+        || expires_at > preparation.expires_at
         || preparation.digest != preparation_digest
     {
         return Err(DeviceEnrollmentFailure::InvalidRequest);

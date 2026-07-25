@@ -30,6 +30,22 @@ impl DeviceEnrollmentRepository {
             // writers and avoiding cross-path deadlocks.
             let identity_hint = command.identity_id;
             lock_identity(tx.connection(), identity_hint).await?;
+            if let Some(row) = sqlx::query("SELECT request_digest,request_bytes,idempotency_digest,receipt_bytes FROM identity.history_recovery_requests WHERE request_id=$1 FOR UPDATE")
+                .bind(*command.request_id.as_uuid())
+                .fetch_optional(&mut *tx.connection())
+                .await?
+            {
+                let stored_digest: Vec<u8> = row.try_get("request_digest")?;
+                let stored_bytes: Vec<u8> = row.try_get("request_bytes")?;
+                let stored_idempotency: Vec<u8> = row.try_get("idempotency_digest")?;
+                if stored_digest.as_slice() == command.request_digest.as_bytes()
+                    && stored_bytes == command.exact_request_bytes
+                    && stored_idempotency.as_slice() == command.idempotency_digest.as_bytes()
+                {
+                    return Ok((false, row.try_get("receipt_bytes")?));
+                }
+                return Err(IdentityPersistenceError::IdempotencyConflict);
+            }
             if sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM identity.history_recovery_requests WHERE identity_id=$1 AND idempotency_digest=$2 AND request_id<>$3)")
                 .bind(command.identity_id.to_string())
                 .bind(command.idempotency_digest.as_bytes().as_slice())
@@ -54,6 +70,8 @@ impl DeviceEnrollmentRepository {
                 || challenge.target_device_signing_key != command.target_device_signing_key
                 || challenge.target_device_encryption_key != command.recipient_encryption_key
                 || challenge.capability_hash != command.enrollment_capability_digest
+                || command.issued_at < challenge.created_at
+                || command.expires_at > challenge.expires_at
             {
                 return Err(IdentityPersistenceError::RecoveryPreparationInvalidated);
             }
@@ -96,7 +114,7 @@ impl DeviceEnrollmentRepository {
                 return Err(IdentityPersistenceError::RecoveryPreparationInvalidated);
             }
 
-            let catalog = sqlx::query("SELECT catalog_id,generation,head_digest,observed_head_sequence,observed_head_hash,authority_device_id,authority_signing_key,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
+            let catalog = sqlx::query("SELECT catalog_id,generation,head_bytes,head_digest,leaf_count,merkle_root,observed_head_sequence,observed_head_hash,authority_device_id,authority_signing_key,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1")
                 .bind(command.identity_id.to_string())
                 .fetch_optional(&mut *tx.connection())
                 .await?
@@ -119,6 +137,7 @@ impl DeviceEnrollmentRepository {
             {
                 return Err(IdentityPersistenceError::RecoveryCatalogHeadChanged);
             }
+            validate_history_recovery_manifest_v2(&command.manifest_bytes, &command, &catalog, &prep)?;
 
             // The persisted provider response is reparsed through the owner
             // Catalog V2 validator; supplied digests and byte shapes are not
@@ -641,6 +660,96 @@ impl DeviceEnrollmentRepository {
             }
         }
     }
+}
+
+fn validate_history_recovery_manifest_v2(
+    bytes: &[u8],
+    command: &CreateHistoryRecoveryRequestV4Command,
+    catalog: &sqlx::postgres::PgRow,
+    preparation: &sqlx::postgres::PgRow,
+) -> Result<(), IdentityPersistenceError> {
+    let value = decode_deterministic_cbor(bytes)
+        .map_err(|_| IdentityPersistenceError::InvalidCommand("history recovery manifest"))?;
+    let CanonicalValue::Map(fields) = value else {
+        return Err(IdentityPersistenceError::InvalidCommand("history recovery manifest"));
+    };
+    if fields.len() != 10
+        || fields.iter().enumerate().any(|(index, (key, _))| {
+            key != &CanonicalValue::Unsigned(u64::try_from(index + 1).unwrap_or(u64::MAX))
+        })
+        || fields[0].1 != CanonicalValue::Unsigned(2)
+        || fields[1].1 != CanonicalValue::Text(command.identity_id.to_string())
+    {
+        return Err(IdentityPersistenceError::InvalidCommand("history recovery manifest fields"));
+    }
+    let catalog_id = match &fields[2].1 {
+        CanonicalValue::Text(value) => uuid::Uuid::parse_str(value)
+            .map_err(|_| IdentityPersistenceError::InvalidCommand("manifest catalog ID"))?,
+        _ => return Err(IdentityPersistenceError::InvalidCommand("manifest catalog ID")),
+    };
+    let generation = match fields[3].1 {
+        CanonicalValue::Unsigned(value) if value > 0 => SafeUint::new(value)
+            .map_err(|_| IdentityPersistenceError::InvalidCommand("manifest generation"))?,
+        _ => return Err(IdentityPersistenceError::InvalidCommand("manifest generation")),
+    };
+    let head_bytes = match &fields[4].1 {
+        CanonicalValue::Bytes(value) if !value.is_empty() && value.len() <= 466 => value,
+        _ => return Err(IdentityPersistenceError::InvalidCommand("manifest catalog head")),
+    };
+    let head = parse_signed_catalog_head_v2(head_bytes)?;
+    let head_digest = match &fields[5].1 {
+        CanonicalValue::Bytes(value) => Sha256Digest::from_bytes(value.as_slice().try_into().map_err(|_| IdentityPersistenceError::InvalidCommand("manifest head digest"))?),
+        _ => return Err(IdentityPersistenceError::InvalidCommand("manifest head digest")),
+    };
+    let merkle_root = match &fields[6].1 {
+        CanonicalValue::Bytes(value) => Sha256Digest::from_bytes(value.as_slice().try_into().map_err(|_| IdentityPersistenceError::InvalidCommand("manifest merkle root"))?),
+        _ => return Err(IdentityPersistenceError::InvalidCommand("manifest merkle root")),
+    };
+    let leaf_count = match fields[7].1 {
+        CanonicalValue::Unsigned(value) if (1..=1023).contains(&value) => value,
+        _ => return Err(IdentityPersistenceError::InvalidCommand("manifest leaf count")),
+    };
+    let leaf_set_digest = match &fields[8].1 {
+        CanonicalValue::Bytes(value) => Sha256Digest::from_bytes(value.as_slice().try_into().map_err(|_| IdentityPersistenceError::InvalidCommand("manifest leaf-set digest"))?),
+        _ => return Err(IdentityPersistenceError::InvalidCommand("manifest leaf-set digest")),
+    };
+    let CanonicalValue::Array(leaf_set) = &fields[9].1 else {
+        return Err(IdentityPersistenceError::InvalidCommand("manifest leaf set"));
+    };
+    if leaf_set.len() != usize::try_from(leaf_count).unwrap_or(0) {
+        return Err(IdentityPersistenceError::InvalidCommand("manifest leaf count"));
+    }
+    let mut seen = HashSet::with_capacity(leaf_set.len());
+    for leaf in leaf_set {
+        let CanonicalValue::Bytes(value) = leaf else {
+            return Err(IdentityPersistenceError::InvalidCommand("manifest leaf digest"));
+        };
+        if value.len() != 32 || !seen.insert(value.as_slice()) {
+            return Err(IdentityPersistenceError::InvalidCommand("manifest leaf digest"));
+        }
+    }
+    let leaf_set_bytes = encode_deterministic_cbor(&fields[9].1)
+        .map_err(|_| IdentityPersistenceError::InvalidCommand("manifest leaf set"))?;
+    if leaf_set_digest
+        != Sha256Digest::hash_domain(b"dirextalk.history-recovery.leaf-set.v2\0", &leaf_set_bytes)
+        || catalog_id != head.catalog_id
+        || generation != head.generation
+        || head_digest != head.digest
+        || merkle_root != head.merkle_root
+        || head.identity_id != command.identity_id
+        || catalog_id != preparation.try_get::<uuid::Uuid, _>("catalog_id")?
+        || generation != safe_uint(preparation.try_get::<i64, _>("catalog_generation")?, "manifest preparation generation")?
+        || head_digest != digest(&preparation.try_get::<Vec<u8>, _>("catalog_head_digest")?, "manifest preparation head")?
+        || catalog_id != catalog.try_get::<uuid::Uuid, _>("catalog_id")?
+        || generation != safe_uint(catalog.try_get::<i64, _>("generation")?, "manifest catalog generation")?
+        || head_digest != digest(&catalog.try_get::<Vec<u8>, _>("head_digest")?, "manifest catalog head")?
+        || head_bytes != catalog.try_get::<Vec<u8>, _>("head_bytes")?.as_slice()
+        || merkle_root != digest(&catalog.try_get::<Vec<u8>, _>("merkle_root")?, "manifest merkle root")?
+        || leaf_count != u64::try_from(catalog.try_get::<i64, _>("leaf_count")?).unwrap_or(0)
+    {
+        return Err(IdentityPersistenceError::RecoveryCatalogHeadChanged);
+    }
+    Ok(())
 }
 
 fn encode_v4_request_receipt(

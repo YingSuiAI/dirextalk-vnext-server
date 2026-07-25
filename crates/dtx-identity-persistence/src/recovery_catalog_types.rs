@@ -58,6 +58,89 @@ pub const MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES: usize =
         + MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES
         + 1_024;
 
+/// Parsed exact signed Catalog V2 head coordinates reused by exhaustive
+/// recovery manifests. The head remains opaque on the wire, but every signed
+/// coordinate is exposed for owner-bound currentness checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogHeadV2 {
+    pub catalog_id: Uuid,
+    pub identity_id: IdentityId,
+    pub generation: SafeUint,
+    pub leaf_count: SafeUint,
+    pub merkle_root: Sha256Digest,
+    pub observed_head: IdentityLogHead,
+    pub authority_device_id: DeviceId,
+    pub authority_key_id: Uuid,
+    pub authority_signing_key: SigningPublicKey,
+    pub issued_at: UtcMillis,
+    pub expires_at: UtcMillis,
+    pub exact_bytes: Vec<u8>,
+    pub digest: Sha256Digest,
+}
+
+/// Validates one exact signed Catalog V2 head without requiring its opaque
+/// encrypted catalog body.
+pub fn parse_signed_catalog_head_v2(exact_bytes: &[u8]) -> Result<CatalogHeadV2, IdentityPersistenceError> {
+    if exact_bytes.is_empty() || exact_bytes.len() > 466 {
+        return Err(invalid("catalog head bytes"));
+    }
+    let value = decode_deterministic_cbor_with_limit(exact_bytes, 466)
+        .map_err(|_| IdentityPersistenceError::RecoveryExactCborInvalid)?;
+    let fields = numbered_fields(&value, 16)?;
+    if fields[0] != &CanonicalValue::Unsigned(2) {
+        return Err(invalid("catalog head version"));
+    }
+    let catalog_id = parse_uuid_v7(fields[1], "catalog ID")?;
+    let identity_id = parse_identity(fields[2])?;
+    let generation = parse_positive_safe_uint(fields[3])?;
+    let leaf_count = parse_positive_safe_uint(fields[5])?;
+    if leaf_count.get() > 1_023 {
+        return Err(invalid("catalog leaf count"));
+    }
+    let merkle_root = parse_digest(fields[6])?;
+    let observed_head = IdentityLogHead::observed(
+        identity_id,
+        parse_safe_uint(fields[8])?,
+        parse_digest(fields[9])?,
+    )?;
+    let authority_device_id = parse_device_uuid_text(fields[10])?;
+    let authority_key_id = parse_uuid_v7(fields[11], "authority key ID")?;
+    let authority_signing_key = parse_signing_key(fields[12])?;
+    let issued_at = parse_utc(fields[13])?;
+    let expires_at = parse_utc(fields[14])?;
+    if issued_at >= expires_at {
+        return Err(invalid("catalog head expiry"));
+    }
+    let signature = parse_signature(fields[15])?;
+    let unsigned = CanonicalValue::Map(
+        (1_u64..)
+            .zip(fields.iter().take(15))
+            .map(|(key, value)| (CanonicalValue::Unsigned(key), (*value).clone()))
+            .collect(),
+    );
+    verify_signature(
+        authority_signing_key,
+        CATALOG_HEAD_SIGNATURE_DOMAIN,
+        &unsigned,
+        signature,
+    )?;
+    Ok(CatalogHeadV2 {
+        catalog_id,
+        identity_id,
+        generation,
+        leaf_count,
+        merkle_root,
+        observed_head,
+        authority_device_id,
+        authority_key_id,
+        authority_signing_key,
+        issued_at,
+        expires_at,
+        exact_bytes: exact_bytes.to_vec(),
+        digest: Sha256Digest::hash_domain(CATALOG_HEAD_DIGEST_DOMAIN, exact_bytes),
+    })
+}
+
 pub struct RecoveryResponseCapability([u8; 32]);
 
 impl fmt::Debug for RecoveryResponseCapability {

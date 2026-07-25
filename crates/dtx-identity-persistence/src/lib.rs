@@ -62,7 +62,7 @@ pub use key_package::{
 };
 pub use recovery_scope_catalog::{
     CATALOG_CIPHERTEXT_HASH_DOMAIN, CATALOG_HEAD_DIGEST_DOMAIN, CATALOG_HEAD_SIGNATURE_DOMAIN,
-    CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN, CatalogPreparationCommand,
+    CURRENT_HISTORY_AUTHORITY_HASH_DOMAIN, CatalogHeadV2, CatalogPreparationCommand,
     CatalogProviderResponseCommand, CatalogStatus, CatalogStatusInvalidation, CatalogUploadCommand,
     MAX_RECOVERY_SCOPE_CATALOG_CIPHERTEXT_BYTES, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES,
     MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
@@ -73,7 +73,7 @@ pub use recovery_scope_catalog::{
     PROVIDER_PACKAGE_DIGEST_DOMAIN, PROVIDER_RESPONSE_DIGEST_DOMAIN,
     PROVIDER_RESPONSE_SIGNATURE_DOMAIN, RECIPIENT_KEY_HASH_DOMAIN, RESPONSE_CAPABILITY_HASH_DOMAIN,
     RecoveryResponseCapability, RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository,
-    RecoveryScopeCatalogStatusOutcome,
+    RecoveryScopeCatalogStatusOutcome, parse_signed_catalog_head_v2,
 };
 pub use repository::{
     IdentityLogPageReadOutcome, IdentityLogRepository, lock_and_load_active_snapshot,

@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use dtx_domain::{DeviceEnrollmentChallengeId, DeviceId, DeviceSessionId, IdentityId};
 use dtx_identity_log::{
@@ -7,7 +7,7 @@ use dtx_identity_log::{
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
-    UtcMillis, encode_deterministic_cbor,
+    UtcMillis, decode_deterministic_cbor, encode_deterministic_cbor,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use sqlx::{PgConnection, Row};
@@ -18,7 +18,7 @@ use zeroize::Zeroize;
 use crate::device_session::DeviceSessionRepository;
 use crate::repository::{lock_and_load_active_snapshot, lock_identity};
 use crate::{
-    CatalogProviderResponseCommand, RECIPIENT_KEY_HASH_DOMAIN,
+    CatalogProviderResponseCommand, RECIPIENT_KEY_HASH_DOMAIN, parse_signed_catalog_head_v2,
     DeviceSessionCredential, IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead,
     IdentityLogRepository, IdentityPersistenceError, IdentityPgStore,
 };
