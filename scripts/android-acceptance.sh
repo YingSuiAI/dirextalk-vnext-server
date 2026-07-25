@@ -29,8 +29,43 @@ TRUST_PROBE_DEX='' TRUST_PROBE_HASH='' TRUST_RESULT_A_PATH='' TRUST_RESULT_B_PAT
 TRUST_PROBE_A_NONCE='' TRUST_PROBE_B_NONCE=''
 PID_A='' PID_B='' PROXY_A_PID='' PROXY_B_PID=''
 SERIAL_A='' SERIAL_B='' PROXY_A_PORT='' CONTROL_A_PORT='' PROXY_B_PORT='' CONTROL_B_PORT='' NODE_A_PORT='' NODE_B_PORT='' EMULATOR_A_PORT='' EMULATOR_B_PORT='' ALLOCATOR_LOCK_FD='' CA_HASH=''
+readonly PROCESS_KILL_GRACE_SECONDS=5
 
 die() { printf '%s\n' "android-acceptance: $*" >&2; exit 1; }
+bounded_seconds() {
+  local seconds=$ANDROID_BOOT_TIMEOUT_SECONDS
+  if [[ "${DTX_ANDROID_TEST_MODE:-}" == 1 && "${DTX_TEST_COMMAND_TIMEOUT_SECONDS:-}" =~ ^[1-9][0-9]*$ ]]; then
+    seconds=$DTX_TEST_COMMAND_TIMEOUT_SECONDS
+  fi
+  printf '%s' "$seconds"
+}
+run_bounded() {
+  local label=$1
+  shift
+  local status
+  if timeout --signal=TERM --kill-after="$PROCESS_KILL_GRACE_SECONDS" "$(bounded_seconds)" "$@"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "$status" == 124 || "$status" == 137 ]]; then
+    printf '%s\n' "android-acceptance: $label timed out" >&2
+  elif (( status != 0 )); then
+    printf '%s\n' "android-acceptance: $label failed" >&2
+  fi
+  return "$status"
+}
+adb_bounded() { local label=$1; shift; run_bounded "adb $label" adb "$@"; }
+compose_bounded() { local label=$1; shift; run_bounded "docker compose $label" docker compose "$@"; }
+avd_bounded() { local label=$1; shift; run_bounded "avdmanager $label" avdmanager "$@"; }
+start_owned_process() {
+  local label=$1
+  shift
+  # setsid makes the recorded executable the process-group leader, so argv and
+  # the reserved ownership tuple remain revalidatable during cleanup.
+  : "$label"
+  setsid "$@" >/dev/null 2>&1 &
+}
 valid_run_id_value() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,47}$ ]]; }
 valid_run_id() { valid_run_id_value "$RUN_ID"; }
 safe_run_root() { [[ "$RUN_ROOT" == "$STATE_ROOT/$RUN_ID" && "$RUN_ID" != *'/'* ]]; }
@@ -161,11 +196,53 @@ validate_reservation_file() {
   (( android_avd_count == 2 && android_rss_reservation_mib == android_avd_count * android_avd_rss_mib )) || return 1
 }
 
+pid_cmdline_matches() {
+  local pid=$1 kind=$2 first=$3 second=$4 third=$5
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  local -a argv=() arg
+  while IFS= read -r -d '' arg; do argv+=("$arg"); done <"/proc/$pid/cmdline"
+  (( ${#argv[@]} > 0 )) || return 1
+  if [[ "$kind" == emulator ]]; then
+    local avd_index=-1 port_index=-1 avd_count=0 port_count=0 index
+    for index in "${!argv[@]}"; do
+      if [[ "${argv[$index]}" == -avd ]]; then avd_index=$index; ((avd_count += 1)); fi
+      if [[ "${argv[$index]}" == -port ]]; then port_index=$index; ((port_count += 1)); fi
+    done
+    (( avd_count == 1 && port_count == 1 && avd_index + 1 < ${#argv[@]} && port_index + 1 < ${#argv[@]} )) || return 1
+    [[ "${argv[$((avd_index + 1))]}" == "$first" && "${argv[$((port_index + 1))]}" == "$second" ]] || return 1
+  else
+    local found=0 arg_value
+    for arg_value in "${argv[@]}"; do
+      [[ "$arg_value" == "$first" || "$arg_value" == "$second" || "$arg_value" == "$third" ]] && ((found += 1))
+    done
+    (( found == 3 )) || return 1
+  fi
+}
+process_group_pgid() {
+  local pid=$1 pgid
+  pgid="$(ps -o pgid= -p "$pid" | tr -d ' ')"
+  [[ "$pgid" =~ ^[1-9][0-9]*$ && "$pgid" == "$pid" ]] || return 1
+  printf '%s' "$pgid"
+}
 stop_pid() {
-  local pid=$1 port=$2
+  local pid=$1 port=$2 kind=${3:-proxy} first=${4:-} second=${5:-} third=${6:-} serial=${7:-} pgid
   [[ -n "$pid" ]] || return 0
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
+  if kill -0 "$pid" 2>/dev/null; then
+    pid_cmdline_matches "$pid" "$kind" "$first" "$second" "$third" || return 1
+    if [[ "$kind" == emulator ]]; then
+      [[ -n "$serial" ]] || return 1
+      (verify_emulator_identity "$serial" "$pid" "$first" "$second") || return 1
+    fi
+    pgid="$(process_group_pgid "$pid")" || return 1
+    kill -TERM -- "-$pgid" 2>/dev/null || return 1
+    local deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
+    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do :; done
+    if kill -0 "$pid" 2>/dev/null; then
+      pid_cmdline_matches "$pid" "$kind" "$first" "$second" "$third" || return 1
+      kill -KILL -- "-$pgid" 2>/dev/null || return 1
+    fi
+    wait "$pid" 2>/dev/null || true
+  fi
   ! kill -0 "$pid" 2>/dev/null || return 1
   ! ss -ltnH "sport = :$port" | grep -q . || return 1
 }
@@ -173,7 +250,7 @@ cleanup_probe_remote() {
   local serial=$1 pid=$2 avd=$3 port=$4 result_path=$5
   [[ -n "$result_path" ]] || return 0
   (verify_emulator "$serial" "$pid" "$avd" "$port") || return 1
-  adb -s "$serial" shell "rm -f '$result_path' /data/local/tmp/dtx-platform-trust-probe.dex && test ! -e '$result_path' && test ! -e /data/local/tmp/dtx-platform-trust-probe.dex" >/dev/null 2>&1 || return 1
+  adb_bounded 'trust-result cleanup' -s "$serial" shell "rm -f '$result_path' /data/local/tmp/dtx-platform-trust-probe.dex && test ! -e '$result_path' && test ! -e /data/local/tmp/dtx-platform-trust-probe.dex" >/dev/null 2>&1 || return 1
 }
 cleanup_remote_serial() {
   local serial=$1 pid=$2 avd=$3 port=$4 result_path=$5 ca_touched=$6 probe_touched=$7 reverse=$8
@@ -187,7 +264,7 @@ cleanup_remote_serial() {
     cleanup_probe_remote "$serial" "$pid" "$avd" "$port" "$result_path" || return 1
   fi
   if [[ "$reverse" == 1 ]]; then
-    adb -s "$serial" reverse --remove tcp:8443 >/dev/null 2>&1 || return 1
+    adb_bounded 'reverse cleanup' -s "$serial" reverse --remove tcp:8443 >/dev/null 2>&1 || return 1
   fi
 }
 cleanup() {
@@ -200,11 +277,20 @@ cleanup() {
   if [[ "$CA_B_TOUCHED" == 1 || "$TRUST_PROBE_B_TOUCHED" == 1 || "$REVERSE_B" == 1 ]]; then
     cleanup_remote_serial "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT" "$TRUST_RESULT_B_PATH" "$CA_B_TOUCHED" "$TRUST_PROBE_B_TOUCHED" "$REVERSE_B" || cleanup_failed=1
   fi
-  stop_pid "$PROXY_A_PID" "$PROXY_A_PORT" || cleanup_failed=1; stop_pid "$PROXY_B_PID" "$PROXY_B_PORT" || cleanup_failed=1
-  stop_pid "$PID_A" "$EMULATOR_A_PORT" || cleanup_failed=1; stop_pid "$PID_B" "$EMULATOR_B_PORT" || cleanup_failed=1
-  [[ "$AVD_A_CREATED" != 1 ]] || { safe_avd "$AVD_A" && avdmanager delete avd --name "$AVD_A" >/dev/null 2>&1 && ! avdmanager list avd | grep -Fqx "    Name: $AVD_A"; } || cleanup_failed=1
-  [[ "$AVD_B_CREATED" != 1 ]] || { safe_avd "$AVD_B" && avdmanager delete avd --name "$AVD_B" >/dev/null 2>&1 && ! avdmanager list avd | grep -Fqx "    Name: $AVD_B"; } || cleanup_failed=1
-  [[ "$COMPOSE_OWNED" != 1 ]] || { safe_project && docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" down --volumes --remove-orphans >/dev/null 2>&1; } || cleanup_failed=1
+  stop_pid "$PROXY_A_PID" "$PROXY_A_PORT" proxy "127.0.0.1:$PROXY_A_PORT" "127.0.0.1:$NODE_A_PORT" "127.0.0.1:$CONTROL_A_PORT" || cleanup_failed=1
+  stop_pid "$PROXY_B_PID" "$PROXY_B_PORT" proxy "127.0.0.1:$PROXY_B_PORT" "127.0.0.1:$NODE_B_PORT" "127.0.0.1:$CONTROL_B_PORT" || cleanup_failed=1
+  stop_pid "$PID_A" "$EMULATOR_A_PORT" emulator "$AVD_A" "$EMULATOR_A_PORT" '' "$SERIAL_A" || cleanup_failed=1
+  stop_pid "$PID_B" "$EMULATOR_B_PORT" emulator "$AVD_B" "$EMULATOR_B_PORT" '' "$SERIAL_B" || cleanup_failed=1
+  [[ "$AVD_A_CREATED" != 1 ]] || { safe_avd "$AVD_A" && avd_bounded 'delete AVD A' delete avd --name "$AVD_A" >/dev/null 2>&1 && ! avd_bounded 'list AVDs' list avd | grep -Fqx "    Name: $AVD_A"; } || cleanup_failed=1
+  [[ "$AVD_B_CREATED" != 1 ]] || { safe_avd "$AVD_B" && avd_bounded 'delete AVD B' delete avd --name "$AVD_B" >/dev/null 2>&1 && ! avd_bounded 'list AVDs' list avd | grep -Fqx "    Name: $AVD_B"; } || cleanup_failed=1
+  if [[ "$COMPOSE_OWNED" == 1 ]]; then
+    if ! safe_project; then
+      cleanup_failed=1
+    else
+      compose_bounded 'ps' --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" ps --all >/dev/null 2>&1 || cleanup_failed=1
+      compose_bounded 'down' --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" down --volumes --remove-orphans >/dev/null 2>&1 || cleanup_failed=1
+    fi
+  fi
   if [[ "$cleanup_failed" == 1 ]]; then
     [[ "$CLAIMED" != 1 ]] || printf '%s\n' 'cleanup=failed' >"$RUN_ROOT/cleanup-status"
     [[ "$status" != 0 ]] || status=1
@@ -221,11 +307,11 @@ trap 'on_signal 143' TERM
 preflight() {
   valid_run_id && safe_run_root && safe_project || die 'unsafe run identity'
   valid_config || die 'invalid Android acceptance configuration'
-  command -v docker >/dev/null || die 'docker is required'; command -v adb >/dev/null || die 'adb is required'; command -v timeout >/dev/null || die 'timeout is required'
+  command -v docker >/dev/null || die 'docker is required'; command -v adb >/dev/null || die 'adb is required'; command -v timeout >/dev/null || die 'timeout is required'; command -v setsid >/dev/null || die 'setsid is required'
   command -v emulator >/dev/null || die 'emulator is required'; command -v avdmanager >/dev/null || die 'avdmanager is required'; command -v ss >/dev/null || die 'ss is required'
-  ! avdmanager list avd | grep -Fqx "    Name: $AVD_A" || die 'AVD A already exists'
-  ! avdmanager list avd | grep -Fqx "    Name: $AVD_B" || die 'AVD B already exists'
-  ! adb devices | grep -Eq "^(${SERIAL_A}|${SERIAL_B})[[:space:]]" || die 'reserved emulator serial is already active'
+  ! avd_bounded 'list AVDs' list avd | grep -Fqx "    Name: $AVD_A" || die 'AVD A already exists'
+  ! avd_bounded 'list AVDs' list avd | grep -Fqx "    Name: $AVD_B" || die 'AVD B already exists'
+  ! adb_bounded 'devices' devices | grep -Eq "^(${SERIAL_A}|${SERIAL_B})[[:space:]]" || die 'reserved emulator serial is already active'
 }
 prepare_trust_probe() {
   local source="$SCRIPT_DIR/android-platform-trust-probe.java" android_jar d8 javac_version probe_dir classes_dir dex_output dex_size source_copy
@@ -260,16 +346,16 @@ prepare_trust_probe() {
 verify_emulator() {
   local serial=$1 pid=$2 avd=$3 port=$4
   verify_emulator_identity "$serial" "$pid" "$avd" "$port"
-  adb -s "$serial" root >/dev/null || die 'adb root failed'
+  adb_bounded 'root' -s "$serial" root >/dev/null || die 'adb root failed'
   verify_emulator_identity "$serial" "$pid" "$avd" "$port"
-  [[ "$(adb -s "$serial" shell 'getprop ro.kernel.qemu' | tr -d '\r')" == 1 ]] || die 'image is not rooted emulator'
-  [[ "$(adb -s "$serial" shell 'id -u' | tr -d '\r')" == 0 ]] || die 'emulator root uid is not zero'
+  [[ "$(adb_bounded 'getprop' -s "$serial" shell 'getprop ro.kernel.qemu' | tr -d '\r')" == 1 ]] || die 'image is not rooted emulator'
+  [[ "$(adb_bounded 'id' -s "$serial" shell 'id -u' | tr -d '\r')" == 0 ]] || die 'emulator root uid is not zero'
 }
 verify_emulator_identity() {
   local serial=$1 pid=$2 avd=$3 port=$4
   valid_pid "$pid" || die 'emulator PID ownership is required'
   valid_emulator_port "$port" || die 'emulator console port ownership is required'
-  timeout --signal=TERM "$ANDROID_BOOT_TIMEOUT_SECONDS" adb -s "$serial" wait-for-device || die 'emulator boot timed out'
+  adb_bounded 'wait-for-device' -s "$serial" wait-for-device >/dev/null || die 'emulator boot timed out'
   kill -0 "$pid" || die 'emulator PID exited'
   [[ -r "/proc/$pid/cmdline" ]] || die 'emulator process command line is unavailable'
   local -a argv=() arg
@@ -284,7 +370,7 @@ verify_emulator_identity() {
   (( port_count == 1 && port_index >= 0 && port_index + 1 < ${#argv[@]} )) || die 'emulator PID has an invalid -port argument set'
   [[ "${argv[$((port_index + 1))]}" == "$port" ]] || die 'emulator PID has a mismatched -port argument'
   local avd_reply line
-  avd_reply="$(adb -s "$serial" emu avd name)" || die 'unable to read emulator AVD name'
+  avd_reply="$(adb_bounded 'avd name' -s "$serial" emu avd name)" || die 'unable to read emulator AVD name'
   local -a console_lines=()
   while IFS= read -r line; do
     line=${line//$'\r'/}
@@ -292,7 +378,7 @@ verify_emulator_identity() {
   done <<<"$avd_reply"
   (( ${#console_lines[@]} == 2 )) || die 'serial does not map to this AVD'
   [[ "${console_lines[0]}" == "$avd" && "${console_lines[1]}" == OK ]] || die 'serial does not map to this AVD'
-  [[ "$(adb -s "$serial" shell 'getprop ro.kernel.qemu' | tr -d '\r')" == 1 ]] || die 'image is not rooted emulator'
+  [[ "$(adb_bounded 'getprop' -s "$serial" shell 'getprop ro.kernel.qemu' | tr -d '\r')" == 1 ]] || die 'image is not rooted emulator'
 }
 assert_emulator_ports_free() {
   local console_port=$1 adb_port
@@ -301,9 +387,9 @@ assert_emulator_ports_free() {
   valid_port "$adb_port" || die 'invalid emulator adb port'
   ! ss -ltnH "sport = :$console_port" | grep -q . || die "emulator console port $console_port is already listening"
   ! ss -ltnH "sport = :$adb_port" | grep -q . || die "emulator adb port $adb_port is already listening"
-  ! adb devices | grep -Eq "^emulator-($console_port|$adb_port)[[:space:]]" || die "emulator port $console_port is already owned by adb"
+  ! adb_bounded 'devices' devices | grep -Eq "^emulator-($console_port|$adb_port)[[:space:]]" || die "emulator port $console_port is already owned by adb"
 }
-adb_shell_ok() { adb -s "$1" shell "$2" >/dev/null; }
+adb_shell_ok() { local serial=$1 command=$2; adb_bounded "shell $command" -s "$serial" shell "$command" >/dev/null; }
 new_nonce() {
   local nonce
   nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
@@ -316,14 +402,14 @@ platform_trust_probe() {
   result_path="/data/local/tmp/dtx-platform-trust-result-$nonce"
   if [[ "$serial" == "$SERIAL_A" ]]; then TRUST_PROBE_A_TOUCHED=1; TRUST_PROBE_A_NONCE="$nonce"; TRUST_RESULT_A_PATH="$result_path"; else TRUST_PROBE_B_TOUCHED=1; TRUST_PROBE_B_NONCE="$nonce"; TRUST_RESULT_B_PATH="$result_path"; fi
   (verify_emulator "$serial" "$pid" "$avd" "$port") || return 1
-  adb -s "$serial" shell "rm -f '$result_path' && test ! -e '$result_path'" >/dev/null 2>&1 || return 1
+  adb_bounded 'trust-result reset' -s "$serial" shell "rm -f '$result_path' && test ! -e '$result_path'" >/dev/null 2>&1 || return 1
   app_status=0
-  adb -s "$serial" push "$TRUST_PROBE_DEX" /data/local/tmp/dtx-platform-trust-probe.dex >/dev/null || app_status=$?
+  if adb_bounded 'trust-probe push' -s "$serial" push "$TRUST_PROBE_DEX" /data/local/tmp/dtx-platform-trust-probe.dex >/dev/null; then :; else app_status=$?; fi
   if [[ "$app_status" == 0 ]]; then
-    adb -s "$serial" shell "app_process -Djava.class.path=/data/local/tmp/dtx-platform-trust-probe.dex /system/bin com.dirextalk.android.PlatformTrustProbe '$endpoint' '$nonce' '$result_path'" >/dev/null 2>&1 || app_status=$?
+    if adb_bounded 'trust-probe app_process' -s "$serial" shell "app_process -Djava.class.path=/data/local/tmp/dtx-platform-trust-probe.dex /system/bin com.dirextalk.android.PlatformTrustProbe '$endpoint' '$nonce' '$result_path'" >/dev/null 2>&1; then :; else app_status=$?; fi
   fi
   (verify_emulator "$serial" "$pid" "$avd" "$port") || return 1
-  result="$(adb -s "$serial" shell "cat '$result_path'" 2>/dev/null | tr -d '\r')" || result=''
+  result="$(adb_bounded 'trust-result read' -s "$serial" shell "cat '$result_path'" 2>/dev/null | tr -d '\r')" || result=''
   [[ "$result" == "$expected $nonce" ]] || return 1
   [[ "$app_status" =~ ^[0-9]+$ ]] || return 1
 }
@@ -336,20 +422,20 @@ verify_ca_file() {
   local serial=$1 ca_file=$2 target=$3 local_digest remote_digest stat mode uid gid context
   adb_shell_ok "$serial" "test -f '$target' && test -r '$target'" || die 'installed CA is absent or unreadable'
   local_digest="$(sha256sum "$ca_file" | awk '{print $1}')" || die 'unable to hash CA file'
-  remote_digest="$(adb -s "$serial" shell "sha256sum '$target'" | awk '{print $1}' | tr -d '\r')" || die 'unable to hash installed CA'
+  remote_digest="$(adb_bounded 'CA digest' -s "$serial" shell "sha256sum '$target'" | awk '{print $1}' | tr -d '\r')" || die 'unable to hash installed CA'
   [[ "$remote_digest" == "$local_digest" ]] || die 'installed CA content mismatch'
-  IFS=' ' read -r mode uid gid <<<"$(adb -s "$serial" shell "stat -c '%a %u %g' '$target'" | tr -d '\r')"
+  IFS=' ' read -r mode uid gid <<<"$(adb_bounded 'CA stat' -s "$serial" shell "stat -c '%a %u %g' '$target'" | tr -d '\r')"
   [[ "$mode" == 644 && "$uid" == 0 && "$gid" == 0 ]] || die "installed CA mode or owner mismatch: mode=$mode uid=$uid gid=$gid"
-  context="$(adb -s "$serial" shell "ls -Z '$target'" | awk '{print $1}' | tr -d '\r')"
+  context="$(adb_bounded 'CA context' -s "$serial" shell "ls -Z '$target'" | awk '{print $1}' | tr -d '\r')"
   [[ "$context" == u:object_r:system_file:s0 ]] || die 'installed CA SELinux context mismatch'
 }
 remount_system() {
   local serial=$1 pid=$2 avd=$3 port=$4 output
-  output="$(adb -s "$serial" remount 2>&1)" || die 'adb remount failed'
+  output="$(adb_bounded 'remount' -s "$serial" remount 2>&1)" || die 'adb remount failed'
   if [[ "$output" == *'Successfully disabled verity'* ]]; then
-    adb -s "$serial" reboot >/dev/null || die 'emulator reboot after verity disable failed'
+    adb_bounded 'reboot' -s "$serial" reboot >/dev/null || die 'emulator reboot after verity disable failed'
     verify_emulator "$serial" "$pid" "$avd" "$port"
-    output="$(adb -s "$serial" remount 2>&1)" || die 'adb remount after reboot failed'
+    output="$(adb_bounded 'remount after reboot' -s "$serial" remount 2>&1)" || die 'adb remount after reboot failed'
   fi
   [[ "$output" == *'remount succeeded'* || "$output" == *'Successfully remounted'* ]] || die 'adb remount did not report success'
   verify_system_rw "$serial"
@@ -360,12 +446,12 @@ install_ca_system_store() {
   [[ "$hash" =~ ^[0-9a-fA-F]{8}$ ]] || die 'unexpected CA subject hash'
   CA_HASH="$hash"; target="/system/etc/security/cacerts/$hash.0"
   if [[ "$serial" == "$SERIAL_A" ]]; then CA_A_TOUCHED=1; else CA_B_TOUCHED=1; fi
-  adb -s "$serial" push "$ca_file" "/data/local/tmp/$hash.0" >/dev/null || die 'CA push failed'
+  adb_bounded 'CA push' -s "$serial" push "$ca_file" "/data/local/tmp/$hash.0" >/dev/null || die 'CA push failed'
   remount_system "$serial" "$pid" "$avd" "$port"
   adb_shell_ok "$serial" "cp '/data/local/tmp/$hash.0' '$target' && chmod 0644 '$target' && chown 0:0 '$target' && restorecon '$target' && rm -f '/data/local/tmp/$hash.0'" || die 'CA installation failed'
   if [[ "$serial" == "$SERIAL_A" ]]; then CA_A_INSTALLED=1; else CA_B_INSTALLED=1; fi
   verify_ca_file "$serial" "$ca_file" "$target"
-  adb -s "$serial" reboot >/dev/null || die 'emulator reboot after CA install failed'
+  adb_bounded 'reboot after CA install' -s "$serial" reboot >/dev/null || die 'emulator reboot after CA install failed'
   verify_emulator "$serial" "$pid" "$avd" "$port"
   verify_ca_file "$serial" "$ca_file" "$target"
 }
@@ -374,14 +460,14 @@ remove_ca_system_store() {
   [[ -n "$CA_HASH" ]] || return 0
   target="/system/etc/security/cacerts/$CA_HASH.0"
   (verify_emulator "$serial" "$( [[ "$serial" == "$SERIAL_A" ]] && printf '%s' "$PID_A" || printf '%s' "$PID_B" )" "$( [[ "$serial" == "$SERIAL_A" ]] && printf '%s' "$AVD_A" || printf '%s' "$AVD_B" )" "$( [[ "$serial" == "$SERIAL_A" ]] && printf '%s' "$EMULATOR_A_PORT" || printf '%s' "$EMULATOR_B_PORT" )") || return 1
-  adb -s "$serial" remount >/dev/null 2>&1 || return 1
+  adb_bounded 'cleanup remount' -s "$serial" remount >/dev/null 2>&1 || return 1
   adb_shell_ok "$serial" "rm -f '$target' /data/local/tmp/$CA_HASH.0 && test ! -e '$target' && test ! -e '/data/local/tmp/$CA_HASH.0'" || return 1
   adb_shell_ok "$serial" "mount -o ro,remount /system" || return 1
   adb_shell_ok "$serial" "test ! -w /system/etc/security/cacerts" || return 1
 }
 start_proxy() {
   local listen=$1 upstream=$2 control=$3 variable=$4
-  "$REPOSITORY_ROOT/target/debug/dtx-android-response-loss-proxy" "127.0.0.1:$listen" "127.0.0.1:$upstream" "127.0.0.1:$control" >/dev/null 2>&1 &
+  start_owned_process 'proxy' "$REPOSITORY_ROOT/target/debug/dtx-android-response-loss-proxy" "127.0.0.1:$listen" "127.0.0.1:$upstream" "127.0.0.1:$control"
   local pid=$!
   # Record ownership before the first readiness probe: startup can fail after
   # fork but before either listener exists.
@@ -401,18 +487,18 @@ real_run() {
   prepare_trust_probe
   cargo build --locked -p dtx-android-response-loss-proxy
   COMPOSE_OWNED=1; record compose_owned 1
-  DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" up --detach --wait
+  DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" compose_bounded 'up' --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" up --detach --wait
   mkdir -p -- "$RUN_ROOT/tls"
-  DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" cp tls-bootstrap:/run/dtx-local-tls/ca.pem "$RUN_ROOT/tls/ca.pem"
-  AVD_A_CREATED=1; avdmanager create avd --name "$AVD_A" --package "$ANDROID_SYSTEM_IMAGE" >/dev/null
-  AVD_B_CREATED=1; avdmanager create avd --name "$AVD_B" --package "$ANDROID_SYSTEM_IMAGE" >/dev/null
+  DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" compose_bounded 'copy bootstrap CA' --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" cp tls-bootstrap:/run/dtx-local-tls/ca.pem "$RUN_ROOT/tls/ca.pem"
+  AVD_A_CREATED=1; avd_bounded 'create AVD A' create avd --name "$AVD_A" --package "$ANDROID_SYSTEM_IMAGE" >/dev/null
+  AVD_B_CREATED=1; avd_bounded 'create AVD B' create avd --name "$AVD_B" --package "$ANDROID_SYSTEM_IMAGE" >/dev/null
   assert_emulator_ports_free "$EMULATOR_A_PORT"; assert_emulator_ports_free "$EMULATOR_B_PORT"
-  emulator -avd "$AVD_A" -port "$EMULATOR_A_PORT" -accel "$ANDROID_ACCELERATION" -cores "$ANDROID_CORES" -memory "$ANDROID_MEMORY_MIB" -gpu "$ANDROID_GPU" -writable-system -no-snapshot -wipe-data -no-window >/dev/null 2>&1 & PID_A=$!; record emulator_a_pid "$PID_A"
+  start_owned_process 'emulator A' emulator -avd "$AVD_A" -port "$EMULATOR_A_PORT" -accel "$ANDROID_ACCELERATION" -cores "$ANDROID_CORES" -memory "$ANDROID_MEMORY_MIB" -gpu "$ANDROID_GPU" -writable-system -no-snapshot -wipe-data -no-window; PID_A=$!; record emulator_a_pid "$PID_A"
   assert_emulator_ports_free "$EMULATOR_B_PORT"
-  emulator -avd "$AVD_B" -port "$EMULATOR_B_PORT" -accel "$ANDROID_ACCELERATION" -cores "$ANDROID_CORES" -memory "$ANDROID_MEMORY_MIB" -gpu "$ANDROID_GPU" -writable-system -no-snapshot -wipe-data -no-window >/dev/null 2>&1 & PID_B=$!; record emulator_b_pid "$PID_B"
+  start_owned_process 'emulator B' emulator -avd "$AVD_B" -port "$EMULATOR_B_PORT" -accel "$ANDROID_ACCELERATION" -cores "$ANDROID_CORES" -memory "$ANDROID_MEMORY_MIB" -gpu "$ANDROID_GPU" -writable-system -no-snapshot -wipe-data -no-window; PID_B=$!; record emulator_b_pid "$PID_B"
   verify_emulator "$SERIAL_A" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT"; verify_emulator "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT"
-  REVERSE_A=1; adb -s "$SERIAL_A" reverse tcp:8443 "tcp:$NODE_A_PORT"
-  REVERSE_B=1; adb -s "$SERIAL_B" reverse tcp:8443 "tcp:$NODE_B_PORT"
+  REVERSE_A=1; adb_bounded 'reverse A' -s "$SERIAL_A" reverse tcp:8443 "tcp:$NODE_A_PORT"
+  REVERSE_B=1; adb_bounded 'reverse B' -s "$SERIAL_B" reverse tcp:8443 "tcp:$NODE_B_PORT"
   platform_trust_probe "$SERIAL_A" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT" 'https://localhost:8443/local/ready' UNTRUSTED || die 'platform trust preinstall classification was not certificate-chain rejection'
   platform_trust_probe "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT" 'https://localhost:8443/local/ready' UNTRUSTED || die 'platform trust preinstall classification was not certificate-chain rejection'
   install_ca_system_store "$SERIAL_A" "$RUN_ROOT/tls/ca.pem" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT"
@@ -420,8 +506,8 @@ real_run() {
   install_ca_system_store "$SERIAL_B" "$RUN_ROOT/tls/ca.pem" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT"
   platform_trust_probe "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT" 'https://localhost:8443/local/ready' TRUSTED || die 'platform trust did not accept installed CA'
   start_proxy "$PROXY_A_PORT" "$NODE_A_PORT" "$CONTROL_A_PORT" PROXY_A_PID; start_proxy "$PROXY_B_PORT" "$NODE_B_PORT" "$CONTROL_B_PORT" PROXY_B_PID
-  REVERSE_A=1; adb -s "$SERIAL_A" reverse tcp:8443 "tcp:$PROXY_A_PORT"
-  REVERSE_B=1; adb -s "$SERIAL_B" reverse tcp:8443 "tcp:$PROXY_B_PORT"
+  REVERSE_A=1; adb_bounded 'reverse proxy A' -s "$SERIAL_A" reverse tcp:8443 "tcp:$PROXY_A_PORT"
+  REVERSE_B=1; adb_bounded 'reverse proxy B' -s "$SERIAL_B" reverse tcp:8443 "tcp:$PROXY_B_PORT"
   die 'Direct/Group Android scenario runner is not available; no acceptance result was claimed'
 }
 case "$MODE" in dry-run) valid_run_id && safe_run_root && safe_project || die 'unsafe run identity'; printf '%s\n' 'android-acceptance: dry-run passed (no external commands)';; self-test) valid_run_id && safe_avd "$AVD_A" && safe_avd "$AVD_B" && safe_project && safe_run_root || die 'safety self-test failed'; printf '%s\n' 'android-acceptance: safety self-test passed';; run) real_run;; esac

@@ -4,6 +4,21 @@ root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 script="$root/scripts/android-acceptance.sh"
 tmp="$(mktemp -d)"
 test_shell_pid=$BASHPID
+cleanup_fixture_processes() {
+  local pid pgid cmd
+  while read -r pid pgid cmd; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ && "$pgid" =~ ^[1-9][0-9]*$ ]] || continue
+    [[ "$pid" == "$BASHPID" || "$pid" == "$test_shell_pid" ]] && continue
+    if [[ "$cmd" == *'/target/debug/'* ]]; then
+      [[ "$cmd" == *"$tmp/"* ]] || continue
+    elif [[ "$cmd" == *'emulator -avd dirextalk-accept-console-extra-'* ]]; then
+      :
+    else
+      continue
+    fi
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+  done < <(ps -eo pid=,pgid=,cmd=)
+}
 cleanup_test_tmp() {
   local status=$?
   [[ $BASHPID == "$test_shell_pid" ]] || return "$status"
@@ -15,6 +30,7 @@ cleanup_test_tmp() {
     done < <(find "$tmp" -type f -name log -print 2>/dev/null)
     ps -eo pid,ppid,stat,cmd | rg -F "$tmp" >&2 || true
   fi
+  cleanup_fixture_processes
   rm -rf -- "$tmp"
   return "$status"
 }
@@ -49,7 +65,7 @@ make_fixture() {
     ' *" remount "*) marker="$DTX_TEST_ROOT/remount-$DTX_TEST_RUN_ID-$serial"; if [[ ! -e "$marker" ]]; then : >"$marker"; printf "Successfully disabled verity\n"; else printf "remount succeeded\n"; fi;;' \
     ' *" reboot "*) :;;' \
     ' *" root "*) [[ -f "$DTX_TEST_MAP/$serial" ]] || exit 1;;' \
-    ' *" shell "*) if [[ "$*" == *app_process* ]]; then nonce=$(printf "%s" "$*" | grep -oE "[0-9a-f]{32}" | tail -n 1); : >"$DTX_TEST_ROOT/app-process-$serial"; result_file="$DTX_TEST_ROOT/result-$serial-$nonce"; if [[ "${DTX_TEST_TRUST_LOST:-}" != 1 ]]; then if [[ "${DTX_TEST_TRUST_NONCE_MISMATCH:-}" == 1 ]]; then printf "TRUSTED wrongnonce\n" >"$result_file"; elif [[ "${DTX_TEST_TRUST_WRONG_FAILURE:-}" == 1 ]]; then printf "CONNECT_FAILED %s\n" "$nonce" >"$result_file"; elif [[ "${DTX_TEST_TRUST_PRETRUST:-}" == 1 || -f "$DTX_TEST_ROOT/trust-$serial" ]]; then printf "TRUSTED %s\n" "$nonce" >"$result_file"; else printf "UNTRUSTED %s\n" "$nonce" >"$result_file"; fi; fi; [[ "${DTX_TEST_TRUST_FAIL:-}" == 1 ]] && exit 1; elif [[ "$*" == *cat*result-* ]]; then nonce=$(printf "%s" "$*" | grep -oE "result-[0-9a-f]{32}" | tail -n 1 | cut -d- -f2); cat "$DTX_TEST_ROOT/result-$serial-$nonce"; elif [[ "$*" == *cp* && "$*" == *cacerts* ]]; then : >"$DTX_TEST_ROOT/trust-$serial"; elif [[ "$*" == *sha256sum* ]]; then sha256sum "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/tls/ca.pem"; elif [[ "$*" == *stat* ]]; then printf "644 0 0\n"; elif [[ "$*" == *ls*Z* ]]; then printf "u:object_r:system_file:s0 root root\n"; elif [[ "$*" == *getprop* ]]; then printf "1\n"; elif [[ "$*" == *id* ]]; then printf "0\n"; fi;;' \
+    ' *" shell "*) if [[ "$*" == *app_process* ]]; then [[ "${DTX_TEST_APP_PROCESS_SLEEP:-}" == 1 ]] && sleep 5; nonce=$(printf "%s" "$*" | grep -oE "[0-9a-f]{32}" | tail -n 1); : >"$DTX_TEST_ROOT/app-process-$serial"; result_file="$DTX_TEST_ROOT/result-$serial-$nonce"; if [[ "${DTX_TEST_TRUST_LOST:-}" != 1 ]]; then if [[ "${DTX_TEST_TRUST_NONCE_MISMATCH:-}" == 1 ]]; then printf "TRUSTED wrongnonce\n" >"$result_file"; elif [[ "${DTX_TEST_TRUST_WRONG_FAILURE:-}" == 1 ]]; then printf "CONNECT_FAILED %s\n" "$nonce" >"$result_file"; elif [[ "${DTX_TEST_TRUST_PRETRUST:-}" == 1 || -f "$DTX_TEST_ROOT/trust-$serial" ]]; then printf "TRUSTED %s\n" "$nonce" >"$result_file"; else printf "UNTRUSTED %s\n" "$nonce" >"$result_file"; fi; fi; [[ "${DTX_TEST_TRUST_FAIL:-}" == 1 ]] && exit 1; elif [[ "$*" == *cat*result-* ]]; then nonce=$(printf "%s" "$*" | grep -oE "result-[0-9a-f]{32}" | tail -n 1 | cut -d- -f2); cat "$DTX_TEST_ROOT/result-$serial-$nonce"; elif [[ "$*" == *cp* && "$*" == *cacerts* ]]; then : >"$DTX_TEST_ROOT/trust-$serial"; elif [[ "$*" == *sha256sum* ]]; then sha256sum "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/tls/ca.pem"; elif [[ "$*" == *stat* ]]; then printf "644 0 0\n"; elif [[ "$*" == *ls*Z* ]]; then printf "u:object_r:system_file:s0 root root\n"; elif [[ "$*" == *getprop* ]]; then printf "1\n"; elif [[ "$*" == *id* ]]; then printf "0\n"; fi;;' \
     ' *" push "*) [[ -f "$DTX_TEST_MAP/$serial" ]] || exit 1; [[ "${DTX_TEST_TRUST_PUSH_FAIL:-}" == 1 && "$*" == *classes.dex* ]] && exit 1 || true;;' \
     ' *" reverse tcp:8443 "*) if [[ "${DTX_TEST_REVERSE_FAIL_AFTER:-}" == 1 && "$serial" == "$(awk -F= '\''$1 == "emulator_a_serial" { print $2 }'\'' "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/resources")" ]]; then echo "reverse-side-effect $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG"; exit 1; fi; [[ "${DTX_TEST_REVERSE:-ok}" == ok ]] || exit 1; [[ "${DTX_TEST_REVERSE_SLEEP:-0}" == 0 ]] || sleep "${DTX_TEST_REVERSE_SLEEP}";;' \
     ' *" reverse --remove tcp:8443 "*) echo "reverse-remove $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG";;' \
@@ -210,6 +226,39 @@ for run in concurrent-a concurrent-b; do
   [[ ! -e "$fixture/.android-acceptance/$run" ]]
   rg -F -- "--project-name dtx-android-accept-$run down" "$fixture/log" >/dev/null
 done
+
+# Cleanup must refuse a reused/mismatched PID without signalling the unrelated
+# process.  The fixture deliberately replaces its argv after binding ports.
+fixture="$tmp/pid-mismatch"; make_fixture "$fixture"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; control=${3##*:}; : >"$DTX_TEST_PROXY_PORTS/$listen"; : >"$DTX_TEST_PROXY_PORTS/$control"' 'exec -a unrelated-proxy python3 -c '\''import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)'\''' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
+if run_fixture "$fixture" pid-mismatch env; then exit 1; fi
+mismatch_pid="$(awk -F= '$1 == "PROXY_A_PID" { print $2 }' "$fixture/.android-acceptance/pid-mismatch/resources")"
+valid_pid_re='^[1-9][0-9]*$'; [[ "$mismatch_pid" =~ $valid_pid_re ]] && kill -0 "$mismatch_pid" 2>/dev/null
+! tr '\0' ' ' <"/proc/$mismatch_pid/cmdline" | rg -F '127.0.0.1:' >/dev/null
+[[ "$(<"$fixture/.android-acceptance/pid-mismatch/cleanup-status")" == cleanup=failed ]]
+kill -KILL "$mismatch_pid" 2>/dev/null || true
+wait "$mismatch_pid" 2>/dev/null || true
+
+# A stubborn descendant is removed by the owned process-group KILL fallback.
+fixture="$tmp/child-cleanup"; make_fixture "$fixture"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; control=${3##*:}; : >"$DTX_TEST_PROXY_PORTS/$listen"; : >"$DTX_TEST_PROXY_PORTS/$control"' '(trap '\'''\'' TERM; while :; do sleep 1; done) & child=$!; printf "%s" "$child" >"$DTX_TEST_ROOT/proxy-child"' 'trap '\''rm -f "$DTX_TEST_PROXY_PORTS/$listen" "$DTX_TEST_PROXY_PORTS/$control"'\'' TERM' 'while :; do sleep 1; done' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
+if run_fixture "$fixture" child-cleanup env; then exit 1; fi
+child_pid="$(<"$fixture/proxy-child")"
+! kill -0 "$child_pid" 2>/dev/null
+[[ ! -e "$fixture/.android-acceptance/child-cleanup" ]]
+
+# Foreground compose and app_process calls have independent bounded deadlines;
+# timeout diagnostics are redacted and owned teardown still runs.
+fixture="$tmp/hung-compose"; make_fixture "$fixture"
+if DTX_TEST_COMPOSE_SLEEP=5 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 run_fixture "$fixture" hung-compose env >/dev/null 2>&1; then exit 1; fi
+rg -F -- '--project-name dtx-android-accept-hung-compose ps --all' "$fixture/log" >/dev/null
+rg -F -- '--project-name dtx-android-accept-hung-compose down' "$fixture/log" >/dev/null
+[[ ! -e "$fixture/.android-acceptance/hung-compose" ]]
+fixture="$tmp/hung-app-process"; make_fixture "$fixture"
+if DTX_TEST_APP_PROCESS_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 run_fixture "$fixture" hung-app-process env >/dev/null 2>&1; then exit 1; fi
+rg -F 'shell app_process' "$fixture/log" >/dev/null
+rg -F -- '--project-name dtx-android-accept-hung-app-process down' "$fixture/log" >/dev/null
+[[ ! -e "$fixture/.android-acceptance/hung-app-process" ]]
 
 # Invalid closed configuration is rejected before any Android side effect.
 fixture="$tmp/config"; make_fixture "$fixture"
