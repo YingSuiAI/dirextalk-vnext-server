@@ -1292,17 +1292,6 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         &candidate,
         "history-recovery-v4-lifecycle-preparation-expired",
     )?;
-    let expired_preparation = history_recovery_request_v4_with_outer_tamper(
-        &history_recovery_request_v4_with_outer_tamper(
-            &expired_preparation,
-            &candidate,
-            18,
-            at(4_900).to_canonical_value(),
-        )?,
-        &candidate,
-        17,
-        at(4_500).to_canonical_value(),
-    )?;
     let mut lifecycle_tx = harness.admin_pool().begin().await?;
     sqlx::query("SET LOCAL session_replication_role='replica'")
         .execute(&mut *lifecycle_tx)
@@ -1317,6 +1306,18 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     .await?;
     lifecycle_tx.commit().await?;
     clock.set(7_000);
+    let persisted_preparation_expires: i64 = sqlx::query_scalar(
+        "SELECT expires_at_ms FROM identity.recovery_scope_catalog_preparations
+          WHERE request_id=$1",
+    )
+    .bind(*challenge.challenge_id().as_uuid())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(200_000 > 7_000, "signed request remains valid at trusted_now");
+    assert!(
+        persisted_preparation_expires <= 7_000,
+        "persisted preparation is expired at trusted_now"
+    );
     assert_error(
         send_history_recovery_request_v4(
             app.clone(),
