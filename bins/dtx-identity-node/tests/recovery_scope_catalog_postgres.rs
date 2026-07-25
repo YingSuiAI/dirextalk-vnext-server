@@ -372,6 +372,46 @@ async fn send_history_recovery_request_v4_custom(
     Ok(app.oneshot(request).await?)
 }
 
+async fn send_four_history_recovery_request_v4(
+    apps: &[axum::Router; 4],
+    idempotency: &str,
+    enrollment_capability: [u8; 32],
+    response_capability: [u8; 32],
+    body: Vec<u8>,
+) -> Result<Vec<axum::response::Response>, Box<dyn Error>> {
+    let (first, second, third, fourth) = tokio::join!(
+        send_history_recovery_request_v4(
+            apps[0].clone(),
+            idempotency,
+            enrollment_capability,
+            response_capability,
+            body.clone(),
+        ),
+        send_history_recovery_request_v4(
+            apps[1].clone(),
+            idempotency,
+            enrollment_capability,
+            response_capability,
+            body.clone(),
+        ),
+        send_history_recovery_request_v4(
+            apps[2].clone(),
+            idempotency,
+            enrollment_capability,
+            response_capability,
+            body.clone(),
+        ),
+        send_history_recovery_request_v4(
+            apps[3].clone(),
+            idempotency,
+            enrollment_capability,
+            response_capability,
+            body,
+        ),
+    );
+    Ok(vec![first?, second?, third?, fourth?])
+}
+
 fn history_recovery_request_v4_headers(
     content_type: Option<&str>,
     accept: Option<&str>,
@@ -1128,11 +1168,11 @@ async fn wait_for_exact_advisory_waiters(
     pool: &sqlx::PgPool,
     lock_key: i64,
     applications: &[&str],
-) -> Result<(), Box<dyn Error>> {
+) -> Result<Vec<i32>, Box<dyn Error>> {
     let class_id = i64::from((lock_key as u64 >> 32) as u32);
     let object_id = i64::from(lock_key as u32);
     let applications: Vec<String> = applications.iter().map(ToString::to_string).collect();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let pids = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let backends: Vec<(String, i32)> = sqlx::query_as(
                 "SELECT application_name,pid FROM pg_stat_activity WHERE datid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND application_name=ANY($1) ORDER BY application_name",
@@ -1161,14 +1201,14 @@ async fn wait_for_exact_advisory_waiters(
                 && waiting.iter().copied().collect::<std::collections::BTreeSet<_>>()
                     == pids.iter().copied().collect()
             {
-                return Ok::<(), sqlx::Error>(());
+                return Ok::<Vec<i32>, sqlx::Error>(pids);
             }
             tokio::task::yield_now().await;
         }
     })
     .await
     .map_err(|_| "advisory lock waiters did not reach the deterministic gate")??;
-    Ok(())
+    Ok(pids)
 }
 
 struct TestClock(AtomicI64);

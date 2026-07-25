@@ -1162,16 +1162,138 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     )
     .await?;
     assert_eq!(cancellation.status(), StatusCode::OK);
-    let v4_created = send_history_recovery_request_v4(
-        app.clone(),
-        request_idempotency,
-        enrollment_capability,
-        response_capability,
-        v4_request.clone(),
+    // Hold the exact identity advisory lock while four independent HTTP
+    // runtimes enter first admission. The gate releases only after every
+    // distinct backend PID is observed waiting on that lock; this proves the
+    // contenders are real lock waiters rather than an accidental serial test.
+    let concurrent_names = [
+        "history-v4-concurrent-0",
+        "history-v4-concurrent-1",
+        "history-v4-concurrent-2",
+        "history-v4-concurrent-3",
+    ];
+    let concurrent_stores = [
+        IdentityPgStore::connect(
+            harness
+                .identity_runtime_options()
+                .application_name(concurrent_names[0]),
+            1,
+        )
+        .await?,
+        IdentityPgStore::connect(
+            harness
+                .identity_runtime_options()
+                .application_name(concurrent_names[1]),
+            1,
+        )
+        .await?,
+        IdentityPgStore::connect(
+            harness
+                .identity_runtime_options()
+                .application_name(concurrent_names[2]),
+            1,
+        )
+        .await?,
+        IdentityPgStore::connect(
+            harness
+                .identity_runtime_options()
+                .application_name(concurrent_names[3]),
+            1,
+        )
+        .await?,
+    ];
+    let concurrent_apps = concurrent_stores.map(|store| {
+        identity_bootstrap_router_with_state(
+            IdentityBootstrapState::with_clock_and_device_session_audience(
+                store,
+                clock.clone(),
+                AUDIENCE,
+            ),
+        )
+    });
+    let lock_key = i64::from_be_bytes(identity_id.digest_bytes()[..8].try_into()?);
+    let mut identity_fence = harness.admin_pool().begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *identity_fence)
+        .await?;
+    let gate = async {
+        let waiter_pids = wait_for_exact_advisory_waiters(
+            harness.admin_pool(),
+            lock_key,
+            &concurrent_names,
+        )
+        .await?;
+        identity_fence.rollback().await?;
+        Ok::<Vec<i32>, Box<dyn Error>>(waiter_pids)
+    };
+    let concurrent_requests = async {
+        tokio::join!(
+            send_history_recovery_request_v4(
+                concurrent_apps[0].clone(),
+                request_idempotency,
+                enrollment_capability,
+                response_capability,
+                v4_request.clone(),
+            ),
+            send_history_recovery_request_v4(
+                concurrent_apps[1].clone(),
+                request_idempotency,
+                enrollment_capability,
+                response_capability,
+                v4_request.clone(),
+            ),
+            send_history_recovery_request_v4(
+                concurrent_apps[2].clone(),
+                request_idempotency,
+                enrollment_capability,
+                response_capability,
+                v4_request.clone(),
+            ),
+            send_history_recovery_request_v4(
+                concurrent_apps[3].clone(),
+                request_idempotency,
+                enrollment_capability,
+                response_capability,
+                v4_request.clone(),
+            ),
+        )
+    };
+    let ((first, second, third, fourth), waiter_pids) =
+        tokio::join!(concurrent_requests, gate);
+    let waiter_pids = waiter_pids?;
+    assert_eq!(waiter_pids.len(), concurrent_names.len());
+    assert_eq!(
+        waiter_pids.iter().copied().collect::<std::collections::BTreeSet<_>>().len(),
+        concurrent_names.len(),
+    );
+    let concurrent_responses = vec![first?, second?, third?, fourth?];
+    let mut created_count = 0;
+    let mut replay_bodies = Vec::new();
+    for response in concurrent_responses {
+        let status = response.status();
+        assert!(status == StatusCode::CREATED || status == StatusCode::OK);
+        assert_history_recovery_request_v4_response_headers(
+            &response,
+            status,
+        );
+        if status == StatusCode::CREATED {
+            created_count += 1;
+        }
+        replay_bodies.push(to_bytes(response.into_body(), 16_384).await?.to_vec());
+    }
+    assert_eq!(created_count, 1);
+    let v4_receipt = replay_bodies
+        .first()
+        .cloned()
+        .ok_or("concurrent V4 response set is empty")?;
+    assert!(replay_bodies.iter().all(|body| body == &v4_receipt));
+    assert_history_recovery_request_rows(
+        harness.admin_pool(),
+        challenge.challenge_id(),
+        1,
     )
     .await?;
-    assert_history_recovery_request_v4_response_headers(&v4_created, StatusCode::CREATED);
-    let v4_receipt = to_bytes(v4_created.into_body(), 16_384).await?.to_vec();
     let v4_replay = send_history_recovery_request_v4(
         app.clone(),
         request_idempotency,
@@ -1182,6 +1304,67 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     .await?;
     assert_history_recovery_request_v4_response_headers(&v4_replay, StatusCode::OK);
     assert_eq!(to_bytes(v4_replay.into_body(), 16_384).await?, v4_receipt);
+
+    let changed_signed_request = history_recovery_request_v4_with_outer_tamper(
+        &v4_request,
+        &candidate,
+        17,
+        at(5_301).to_canonical_value(),
+    )?;
+    for response in send_four_history_recovery_request_v4(
+        &concurrent_apps,
+        request_idempotency,
+        enrollment_capability,
+        response_capability,
+        changed_signed_request,
+    )
+    .await?
+    {
+        assert_error(
+            response,
+            StatusCode::CONFLICT,
+            "IDEMPOTENCY_CONFLICT",
+        )
+        .await?;
+    }
+    for response in send_four_history_recovery_request_v4(
+        &concurrent_apps,
+        "history-recovery-v4-changed",
+        enrollment_capability,
+        response_capability,
+        v4_request.clone(),
+    )
+    .await?
+    {
+        assert_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        )
+        .await?;
+    }
+    for response in send_four_history_recovery_request_v4(
+        &concurrent_apps,
+        request_idempotency,
+        [74; 32],
+        response_capability,
+        v4_request.clone(),
+    )
+    .await?
+    {
+        assert_error(
+            response,
+            StatusCode::UNAUTHORIZED,
+            "DEVICE_ENROLLMENT_CAPABILITY_INVALID",
+        )
+        .await?;
+    }
+    assert_history_recovery_request_rows(
+        harness.admin_pool(),
+        challenge.challenge_id(),
+        1,
+    )
+    .await?;
     let cancellation_replay = cancel_enrollment_challenge(
         app.clone(),
         active_candidate.challenge_id(),
