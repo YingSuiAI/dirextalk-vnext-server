@@ -15,6 +15,14 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
     // `PostgresHarness::start` runs the complete forward migration set and
     // provisions the least-privilege runtime role. A failure here is a hard
     // preflight failure rather than a test skip.
-    let _harness = PostgresHarness::start().await?;
+    let harness = PostgresHarness::start().await?;
+    // Test-only privilege expansion is limited to the two Route Health
+    // ledger relations; production grants and tenant RLS remain unchanged.
+    sqlx::raw_sql(
+        "GRANT SELECT, INSERT ON agent.agent_route_health_receipts TO dtx_runtime_test;
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_runtime_test;",
+    )
+    .execute(harness.admin_pool())
+    .await?;
     Ok(())
 }
