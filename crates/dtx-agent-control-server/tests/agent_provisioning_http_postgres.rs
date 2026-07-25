@@ -2822,6 +2822,39 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     )
     .await?;
 
+    let mut replay_before = store.begin_tenant(tenant_id).await?;
+    let before_bootstrap: (i64, Vec<u8>) = sqlx::query_as(
+        "SELECT updated_at_ms, delivery_receipt_digest FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND bootstrap_id=$2",
+    ).bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(replay_before.connection()).await?;
+    let before_outbox: (String, Vec<u8>) = sqlx::query_as(
+        "SELECT state, result_digest FROM agent.agent_route_bootstrap_outbox WHERE tenant_id=$1 AND bootstrap_id=$2 AND command_kind='deliver_bootstrap'",
+    ).bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(replay_before.connection()).await?;
+    let before_head: (Uuid, Uuid, Uuid, Vec<u8>, Vec<u8>, i64) = sqlx::query_as(
+        "SELECT bootstrap_id, delivery_id, route_id, route_fence, capsule_digest, installed_at_ms FROM agent.agent_route_binding_heads WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3 AND installation_id=$4 AND binding_id=$5 AND agent_control_device_id=$6",
+    ).bind(Uuid::from(tenant_id)).bind(owner_id.to_string()).bind(Uuid::from(owner_device_id)).bind(Uuid::from(installation_id)).bind(Uuid::from(binding_id)).bind(Uuid::from(agent_control_device_id)).fetch_one(replay_before.connection()).await?;
+    let before_cursor: i64 = sqlx::query_scalar("SELECT acknowledged_command_sequence FROM agent.connector_control_stream_heads WHERE tenant_id=$1 AND connector_id=$2").bind(Uuid::from(tenant_id)).bind(Uuid::from(connector.connector_id())).fetch_one(replay_before.connection()).await?;
+    replay_before.rollback().await?;
+    app.complete_agent_route_bootstrap(
+        authenticate_at(
+            index.clone(),
+            &ca_der,
+            &completion.credential,
+            route_auth_time_ms,
+        )?,
+        installed.clone(),
+    )
+    .await?;
+    let mut replay_after = store.begin_tenant(tenant_id).await?;
+    let after_bootstrap: (i64, Vec<u8>) = sqlx::query_as("SELECT updated_at_ms, delivery_receipt_digest FROM agent.agent_route_bootstraps WHERE tenant_id=$1 AND bootstrap_id=$2").bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(replay_after.connection()).await?;
+    let after_outbox: (String, Vec<u8>) = sqlx::query_as("SELECT state, result_digest FROM agent.agent_route_bootstrap_outbox WHERE tenant_id=$1 AND bootstrap_id=$2 AND command_kind='deliver_bootstrap'").bind(Uuid::from(tenant_id)).bind(Uuid::from(bootstrap_id)).fetch_one(replay_after.connection()).await?;
+    let after_head: (Uuid, Uuid, Uuid, Vec<u8>, Vec<u8>, i64) = sqlx::query_as("SELECT bootstrap_id, delivery_id, route_id, route_fence, capsule_digest, installed_at_ms FROM agent.agent_route_binding_heads WHERE tenant_id=$1 AND owner_identity_id=$2 AND owner_device_id=$3 AND installation_id=$4 AND binding_id=$5 AND agent_control_device_id=$6").bind(Uuid::from(tenant_id)).bind(owner_id.to_string()).bind(Uuid::from(owner_device_id)).bind(Uuid::from(installation_id)).bind(Uuid::from(binding_id)).bind(Uuid::from(agent_control_device_id)).fetch_one(replay_after.connection()).await?;
+    let after_cursor: i64 = sqlx::query_scalar("SELECT acknowledged_command_sequence FROM agent.connector_control_stream_heads WHERE tenant_id=$1 AND connector_id=$2").bind(Uuid::from(tenant_id)).bind(Uuid::from(connector.connector_id())).fetch_one(replay_after.connection()).await?;
+    assert_eq!(after_bootstrap, before_bootstrap);
+    assert_eq!(after_outbox, before_outbox);
+    assert_eq!(after_head, before_head);
+    assert_eq!(after_cursor, before_cursor);
+    replay_after.rollback().await?;
+
     let mut installed_session = store.begin_tenant(tenant_id).await?;
     let installed_state: String = sqlx::query_scalar(
         "SELECT state FROM agent.agent_route_bootstraps
