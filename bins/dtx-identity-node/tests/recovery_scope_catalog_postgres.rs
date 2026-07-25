@@ -656,6 +656,23 @@ fn history_recovery_request_v4_with_outer_tamper(
     resign_history_recovery_request_v4(CanonicalValue::Map(fields), candidate)
 }
 
+fn history_recovery_request_v4_with_idempotency(
+    bytes: &[u8],
+    candidate: &SigningKey,
+    idempotency: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    history_recovery_request_v4_with_outer_tamper(
+        bytes,
+        candidate,
+        20,
+        Sha256Digest::hash_domain(
+            b"dirextalk.history-recovery.request-idempotency.v4\0",
+            idempotency.as_bytes(),
+        )
+        .to_canonical_value(),
+    )
+}
+
 fn history_recovery_request_v4_with_payload_tamper(
     bytes: &[u8],
     candidate: &SigningKey,

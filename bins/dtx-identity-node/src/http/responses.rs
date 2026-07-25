@@ -378,6 +378,11 @@ pub(crate) fn history_recovery_request_v4_failure_response(
             HistoryRecoveryRequestV4ErrorCode::PreparationRevoked,
             false,
         ),
+        HistoryRecoveryRequestV4Failure::CatalogExpired => (
+            StatusCode::GONE,
+            HistoryRecoveryRequestV4ErrorCode::CatalogExpired,
+            false,
+        ),
         HistoryRecoveryRequestV4Failure::PreparationInvalidated => (
             StatusCode::PRECONDITION_FAILED,
             HistoryRecoveryRequestV4ErrorCode::PreparationInvalidated,

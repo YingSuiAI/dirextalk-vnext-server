@@ -1162,6 +1162,275 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     )
     .await?;
     assert_eq!(cancellation.status(), StatusCode::OK);
+
+    // First admission distinguishes persisted lifecycle terminal states from
+    // nonterminal coordinate drift.  Each request uses a fresh idempotency
+    // digest but the same approved challenge and artifacts, and every
+    // rejected path is asserted before any request row can be written.
+    let preparation_snapshot: (i64, Option<i64>) = sqlx::query_as(
+        "SELECT expires_at_ms,provider_expires_at_ms
+           FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1",
+    )
+    .bind(*challenge.challenge_id().as_uuid())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    let catalog_expiry: i64 = sqlx::query_scalar(
+        "SELECT expires_at_ms FROM identity.recovery_scope_catalogs
+          WHERE identity_id=$1 ORDER BY generation DESC LIMIT 1",
+    )
+    .bind(identity_id.to_string())
+    .fetch_one(harness.admin_pool())
+    .await?;
+
+    let expired_request = history_recovery_request_v4_with_outer_tamper(
+        &history_recovery_request_v4_with_idempotency(
+            &v4_request,
+            &candidate,
+            "history-recovery-v4-lifecycle-request-expired",
+        )?,
+        &candidate,
+        18,
+        at(4_900).to_canonical_value(),
+    )?;
+    let expired_request = history_recovery_request_v4_with_outer_tamper(
+        &expired_request,
+        &candidate,
+        17,
+        at(4_500).to_canonical_value(),
+    )?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            "history-recovery-v4-lifecycle-request-expired",
+            enrollment_capability,
+            response_capability,
+            expired_request,
+        )
+        .await?,
+        StatusCode::GONE,
+        "RECOVERY_PREPARATION_EXPIRED",
+    )
+    .await?;
+    assert_history_recovery_request_rows(harness.admin_pool(), challenge.challenge_id(), 0).await?;
+
+    let expired_preparation = history_recovery_request_v4_with_idempotency(
+        &v4_request,
+        &candidate,
+        "history-recovery-v4-lifecycle-preparation-expired",
+    )?;
+    let expired_preparation = history_recovery_request_v4_with_outer_tamper(
+        &history_recovery_request_v4_with_outer_tamper(
+            &expired_preparation,
+            &candidate,
+            18,
+            at(4_900).to_canonical_value(),
+        )?,
+        &candidate,
+        17,
+        at(4_500).to_canonical_value(),
+    )?;
+    let mut lifecycle_tx = harness.admin_pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *lifecycle_tx)
+        .await?;
+    sqlx::query(
+        "UPDATE identity.recovery_scope_catalog_preparations
+            SET expires_at_ms=$2,provider_expires_at_ms=$2 WHERE request_id=$1",
+    )
+    .bind(*challenge.challenge_id().as_uuid())
+    .bind(6_000_i64)
+    .execute(&mut *lifecycle_tx)
+    .await?;
+    lifecycle_tx.commit().await?;
+    clock.set(7_000);
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            "history-recovery-v4-lifecycle-preparation-expired",
+            enrollment_capability,
+            response_capability,
+            expired_preparation,
+        )
+        .await?,
+        StatusCode::GONE,
+        "RECOVERY_PREPARATION_EXPIRED",
+    )
+    .await?;
+    assert_history_recovery_request_rows(harness.admin_pool(), challenge.challenge_id(), 0).await?;
+    let mut lifecycle_tx = harness.admin_pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *lifecycle_tx)
+        .await?;
+    sqlx::query(
+        "UPDATE identity.recovery_scope_catalog_preparations
+            SET expires_at_ms=$2,provider_expires_at_ms=$3 WHERE request_id=$1",
+    )
+    .bind(*challenge.challenge_id().as_uuid())
+    .bind(preparation_snapshot.0)
+    .bind(preparation_snapshot.1)
+    .execute(&mut *lifecycle_tx)
+    .await?;
+    clock.set(5_300);
+    lifecycle_tx.commit().await?;
+
+    let expired_provider = history_recovery_request_v4_with_idempotency(
+        &v4_request,
+        &candidate,
+        "history-recovery-v4-lifecycle-provider-expired",
+    )?;
+    let mut lifecycle_tx = harness.admin_pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *lifecycle_tx)
+        .await?;
+    sqlx::query(
+        "UPDATE identity.recovery_scope_catalog_preparations
+            SET provider_expires_at_ms=$2 WHERE request_id=$1",
+    )
+    .bind(*challenge.challenge_id().as_uuid())
+    .bind(6_000_i64)
+    .execute(&mut *lifecycle_tx)
+    .await?;
+    lifecycle_tx.commit().await?;
+    clock.set(7_000);
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            "history-recovery-v4-lifecycle-provider-expired",
+            enrollment_capability,
+            response_capability,
+            expired_provider,
+        )
+        .await?,
+        StatusCode::GONE,
+        "RECOVERY_PREPARATION_EXPIRED",
+    )
+    .await?;
+    assert_history_recovery_request_rows(harness.admin_pool(), challenge.challenge_id(), 0).await?;
+    clock.set(5_300);
+    let mut lifecycle_tx = harness.admin_pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *lifecycle_tx)
+        .await?;
+    sqlx::query(
+        "UPDATE identity.recovery_scope_catalog_preparations
+            SET provider_expires_at_ms=$2 WHERE request_id=$1",
+    )
+    .bind(*challenge.challenge_id().as_uuid())
+    .bind(preparation_snapshot.1)
+    .execute(&mut *lifecycle_tx)
+    .await?;
+    lifecycle_tx.commit().await?;
+
+    let expired_catalog = history_recovery_request_v4_with_idempotency(
+        &v4_request,
+        &candidate,
+        "history-recovery-v4-lifecycle-catalog-expired",
+    )?;
+    let mut lifecycle_tx = harness.admin_pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *lifecycle_tx)
+        .await?;
+    sqlx::query(
+        "UPDATE identity.recovery_scope_catalogs SET expires_at_ms=$2
+          WHERE identity_id=$1 AND generation=1",
+    )
+    .bind(identity_id.to_string())
+    .bind(6_000_i64)
+    .execute(&mut *lifecycle_tx)
+    .await?;
+    lifecycle_tx.commit().await?;
+    clock.set(7_000);
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            "history-recovery-v4-lifecycle-catalog-expired",
+            enrollment_capability,
+            response_capability,
+            expired_catalog,
+        )
+        .await?,
+        StatusCode::GONE,
+        "RECOVERY_CATALOG_EXPIRED",
+    )
+    .await?;
+    assert_history_recovery_request_rows(harness.admin_pool(), challenge.challenge_id(), 0).await?;
+    clock.set(5_300);
+    let mut lifecycle_tx = harness.admin_pool().begin().await?;
+    sqlx::query("SET LOCAL session_replication_role='replica'")
+        .execute(&mut *lifecycle_tx)
+        .await?;
+    sqlx::query(
+        "UPDATE identity.recovery_scope_catalogs SET expires_at_ms=$2
+          WHERE identity_id=$1 AND generation=1",
+    )
+    .bind(identity_id.to_string())
+    .bind(catalog_expiry)
+    .execute(&mut *lifecycle_tx)
+    .await?;
+    lifecycle_tx.commit().await?;
+
+    let drift_request = history_recovery_request_v4_with_idempotency(
+        &v4_request,
+        &candidate,
+        "history-recovery-v4-lifecycle-catalog-drift",
+    )?;
+    sqlx::query(
+        "UPDATE identity.recovery_scope_catalogs SET head_digest=$2
+          WHERE identity_id=$1 AND generation=1",
+    )
+    .bind(identity_id.to_string())
+    .bind([99_u8; 32].as_slice())
+    .execute(harness.admin_pool())
+    .await?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            "history-recovery-v4-lifecycle-catalog-drift",
+            enrollment_capability,
+            response_capability,
+            drift_request,
+        )
+        .await?,
+        StatusCode::PRECONDITION_FAILED,
+        "CATALOG_HEAD_CHANGED",
+    )
+    .await?;
+    assert_history_recovery_request_rows(harness.admin_pool(), challenge.challenge_id(), 0).await?;
+    sqlx::query(
+        "UPDATE identity.recovery_scope_catalogs SET head_digest=$2
+          WHERE identity_id=$1 AND generation=1",
+    )
+    .bind(identity_id.to_string())
+    .bind(catalog_head_digest.as_bytes().as_slice())
+    .execute(harness.admin_pool())
+    .await?;
+
+    sqlx::query("REVOKE SELECT ON identity.recovery_scope_catalogs FROM dtx_identity_runtime")
+        .execute(harness.admin_pool())
+        .await?;
+    let unavailable_request = history_recovery_request_v4_with_idempotency(
+        &v4_request,
+        &candidate,
+        "history-recovery-v4-lifecycle-unavailable",
+    )?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            "history-recovery-v4-lifecycle-unavailable",
+            enrollment_capability,
+            response_capability,
+            unavailable_request,
+        )
+        .await?,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "IDENTITY_SERVICE_UNAVAILABLE",
+    )
+    .await?;
+    assert_history_recovery_request_rows(harness.admin_pool(), challenge.challenge_id(), 0).await?;
+    sqlx::query("GRANT SELECT ON identity.recovery_scope_catalogs TO dtx_identity_runtime")
+        .execute(harness.admin_pool())
+        .await?;
+
     // Hold the exact identity advisory lock while four independent HTTP
     // runtimes enter first admission. The gate releases only after every
     // distinct backend PID is observed waiting on that lock; this proves the

@@ -89,11 +89,25 @@ impl DeviceEnrollmentRepository {
                 return Err(IdentityPersistenceError::IdempotencyConflict);
             }
             let challenge = lock_challenge(tx.connection(), command.request_id).await?;
-            if challenge.identity_id != identity_hint
-                || challenge.protocol_version != 1
-                || challenge.state != DurableChallengeState::Approved
-                || challenge.cancelled_at.is_some()
-                || challenge.approved_head
+            if challenge.identity_id != identity_hint || challenge.protocol_version != 1 {
+                return Err(IdentityPersistenceError::RecoveryPreparationInvalidated);
+            }
+            if challenge.cancelled_at.is_some()
+                || challenge.state == DurableChallengeState::Cancelled
+            {
+                return Err(IdentityPersistenceError::RecoveryPreparationRevoked);
+            }
+            if challenge.state == DurableChallengeState::Open {
+                return Err(if now >= challenge.expires_at {
+                    IdentityPersistenceError::RecoveryPreparationExpired
+                } else {
+                    IdentityPersistenceError::RecoveryPreparationInvalidated
+                });
+            }
+            if now >= command.expires_at {
+                return Err(IdentityPersistenceError::RecoveryPreparationExpired);
+            }
+            if challenge.approved_head
                     != Some(IdentityLogHead::observed(
                         command.identity_id,
                         command.post_head_sequence,
@@ -128,6 +142,16 @@ impl DeviceEnrollmentRepository {
                 .ok_or(IdentityPersistenceError::RecoveryPreparationRevoked)?;
             let provider_digest: Vec<u8> = prep.try_get::<Option<Vec<u8>>,_>("provider_response_digest")?
                 .ok_or(IdentityPersistenceError::RecoveryPreparationInvalidated)?;
+            if now.get() >= prep.try_get::<i64, _>("expires_at_ms")? {
+                return Err(IdentityPersistenceError::RecoveryPreparationExpired);
+            }
+            if now.get()
+                >= prep
+                    .try_get::<Option<i64>, _>("provider_expires_at_ms")?
+                    .ok_or(IdentityPersistenceError::RecoveryPreparationRevoked)?
+            {
+                return Err(IdentityPersistenceError::RecoveryPreparationExpired);
+            }
             if identity != command.identity_id.to_string()
                 || prep.try_get::<uuid::Uuid,_>("candidate_device_id")? != *command.target_device_id.as_uuid()
                 || prep.try_get::<Vec<u8>,_>("candidate_signing_key")?.as_slice() != command.target_device_signing_key.as_bytes()
@@ -137,12 +161,10 @@ impl DeviceEnrollmentRepository {
                 || preparation_bytes != command.preparation_bytes
                 || preparation_digest.as_slice() != command.preparation_digest.as_bytes()
                 || prep.try_get::<Vec<u8>,_>("enrollment_capability_hash")?.as_slice() != command.enrollment_capability_digest.as_bytes()
-                || now < command.issued_at
-                || now >= command.expires_at
                 || now.get() < prep.try_get::<i64,_>("issued_at_ms")?
-                || now.get() >= prep.try_get::<i64,_>("expires_at_ms")?
                 || command.issued_at.get() < prep.try_get::<i64,_>("issued_at_ms")?
                 || command.expires_at.get() > prep.try_get::<i64,_>("expires_at_ms")?
+                || now < command.issued_at
             {
                 return Err(IdentityPersistenceError::RecoveryPreparationInvalidated);
             }
@@ -152,6 +174,9 @@ impl DeviceEnrollmentRepository {
                 .fetch_optional(&mut *tx.connection())
                 .await?
                 .ok_or(IdentityPersistenceError::RecoveryCatalogHeadChanged)?;
+            if now.get() >= catalog.try_get::<i64, _>("expires_at_ms")? {
+                return Err(IdentityPersistenceError::RecoveryCatalogExpired);
+            }
             if catalog.try_get::<uuid::Uuid,_>("catalog_id")?
                     != prep.try_get::<uuid::Uuid,_>("catalog_id")?
                 || catalog.try_get::<i64,_>("generation")?
@@ -162,13 +187,19 @@ impl DeviceEnrollmentRepository {
                     != command.pre_head_sequence.get() as i64
                 || catalog.try_get::<Vec<u8>,_>("observed_head_hash")?.as_slice()
                     != command.pre_head_hash.as_bytes()
-                || now.get() >= catalog.try_get::<i64,_>("expires_at_ms")?
-                || catalog.try_get::<uuid::Uuid,_>("authority_device_id")?
-                    != prep.try_get::<uuid::Uuid,_>("authority_device_id")?
-                || catalog.try_get::<Vec<u8>,_>("authority_signing_key")?.as_slice()
-                    != prep.try_get::<Vec<u8>,_>("authority_signing_key")?.as_slice()
             {
                 return Err(IdentityPersistenceError::RecoveryCatalogHeadChanged);
+            }
+            if catalog.try_get::<uuid::Uuid, _>("authority_device_id")?
+                != prep.try_get::<uuid::Uuid, _>("authority_device_id")?
+                || catalog
+                    .try_get::<Vec<u8>, _>("authority_signing_key")?
+                    .as_slice()
+                    != prep
+                        .try_get::<Vec<u8>, _>("authority_signing_key")?
+                        .as_slice()
+            {
+                return Err(IdentityPersistenceError::RecoveryAuthorityChanged);
             }
             validate_history_recovery_manifest_v2(&command.manifest_bytes, &command, &catalog, &prep)?;
 
@@ -180,6 +211,9 @@ impl DeviceEnrollmentRepository {
                 command.request_id,
                 provider_bytes.clone(),
             )?;
+            if now >= provider.expires_at {
+                return Err(IdentityPersistenceError::RecoveryPreparationExpired);
+            }
             if Sha256Digest::from_bytes(provider_digest.try_into().map_err(|_| IdentityPersistenceError::CorruptData("provider response digest"))?) != provider.digest
                 || provider.identity_id != command.identity_id
                 || provider.catalog_id != prep.try_get::<uuid::Uuid,_>("catalog_id")?
@@ -191,7 +225,6 @@ impl DeviceEnrollmentRepository {
                 || provider.successor_head != IdentityLogHead::observed(command.identity_id, command.post_head_sequence, command.post_head_hash)?
                 || provider.recipient_key_digest != Sha256Digest::hash_domain(RECIPIENT_KEY_HASH_DOMAIN, command.recipient_encryption_key.as_bytes())
                 || provider.expires_at > command.expires_at
-                || now >= provider.expires_at
                 || (provider.authority_kind == 1
                     && (provider.authority_device_id
                         != Some(parse_device_id(catalog.try_get::<uuid::Uuid,_>("authority_device_id")?)?)

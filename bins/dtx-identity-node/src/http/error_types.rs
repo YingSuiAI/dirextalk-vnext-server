@@ -160,6 +160,7 @@ pub(crate) enum HistoryRecoveryRequestV4Failure {
     IdempotencyConflict,
     PreparationExpired,
     PreparationRevoked,
+    CatalogExpired,
     PreparationInvalidated,
     IdentityHeadChanged,
     CatalogHeadChanged,
@@ -180,6 +181,8 @@ pub(crate) enum HistoryRecoveryRequestV4ErrorCode {
     PreparationExpired,
     #[serde(rename = "RECOVERY_PREPARATION_REVOKED")]
     PreparationRevoked,
+    #[serde(rename = "RECOVERY_CATALOG_EXPIRED")]
+    CatalogExpired,
     #[serde(rename = "RECOVERY_PREPARATION_INVALIDATED")]
     PreparationInvalidated,
     #[serde(rename = "IDENTITY_HEAD_CHANGED")]

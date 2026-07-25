@@ -480,9 +480,11 @@ pub(crate) fn map_history_recovery_request_v4_persistence_error(
         IdentityPersistenceError::RecoveryPreparationExpired => {
             HistoryRecoveryRequestV4Failure::PreparationExpired
         }
-        IdentityPersistenceError::DeviceEnrollmentChallengeExpired
-        | IdentityPersistenceError::RecoveryCatalogExpired => {
+        IdentityPersistenceError::DeviceEnrollmentChallengeExpired => {
             HistoryRecoveryRequestV4Failure::PreparationExpired
+        }
+        IdentityPersistenceError::RecoveryCatalogExpired => {
+            HistoryRecoveryRequestV4Failure::CatalogExpired
         }
         IdentityPersistenceError::RecoveryPreparationRevoked => {
             HistoryRecoveryRequestV4Failure::PreparationRevoked
