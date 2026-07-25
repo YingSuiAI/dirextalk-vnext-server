@@ -989,6 +989,84 @@ pub(crate) fn agent_route_bootstrap_delivery_body(
     expires_at: i64,
     owner_key: &SigningKey,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
+    agent_route_bootstrap_delivery_body_with_pin(
+        bootstrap_id,
+        delivery_id,
+        tenant_id,
+        installation_id,
+        binding_id,
+        agent_control_device_id,
+        owner_id,
+        owner_device_id,
+        recipient_id,
+        route_id,
+        capsule_digest,
+        opaque_sealed_bootstrap,
+        expires_at,
+        owner_key,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agent_route_bootstrap_delivery_body_v2(
+    bootstrap_id: AgentRouteBootstrapId,
+    delivery_id: AgentRouteDeliveryId,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    owner_id: IdentityId,
+    owner_device_id: DeviceId,
+    recipient_id: AgentRouteRecipientId,
+    route_id: ConversationId,
+    capsule_digest: Sha256Digest,
+    opaque_sealed_bootstrap: Vec<u8>,
+    expires_at: i64,
+    owner_key: &SigningKey,
+    server_receipt_key_id: RouteHealthKeyId,
+    server_receipt_public_key_digest: Sha256Digest,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    agent_route_bootstrap_delivery_body_with_pin(
+        bootstrap_id,
+        delivery_id,
+        tenant_id,
+        installation_id,
+        binding_id,
+        agent_control_device_id,
+        owner_id,
+        owner_device_id,
+        recipient_id,
+        route_id,
+        capsule_digest,
+        opaque_sealed_bootstrap,
+        expires_at,
+        owner_key,
+        Some(server_receipt_key_id),
+        Some(server_receipt_public_key_digest),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_route_bootstrap_delivery_body_with_pin(
+    bootstrap_id: AgentRouteBootstrapId,
+    delivery_id: AgentRouteDeliveryId,
+    tenant_id: TenantId,
+    installation_id: InstallationId,
+    binding_id: BindingId,
+    agent_control_device_id: AgentDeviceId,
+    owner_id: IdentityId,
+    owner_device_id: DeviceId,
+    recipient_id: AgentRouteRecipientId,
+    route_id: ConversationId,
+    capsule_digest: Sha256Digest,
+    opaque_sealed_bootstrap: Vec<u8>,
+    expires_at: i64,
+    owner_key: &SigningKey,
+    server_receipt_key_id: Option<RouteHealthKeyId>,
+    server_receipt_public_key_digest: Option<Sha256Digest>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
     let binding = CanonicalValue::Map(vec![
         (u(1), u(1)),
         (u(2), text(bootstrap_id)),
@@ -1004,14 +1082,42 @@ pub(crate) fn agent_route_bootstrap_delivery_body(
         (u(12), bytes(capsule_digest.as_bytes())),
         (u(13), CanonicalValue::Bytes(opaque_sealed_bootstrap)),
         (u(14), UtcMillis::new(expires_at)?.to_canonical_value()),
+        (u(15), optional_text(server_receipt_key_id)),
+        (
+            u(16),
+            server_receipt_public_key_digest
+                .map(|digest| bytes(digest.as_bytes()))
+                .unwrap_or(CanonicalValue::Null),
+        ),
     ]);
-    signed_owner_body(
-        binding,
-        b"dirextalk.agent-route-bootstrap-delivery-binding.v1\0",
-        b"dirextalk.agent-route-bootstrap-delivery-signature.v1\0",
-        owner_key,
-        None,
-    )
+    let binding = if server_receipt_key_id.is_some() && server_receipt_public_key_digest.is_some() {
+        binding
+    } else {
+        let CanonicalValue::Map(mut fields) = binding else {
+            unreachable!()
+        };
+        fields.truncate(14);
+        CanonicalValue::Map(fields)
+    };
+    let (binding_domain, signature_domain) =
+        if server_receipt_key_id.is_some() && server_receipt_public_key_digest.is_some() {
+            (
+                b"dirextalk.agent-route-bootstrap-delivery-binding.v2\0".as_slice(),
+                b"dirextalk.agent-route-bootstrap-delivery-signature.v2\0".as_slice(),
+            )
+        } else {
+            (
+                b"dirextalk.agent-route-bootstrap-delivery-binding.v1\0".as_slice(),
+                b"dirextalk.agent-route-bootstrap-delivery-signature.v1\0".as_slice(),
+            )
+        };
+    signed_owner_body(binding, binding_domain, signature_domain, owner_key, None)
+}
+
+fn optional_text(value: Option<RouteHealthKeyId>) -> CanonicalValue {
+    value.map_or(CanonicalValue::Null, |value| {
+        CanonicalValue::Text(value.to_string())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

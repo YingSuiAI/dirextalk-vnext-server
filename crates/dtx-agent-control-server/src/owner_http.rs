@@ -4323,7 +4323,9 @@ mod tests {
     use dtx_agent_control::Sha256Digest as ControlSha256Digest;
     use dtx_agent_registry::PrivacyPolicyDigest;
     use dtx_domain::{
-        ConversationId, DeviceId, GrantId, InstallationId, RequestId, Revision, TenantId,
+        AgentDeviceId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId,
+        BindingId, ConversationId, DeviceId, GrantId, InstallationId, RequestId, Revision,
+        RouteHealthKeyId, TenantId,
     };
     use dtx_wire::{CanonicalValue, decode_deterministic_cbor, encode_deterministic_cbor};
     use dtx_wire::{Sha256Digest, UtcMillis};
@@ -4332,12 +4334,13 @@ mod tests {
     use super::{
         AgentProvisioningDeliveryReceipt, AgentProvisioningOwnerError,
         ConversationGrantOwnerAction, PRIVATE_CONVERSATION_PROFILE_V1,
-        PRIVATE_CONVERSATION_TOOLS_PROFILE_V1, REVOCATION_BINDING_DOMAIN, approval_status,
-        conversation_grant_receipt_cbor, delivery_receipt_cbor, delivery_status, parse_approval,
-        parse_connector_projection_query, parse_connector_projection_representation,
-        parse_conversation_grant, parse_conversation_grant_fence,
-        parse_conversation_grant_operation, parse_delivery, parse_device_session,
-        parse_idempotency, parse_revocation, private_conversation_permissions,
+        PRIVATE_CONVERSATION_TOOLS_PROFILE_V1, REVOCATION_BINDING_DOMAIN, agent_route_target_cbor,
+        approval_status, conversation_grant_receipt_cbor, delivery_receipt_cbor, delivery_status,
+        parse_agent_route_bootstrap_delivery, parse_approval, parse_connector_projection_query,
+        parse_connector_projection_representation, parse_conversation_grant,
+        parse_conversation_grant_fence, parse_conversation_grant_operation, parse_delivery,
+        parse_device_session, parse_idempotency, parse_revocation,
+        private_conversation_permissions,
     };
 
     const VECTORS: &str = include_str!(
@@ -4809,6 +4812,209 @@ mod tests {
             parse_revocation(&changed),
             Err(AgentProvisioningOwnerError::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn route_bootstrap_target_projection_keeps_legacy_and_pinned_shapes_distinct() {
+        let tenant_id: TenantId = "0190f2a5-7b1c-7abc-8def-012345678901".parse().unwrap();
+        let installation_id: InstallationId =
+            "0190f2a5-7b1c-7abc-8def-012345678902".parse().unwrap();
+        let binding_id: BindingId = "0190f2a5-7b1c-7abc-8def-012345678903".parse().unwrap();
+        let device_id: AgentDeviceId = "0190f2a5-7b1c-7abc-8def-012345678904".parse().unwrap();
+        let legacy = agent_route_target_cbor(
+            tenant_id,
+            installation_id,
+            binding_id,
+            device_id,
+            None,
+            None,
+        )
+        .unwrap();
+        let legacy_value = decode_deterministic_cbor(&legacy).unwrap();
+        let CanonicalValue::Map(legacy_fields) = legacy_value else {
+            panic!("target projection must be a map")
+        };
+        assert_eq!(legacy_fields.len(), 5);
+        assert_eq!(legacy_fields[0].1, CanonicalValue::Unsigned(1));
+
+        let key_id = RouteHealthKeyId::new();
+        let public_key = [0x42; 32];
+        let pinned = agent_route_target_cbor(
+            tenant_id,
+            installation_id,
+            binding_id,
+            device_id,
+            Some(key_id),
+            Some(public_key),
+        )
+        .unwrap();
+        let pinned_value = decode_deterministic_cbor(&pinned).unwrap();
+        let CanonicalValue::Map(pinned_fields) = pinned_value else {
+            panic!("target projection must be a map")
+        };
+        assert_eq!(pinned_fields.len(), 7);
+        assert_eq!(pinned_fields[0].1, CanonicalValue::Unsigned(2));
+        assert_eq!(pinned_fields[5].0, CanonicalValue::Unsigned(6));
+        assert_eq!(pinned_fields[6].0, CanonicalValue::Unsigned(7));
+        assert_eq!(
+            pinned_fields[6].1,
+            CanonicalValue::Bytes(public_key.to_vec())
+        );
+        assert_ne!(legacy, pinned);
+    }
+
+    #[test]
+    fn route_bootstrap_delivery_v2_requires_an_exact_receipt_pin_pair() {
+        let key_id = RouteHealthKeyId::new();
+        let digest = [0x55; 32];
+        let mut fields = route_bootstrap_delivery_fields(Some(key_id), Some(digest.to_vec()));
+        let encoded = route_bootstrap_delivery_body(&fields);
+        let parsed = parse_agent_route_bootstrap_delivery(&encoded).unwrap();
+        assert_eq!(parsed.server_receipt_key_id, Some(key_id));
+        assert_eq!(
+            parsed.server_receipt_public_key_digest.unwrap().as_bytes(),
+            &digest
+        );
+
+        fields.retain(|(key, _)| *key != CanonicalValue::Unsigned(15));
+        assert_eq!(
+            parse_agent_route_bootstrap_delivery(&route_bootstrap_delivery_body(&fields)),
+            Err(AgentProvisioningOwnerError::InvalidRequest)
+        );
+        let mut fields = route_bootstrap_delivery_fields(Some(key_id), Some(digest.to_vec()));
+        fields.retain(|(key, _)| *key != CanonicalValue::Unsigned(16));
+        assert_eq!(
+            parse_agent_route_bootstrap_delivery(&route_bootstrap_delivery_body(&fields)),
+            Err(AgentProvisioningOwnerError::InvalidRequest)
+        );
+
+        let mut fields = route_bootstrap_delivery_fields(Some(key_id), Some(digest.to_vec()));
+        fields[14].1 = CanonicalValue::Text(RouteHealthKeyId::new().to_string());
+        // Parsing preserves the supplied pair; the transaction fence compares it
+        // against the persisted bootstrap snapshot before any mutation.
+        let parsed =
+            parse_agent_route_bootstrap_delivery(&route_bootstrap_delivery_body(&fields)).unwrap();
+        assert_ne!(parsed.server_receipt_key_id, Some(key_id));
+    }
+
+    #[test]
+    fn route_bootstrap_delivery_v1_has_no_pin_fields_and_is_byte_stable() {
+        let fields = route_bootstrap_delivery_fields(None, None);
+        let encoded = route_bootstrap_delivery_body(&fields);
+        let parsed = parse_agent_route_bootstrap_delivery(&encoded).unwrap();
+        assert_eq!(parsed.server_receipt_key_id, None);
+        assert_eq!(parsed.server_receipt_public_key_digest, None);
+        assert_eq!(
+            encoded,
+            encode_deterministic_cbor(&decode_deterministic_cbor(&encoded).unwrap()).unwrap()
+        );
+    }
+
+    fn route_bootstrap_delivery_fields(
+        key_id: Option<RouteHealthKeyId>,
+        digest: Option<Vec<u8>>,
+    ) -> Vec<(CanonicalValue, CanonicalValue)> {
+        let bootstrap_id = AgentRouteBootstrapId::new();
+        let delivery_id = AgentRouteDeliveryId::new();
+        let tenant_id = TenantId::new();
+        let installation_id = InstallationId::new();
+        let binding_id = BindingId::new();
+        let agent_device_id = AgentDeviceId::new();
+        let owner_id: dtx_domain::IdentityId =
+            "dtxi155pujebuvamvkmouxx6okeiijjuzjxxw4ktjahrjy6z27frlobiq"
+                .parse()
+                .unwrap();
+        let owner_device_id = DeviceId::new();
+        let recipient_id = AgentRouteRecipientId::new();
+        let route_id = ConversationId::new();
+        let capsule = vec![0x77; 16];
+        let capsule_digest =
+            Sha256Digest::hash_domain(b"dirextalk.agent-route-bootstrap-capsule.v1\0", &capsule);
+        let mut fields = vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(2)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(bootstrap_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Text(delivery_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                CanonicalValue::Text(tenant_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(5),
+                CanonicalValue::Text(installation_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(6),
+                CanonicalValue::Text(binding_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(7),
+                CanonicalValue::Text(agent_device_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(8),
+                CanonicalValue::Text(owner_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(9),
+                CanonicalValue::Text(owner_device_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(10),
+                CanonicalValue::Text(recipient_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(11),
+                CanonicalValue::Text(route_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(12),
+                CanonicalValue::Bytes(capsule_digest.as_bytes().to_vec()),
+            ),
+            (CanonicalValue::Unsigned(13), CanonicalValue::Bytes(capsule)),
+            (
+                CanonicalValue::Unsigned(14),
+                CanonicalValue::Unsigned(1_756_700_000_000),
+            ),
+        ];
+        if let (Some(key_id), Some(digest)) = (key_id, digest) {
+            fields.push((
+                CanonicalValue::Unsigned(15),
+                CanonicalValue::Text(key_id.to_string()),
+            ));
+            fields.push((CanonicalValue::Unsigned(16), CanonicalValue::Bytes(digest)));
+        } else {
+            fields[0].1 = CanonicalValue::Unsigned(1);
+        }
+        fields
+    }
+
+    fn route_bootstrap_delivery_body(fields: &[(CanonicalValue, CanonicalValue)]) -> Vec<u8> {
+        let binding = CanonicalValue::Map(fields.to_vec());
+        let binding_bytes = encode_deterministic_cbor(&binding).unwrap();
+        let binding_domain = if fields.len() == 16 {
+            crate::agent_route_bootstrap::AGENT_ROUTE_BOOTSTRAP_DELIVERY_BINDING_DOMAIN_V2
+        } else {
+            crate::AGENT_ROUTE_BOOTSTRAP_DELIVERY_BINDING_DOMAIN
+        };
+        let binding_digest = Sha256Digest::hash_domain(binding_domain, &binding_bytes);
+        encode_deterministic_cbor(&CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), binding),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Bytes(binding_digest.as_bytes().to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Bytes(vec![0; 64]),
+            ),
+        ]))
+        .unwrap()
     }
 
     fn decoded_value(encoded_hex: &str) -> CanonicalValue {

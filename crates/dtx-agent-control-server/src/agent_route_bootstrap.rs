@@ -957,9 +957,12 @@ async fn deliver_in_transaction(
     {
         return Err(AgentRouteBootstrapError::Forbidden);
     }
-    if command.server_receipt_key_id != row.server_receipt_key_id
-        || command.server_receipt_public_key_digest != row.server_receipt_public_key_digest
-    {
+    if !receipt_pin_matches(
+        row.server_receipt_key_id,
+        row.server_receipt_public_key_digest,
+        command.server_receipt_key_id,
+        command.server_receipt_public_key_digest,
+    ) {
         return Err(AgentRouteBootstrapError::Conflict);
     }
     if let Some(delivery_id) = row.delivery_id {
@@ -1380,7 +1383,7 @@ async fn load_current_server_receipt_pin(
     tenant_id: TenantId,
     connector_id: ConnectorId,
 ) -> Result<(Option<RouteHealthKeyId>, Option<[u8; 32]>), AgentRouteBootstrapError> {
-    let row = match sqlx::query(
+    let row = sqlx::query(
         "SELECT route_health_receipt_key_id,
                 route_health_receipt_public_key
            FROM agent.connector_control_credentials
@@ -1392,10 +1395,7 @@ async fn load_current_server_receipt_pin(
     .bind(Uuid::from(connector_id))
     .fetch_optional(&mut *connection)
     .await
-    {
-        Ok(row) => row,
-        Err(_) => return Ok((None, None)),
-    };
+    .map_err(map_sql)?;
     let Some(row) = row else {
         // Legacy v1.5 fixtures may not materialize a credential revision row;
         // preserve the absence of a receipt pin rather than inventing one.
@@ -1464,14 +1464,19 @@ async fn resolve_owned_agent_route_bootstrap_target(
     .bind(connector_id)
     .fetch_optional(&mut *connection)
     .await
-    .ok()
-    .flatten();
+    .map_err(map_sql)?;
     let key_id: Option<Uuid> = pin
         .as_ref()
-        .and_then(|row| row.try_get("route_health_receipt_key_id").ok());
+        .map(|row| row.try_get("route_health_receipt_key_id"))
+        .transpose()
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?
+        .flatten();
     let public: Option<Vec<u8>> = pin
         .as_ref()
-        .and_then(|row| row.try_get("route_health_receipt_public_key").ok());
+        .map(|row| row.try_get("route_health_receipt_public_key"))
+        .transpose()
+        .map_err(|_| AgentRouteBootstrapError::Unavailable)?
+        .flatten();
     let (server_receipt_key_id, server_receipt_public_key) = match (key_id, public) {
         (None, None) => (None, None),
         (Some(key_id), Some(public)) => (
@@ -1920,6 +1925,139 @@ fn validate_delivery(
         return Err(AgentRouteBootstrapError::InvalidRequest);
     }
     Ok(())
+}
+
+fn receipt_pin_matches(
+    expected_key_id: Option<RouteHealthKeyId>,
+    expected_public_key_digest: Option<Sha256Digest>,
+    supplied_key_id: Option<RouteHealthKeyId>,
+    supplied_public_key_digest: Option<Sha256Digest>,
+) -> bool {
+    expected_key_id == supplied_key_id && expected_public_key_digest == supplied_public_key_digest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentRouteBootstrapState, owner_receipt_cbor, receipt_pin_matches};
+    use dtx_domain::{AgentRouteBootstrapId, RouteHealthKeyId, TenantId};
+    use dtx_wire::{CanonicalValue, Sha256Digest, UtcMillis, decode_deterministic_cbor};
+
+    #[test]
+    fn receipt_pin_fence_requires_the_exact_paired_id_and_digest() {
+        let key_a = RouteHealthKeyId::new();
+        let key_b = RouteHealthKeyId::new();
+        let digest_a = Sha256Digest::from_bytes([0x11; 32]);
+        let digest_b = Sha256Digest::from_bytes([0x22; 32]);
+        assert!(receipt_pin_matches(
+            Some(key_a),
+            Some(digest_a),
+            Some(key_a),
+            Some(digest_a)
+        ));
+        assert!(!receipt_pin_matches(
+            Some(key_a),
+            Some(digest_a),
+            None,
+            None
+        ));
+        assert!(!receipt_pin_matches(
+            Some(key_a),
+            Some(digest_a),
+            Some(key_a),
+            None
+        ));
+        assert!(!receipt_pin_matches(
+            Some(key_a),
+            Some(digest_a),
+            Some(key_b),
+            Some(digest_a)
+        ));
+        assert!(!receipt_pin_matches(
+            Some(key_a),
+            Some(digest_a),
+            Some(key_a),
+            Some(digest_b)
+        ));
+        assert!(!receipt_pin_matches(
+            Some(key_a),
+            Some(digest_a),
+            Some(key_b),
+            Some(digest_b)
+        ));
+        assert!(receipt_pin_matches(None, None, None, None));
+    }
+
+    #[test]
+    fn owner_receipt_v1_bytes_stay_legacy_and_pinned_replays_are_identical() {
+        let tenant_id = TenantId::new();
+        let bootstrap_id = AgentRouteBootstrapId::new();
+        let expires_at = UtcMillis::new(1_756_700_000_000).unwrap();
+        let updated_at = UtcMillis::new(1_756_699_999_000).unwrap();
+        let legacy = owner_receipt_cbor(
+            tenant_id,
+            bootstrap_id,
+            AgentRouteBootstrapState::PendingRecipient,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            expires_at,
+            updated_at,
+            None,
+        )
+        .unwrap();
+        let CanonicalValue::Map(legacy_fields) = decode_deterministic_cbor(&legacy).unwrap() else {
+            panic!("receipt must be a map")
+        };
+        assert_eq!(legacy_fields.len(), 11);
+        assert_eq!(legacy_fields[0].1, CanonicalValue::Unsigned(1));
+
+        let key_id = RouteHealthKeyId::new();
+        let digest = Sha256Digest::from_bytes([0x33; 32]);
+        let pinned = owner_receipt_cbor(
+            tenant_id,
+            bootstrap_id,
+            AgentRouteBootstrapState::PendingRecipient,
+            None,
+            None,
+            None,
+            None,
+            Some(key_id),
+            Some(digest),
+            expires_at,
+            updated_at,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            pinned,
+            owner_receipt_cbor(
+                tenant_id,
+                bootstrap_id,
+                AgentRouteBootstrapState::PendingRecipient,
+                None,
+                None,
+                None,
+                None,
+                Some(key_id),
+                Some(digest),
+                expires_at,
+                updated_at,
+                None,
+            )
+            .unwrap()
+        );
+        let CanonicalValue::Map(pinned_fields) = decode_deterministic_cbor(&pinned).unwrap() else {
+            panic!("receipt must be a map")
+        };
+        assert_eq!(pinned_fields.len(), 13);
+        assert_eq!(pinned_fields[0].1, CanonicalValue::Unsigned(2));
+        assert_eq!(pinned_fields[11].0, CanonicalValue::Unsigned(12));
+        assert_eq!(pinned_fields[12].0, CanonicalValue::Unsigned(13));
+        assert_ne!(legacy, pinned);
+    }
 }
 
 fn valid_stable_code(value: &str) -> bool {
