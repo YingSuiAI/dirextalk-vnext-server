@@ -1232,6 +1232,7 @@ dependencies = [
  "subtle",
  "testcontainers-modules",
  "tokio",
+ "tokio-stream",
  "uuid",
  "zeroize",
 ]

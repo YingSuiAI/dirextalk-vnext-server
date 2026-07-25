@@ -161,6 +161,88 @@ pub(crate) fn encode_pull_receipt(
     .map_err(|_| MailboxPersistenceError::InvalidCommand("mailbox pull receipt encoding"))
 }
 
+fn byte_string_header_len(length: usize) -> usize {
+    if length <= 23 {
+        1
+    } else if length <= 255 {
+        2
+    } else if length <= 65_535 {
+        3
+    } else if length <= u32::MAX as usize {
+        5
+    } else {
+        9
+    }
+}
+
+pub(crate) fn pull_receipt_within_limit(
+    mailbox_id: MailboxId,
+    next_sequence: SafeUint,
+    envelopes: &[PulledEnvelope],
+    candidate: Option<(&SafeUint, &EnvelopeId, usize, &UtcMillis)>,
+) -> Result<bool, MailboxPersistenceError> {
+    let mut values = envelopes
+        .iter()
+        .map(|envelope| {
+            (
+                envelope.delivery_sequence,
+                envelope.envelope_id,
+                envelope.opaque_ciphertext.len(),
+                envelope.expires_at,
+            )
+        })
+        .collect::<Vec<_>>();
+    if let Some((sequence, envelope_id, ciphertext_len, expires_at)) = candidate {
+        values.push((*sequence, *envelope_id, ciphertext_len, *expires_at));
+    }
+    if values.len() > MAX_PAGE_ENTRIES {
+        return Ok(false);
+    }
+    let skeleton = values
+        .iter()
+        .map(|(sequence, envelope_id, _, expires_at)| {
+            CanonicalValue::Map(vec![
+                (CanonicalValue::Unsigned(1), sequence.to_canonical_value()),
+                (
+                    CanonicalValue::Unsigned(2),
+                    CanonicalValue::Text(envelope_id.to_string()),
+                ),
+                (
+                    CanonicalValue::Unsigned(3),
+                    CanonicalValue::Bytes(Vec::new()),
+                ),
+                (CanonicalValue::Unsigned(4), expires_at.to_canonical_value()),
+            ])
+        })
+        .collect();
+    let base = encode_deterministic_cbor_with_limit(
+        &CanonicalValue::Map(vec![
+            (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(mailbox_id.to_string()),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                next_sequence.to_canonical_value(),
+            ),
+            (CanonicalValue::Unsigned(4), CanonicalValue::Array(skeleton)),
+        ]),
+        MAX_PULL_RECEIPT_BYTES,
+    )
+    .map_err(|_| MailboxPersistenceError::CorruptData("mailbox pull receipt encoding"))?;
+    let payload_bytes = values.iter().try_fold(0usize, |total, (_, _, length, _)| {
+        total
+            .checked_add(*length)
+            .and_then(|total| total.checked_add(byte_string_header_len(*length) - 1))
+            .ok_or(MailboxPersistenceError::CapacityExceeded)
+    })?;
+    Ok(base
+        .len()
+        .checked_add(payload_bytes)
+        .is_some_and(|size| size <= MAX_PULL_RECEIPT_BYTES))
+}
+
 pub(crate) fn encode_acknowledgement_receipt(
     mailbox_id: MailboxId,
     envelope_ids: &[EnvelopeId],
@@ -239,6 +321,7 @@ mod tests {
         let receipt = encode_pull_receipt(MailboxId::new(), base.delivery_sequence, &[base])
             .expect("maximum history Offer pull receipt");
         assert!(!receipt.is_empty());
+        assert!(receipt.len() <= crate::MAX_PULL_RECEIPT_BYTES);
 
         let over = PulledEnvelope {
             delivery_sequence: SafeUint::new(1).expect("safe sequence"),

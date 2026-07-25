@@ -8,6 +8,7 @@ use dtx_wire::{
     encode_deterministic_cbor_with_limit,
 };
 use sqlx::{PgConnection, Row};
+use tokio_stream::StreamExt;
 
 use crate::{
     MAX_ACTIVE_ENVELOPE_BYTES, MAX_PULL_RECEIPT_BYTES, MailboxOperationOutcome,
@@ -176,7 +177,7 @@ impl crate::MailboxRepository {
                     MailboxPersistenceError::CorruptData("identity delivery segment count")
                 })?,
             );
-            let rows = sqlx::query(
+            let mut rows = sqlx::query(
                 "SELECT journal.delivery_sequence,journal.envelope_id,journal.expires_at_ms,
                         CASE WHEN journal.expires_at_ms>$3 THEN envelope.opaque_ciphertext END AS opaque_ciphertext
                    FROM messaging.identity_delivery_journal AS journal
@@ -192,18 +193,19 @@ impl crate::MailboxRepository {
             .bind(now.get())
             .bind(remaining_limit)
             .bind(highwater)
-            .fetch_all(&mut *session.connection())
-            .await?;
-            segments.reserve(rows.len());
+            .fetch(&mut *session.connection());
+            segments.reserve(usize::from(request.limit()));
             let mut expected = row_lower_bound.saturating_add(1);
-            for row in rows {
+            let mut truncated_for_budget = false;
+            while let Some(row) = rows.next().await {
+                let row = row?;
                 let sequence: i64 = row.try_get("delivery_sequence")?;
                 if sequence != expected {
                     return Err(MailboxPersistenceError::CorruptData(
                         "identity delivery sequence gap",
                     ));
                 }
-                expected = expected.saturating_add(1);
+                let next_expected = expected.saturating_add(1);
                 let expires_at = parse_time(row.try_get("expires_at_ms")?)?;
                 let ciphertext: Option<Vec<u8>> = row.try_get("opaque_ciphertext")?;
                 if let Some(ciphertext) = ciphertext {
@@ -212,19 +214,33 @@ impl crate::MailboxRepository {
                             "identity mailbox ciphertext",
                         ));
                     }
-                    segments.push(IdentityDeliverySegment::Envelope(
-                        IdentityPulledEnvelope {
-                            delivery_sequence: safe_sequence(sequence)?,
-                            envelope_id: parse_envelope_id(row.try_get("envelope_id")?)?,
-                            opaque_ciphertext: ciphertext,
-                            expires_at,
-                        },
-                    ));
+                    let candidate = IdentityDeliverySegment::Envelope(IdentityPulledEnvelope {
+                        delivery_sequence: safe_sequence(sequence)?,
+                        envelope_id: parse_envelope_id(row.try_get("envelope_id")?)?,
+                        opaque_ciphertext: ciphertext,
+                        expires_at,
+                    });
+                    if !identity_pull_receipt_within_limit(
+                        authenticated.identity_id(),
+                        authenticated.device_id(),
+                        safe_sequence(highwater)?,
+                        safe_sequence(resumable_floor)?,
+                        &segments,
+                        Some(&candidate),
+                    )? {
+                        truncated_for_budget = true;
+                        break;
+                    }
+                    segments.push(candidate);
                 } else {
                     extend_terminal_range(&mut segments, safe_sequence(sequence)?);
                 }
+                expected = next_expected;
             }
-            if expected.saturating_sub(1) < highwater && segments.is_empty() {
+            if !truncated_for_budget
+                && expected.saturating_sub(1) < highwater
+                && segments.is_empty()
+            {
                 return Err(MailboxPersistenceError::CorruptData(
                     "identity delivery page unavailable",
                 ));
@@ -368,7 +384,14 @@ fn encode_pull_v3_receipt(
     }
     let ciphertext_bytes = segments.iter().try_fold(0usize, |total, segment| {
         let bytes = match segment {
-            IdentityDeliverySegment::Envelope(entry) => entry.opaque_ciphertext.len(),
+            IdentityDeliverySegment::Envelope(entry) => {
+                if entry.opaque_ciphertext.len() > crate::MAX_HISTORY_OFFER_BYTES {
+                    return Err(MailboxPersistenceError::CorruptData(
+                        "identity mailbox ciphertext",
+                    ));
+                }
+                entry.opaque_ciphertext.len()
+            }
             IdentityDeliverySegment::TerminalRange { .. } => 0,
         };
         total
@@ -437,6 +460,26 @@ fn encode_pull_v3_receipt(
         MAX_PULL_RECEIPT_BYTES,
     )
     .map_err(|_| MailboxPersistenceError::CorruptData("identity pull V3 receipt"))
+}
+
+fn identity_pull_receipt_within_limit(
+    identity_id: IdentityId,
+    device_id: DeviceId,
+    highwater: SafeUint,
+    resumable_floor: SafeUint,
+    segments: &[IdentityDeliverySegment],
+    candidate: Option<&IdentityDeliverySegment>,
+) -> Result<bool, MailboxPersistenceError> {
+    let mut trial = segments.to_vec();
+    if let Some(candidate) = candidate {
+        trial.push(candidate.clone());
+    }
+    match encode_pull_v3_receipt(identity_id, device_id, highwater, resumable_floor, &trial) {
+        Ok(bytes) => Ok(bytes.len() <= MAX_PULL_RECEIPT_BYTES),
+        Err(MailboxPersistenceError::CapacityExceeded) => Ok(false),
+        Err(MailboxPersistenceError::CorruptData("identity pull V3 receipt")) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 async fn authorize_identity_device(
@@ -515,6 +558,51 @@ async fn authorize_identity_device(
     .execute(&mut *connection)
     .await?;
     Ok(earliest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_pull_receipt_accepts_history_offer_ceiling_and_rejects_one_byte_over() {
+        let identity: IdentityId = "dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la"
+            .parse()
+            .expect("identity id");
+        let device = DeviceId::new();
+        let segment = IdentityDeliverySegment::Envelope(IdentityPulledEnvelope {
+            delivery_sequence: SafeUint::new(1).expect("sequence"),
+            envelope_id: EnvelopeId::new(),
+            opaque_ciphertext: vec![0; crate::MAX_HISTORY_OFFER_BYTES],
+            expires_at: UtcMillis::new(6_000).expect("timestamp"),
+        });
+        let receipt = encode_pull_v3_receipt(
+            identity,
+            device,
+            SafeUint::new(1).expect("highwater"),
+            SafeUint::new(0).expect("floor"),
+            std::slice::from_ref(&segment),
+        )
+        .expect("maximum history Offer identity receipt");
+        assert!(receipt.len() <= MAX_PULL_RECEIPT_BYTES);
+
+        let over = IdentityDeliverySegment::Envelope(IdentityPulledEnvelope {
+            delivery_sequence: SafeUint::new(1).expect("sequence"),
+            envelope_id: EnvelopeId::new(),
+            opaque_ciphertext: vec![0; crate::MAX_HISTORY_OFFER_BYTES + 1],
+            expires_at: UtcMillis::new(6_000).expect("timestamp"),
+        });
+        assert!(
+            encode_pull_v3_receipt(
+                identity,
+                device,
+                SafeUint::new(1).expect("highwater"),
+                SafeUint::new(0).expect("floor"),
+                std::slice::from_ref(&over),
+            )
+            .is_err()
+        );
+    }
 }
 
 async fn current_history_grant_earliest(

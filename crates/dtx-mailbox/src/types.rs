@@ -38,11 +38,9 @@ pub const MAILBOX_ENQUEUE_REPLAY_RETENTION_MILLIS: i64 = MAILBOX_OPERATION_REPLA
 pub const MAX_PAGE_ENTRIES: usize = 100;
 /// Maximum exact opaque OfferV3 bytes admitted by the history grant path.
 pub(crate) const MAX_HISTORY_OFFER_BYTES: usize = 1_049_093;
-/// Maximum encoded pull receipt/page budget. This permits a full history Offer
-/// while retaining the mailbox's aggregate retained-byte quota as the memory
-/// bound for larger pages.
-pub(crate) const MAX_PULL_RECEIPT_BYTES: usize =
-    MAX_ACTIVE_ENVELOPE_BYTES + MAX_HISTORY_GRANT_ENVELOPE_BYTES;
+/// Maximum encoded pull receipt/page budget. This permits one full history
+/// Offer and leaves a fixed amount for canonical page framing and metadata.
+pub(crate) const MAX_PULL_RECEIPT_BYTES: usize = MAX_HISTORY_OFFER_BYTES + 512;
 
 const MAX_REGISTER_COMMAND_BYTES: usize = 16_384;
 const MAX_ENVELOPE_COMMAND_BYTES: usize = 262_400;

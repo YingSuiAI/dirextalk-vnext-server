@@ -6,6 +6,7 @@ use dtx_identity_persistence::{
 use dtx_wire::{SafeUint, Sha256Digest, UtcMillis};
 use sqlx::{PgConnection, Row};
 use subtle::ConstantTimeEq;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::{
@@ -19,8 +20,8 @@ mod codec;
 use codec::{
     PulledEnvelope, encode_acknowledgement_receipt, encode_enqueue_receipt, encode_pull_receipt,
     encode_registration_receipt, parse_device_id, parse_digest, parse_envelope_id,
-    parse_identity_id, parse_safe_sequence, parse_utc_millis, replay_envelope_receipt,
-    replay_receipt,
+    parse_identity_id, parse_safe_sequence, parse_utc_millis, pull_receipt_within_limit,
+    replay_envelope_receipt, replay_receipt,
 };
 
 /// Durable repository for opaque mailbox registration and at-least-once relay.
@@ -368,7 +369,7 @@ impl MailboxRepository {
             let mailbox = load_mailbox_for_update(session.connection(), mailbox_id, now).await?;
             authorize_owner(&mailbox, authenticated)?;
             let _ = expire_available(session.connection(), mailbox_id, now).await?;
-            let rows = sqlx::query(
+            let mut rows = sqlx::query(
                 "SELECT delivery_sequence, envelope_id, opaque_ciphertext, expires_at_ms, state
                    FROM messaging.mailbox_envelopes
                   WHERE mailbox_id=$1 AND delivery_sequence > $2
@@ -381,12 +382,12 @@ impl MailboxRepository {
                     .map_err(|_| MailboxPersistenceError::InvalidCommand("mailbox pull cursor"))?,
             )
             .bind(i64::from(request.limit()))
-            .fetch_all(&mut *session.connection())
-            .await?;
+            .fetch(&mut *session.connection());
 
             let mut cursor = request.after_sequence();
             let mut envelopes = Vec::new();
-            for row in rows {
+            while let Some(row) = rows.next().await {
+                let row = row?;
                 let sequence = parse_safe_sequence(row.try_get("delivery_sequence")?)?;
                 let state: String = row.try_get("state")?;
                 match state.as_str() {
@@ -401,6 +402,24 @@ impl MailboxRepository {
                             ));
                         }
                         let expires_at = parse_utc_millis(row.try_get("expires_at_ms")?)?;
+                        if !pull_receipt_within_limit(
+                            mailbox_id,
+                            sequence,
+                            &envelopes,
+                            Some((
+                                &sequence,
+                                &envelope_id,
+                                opaque_ciphertext.len(),
+                                &expires_at,
+                            )),
+                        )? {
+                            if envelopes.is_empty() {
+                                return Err(MailboxPersistenceError::CorruptData(
+                                    "mailbox pull receipt budget",
+                                ));
+                            }
+                            break;
+                        }
                         envelopes.push(PulledEnvelope {
                             delivery_sequence: sequence,
                             envelope_id,
