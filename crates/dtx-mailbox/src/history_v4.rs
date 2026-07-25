@@ -21,6 +21,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::types::MAX_HISTORY_GRANT_ENVELOPE_BYTES;
 use crate::{
     MAX_ACTIVE_ENVELOPE_BYTES, MAX_ACTIVE_ENVELOPES, MailboxEnvelopeCommand,
     MailboxOperationOutcome, MailboxPersistenceError, MailboxPgStore,
@@ -576,7 +577,7 @@ impl crate::MailboxRepository {
                 return Err(MailboxPersistenceError::CapacityExceeded);
             }
             let sequence = mailbox.next_delivery_sequence.checked_add(1).ok_or(MailboxPersistenceError::CapacityExceeded)?;
-            let envelope_exact = encode_deterministic_cbor_with_limit(&CanonicalValue::Map(vec![(CanonicalValue::Unsigned(1),CanonicalValue::Unsigned(1)),(CanonicalValue::Unsigned(2),CanonicalValue::Text(command.envelope_id.to_string())),(CanonicalValue::Unsigned(3),CanonicalValue::Bytes(command.exact_offer.clone())),(CanonicalValue::Unsigned(4),command.expires_at.to_canonical_value())]), 1_049_100).map_err(|_| invalid("envelope"))?;
+            let envelope_exact = encode_deterministic_cbor_with_limit(&CanonicalValue::Map(vec![(CanonicalValue::Unsigned(1),CanonicalValue::Unsigned(1)),(CanonicalValue::Unsigned(2),CanonicalValue::Text(command.envelope_id.to_string())),(CanonicalValue::Unsigned(3),CanonicalValue::Bytes(command.exact_offer.clone())),(CanonicalValue::Unsigned(4),command.expires_at.to_canonical_value())]), MAX_HISTORY_GRANT_ENVELOPE_BYTES).map_err(|_| invalid("envelope"))?;
             let envelope = MailboxEnvelopeCommand::new_history_grant(command.idempotency_digest, command.mailbox_id, command.envelope_id, command.exact_offer.clone(), command.expires_at, envelope_exact)?;
             let fact_id = command.delivery_fact_id;
             let event_id = Uuid::now_v7(); let outbox_id = Uuid::now_v7();

@@ -38,7 +38,7 @@ pub const MAX_PAGE_ENTRIES: usize = 100;
 
 const MAX_REGISTER_COMMAND_BYTES: usize = 16_384;
 const MAX_ENVELOPE_COMMAND_BYTES: usize = 262_400;
-const MAX_HISTORY_GRANT_ENVELOPE_BYTES: usize = 1_049_100;
+pub(crate) const MAX_HISTORY_GRANT_ENVELOPE_BYTES: usize = 1_049_134;
 const MAX_ACK_COMMAND_BYTES: usize = 8_192;
 
 /// A raw 256-bit mailbox write capability held only at the sender boundary.
