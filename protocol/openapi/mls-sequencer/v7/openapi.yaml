@@ -345,7 +345,7 @@ x-dirextalk-compact-map-fields:
     '10': {name: history-request-digest, source: history-owner-domain-digest-of-field-9}
     '11': {name: exact-history-manifest-v2, source: history-v3-owner-rule}
     '12': {name: history-manifest-digest, source: history-owner-domain-digest-of-field-11}
-    '13': {name: exact-history-grant-v4, source: history-v3-owner-rule}
+    '13': {name: exact-history-grant-v5, source: history-v3-owner-rule}
     '14': {name: history-grant-digest, source: history-owner-domain-digest-of-field-13}
     '15': {name: exact-recipient-history-offer-v3, source: history-v3-owner-rule}
     '16': {name: recipient-offer-digest, source: history-owner-domain-digest-of-field-15}

@@ -11,7 +11,7 @@ mod semantics;
 const CDDL_RELATIVE: &str = "protocol/cddl/mls-sequencer/v7/mls-sequencer-v7.cddl";
 const OPENAPI_RELATIVE: &str = "protocol/openapi/mls-sequencer/v7/openapi.yaml";
 const CDDL_SHA256: &str = "6420b0dcc8ea6976ab85cce71dcf6410eb26c298eae81dfcaa34df46394aa761";
-const OPENAPI_SHA256: &str = "5e65b6cb275bb3584fb293f269246a670c5996dbd0d185738061b60bcf86c975";
+const OPENAPI_SHA256: &str = "71959152f6f8dea1d005d7550706db1b1024a7ae7cef9db3136675c7f5a3191c";
 
 const DOMAINS: &[(&str, &str)] = &[
     (

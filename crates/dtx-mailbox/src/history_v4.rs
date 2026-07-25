@@ -475,12 +475,21 @@ impl crate::MailboxRepository {
             { return Err(MailboxPersistenceError::HistoryRecoveryInvalidated); }
             let prep = sqlx::query("SELECT provider_device_id,provider_signing_key,provider_response_bytes,provider_response_digest,preparation_digest,provider_expires_at_ms,catalog_id,catalog_generation,catalog_head_digest,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR SHARE")
                 .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
-            if let Some(response_bytes) = prep.try_get::<Option<Vec<u8>>, _>("provider_response_bytes")? {
-                if Sha256Digest::hash_domain(PROVIDER_RESPONSE_DOMAIN, &response_bytes)
-                    != command.provider_response_digest
-                {
-                    return Err(MailboxPersistenceError::HistoryRecoveryInvalidated);
-                }
+            // The signed Offer V3 digest is a commitment to an exact Ready
+            // response, not a substitute for durable Ready evidence. Both
+            // columns must be present and agree with each other and field 16
+            // before any mailbox/journal/outbox mutation is possible.
+            let response_bytes = prep
+                .try_get::<Option<Vec<u8>>, _>("provider_response_bytes")?
+                .ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
+            let persisted_response_digest = prep
+                .try_get::<Option<Vec<u8>>, _>("provider_response_digest")?
+                .ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
+            if Sha256Digest::hash_domain(PROVIDER_RESPONSE_DOMAIN, &response_bytes)
+                != command.provider_response_digest
+                || persisted_response_digest.as_slice() != command.provider_response_digest.as_bytes()
+            {
+                return Err(MailboxPersistenceError::HistoryRecoveryInvalidated);
             }
             let signed_catalog_head = parse_signed_catalog_head_v2(&command.catalog_head_bytes)
                 .map_err(|_| MailboxPersistenceError::HistoryRecoveryInvalidated)?;
@@ -489,7 +498,6 @@ impl crate::MailboxRepository {
             }
             if prep.try_get::<Option<Uuid>,_>("provider_device_id")? != Some(*command.provider_device_id.as_uuid())
                 || prep.try_get::<Option<Vec<u8>>,_>("provider_signing_key")?.as_deref() != Some(provider_key_from_descriptor(&command.provider_descriptor)?.as_bytes())
-                || prep.try_get::<Option<Vec<u8>>,_>("provider_response_digest")?.is_some_and(|digest| digest.as_slice() != command.provider_response_digest.as_bytes())
                 || prep.try_get::<Vec<u8>,_>("preparation_digest")?.as_slice() != command.preparation_digest.as_bytes()
                 || prep.try_get::<Option<i64>,_>("provider_expires_at_ms")?.is_none_or(|expiry| expiry < command.expires_at.get())
                 || prep.try_get::<Uuid,_>("catalog_id")? != command.catalog_id
