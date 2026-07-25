@@ -25,9 +25,10 @@ use dtx_identity_log::{
     genesis_recovery_acceptance_input, identity_log_signature_input,
 };
 use dtx_identity_node::{
-    DEVICE_ENROLLMENT_CAPABILITY_HEADER, DEVICE_SESSION_AUTHORIZATION_SCHEME,
-    HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE, HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE,
-    HISTORY_RECOVERY_REQUEST_V4_PATH, IdentityBootstrapState, RECOVERY_RESPONSE_CAPABILITY_HEADER,
+    DEVICE_ENROLLMENT_CAPABILITY_HEADER, DEVICE_ENROLLMENT_CHALLENGE_STATUS_PATH,
+    DEVICE_SESSION_AUTHORIZATION_SCHEME, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
+    HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE, HISTORY_RECOVERY_REQUEST_V4_PATH,
+    IdentityBootstrapState, RECOVERY_RESPONSE_CAPABILITY_HEADER,
     RECOVERY_SCOPE_CATALOG_CONTENT_TYPE, RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE,
@@ -355,6 +356,28 @@ async fn send_history_recovery_request_v4(
         .await?)
 }
 
+async fn cancel_enrollment_challenge(
+    app: axum::Router,
+    challenge_id: DeviceEnrollmentChallengeId,
+    capability: [u8; 32],
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    Ok(app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(
+                    DEVICE_ENROLLMENT_CHALLENGE_STATUS_PATH
+                        .replace("{challenge_id}", &challenge_id.to_string()),
+                )
+                .header(
+                    DEVICE_ENROLLMENT_CAPABILITY_HEADER,
+                    Base64UrlUnpadded::encode_string(&capability),
+                )
+                .body(Body::empty())?,
+        )
+        .await?)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn history_recovery_request_v4_body(
     request_id: DeviceEnrollmentChallengeId,
@@ -498,6 +521,39 @@ fn history_recovery_request_v4_with_outer_tamper(
     };
     fields[field_index - 1].1 = replacement;
     resign_history_recovery_request_v4(CanonicalValue::Map(fields), candidate)
+}
+
+fn history_recovery_request_v4_with_payload_tamper(
+    bytes: &[u8],
+    candidate: &SigningKey,
+    field_index: usize,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let CanonicalValue::Map(mut fields) = decode_deterministic_cbor(bytes)? else {
+        return Err("V4 request must be a map".into());
+    };
+    fields[field_index - 1].1 = CanonicalValue::Bytes(payload.clone());
+    let (digest_field, digest_domain): (usize, &[u8]) = match field_index {
+        11 => (12, b"dirextalk.identity-device-add.v1\0"),
+        13 => (
+            14,
+            b"dirextalk.recovery-scope-catalog-handoff-preparation-digest.v2\0",
+        ),
+        _ => return Err("unsupported V4 payload field".into()),
+    };
+    fields[digest_field - 1].1 =
+        Sha256Digest::hash_domain(digest_domain, &payload).to_canonical_value();
+    resign_history_recovery_request_v4(CanonicalValue::Map(fields), candidate)
+}
+
+fn history_recovery_request_v4_with_signature_tamper(
+    bytes: &[u8],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let CanonicalValue::Map(mut fields) = decode_deterministic_cbor(bytes)? else {
+        return Err("V4 request must be a map".into());
+    };
+    fields[20].1 = CanonicalValue::Bytes(vec![0; 64]);
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
 }
 
 fn authorization(session: &Session) -> String {

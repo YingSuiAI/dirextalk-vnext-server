@@ -429,6 +429,27 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         5_200,
     );
     let candidate_add_bytes = candidate_add.to_deterministic_cbor()?;
+    // Keep one duplicate candidate card open while the approved V4 request
+    // is attempted. Admission must reject before inserting any request row;
+    // cancelling this card then allows the exact request to proceed.
+    let active_candidate_capability = [74; 32];
+    let active_candidate = enrollment_repository
+        .create_challenge(
+            &store,
+            CreateDeviceEnrollmentChallengeCommand::new(
+                Sha256Digest::from_bytes([73; 32]),
+                identity_id,
+                candidate_device,
+                public(&candidate),
+                DeviceEncryptionPublicKey::try_from([55; 32])?,
+                DeviceEnrollmentCapability::new(active_candidate_capability)?,
+            )?,
+            at(5_200),
+        )
+        .await?;
+    let DeviceEnrollmentChallengeOutcome::Created(active_candidate) = active_candidate else {
+        return Err("duplicate candidate challenge must be new".into());
+    };
     let approval = DeviceEnrollmentApprovalCommand::new(
         Sha256Digest::from_bytes([71; 32]),
         challenge.challenge_id(),
@@ -799,6 +820,34 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         response_capability,
         request_idempotency,
     )?;
+    let blocked = send_history_recovery_request_v4(
+        app.clone(),
+        request_idempotency,
+        enrollment_capability,
+        response_capability,
+        v4_request.clone(),
+    )
+    .await?;
+    assert_error(
+        blocked,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "IDENTITY_SERVICE_UNAVAILABLE",
+    )
+    .await?;
+    let blocked_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM identity.history_recovery_requests WHERE request_id=$1",
+    )
+    .bind(*challenge.challenge_id().as_uuid())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(blocked_rows, 0);
+    let cancellation = cancel_enrollment_challenge(
+        app.clone(),
+        active_candidate.challenge_id(),
+        active_candidate_capability,
+    )
+    .await?;
+    assert_eq!(cancellation.status(), StatusCode::OK);
     let v4_created = send_history_recovery_request_v4(
         app.clone(),
         request_idempotency,
@@ -821,6 +870,30 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     assert_eq!(v4_replay.status(), StatusCode::OK);
     assert_catalog_headers(&v4_replay, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE);
     assert_eq!(to_bytes(v4_replay.into_body(), 16_384).await?, v4_receipt);
+    let cancellation_replay = cancel_enrollment_challenge(
+        app.clone(),
+        active_candidate.challenge_id(),
+        active_candidate_capability,
+    )
+    .await?;
+    assert_eq!(cancellation_replay.status(), StatusCode::OK);
+    let v4_after_cancellation = send_history_recovery_request_v4(
+        app.clone(),
+        request_idempotency,
+        enrollment_capability,
+        response_capability,
+        v4_request.clone(),
+    )
+    .await?;
+    assert_eq!(v4_after_cancellation.status(), StatusCode::OK);
+    assert_catalog_headers(
+        &v4_after_cancellation,
+        HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
+    );
+    assert_eq!(
+        to_bytes(v4_after_cancellation.into_body(), 16_384).await?,
+        v4_receipt
+    );
     let v4_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM identity.history_recovery_requests WHERE request_id=$1",
     )
@@ -915,6 +988,167 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     .fetch_one(harness.admin_pool())
     .await?;
     assert_eq!(rows_after_rejections, 1);
+    let signature_tamper = history_recovery_request_v4_with_signature_tamper(&v4_request)?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            request_idempotency,
+            enrollment_capability,
+            response_capability,
+            signature_tamper,
+        )
+        .await?,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DEVICE_ENROLLMENT_INVALID",
+    )
+    .await?;
+
+    // DeviceAdd and Preparation are independently bounded and authenticated
+    // before any repository state is touched. Recompute each nested digest
+    // and the candidate signature so failures reach the intended inner
+    // validator rather than the outer envelope check.
+    let mut tampered_device_add = candidate_add_bytes.clone();
+    *tampered_device_add.last_mut().expect("DeviceAdd is non-empty") ^= 1;
+    let mismatched_device_add = device_add(
+        &root,
+        identity_id,
+        DeviceId::from_str(SECOND_CANDIDATE_DEVICE)?,
+        &key(6),
+        66,
+        4,
+        head3.hash(),
+        5_200,
+    )
+    .to_deterministic_cbor()?;
+    for (_case, payload) in [
+        ("DeviceAdd malformed", vec![0xff]),
+        ("DeviceAdd signature", tampered_device_add),
+        ("DeviceAdd mismatched", mismatched_device_add),
+    ] {
+        let tampered = history_recovery_request_v4_with_payload_tamper(
+            &v4_request,
+            &candidate,
+            11,
+            payload,
+        )?;
+        let response = send_history_recovery_request_v4(
+            app.clone(),
+            request_idempotency,
+            enrollment_capability,
+            response_capability,
+            tampered,
+        )
+        .await?;
+        assert_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        )
+        .await?;
+    }
+    let device_add_digest_mismatch = history_recovery_request_v4_with_outer_tamper(
+        &v4_request,
+        &candidate,
+        12,
+        CanonicalValue::Bytes(vec![0; 32]),
+    )?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            request_idempotency,
+            enrollment_capability,
+            response_capability,
+            device_add_digest_mismatch,
+        )
+        .await?,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DEVICE_ENROLLMENT_INVALID",
+    )
+    .await?;
+
+    let mut tampered_preparation = preparation.clone();
+    *tampered_preparation
+        .last_mut()
+        .expect("Preparation is non-empty") ^= 1;
+    let mismatched_preparation = preparation_body(
+        challenge.challenge_id(),
+        identity_id,
+        DeviceId::from_str(SECOND_CANDIDATE_DEVICE)?,
+        &key(6),
+        [66; 32],
+        head3,
+        enrollment_capability,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        safe(1),
+        catalog_head_digest,
+        "catalog-preparation-mismatched-candidate",
+    )?;
+    for (_case, payload) in [
+        ("Preparation malformed", vec![0xff]),
+        ("Preparation signature", tampered_preparation),
+        ("Preparation mismatched", mismatched_preparation),
+    ] {
+        let tampered = history_recovery_request_v4_with_payload_tamper(
+            &v4_request,
+            &candidate,
+            13,
+            payload,
+        )?;
+        let response = send_history_recovery_request_v4(
+            app.clone(),
+            request_idempotency,
+            enrollment_capability,
+            response_capability,
+            tampered,
+        )
+        .await?;
+        assert_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        )
+        .await?;
+    }
+    let preparation_digest_mismatch = history_recovery_request_v4_with_outer_tamper(
+        &v4_request,
+        &candidate,
+        14,
+        CanonicalValue::Bytes(vec![0; 32]),
+    )?;
+    assert_error(
+        send_history_recovery_request_v4(
+            app.clone(),
+            request_idempotency,
+            enrollment_capability,
+            response_capability,
+            preparation_digest_mismatch,
+        )
+        .await?,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DEVICE_ENROLLMENT_INVALID",
+    )
+    .await?;
+    for (field, value) in [(17, at(4_499)), (18, at(200_001))] {
+        let tampered = history_recovery_request_v4_with_outer_tamper(
+            &v4_request,
+            &candidate,
+            field,
+            value.to_canonical_value(),
+        )?;
+        assert_error(
+            send_history_recovery_request_v4(
+                app.clone(),
+                request_idempotency,
+                enrollment_capability,
+                response_capability,
+                tampered,
+            )
+            .await?,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "DEVICE_ENROLLMENT_INVALID",
+        )
+        .await?;
+    }
 
     clock.set(5_400);
     let rotated = catalog_body(
