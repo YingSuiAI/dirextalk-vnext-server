@@ -385,7 +385,7 @@ impl crate::MailboxRepository {
             }
             let mut mailbox = load_mailbox_for_update(tx.connection(), command.mailbox_id, now).await?;
             if mailbox.owner_identity_id != command.identity_id { return Err(MailboxPersistenceError::MailboxUnavailable); }
-            if let Some(row) = sqlx::query("SELECT grant_digest,receipt_bytes,receipt_hash FROM messaging.history_recovery_grants_v4 WHERE identity_id=$1 AND request_id=$2 FOR SHARE")
+            if let Some(row) = sqlx::query("SELECT grant_digest,receipt_bytes,receipt_hash FROM messaging.history_recovery_grants_v4 WHERE identity_id=$1 AND request_id=$2")
                 .bind(command.identity_id.to_string())
                 .bind(*command.request_id.as_uuid())
                 .fetch_optional(&mut *tx.connection())
@@ -410,7 +410,7 @@ impl crate::MailboxRepository {
             {
                 return Err(MailboxPersistenceError::HistoryRecoveryExpired);
             }
-            let request = sqlx::query("SELECT request_digest,manifest_digest,manifest_bytes,identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_digest,preparation_digest,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1 FOR SHARE")
+            let request = sqlx::query("SELECT request_digest,manifest_digest,manifest_bytes,identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_digest,preparation_digest,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1")
                 .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
             if request.try_get::<String,_>("identity_id")? != command.identity_id.to_string()
                 || request.try_get::<Vec<u8>,_>("request_digest")?.as_slice() != command.request_digest.as_bytes()
@@ -432,11 +432,10 @@ impl crate::MailboxRepository {
                 &request.try_get::<Vec<u8>, _>("manifest_bytes")?,
                 command,
             )?;
-            let challenge = sqlx::query("SELECT state,approved_head_hash,target_device_id,target_device_signing_key,target_device_encryption_key,expires_at_ms FROM identity.device_enrollment_challenges WHERE challenge_id=$1 FOR SHARE")
+            let challenge = sqlx::query("SELECT state,approved_head_hash,target_device_id,target_device_signing_key,target_device_encryption_key,expires_at_ms FROM identity.device_enrollment_challenges WHERE challenge_id=$1")
                 .bind(*command.request_id.as_uuid())
                 .fetch_optional(&mut *tx.connection())
-                .await?
-                .ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
+                .await?.ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
             if challenge.try_get::<i64, _>("expires_at_ms")? <= now.get() {
                 return Err(MailboxPersistenceError::HistoryRecoveryExpired);
             }
@@ -452,7 +451,7 @@ impl crate::MailboxRepository {
             {
                 return Err(MailboxPersistenceError::HistoryRecoveryInvalidated);
             }
-            let catalog = sqlx::query("SELECT head_bytes,head_digest,merkle_root,leaf_count,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 AND catalog_id=$2 AND generation=$3 FOR SHARE")
+            let catalog = sqlx::query("SELECT head_bytes,head_digest,merkle_root,leaf_count,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 AND catalog_id=$2 AND generation=$3")
                 .bind(command.identity_id.to_string()).bind(command.catalog_id).bind(command.generation.get() as i64)
                 .fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
             if catalog.try_get::<i64,_>("expires_at_ms")? <= now.get() {
@@ -463,7 +462,7 @@ impl crate::MailboxRepository {
                 || catalog.try_get::<Vec<u8>,_>("merkle_root")?.as_slice() != command.catalog_merkle_root.as_bytes()
                 || catalog.try_get::<i64,_>("leaf_count")? != command.catalog_leaf_count.get() as i64
             { return Err(MailboxPersistenceError::HistoryRecoveryInvalidated); }
-            let prep = sqlx::query("SELECT provider_device_id,provider_signing_key,provider_response_bytes,provider_response_digest,preparation_digest,provider_expires_at_ms,catalog_id,catalog_generation,catalog_head_digest,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR SHARE")
+            let prep = sqlx::query("SELECT provider_device_id,provider_signing_key,provider_response_bytes,provider_response_digest,preparation_digest,provider_expires_at_ms,catalog_id,catalog_generation,catalog_head_digest,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1")
                 .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
             // The signed Offer V3 digest is a commitment to an exact Ready
             // response, not a substitute for durable Ready evidence. Both

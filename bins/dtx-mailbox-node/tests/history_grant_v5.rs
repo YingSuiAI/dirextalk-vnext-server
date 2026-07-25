@@ -119,6 +119,21 @@ async fn history_grant_v5_http_success_replays_exactly_and_rejects_mismatch()
     let harness = support::PostgresHarness::start().await?;
     let identity_store = IdentityPgStore::connect(harness.identity_runtime_options(), 4).await?;
     let mailbox_store = MailboxPgStore::connect(harness.mailbox_runtime_options(), 4).await?;
+    let mut privilege_probe =
+        PgConnection::connect_with(&harness.mailbox_runtime_options()).await?;
+    let (identity_select, identity_update): (bool, bool) = sqlx::query_as(
+        "SELECT bool_and(has_table_privilege(current_user, table_name, 'SELECT')),\n                bool_or(has_table_privilege(current_user, table_name, 'UPDATE'))\n           FROM unnest(ARRAY['identity.history_recovery_requests',\n                             'identity.device_enrollment_challenges',\n                             'identity.recovery_scope_catalogs',\n                             'identity.recovery_scope_catalog_preparations']::text[]) AS tables(table_name)",
+    )
+    .fetch_one(&mut privilege_probe)
+    .await?;
+    assert!(
+        identity_select,
+        "mailbox runtime must retain identity evidence SELECT"
+    );
+    assert!(
+        !identity_update,
+        "mailbox runtime identity evidence must remain SELECT-only"
+    );
     let identity_app = identity_bootstrap_router_with_state(
         IdentityBootstrapState::with_clock_and_device_session_audience(
             identity_store.clone(),
@@ -521,7 +536,7 @@ async fn history_grant_v5_http_success_replays_exactly_and_rejects_mismatch()
         0,
         Uuid::now_v7(),
         6_000,
-        100_000,
+        90_000,
         &provider_signer,
         &owner_device_signer,
         &offer,
@@ -535,31 +550,41 @@ async fn history_grant_v5_http_success_replays_exactly_and_rejects_mismatch()
         parsed_grant.is_ok(),
         "testkit grant parse error: {parsed_grant:?}"
     );
-    let first = send_v2(
-        mailbox_app.clone(),
-        DEVICE_HISTORY_GRANT_V5_PATH,
-        DEVICE_HISTORY_GRANT_V5_CONTENT_TYPE,
-        Some("mailbox-grant-0001"),
-        provider.session_id,
-        provider.session_secret,
-        grant.clone(),
-    )
-    .await?;
-    if first.status() != StatusCode::CREATED {
-        let error_body = response_bytes(first).await?;
-        panic!(
-            "grant status {} code {:?}",
-            StatusCode::UNPROCESSABLE_ENTITY,
-            serde_json::from_slice::<serde_json::Value>(&error_body)
-                .ok()
-                .and_then(|v| v
-                    .pointer("/error/code")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned))
-        );
-    }
+    let (first_result, concurrent_result) = tokio::join!(
+        send_v2(
+            mailbox_app.clone(),
+            DEVICE_HISTORY_GRANT_V5_PATH,
+            DEVICE_HISTORY_GRANT_V5_CONTENT_TYPE,
+            Some("mailbox-grant-0001"),
+            provider.session_id,
+            provider.session_secret,
+            grant.clone(),
+        ),
+        send_v2(
+            mailbox_app.clone(),
+            DEVICE_HISTORY_GRANT_V5_PATH,
+            DEVICE_HISTORY_GRANT_V5_CONTENT_TYPE,
+            Some("mailbox-grant-0001"),
+            provider.session_id,
+            provider.session_secret,
+            grant.clone(),
+        )
+    );
+    let first = first_result?;
+    let concurrent = concurrent_result?;
+    assert!(
+        matches!(
+            (first.status(), concurrent.status()),
+            (StatusCode::CREATED, StatusCode::OK) | (StatusCode::OK, StatusCode::CREATED)
+        ),
+        "concurrent grant statuses: {} and {}",
+        first.status(),
+        concurrent.status()
+    );
     assert_content_type(&first, DEVICE_HISTORY_GRANT_RECEIPT_V5_CONTENT_TYPE);
+    assert_content_type(&concurrent, DEVICE_HISTORY_GRANT_RECEIPT_V5_CONTENT_TYPE);
     let receipt = response_bytes(first).await?;
+    assert_eq!(response_bytes(concurrent).await?, receipt);
     let replay = send_v2(
         mailbox_app.clone(),
         DEVICE_HISTORY_GRANT_V5_PATH,
