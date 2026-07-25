@@ -1694,7 +1694,16 @@ fn agent_route_target_cbor(
     server_receipt_public_key: Option<[u8; 32]>,
 ) -> Result<Vec<u8>, AgentProvisioningOwnerError> {
     let mut fields = vec![
-        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(1),
+            CanonicalValue::Unsigned(
+                if server_receipt_key_id.is_some() && server_receipt_public_key.is_some() {
+                    2
+                } else {
+                    1
+                },
+            ),
+        ),
         (
             CanonicalValue::Unsigned(2),
             CanonicalValue::Text(tenant_id.to_string()),

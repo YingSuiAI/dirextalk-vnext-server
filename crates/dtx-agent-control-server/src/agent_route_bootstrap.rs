@@ -1726,7 +1726,16 @@ fn owner_receipt_cbor(
     opaque_recipient_capsule: Option<&[u8]>,
 ) -> Result<Vec<u8>, AgentRouteBootstrapError> {
     let mut fields = vec![
-        (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+        (
+            CanonicalValue::Unsigned(1),
+            CanonicalValue::Unsigned(
+                if server_receipt_key_id.is_some() && server_receipt_public_key_digest.is_some() {
+                    2
+                } else {
+                    1
+                },
+            ),
+        ),
         (
             CanonicalValue::Unsigned(2),
             CanonicalValue::Text(tenant_id.to_string()),
