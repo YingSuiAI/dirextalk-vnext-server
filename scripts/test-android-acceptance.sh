@@ -54,7 +54,7 @@ make_fixture() {
   cp "$root/scripts/android-platform-trust-probe.java" "$fixture/scripts/android-platform-trust-probe.java"
   : >"$fixture/sdk/platforms/android-35/android.jar"
   : >"$fixture/docker-compose.local.yml"
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "cargo $*" >>"$DTX_TEST_LOG"' 'exit 0' >"$fixture/bin/cargo"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "cargo $*" >>"$DTX_TEST_LOG"' '[[ "${DTX_TEST_CARGO_SLEEP:-0}" == 1 ]] && sleep 5' 'exit 0' >"$fixture/bin/cargo"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "docker $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" up "*) if [[ "${DTX_TEST_COMPOSE_UP:-ok}" == fail ]]; then exit 1; fi; sleep "${DTX_TEST_COMPOSE_SLEEP:-0}";; *" cp "*) dest="${*: -1}"; mkdir -p "$(dirname "$dest")"; printf ca-fixture >"$dest";; esac' 'exit 0' >"$fixture/bin/docker"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "avdmanager $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" list avd "*) [[ "${DTX_TEST_AVD_PRESENT:-}" == 1 ]] && printf "    Name: %s\n" "${DTX_TEST_AVD_NAME:-}";; *" create avd "*) [[ "${DTX_TEST_AVD_CREATE:-ok}" == ok ]] || exit 1;; *" delete avd "*) [[ "${DTX_TEST_AVD_DELETE:-ok}" == ok ]] || exit 1;; esac' 'exit 0' >"$fixture/bin/avdmanager"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' \
@@ -67,13 +67,15 @@ make_fixture() {
     ' *" remount "*) marker="$DTX_TEST_ROOT/remount-$DTX_TEST_RUN_ID-$serial"; if [[ ! -e "$marker" ]]; then : >"$marker"; printf "Successfully disabled verity\n"; else printf "remount succeeded\n"; fi;;' \
     ' *" reboot "*) :;;' \
     ' *" root "*) [[ -f "$DTX_TEST_MAP/$serial" ]] || exit 1;;' \
-    ' *" shell "*) if [[ "$*" == *app_process* ]]; then [[ "${DTX_TEST_APP_PROCESS_SLEEP:-}" == 1 ]] && sleep 5; nonce=$(printf "%s" "$*" | grep -oE "[0-9a-f]{32}" | tail -n 1); : >"$DTX_TEST_ROOT/app-process-$serial"; result_file="$DTX_TEST_ROOT/result-$serial-$nonce"; if [[ "${DTX_TEST_TRUST_LOST:-}" != 1 ]]; then if [[ "${DTX_TEST_TRUST_NONCE_MISMATCH:-}" == 1 ]]; then printf "TRUSTED wrongnonce\n" >"$result_file"; elif [[ "${DTX_TEST_TRUST_WRONG_FAILURE:-}" == 1 ]]; then printf "CONNECT_FAILED %s\n" "$nonce" >"$result_file"; elif [[ "${DTX_TEST_TRUST_PRETRUST:-}" == 1 || -f "$DTX_TEST_ROOT/trust-$serial" ]]; then printf "TRUSTED %s\n" "$nonce" >"$result_file"; else printf "UNTRUSTED %s\n" "$nonce" >"$result_file"; fi; fi; [[ "${DTX_TEST_TRUST_FAIL:-}" == 1 ]] && exit 1; elif [[ "$*" == *cat*result-* ]]; then nonce=$(printf "%s" "$*" | grep -oE "result-[0-9a-f]{32}" | tail -n 1 | cut -d- -f2); cat "$DTX_TEST_ROOT/result-$serial-$nonce"; elif [[ "$*" == *cp* && "$*" == *cacerts* ]]; then : >"$DTX_TEST_ROOT/trust-$serial"; elif [[ "$*" == *sha256sum* ]]; then sha256sum "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/tls/ca.pem"; elif [[ "$*" == *stat* ]]; then printf "644 0 0\n"; elif [[ "$*" == *ls*Z* ]]; then printf "u:object_r:system_file:s0 root root\n"; elif [[ "$*" == *getprop* ]]; then printf "1\n"; elif [[ "$*" == *id* ]]; then printf "0\n"; fi;;' \
+    ' *" shell "*) if [[ "$*" == *app_process* ]]; then [[ "${DTX_TEST_APP_PROCESS_SLEEP:-}" == 1 ]] && sleep 5; nonce=$(printf "%s" "$*" | grep -oE "[0-9a-f]{32}" | tail -n 1); : >"$DTX_TEST_ROOT/app-process-$serial"; result_file="$DTX_TEST_ROOT/result-$serial-$nonce"; if [[ "${DTX_TEST_TRUST_LOST:-}" != 1 ]]; then if [[ "${DTX_TEST_TRUST_NONCE_MISMATCH:-}" == 1 ]]; then printf "TRUSTED wrongnonce\n" >"$result_file"; elif [[ "${DTX_TEST_TRUST_WRONG_FAILURE:-}" == 1 ]]; then printf "CONNECT_FAILED %s\n" "$nonce" >"$result_file"; elif [[ "${DTX_TEST_TRUST_PRETRUST:-}" == 1 || -f "$DTX_TEST_ROOT/trust-$serial" ]]; then printf "TRUSTED %s\n" "$nonce" >"$result_file"; else printf "UNTRUSTED %s\n" "$nonce" >"$result_file"; fi; fi; if [[ "${DTX_TEST_TRUST_FAIL:-}" == 1 ]]; then exit 1; fi; elif [[ "$*" == *cat*result-* ]]; then nonce=$(printf "%s" "$*" | grep -oE "result-[0-9a-f]{32}" | tail -n 1 | cut -d- -f2); cat "$DTX_TEST_ROOT/result-$serial-$nonce"; elif [[ "$*" == *cp* && "$*" == *cacerts* ]]; then : >"$DTX_TEST_ROOT/trust-$serial"; elif [[ "$*" == *sha256sum* ]]; then sha256sum "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/tls/ca.pem"; elif [[ "$*" == *stat* ]]; then printf "644 0 0\n"; elif [[ "$*" == *ls*Z* ]]; then printf "u:object_r:system_file:s0 root root\n"; elif [[ "$*" == *getprop* ]]; then printf "1\n"; elif [[ "$*" == *id* ]]; then printf "0\n"; fi;;' \
     ' *" push "*) [[ -f "$DTX_TEST_MAP/$serial" ]] || exit 1; [[ "${DTX_TEST_TRUST_PUSH_FAIL:-}" == 1 && "$*" == *classes.dex* ]] && exit 1 || true;;' \
     ' *" reverse tcp:8443 "*) if [[ "${DTX_TEST_REVERSE_FAIL_AFTER:-}" == 1 && "$serial" == "$(awk -F= '\''$1 == "emulator_a_serial" { print $2 }'\'' "$DTX_TEST_ROOT/.android-acceptance/$DTX_TEST_RUN_ID/resources")" ]]; then echo "reverse-side-effect $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG"; exit 1; fi; [[ "${DTX_TEST_REVERSE:-ok}" == ok ]] || exit 1; [[ "${DTX_TEST_REVERSE_SLEEP:-0}" == 0 ]] || sleep "${DTX_TEST_REVERSE_SLEEP}";;' \
     ' *" reverse --remove tcp:8443 "*) echo "reverse-remove $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG";;' \
     'esac' >"$fixture/bin/adb"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "emulator $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'avd=""; port=""; while (($#)); do case "$1" in -avd) avd=$2; shift 2;; -port) port=$2; shift 2;; *) shift;; esac; done' 'tmp_map="$DTX_TEST_MAP/.emulator-$port.$$"; printf "%s\n" "$avd" >"$tmp_map"; mv -f -- "$tmp_map" "$DTX_TEST_MAP/emulator-$port"' 'exec python3 -c '\''import signal,sys; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.pause()'\'' emulator -avd "$avd" -port "$port"' >"$fixture/bin/emulator"
-  printf '%s\n' '#!/usr/bin/env bash' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_OPENSSL_SLEEP:-0}" == 1 ]] && sleep 5' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_SHA256_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/sha256sum "$@"' >"$fixture/bin/sha256sum"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_STAT_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/stat "$@"' >"$fixture/bin/stat"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "javac $*" >>"$DTX_TEST_LOG"' 'if [[ "$*" == *"-version"* ]]; then [[ "${DTX_TEST_JAVAC_VERSION_SLEEP:-0}" == 1 ]] && sleep 5; printf "javac 17.0.0\n" >&2; exit 0; fi' '[[ "${DTX_TEST_JAVAC_COMPILE_SLEEP:-0}" == 1 ]] && sleep 5' 'while (($#)); do if [[ "$1" == -d ]]; then mkdir -p "$2"; : >"$2/PlatformTrustProbe.class"; break; fi; shift; done' >"$fixture/bin/javac"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "d8 $*" >>"$DTX_TEST_LOG"' '[[ "${DTX_TEST_D8_SLEEP:-0}" == 1 ]] && sleep 5' 'while (($#)); do if [[ "$1" == --output ]]; then mkdir -p "$2"; : >"$2/classes.dex"; break; fi; shift; done' >"$fixture/sdk/build-tools/35.0.0/d8"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'if [[ "${DTX_TEST_PS_SLEEP_ON_MARKER:-0}" == 1 && -e "$DTX_TEST_ROOT/cleanup-probe-marker" ]]; then echo "ps cleanup probe" >>"$DTX_TEST_LOG"; sleep 5; fi' 'exec /usr/bin/ps "$@"' >"$fixture/bin/ps"
@@ -252,6 +254,15 @@ child_pid="$(<"$fixture/proxy-child")"
 ! kill -0 "$child_pid" 2>/dev/null
 [[ ! -e "$fixture/.android-acceptance/child-cleanup" ]]
 
+# If the group leader exits on TERM, the independently revalidated group still
+# contains and removes its stubborn child.
+fixture="$tmp/leader-exit"; make_fixture "$fixture"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; control=${3##*:}; : >"$DTX_TEST_PROXY_PORTS/$listen"; : >"$DTX_TEST_PROXY_PORTS/$control"' '(trap "" TERM; while :; do sleep 1; done) & child=$!; printf "%s" "$child" >"$DTX_TEST_ROOT/leader-child"' 'trap "rm -f \"$DTX_TEST_PROXY_PORTS/$listen\" \"$DTX_TEST_PROXY_PORTS/$control\"; exit 0" TERM' 'while :; do sleep 1; done' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
+if run_fixture "$fixture" leader-exit env; then exit 1; fi
+leader_child_pid="$(<"$fixture/leader-child")"
+! kill -0 "$leader_child_pid" 2>/dev/null
+[[ ! -e "$fixture/.android-acceptance/leader-exit" ]]
+
 # Foreground compose and app_process calls have independent bounded deadlines;
 # timeout diagnostics are redacted and owned teardown still runs.
 fixture="$tmp/hung-compose"; make_fixture "$fixture"
@@ -264,6 +275,18 @@ if DTX_TEST_APP_PROCESS_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 run_fixture "
 rg -F 'shell app_process' "$fixture/log" >/dev/null
 rg -F -- '--project-name dtx-android-accept-hung-app-process down' "$fixture/log" >/dev/null
 [[ ! -e "$fixture/.android-acceptance/hung-app-process" ]]
+fixture="$tmp/hung-cargo"; make_fixture "$fixture"
+if DTX_TEST_CARGO_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 run_fixture "$fixture" hung-cargo env >/dev/null 2>&1; then exit 1; fi
+rg -F 'cargo build --locked -p dtx-android-response-loss-proxy' "$fixture/log" >/dev/null
+[[ ! -e "$fixture/.android-acceptance/hung-cargo" ]]
+fixture="$tmp/hung-sha256"; make_fixture "$fixture"
+if DTX_TEST_SHA256_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 run_fixture "$fixture" hung-sha256 env >/dev/null 2>&1; then exit 1; fi
+[[ ! -e "$fixture/.android-acceptance/hung-sha256" ]]
+fixture="$tmp/hung-openssl"; make_fixture "$fixture"
+if DTX_TEST_OPENSSL_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 run_fixture "$fixture" hung-openssl env >/dev/null 2>&1; then exit 1; fi
+rg -F 'shell app_process' "$fixture/log" >/dev/null
+! rg -F ' remount' "$fixture/log" >/dev/null
+[[ ! -e "$fixture/.android-acceptance/hung-openssl" ]]
 
 # Native trust-probe toolchain calls use the same deadline as foreground
 # commands, including javac version/compilation and d8.
@@ -308,6 +331,7 @@ rg -F 'shell app_process' "$fixture/log" >/dev/null
 fixture="$tmp/trust-failure"; make_fixture "$fixture"
 if DTX_TEST_TRUST_FAIL=1 run_fixture "$fixture" trust-failure env >/dev/null 2>&1; then exit 1; fi
 rg -F 'shell app_process' "$fixture/log" >/dev/null
+! rg -F ' remount' "$fixture/log" >/dev/null
 for trust_mode in TRUST_NONCE_MISMATCH TRUST_LOST TRUST_WRONG_FAILURE TRUST_PRETRUST TRUST_PUSH_FAIL; do
   trust_id="trust-${trust_mode,,}"; trust_id="${trust_id//_/-}"; fixture="$tmp/$trust_id"; make_fixture "$fixture"
   case "$trust_mode" in

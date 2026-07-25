@@ -60,6 +60,8 @@ compose_bounded() { local label=$1; shift; run_bounded "docker compose $label" d
 avd_bounded() { local label=$1; shift; run_bounded "avdmanager $label" avdmanager "$@"; }
 ps_bounded() { run_bounded 'ps' ps "$@"; }
 ss_bounded() { run_bounded 'ss' ss "$@"; }
+stat_bounded() { run_bounded 'stat' stat "$@"; }
+sha256_bounded() { run_bounded 'sha256sum' sha256sum "$@"; }
 start_owned_process() {
   local label=$1
   shift
@@ -226,26 +228,55 @@ process_group_pgid() {
   [[ "$pgid" =~ ^[1-9][0-9]*$ && "$pgid" == "$pid" ]] || return 1
   printf '%s' "$pgid"
 }
+group_live_member_pids() {
+  local pgid=$1 pid member_pgid state listing
+  listing="$(ps_bounded -e -o pid=,pgid=,stat=)" || return 2
+  while IFS=' ' read -r pid member_pgid state; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ && "$member_pgid" == "$pgid" && "$state" != Z* ]] || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    printf '%s\n' "$pid"
+  done <<<"$listing"
+}
+group_has_live_members() {
+  local members status
+  members="$(group_live_member_pids "$1")"; status=$?
+  (( status == 0 )) || return "$status"
+  [[ -n "$members" ]]
+}
+wait_for_group_exit() {
+  local pgid=$1 deadline=$2 status
+  while group_has_live_members "$pgid"; do
+    (( SECONDS < deadline )) || return 1
+  done
+  status=$?
+  [[ "$status" == 1 ]] && return 0
+  return "$status"
+}
 stop_pid() {
   local pid=$1 port=$2 kind=${3:-proxy} first=${4:-} second=${5:-} third=${6:-} serial=${7:-} pgid
   [[ -n "$pid" ]] || return 0
-  if kill -0 "$pid" 2>/dev/null; then
-    pid_cmdline_matches "$pid" "$kind" "$first" "$second" "$third" || return 1
-    if [[ "$kind" == emulator ]]; then
-      [[ -n "$serial" ]] || return 1
-      (verify_emulator_identity "$serial" "$pid" "$first" "$second") || return 1
-    fi
-    pgid="$(process_group_pgid "$pid")" || return 1
-    kill -TERM -- "-$pgid" 2>/dev/null || return 1
-    local deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
-    while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do :; done
-    if kill -0 "$pid" 2>/dev/null; then
-      pid_cmdline_matches "$pid" "$kind" "$first" "$second" "$third" || return 1
-      kill -KILL -- "-$pgid" 2>/dev/null || return 1
-    fi
-    wait "$pid" 2>/dev/null || true
+  kill -0 "$pid" 2>/dev/null || return 1
+  pid_cmdline_matches "$pid" "$kind" "$first" "$second" "$third" || return 1
+  if [[ "$kind" == emulator ]]; then
+    [[ -n "$serial" ]] || return 1
+    (verify_emulator_identity "$serial" "$pid" "$first" "$second") || return 1
   fi
-  ! kill -0 "$pid" 2>/dev/null || return 1
+  pgid="$(process_group_pgid "$pid")" || return 1
+  group_has_live_members "$pgid" || return 1
+  kill -TERM -- "-$pgid" 2>/dev/null || return 1
+  local deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
+  wait_for_group_exit "$pgid" "$deadline"; local group_status=$?
+  # A leader may have exited or become a zombie after TERM.  The previously
+  # validated, unreusable process group is the ownership boundary now.
+  if [[ "$group_status" == 1 ]]; then
+    kill -KILL -- "-$pgid" 2>/dev/null || return 1
+    deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
+    wait_for_group_exit "$pgid" "$deadline" || return 1
+  elif [[ "$group_status" != 0 ]]; then
+    return 1
+  fi
+  ! group_has_live_members "$pgid" || return 1
+  wait "$pid" 2>/dev/null || true
   ! ss_bounded -ltnH "sport = :$port" | grep -q . || return 1
 }
 cleanup_probe_remote() {
@@ -320,7 +351,7 @@ prepare_trust_probe() {
   if [[ "${DTX_ANDROID_TEST_MODE:-}" == 1 && "${DTX_TEST_NATIVE_TRUST_PROBE:-}" != 1 ]]; then
     probe_dir="$(mktemp -d "$RUN_ROOT/trust-probe.XXXXXX")" || die 'unable to create private trust probe directory'
     TRUST_PROBE_DEX="$probe_dir/classes.dex"; printf test-dex >"$TRUST_PROBE_DEX"
-    TRUST_PROBE_HASH="$(sha256sum "$TRUST_PROBE_DEX" | awk '{print $1}')"
+    TRUST_PROBE_HASH="$(sha256_bounded "$TRUST_PROBE_DEX" | awk '{print $1}')"
     return 0
   fi
   [[ -f "$source" && ! -L "$source" ]] || die 'fixed trust probe source is missing or symlinked'
@@ -345,9 +376,9 @@ prepare_trust_probe() {
   run_bounded 'd8 trust probe' "$d8" --lib "$android_jar" --output "$dex_output" "$classes_dir" || die 'trust probe dex compilation failed'
   TRUST_PROBE_DEX="$dex_output/classes.dex"
   [[ -f "$TRUST_PROBE_DEX" && ! -L "$TRUST_PROBE_DEX" ]] || die 'trust probe dex output is missing or symlinked'
-  dex_size="$(stat -c '%s' "$TRUST_PROBE_DEX")"
+  dex_size="$(stat_bounded -c '%s' "$TRUST_PROBE_DEX")"
   [[ "$dex_size" =~ ^[0-9]+$ && dex_size -le 4194304 ]] || die 'trust probe dex output exceeds bound'
-  TRUST_PROBE_HASH="$(sha256sum "$TRUST_PROBE_DEX" | awk '{print $1}')"
+  TRUST_PROBE_HASH="$(sha256_bounded "$TRUST_PROBE_DEX" | awk '{print $1}')"
   [[ "$TRUST_PROBE_HASH" =~ ^[0-9a-f]{64}$ ]] || die 'trust probe dex hash is invalid'
 }
 verify_emulator() {
@@ -418,7 +449,7 @@ platform_trust_probe() {
   (verify_emulator "$serial" "$pid" "$avd" "$port") || return 1
   result="$(adb_bounded 'trust-result read' -s "$serial" shell "cat '$result_path'" 2>/dev/null | tr -d '\r')" || result=''
   [[ "$result" == "$expected $nonce" ]] || return 1
-  [[ "$app_status" =~ ^[0-9]+$ ]] || return 1
+  [[ "$app_status" == 0 ]] || return 1
 }
 verify_system_rw() {
   local serial=$1 probe="/system/etc/security/cacerts/.dtx-writable-$RUN_ID"
@@ -428,7 +459,7 @@ verify_system_rw() {
 verify_ca_file() {
   local serial=$1 ca_file=$2 target=$3 local_digest remote_digest stat mode uid gid context
   adb_shell_ok "$serial" "test -f '$target' && test -r '$target'" || die 'installed CA is absent or unreadable'
-  local_digest="$(sha256sum "$ca_file" | awk '{print $1}')" || die 'unable to hash CA file'
+  local_digest="$(sha256_bounded "$ca_file" | awk '{print $1}')" || die 'unable to hash CA file'
   remote_digest="$(adb_bounded 'CA digest' -s "$serial" shell "sha256sum '$target'" | awk '{print $1}' | tr -d '\r')" || die 'unable to hash installed CA'
   [[ "$remote_digest" == "$local_digest" ]] || die 'installed CA content mismatch'
   IFS=' ' read -r mode uid gid <<<"$(adb_bounded 'CA stat' -s "$serial" shell "stat -c '%a %u %g' '$target'" | tr -d '\r')"
@@ -449,7 +480,7 @@ remount_system() {
 }
 install_ca_system_store() {
   local serial=$1 ca_file=$2 pid=$3 avd=$4 port=$5 hash target
-  hash="$(openssl x509 -hash -noout -in "$ca_file" | tr -d '\r\n')"
+  hash="$(run_bounded 'openssl CA hash' openssl x509 -hash -noout -in "$ca_file" | tr -d '\r\n')"
   [[ "$hash" =~ ^[0-9a-fA-F]{8}$ ]] || die 'unexpected CA subject hash'
   CA_HASH="$hash"; target="/system/etc/security/cacerts/$hash.0"
   if [[ "$serial" == "$SERIAL_A" ]]; then CA_A_TOUCHED=1; else CA_B_TOUCHED=1; fi
@@ -492,7 +523,7 @@ start_proxy() {
 real_run() {
   claim; preflight
   prepare_trust_probe
-  cargo build --locked -p dtx-android-response-loss-proxy
+  run_bounded 'cargo build response-loss proxy' cargo build --locked -p dtx-android-response-loss-proxy
   COMPOSE_OWNED=1; record compose_owned 1
   DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" compose_bounded 'up' --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" up --detach --wait
   mkdir -p -- "$RUN_ROOT/tls"
