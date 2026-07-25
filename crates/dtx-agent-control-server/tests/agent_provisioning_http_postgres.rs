@@ -2053,18 +2053,21 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
                 spec_revision: completion.credential.revision(),
                 protocol: ParsedProtocolRange {
                     minimum_major: 1,
-                    minimum_minor: 5,
+                    minimum_minor: 6,
                     maximum_major: 1,
-                    maximum_minor: 5,
+                    maximum_minor: 6,
                 },
                 runtime_claims: claims()?,
                 capacity: capacity(),
                 last_applied_command_sequence: 0,
-                required_server_capabilities: Vec::new(),
+                required_server_capabilities: vec![
+                    "agent-route-health.v1".into(),
+                    "opaque-agent-provisioning".into(),
+                ],
             },
         )
         .await?;
-    assert_eq!(opened.protocol_minor, 5);
+    assert_eq!(opened.protocol_minor, 6);
     let fence = opened.lease.fence();
     let router = agent_provisioning_owner_router(Arc::new(
         PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, app.clone()),
@@ -2956,7 +2959,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
                 },
                 runtime_claims: claims()?,
                 capacity: capacity(),
-                last_applied_command_sequence: 0,
+                last_applied_command_sequence: delivery_command.sequence(),
                 required_server_capabilities: vec!["agent-route-health.v1".into()],
             },
         )
@@ -2992,7 +2995,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
                 },
                 runtime_claims: claims()?,
                 capacity: capacity(),
-                last_applied_command_sequence: 0,
+                last_applied_command_sequence: delivery_command.sequence(),
                 required_server_capabilities: Vec::new(),
             },
         )
