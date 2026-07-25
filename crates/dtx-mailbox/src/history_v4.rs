@@ -1,4 +1,4 @@
-//! Catalog-exhaustive History Recovery Grant V4 admission.
+//! Catalog-exhaustive History Recovery Grant V5 admission.
 //!
 //! This module deliberately keeps every provider payload opaque.  The only
 //! bytes accepted after the signed grant are the recipient ciphertext offer;
@@ -30,20 +30,22 @@ use crate::{
 };
 
 pub const GRANT_SIGNATURE_DOMAIN: &[u8] =
-    b"dirextalk.history-recovery.grant-provider-signature.v4\0";
+    b"dirextalk.history-recovery.grant-provider-signature.v5\0";
 pub const AUTHORITY_SIGNATURE_DOMAIN: &[u8] =
-    b"dirextalk.history-recovery.grant-authority-signature.v4\0";
-pub const GRANT_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.grant.v4\0";
+    b"dirextalk.history-recovery.grant-authority-signature.v5\0";
+pub const GRANT_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.grant.v5\0";
 pub const DELIVERY_FACT_DOMAIN: &[u8] = b"dirextalk.history-recovery.delivery-fact.v2\0";
 pub const DELIVERY_RECEIPT_DOMAIN: &[u8] = b"dirextalk.history-recovery.delivery-receipt.v2\0";
 pub const AUTHORITY_ID_DOMAIN: &[u8] = b"dirextalk.device-history-authority-id.v1\0";
 pub const RECIPIENT_KEY_DOMAIN: &[u8] = b"dirextalk.recovery-recipient-key.v1\0";
-pub const OFFER_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.recipient-offer.v2\0";
-pub const OFFER_CIPHERTEXT_DOMAIN: &[u8] = b"dirextalk.history-recovery.offer-ciphertext.v2\0";
+pub const OFFER_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.recipient-offer.v3\0";
+pub const OFFER_CIPHERTEXT_DOMAIN: &[u8] = b"dirextalk.history-recovery.offer-ciphertext.v3\0";
+pub const PROVIDER_RESPONSE_DOMAIN: &[u8] =
+    b"dirextalk.recovery-scope-catalog-handoff-provider-response.v2\0";
 pub const MANIFEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.manifest.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeviceHistoryGrantV4Command {
+pub struct DeviceHistoryGrantV5Command {
     pub idempotency_digest: Sha256Digest,
     pub identity_id: IdentityId,
     pub request_id: DeviceEnrollmentChallengeId,
@@ -69,6 +71,7 @@ pub struct DeviceHistoryGrantV4Command {
     pub provider_descriptor: Vec<u8>,
     pub authority_descriptor: Vec<u8>,
     pub recipient_key_digest: Sha256Digest,
+    pub provider_response_digest: Sha256Digest,
     pub offer_digest: Sha256Digest,
     pub mailbox_id: MailboxId,
     pub envelope_id: EnvelopeId,
@@ -85,7 +88,7 @@ pub struct DeviceHistoryGrantV4Command {
     pub offer_expires_at: UtcMillis,
 }
 
-impl DeviceHistoryGrantV4Command {
+impl DeviceHistoryGrantV5Command {
     pub fn parse(
         bytes: Vec<u8>,
         idempotency_digest: Sha256Digest,
@@ -95,7 +98,7 @@ impl DeviceHistoryGrantV4Command {
         }
         let value = decode_deterministic_cbor(&bytes).map_err(|_| invalid("grant cbor"))?;
         let fields = numbered(&value, 36)?;
-        if fields[0] != CanonicalValue::Unsigned(4) {
+        if fields[0] != CanonicalValue::Unsigned(5) {
             return Err(invalid("grant version"));
         }
         let unsigned = encode_deterministic_cbor(&CanonicalValue::Map(
@@ -148,8 +151,10 @@ impl DeviceHistoryGrantV4Command {
             }
             _ => return Err(invalid("offer")),
         };
-        let offer_fields = numbered(&fields[35], 15)?;
-        if offer_fields[0] != CanonicalValue::Unsigned(2)
+        let offer_fields = numbered(&fields[35], 16)?;
+        let (offer_ciphertext, provider_response_digest, offer_issued, offer_expires) =
+            parse_offer_v3(&fields[35])?;
+        if offer_fields[0] != CanonicalValue::Unsigned(3)
             || offer_fields[1] != fields[2]
             || offer_fields[2] != fields[3]
             || offer_fields[3] != fields[4]
@@ -162,19 +167,12 @@ impl DeviceHistoryGrantV4Command {
         {
             return Err(invalid("offer coordinates"));
         }
-        let offer_ciphertext = match &offer_fields[9] {
-            CanonicalValue::Bytes(value) if !value.is_empty() && value.len() <= 1_048_576 => value,
-            _ => return Err(invalid("offer ciphertext")),
-        };
         if offer_fields[10]
-            != Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, offer_ciphertext)
+            != Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, &offer_ciphertext)
                 .to_canonical_value()
         {
             return Err(invalid("offer ciphertext digest"));
         }
-        validate_attachment_reference(&offer_fields[11])?;
-        let offer_issued = parse_utc(&offer_fields[12])?;
-        let offer_expires = parse_utc(&offer_fields[13])?;
         if offer_issued >= offer_expires {
             return Err(invalid("offer interval"));
         }
@@ -232,6 +230,7 @@ impl DeviceHistoryGrantV4Command {
             provider_descriptor,
             authority_descriptor,
             recipient_key_digest: parse_digest(&fields[23])?,
+            provider_response_digest,
             offer_digest,
             mailbox_id: parse_mailbox(&fields[25])?,
             envelope_id: parse_envelope(&fields[26])?,
@@ -260,7 +259,7 @@ impl DeviceHistoryGrantV4Command {
 
     fn unsigned_value(&self) -> CanonicalValue {
         let mut fields = vec![
-            (1, CanonicalValue::Unsigned(4)),
+            (1, CanonicalValue::Unsigned(5)),
             (2, CanonicalValue::Text(self.identity_id.to_string())),
             (3, CanonicalValue::Text(self.request_id.to_string())),
             (4, self.request_digest.to_canonical_value()),
@@ -331,18 +330,18 @@ impl DeviceHistoryGrantV4Command {
     }
 }
 
-impl fmt::Display for DeviceHistoryGrantV4Command {
+impl fmt::Display for DeviceHistoryGrantV5Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "history-grant:{}", self.request_id)
     }
 }
 
 impl crate::MailboxRepository {
-    pub async fn grant_device_history_v4(
+    pub async fn grant_device_history_v5(
         self,
         store: &MailboxPgStore,
         credential: &DeviceSessionCredential,
-        command: &DeviceHistoryGrantV4Command,
+        command: &DeviceHistoryGrantV5Command,
         now: UtcMillis,
     ) -> Result<MailboxOperationOutcome, MailboxPersistenceError> {
         let mut tx = store.begin().await?;
@@ -474,8 +473,15 @@ impl crate::MailboxRepository {
                 || catalog.try_get::<Vec<u8>,_>("merkle_root")?.as_slice() != command.catalog_merkle_root.as_bytes()
                 || catalog.try_get::<i64,_>("leaf_count")? != command.catalog_leaf_count.get() as i64
             { return Err(MailboxPersistenceError::HistoryRecoveryInvalidated); }
-            let prep = sqlx::query("SELECT provider_device_id,provider_signing_key,preparation_digest,provider_expires_at_ms,catalog_id,catalog_generation,catalog_head_digest,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR SHARE")
+            let prep = sqlx::query("SELECT provider_device_id,provider_signing_key,provider_response_bytes,provider_response_digest,preparation_digest,provider_expires_at_ms,catalog_id,catalog_generation,catalog_head_digest,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR SHARE")
                 .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
+            if let Some(response_bytes) = prep.try_get::<Option<Vec<u8>>, _>("provider_response_bytes")? {
+                if Sha256Digest::hash_domain(PROVIDER_RESPONSE_DOMAIN, &response_bytes)
+                    != command.provider_response_digest
+                {
+                    return Err(MailboxPersistenceError::HistoryRecoveryInvalidated);
+                }
+            }
             let signed_catalog_head = parse_signed_catalog_head_v2(&command.catalog_head_bytes)
                 .map_err(|_| MailboxPersistenceError::HistoryRecoveryInvalidated)?;
             if prep.try_get::<Option<i64>, _>("provider_expires_at_ms")?.is_some_and(|expiry| expiry <= now.get()) {
@@ -483,6 +489,7 @@ impl crate::MailboxRepository {
             }
             if prep.try_get::<Option<Uuid>,_>("provider_device_id")? != Some(*command.provider_device_id.as_uuid())
                 || prep.try_get::<Option<Vec<u8>>,_>("provider_signing_key")?.as_deref() != Some(provider_key_from_descriptor(&command.provider_descriptor)?.as_bytes())
+                || prep.try_get::<Option<Vec<u8>>,_>("provider_response_digest")?.is_some_and(|digest| digest.as_slice() != command.provider_response_digest.as_bytes())
                 || prep.try_get::<Vec<u8>,_>("preparation_digest")?.as_slice() != command.preparation_digest.as_bytes()
                 || prep.try_get::<Option<i64>,_>("provider_expires_at_ms")?.is_none_or(|expiry| expiry < command.expires_at.get())
                 || prep.try_get::<Uuid,_>("catalog_id")? != command.catalog_id
@@ -651,7 +658,7 @@ impl crate::MailboxRepository {
 
 fn validate_manifest_coordinates(
     bytes: &[u8],
-    command: &DeviceHistoryGrantV4Command,
+    command: &DeviceHistoryGrantV5Command,
 ) -> Result<(), MailboxPersistenceError> {
     if bytes.is_empty() || bytes.len() > 35_477 {
         return Err(invalid("manifest bounds"));
@@ -695,6 +702,42 @@ fn validate_manifest_coordinates(
         return Err(invalid("manifest leaf-set digest"));
     }
     Ok(())
+}
+
+fn parse_offer_v3(
+    value: &CanonicalValue,
+) -> Result<(Vec<u8>, Sha256Digest, UtcMillis, UtcMillis), MailboxPersistenceError> {
+    let fields = numbered(value, 16)?;
+    if fields[0] != CanonicalValue::Unsigned(3) {
+        return Err(invalid("offer version"));
+    }
+    let ciphertext = match &fields[9] {
+        CanonicalValue::Bytes(value) if !value.is_empty() && value.len() <= 1_048_576 => {
+            value.clone()
+        }
+        _ => return Err(invalid("offer ciphertext")),
+    };
+    if fields[10]
+        != Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, &ciphertext).to_canonical_value()
+    {
+        return Err(invalid("offer ciphertext digest"));
+    }
+    validate_attachment_reference(&fields[11])?;
+    let issued = parse_utc(&fields[12])?;
+    let expires = parse_utc(&fields[13])?;
+    if issued >= expires {
+        return Err(invalid("offer interval"));
+    }
+    parse_digest(&fields[14])?;
+    let provider_response_digest = parse_digest(&fields[15])?;
+    if provider_response_digest
+        .as_bytes()
+        .iter()
+        .all(|byte| *byte == 0)
+    {
+        return Err(invalid("provider response digest"));
+    }
+    Ok((ciphertext, provider_response_digest, issued, expires))
 }
 
 fn numbered(
@@ -935,5 +978,111 @@ fn map_identity(e: IdentityPersistenceError) -> MailboxPersistenceError {
     match e {
         IdentityPersistenceError::Database(e) => MailboxPersistenceError::Database(e),
         _ => MailboxPersistenceError::DeviceAuthenticationRejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offer(version: u64, ciphertext: &[u8], provider_digest: [u8; 32]) -> CanonicalValue {
+        let request_id = Uuid::now_v7().to_string();
+        let catalog_id = Uuid::now_v7().to_string();
+        let ciphertext_digest = Sha256Digest::hash_domain(OFFER_CIPHERTEXT_DOMAIN, ciphertext);
+        CanonicalValue::Map(vec![
+            (
+                CanonicalValue::Unsigned(1),
+                CanonicalValue::Unsigned(version),
+            ),
+            (
+                CanonicalValue::Unsigned(2),
+                CanonicalValue::Text(request_id),
+            ),
+            (
+                CanonicalValue::Unsigned(3),
+                CanonicalValue::Bytes([3; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(4),
+                CanonicalValue::Bytes([4; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(5),
+                CanonicalValue::Text(catalog_id),
+            ),
+            (CanonicalValue::Unsigned(6), CanonicalValue::Unsigned(1)),
+            (
+                CanonicalValue::Unsigned(7),
+                CanonicalValue::Bytes([7; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(8),
+                CanonicalValue::Bytes([8; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(9),
+                CanonicalValue::Bytes([9; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(10),
+                CanonicalValue::Bytes(ciphertext.to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(11),
+                ciphertext_digest.to_canonical_value(),
+            ),
+            (CanonicalValue::Unsigned(12), CanonicalValue::Null),
+            (
+                CanonicalValue::Unsigned(13),
+                CanonicalValue::Unsigned(1_000),
+            ),
+            (
+                CanonicalValue::Unsigned(14),
+                CanonicalValue::Unsigned(2_000),
+            ),
+            (
+                CanonicalValue::Unsigned(15),
+                CanonicalValue::Bytes([15; 32].to_vec()),
+            ),
+            (
+                CanonicalValue::Unsigned(16),
+                CanonicalValue::Bytes(provider_digest.to_vec()),
+            ),
+        ])
+    }
+
+    #[test]
+    fn offer_v3_round_trips_exact_canonical_bytes() {
+        let value = offer(3, b"opaque-history", [16; 32]);
+        let exact = encode_deterministic_cbor(&value).expect("canonical offer");
+        let decoded = decode_deterministic_cbor(&exact).expect("decode offer");
+        let (ciphertext, provider_digest, issued, expires) =
+            parse_offer_v3(&decoded).expect("offer v3");
+        assert_eq!(ciphertext, b"opaque-history");
+        assert_eq!(provider_digest, Sha256Digest::from_bytes([16; 32]));
+        assert_eq!(issued, UtcMillis::new(1_000).unwrap());
+        assert_eq!(expires, UtcMillis::new(2_000).unwrap());
+        assert_eq!(encode_deterministic_cbor(&decoded).unwrap(), exact);
+    }
+
+    #[test]
+    fn offer_v3_rejects_version_duplicate_tamper_and_zero_digest() {
+        assert!(parse_offer_v3(&offer(2, b"opaque-history", [16; 32])).is_err());
+        let mut duplicate = match offer(3, b"opaque-history", [16; 32]) {
+            CanonicalValue::Map(fields) => fields,
+            _ => unreachable!(),
+        };
+        duplicate.push((
+            CanonicalValue::Unsigned(16),
+            CanonicalValue::Bytes([16; 32].to_vec()),
+        ));
+        assert!(parse_offer_v3(&CanonicalValue::Map(duplicate)).is_err());
+
+        let mut tampered = offer(3, b"opaque-history", [16; 32]);
+        if let CanonicalValue::Map(fields) = &mut tampered {
+            fields[9].1 = CanonicalValue::Bytes(b"tampered".to_vec());
+        }
+        assert!(parse_offer_v3(&tampered).is_err());
+        assert!(parse_offer_v3(&offer(3, b"opaque-history", [0; 32])).is_err());
     }
 }

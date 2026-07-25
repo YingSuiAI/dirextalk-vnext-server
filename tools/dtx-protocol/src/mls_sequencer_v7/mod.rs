@@ -10,8 +10,8 @@ mod openapi;
 mod semantics;
 const CDDL_RELATIVE: &str = "protocol/cddl/mls-sequencer/v7/mls-sequencer-v7.cddl";
 const OPENAPI_RELATIVE: &str = "protocol/openapi/mls-sequencer/v7/openapi.yaml";
-const CDDL_SHA256: &str = "ff74d5fe4a1c9bd54a3cbadf0b5ee22e9ea87aeb4cceb21413b2b20168c54d85";
-const OPENAPI_SHA256: &str = "6eddf81cd0dbe0c8ec57fc6bb7a284c0d4a5d840b0e118cd6255268faa3ee197";
+const CDDL_SHA256: &str = "6420b0dcc8ea6976ab85cce71dcf6410eb26c298eae81dfcaa34df46394aa761";
+const OPENAPI_SHA256: &str = "5e65b6cb275bb3584fb293f269246a670c5996dbd0d185738061b60bcf86c975";
 
 const DOMAINS: &[(&str, &str)] = &[
     (
@@ -183,8 +183,8 @@ const RULES: &[&str] = &[
     "exact-catalog-proof-v2",
     "exact-history-recovery-request-v4",
     "exact-history-recovery-manifest-v2",
-    "exact-history-recovery-grant-v4",
-    "exact-recipient-history-offer-v2",
+    "exact-history-recovery-grant-v5",
+    "exact-recipient-history-offer-v3",
     "exact-history-recovery-delivery-fact-v2",
     "exact-key-package-publish-receipt-v4",
     "exact-key-package-claim-receipt-v4",
@@ -236,7 +236,7 @@ const MAP_LAYOUTS: &[(&str, &str)] = &[
     ),
     (
         "mls-recovery-add-request-v7",
-        "7 uuid-v7 scope identity-id identity-id uuid-v7 ed25519-public-key uuid-v7 exact-history-recovery-request-v4 digest exact-history-recovery-manifest-v2 digest exact-history-recovery-grant-v4 digest exact-recipient-history-offer-v2 digest exact-history-recovery-delivery-fact-v2 digest uuid-v7 positive-uint exact-signed-catalog-head-v2 digest catalog-exhaustive-count catalog-exhaustive-count exact-catalog-opening-v2 digest exact-catalog-proof-v2 digest exact-key-package-publish-receipt-v4 digest exact-key-package-claim-receipt-v4 digest safe-parent digest positive-uint digest safe-parent positive-uint digest bstr:1048576 digest bstr:1048576 digest mls-recovery-route-v1 digest mls-recovery-controller-proof-v1 digest utc-millis utc-millis digest signature",
+        "7 uuid-v7 scope identity-id identity-id uuid-v7 ed25519-public-key uuid-v7 exact-history-recovery-request-v4 digest exact-history-recovery-manifest-v2 digest exact-history-recovery-grant-v5 digest exact-recipient-history-offer-v3 digest exact-history-recovery-delivery-fact-v2 digest uuid-v7 positive-uint exact-signed-catalog-head-v2 digest catalog-exhaustive-count catalog-exhaustive-count exact-catalog-opening-v2 digest exact-catalog-proof-v2 digest exact-key-package-publish-receipt-v4 digest exact-key-package-claim-receipt-v4 digest safe-parent digest positive-uint digest safe-parent positive-uint digest bstr:1048576 digest bstr:1048576 digest mls-recovery-route-v1 digest mls-recovery-controller-proof-v1 digest utc-millis utc-millis digest signature",
     ),
     (
         "mls-recovery-add-receipt-v7",
@@ -308,7 +308,7 @@ const MAP_MAXIMA: &[(&str, u64)] = &[
     ("mls-recovery-issuer-authorization-request-v1", 8_953),
     ("mls-recovery-route-v1", 2_304),
     ("mls-recovery-controller-proof-v1", 4_507),
-    ("mls-recovery-add-request-v7", 4_489_149),
+    ("mls-recovery-add-request-v7", 4_489_217),
     ("mls-recovery-add-receipt-v7", 613),
     ("signed-mls-recovery-add-receipt-v7", 791),
     ("mls-recovery-confirmation-v2", 1_510),

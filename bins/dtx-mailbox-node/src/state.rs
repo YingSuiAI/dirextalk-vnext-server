@@ -37,7 +37,7 @@ use crate::{
     codec::{
         parse_account_read_cursor_query, parse_account_read_cursor_write,
         parse_acknowledgement_request, parse_device_history_grant, parse_device_history_grant_v2,
-        parse_device_history_grant_v4, parse_envelope_id, parse_envelope_request,
+        parse_device_history_grant_v5, parse_envelope_id, parse_envelope_request,
         parse_identity_ack_v2_request, parse_identity_pull_v3_request, parse_mailbox_id,
         parse_pull_request, parse_registration_request,
     },
@@ -338,11 +338,11 @@ impl MailboxNodeState {
         let credential = parse_device_session_authorization(headers)?;
         let idempotency_key_hash =
             idempotency_key_hash(headers, HTTP_HISTORY_GRANT_V5_IDEMPOTENCY_HASH_DOMAIN)?;
-        let bytes = read_exact_body(body, 1_050_699).await?;
-        let command = parse_device_history_grant_v4(&bytes, idempotency_key_hash)?;
+        let bytes = read_exact_body(body, 1_050_733).await?;
+        let command = parse_device_history_grant_v5(&bytes, idempotency_key_hash)?;
         let outcome = self
             .repository
-            .grant_device_history_v4(&self.store, &credential, &command, self.now()?)
+            .grant_device_history_v5(&self.store, &credential, &command, self.now()?)
             .await
             .map_err(|error| map_persistence_error(&error))?;
         Ok(MailboxSuccess::write(

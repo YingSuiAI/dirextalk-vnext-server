@@ -24,12 +24,12 @@ x-dirextalk-crypto-domains:
   request-signature: "dirextalk.history-recovery.request-signature.v4\0"
   request: "dirextalk.history-recovery.request.v4\0"
   request-idempotency: "dirextalk.history-recovery.request-idempotency.v4\0"
-  offer: "dirextalk.history-recovery.recipient-offer.v2\0"
-  offer-ciphertext: "dirextalk.history-recovery.offer-ciphertext.v2\0"
-  grant-provider-signature: "dirextalk.history-recovery.grant-provider-signature.v4\0"
-  grant-authority-signature: "dirextalk.history-recovery.grant-authority-signature.v4\0"
-  grant: "dirextalk.history-recovery.grant.v4\0"
-  grant-idempotency: "dirextalk.history-recovery.grant-idempotency.v4\0"
+  offer: "dirextalk.history-recovery.recipient-offer.v3\0"
+  offer-ciphertext: "dirextalk.history-recovery.offer-ciphertext.v3\0"
+  grant-provider-signature: "dirextalk.history-recovery.grant-provider-signature.v5\0"
+  grant-authority-signature: "dirextalk.history-recovery.grant-authority-signature.v5\0"
+  grant: "dirextalk.history-recovery.grant.v5\0"
+  grant-idempotency: "dirextalk.history-recovery.grant-idempotency.v5\0"
   delivery-fact: "dirextalk.history-recovery.delivery-fact.v2\0"
   completion-key-descriptor: "dirextalk.history-recovery.completion-key-descriptor.v2\0"
   completion-key-descriptor-signature: "dirextalk.history-recovery.completion-key-descriptor-signature.v2\0"
@@ -260,12 +260,12 @@ x-dirextalk-request-header-bindings:
     header: DTX-Recovery-Response-Capability
     request-v4-cbor-path: [19]
   request-idempotency: {header: Idempotency-Key, request-v4-cbor-path: [20]}
-  grant-idempotency: {header: Idempotency-Key, grant-v4-cbor-path: [33]}
+  grant-idempotency: {header: Idempotency-Key, grant-v5-cbor-path: [33]}
   completion-idempotency: {header: Idempotency-Key, completion-v2-cbor-path: [33]}
 x-dirextalk-grant-signatures:
   exact-common-unsigned-fields: [1, 33]
-  provider-signature: {cbor-path: [34], domain: "dirextalk.history-recovery.grant-provider-signature.v4\0"}
-  independent-authority-signature: {cbor-path: [35], domain: "dirextalk.history-recovery.grant-authority-signature.v4\0"}
+  provider-signature: {cbor-path: [34], domain: "dirextalk.history-recovery.grant-provider-signature.v5\0"}
+  independent-authority-signature: {cbor-path: [35], domain: "dirextalk.history-recovery.grant-authority-signature.v5\0"}
   provider-descriptor: {cbor-path: [22], owner-rule: recovery-scope-catalog-provider-descriptor-v2}
   independent-authority: {cbor-path: [23], owner-rule: recovery-scope-catalog-independent-authority-v2}
   authenticated-provider-session-equals-descriptor: true
@@ -362,9 +362,9 @@ paths:
         '422': {$ref: '#/components/responses/InvalidExactCbor'}
   /v5/devices/history-grants:
     post:
-      operationId: grantDeviceHistoryV4
+      operationId: grantDeviceHistoryV5
       x-dirextalk-authentication: {kind: active-provider-device, required: true}
-      x-dirextalk-body-ceiling-bytes: 1050699
+      x-dirextalk-body-ceiling-bytes: 1050733
       x-dirextalk-atomic-commit: [grant, mailbox-envelope, immutable-delivery-fact, realtime-journal, outbox]
       parameters:
         - $ref: '#/components/parameters/DeviceAuthorization'
@@ -372,8 +372,8 @@ paths:
       requestBody:
         required: true
         content:
-          application/vnd.dirextalk.history-recovery-grant.v4+cbor:
-            x-dirextalk-cddl-rule: history-recovery-grant-v4
+          application/vnd.dirextalk.history-recovery-grant.v5+cbor:
+            x-dirextalk-cddl-rule: history-recovery-grant-v5
             x-dirextalk-exact-cbor: true
             schema: {$ref: '#/components/schemas/ExactCanonicalCbor'}
       responses:

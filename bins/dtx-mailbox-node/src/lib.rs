@@ -85,7 +85,7 @@ pub const DEVICE_HISTORY_GRANT_V2_CONTENT_TYPE: &str =
 pub const DEVICE_HISTORY_GRANT_RECEIPT_V2_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.device-history-grant-receipt.v2+cbor";
 pub const DEVICE_HISTORY_GRANT_V5_CONTENT_TYPE: &str =
-    "application/vnd.dirextalk.history-recovery-grant.v4+cbor";
+    "application/vnd.dirextalk.history-recovery-grant.v5+cbor";
 pub const DEVICE_HISTORY_GRANT_RECEIPT_V5_CONTENT_TYPE: &str =
     "application/vnd.dirextalk.history-recovery-delivery-receipt.v2+cbor";
 pub const ACCOUNT_READ_CURSOR_WRITE_V1_CONTENT_TYPE: &str =
@@ -121,6 +121,6 @@ pub(crate) const HTTP_IDENTITY_ACK_V2_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
 pub(crate) const HTTP_HISTORY_GRANT_V2_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
     b"dirextalk.mailbox-http-history-grant-idempotency-key.v2\0";
 pub(crate) const HTTP_HISTORY_GRANT_V5_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
-    b"dirextalk.history-recovery.grant-idempotency.v4\0";
+    b"dirextalk.history-recovery.grant-idempotency.v5\0";
 pub(crate) const HTTP_ACCOUNT_READ_CURSOR_IDEMPOTENCY_HASH_DOMAIN: &[u8] =
     b"dirextalk.account-read-cursor-http-idempotency-key.v1\0";
