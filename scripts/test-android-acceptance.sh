@@ -73,7 +73,7 @@ make_fixture() {
     ' *" reverse --remove tcp:8443 "*) echo "reverse-remove $DTX_TEST_RUN_ID $serial" >>"$DTX_TEST_LOG";;' \
     'esac' >"$fixture/bin/adb"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "emulator $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'avd=""; port=""; while (($#)); do case "$1" in -avd) avd=$2; shift 2;; -port) port=$2; shift 2;; *) shift;; esac; done' 'tmp_map="$DTX_TEST_MAP/.emulator-$port.$$"; printf "%s\n" "$avd" >"$tmp_map"; mv -f -- "$tmp_map" "$DTX_TEST_MAP/emulator-$port"' 'exec python3 -c '\''import signal,sys; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.pause()'\'' emulator -avd "$avd" -port "$port"' >"$fixture/bin/emulator"
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_OPENSSL_SLEEP:-0}" == 1 ]] && sleep 5' '[[ "${1:-}" != rand ]] || { printf "0123456789abcdef0123456789abcdef\n"; exit 0; }' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_OPENSSL_SLEEP:-0}" == 1 && "${1:-}" == x509 ]] && sleep 5' '[[ "${1:-}" != rand ]] || { printf "0123456789abcdef0123456789abcdef\n"; exit 0; }' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_SHA256_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/sha256sum "$@"' >"$fixture/bin/sha256sum"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_STAT_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/stat "$@"' >"$fixture/bin/stat"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' '[[ "${DTX_TEST_MKDIR_SLEEP:-0}" == 1 ]] && sleep 5' 'exec /usr/bin/mkdir "$@"' >"$fixture/bin/mkdir"
