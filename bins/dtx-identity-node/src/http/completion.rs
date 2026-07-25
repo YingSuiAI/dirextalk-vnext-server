@@ -4,7 +4,9 @@ use super::{
     has_exact_content_type, header, idempotency_key_hash, parse_device_session_authorization,
     to_bytes,
 };
-use dtx_identity_persistence::{CompletionSignerMetadata, HistoryRecoveryCompletionCommand};
+use dtx_identity_persistence::{
+    CompletionSignerMetadata, HistoryRecoveryCompletionCommand, is_canonical_https_origin,
+};
 use dtx_wire::Sha256Digest;
 
 const IDEMPOTENCY_DOMAIN: &[u8] = b"dirextalk.history-recovery.completion-idempotency.v2\0";
@@ -13,7 +15,7 @@ pub(crate) async fn get_completion_key(State(state): State<IdentityBootstrapStat
     let Some(config) = state.completion_signer.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    if !state.public_origin.starts_with("https://") {
+    if !is_canonical_https_origin(&state.public_origin) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let now = match state.committed_at() {
@@ -125,7 +127,7 @@ pub(crate) async fn complete_history_recovery(
     let Some(config) = state.completion_signer.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    if !state.public_origin.starts_with("https://") {
+    if !is_canonical_https_origin(&state.public_origin) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let now = match state.committed_at() {

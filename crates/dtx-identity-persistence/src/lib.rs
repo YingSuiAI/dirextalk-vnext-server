@@ -18,7 +18,7 @@ pub use client_binding::{
     CLIENT_BINDING_INITIAL_DEVICE_HASH_DOMAIN, CLIENT_BINDING_ISSUE_HASH_DOMAIN,
     ClientBindingAuthorization, ClientBindingImport, ClientBindingImportError,
     ClientBindingIssueCommand, ClientBindingIssueOutcome, ClientBindingRepository,
-    ClientBindingState, ClientBindingWorkflowError,
+    ClientBindingState, ClientBindingWorkflowError, is_canonical_https_origin,
 };
 pub use device_enrollment::{
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,

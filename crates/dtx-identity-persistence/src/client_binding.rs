@@ -601,7 +601,10 @@ impl ClientBindingRepository {
     }
 }
 
-fn is_canonical_https_origin(value: &str) -> bool {
+/// Returns true only for the exact ASCII serialization of an HTTPS origin.
+/// Userinfo, path, query, fragment, default ports, case changes and trailing
+/// slash variants are rejected rather than normalized.
+pub fn is_canonical_https_origin(value: &str) -> bool {
     let Ok(url) = url::Url::parse(value) else {
         return false;
     };
@@ -799,17 +802,7 @@ fn canonical_v7(value: &str) -> Result<Uuid, ClientBindingImportError> {
     }
 }
 fn canonical_origin(value: &str) -> bool {
-    let Ok(url) = url::Url::parse(value) else {
-        return false;
-    };
-    url.scheme() == "https"
-        && url.host_str().is_some()
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.path() == "/"
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && url.origin().ascii_serialization() == value
+    is_canonical_https_origin(value)
 }
 fn hex_digest(value: &str) -> Result<Sha256Digest, ClientBindingImportError> {
     if value.len() != 64

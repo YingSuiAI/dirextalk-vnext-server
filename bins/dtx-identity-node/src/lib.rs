@@ -54,7 +54,7 @@ use dtx_identity_persistence::{
     MAX_KEY_PACKAGE_PUBLISH_BYTES, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
     MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES,
     RecoveryResponseCapability, RecoveryScopeCatalogOutcome, RecoveryScopeCatalogRepository,
-    RecoveryScopeCatalogStatusOutcome, lock_and_load_active_snapshot,
+    RecoveryScopeCatalogStatusOutcome, is_canonical_https_origin, lock_and_load_active_snapshot,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -473,6 +473,9 @@ impl IdentityBootstrapState {
         config: CompletionSignerConfig,
     ) -> Result<Self, IdentityNodeConfigurationError> {
         config.validate()?;
+        if !is_canonical_https_origin(&self.device_session_audience) {
+            return Err(IdentityNodeConfigurationError::InvalidCompletionSigner);
+        }
         self.completion_signer = Some(Arc::new(config));
         Ok(self)
     }

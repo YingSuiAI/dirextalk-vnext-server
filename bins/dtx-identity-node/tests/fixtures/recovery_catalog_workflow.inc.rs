@@ -2513,7 +2513,7 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     )
     .expect("completion fixture parses");
     let config = CompletionSignerConfig { key_id: Uuid::now_v7(), epoch: 1, rollback_floor_epoch: 1, issued_at: at(2_000), expires_at: at(9_000), previous_descriptor_digest: None, signing_key: signer };
-    let _descriptor = dtx_identity_persistence::HistoryRecoveryCompletionRepository
+    let descriptor1 = dtx_identity_persistence::HistoryRecoveryCompletionRepository
         .ensure_descriptor(
             &store,
             AUDIENCE,
@@ -2529,7 +2529,12 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
             at(5_000),
         )
         .await?;
-    let app = identity_bootstrap_router_with_state(IdentityBootstrapState::with_clock_and_device_session_audience(store, clock, AUDIENCE).with_completion_signer_config(config)?);
+    let app = identity_bootstrap_router_with_state(IdentityBootstrapState::with_clock_and_device_session_audience(store.clone(), clock.clone(), AUDIENCE).with_completion_signer_config(config.clone())?);
+    let current_descriptor = app.clone().oneshot(Request::builder().method("GET").uri(HISTORY_RECOVERY_COMPLETION_KEY_PATH).body(Body::empty())?).await?;
+    assert_eq!(current_descriptor.status(), StatusCode::OK);
+    assert_eq!(to_bytes(current_descriptor.into_body(), 16_384).await?.as_ref(), descriptor1.exact_bytes.as_slice());
+    let descriptor1_hex = descriptor1.digest.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let historical_path = HISTORY_RECOVERY_COMPLETION_KEY_HISTORICAL_PATH.replace("{descriptor_digest}", &descriptor1_hex);
     let uri = HISTORY_RECOVERY_COMPLETION_PATH.replace("{completion_id}", &completion_id.to_string());
     let first = Request::builder().method("POST").uri(&uri).header(header::CONTENT_TYPE, HISTORY_RECOVERY_COMPLETION_CONTENT_TYPE).header("idempotency-key", "completion-00001").header(header::AUTHORIZATION, super::authorization(&candidate_session)).body(Body::from(command.clone()))?;
     let second = Request::builder().method("POST").uri(&uri).header(header::CONTENT_TYPE, HISTORY_RECOVERY_COMPLETION_CONTENT_TYPE).header("idempotency-key", "completion-00001").header(header::AUTHORIZATION, super::authorization(&candidate_session)).body(Body::from(command.clone()))?;
@@ -2556,5 +2561,47 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     let readback = app.oneshot(Request::builder().method("GET").uri(&uri).header(header::AUTHORIZATION, super::authorization(&candidate_session)).body(Body::empty())?).await?;
     assert_eq!(readback.status(), StatusCode::OK);
     assert_eq!(to_bytes(readback.into_body(), 16_384).await?.as_ref(), receipt.as_slice());
+    let signer2 = SigningKey::from_bytes(&[109;32]);
+    let config2 = CompletionSignerConfig { key_id: Uuid::now_v7(), epoch: 2, rollback_floor_epoch: 2, issued_at: at(6_000), expires_at: at(10_000), previous_descriptor_digest: Some(descriptor1.digest), signing_key: signer2 };
+    let descriptor2 = dtx_identity_persistence::HistoryRecoveryCompletionRepository
+        .ensure_descriptor(
+            &store,
+            AUDIENCE,
+            dtx_identity_persistence::CompletionSignerMetadata {
+                key_id: config2.key_id,
+                epoch: config2.epoch,
+                rollback_floor_epoch: config2.rollback_floor_epoch,
+                issued_at: config2.issued_at,
+                expires_at: config2.expires_at,
+                previous_descriptor_digest: config2.previous_descriptor_digest,
+            },
+            &config2.signing_key,
+            at(6_000),
+        )
+        .await?;
+    assert_ne!(descriptor1.digest, descriptor2.digest);
+    let before_rejected = dtx_identity_persistence::HistoryRecoveryCompletionRepository.current_descriptor(&store).await?.expect("descriptor head").digest;
+    let rejected_previous = dtx_identity_persistence::HistoryRecoveryCompletionRepository
+        .ensure_descriptor(&store, AUDIENCE, dtx_identity_persistence::CompletionSignerMetadata { key_id: Uuid::now_v7(), epoch: 3, rollback_floor_epoch: 1, issued_at: at(6_000), expires_at: at(10_000), previous_descriptor_digest: Some(Sha256Digest::from_bytes([250;32])) }, &SigningKey::from_bytes(&[110;32]), at(6_000))
+        .await;
+    assert!(rejected_previous.is_err());
+    assert_eq!(dtx_identity_persistence::HistoryRecoveryCompletionRepository.current_descriptor(&store).await?.expect("descriptor head").digest, before_rejected);
+    let rejected_epoch = dtx_identity_persistence::HistoryRecoveryCompletionRepository
+        .ensure_descriptor(&store, AUDIENCE, dtx_identity_persistence::CompletionSignerMetadata { key_id: Uuid::now_v7(), epoch: 4, rollback_floor_epoch: 2, issued_at: at(6_000), expires_at: at(10_000), previous_descriptor_digest: Some(descriptor2.digest) }, &SigningKey::from_bytes(&[111;32]), at(6_000))
+        .await;
+    assert!(rejected_epoch.is_err());
+    let rejected_floor = dtx_identity_persistence::HistoryRecoveryCompletionRepository
+        .ensure_descriptor(&store, AUDIENCE, dtx_identity_persistence::CompletionSignerMetadata { key_id: Uuid::now_v7(), epoch: 3, rollback_floor_epoch: 1, issued_at: at(6_000), expires_at: at(10_000), previous_descriptor_digest: Some(descriptor2.digest) }, &SigningKey::from_bytes(&[112;32]), at(6_000))
+        .await;
+    assert!(rejected_floor.is_err());
+    assert_eq!(dtx_identity_persistence::HistoryRecoveryCompletionRepository.current_descriptor(&store).await?.expect("descriptor head").digest, before_rejected);
+    let restarted = IdentityPgStore::connect(harness.identity_runtime_options(), 8).await?;
+    let app2 = identity_bootstrap_router_with_state(IdentityBootstrapState::with_clock_and_device_session_audience(restarted, clock, AUDIENCE).with_completion_signer_config(config2)?);
+    let current2 = app2.clone().oneshot(Request::builder().method("GET").uri(HISTORY_RECOVERY_COMPLETION_KEY_PATH).body(Body::empty())?).await?;
+    assert_eq!(current2.status(), StatusCode::OK);
+    assert_eq!(to_bytes(current2.into_body(), 16_384).await?.as_ref(), descriptor2.exact_bytes.as_slice());
+    let historical2 = app2.oneshot(Request::builder().method("GET").uri(&historical_path).body(Body::empty())?).await?;
+    assert_eq!(historical2.status(), StatusCode::OK);
+    assert_eq!(to_bytes(historical2.into_body(), 16_384).await?.as_ref(), descriptor1.exact_bytes.as_slice());
     Ok(())
 }

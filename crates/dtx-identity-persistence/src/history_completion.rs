@@ -7,7 +7,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
-use crate::{IdentityPersistenceError, IdentityPgStore};
+use crate::{IdentityPersistenceError, IdentityPgStore, is_canonical_https_origin};
 
 pub const COMPLETION_DESCRIPTOR_DOMAIN: &[u8] =
     b"dirextalk.history-recovery.completion-key-descriptor.v2\0";
@@ -55,7 +55,8 @@ impl CompletionKeyDescriptor {
         origin: &str,
         signing_key: &SigningKey,
     ) -> Result<Self, IdentityPersistenceError> {
-        if metadata.key_id.get_version_num() != 7
+        if !is_canonical_https_origin(origin)
+            || metadata.key_id.get_version_num() != 7
             || metadata.epoch == 0
             || metadata.rollback_floor_epoch == 0
             || metadata.rollback_floor_epoch > metadata.epoch
@@ -956,6 +957,24 @@ fn digest32(bytes: &[u8]) -> Result<Sha256Digest, IdentityPersistenceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_https_origin_is_exact_and_shared() {
+        for value in [
+            "https://identity.example/path",
+            "https://identity.example?query",
+            "https://identity.example#fragment",
+            "https://user@identity.example",
+            "https://identity.example:443",
+            "HTTPS://identity.example",
+            "https://identity.example/",
+        ] {
+            assert!(!is_canonical_https_origin(value), "accepted {value}");
+        }
+        assert!(is_canonical_https_origin("https://identity.example"));
+        assert!(is_canonical_https_origin("https://127.0.0.1"));
+        assert!(!is_canonical_https_origin("http://127.0.0.1"));
+    }
 
     #[test]
     fn descriptor_is_canonical_and_signed_by_provisioned_key() {
