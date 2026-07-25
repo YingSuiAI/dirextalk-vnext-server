@@ -144,13 +144,15 @@ pub async fn record_route_health(
         if active.is_none() { return Err(RouteHealthParseError::InvalidShape); }
         let approval_current: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM agent.agent_identity_approvals a
+             JOIN agent.agent_devices d ON d.tenant_id=a.tenant_id
+               AND d.installation_id=a.installation_id AND d.agent_device_id=a.agent_device_id
              JOIN identity.log_heads h ON h.identity_id=a.agent_identity_id
              AND h.sequence=a.identity_head_sequence AND h.head_hash=a.identity_head_hash
              WHERE a.tenant_id=$1 AND a.installation_id=$2 AND a.binding_id=$3
-               AND a.agent_device_id=$4 AND a.credential_fingerprint=$5)")
+               AND a.agent_device_id=$4 AND a.credential_fingerprint=d.credential_fingerprint
+               AND d.state='active')")
             .bind(Uuid::from(request.tenant_id)).bind(Uuid::from(request.installation_id))
             .bind(Uuid::from(request.binding_id)).bind(Uuid::from(request.agent_device_id))
-            .bind(peer.certificate_fingerprint().as_bytes().to_vec())
             .fetch_one(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
         let existing = sqlx::query("SELECT request_digest, receipt_bytes, observation_revision FROM agent.agent_route_health_receipts WHERE tenant_id=$1 AND route_id=$2 AND nonce=$3 FOR UPDATE")
             .bind(Uuid::from(request.tenant_id)).bind(Uuid::from(request.route_id)).bind(request.nonce.to_vec()).fetch_optional(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
