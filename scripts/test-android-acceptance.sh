@@ -246,6 +246,29 @@ valid_pid_re='^[1-9][0-9]*$'; [[ "$mismatch_pid" =~ $valid_pid_re ]] && kill -0 
 kill -KILL "$mismatch_pid" 2>/dev/null || true
 wait "$mismatch_pid" 2>/dev/null || true
 
+# If a guardian dies after the group TERM, its numeric PGID must be treated as
+# reusable/ambiguous: no group KILL may follow.  BASH_ENV records all kill
+# builtins and, after the guardian has died, deterministically maps that
+# numeric group to an unrelated sentinel.  A mistaken post-TERM group signal
+# would therefore reach the sentinel rather than an actual reused PGID.
+fixture="$tmp/guardian-mismatch"; make_fixture "$fixture"
+printf '%s\n' 'kill() {' '  printf "kill" >>"$DTX_TEST_KILL_LOG"' '  for arg in "$@"; do printf " <%s>" "$arg" >>"$DTX_TEST_KILL_LOG"; done' '  printf "\n" >>"$DTX_TEST_KILL_LOG"' '  if [[ -n "${DTX_TEST_REUSED_PGID_FILE:-}" && -s "$DTX_TEST_REUSED_PGID_FILE" && -n "${DTX_TEST_UNRELATED_PID:-}" && "${!#}" == "-$(<"$DTX_TEST_REUSED_PGID_FILE")" ]]; then' '    builtin kill "$1" "$DTX_TEST_UNRELATED_PID"' '    return' '  fi' '  builtin kill "$@"' '}' >"$fixture/kill-spy.bash"
+setsid bash -c 'trap "exit 0" TERM; while :; do sleep 1; done' & unrelated_pid=$!
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; control=${3##*:}; : >"$DTX_TEST_PROXY_PORTS/$listen"; : >"$DTX_TEST_PROXY_PORTS/$control"' 'trap '\''printf "%s" "$PPID" >"$DTX_TEST_REUSED_PGID_FILE"; kill -KILL "$PPID"; trap "" TERM; while :; do sleep 1; done'\'' TERM' 'while :; do sleep 1; done' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
+if BASH_ENV="$fixture/kill-spy.bash" DTX_TEST_KILL_LOG="$fixture/kill-log" DTX_TEST_REUSED_PGID_FILE="$fixture/reused-pgid" DTX_TEST_UNRELATED_PID="$unrelated_pid" run_fixture "$fixture" guardian-mismatch env; then exit 1; fi
+guardian_root="$fixture/.android-acceptance/guardian-mismatch"
+guardian_pid="$(awk -F= '$1 == "PROXY_A_GUARDIAN_PID" { print $2 }' "$guardian_root/resources")"
+guardian_child="$(awk -F= '$1 == "PROXY_A_PID" { print $2 }' "$guardian_root/resources")"
+[[ "$guardian_pid" =~ $valid_pid_re && "$guardian_child" =~ $valid_pid_re ]]
+[[ "$(<"$guardian_root/cleanup-status")" == cleanup=failed ]]
+rg -F "kill <-TERM> <--> <-$guardian_pid>" "$fixture/kill-log" >/dev/null
+! rg -F "<-$guardian_pid>" "$fixture/kill-log" | rg -F -- '-KILL' >/dev/null
+kill -0 "$unrelated_pid" 2>/dev/null
+kill -KILL "$guardian_child" 2>/dev/null || true
+wait "$guardian_child" 2>/dev/null || true
+kill -TERM "$unrelated_pid" 2>/dev/null || true
+wait "$unrelated_pid" 2>/dev/null || true
+
 # A stubborn descendant is removed by the owned process-group KILL fallback.
 fixture="$tmp/child-cleanup"; make_fixture "$fixture"
 printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; control=${3##*:}; : >"$DTX_TEST_PROXY_PORTS/$listen"; : >"$DTX_TEST_PROXY_PORTS/$control"' '(trap '\'''\'' TERM; while :; do sleep 1; done) & child=$!; printf "%s" "$child" >"$DTX_TEST_ROOT/proxy-child"' 'trap '\''rm -f "$DTX_TEST_PROXY_PORTS/$listen" "$DTX_TEST_PROXY_PORTS/$control"'\'' TERM' 'while :; do sleep 1; done' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"

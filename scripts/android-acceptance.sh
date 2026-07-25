@@ -286,9 +286,16 @@ wait_for_group_exit() {
 }
 guardian_matches() {
   local pid=$1 start=$2 pgid
+  valid_pid "$pid" && valid_uint "$start" || return 1
   [[ "$(proc_start_identity "$pid")" == "$start" ]] || return 1
   pgid="$(process_group_pgid "$pid")" || return 1
   [[ "$pgid" == "$pid" ]]
+}
+guardian_is_gone() {
+  local pid=$1 start=$2 current
+  valid_pid "$pid" && valid_uint "$start" || return 1
+  current="$(proc_start_identity "$pid" 2>/dev/null || true)"
+  [[ "$current" != "$start" ]]
 }
 stop_pid() {
   local pid=$1 child_start=$2 guardian=$3 guardian_start=$4 port=$5 kind=${6:-proxy} first=${7:-} second=${8:-} third=${9:-} serial=${10:-} pgid
@@ -312,6 +319,7 @@ stop_pid() {
   deadline=$((SECONDS + PROCESS_KILL_GRACE_SECONDS))
   wait_for_group_exit "$pgid" "$deadline" || return 1
   ! group_has_live_members "$pgid" || return 1
+  guardian_is_gone "$guardian" "$guardian_start" || return 1
   wait "$pid" 2>/dev/null || true
   ! ss_bounded -ltnH "sport = :$port" | grep -q . || return 1
 }
