@@ -779,6 +779,56 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
         preparation_receipt_bytes
     );
 
+    // The V4 request uses only artifacts accepted by the production Catalog
+    // workflow above: the signed H+1 DeviceAdd, the persisted preparation and
+    // provider response, and the canonical signed Catalog head.
+    let request_idempotency = "history-recovery-v4-0001";
+    let v4_request = history_recovery_request_v4_body(
+        challenge.challenge_id(),
+        identity_id,
+        candidate_device,
+        &candidate,
+        [55; 32],
+        head3,
+        head4,
+        &candidate_add_bytes,
+        &preparation,
+        uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b1")?,
+        &first_head,
+        catalog_head_digest,
+        response_capability,
+        request_idempotency,
+    )?;
+    let v4_created = send_history_recovery_request_v4(
+        app.clone(),
+        request_idempotency,
+        enrollment_capability,
+        response_capability,
+        v4_request.clone(),
+    )
+    .await?;
+    assert_eq!(v4_created.status(), StatusCode::CREATED);
+    assert_catalog_headers(&v4_created, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE);
+    let v4_receipt = to_bytes(v4_created.into_body(), 16_384).await?.to_vec();
+    let v4_replay = send_history_recovery_request_v4(
+        app.clone(),
+        request_idempotency,
+        enrollment_capability,
+        response_capability,
+        v4_request.clone(),
+    )
+    .await?;
+    assert_eq!(v4_replay.status(), StatusCode::OK);
+    assert_catalog_headers(&v4_replay, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE);
+    assert_eq!(to_bytes(v4_replay.into_body(), 16_384).await?, v4_receipt);
+    let v4_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM identity.history_recovery_requests WHERE request_id=$1",
+    )
+    .bind(*challenge.challenge_id().as_uuid())
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(v4_rows, 1);
+
     clock.set(5_400);
     let rotated = catalog_body(
         identity_id,
@@ -805,6 +855,23 @@ async fn catalog_http_workflow_is_exact_capability_gated_and_fail_closed()
     let rotated_head_digest = Sha256Digest::hash_domain(
         dtx_identity_persistence::CATALOG_HEAD_DIGEST_DOMAIN,
         &rotated_head,
+    );
+    let v4_drift_replay = send_history_recovery_request_v4(
+        app.clone(),
+        request_idempotency,
+        enrollment_capability,
+        response_capability,
+        v4_request,
+    )
+    .await?;
+    assert_eq!(v4_drift_replay.status(), StatusCode::OK);
+    assert_catalog_headers(
+        &v4_drift_replay,
+        HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
+    );
+    assert_eq!(
+        to_bytes(v4_drift_replay.into_body(), 16_384).await?,
+        v4_receipt
     );
     let invalidated =
         send_status(app.clone(), challenge.challenge_id(), response_capability).await?;

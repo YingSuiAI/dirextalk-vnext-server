@@ -536,6 +536,8 @@ impl PostgresHarness {
                 TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.recovery_scope_catalog_preparations
                 TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.history_recovery_requests
+                TO dtx_identity_runtime;
              GRANT SELECT, INSERT, UPDATE ON identity.client_bindings
                 TO dtx_identity_runtime;
              GRANT UPDATE(

@@ -11,7 +11,7 @@ impl DeviceEnrollmentRepository {
             // Replay is resolved before any mutable validity checks.  A
             // committed receipt therefore remains replayable after expiry,
             // cancellation, rotation, or catalog/head drift.
-            if let Some(row) = sqlx::query("SELECT request_digest,request_bytes,idempotency_digest,receipt_bytes FROM identity.history_recovery_requests WHERE request_id=$1 FOR UPDATE")
+            if let Some(row) = sqlx::query("SELECT request_digest,request_bytes,idempotency_digest,receipt_bytes FROM identity.history_recovery_requests WHERE request_id=$1")
                 .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await? {
                 let digest: Vec<u8> = row.try_get("request_digest")?;
                 let bytes: Vec<u8> = row.try_get("request_bytes")?;
@@ -30,7 +30,7 @@ impl DeviceEnrollmentRepository {
             // writers and avoiding cross-path deadlocks.
             let identity_hint = command.identity_id;
             lock_identity(tx.connection(), identity_hint).await?;
-            if let Some(row) = sqlx::query("SELECT request_digest,request_bytes,idempotency_digest,receipt_bytes FROM identity.history_recovery_requests WHERE request_id=$1 FOR UPDATE")
+            if let Some(row) = sqlx::query("SELECT request_digest,request_bytes,idempotency_digest,receipt_bytes FROM identity.history_recovery_requests WHERE request_id=$1")
                 .bind(*command.request_id.as_uuid())
                 .fetch_optional(&mut *tx.connection())
                 .await?

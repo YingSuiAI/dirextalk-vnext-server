@@ -26,7 +26,8 @@ use dtx_identity_log::{
 };
 use dtx_identity_node::{
     DEVICE_ENROLLMENT_CAPABILITY_HEADER, DEVICE_SESSION_AUTHORIZATION_SCHEME,
-    IdentityBootstrapState, RECOVERY_RESPONSE_CAPABILITY_HEADER,
+    HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE, HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE,
+    HISTORY_RECOVERY_REQUEST_V4_PATH, IdentityBootstrapState, RECOVERY_RESPONSE_CAPABILITY_HEADER,
     RECOVERY_SCOPE_CATALOG_CONTENT_TYPE, RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_PATH_TEMPLATE, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
     RECOVERY_SCOPE_CATALOG_PREPARATION_PATH_TEMPLATE,
@@ -42,9 +43,9 @@ use dtx_identity_persistence::{
     CreateDeviceEnrollmentChallengeCommand, DEVICE_SESSION_SECRET_HASH_DOMAIN,
     DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability, DeviceEnrollmentChallengeOutcome,
     DeviceEnrollmentRepository, DeviceSessionCompletionCommand, DeviceSessionCredential,
-    DeviceSessionOutcome, DeviceSessionRepository, IdentityAppendCommand, IdentityAppendOutcome,
-    IdentityLogHead, IdentityLogRepository, IdentityPgStore,
-    MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
+    DeviceSessionOutcome, DeviceSessionRepository, HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN,
+    IdentityAppendCommand, IdentityAppendOutcome, IdentityLogHead, IdentityLogRepository,
+    IdentityPgStore, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
     MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES,
     PREPARATION_DIGEST_DOMAIN, PREPARATION_SIGNATURE_DOMAIN, PROVIDER_AAD_DIGEST_DOMAIN,
     PROVIDER_AUTHORITY_SIGNATURE_DOMAIN, PROVIDER_CIPHERTEXT_HASH_DOMAIN,
@@ -318,6 +319,132 @@ async fn send_provider_response_custom(
         builder = builder.header(header::CONTENT_LENGTH, length);
     }
     Ok(app.oneshot(builder.body(Body::from(body))?).await?)
+}
+
+async fn send_history_recovery_request_v4(
+    app: axum::Router,
+    idempotency: &str,
+    enrollment_capability: [u8; 32],
+    response_capability: [u8; 32],
+    body: Vec<u8>,
+) -> Result<axum::response::Response, Box<dyn Error>> {
+    Ok(app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(HISTORY_RECOVERY_REQUEST_V4_PATH)
+                .header(
+                    header::CONTENT_TYPE,
+                    HISTORY_RECOVERY_REQUEST_V4_CONTENT_TYPE,
+                )
+                .header(
+                    header::ACCEPT,
+                    HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
+                )
+                .header("idempotency-key", idempotency)
+                .header(
+                    DEVICE_ENROLLMENT_CAPABILITY_HEADER,
+                    Base64UrlUnpadded::encode_string(&enrollment_capability),
+                )
+                .header(
+                    RECOVERY_RESPONSE_CAPABILITY_HEADER,
+                    Base64UrlUnpadded::encode_string(&response_capability),
+                )
+                .body(Body::from(body))?,
+        )
+        .await?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn history_recovery_request_v4_body(
+    request_id: DeviceEnrollmentChallengeId,
+    identity: IdentityId,
+    candidate_device: DeviceId,
+    candidate: &SigningKey,
+    recipient: [u8; 32],
+    pre_head: IdentityLogHead,
+    post_head: IdentityLogHead,
+    device_add: &[u8],
+    preparation: &[u8],
+    catalog_id: uuid::Uuid,
+    catalog_head: &[u8],
+    catalog_head_digest: Sha256Digest,
+    response_capability: [u8; 32],
+    idempotency: &str,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let leaves = CanonicalValue::Array(vec![CanonicalValue::Bytes(vec![0x91; 32])]);
+    let leaf_bytes = encode_deterministic_cbor(&leaves)?;
+    let manifest = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(identity.to_string())),
+        field(3, CanonicalValue::Text(catalog_id.to_string())),
+        field(4, safe(1).to_canonical_value()),
+        field(5, CanonicalValue::Bytes(catalog_head.to_vec())),
+        field(6, catalog_head_digest.to_canonical_value()),
+        field(7, Sha256Digest::from_bytes([31; 32]).to_canonical_value()),
+        field(8, CanonicalValue::Unsigned(1)),
+        field(
+            9,
+            Sha256Digest::hash_domain(b"dirextalk.history-recovery.leaf-set.v2\0", &leaf_bytes)
+                .to_canonical_value(),
+        ),
+        field(10, leaves),
+    ]);
+    let manifest_bytes = encode_deterministic_cbor(&manifest)?;
+    let unsigned = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(4)),
+        field(2, CanonicalValue::Text(request_id.to_string())),
+        field(3, CanonicalValue::Text(identity.to_string())),
+        field(4, CanonicalValue::Text(candidate_device.to_string())),
+        field(5, public(candidate).to_canonical_value()),
+        field(6, CanonicalValue::Bytes(recipient.to_vec())),
+        field(7, pre_head.sequence().to_canonical_value()),
+        field(8, pre_head.hash().to_canonical_value()),
+        field(9, post_head.sequence().to_canonical_value()),
+        field(10, post_head.hash().to_canonical_value()),
+        field(11, CanonicalValue::Bytes(device_add.to_vec())),
+        field(
+            12,
+            Sha256Digest::hash_domain(b"dirextalk.identity-device-add.v1\0", device_add)
+                .to_canonical_value(),
+        ),
+        field(13, CanonicalValue::Bytes(preparation.to_vec())),
+        field(
+            14,
+            Sha256Digest::hash_domain(PREPARATION_DIGEST_DOMAIN, preparation).to_canonical_value(),
+        ),
+        field(15, manifest),
+        field(
+            16,
+            Sha256Digest::hash_domain(b"dirextalk.history-recovery.manifest.v2\0", &manifest_bytes)
+                .to_canonical_value(),
+        ),
+        field(17, at(5_300).to_canonical_value()),
+        // Provider authorization is valid through 200_000, so the request
+        // interval must contain that full accepted provider interval.
+        field(18, at(200_000).to_canonical_value()),
+        field(
+            19,
+            Sha256Digest::hash_domain(RESPONSE_CAPABILITY_HASH_DOMAIN, &response_capability)
+                .to_canonical_value(),
+        ),
+        field(
+            20,
+            Sha256Digest::hash_domain(
+                b"dirextalk.history-recovery.request-idempotency.v4\0",
+                idempotency.as_bytes(),
+            )
+            .to_canonical_value(),
+        ),
+    ]);
+    let unsigned_bytes = encode_deterministic_cbor(&unsigned)?;
+    let mut input = HISTORY_RECOVERY_REQUEST_V4_SIGNATURE_DOMAIN.to_vec();
+    input.extend_from_slice(&unsigned_bytes);
+    let CanonicalValue::Map(mut fields) = unsigned else {
+        unreachable!()
+    };
+    fields.push(field(21, signature(candidate, &input).to_canonical_value()));
+    Ok(encode_deterministic_cbor(&CanonicalValue::Map(fields))?)
 }
 
 fn authorization(session: &Session) -> String {
