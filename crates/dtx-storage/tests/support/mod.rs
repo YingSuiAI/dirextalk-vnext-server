@@ -536,6 +536,8 @@ impl PostgresHarness {
                 TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.recovery_scope_catalog_preparations
                 TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.history_recovery_requests
+                TO dtx_identity_runtime;
              GRANT SELECT, INSERT, UPDATE ON identity.client_bindings
                 TO dtx_identity_runtime;
              GRANT UPDATE(
@@ -601,6 +603,13 @@ impl PostgresHarness {
                 messaging.device_delivery_ack_claims TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON messaging.history_recovery_offers
                 TO dtx_mailbox_runtime;
+             GRANT SELECT, INSERT ON messaging.history_recovery_grants_v4
+                TO dtx_mailbox_runtime;
+             GRANT SELECT ON identity.device_enrollment_challenges,
+                 identity.history_recovery_requests,
+                 identity.recovery_scope_catalogs,
+                 identity.recovery_scope_catalog_preparations
+                 TO dtx_mailbox_runtime;
              GRANT USAGE ON SCHEMA realtime TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT, UPDATE ON realtime.identity_heads TO dtx_mailbox_runtime;
              GRANT SELECT, INSERT ON realtime.journal, realtime.outbox TO dtx_mailbox_runtime;

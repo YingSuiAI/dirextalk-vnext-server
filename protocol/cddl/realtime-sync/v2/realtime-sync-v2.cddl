@@ -30,7 +30,8 @@ identity-mailbox-pull-receipt-v3 = {
 identity-mailbox-segment-v3 = identity-mailbox-envelope-v3 / identity-mailbox-terminal-range-v3
 identity-mailbox-envelope-v3 = {
   1: 1, 2: 1..9007199254740991, 3: uuid-v7,
-  4: bstr .size (1..262144), 5: int
+  ; Identity delivery is read-side only and may carry a History OfferV3.
+  4: bstr .size (1..1049093), 5: int
 }
 identity-mailbox-terminal-range-v3 = {
   1: 2, 2: 1..9007199254740991, 3: 1..9007199254740991

@@ -251,6 +251,8 @@ components:
       content:
         application/vnd.dirextalk.mailbox-pull-receipt.v1+cbor:
           x-dirextalk-exact-cbor: true
+          x-dirextalk-max-pull-ciphertext-bytes: 1049093
+          x-dirextalk-max-pull-entries: 100
           schema:
             type: string
             format: binary

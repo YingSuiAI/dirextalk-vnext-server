@@ -87,8 +87,8 @@ x-dirextalk-owner-consumer-ceilings:
     owner-artifact: protocol/cddl/history-recovery/v3/history-recovery-v3.cddl
     manifest: {owner-raw: 35477, consumer-bstr: 35480, consumed-by: [recovery-add-v7]}
     request: {owner-raw: 37114, consumer-bstr: 37117, consumed-by: [recovery-add-v7]}
-    grant: {owner-raw: 1050699, consumer-bstr: 1050704, consumed-by: [recovery-add-v7]}
-    recipient-offer: {owner-raw: 1049059, consumer-bstr: 1049064, consumed-by: [recovery-add-v7]}
+    grant: {owner-raw: 1050733, consumer-bstr: 1050738, consumed-by: [recovery-add-v7]}
+    recipient-offer: {owner-raw: 1049093, consumer-bstr: 1049098, consumed-by: [recovery-add-v7]}
     delivery-fact: {owner-raw: 366, consumer-bstr: 369, consumed-by: [recovery-add-v7]}
     completion-command: {owner-raw: 3593836, consumed-by: []}
     completion-presentation: {owner-raw: 5660, consumer-bstr: 5663, consumed-by: [completion-cache-v2]}
@@ -107,7 +107,7 @@ x-dirextalk-body-ceilings:
   issuer-authorization-response-fields-1-through-22: 2613
   route-v1: 2304
   controller-proof-v1: 4507
-  recovery-add-v7: 4489149
+  recovery-add-v7: 4489217
   recovery-add-receipt-v7: 613
   signed-recovery-add-receipt-v7: 791
   confirmation-v2: 1510
@@ -211,7 +211,7 @@ x-dirextalk-cbor-ceiling-arithmetic:
     14-map-header-and-key-bytes + 4493-value-bytes = 4507; the exact owner
     membership-receipt payload contributes a 4099-byte enclosing bstr.
   recovery-add-v7: >-
-    81-map-header-and-key-bytes + 4489068-value-bytes = 4489149; owner bstr
+    81-map-header-and-key-bytes + 4489136-value-bytes = 4489217; owner bstr
     encodings are request 37117, manifest 35480, grant 1050704, recipient offer
     1049064, delivery fact 369, signed head 469, opening 7267, proof 405,
     publish receipt 67536, and claim receipt 135569 bytes.
@@ -345,9 +345,9 @@ x-dirextalk-compact-map-fields:
     '10': {name: history-request-digest, source: history-owner-domain-digest-of-field-9}
     '11': {name: exact-history-manifest-v2, source: history-v3-owner-rule}
     '12': {name: history-manifest-digest, source: history-owner-domain-digest-of-field-11}
-    '13': {name: exact-history-grant-v4, source: history-v3-owner-rule}
+    '13': {name: exact-history-grant-v5, source: history-v3-owner-rule}
     '14': {name: history-grant-digest, source: history-owner-domain-digest-of-field-13}
-    '15': {name: exact-recipient-offer-v2, source: history-v3-owner-rule}
+    '15': {name: exact-recipient-history-offer-v3, source: history-v3-owner-rule}
     '16': {name: recipient-offer-digest, source: history-owner-domain-digest-of-field-15}
     '17': {name: exact-delivery-fact-v2, source: history-v3-owner-rule}
     '18': {name: delivery-fact-digest, source: history-owner-domain-digest-of-field-17}
@@ -903,7 +903,7 @@ x-dirextalk-exact-http-operations:
     method: POST
     authorization: current-scope-controller-device-session
     request-media-type: application/vnd.dirextalk.mls-recovery-commit.v7+cbor
-    request-ceiling: 4489149
+    request-ceiling: 4489217
     response-media-type: application/vnd.dirextalk.mls-recovery-commit-receipt.v7+cbor
     response-ceiling: 791
     idempotency-digest-cbor-path: [50]
@@ -1012,7 +1012,7 @@ paths:
       operationId: submitMlsRecoveryCommitV7
       x-dirextalk-authentication: {kind: current-scope-controller, required: true}
       x-dirextalk-replay-order: '#/x-dirextalk-replay-order'
-      x-dirextalk-body-ceiling-bytes: 4489149
+      x-dirextalk-body-ceiling-bytes: 4489217
       x-dirextalk-all-validation-before-write: true
       x-dirextalk-path-coordinate-binding:
         reject: reject-before-durable-writes
@@ -1303,7 +1303,7 @@ components:
     RecoveryAddRequestCbor:
       type: string
       contentEncoding: binary
-      maxLength: 4489149
+      maxLength: 4489217
       x-dirextalk-exact-cbor: true
       x-dirextalk-cddl-rule: mls-recovery-add-request-v7
     ConfirmationCommandCbor:

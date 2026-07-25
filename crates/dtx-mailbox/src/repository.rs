@@ -6,21 +6,22 @@ use dtx_identity_persistence::{
 use dtx_wire::{SafeUint, Sha256Digest, UtcMillis};
 use sqlx::{PgConnection, Row};
 use subtle::ConstantTimeEq;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::{
     MAX_ACTIVE_ENVELOPE_BYTES, MAX_ACTIVE_ENVELOPES, MAX_ENVELOPE_TTL_MILLIS,
-    MailboxAcknowledgementCommand, MailboxEnvelopeCommand, MailboxOperationOutcome,
-    MailboxPersistenceError, MailboxPgStore, MailboxPullRequest, MailboxRegistrationCommand,
-    MailboxWriteCapability, types::receipt_hash,
+    MAX_HISTORY_OFFER_BYTES, MailboxAcknowledgementCommand, MailboxEnvelopeCommand,
+    MailboxOperationOutcome, MailboxPersistenceError, MailboxPgStore, MailboxPullRequest,
+    MailboxRegistrationCommand, MailboxWriteCapability, types::receipt_hash,
 };
 
 mod codec;
 use codec::{
     PulledEnvelope, encode_acknowledgement_receipt, encode_enqueue_receipt, encode_pull_receipt,
     encode_registration_receipt, parse_device_id, parse_digest, parse_envelope_id,
-    parse_identity_id, parse_safe_sequence, parse_utc_millis, replay_envelope_receipt,
-    replay_receipt,
+    parse_identity_id, parse_safe_sequence, parse_utc_millis, pull_receipt_within_limit,
+    replay_envelope_receipt, replay_receipt,
 };
 
 /// Durable repository for opaque mailbox registration and at-least-once relay.
@@ -368,23 +369,25 @@ impl MailboxRepository {
             let mailbox = load_mailbox_for_update(session.connection(), mailbox_id, now).await?;
             authorize_owner(&mailbox, authenticated)?;
             let _ = expire_available(session.connection(), mailbox_id, now).await?;
-            let rows = sqlx::query(
+            let mut rows = sqlx::query(
                 "SELECT delivery_sequence, envelope_id, opaque_ciphertext, expires_at_ms, state
                    FROM messaging.mailbox_envelopes
                   WHERE mailbox_id=$1 AND delivery_sequence > $2
-                  ORDER BY delivery_sequence",
+                  ORDER BY delivery_sequence
+                  LIMIT $3",
             )
             .bind(*mailbox_id.as_uuid())
             .bind(
                 i64::try_from(request.after_sequence().get())
                     .map_err(|_| MailboxPersistenceError::InvalidCommand("mailbox pull cursor"))?,
             )
-            .fetch_all(&mut *session.connection())
-            .await?;
+            .bind(i64::from(request.limit()))
+            .fetch(&mut *session.connection());
 
             let mut cursor = request.after_sequence();
             let mut envelopes = Vec::new();
-            for row in rows {
+            while let Some(row) = rows.next().await {
+                let row = row?;
                 let sequence = parse_safe_sequence(row.try_get("delivery_sequence")?)?;
                 let state: String = row.try_get("state")?;
                 match state.as_str() {
@@ -392,13 +395,31 @@ impl MailboxRepository {
                         let envelope_id = parse_envelope_id(row.try_get("envelope_id")?)?;
                         let opaque_ciphertext: Vec<u8> = row.try_get("opaque_ciphertext")?;
                         if opaque_ciphertext.is_empty()
-                            || opaque_ciphertext.len() > crate::MAX_OPAQUE_CIPHERTEXT_BYTES
+                            || opaque_ciphertext.len() > MAX_HISTORY_OFFER_BYTES
                         {
                             return Err(MailboxPersistenceError::CorruptData(
                                 "mailbox opaque ciphertext",
                             ));
                         }
                         let expires_at = parse_utc_millis(row.try_get("expires_at_ms")?)?;
+                        if !pull_receipt_within_limit(
+                            mailbox_id,
+                            sequence,
+                            &envelopes,
+                            Some((
+                                &sequence,
+                                &envelope_id,
+                                opaque_ciphertext.len(),
+                                &expires_at,
+                            )),
+                        )? {
+                            if envelopes.is_empty() {
+                                return Err(MailboxPersistenceError::CorruptData(
+                                    "mailbox pull receipt budget",
+                                ));
+                            }
+                            break;
+                        }
                         envelopes.push(PulledEnvelope {
                             delivery_sequence: sequence,
                             envelope_id,
@@ -632,6 +653,71 @@ pub(crate) async fn append_identity_delivery_and_realtime(
     Ok(())
 }
 
+/// Grant V4 variant that supplies immutable UUIDv7 coordinates for the
+/// realtime journal and outbox rows. Legacy mailbox delivery continues to use
+/// the original cursor-only helper above.
+pub(crate) async fn append_identity_delivery_and_realtime_with_ids(
+    connection: &mut PgConnection,
+    identity_id: IdentityId,
+    command: &MailboxEnvelopeCommand,
+    now: UtcMillis,
+    event_id: Uuid,
+    outbox_record_id: Uuid,
+) -> Result<(), MailboxPersistenceError> {
+    initialize_delivery_heads(connection, identity_id).await?;
+    let delivery_sequence: i64 = sqlx::query_scalar(
+        "UPDATE messaging.identity_delivery_heads SET next_sequence=next_sequence+1
+         WHERE identity_id=$1 RETURNING next_sequence",
+    )
+    .bind(identity_id.to_string())
+    .fetch_one(&mut *connection)
+    .await?;
+    sqlx::query(
+        "INSERT INTO messaging.identity_delivery_journal(
+             identity_id, delivery_sequence, mailbox_id, envelope_id, expires_at_ms, created_at_ms
+         ) VALUES ($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(identity_id.to_string())
+    .bind(delivery_sequence)
+    .bind(*command.mailbox_id().as_uuid())
+    .bind(*command.envelope_id().as_uuid())
+    .bind(command.expires_at().get())
+    .bind(now.get())
+    .execute(&mut *connection)
+    .await?;
+    let realtime_cursor: i64 = sqlx::query_scalar(
+        "UPDATE realtime.identity_heads SET next_cursor=next_cursor+1
+         WHERE identity_id=$1 RETURNING next_cursor",
+    )
+    .bind(identity_id.to_string())
+    .fetch_one(&mut *connection)
+    .await?;
+    let subject_digest = Sha256Digest::hash_domain(
+        b"dirextalk.realtime-mailbox-subject.v1\0",
+        command.envelope_id().as_uuid().as_bytes(),
+    );
+    sqlx::query(
+        "INSERT INTO realtime.journal(
+             identity_id,cursor,event_id,event_kind,subject_digest,created_at_ms,expires_at_ms
+         ) VALUES ($1,$2,$3,'mailbox_delivery',$4,$5,$6)",
+    )
+    .bind(identity_id.to_string())
+    .bind(realtime_cursor)
+    .bind(event_id)
+    .bind(subject_digest.as_bytes().as_slice())
+    .bind(now.get())
+    .bind(command.expires_at().get())
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query("INSERT INTO realtime.outbox(identity_id,cursor,record_id) VALUES ($1,$2,$3)")
+        .bind(identity_id.to_string())
+        .bind(realtime_cursor)
+        .bind(outbox_record_id)
+        .execute(&mut *connection)
+        .await?;
+    Ok(())
+}
+
 /// Creates the best-effort opaque-push wake hint for one newly persisted
 /// mailbox envelope. The migration-owned function performs registration
 /// selection and idempotent insertion under its provider lock; this call only
@@ -718,7 +804,7 @@ pub(crate) async fn finish_transaction<T>(
     }
 }
 
-async fn advisory_lock(
+pub(crate) async fn advisory_lock(
     connection: &mut PgConnection,
     namespace: &str,
     value: &str,

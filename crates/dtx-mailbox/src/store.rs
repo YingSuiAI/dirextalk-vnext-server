@@ -127,6 +127,7 @@ async fn validate_mailbox_runtime_role(pool: &PgPool) -> Result<(), MailboxPersi
              AND has_table_privilege(current_user, 'messaging.device_delivery_ack_claims', 'SELECT,INSERT')
              AND has_table_privilege(current_user, 'messaging.device_history_grants', 'SELECT,INSERT,UPDATE')
              AND has_table_privilege(current_user, 'messaging.history_recovery_offers', 'SELECT,INSERT')
+             AND has_table_privilege(current_user, 'messaging.history_recovery_grants_v4', 'SELECT,INSERT')
              AND has_schema_privilege(current_user, 'realtime', 'USAGE')
              AND has_table_privilege(current_user, 'realtime.identity_heads', 'SELECT,INSERT,UPDATE')
              AND has_table_privilege(current_user, 'realtime.journal', 'SELECT,INSERT')
@@ -142,6 +143,10 @@ async fn validate_mailbox_runtime_role(pool: &PgPool) -> Result<(), MailboxPersi
              AND has_table_privilege(current_user, 'identity.device_sessions', 'SELECT')
              AND has_table_privilege(current_user, 'identity.log_heads', 'SELECT')
              AND has_table_privilege(current_user, 'identity.log_entries', 'SELECT')
+             AND has_table_privilege(current_user, 'identity.device_enrollment_challenges', 'SELECT')
+             AND has_table_privilege(current_user, 'identity.history_recovery_requests', 'SELECT')
+             AND has_table_privilege(current_user, 'identity.recovery_scope_catalogs', 'SELECT')
+             AND has_table_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'SELECT')
              AND has_function_privilege(
                  current_user,
                  'identity.identity_mailbox_reader_authorized()'::regprocedure,
@@ -259,7 +264,13 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, MailboxPersi
                   WHERE namespace.nspname = 'identity'
                     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
                     AND (
-                        (relation.relname NOT IN ('device_sessions', 'log_heads', 'log_entries')
+                        (relation.relname NOT IN (
+                             'device_sessions', 'log_heads', 'log_entries',
+                             'device_enrollment_challenges',
+                             'history_recovery_requests',
+                             'recovery_scope_catalogs',
+                             'recovery_scope_catalog_preparations'
+                         )
                          AND has_table_privilege(current_user, relation.oid, 'SELECT'))
                         OR has_table_privilege(current_user, relation.oid, 'INSERT')
                         OR has_table_privilege(current_user, relation.oid, 'UPDATE')

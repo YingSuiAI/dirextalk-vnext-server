@@ -36,13 +36,6 @@ fn numbered_fields(
         })
         .collect()
 }
-fn require_version(value: &CanonicalValue) -> Result<(), IdentityPersistenceError> {
-    if value == &CanonicalValue::Unsigned(1) {
-        Ok(())
-    } else {
-        Err(invalid("version"))
-    }
-}
 fn parse_identity(value: &CanonicalValue) -> Result<IdentityId, IdentityPersistenceError> {
     let CanonicalValue::Text(value) = value else {
         return Err(invalid("identity ID"));
@@ -54,6 +47,28 @@ fn parse_device(value: &CanonicalValue) -> Result<DeviceId, IdentityPersistenceE
         return Err(invalid("device ID"));
     };
     DeviceId::from_str(value).map_err(|_| invalid("device ID"))
+}
+fn parse_device_uuid_text(value: &CanonicalValue) -> Result<DeviceId, IdentityPersistenceError> {
+    parse_device(value)
+}
+fn parse_uuid(value: &CanonicalValue) -> Result<Uuid, IdentityPersistenceError> {
+    let CanonicalValue::Text(value) = value else {
+        return Err(invalid("UUID"));
+    };
+    Uuid::parse_str(value).map_err(|_| invalid("UUID"))
+}
+fn parse_uuid_v7(value: &CanonicalValue, label: &'static str) -> Result<Uuid, IdentityPersistenceError> {
+    let CanonicalValue::Text(text) = value else {
+        return Err(invalid(label));
+    };
+    let uuid = parse_uuid(value)?;
+    if uuid.get_version_num() != 7
+        || uuid.get_variant() != uuid::Variant::RFC4122
+        || uuid.hyphenated().to_string() != *text
+    {
+        return Err(invalid(label));
+    }
+    Ok(uuid)
 }
 fn parse_challenge(
     value: &CanonicalValue,

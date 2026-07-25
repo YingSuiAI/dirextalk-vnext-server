@@ -26,28 +26,50 @@ async fn provider_response_rows(
         .bind(identity.to_string()).fetch_one(harness.admin_pool()).await
 }
 
-async fn wait_until_identity_lock_is_held(
+async fn wait_until_exact_advisory_waiters(
     pool: &sqlx::PgPool,
-    identity_id: IdentityId,
+    lock_key: i64,
+    applications: &[&str],
 ) -> Result<(), Box<dyn Error>> {
-    let bytes = identity_id.digest_bytes();
-    let lock_key = i64::from_be_bytes(bytes[..8].try_into()?);
+    let class_id = i64::from((lock_key as u64 >> 32) as u32);
+    let object_id = i64::from(lock_key as u32);
+    let applications: Vec<String> = applications.iter().map(ToString::to_string).collect();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let mut probe = pool.begin().await?;
-            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-                .bind(lock_key)
-                .fetch_one(&mut *probe)
-                .await?;
-            probe.rollback().await?;
-            if !acquired {
+            let backends: Vec<(String, i32)> = sqlx::query_as(
+                "SELECT application_name,pid FROM pg_stat_activity WHERE datid=(SELECT oid FROM pg_database WHERE datname=current_database()) AND application_name=ANY($1) ORDER BY application_name",
+            )
+            .bind(&applications)
+            .fetch_all(pool)
+            .await?;
+            let pids: Vec<i32> = backends.iter().map(|(_, pid)| *pid).collect();
+            let waiting: Vec<i32> = if pids.len() == applications.len()
+                && pids.iter().copied().collect::<std::collections::BTreeSet<_>>().len()
+                    == pids.len()
+            {
+                sqlx::query_scalar(
+                    "SELECT pid FROM pg_locks WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND locktype='advisory' AND classid=$1 AND objid=$2 AND objsubid=1 AND granted=false AND pid=ANY($3) ORDER BY pid",
+                )
+                .bind(class_id)
+                .bind(object_id)
+                .bind(&pids)
+                .fetch_all(pool)
+                .await?
+            } else {
+                Vec::new()
+            };
+            if pids.len() == applications.len()
+                && waiting.len() == pids.len()
+                && waiting.iter().copied().collect::<std::collections::BTreeSet<_>>()
+                    == pids.iter().copied().collect()
+            {
                 return Ok::<(), sqlx::Error>(());
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .map_err(|_| "identity advisory lock was not acquired in time")??;
+    .map_err(|_| "exact advisory-lock gate did not observe all expected waiters")??;
     Ok(())
 }
 
@@ -114,39 +136,51 @@ fn catalog_command(
     previous: Option<Sha256Digest>,
     merkle: [u8; 32],
 ) -> Result<CatalogUploadCommand, IdentityPersistenceError> {
-    let ciphertext = b"opaque-encrypted-catalog-v1".to_vec();
+    let ciphertext = b"opaque-encrypted-catalog-v2".to_vec();
+    let catalog_id = uuid::Uuid::parse_str(match generation.get() {
+        1 => "0190f2a5-7b1c-7abc-8def-0123456789b1",
+        2 => "0190f2a5-7b1c-7abc-8def-0123456789b3",
+        _ => "0190f2a5-7b1c-7abc-8def-0123456789b4",
+    })
+    .unwrap();
+    let authority_device = DeviceId::from_str(AUTHORITY_DEVICE).unwrap();
+    let authority_key_id = uuid::Uuid::parse_str("0190f2a5-7b1c-7abc-8def-0123456789b2").unwrap();
     let unsigned = CanonicalValue::Map(vec![
-        field(1, CanonicalValue::Unsigned(1)),
-        field(2, CanonicalValue::Text(identity.to_string())),
-        field(3, generation.to_canonical_value()),
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(catalog_id.to_string())),
+        field(3, CanonicalValue::Text(identity.to_string())),
+        field(4, generation.to_canonical_value()),
         field(
-            4,
+            5,
             previous.map_or(CanonicalValue::Null, |v| v.to_canonical_value()),
         ),
-        field(5, CanonicalValue::Unsigned(1)),
-        field(6, CanonicalValue::Bytes(merkle.to_vec())),
+        field(6, CanonicalValue::Unsigned(1)),
+        field(7, CanonicalValue::Bytes(merkle.to_vec())),
         field(
-            7,
+            8,
             Sha256Digest::hash_domain(CATALOG_CIPHERTEXT_HASH_DOMAIN, &ciphertext)
                 .to_canonical_value(),
         ),
-        field(8, head.sequence().to_canonical_value()),
-        field(9, head.hash().to_canonical_value()),
-        field(10, at(2_500).to_canonical_value()),
-        field(11, at(250_000).to_canonical_value()),
+        field(9, head.sequence().to_canonical_value()),
+        field(10, head.hash().to_canonical_value()),
+        field(11, CanonicalValue::Text(authority_device.to_string())),
+        field(12, CanonicalValue::Text(authority_key_id.to_string())),
+        field(13, public(signer).to_canonical_value()),
+        field(14, at(2_500).to_canonical_value()),
+        field(15, at(250_000).to_canonical_value()),
     ]);
     let signature = domain_signature(signer, CATALOG_HEAD_SIGNATURE_DOMAIN, &unsigned)?;
     let CanonicalValue::Map(mut signed_fields) = unsigned else {
         unreachable!()
     };
-    signed_fields.push(field(12, signature.to_canonical_value()));
+    signed_fields.push(field(16, signature.to_canonical_value()));
     let upload = CanonicalValue::Map(vec![
         field(1, CanonicalValue::Map(signed_fields)),
         field(2, CanonicalValue::Bytes(ciphertext)),
     ]);
     let exact_upload = encode_deterministic_cbor(&upload)
         .map_err(|_| IdentityPersistenceError::InvalidCommand("test catalog"))?;
-    CatalogUploadCommand::parse(idempotency, generation, &exact_upload)
+    CatalogUploadCommand::parse_v2(idempotency, catalog_id, &exact_upload)
 }
 
 fn preparation_bytes(
@@ -157,30 +191,35 @@ fn preparation_bytes(
     recipient: [u8; 32],
     head: IdentityLogHead,
     response_capability: [u8; 32],
+    catalog: &CatalogUploadCommand,
+    idempotency: Sha256Digest,
 ) -> Result<Vec<u8>, IdentityPersistenceError> {
     let unsigned = CanonicalValue::Map(vec![
-        field(1, CanonicalValue::Unsigned(1)),
+        field(1, CanonicalValue::Unsigned(2)),
         field(2, CanonicalValue::Text(request.to_string())),
         field(3, CanonicalValue::Text(identity.to_string())),
-        field(4, CanonicalValue::Text(device.to_string())),
-        field(5, public(signer).to_canonical_value()),
-        field(6, CanonicalValue::Bytes(recipient.to_vec())),
-        field(7, head.sequence().to_canonical_value()),
-        field(8, head.hash().to_canonical_value()),
-        field(9, CanonicalValue::Bytes(vec![60; 32])),
-        field(10, at(4_500).to_canonical_value()),
-        field(11, at(200_000).to_canonical_value()),
-        field(
-            12,
+        field(4, CanonicalValue::Text(catalog.catalog_id.to_string())),
+        field(5, catalog.generation.to_canonical_value()),
+        field(6, catalog.head_digest.to_canonical_value()),
+        field(7, CanonicalValue::Text(device.to_string())),
+        field(8, public(signer).to_canonical_value()),
+        field(9, CanonicalValue::Bytes(recipient.to_vec())),
+        field(10, head.sequence().to_canonical_value()),
+        field(11, head.hash().to_canonical_value()),
+        field(12, CanonicalValue::Bytes(vec![60; 32])),
+        field(13,
             Sha256Digest::hash_domain(RESPONSE_CAPABILITY_HASH_DOMAIN, &response_capability)
                 .to_canonical_value(),
         ),
+        field(14, idempotency.to_canonical_value()),
+        field(15, at(4_500).to_canonical_value()),
+        field(16, at(200_000).to_canonical_value()),
     ]);
     let signature = domain_signature(signer, PREPARATION_SIGNATURE_DOMAIN, &unsigned)?;
     let CanonicalValue::Map(mut signed_fields) = unsigned else {
         unreachable!()
     };
-    signed_fields.push(field(13, signature.to_canonical_value()));
+    signed_fields.push(field(17, signature.to_canonical_value()));
     encode_deterministic_cbor(&CanonicalValue::Map(signed_fields))
         .map_err(|_| IdentityPersistenceError::InvalidCommand("test preparation"))
 }
@@ -190,36 +229,87 @@ fn provider_command(
     catalog: Sha256Digest,
     device: DeviceId,
     signer: &SigningKey,
-    authority: Sha256Digest,
+    _authority: Sha256Digest,
     recipient: [u8; 32],
     idempotency: Sha256Digest,
+    identity: IdentityId,
+    catalog_id: uuid::Uuid,
+    generation: SafeUint,
+    prep_digest: Sha256Digest,
+    observed: IdentityLogHead,
+    successor: IdentityLogHead,
+    candidate: DeviceId,
+    _candidate_signer: &SigningKey,
+    device_add: &[u8],
 ) -> Result<CatalogProviderResponseCommand, IdentityPersistenceError> {
-    let ciphertext = b"opaque-hpke-response-v1".to_vec();
-    let unsigned = CanonicalValue::Map(vec![
+    let envelope = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Bytes(vec![9; 32])),
+        field(3, CanonicalValue::Bytes(vec![8; 17])),
+    ]);
+    let envelope_bytes = encode_deterministic_cbor(&envelope)
+        .map_err(|_| IdentityPersistenceError::InvalidCommand("test envelope"))?;
+    let device_add_digest = Sha256Digest::hash_domain(b"dirextalk.identity-device-add.v1\0", device_add);
+    let provider_descriptor = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(device.to_string())),
+        field(3, public(signer).to_canonical_value()),
+    ]);
+    let authority_descriptor = CanonicalValue::Map(vec![
         field(1, CanonicalValue::Unsigned(1)),
+        field(2, CanonicalValue::Text(AUTHORITY_DEVICE.to_owned())),
+        field(3, public(&key(3)).to_canonical_value()),
+    ]);
+    let package_digest = Sha256Digest::from_bytes([77; 32]);
+    let aad_unsigned = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
         field(2, CanonicalValue::Text(request.to_string())),
-        field(3, catalog.to_canonical_value()),
-        field(4, CanonicalValue::Text(device.to_string())),
-        field(5, public(signer).to_canonical_value()),
-        field(6, authority.to_canonical_value()),
-        field(
-            7,
-            Sha256Digest::hash_domain(RECIPIENT_KEY_HASH_DOMAIN, &recipient).to_canonical_value(),
-        ),
-        field(8, CanonicalValue::Bytes(ciphertext.clone())),
-        field(
-            9,
-            Sha256Digest::hash_domain(PROVIDER_CIPHERTEXT_HASH_DOMAIN, &ciphertext)
-                .to_canonical_value(),
-        ),
-        field(10, at(200_000).to_canonical_value()),
+        field(3, prep_digest.to_canonical_value()),
+        field(4, CanonicalValue::Text(identity.to_string())),
+        field(5, CanonicalValue::Text(catalog_id.to_string())),
+        field(6, generation.to_canonical_value()),
+        field(7, catalog.to_canonical_value()),
+        field(8, CanonicalValue::Text(candidate.to_string())),
+        field(9, Sha256Digest::hash_domain(RECIPIENT_KEY_HASH_DOMAIN, &recipient).to_canonical_value()),
+        field(10, observed.sequence().to_canonical_value()),
+        field(11, observed.hash().to_canonical_value()),
+        field(12, successor.sequence().to_canonical_value()),
+        field(13, successor.hash().to_canonical_value()),
+        field(14, device_add_digest.to_canonical_value()),
+        field(15, provider_descriptor.clone()),
+        field(16, authority_descriptor.clone()),
+        field(17, package_digest.to_canonical_value()),
+        field(18, idempotency.to_canonical_value()),
+        field(19, at(7_150).to_canonical_value()),
+        field(20, at(200_000).to_canonical_value()),
+    ]);
+    let aad_bytes = encode_deterministic_cbor(&aad_unsigned)
+        .map_err(|_| IdentityPersistenceError::InvalidCommand("test aad"))?;
+    let aad_digest = Sha256Digest::hash_domain(PROVIDER_AAD_DIGEST_DOMAIN, &aad_bytes);
+    let envelope_digest = Sha256Digest::hash_domain(PROVIDER_CIPHERTEXT_HASH_DOMAIN, &envelope_bytes);
+    let unsigned = CanonicalValue::Map(vec![
+        field(1, CanonicalValue::Unsigned(2)),
+        field(2, CanonicalValue::Text(request.to_string())),
+        field(3, prep_digest.to_canonical_value()), field(4, CanonicalValue::Text(identity.to_string())),
+        field(5, CanonicalValue::Text(catalog_id.to_string())), field(6, generation.to_canonical_value()),
+        field(7, catalog.to_canonical_value()), field(8, CanonicalValue::Text(candidate.to_string())),
+        field(9, Sha256Digest::hash_domain(RECIPIENT_KEY_HASH_DOMAIN, &recipient).to_canonical_value()),
+        field(10, observed.sequence().to_canonical_value()), field(11, observed.hash().to_canonical_value()),
+        field(12, successor.sequence().to_canonical_value()), field(13, successor.hash().to_canonical_value()),
+        field(14, device_add_digest.to_canonical_value()), field(15, provider_descriptor.clone()), field(16, authority_descriptor.clone()),
+        field(17, package_digest.to_canonical_value()), field(18, aad_digest.to_canonical_value()), field(19, envelope_digest.to_canonical_value()),
+        field(20, idempotency.to_canonical_value()), field(21, at(7_150).to_canonical_value()), field(22, at(200_000).to_canonical_value()),
     ]);
     let signature = domain_signature(signer, PROVIDER_RESPONSE_SIGNATURE_DOMAIN, &unsigned)?;
     let CanonicalValue::Map(mut signed_fields) = unsigned else {
         unreachable!()
     };
-    signed_fields.push(field(11, signature.to_canonical_value()));
-    CatalogProviderResponseCommand::parse(
+    let authority_signature = domain_signature(&key(3), PROVIDER_AUTHORITY_SIGNATURE_DOMAIN, &CanonicalValue::Map(signed_fields.clone()))?;
+    signed_fields.push(field(23, signature.to_canonical_value()));
+    signed_fields.push(field(24, authority_signature.to_canonical_value()));
+    signed_fields.push(field(25, CanonicalValue::Bytes(device_add.to_vec())));
+    signed_fields.push(field(26, envelope));
+    CatalogProviderResponseCommand::parse_v2(
         idempotency,
         request,
         encode_deterministic_cbor(&CanonicalValue::Map(signed_fields))

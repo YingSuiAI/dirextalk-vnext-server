@@ -16,12 +16,12 @@
 ; request-signature-domain = `dirextalk.history-recovery.request-signature.v4\0`.
 ; request-domain = `dirextalk.history-recovery.request.v4\0`.
 ; request-idempotency-domain = `dirextalk.history-recovery.request-idempotency.v4\0`.
-; offer-domain = `dirextalk.history-recovery.recipient-offer.v2\0`.
-; offer-ciphertext-domain = `dirextalk.history-recovery.offer-ciphertext.v2\0`.
-; grant-signature-domain = `dirextalk.history-recovery.grant-provider-signature.v4\0`.
-; grant-authority-signature-domain = `dirextalk.history-recovery.grant-authority-signature.v4\0`.
-; grant-domain = `dirextalk.history-recovery.grant.v4\0`.
-; grant-idempotency-domain = `dirextalk.history-recovery.grant-idempotency.v4\0`.
+; offer-domain = `dirextalk.history-recovery.recipient-offer.v3\0`.
+; offer-ciphertext-domain = `dirextalk.history-recovery.offer-ciphertext.v3\0`.
+; grant-signature-domain = `dirextalk.history-recovery.grant-provider-signature.v5\0`.
+; grant-authority-signature-domain = `dirextalk.history-recovery.grant-authority-signature.v5\0`.
+; grant-domain = `dirextalk.history-recovery.grant.v5\0`.
+; grant-idempotency-domain = `dirextalk.history-recovery.grant-idempotency.v5\0`.
 ; delivery-fact-domain = `dirextalk.history-recovery.delivery-fact.v2\0`.
 ; completion-key-descriptor-domain = `dirextalk.history-recovery.completion-key-descriptor.v2\0`.
 ; completion-key-descriptor-signature-domain = `dirextalk.history-recovery.completion-key-descriptor-signature.v2\0`.
@@ -167,8 +167,8 @@ history-recovery-attachment-reference-v2 = {
   3: positive-uint,             ; exact byte length
   4: digest                     ; high-entropy attachment capability digest
 }
-recipient-history-offer-v2 = {
-  1: 2,
+recipient-history-offer-v3 = {
+  1: 3,
   2: uuid-v7,                   ; request_id
   3: digest,                    ; exact signed request digest
   4: digest,                    ; exact manifest digest
@@ -182,9 +182,10 @@ recipient-history-offer-v2 = {
   12: history-recovery-attachment-reference-v2 / null,
   13: utc-millis,               ; issued_at
   14: utc-millis,               ; expires_at
-  15: digest                    ; request recipient-key digest
+  15: digest,                   ; request recipient-key digest
+  16: digest                    ; SHA-256(provider-response-domain || exact canonical full provider response fields 1..26)
 }
-exact-recipient-history-offer-v2 = bstr .size (1..1049059)
+exact-recipient-history-offer-v3 = bstr .size (1..1049093)
 
 ; Exact Catalog-owned signer encodings. Semantics and closed unions are owned
 ; by recovery-scope-catalog/v2 and must be validated there.
@@ -196,8 +197,8 @@ exact-catalog-independent-authority-v2 = bstr .size (73..77)
 ; acceptance atomically appends the grant, opaque mailbox envelope, immutable
 ; delivery fact, realtime journal row, and outbox row. No push delivery result
 ; changes this commit. Durable opaque Mailbox Pull/ACK remains delivery truth.
-history-recovery-grant-unsigned-v4 = {
-  1: 4,
+history-recovery-grant-unsigned-v5 = {
+  1: 5,
   2: identity-id,
   3: uuid-v7,                   ; request_id
   4: digest,                    ; exact signed request digest
@@ -231,8 +232,8 @@ history-recovery-grant-unsigned-v4 = {
   32: utc-millis,               ; expires_at
   33: digest                    ; grant Idempotency-Key digest
 }
-history-recovery-grant-v4 = {
-  1: 4, 2: identity-id, 3: uuid-v7, 4: digest, 5: digest,
+history-recovery-grant-v5 = {
+  1: 5, 2: identity-id, 3: uuid-v7, 4: digest, 5: digest,
   6: uuid-v7, 7: positive-uint, 8: exact-signed-catalog-head-v2,
   9: digest, 10: digest, 11: catalog-exhaustive-count, 12: digest,
   13: uuid-v7, 14: ed25519-public-key, 15: x25519-public-key,
@@ -245,9 +246,9 @@ history-recovery-grant-v4 = {
   31: utc-millis, 32: utc-millis, 33: digest,
   34: signature,                 ; provider signs exact fields 1..33
   35: signature,                 ; authority signs the identical fields 1..33
-  36: recipient-history-offer-v2
+  36: recipient-history-offer-v3
 }
-exact-history-recovery-grant-v4 = bstr .size (1..1050699)
+exact-history-recovery-grant-v5 = bstr .size (1..1050733)
 
 ; Immutable and retained independently of mailbox compaction. It records the
 ; committed delivery, not a mutable cursor and not a device-global ACK.
@@ -423,9 +424,9 @@ history-recovery-completion-command-unsigned-v2 = {
   19: digest,                   ; exact request digest
   20: exact-history-recovery-manifest-v2,
   21: digest,                   ; exact manifest digest
-  22: exact-history-recovery-grant-v4,
+  22: exact-history-recovery-grant-v5,
   23: digest,                   ; exact grant digest
-  24: exact-recipient-history-offer-v2,
+  24: exact-recipient-history-offer-v3,
   25: digest,                   ; exact offer digest
   26: exact-history-recovery-delivery-fact-v2,
   27: digest,                   ; exact immutable delivery-fact digest
@@ -447,8 +448,8 @@ history-recovery-completion-command-v2 = {
   16: exact-catalog-preparation-v2, 17: digest,
   18: exact-history-recovery-request-v4, 19: digest,
   20: exact-history-recovery-manifest-v2, 21: digest,
-  22: exact-history-recovery-grant-v4, 23: digest,
-  24: exact-recipient-history-offer-v2, 25: digest,
+  22: exact-history-recovery-grant-v5, 23: digest,
+  24: exact-recipient-history-offer-v3, 25: digest,
   26: exact-history-recovery-delivery-fact-v2, 27: digest,
   28: catalog-exhaustive-count, 29: digest,
   30: [1*1023 history-recovery-completion-entry-v2],

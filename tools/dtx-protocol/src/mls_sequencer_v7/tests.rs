@@ -32,7 +32,7 @@ mod contract_tests {
     fn rejects_add_ceiling_mutation() {
         let mutated = replace_once(
             OPENAPI,
-            "  recovery-add-v7: 4489149",
+            "  recovery-add-v7: 4489217",
             "  recovery-add-v7: 4489150",
         );
         rejected(CDDL, &mutated, "body ceiling drift");
@@ -129,7 +129,7 @@ mod contract_tests {
 
         let schema = replace_once(
             OPENAPI,
-            "      maxLength: 4489149",
+            "      maxLength: 4489217",
             "      maxLength: 4489150",
         );
         rejected(CDDL, &schema, "schema maximum/media rule drift");

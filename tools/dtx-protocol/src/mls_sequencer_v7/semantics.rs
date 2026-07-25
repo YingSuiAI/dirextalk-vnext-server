@@ -311,7 +311,7 @@ pub(super) fn validate_semantics(document: &Value) -> Result<(), ProtocolToolErr
         "/x-dirextalk-cbor-ceiling-arithmetic/recovery-add-v7",
         "Add ceiling arithmetic",
     )?;
-    if !arithmetic.contains("81-map-header-and-key-bytes + 4489068-value-bytes = 4489149") {
+    if !arithmetic.contains("81-map-header-and-key-bytes + 4489136-value-bytes = 4489217") {
         return Err(ProtocolToolError::new(
             "MLS Sequencer V7 Add canonical ceiling arithmetic drift",
         ));

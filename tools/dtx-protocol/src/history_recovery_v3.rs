@@ -10,8 +10,8 @@ use crate::ProtocolToolError;
 
 const CDDL_RELATIVE: &str = "protocol/cddl/history-recovery/v3/history-recovery-v3.cddl";
 const OPENAPI_RELATIVE: &str = "protocol/openapi/history-recovery/v3/openapi.yaml";
-const CDDL_SHA256: &str = "67446af3f17e72660d71173446411517ab3c30ccc1571da83b816ba613814176";
-const OPENAPI_SHA256: &str = "167944808e484db94a21568bc2041019f473388f99ca425bfa877af77dd5a446";
+const CDDL_SHA256: &str = "cbc9d894a2edefed2e5df4b6843ec7eb7bd1666d53d2d1be47f8dbb026282a95";
+const OPENAPI_SHA256: &str = "57ed5f87f35c5d20a1ee901eb7fdef6980db243b8b9fe7543599b166d22b3ac1";
 
 const DOMAINS: &[(&str, &str)] = &[
     ("manifest", "dirextalk.history-recovery.manifest.v2\0"),
@@ -25,23 +25,23 @@ const DOMAINS: &[(&str, &str)] = &[
         "request-idempotency",
         "dirextalk.history-recovery.request-idempotency.v4\0",
     ),
-    ("offer", "dirextalk.history-recovery.recipient-offer.v2\0"),
+    ("offer", "dirextalk.history-recovery.recipient-offer.v3\0"),
     (
         "offer-ciphertext",
-        "dirextalk.history-recovery.offer-ciphertext.v2\0",
+        "dirextalk.history-recovery.offer-ciphertext.v3\0",
     ),
     (
         "grant-provider-signature",
-        "dirextalk.history-recovery.grant-provider-signature.v4\0",
+        "dirextalk.history-recovery.grant-provider-signature.v5\0",
     ),
     (
         "grant-authority-signature",
-        "dirextalk.history-recovery.grant-authority-signature.v4\0",
+        "dirextalk.history-recovery.grant-authority-signature.v5\0",
     ),
-    ("grant", "dirextalk.history-recovery.grant.v4\0"),
+    ("grant", "dirextalk.history-recovery.grant.v5\0"),
     (
         "grant-idempotency",
-        "dirextalk.history-recovery.grant-idempotency.v4\0",
+        "dirextalk.history-recovery.grant-idempotency.v5\0",
     ),
     (
         "delivery-fact",
@@ -148,8 +148,8 @@ fn validate_cddl_contract(cddl: &Cddl) -> Result<(), ProtocolToolError> {
     for (rule, maximum) in [
         ("exact-history-recovery-manifest-v2", 35_477),
         ("exact-history-recovery-request-v4", 37_114),
-        ("exact-recipient-history-offer-v2", 1_049_059),
-        ("exact-history-recovery-grant-v4", 1_050_699),
+        ("exact-recipient-history-offer-v3", 1_049_093),
+        ("exact-history-recovery-grant-v5", 1_050_733),
         ("exact-history-recovery-completion-command-v2", 3_593_836),
         ("exact-history-recovery-completion-entry-v2", 1_387),
         ("exact-signed-history-recovery-completion-receipt-v2", 3_770),
@@ -165,9 +165,9 @@ fn validate_cddl_contract(cddl: &Cddl) -> Result<(), ProtocolToolError> {
         ("history-recovery-request-unsigned-v4", 4, 20),
         ("history-recovery-request-v4", 4, 21),
         ("history-recovery-request-receipt-v4", 4, 5),
-        ("recipient-history-offer-v2", 2, 15),
-        ("history-recovery-grant-unsigned-v4", 4, 33),
-        ("history-recovery-grant-v4", 4, 36),
+        ("recipient-history-offer-v3", 3, 16),
+        ("history-recovery-grant-unsigned-v5", 5, 33),
+        ("history-recovery-grant-v5", 5, 36),
         ("history-recovery-delivery-fact-v2", 2, 12),
         ("history-recovery-delivery-receipt-v2", 2, 4),
         (
@@ -276,9 +276,9 @@ fn validate_cddl_contract(cddl: &Cddl) -> Result<(), ProtocolToolError> {
     )?;
     validate_field_type(
         cddl,
-        "history-recovery-grant-v4",
+        "history-recovery-grant-v5",
         36,
-        ExpectedType::Name("recipient-history-offer-v2"),
+        ExpectedType::Name("recipient-history-offer-v3"),
     )?;
     for (field, expected) in [
         (
@@ -400,11 +400,11 @@ fn validate_openapi_contract(document: &Value) -> Result<(), ProtocolToolError> 
     validate_operation(
         document,
         "/paths/~1v5~1devices~1history-grants/post",
-        "grantDeviceHistoryV4",
-        Some(1_050_699),
+        "grantDeviceHistoryV5",
+        Some(1_050_733),
         Some((
-            "application/vnd.dirextalk.history-recovery-grant.v4+cbor",
-            "history-recovery-grant-v4",
+            "application/vnd.dirextalk.history-recovery-grant.v5+cbor",
+            "history-recovery-grant-v5",
         )),
     )?;
     validate_operation(

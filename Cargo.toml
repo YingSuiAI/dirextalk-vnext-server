@@ -28,6 +28,7 @@ members = [
     "crates/dtx-federated-identity",
     "crates/dtx-group-policy",
     "crates/dtx-group-persistence",
+    "crates/dtx-history-recovery-testkit",
     "crates/dtx-http-cache",
     "crates/dtx-identity-log",
     "crates/dtx-identity-persistence",

@@ -1102,6 +1102,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-history-recovery-testkit"
+version = "0.1.4"
+dependencies = [
+ "dtx-domain",
+ "dtx-identity-log",
+ "dtx-wire",
+ "ed25519-dalek",
+ "sha2 0.11.0",
+ "uuid",
+]
+
+[[package]]
 name = "dtx-http-cache"
 version = "0.1.4"
 dependencies = [
@@ -1129,6 +1141,7 @@ dependencies = [
  "dtx-contact",
  "dtx-domain",
  "dtx-federated-identity",
+ "dtx-history-recovery-testkit",
  "dtx-identity-log",
  "dtx-identity-persistence",
  "dtx-storage",
@@ -1226,6 +1239,7 @@ dependencies = [
  "subtle",
  "testcontainers-modules",
  "tokio",
+ "tokio-stream",
  "uuid",
  "zeroize",
 ]
@@ -1237,7 +1251,9 @@ dependencies = [
  "axum",
  "base64ct",
  "dtx-domain",
+ "dtx-history-recovery-testkit",
  "dtx-identity-log",
+ "dtx-identity-node",
  "dtx-identity-persistence",
  "dtx-mailbox",
  "dtx-realtime-sync",

@@ -18,6 +18,9 @@ positive-safe-uint-v1 = 1..9007199254740991
 ; registration and every envelope expiry are additionally limited to seven
 ; days (604800000 milliseconds) by the semantic validator.
 opaque-ciphertext-v1 = bstr .size (1..262144)
+; Pull delivery may also carry an exact History OfferV3. Writers remain bound
+; to opaque-ciphertext-v1; this larger bound is read-side only.
+history-offer-ciphertext-v1 = bstr .size (1..1049093)
 
 ; An active owner device registers one mailbox and only a one-way write
 ; capability hash. Replaying the exact body and idempotency key returns the
@@ -65,7 +68,7 @@ mailbox-pull-v1 = {
 mailbox-delivery-envelope-v1 = {
   1: positive-safe-uint-v1,
   2: uuid-v7-v1,
-  3: opaque-ciphertext-v1,
+  3: history-offer-ciphertext-v1,
   4: utc-millis-v1
 }
 

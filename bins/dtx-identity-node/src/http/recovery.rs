@@ -1,32 +1,34 @@
 use super::{
-    Body, CatalogPreparationCommand, CatalogProviderResponseCommand, CatalogStatus,
-    CatalogUploadCommand, DEVICE_ENROLLMENT_CAPABILITY_HEADER, DeviceEnrollmentChallengeId,
+    Body, CatalogPreparationCommand, CatalogProviderResponseCommand, CatalogUploadCommand,
+    DEVICE_ENROLLMENT_CAPABILITY_HEADER, DeviceEnrollmentChallengeId,
     HTTP_RECOVERY_CATALOG_IDEMPOTENCY_KEY_HASH_DOMAIN,
     HTTP_RECOVERY_PREPARATION_IDEMPOTENCY_KEY_HASH_DOMAIN,
     HTTP_RECOVERY_PROVIDER_IDEMPOTENCY_KEY_HASH_DOMAIN, HeaderMap, IDEMPOTENCY_KEY_HEADER,
-    IdentityBootstrapState, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES,
-    MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES, Path, RECOVERY_RESPONSE_CAPABILITY_HEADER,
-    RECOVERY_SCOPE_CATALOG_CONTENT_TYPE, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
-    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE, RecoveryCatalogFailure,
-    RecoveryCatalogHeadSuccess, RecoveryCatalogStatusSuccess, Request, RequestId, Response, State,
-    StatusCode, has_exact_content_type, header, idempotency_key_hash,
+    IdentityBootstrapState, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES,
+    MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES,
+    Path, RECOVERY_RESPONSE_CAPABILITY_HEADER, RECOVERY_SCOPE_CATALOG_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE, RecoveryCatalogFailure, RecoveryCatalogHeadSuccess,
+    RecoveryCatalogReceiptKind, RecoveryCatalogStatusSuccess, Request, RequestId, Response, State,
+    StatusCode, has_exact_content_type, has_exact_header, header, idempotency_key_hash,
     map_recovery_catalog_prepare_error, map_recovery_catalog_provider_error,
     map_recovery_catalog_publish_error, map_recovery_catalog_status_error,
-    parse_device_session_authorization, parse_positive_safe_uint_path,
-    parse_recovery_enrollment_capability, parse_recovery_response_capability,
-    recovery_catalog_failure_response, recovery_catalog_head_response,
-    recovery_catalog_status_response, to_bytes,
+    parse_device_session_authorization, parse_recovery_enrollment_capability,
+    parse_recovery_response_capability, recovery_catalog_failure_response,
+    recovery_catalog_head_response, recovery_catalog_status_response, to_bytes,
 };
 
 pub(crate) async fn publish_recovery_scope_catalog(
     State(state): State<IdentityBootstrapState>,
-    Path(generation): Path<String>,
+    Path(catalog_id): Path<String>,
     request: Request,
 ) -> Response {
     let request_id = RequestId::new();
     let (parts, body) = request.into_parts();
     match state
-        .publish_recovery_scope_catalog(&generation, &parts.headers, body)
+        .publish_recovery_scope_catalog(&catalog_id, &parts.headers, body)
         .await
     {
         Ok(success) => recovery_catalog_head_response(success, request_id),
@@ -84,12 +86,16 @@ pub(crate) async fn put_recovery_scope_catalog_provider_response(
 impl IdentityBootstrapState {
     async fn publish_recovery_scope_catalog(
         &self,
-        route_generation: &str,
+        route_catalog_id: &str,
         headers: &HeaderMap,
         body: Body,
     ) -> Result<RecoveryCatalogHeadSuccess, RecoveryCatalogFailure> {
-        if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_CONTENT_TYPE)
-            || headers.contains_key(header::CONTENT_ENCODING)
+        validate_media_and_size(
+            headers,
+            Some(RECOVERY_SCOPE_CATALOG_CONTENT_TYPE),
+            Some(MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES),
+        )?;
+        if headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
             || headers.contains_key(RECOVERY_RESPONSE_CAPABILITY_HEADER)
@@ -101,11 +107,12 @@ impl IdentityBootstrapState {
         let idempotency_key_hash =
             idempotency_key_hash(headers, HTTP_RECOVERY_CATALOG_IDEMPOTENCY_KEY_HASH_DOMAIN)
                 .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
-        let generation = parse_positive_safe_uint_path(route_generation)?;
-        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES)
-            .await
+        let catalog_id = uuid::Uuid::parse_str(route_catalog_id)
             .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
-        let command = CatalogUploadCommand::parse(idempotency_key_hash, generation, &bytes)
+        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_UPLOAD_BYTES)
+            .await
+            .map_err(|_| RecoveryCatalogFailure::TooLarge)?;
+        let command = CatalogUploadCommand::parse_v2(idempotency_key_hash, catalog_id, &bytes)
             .map_err(|error| map_recovery_catalog_publish_error(&error))?;
         let now = self
             .committed_at()
@@ -130,8 +137,12 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
-        if !has_exact_content_type(headers, RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE)
-            || headers.contains_key(header::CONTENT_ENCODING)
+        validate_media_and_size(
+            headers,
+            Some(RECOVERY_SCOPE_CATALOG_PREPARATION_CONTENT_TYPE),
+            Some(MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES),
+        )?;
+        if headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(header::AUTHORIZATION)
         {
@@ -144,10 +155,13 @@ impl IdentityBootstrapState {
         .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
         let enrollment_capability = parse_recovery_enrollment_capability(headers)?;
         let response_capability = parse_recovery_response_capability(headers)?;
-        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_SIGNED_METADATA_BYTES)
+        if response_capability.equals_raw(enrollment_capability.as_bytes()) {
+            return Err(RecoveryCatalogFailure::CapabilityRejected);
+        }
+        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_PREPARATION_BYTES)
             .await
-            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
-        let command = CatalogPreparationCommand::parse(
+            .map_err(|_| RecoveryCatalogFailure::TooLarge)?;
+        let command = CatalogPreparationCommand::parse_v2(
             idempotency_key_hash,
             bytes.to_vec(),
             enrollment_capability,
@@ -169,6 +183,7 @@ impl IdentityBootstrapState {
                 StatusCode::OK
             },
             outcome,
+            receipt: RecoveryCatalogReceiptKind::Preparation,
         })
     }
 
@@ -178,7 +193,23 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
+        validate_media_and_size(headers, None, None)?;
+        if !has_exact_header(
+            headers,
+            header::ACCEPT,
+            RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+        ) {
+            return Err(RecoveryCatalogFailure::NotAcceptable);
+        }
+        if headers.contains_key(header::CONTENT_TYPE) {
+            return Err(RecoveryCatalogFailure::UnsupportedMedia);
+        }
         if headers.contains_key(header::CONTENT_TYPE)
+            || !has_exact_header(
+                headers,
+                header::ACCEPT,
+                RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+            )
             || headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(header::AUTHORIZATION)
@@ -205,12 +236,14 @@ impl IdentityBootstrapState {
             .status(&self.store, request_id, &response_capability, now)
             .await
             .map_err(|error| map_recovery_catalog_status_error(&error))?;
-        let status = match outcome.status {
-            CatalogStatus::Pending | CatalogStatus::ResponseAvailable => StatusCode::OK,
-            CatalogStatus::Expired => StatusCode::GONE,
-            CatalogStatus::Invalidated(_) => StatusCode::PRECONDITION_FAILED,
-        };
-        Ok(RecoveryCatalogStatusSuccess { status, outcome })
+        // Catalog V2 status is an authoritative one-of-five representation;
+        // terminal state is carried in the body and GET itself remains 200.
+        let status = StatusCode::OK;
+        Ok(RecoveryCatalogStatusSuccess {
+            status,
+            outcome,
+            receipt: RecoveryCatalogReceiptKind::None,
+        })
     }
 
     async fn put_recovery_scope_catalog_provider_response(
@@ -219,10 +252,19 @@ impl IdentityBootstrapState {
         headers: &HeaderMap,
         body: Body,
     ) -> Result<RecoveryCatalogStatusSuccess, RecoveryCatalogFailure> {
-        if !has_exact_content_type(
+        validate_media_and_size(
             headers,
-            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE,
-        ) || headers.contains_key(header::CONTENT_ENCODING)
+            Some(RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_CONTENT_TYPE),
+            Some(MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES),
+        )?;
+        if !has_exact_header(
+            headers,
+            header::ACCEPT,
+            RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+        ) {
+            return Err(RecoveryCatalogFailure::NotAcceptable);
+        }
+        if headers.contains_key(header::CONTENT_ENCODING)
             || headers.contains_key(header::IF_MATCH)
             || headers.contains_key(DEVICE_ENROLLMENT_CAPABILITY_HEADER)
             || headers.contains_key(RECOVERY_RESPONSE_CAPABILITY_HEADER)
@@ -237,12 +279,15 @@ impl IdentityBootstrapState {
         let idempotency_key_hash =
             idempotency_key_hash(headers, HTTP_RECOVERY_PROVIDER_IDEMPOTENCY_KEY_HASH_DOMAIN)
                 .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
-        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_COMMAND_BYTES)
+        let bytes = to_bytes(body, MAX_RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_BYTES)
             .await
-            .map_err(|_| RecoveryCatalogFailure::InvalidRequest)?;
-        let command =
-            CatalogProviderResponseCommand::parse(idempotency_key_hash, request_id, bytes.to_vec())
-                .map_err(|error| map_recovery_catalog_provider_error(&error))?;
+            .map_err(|_| RecoveryCatalogFailure::TooLarge)?;
+        let command = CatalogProviderResponseCommand::parse_v2(
+            idempotency_key_hash,
+            request_id,
+            bytes.to_vec(),
+        )
+        .map_err(|error| map_recovery_catalog_provider_error(&error))?;
         let now = self
             .committed_at()
             .map_err(|()| RecoveryCatalogFailure::TemporarilyUnavailable)?;
@@ -252,8 +297,39 @@ impl IdentityBootstrapState {
             .await
             .map_err(|error| map_recovery_catalog_provider_error(&error))?;
         Ok(RecoveryCatalogStatusSuccess {
-            status: StatusCode::OK,
+            status: if outcome.created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
             outcome,
+            receipt: RecoveryCatalogReceiptKind::ProviderResponse,
         })
     }
+}
+
+fn validate_media_and_size(
+    headers: &HeaderMap,
+    expected_content_type: Option<&'static str>,
+    maximum_body_bytes: Option<usize>,
+) -> Result<(), RecoveryCatalogFailure> {
+    let media_valid = match expected_content_type {
+        Some(expected) => has_exact_content_type(headers, expected),
+        None => !headers.contains_key(header::CONTENT_TYPE),
+    };
+    if !media_valid {
+        return Err(RecoveryCatalogFailure::UnsupportedMedia);
+    }
+    if maximum_body_bytes.is_some_and(|maximum| content_length_exceeds(headers, maximum)) {
+        return Err(RecoveryCatalogFailure::TooLarge);
+    }
+    Ok(())
+}
+
+fn content_length_exceeds(headers: &HeaderMap, maximum: usize) -> bool {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > maximum)
 }

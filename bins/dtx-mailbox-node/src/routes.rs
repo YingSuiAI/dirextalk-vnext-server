@@ -19,6 +19,7 @@ pub fn mailbox_router_with_state(state: MailboxNodeState) -> Router {
         )
         .route(DEVICE_HISTORY_GRANT_V1_PATH, post(grant_device_history))
         .route(DEVICE_HISTORY_GRANT_V2_PATH, post(grant_device_history_v2))
+        .route(DEVICE_HISTORY_GRANT_V5_PATH, post(grant_device_history_v5))
         .route(
             ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
             post(write_account_read_cursor),
@@ -132,6 +133,18 @@ async fn grant_device_history_v2(
     }
 }
 
+async fn grant_device_history_v5(
+    State(state): State<MailboxNodeState>,
+    request: Request,
+) -> Response {
+    let request_id = RequestId::new();
+    let (parts, body) = request.into_parts();
+    match state.grant_device_history_v5(&parts.headers, body).await {
+        Ok(success) => mailbox_success_response(success, request_id),
+        Err(failure) => mailbox_failure_response(failure, request_id),
+    }
+}
+
 async fn write_account_read_cursor(
     State(state): State<MailboxNodeState>,
     request: Request,
@@ -166,9 +179,9 @@ use dtx_mailbox::MailboxPgStore;
 
 use super::{
     ACCOUNT_READ_CURSOR_QUERY_V1_PATH, ACCOUNT_READ_CURSOR_WRITE_V1_PATH,
-    DEVICE_HISTORY_GRANT_V1_PATH, DEVICE_HISTORY_GRANT_V2_PATH, IDENTITY_MAILBOX_ACK_V2_PATH,
-    IDENTITY_MAILBOX_PULL_V3_PATH, MAILBOX_ACK_PATH_TEMPLATE, MAILBOX_ENQUEUE_PATH_TEMPLATE,
-    MAILBOX_PULL_PATH_TEMPLATE, MAILBOX_REGISTER_PATH_TEMPLATE,
+    DEVICE_HISTORY_GRANT_V1_PATH, DEVICE_HISTORY_GRANT_V2_PATH, DEVICE_HISTORY_GRANT_V5_PATH,
+    IDENTITY_MAILBOX_ACK_V2_PATH, IDENTITY_MAILBOX_PULL_V3_PATH, MAILBOX_ACK_PATH_TEMPLATE,
+    MAILBOX_ENQUEUE_PATH_TEMPLATE, MAILBOX_PULL_PATH_TEMPLATE, MAILBOX_REGISTER_PATH_TEMPLATE,
 };
 use super::{
     attachment,

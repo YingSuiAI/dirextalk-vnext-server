@@ -64,7 +64,7 @@ pub(super) const BINARY_SCHEMA_SPECS: &[(&str, u64, &str, &str)] = &[
     ),
     (
         "RecoveryAddRequestCbor",
-        4_489_149,
+        4_489_217,
         "x-dirextalk-cddl-rule",
         "mls-recovery-add-request-v7",
     ),
@@ -271,7 +271,7 @@ pub(super) fn validate_contract(document: &Value) -> Result<(), ProtocolToolErro
         ("issuer-authorization-response-fields-1-through-22", 2_613),
         ("route-v1", 2_304),
         ("controller-proof-v1", 4_507),
-        ("recovery-add-v7", 4_489_149),
+        ("recovery-add-v7", 4_489_217),
         ("recovery-add-receipt-v7", 613),
         ("signed-recovery-add-receipt-v7", 791),
         ("confirmation-v2", 1_510),
@@ -419,7 +419,7 @@ pub(super) fn validate_contract(document: &Value) -> Result<(), ProtocolToolErro
                 ("422", "InvalidExactCbor"),
             ],
             request: Some(RequestSpec {
-                ceiling: 4_489_149,
+                ceiling: 4_489_217,
                 media_type: "application/vnd.dirextalk.mls-recovery-commit.v7+cbor",
                 rule: "mls-recovery-add-request-v7",
                 schema: "RecoveryAddRequestCbor",

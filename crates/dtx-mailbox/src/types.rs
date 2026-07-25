@@ -3,6 +3,7 @@ use std::{collections::HashSet, fmt};
 use dtx_domain::{DeviceId, EnvelopeId, IdentityId, MailboxId};
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, SafeUint, Sha256Digest, UtcMillis, encode_deterministic_cbor,
+    encode_deterministic_cbor_with_limit,
 };
 use zeroize::Zeroize;
 
@@ -35,9 +36,17 @@ pub const MAILBOX_OPERATION_REPLAY_RETENTION_MILLIS: i64 = 15 * 60 * 1_000;
 pub const MAILBOX_ENQUEUE_REPLAY_RETENTION_MILLIS: i64 = MAILBOX_OPERATION_REPLAY_RETENTION_MILLIS;
 /// Maximum entries in a pull page or acknowledgement command.
 pub const MAX_PAGE_ENTRIES: usize = 100;
+/// Maximum exact opaque OfferV3 bytes admitted by the history grant path.
+pub(crate) const MAX_HISTORY_OFFER_BYTES: usize = 1_049_093;
+/// Maximum encoded pull receipt/page budget. This permits one full history
+/// Offer and leaves a fixed amount for canonical page framing and metadata.
+pub(crate) const MAX_PULL_RECEIPT_BYTES: usize = MAX_HISTORY_OFFER_BYTES + 512;
 
 const MAX_REGISTER_COMMAND_BYTES: usize = 16_384;
 const MAX_ENVELOPE_COMMAND_BYTES: usize = 262_400;
+// Canonical mailbox-envelope map overhead is 52 bytes for the frozen
+// History OfferV3 boundary (1_049_093 + 52 = 1_049_145).
+pub(crate) const MAX_HISTORY_GRANT_ENVELOPE_BYTES: usize = MAX_HISTORY_OFFER_BYTES + 52;
 const MAX_ACK_COMMAND_BYTES: usize = 8_192;
 
 /// A raw 256-bit mailbox write capability held only at the sender boundary.
@@ -264,6 +273,35 @@ impl MailboxEnvelopeCommand {
         Ok(command)
     }
 
+    /// Constructs the bounded opaque envelope used only by History Grant V4.
+    /// This path deliberately does not widen the generic mailbox enqueue
+    /// ceiling; the grant's exact Offer V2 bytes own the larger bound.
+    pub(crate) fn new_history_grant(
+        idempotency_key_hash: Sha256Digest,
+        mailbox_id: MailboxId,
+        envelope_id: EnvelopeId,
+        opaque_ciphertext: Vec<u8>,
+        expires_at: UtcMillis,
+        exact_bytes: Vec<u8>,
+    ) -> Result<Self, MailboxPersistenceError> {
+        validate_exact_command_bytes(&exact_bytes, MAX_HISTORY_GRANT_ENVELOPE_BYTES)?;
+        if opaque_ciphertext.is_empty() || opaque_ciphertext.len() > MAX_HISTORY_OFFER_BYTES {
+            return Err(MailboxPersistenceError::InvalidCommand(
+                "history grant opaque ciphertext byte length",
+            ));
+        }
+        let command = Self {
+            idempotency_key_hash,
+            mailbox_id,
+            envelope_id,
+            opaque_ciphertext,
+            expires_at,
+            exact_bytes,
+        };
+        command.require_exact_bytes_with_limit(MAX_HISTORY_GRANT_ENVELOPE_BYTES)?;
+        Ok(command)
+    }
+
     /// Returns the destination mailbox.
     #[must_use]
     pub const fn mailbox_id(&self) -> MailboxId {
@@ -303,8 +341,16 @@ impl MailboxEnvelopeCommand {
     }
 
     fn require_exact_bytes(&self) -> Result<(), MailboxPersistenceError> {
-        let expected = encode_deterministic_cbor(&self.to_canonical_value())
-            .map_err(|_| MailboxPersistenceError::InvalidCommand("mailbox enqueue encoding"))?;
+        self.require_exact_bytes_with_limit(MAX_ENVELOPE_COMMAND_BYTES)
+    }
+
+    fn require_exact_bytes_with_limit(
+        &self,
+        maximum_bytes: usize,
+    ) -> Result<(), MailboxPersistenceError> {
+        let expected =
+            encode_deterministic_cbor_with_limit(&self.to_canonical_value(), maximum_bytes)
+                .map_err(|_| MailboxPersistenceError::InvalidCommand("mailbox enqueue encoding"))?;
         if expected == self.exact_bytes {
             Ok(())
         } else {
@@ -522,5 +568,74 @@ fn validate_exact_command_bytes(
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_grant_envelope_accepts_exact_offer_ceiling_and_rejects_one_byte_over() {
+        let idempotency_key_hash = Sha256Digest::from_bytes([7; 32]);
+        let mailbox_id = MailboxId::new();
+        let envelope_id = EnvelopeId::new();
+        let expires_at = UtcMillis::new(6_000).expect("valid timestamp");
+        let opaque = vec![0; 1_049_093];
+        let exact = encode_deterministic_cbor_with_limit(
+            &CanonicalValue::Map(vec![
+                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+                (
+                    CanonicalValue::Unsigned(2),
+                    CanonicalValue::Text(envelope_id.to_string()),
+                ),
+                (
+                    CanonicalValue::Unsigned(3),
+                    CanonicalValue::Bytes(opaque.clone()),
+                ),
+                (CanonicalValue::Unsigned(4), expires_at.to_canonical_value()),
+            ]),
+            MAX_HISTORY_GRANT_ENVELOPE_BYTES,
+        )
+        .expect("maximum history envelope remains encodable");
+        assert_eq!(exact.len(), MAX_HISTORY_GRANT_ENVELOPE_BYTES);
+        assert!(
+            MailboxEnvelopeCommand::new_history_grant(
+                idempotency_key_hash,
+                mailbox_id,
+                envelope_id,
+                opaque.clone(),
+                expires_at,
+                exact,
+            )
+            .is_ok()
+        );
+
+        let over = vec![0; 1_049_094];
+        let over_exact = encode_deterministic_cbor_with_limit(
+            &CanonicalValue::Map(vec![
+                (CanonicalValue::Unsigned(1), CanonicalValue::Unsigned(1)),
+                (
+                    CanonicalValue::Unsigned(2),
+                    CanonicalValue::Text(envelope_id.to_string()),
+                ),
+                (CanonicalValue::Unsigned(3), CanonicalValue::Bytes(over)),
+                (CanonicalValue::Unsigned(4), expires_at.to_canonical_value()),
+            ]),
+            MAX_HISTORY_GRANT_ENVELOPE_BYTES + 1,
+        )
+        .expect("one-byte-over envelope remains encodable");
+        assert_eq!(over_exact.len(), MAX_HISTORY_GRANT_ENVELOPE_BYTES + 1);
+        assert!(
+            MailboxEnvelopeCommand::new_history_grant(
+                idempotency_key_hash,
+                mailbox_id,
+                envelope_id,
+                vec![0; 1_049_094],
+                expires_at,
+                over_exact,
+            )
+            .is_err()
+        );
     }
 }

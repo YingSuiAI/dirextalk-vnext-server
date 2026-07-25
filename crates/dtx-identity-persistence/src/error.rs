@@ -83,6 +83,8 @@ pub enum IdentityPersistenceError {
     RecoveryCandidateKeyChanged,
     /// A catalog/preparation fence changed after preparation.
     RecoveryPreparationInvalidated,
+    /// An authenticated provider session did not match the request provider.
+    RecoveryProviderMismatch,
     /// Stored rows did not rehydrate to one exact valid identity-log projection.
     CorruptData(&'static str),
 }
@@ -138,6 +140,7 @@ impl fmt::Display for IdentityPersistenceError {
             Self::RecoveryAuthorityChanged => "recovery catalog authority changed",
             Self::RecoveryCandidateKeyChanged => "recovery candidate key changed",
             Self::RecoveryPreparationInvalidated => "recovery catalog preparation invalidated",
+            Self::RecoveryProviderMismatch => "recovery catalog provider mismatch",
             Self::CorruptData(_) => "identity persistence contained invalid durable data",
         })
     }
@@ -182,6 +185,7 @@ impl Error for IdentityPersistenceError {
             | Self::RecoveryAuthorityChanged
             | Self::RecoveryCandidateKeyChanged
             | Self::RecoveryPreparationInvalidated
+            | Self::RecoveryProviderMismatch
             | Self::CorruptData(_) => None,
         }
     }

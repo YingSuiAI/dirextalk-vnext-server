@@ -148,6 +148,55 @@ pub(crate) struct DeviceEnrollmentApprovalSuccess {
     pub(crate) exact_receipt_bytes: Vec<u8>,
 }
 
+pub(crate) struct HistoryRecoveryRequestV4Success {
+    pub(crate) status: StatusCode,
+    pub(crate) exact_receipt_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HistoryRecoveryRequestV4Failure {
+    InvalidRequest,
+    CapabilityRejected,
+    IdempotencyConflict,
+    PreparationExpired,
+    PreparationRevoked,
+    CatalogExpired,
+    PreparationInvalidated,
+    IdentityHeadChanged,
+    CatalogHeadChanged,
+    AuthorityChanged,
+    CandidateKeyChanged,
+    TemporarilyUnavailable,
+}
+
+#[derive(Clone, Copy, Serialize)]
+pub(crate) enum HistoryRecoveryRequestV4ErrorCode {
+    #[serde(rename = "DEVICE_ENROLLMENT_INVALID")]
+    InvalidRequest,
+    #[serde(rename = "DEVICE_ENROLLMENT_CAPABILITY_INVALID")]
+    CapabilityRejected,
+    #[serde(rename = "IDEMPOTENCY_CONFLICT")]
+    IdempotencyConflict,
+    #[serde(rename = "RECOVERY_PREPARATION_EXPIRED")]
+    PreparationExpired,
+    #[serde(rename = "RECOVERY_PREPARATION_REVOKED")]
+    PreparationRevoked,
+    #[serde(rename = "RECOVERY_CATALOG_EXPIRED")]
+    CatalogExpired,
+    #[serde(rename = "RECOVERY_PREPARATION_INVALIDATED")]
+    PreparationInvalidated,
+    #[serde(rename = "IDENTITY_HEAD_CHANGED")]
+    IdentityHeadChanged,
+    #[serde(rename = "CATALOG_HEAD_CHANGED")]
+    CatalogHeadChanged,
+    #[serde(rename = "AUTHORITY_CHANGED")]
+    AuthorityChanged,
+    #[serde(rename = "CANDIDATE_KEY_CHANGED")]
+    CandidateKeyChanged,
+    #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]
+    TemporarilyUnavailable,
+}
+
 pub(crate) struct DeviceRevokeSuccess {
     pub(crate) status: StatusCode,
     pub(crate) exact_receipt_bytes: Vec<u8>,
@@ -171,10 +220,21 @@ pub(crate) struct RecoveryCatalogHeadSuccess {
 pub(crate) struct RecoveryCatalogStatusSuccess {
     pub(crate) status: StatusCode,
     pub(crate) outcome: RecoveryScopeCatalogStatusOutcome,
+    pub(crate) receipt: RecoveryCatalogReceiptKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryCatalogReceiptKind {
+    None,
+    Preparation,
+    ProviderResponse,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RecoveryCatalogFailure {
+    NotAcceptable,
+    UnsupportedMedia,
+    TooLarge,
     InvalidRequest,
     ExactCborInvalid,
     CapabilityRejected,
@@ -189,6 +249,7 @@ pub(crate) enum RecoveryCatalogFailure {
     CatalogHeadChanged,
     AuthorityChanged,
     CandidateKeyChanged,
+    ProviderMismatch,
     IdempotencyConflict,
     TemporarilyUnavailable,
 }
@@ -360,6 +421,12 @@ pub(crate) enum KeyPackageErrorCode {
 
 #[derive(Clone, Copy, Serialize)]
 pub(crate) enum RecoveryCatalogErrorCode {
+    #[serde(rename = "RECOVERY_HANDOFF_NOT_ACCEPTABLE")]
+    NotAcceptable,
+    #[serde(rename = "RECOVERY_HANDOFF_UNSUPPORTED_MEDIA_TYPE")]
+    UnsupportedMedia,
+    #[serde(rename = "RECOVERY_HANDOFF_TOO_LARGE")]
+    TooLarge,
     #[serde(rename = "RECOVERY_CATALOG_INVALID")]
     InvalidRequest,
     #[serde(rename = "EXACT_CBOR_INVALID")]
@@ -388,6 +455,8 @@ pub(crate) enum RecoveryCatalogErrorCode {
     AuthorityChanged,
     #[serde(rename = "CANDIDATE_KEY_CHANGED")]
     CandidateKeyChanged,
+    #[serde(rename = "RECOVERY_PROVIDER_MISMATCH")]
+    ProviderMismatch,
     #[serde(rename = "IDEMPOTENCY_CONFLICT")]
     IdempotencyConflict,
     #[serde(rename = "IDENTITY_SERVICE_UNAVAILABLE")]

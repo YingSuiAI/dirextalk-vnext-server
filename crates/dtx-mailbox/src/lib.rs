@@ -13,6 +13,7 @@ mod attachment;
 mod error;
 mod history;
 mod history_v2;
+mod history_v4;
 mod multi_device;
 mod repository;
 mod store;
@@ -26,6 +27,7 @@ pub use attachment::{
 pub use error::MailboxPersistenceError;
 pub use history::{DeviceHistoryAuthorization, DeviceHistoryGrantCommand};
 pub use history_v2::{DeviceHistoryGrantAuthorityV2, DeviceHistoryGrantCommandV2};
+pub use history_v4::{DELIVERY_RECEIPT_DOMAIN, DeviceHistoryGrantV5Command, GRANT_DIGEST_DOMAIN};
 pub use multi_device::{
     IdentityDeliverySegment, IdentityMailboxAckCommand, IdentityMailboxPullRequest,
     IdentityPulledEnvelope, MAX_IDENTITY_PULL_ENTRIES,
@@ -39,3 +41,4 @@ pub use types::{
     MailboxAcknowledgementCommand, MailboxEnvelopeCommand, MailboxOperationOutcome,
     MailboxPullRequest, MailboxRegistrationCommand, MailboxWriteCapability,
 };
+pub(crate) use types::{MAX_HISTORY_OFFER_BYTES, MAX_PULL_RECEIPT_BYTES};

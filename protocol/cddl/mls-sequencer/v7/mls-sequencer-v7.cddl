@@ -95,8 +95,8 @@ exact-signed-catalog-head-v2 = bstr .size (1..466)
 exact-catalog-proof-v2 = bstr .size (1..402)
 exact-history-recovery-request-v4 = bstr .size (1..37114)
 exact-history-recovery-manifest-v2 = bstr .size (1..35477)
-exact-history-recovery-grant-v4 = bstr .size (1..1050699)
-exact-recipient-history-offer-v2 = bstr .size (1..1049059)
+exact-history-recovery-grant-v5 = bstr .size (1..1050733)
+exact-recipient-history-offer-v3 = bstr .size (1..1049093)
 exact-history-recovery-delivery-fact-v2 = bstr .size (1..366)
 exact-key-package-publish-receipt-v4 = bstr .size (1..67531)
 exact-key-package-claim-receipt-v4 = bstr .size (1..135564)
@@ -221,9 +221,9 @@ mls-recovery-add-request-v7 = {
   10: digest,
   11: exact-history-recovery-manifest-v2,
   12: digest,
-  13: exact-history-recovery-grant-v4,
+  13: exact-history-recovery-grant-v5,
   14: digest,
-  15: exact-recipient-history-offer-v2,
+  15: exact-recipient-history-offer-v3,
   16: digest,
   17: exact-history-recovery-delivery-fact-v2,
   18: digest,

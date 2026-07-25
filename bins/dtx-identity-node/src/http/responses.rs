@@ -7,16 +7,21 @@ use super::{
     DeviceEnrollmentChallengeSuccess, DeviceEnrollmentErrorCode, DeviceEnrollmentFailure,
     DeviceRevokeErrorCode, DeviceRevokeFailure, DeviceRevokeSuccess,
     DeviceSessionChallengeResponse, DeviceSessionErrorCode, DeviceSessionFailure,
-    DeviceSessionSuccess, Encoding, HeaderMap, HeaderValue, IDENTITY_APPEND_RECEIPT_CONTENT_TYPE,
+    DeviceSessionSuccess, Encoding, HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE, HeaderMap,
+    HeaderValue, HistoryRecoveryRequestV4ErrorCode, HistoryRecoveryRequestV4Failure,
+    HistoryRecoveryRequestV4Success, IDENTITY_APPEND_RECEIPT_CONTENT_TYPE,
     IDENTITY_LOG_PAGE_CONTENT_TYPE, IdentityLogPageErrorCode, IdentityLogPageFailure,
     IdentityLogPageV1, InitialDeviceErrorCode, InitialDeviceFailure, InitialDeviceSuccess,
     IntoResponse, KEY_PACKAGE_CLAIM_RECEIPT_CONTENT_TYPE, KEY_PACKAGE_PUBLISH_RECEIPT_CONTENT_TYPE,
     KeyPackageClaimSuccess, KeyPackageErrorCode, KeyPackageFailure, KeyPackagePublishSuccess,
     MlsV5RecoveryAuthorizationErrorCode, MlsV5RecoveryAuthorizationFailure,
-    RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE, RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
-    REQUEST_ID_HEADER, RecoveryCatalogErrorCode, RecoveryCatalogFailure,
-    RecoveryCatalogHeadSuccess, RecoveryCatalogStatusSuccess, RequestId, Response, SafeErrorBody,
-    SafeErrorEnvelope, Serialize, StatusCode, UtcMillis, encode_deterministic_cbor, header,
+    RECOVERY_SCOPE_CATALOG_HEAD_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE,
+    RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE, REQUEST_ID_HEADER, RecoveryCatalogErrorCode,
+    RecoveryCatalogFailure, RecoveryCatalogHeadSuccess, RecoveryCatalogReceiptKind,
+    RecoveryCatalogStatusSuccess, RequestId, Response, SafeErrorBody, SafeErrorEnvelope, Serialize,
+    StatusCode, UtcMillis, encode_deterministic_cbor, header,
 };
 
 pub(crate) fn bootstrap_success_response(
@@ -331,6 +336,87 @@ pub(crate) fn device_enrollment_approval_success_response(
     )
 }
 
+pub(crate) fn history_recovery_request_v4_success_response(
+    success: HistoryRecoveryRequestV4Success,
+    request_id: RequestId,
+) -> Response {
+    exact_cbor_response(
+        success.status,
+        success.exact_receipt_bytes,
+        HISTORY_RECOVERY_REQUEST_RECEIPT_V4_CONTENT_TYPE,
+        request_id,
+    )
+}
+
+pub(crate) fn history_recovery_request_v4_failure_response(
+    failure: HistoryRecoveryRequestV4Failure,
+    request_id: RequestId,
+) -> Response {
+    let (status, code, retryable) = match failure {
+        HistoryRecoveryRequestV4Failure::InvalidRequest => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            HistoryRecoveryRequestV4ErrorCode::InvalidRequest,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::CapabilityRejected => (
+            StatusCode::UNAUTHORIZED,
+            HistoryRecoveryRequestV4ErrorCode::CapabilityRejected,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::IdempotencyConflict => (
+            StatusCode::CONFLICT,
+            HistoryRecoveryRequestV4ErrorCode::IdempotencyConflict,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::PreparationExpired => (
+            StatusCode::GONE,
+            HistoryRecoveryRequestV4ErrorCode::PreparationExpired,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::PreparationRevoked => (
+            StatusCode::GONE,
+            HistoryRecoveryRequestV4ErrorCode::PreparationRevoked,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::CatalogExpired => (
+            StatusCode::GONE,
+            HistoryRecoveryRequestV4ErrorCode::CatalogExpired,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::PreparationInvalidated => (
+            StatusCode::PRECONDITION_FAILED,
+            HistoryRecoveryRequestV4ErrorCode::PreparationInvalidated,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::IdentityHeadChanged => (
+            StatusCode::PRECONDITION_FAILED,
+            HistoryRecoveryRequestV4ErrorCode::IdentityHeadChanged,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::CatalogHeadChanged => (
+            StatusCode::PRECONDITION_FAILED,
+            HistoryRecoveryRequestV4ErrorCode::CatalogHeadChanged,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::AuthorityChanged => (
+            StatusCode::PRECONDITION_FAILED,
+            HistoryRecoveryRequestV4ErrorCode::AuthorityChanged,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::CandidateKeyChanged => (
+            StatusCode::PRECONDITION_FAILED,
+            HistoryRecoveryRequestV4ErrorCode::CandidateKeyChanged,
+            false,
+        ),
+        HistoryRecoveryRequestV4Failure::TemporarilyUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            HistoryRecoveryRequestV4ErrorCode::TemporarilyUnavailable,
+            true,
+        ),
+    };
+    safe_error_response(status, code, retryable, request_id)
+}
+
 pub(crate) fn device_revoke_success_response(
     success: DeviceRevokeSuccess,
     request_id: RequestId,
@@ -513,11 +599,24 @@ pub(crate) fn recovery_catalog_status_response(
     success: &RecoveryCatalogStatusSuccess,
     request_id: RequestId,
 ) -> Response {
-    match success.outcome.exact_bytes() {
+    let response = if success.receipt != RecoveryCatalogReceiptKind::None {
+        success.outcome.receipt_bytes.clone().ok_or(())
+    } else {
+        success.outcome.exact_bytes().map_err(|_| ())
+    };
+    match response {
         Ok(bytes) => exact_cbor_response(
             success.status,
             bytes,
-            RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+            match success.receipt {
+                RecoveryCatalogReceiptKind::Preparation => {
+                    RECOVERY_SCOPE_CATALOG_PREPARATION_RECEIPT_CONTENT_TYPE
+                }
+                RecoveryCatalogReceiptKind::ProviderResponse => {
+                    RECOVERY_SCOPE_CATALOG_PROVIDER_RESPONSE_RECEIPT_CONTENT_TYPE
+                }
+                RecoveryCatalogReceiptKind::None => RECOVERY_SCOPE_CATALOG_STATUS_CONTENT_TYPE,
+            },
             request_id,
         ),
         Err(_) => recovery_catalog_failure_response(
@@ -532,6 +631,21 @@ pub(crate) fn recovery_catalog_failure_response(
     request_id: RequestId,
 ) -> Response {
     let (status, code, retryable) = match failure {
+        RecoveryCatalogFailure::NotAcceptable => (
+            StatusCode::NOT_ACCEPTABLE,
+            RecoveryCatalogErrorCode::NotAcceptable,
+            false,
+        ),
+        RecoveryCatalogFailure::UnsupportedMedia => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            RecoveryCatalogErrorCode::UnsupportedMedia,
+            false,
+        ),
+        RecoveryCatalogFailure::TooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            RecoveryCatalogErrorCode::TooLarge,
+            false,
+        ),
         RecoveryCatalogFailure::InvalidRequest => (
             StatusCode::UNPROCESSABLE_ENTITY,
             RecoveryCatalogErrorCode::InvalidRequest,
@@ -600,6 +714,11 @@ pub(crate) fn recovery_catalog_failure_response(
         RecoveryCatalogFailure::CandidateKeyChanged => (
             StatusCode::PRECONDITION_FAILED,
             RecoveryCatalogErrorCode::CandidateKeyChanged,
+            false,
+        ),
+        RecoveryCatalogFailure::ProviderMismatch => (
+            StatusCode::FORBIDDEN,
+            RecoveryCatalogErrorCode::ProviderMismatch,
             false,
         ),
         RecoveryCatalogFailure::IdempotencyConflict => (
