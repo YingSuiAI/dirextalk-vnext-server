@@ -90,6 +90,7 @@ pub struct CatalogHeadV2 {
     pub generation: SafeUint,
     pub leaf_count: SafeUint,
     pub merkle_root: Sha256Digest,
+    pub leaf_set_digest: Sha256Digest,
     pub observed_head: IdentityLogHead,
     pub authority_device_id: DeviceId,
     pub authority_key_id: Uuid,
@@ -120,6 +121,7 @@ pub fn parse_signed_catalog_head_v2(exact_bytes: &[u8]) -> Result<CatalogHeadV2,
         return Err(invalid("catalog leaf count"));
     }
     let merkle_root = parse_digest(fields[6])?;
+    let leaf_set_digest = parse_digest(fields[7])?;
     let observed_head = IdentityLogHead::observed(
         identity_id,
         parse_safe_uint(fields[8])?,
@@ -152,6 +154,7 @@ pub fn parse_signed_catalog_head_v2(exact_bytes: &[u8]) -> Result<CatalogHeadV2,
         generation,
         leaf_count,
         merkle_root,
+        leaf_set_digest,
         observed_head,
         authority_device_id,
         authority_key_id,

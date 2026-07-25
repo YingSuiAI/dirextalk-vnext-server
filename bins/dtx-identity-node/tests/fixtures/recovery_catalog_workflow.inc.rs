@@ -2432,7 +2432,8 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     let cert_issuer = SigningKey::from_bytes(&[106;32]);
     let leaf = history_testkit::catalog_leaf_v2(catalog_id, 1, 1, [1;32], [2;32], cert_issuer.verifying_key().to_bytes(), 2_000, 8_000, [3;32]);
     let leaf_digest = Sha256Digest::hash_domain(b"dirextalk.recovery-scope-catalog-leaf-commitment.v2\0", &leaf);
-    let catalog_upload = history_testkit::catalog_v2(identity, catalog_id, 1, None, head1.sequence().get(), *head1.hash().as_bytes(), candidate_device, Uuid::now_v7(), &root, *leaf_digest.as_bytes(), b"opaque-catalog", 2_500, 250_000);
+    let leaf_set_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.leaf-set.v2\0", &encode_deterministic_cbor(&CanonicalValue::Array(vec![CanonicalValue::Bytes(leaf_digest.as_bytes().to_vec())]))?);
+    let catalog_upload = history_testkit::catalog_v2_with_leaf_set(identity, catalog_id, 1, None, head1.sequence().get(), *head1.hash().as_bytes(), candidate_device, Uuid::now_v7(), &root, *leaf_digest.as_bytes(), *leaf_set_digest.as_bytes(), b"opaque-catalog", 2_500, 250_000);
     let CanonicalValue::Map(upload_fields) = decode_deterministic_cbor(&catalog_upload)? else { unreachable!() };
     let catalog_head = encode_deterministic_cbor(&upload_fields[0].1)?;
     let catalog_head_digest = Sha256Digest::hash_domain(b"dirextalk.recovery-scope-catalog-head.v2\0", &catalog_head);
@@ -2443,10 +2444,7 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     let CanonicalValue::Map(request_fields) = request_value else { unreachable!() };
     let manifest = encode_deterministic_cbor(&request_fields[14].1)?;
     let CanonicalValue::Map(manifest_fields) = &request_fields[14].1 else { unreachable!() };
-    let leaf_set_digest = match &manifest_fields[8].1 {
-        CanonicalValue::Bytes(value) => <[u8; 32]>::try_from(value.as_slice()).unwrap(),
-        _ => unreachable!(),
-    };
+    assert_eq!(manifest_fields[8].1, CanonicalValue::Bytes(leaf_set_digest.as_bytes().to_vec()));
     let request_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.request.v4\0", &request);
     let manifest_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.manifest.v2\0", &manifest);
     let device_add_digest = Sha256Digest::hash_domain(history_testkit::IDENTITY_DEVICE_ADD_DOMAIN, &candidate_add.to_deterministic_cbor()?);
@@ -2457,7 +2455,7 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
         .bind(request_id).bind(identity.to_string()).bind(*candidate_device.as_uuid()).bind(candidate.verifying_key().to_bytes().to_vec()).bind(vec![51_u8;32]).bind(head1.sequence().get() as i64).bind(head1.hash().as_bytes().to_vec()).bind(head2.sequence().get() as i64).bind(head2.hash().as_bytes().to_vec()).bind(candidate_add.to_deterministic_cbor()?).bind(device_add_digest.as_bytes().to_vec()).bind(&preparation).bind(Sha256Digest::hash_domain(history_testkit::PREPARATION_DIGEST_DOMAIN,&preparation).as_bytes().to_vec()).bind(&manifest).bind(manifest_digest.as_bytes().to_vec()).bind(2_500_i64).bind(250_000_i64).bind(vec![52_u8;32]).bind(vec![54_u8;32]).bind(vec![0_u8;64]).bind(&request).bind(request_digest.as_bytes().to_vec()).bind(vec![1_u8]).bind(2_500_i64).execute(harness.identity_runtime_pool()).await?;
     assert_eq!(request_value.rows_affected(), 1);
 
-    let offer = history_testkit::offer_v3(request_challenge_id, *request_digest.as_bytes(), *manifest_digest.as_bytes(), catalog_id, 1, *catalog_head_digest.as_bytes(), leaf_set_digest, [32;32], *Sha256Digest::hash_domain(b"dirextalk.recovery-recipient-key.v1\0", &[51;32]).as_bytes(), b"opaque-offer", [61;32], 2_500, 250_000);
+    let offer = history_testkit::offer_v3(request_challenge_id, *request_digest.as_bytes(), *manifest_digest.as_bytes(), catalog_id, 1, *catalog_head_digest.as_bytes(), *leaf_set_digest.as_bytes(), [32;32], *Sha256Digest::hash_domain(b"dirextalk.recovery-recipient-key.v1\0", &[51;32]).as_bytes(), b"opaque-offer", [61;32], 2_500, 250_000);
     let mailbox_id = Uuid::now_v7();
     let envelope_id = Uuid::now_v7();
     let delivery_fact_id = Uuid::now_v7();
@@ -2465,12 +2463,12 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     let authority = key(105);
     let provider_descriptor = CanonicalValue::Map(vec![field(1, CanonicalValue::Unsigned(2)), field(2, CanonicalValue::Text(Uuid::now_v7().to_string())), field(3, public(&provider).to_canonical_value())]);
     let authority_descriptor = CanonicalValue::Map(vec![field(1, CanonicalValue::Unsigned(1)), field(2, CanonicalValue::Text(Uuid::now_v7().to_string())), field(3, public(&authority).to_canonical_value())]);
-    let grant = history_testkit::grant_v5(identity, request_challenge_id, *request_digest.as_bytes(), *manifest_digest.as_bytes(), catalog_id, 1, &catalog_head, *catalog_head_digest.as_bytes(), *leaf_digest.as_bytes(), 1, leaf_set_digest, candidate_device, &candidate, [51;32], head1.sequence().get(), *head1.hash().as_bytes(), head2.sequence().get(), *head2.hash().as_bytes(), *device_add_digest.as_bytes(), *Sha256Digest::hash_domain(history_testkit::PREPARATION_DIGEST_DOMAIN,&preparation).as_bytes(), provider_descriptor, authority_descriptor.clone(), mailbox_id, envelope_id, 0, delivery_fact_id, 2_500, 250_000, &provider, &authority, &offer, [54;32], 2_500, 250_000);
+    let grant = history_testkit::grant_v5(identity, request_challenge_id, *request_digest.as_bytes(), *manifest_digest.as_bytes(), catalog_id, 1, &catalog_head, *catalog_head_digest.as_bytes(), *leaf_digest.as_bytes(), 1, *leaf_set_digest.as_bytes(), candidate_device, &candidate, [51;32], head1.sequence().get(), *head1.hash().as_bytes(), head2.sequence().get(), *head2.hash().as_bytes(), *device_add_digest.as_bytes(), *Sha256Digest::hash_domain(history_testkit::PREPARATION_DIGEST_DOMAIN,&preparation).as_bytes(), provider_descriptor, authority_descriptor.clone(), mailbox_id, envelope_id, 0, delivery_fact_id, 2_500, 250_000, &provider, &authority, &offer, [54;32], 2_500, 250_000);
     let grant_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.grant.v5\0", &grant);
     let offer_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.recipient-offer.v3\0", &offer);
     let delivery = history_testkit::delivery_v2(delivery_fact_id, mailbox_id, envelope_id, 1, *grant_digest.as_bytes(), *offer_digest.as_bytes(), request_id, *candidate_device.as_uuid(), 3_000, Uuid::now_v7(), Uuid::now_v7());
     let delivery_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.delivery-fact.v2\0", &delivery);
-    let context = history_testkit::completion_context_v2([71;32], Uuid::now_v7(), request_id, *request_digest.as_bytes(), identity, *candidate_device.as_uuid(), catalog_id, 1, *catalog_head_digest.as_bytes(), 1, leaf_set_digest);
+    let context = history_testkit::completion_context_v2([71;32], Uuid::now_v7(), request_id, *request_digest.as_bytes(), identity, *candidate_device.as_uuid(), catalog_id, 1, *catalog_head_digest.as_bytes(), 1, *leaf_set_digest.as_bytes());
     let completion_id = match decode_deterministic_cbor(&context)? { CanonicalValue::Map(fields) => match &fields[2].1 { CanonicalValue::Text(value) => Uuid::parse_str(value)?, _ => unreachable!() }, _ => unreachable!() };
     let child = SigningKey::from_bytes(&[107;32]);
     let context_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery-completion-context.v2\0", &context);
@@ -2501,7 +2499,7 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     .expect("entry");
     let signer = SigningKey::from_bytes(&[108;32]);
     let completion_idempotency = Sha256Digest::hash_domain(b"dirextalk.history-recovery.completion-idempotency.v2\0", b"completion-00001");
-    let input = history_testkit::CompletionV2Input { completion_id, identity, candidate_device: *candidate_device.as_uuid(), highwater: head1.sequence().get(), head_at_highwater: *head1.hash().as_bytes(), highwater_next: head2.sequence().get(), final_head_hash: *head2.hash().as_bytes(), catalog_id, catalog_generation: 1, catalog_head: catalog_head.clone(), catalog_head_digest: *catalog_head_digest.as_bytes(), catalog_root_digest: *leaf_digest.as_bytes(), leaf_set_digest, preparation: preparation.clone(), request, request_digest: *request_digest.as_bytes(), manifest, manifest_digest: *manifest_digest.as_bytes(), grant, grant_digest: *grant_digest.as_bytes(), offer: offer.clone(), offer_digest: *offer_digest.as_bytes(), delivery, delivery_digest: *delivery_digest.as_bytes(), entries: vec![entry], issued_at: 3_000, expires_at: 8_000, idempotency_digest: *completion_idempotency.as_bytes(), context };
+    let input = history_testkit::CompletionV2Input { completion_id, identity, candidate_device: *candidate_device.as_uuid(), highwater: head1.sequence().get(), head_at_highwater: *head1.hash().as_bytes(), highwater_next: head2.sequence().get(), final_head_hash: *head2.hash().as_bytes(), catalog_id, catalog_generation: 1, catalog_head: catalog_head.clone(), catalog_head_digest: *catalog_head_digest.as_bytes(), catalog_root_digest: *leaf_digest.as_bytes(), leaf_set_digest: *leaf_set_digest.as_bytes(), preparation: preparation.clone(), request, request_digest: *request_digest.as_bytes(), manifest, manifest_digest: *manifest_digest.as_bytes(), grant, grant_digest: *grant_digest.as_bytes(), offer: offer.clone(), offer_digest: *offer_digest.as_bytes(), delivery, delivery_digest: *delivery_digest.as_bytes(), entries: vec![entry], issued_at: 3_000, expires_at: 8_000, idempotency_digest: *completion_idempotency.as_bytes(), context };
     let command = history_testkit::completion_command_v2(&input, &candidate);
     dtx_history_recovery_protocol::validate_catalog_head_v2(&input.catalog_head).expect("head");
     dtx_history_recovery_protocol::validate_request_v4(&input.request).expect("request");
@@ -2531,7 +2529,7 @@ async fn completion_http_fixture_accepts_exact_post_replay_and_readback() -> Res
     assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert!(dtx_identity_persistence::HistoryRecoveryCompletionRepository.current_descriptor(&store).await?.is_none());
     let invalid_provider = CanonicalValue::Map(vec![field(1, CanonicalValue::Unsigned(2)), field(2, CanonicalValue::Text(candidate_device.to_string())), field(3, public(&provider).to_canonical_value())]);
-    let invalid_grant = history_testkit::grant_v5(identity, request_challenge_id, *request_digest.as_bytes(), *manifest_digest.as_bytes(), catalog_id, 1, &catalog_head, *catalog_head_digest.as_bytes(), *leaf_digest.as_bytes(), 1, leaf_set_digest, candidate_device, &candidate, [51;32], head1.sequence().get(), *head1.hash().as_bytes(), head2.sequence().get(), *head2.hash().as_bytes(), *device_add_digest.as_bytes(), *Sha256Digest::hash_domain(history_testkit::PREPARATION_DIGEST_DOMAIN,&preparation).as_bytes(), invalid_provider, authority_descriptor.clone(), mailbox_id, envelope_id, 0, delivery_fact_id, 2_500, 250_000, &provider, &authority, &offer, [54;32], 2_500, 250_000);
+    let invalid_grant = history_testkit::grant_v5(identity, request_challenge_id, *request_digest.as_bytes(), *manifest_digest.as_bytes(), catalog_id, 1, &catalog_head, *catalog_head_digest.as_bytes(), *leaf_digest.as_bytes(), 1, *leaf_set_digest.as_bytes(), candidate_device, &candidate, [51;32], head1.sequence().get(), *head1.hash().as_bytes(), head2.sequence().get(), *head2.hash().as_bytes(), *device_add_digest.as_bytes(), *Sha256Digest::hash_domain(history_testkit::PREPARATION_DIGEST_DOMAIN,&preparation).as_bytes(), invalid_provider, authority_descriptor.clone(), mailbox_id, envelope_id, 0, delivery_fact_id, 2_500, 250_000, &provider, &authority, &offer, [54;32], 2_500, 250_000);
     let invalid_grant_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.grant.v5\0", &invalid_grant);
     let invalid_delivery = history_testkit::delivery_v2(delivery_fact_id, mailbox_id, envelope_id, 1, *invalid_grant_digest.as_bytes(), *offer_digest.as_bytes(), request_id, *candidate_device.as_uuid(), 3_000, Uuid::now_v7(), Uuid::now_v7());
     let invalid_delivery_digest = Sha256Digest::hash_domain(b"dirextalk.history-recovery.delivery-fact.v2\0", &invalid_delivery);

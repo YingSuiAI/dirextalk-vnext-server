@@ -246,6 +246,7 @@ impl HistoryRecoveryCompletionCommand {
         }
         let catalog_root_digest = digest_field(&fields[12])?;
         let catalog_leaf_count = uint_field(&fields[13])?;
+        let leaf_set_digest = digest_field(&fields[14])?;
         if !(1..=1023).contains(&catalog_leaf_count) {
             return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
         }
@@ -253,10 +254,10 @@ impl HistoryRecoveryCompletionCommand {
             || parsed_head.generation.get() != catalog_generation
             || parsed_head.merkle_root != catalog_root_digest
             || parsed_head.leaf_count.get() != catalog_leaf_count
+            || parsed_head.leaf_set_digest != leaf_set_digest
         {
             return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
         }
-        let leaf_set_digest = digest_field(&fields[14])?;
         let preparation = bytes_field(&fields[15], 532)?;
         let preparation_digest = digest_field(&fields[16])?;
         if Sha256Digest::hash_domain(
@@ -432,6 +433,7 @@ impl HistoryRecoveryCompletionCommand {
             || head.digest() != catalog_head_digest
             || head.merkle_root() != catalog_root_digest
             || head.leaf_count() != catalog_leaf_count
+            || head.leaf_set_digest() != leaf_set_digest
             || head.identity_id().to_string() != identity_id
         {
             return Err(IdentityPersistenceError::RecoveryCompletionInvalid);

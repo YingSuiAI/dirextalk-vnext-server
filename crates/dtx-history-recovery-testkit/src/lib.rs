@@ -175,6 +175,41 @@ pub fn catalog_v2(
     issued_at: i64,
     expires_at: i64,
 ) -> Vec<u8> {
+    catalog_v2_with_leaf_set(
+        identity,
+        catalog_id,
+        generation,
+        previous,
+        head_sequence,
+        head_hash,
+        authority_device,
+        authority_key_id,
+        signer,
+        merkle_root,
+        *Sha256Digest::hash_domain(CATALOG_CIPHERTEXT_HASH_DOMAIN, ciphertext).as_bytes(),
+        ciphertext,
+        issued_at,
+        expires_at,
+    )
+}
+
+/// Build a CatalogV2 envelope whose signed head binds the supplied leaf-set digest.
+pub fn catalog_v2_with_leaf_set(
+    identity: IdentityId,
+    catalog_id: Uuid,
+    generation: u64,
+    previous: Option<[u8; 32]>,
+    head_sequence: u64,
+    head_hash: [u8; 32],
+    authority_device: DeviceId,
+    authority_key_id: Uuid,
+    signer: &SigningKey,
+    merkle_root: [u8; 32],
+    leaf_set_digest: [u8; 32],
+    ciphertext: &[u8],
+    issued_at: i64,
+    expires_at: i64,
+) -> Vec<u8> {
     let unsigned = CanonicalValue::Map(vec![
         field(1, CanonicalValue::Unsigned(2)),
         field(2, CanonicalValue::Text(catalog_id.to_string())),
@@ -183,11 +218,7 @@ pub fn catalog_v2(
         field(5, previous.map_or(CanonicalValue::Null, digest)),
         field(6, CanonicalValue::Unsigned(1)),
         field(7, CanonicalValue::Bytes(merkle_root.to_vec())),
-        field(
-            8,
-            Sha256Digest::hash_domain(CATALOG_CIPHERTEXT_HASH_DOMAIN, ciphertext)
-                .to_canonical_value(),
-        ),
+        field(8, digest(leaf_set_digest)),
         field(9, CanonicalValue::Unsigned(head_sequence)),
         field(10, digest(head_hash)),
         field(11, CanonicalValue::Text(authority_device.to_string())),
@@ -1417,7 +1448,14 @@ mod tests {
         let authority_device = DeviceId::new();
         let identity = IdentityId::derive(public(&authority).as_domain_key());
         let catalog_id = Uuid::now_v7();
-        let upload = catalog_v2(
+        let leaf_set_digest = Sha256Digest::hash_domain(
+            b"dirextalk.history-recovery.leaf-set.v2\0",
+            &dtx_wire::encode_deterministic_cbor(&CanonicalValue::Array(vec![
+                CanonicalValue::Bytes(vec![31; 32]),
+            ]))
+            .expect("leaf set"),
+        );
+        let upload = catalog_v2_with_leaf_set(
             identity,
             catalog_id,
             1,
@@ -1428,6 +1466,7 @@ mod tests {
             Uuid::now_v7(),
             &authority,
             [31; 32],
+            *leaf_set_digest.as_bytes(),
             b"opaque-catalog",
             1_000,
             10_000,
@@ -1517,13 +1556,6 @@ mod tests {
             dtx_wire::encode_deterministic_cbor(&request_fields[14].1).expect("manifest");
         let manifest_digest =
             Sha256Digest::hash_domain(b"dirextalk.history-recovery.manifest.v2\0", &manifest);
-        let leaf_set_digest = Sha256Digest::hash_domain(
-            b"dirextalk.history-recovery.leaf-set.v2\0",
-            &dtx_wire::encode_deterministic_cbor(&CanonicalValue::Array(vec![
-                CanonicalValue::Bytes(vec![31; 32]),
-            ]))
-            .expect("leaf set"),
-        );
         let provider = SigningKey::from_bytes(&[19; 32]);
         let provider_device = DeviceId::new();
         let provider_descriptor = CanonicalValue::Map(vec![
@@ -1575,6 +1607,89 @@ mod tests {
             [13; 32],
             [14; 32],
             [15; 32],
+            provider_descriptor.clone(),
+            authority_descriptor.clone(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            0,
+            Uuid::now_v7(),
+            1_000,
+            8_000,
+            &provider,
+            &authority,
+            &grant_offer,
+            [44; 32],
+            1_000,
+            8_000,
+        );
+        validate_grant_v5(&grant).expect("grant golden");
+        let CanonicalValue::Map(mut mismatched_head_fields) =
+            dtx_wire::decode_deterministic_cbor(&head).expect("head map")
+        else {
+            panic!("head map");
+        };
+        mismatched_head_fields[7].1 = CanonicalValue::Bytes([99; 32].to_vec());
+        let unsigned_head = CanonicalValue::Map(mismatched_head_fields[..15].to_vec());
+        mismatched_head_fields[15].1 =
+            signature(&authority, CATALOG_HEAD_SIGNATURE_DOMAIN, &unsigned_head)
+                .to_canonical_value();
+        let mismatched_head =
+            dtx_wire::encode_deterministic_cbor(&CanonicalValue::Map(mismatched_head_fields))
+                .expect("mismatched head");
+        let bad_manifest_request = request_v4(
+            request_id,
+            identity,
+            candidate_device,
+            &candidate,
+            [21; 32],
+            0,
+            [12; 32],
+            1,
+            [13; 32],
+            b"device-add",
+            b"preparation",
+            catalog_id,
+            &mismatched_head,
+            *Sha256Digest::hash_domain(
+                dtx_history_recovery_protocol::CATALOG_HEAD_DIGEST_DOMAIN,
+                &mismatched_head,
+            )
+            .as_bytes(),
+            [22; 32],
+            "request-idempotency-mismatch",
+            1_000,
+            9_000,
+        );
+        assert!(validate_request_v4(&bad_manifest_request).is_err());
+        let bad_grant = grant_v5(
+            identity,
+            request_id,
+            *Sha256Digest::hash_domain(
+                dtx_history_recovery_protocol::REQUEST_DIGEST_DOMAIN,
+                &request,
+            )
+            .as_bytes(),
+            *manifest_digest.as_bytes(),
+            catalog_id,
+            1,
+            &mismatched_head,
+            *Sha256Digest::hash_domain(
+                dtx_history_recovery_protocol::CATALOG_HEAD_DIGEST_DOMAIN,
+                &mismatched_head,
+            )
+            .as_bytes(),
+            [31; 32],
+            1,
+            *leaf_set_digest.as_bytes(),
+            candidate_device,
+            &candidate,
+            [21; 32],
+            0,
+            [12; 32],
+            1,
+            [13; 32],
+            [14; 32],
+            [15; 32],
             provider_descriptor,
             authority_descriptor,
             Uuid::now_v7(),
@@ -1590,7 +1705,7 @@ mod tests {
             1_000,
             8_000,
         );
-        validate_grant_v5(&grant).expect("grant golden");
+        assert!(validate_grant_v5(&bad_grant).is_err());
         let mut tampered_grant = grant;
         tampered_grant[20] ^= 1;
         assert!(validate_grant_v5(&tampered_grant).is_err());

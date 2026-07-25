@@ -74,6 +74,7 @@ pub struct CatalogHeadV2 {
     generation: u64,
     leaf_count: u64,
     merkle_root: Sha256Digest,
+    leaf_set_digest: Sha256Digest,
     issued_at: u64,
     expires_at: u64,
     digest: Sha256Digest,
@@ -96,6 +97,9 @@ impl CatalogHeadV2 {
     }
     pub fn merkle_root(&self) -> Sha256Digest {
         self.merkle_root
+    }
+    pub fn leaf_set_digest(&self) -> Sha256Digest {
+        self.leaf_set_digest
     }
     pub fn issued_at(&self) -> u64 {
         self.issued_at
@@ -385,7 +389,7 @@ pub fn validate_catalog_head_v2(raw: &[u8]) -> Result<CatalogHeadV2, ProtocolErr
     };
     let _head_digest = digest(&fields[9])?;
     let merkle_root = digest(&fields[6])?;
-    let _ciphertext_digest = digest(&fields[7])?;
+    let leaf_set_digest = digest(&fields[7])?;
     let _observed_sequence = uint(&fields[8], false)?;
     let _authority_device = uuid(&fields[10])?;
     let _authority_key_id = uuid(&fields[11])?;
@@ -407,6 +411,7 @@ pub fn validate_catalog_head_v2(raw: &[u8]) -> Result<CatalogHeadV2, ProtocolErr
         generation,
         leaf_count,
         merkle_root,
+        leaf_set_digest,
         issued_at: issued,
         expires_at: expires,
         digest: Sha256Digest::hash_domain(CATALOG_HEAD_DIGEST_DOMAIN, raw),
@@ -441,6 +446,9 @@ pub fn validate_manifest_v2(raw: &[u8]) -> Result<ManifestV2, ProtocolError> {
         return Err(err("manifest coordinates"));
     };
     let leaf_set = digest(&fields[8])?;
+    if head.leaf_set_digest() != leaf_set {
+        return Err(err("head leaf set digest"));
+    }
     let CanonicalValue::Array(leaves) = &fields[9] else {
         return Err(err("leaf set"));
     };
@@ -616,6 +624,7 @@ pub fn validate_grant_v5(raw: &[u8]) -> Result<GrantV5, ProtocolError> {
         || uint(&fields[6], true)? != head.generation()
         || uint(&fields[10], true)? != head.leaf_count()
         || root_digest != head.merkle_root()
+        || digest(&fields[11])? != head.leaf_set_digest()
     {
         return Err(err("grant catalog coordinates"));
     }
