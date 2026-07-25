@@ -5,12 +5,12 @@
 //! no plaintext history, MLS state, prompt, path, or provider fallback is
 //! decoded or persisted.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use dtx_domain::{DeviceEnrollmentChallengeId, DeviceId, EnvelopeId, IdentityId, MailboxId};
 use dtx_identity_persistence::{
     DeviceSessionCredential, DeviceSessionRepository, IdentityPersistenceError,
-    lock_and_load_active_snapshot,
+    lock_and_load_active_snapshot, parse_signed_catalog_head_v2,
 };
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, SafeUint, Sha256Digest, SigningPublicKey,
@@ -21,10 +21,11 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    MailboxEnvelopeCommand, MailboxOperationOutcome, MailboxPersistenceError, MailboxPgStore,
+    MAX_ACTIVE_ENVELOPE_BYTES, MAX_ACTIVE_ENVELOPES, MailboxEnvelopeCommand,
+    MailboxOperationOutcome, MailboxPersistenceError, MailboxPgStore,
     repository::{
-        append_identity_delivery_and_realtime, enqueue_opaque_push_intent, finish_transaction,
-        load_mailbox_for_update,
+        advisory_lock, append_identity_delivery_and_realtime_with_ids, enqueue_opaque_push_intent,
+        expire_available, finish_transaction, load_mailbox_for_update,
     },
 };
 
@@ -39,6 +40,7 @@ pub const AUTHORITY_ID_DOMAIN: &[u8] = b"dirextalk.device-history-authority-id.v
 pub const RECIPIENT_KEY_DOMAIN: &[u8] = b"dirextalk.recovery-recipient-key.v1\0";
 pub const OFFER_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.recipient-offer.v2\0";
 pub const OFFER_CIPHERTEXT_DOMAIN: &[u8] = b"dirextalk.history-recovery.offer-ciphertext.v2\0";
+pub const MANIFEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.manifest.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceHistoryGrantV4Command {
@@ -79,6 +81,8 @@ pub struct DeviceHistoryGrantV4Command {
     pub authority_signature: Ed25519Signature,
     pub exact_offer: Vec<u8>,
     pub exact_grant: Vec<u8>,
+    pub offer_issued_at: UtcMillis,
+    pub offer_expires_at: UtcMillis,
 }
 
 impl DeviceHistoryGrantV4Command {
@@ -104,6 +108,20 @@ impl DeviceHistoryGrantV4Command {
         .map_err(|_| invalid("grant unsigned"))?;
         let identity_id = parse_identity(&fields[1])?;
         let request_id = parse_challenge(&fields[2])?;
+        let catalog_id = parse_uuid(&fields[5])?;
+        let generation = parse_positive(&fields[6])?;
+        let catalog_head_bytes = bytes_field(&fields[7], 466)?;
+        let catalog_head = parse_signed_catalog_head_v2(&catalog_head_bytes)
+            .map_err(|_| invalid("catalog head"))?;
+        if catalog_head.identity_id != identity_id
+            || catalog_head.catalog_id != catalog_id
+            || catalog_head.generation != generation
+            || catalog_head.digest != parse_digest(&fields[8])?
+            || catalog_head.merkle_root != parse_digest(&fields[9])?
+            || catalog_head.leaf_count != parse_positive(&fields[10])?
+        {
+            return Err(invalid("catalog head coordinates"));
+        }
         let provider_descriptor = exact_descriptor(&fields[21], 2, 77)?;
         let provider_device_id = parse_provider_device(&fields[21])?;
         let authority_descriptor = exact_authority_descriptor(&fields[22])?;
@@ -139,7 +157,8 @@ impl DeviceHistoryGrantV4Command {
             || offer_fields[5] != fields[6]
             || offer_fields[6] != fields[8]
             || offer_fields[7] != fields[11]
-            || offer_fields[9] != fields[23]
+            || parse_digest(&offer_fields[8]).is_err()
+            || parse_digest(&offer_fields[14])? != parse_digest(&fields[23])?
         {
             return Err(invalid("offer coordinates"));
         }
@@ -153,10 +172,16 @@ impl DeviceHistoryGrantV4Command {
         {
             return Err(invalid("offer ciphertext digest"));
         }
+        validate_attachment_reference(&offer_fields[11])?;
         let offer_issued = parse_utc(&offer_fields[12])?;
         let offer_expires = parse_utc(&offer_fields[13])?;
         if offer_issued >= offer_expires {
             return Err(invalid("offer interval"));
+        }
+        let grant_issued = parse_utc(&fields[30])?;
+        let grant_expires = parse_utc(&fields[31])?;
+        if offer_issued < grant_issued || offer_expires > grant_expires {
+            return Err(invalid("offer grant interval"));
         }
         let offer_digest = parse_digest(&fields[24])?;
         if Sha256Digest::hash_domain(OFFER_DIGEST_DOMAIN, &offer) != offer_digest {
@@ -187,9 +212,9 @@ impl DeviceHistoryGrantV4Command {
             request_id,
             request_digest: parse_digest(&fields[3])?,
             manifest_digest: parse_digest(&fields[4])?,
-            catalog_id: parse_uuid(&fields[5])?,
-            generation: parse_positive(&fields[6])?,
-            catalog_head_bytes: bytes_field(&fields[7], 466)?,
+            catalog_id,
+            generation,
+            catalog_head_bytes,
             catalog_head_digest: parse_digest(&fields[8])?,
             catalog_merkle_root: parse_digest(&fields[9])?,
             catalog_leaf_count: parse_positive(&fields[10])?,
@@ -219,6 +244,8 @@ impl DeviceHistoryGrantV4Command {
             authority_signature,
             exact_offer: offer,
             exact_grant: bytes,
+            offer_issued_at: offer_issued,
+            offer_expires_at: offer_expires,
         };
         if command.issued_at >= command.expires_at
             || command.post_head_sequence.get() != command.pre_head_sequence.get().saturating_add(1)
@@ -321,7 +348,17 @@ impl crate::MailboxRepository {
         let mut tx = store.begin().await?;
         let result = async {
             let auth = DeviceSessionRepository::authenticate_in_transaction(tx.connection(), credential, now).await.map_err(map_identity)?;
-            if auth.identity_id() != command.identity_id { return Err(MailboxPersistenceError::DeviceAuthenticationRejected); }
+            if auth.identity_id() != command.identity_id
+                || auth.device_id() != command.provider_device_id
+            {
+                return Err(MailboxPersistenceError::ProviderAuthorizationRejected);
+            }
+            advisory_lock(
+                tx.connection(),
+                "history-recovery-grant-request",
+                &format!("{}:{}", command.identity_id, command.request_id),
+            )
+            .await?;
             let grant_digest = command.grant_digest();
             if let Some(row) = sqlx::query("SELECT grant_digest,receipt_bytes,receipt_hash FROM messaging.history_recovery_grants_v4 WHERE identity_id=$1 AND request_id=$2")
                 .bind(command.identity_id.to_string()).bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await? {
@@ -341,11 +378,45 @@ impl crate::MailboxRepository {
                     return Err(MailboxPersistenceError::IdempotencyConflict);
                 }
             }
-            let mailbox = load_mailbox_for_update(tx.connection(), command.mailbox_id, now).await?;
+            let mut mailbox = load_mailbox_for_update(tx.connection(), command.mailbox_id, now).await?;
             if mailbox.owner_identity_id != command.identity_id { return Err(MailboxPersistenceError::MailboxUnavailable); }
-            if command.issued_at > now || now >= command.expires_at { return Err(MailboxPersistenceError::DeviceAuthenticationRejected); }
-            let request = sqlx::query("SELECT request_digest,manifest_digest,identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_digest,preparation_digest,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1 FOR SHARE")
-                .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::DeviceAuthenticationRejected)?;
+            if let Some(row) = sqlx::query("SELECT grant_digest,receipt_bytes,receipt_hash FROM messaging.history_recovery_grants_v4 WHERE identity_id=$1 AND request_id=$2 FOR SHARE")
+                .bind(command.identity_id.to_string())
+                .bind(*command.request_id.as_uuid())
+                .fetch_optional(&mut *tx.connection())
+                .await?
+            {
+                if row.try_get::<Vec<u8>, _>("grant_digest")?.as_slice() != grant_digest.as_bytes() {
+                    return Err(MailboxPersistenceError::IdempotencyConflict);
+                }
+                let receipt: Vec<u8> = row.try_get("receipt_bytes")?;
+                let hash: Vec<u8> = row.try_get("receipt_hash")?;
+                if Sha256Digest::hash_domain(DELIVERY_RECEIPT_DOMAIN, &receipt).as_bytes()
+                    != hash.as_slice()
+                {
+                    return Err(MailboxPersistenceError::ReceiptIntegrity);
+                }
+                return Ok(MailboxOperationOutcome::new(receipt, true));
+            }
+            let (expired_count, expired_bytes) =
+                expire_available(tx.connection(), command.mailbox_id, now).await?;
+            mailbox.active_envelope_count = mailbox
+                .active_envelope_count
+                .checked_sub(expired_count)
+                .ok_or(MailboxPersistenceError::CorruptData("mailbox envelope count"))?;
+            mailbox.active_envelope_bytes = mailbox
+                .active_envelope_bytes
+                .checked_sub(expired_bytes)
+                .ok_or(MailboxPersistenceError::CorruptData("mailbox envelope bytes"))?;
+            if command.issued_at > now
+                || command.offer_issued_at > now
+                || now >= command.expires_at
+                || now >= command.offer_expires_at
+            {
+                return Err(MailboxPersistenceError::HistoryRecoveryExpired);
+            }
+            let request = sqlx::query("SELECT request_digest,manifest_digest,manifest_bytes,identity_id,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_digest,preparation_digest,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1 FOR SHARE")
+                .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
             if request.try_get::<String,_>("identity_id")? != command.identity_id.to_string()
                 || request.try_get::<Vec<u8>,_>("request_digest")?.as_slice() != command.request_digest.as_bytes()
                 || request.try_get::<Vec<u8>,_>("manifest_digest")?.as_slice() != command.manifest_digest.as_bytes()
@@ -358,38 +429,92 @@ impl crate::MailboxRepository {
                 || request.try_get::<Vec<u8>,_>("post_head_hash")?.as_slice() != command.post_head_hash.as_bytes()
                 || request.try_get::<Vec<u8>,_>("device_add_digest")?.as_slice() != command.device_add_digest.as_bytes()
                 || request.try_get::<Vec<u8>,_>("preparation_digest")?.as_slice() != command.preparation_digest.as_bytes()
-            { return Err(MailboxPersistenceError::DeviceAuthenticationRejected); }
-            let catalog = sqlx::query("SELECT head_bytes,head_digest,merkle_root,leaf_count FROM identity.recovery_scope_catalogs WHERE identity_id=$1 AND catalog_id=$2 AND generation=$3 FOR SHARE")
+            { return Err(MailboxPersistenceError::HistoryRecoveryInvalidated); }
+            if request.try_get::<i64, _>("expires_at_ms")? <= now.get() {
+                return Err(MailboxPersistenceError::HistoryRecoveryExpired);
+            }
+            validate_manifest_coordinates(
+                &request.try_get::<Vec<u8>, _>("manifest_bytes")?,
+                command,
+            )?;
+            let challenge = sqlx::query("SELECT state,approved_head_hash,target_device_id,target_device_signing_key,target_device_encryption_key,expires_at_ms FROM identity.device_enrollment_challenges WHERE challenge_id=$1 FOR SHARE")
+                .bind(*command.request_id.as_uuid())
+                .fetch_optional(&mut *tx.connection())
+                .await?
+                .ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
+            if challenge.try_get::<i64, _>("expires_at_ms")? <= now.get() {
+                return Err(MailboxPersistenceError::HistoryRecoveryExpired);
+            }
+            if challenge.try_get::<String, _>("state")? != "approved"
+                || challenge.try_get::<Option<Vec<u8>>, _>("approved_head_hash")?.as_deref()
+                    != Some(command.post_head_hash.as_bytes())
+                || challenge.try_get::<Uuid, _>("target_device_id")?
+                    != *command.candidate_device_id.as_uuid()
+                || challenge.try_get::<Vec<u8>, _>("target_device_signing_key")?.as_slice()
+                    != command.candidate_signing_key.as_bytes()
+                || challenge.try_get::<Vec<u8>, _>("target_device_encryption_key")?.as_slice()
+                    != command.candidate_recipient_key.as_slice()
+            {
+                return Err(MailboxPersistenceError::HistoryRecoveryInvalidated);
+            }
+            let catalog = sqlx::query("SELECT head_bytes,head_digest,merkle_root,leaf_count,expires_at_ms FROM identity.recovery_scope_catalogs WHERE identity_id=$1 AND catalog_id=$2 AND generation=$3 FOR SHARE")
                 .bind(command.identity_id.to_string()).bind(command.catalog_id).bind(command.generation.get() as i64)
-                .fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::MailboxConflict)?;
+                .fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
+            if catalog.try_get::<i64,_>("expires_at_ms")? <= now.get() {
+                return Err(MailboxPersistenceError::HistoryRecoveryExpired);
+            }
             if catalog.try_get::<Vec<u8>,_>("head_bytes")?.as_slice() != command.catalog_head_bytes.as_slice()
                 || catalog.try_get::<Vec<u8>,_>("head_digest")?.as_slice() != command.catalog_head_digest.as_bytes()
                 || catalog.try_get::<Vec<u8>,_>("merkle_root")?.as_slice() != command.catalog_merkle_root.as_bytes()
                 || catalog.try_get::<i64,_>("leaf_count")? != command.catalog_leaf_count.get() as i64
-            { return Err(MailboxPersistenceError::MailboxConflict); }
-            let prep = sqlx::query("SELECT provider_device_id,provider_signing_key,preparation_digest,provider_expires_at_ms FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR SHARE")
-                .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::DeviceAuthenticationRejected)?;
+            { return Err(MailboxPersistenceError::HistoryRecoveryInvalidated); }
+            let prep = sqlx::query("SELECT provider_device_id,provider_signing_key,preparation_digest,provider_expires_at_ms,catalog_id,catalog_generation,catalog_head_digest,candidate_device_id,candidate_signing_key,candidate_recipient_key,observed_head_sequence,observed_head_hash,authority_device_id,authority_key_id,authority_signing_key FROM identity.recovery_scope_catalog_preparations WHERE request_id=$1 FOR SHARE")
+                .bind(*command.request_id.as_uuid()).fetch_optional(&mut *tx.connection()).await?.ok_or(MailboxPersistenceError::HistoryRecoveryInvalidated)?;
+            let signed_catalog_head = parse_signed_catalog_head_v2(&command.catalog_head_bytes)
+                .map_err(|_| MailboxPersistenceError::HistoryRecoveryInvalidated)?;
+            if prep.try_get::<Option<i64>, _>("provider_expires_at_ms")?.is_some_and(|expiry| expiry <= now.get()) {
+                return Err(MailboxPersistenceError::HistoryRecoveryExpired);
+            }
             if prep.try_get::<Option<Uuid>,_>("provider_device_id")? != Some(*command.provider_device_id.as_uuid())
                 || prep.try_get::<Option<Vec<u8>>,_>("provider_signing_key")?.as_deref() != Some(provider_key_from_descriptor(&command.provider_descriptor)?.as_bytes())
                 || prep.try_get::<Vec<u8>,_>("preparation_digest")?.as_slice() != command.preparation_digest.as_bytes()
                 || prep.try_get::<Option<i64>,_>("provider_expires_at_ms")?.is_none_or(|expiry| expiry < command.expires_at.get())
-            { return Err(MailboxPersistenceError::MailboxConflict); }
+                || prep.try_get::<Uuid,_>("catalog_id")? != command.catalog_id
+                || prep.try_get::<i64,_>("catalog_generation")? != command.generation.get() as i64
+                || prep.try_get::<Vec<u8>,_>("catalog_head_digest")?.as_slice() != command.catalog_head_digest.as_bytes()
+                || prep.try_get::<Uuid,_>("candidate_device_id")? != *command.candidate_device_id.as_uuid()
+                || prep.try_get::<Vec<u8>,_>("candidate_signing_key")?.as_slice() != command.candidate_signing_key.as_bytes()
+                || prep.try_get::<Vec<u8>,_>("candidate_recipient_key")?.as_slice() != command.candidate_recipient_key.as_slice()
+                || prep.try_get::<i64,_>("observed_head_sequence")? != command.pre_head_sequence.get() as i64
+                || prep.try_get::<Vec<u8>,_>("observed_head_hash")?.as_slice() != command.pre_head_hash.as_bytes()
+                || prep.try_get::<Uuid,_>("authority_device_id")? != *signed_catalog_head.authority_device_id.as_uuid()
+                || prep.try_get::<Uuid,_>("authority_key_id")? != signed_catalog_head.authority_key_id
+                || prep.try_get::<Vec<u8>,_>("authority_signing_key")?.as_slice() != signed_catalog_head.authority_signing_key.as_bytes()
+            { return Err(MailboxPersistenceError::HistoryRecoveryInvalidated); }
             let snapshot = lock_and_load_active_snapshot(tx.connection(), command.identity_id).await.map_err(map_identity)?;
             let current_head = snapshot.head();
-            if current_head.hash() != command.post_head_hash { return Err(MailboxPersistenceError::MailboxConflict); }
-            let provider_key = DeviceSessionRepository::active_device_signing_key_in_transaction(tx.connection(), command.identity_id, command.provider_device_id).await.map_err(|_| MailboxPersistenceError::DeviceAuthenticationRejected)?;
-            if provider_key.as_bytes() != provider_key_from_descriptor(&command.provider_descriptor)?.as_bytes() { return Err(MailboxPersistenceError::DeviceAuthenticationRejected); }
+            if current_head.hash() != command.post_head_hash
+                || current_head.sequence().get() != command.post_head_sequence.get()
+            {
+                return Err(MailboxPersistenceError::HistoryRecoveryInvalidated);
+            }
+            let provider_key = DeviceSessionRepository::active_device_signing_key_in_transaction(tx.connection(), command.identity_id, command.provider_device_id).await.map_err(|_| MailboxPersistenceError::HistoryRecoveryInvalidated)?;
+            if provider_key.as_bytes() != provider_key_from_descriptor(&command.provider_descriptor)?.as_bytes() { return Err(MailboxPersistenceError::HistoryRecoveryInvalidated); }
             let authority_key = parse_authority_key(&decode_bytes(&command.authority_descriptor))?;
             let authority_current = match decode_bytes(&command.authority_descriptor) {
                 CanonicalValue::Map(fields) => match fields.first().map(|(_, v)| v) {
                     Some(CanonicalValue::Unsigned(1)) => {
                         let device = parse_device_device(&fields[1].1)?;
-                        DeviceSessionRepository::active_device_signing_key_in_transaction(
+                        let prep_device = prep.try_get::<Uuid, _>("authority_device_id")?;
+                        let prep_key = prep.try_get::<Vec<u8>, _>("authority_signing_key")?;
+                        device.as_uuid() == &prep_device
+                            && prep_key.as_slice() == authority_key.as_bytes()
+                            && DeviceSessionRepository::active_device_signing_key_in_transaction(
                             tx.connection(), command.identity_id, device,
-                        )
-                        .await
-                        .map(|key| key == authority_key)
-                        .unwrap_or(false)
+                            )
+                            .await
+                            .map(|key| key == authority_key)
+                            .unwrap_or(false)
                     }
                     Some(CanonicalValue::Unsigned(2)) => {
                         let id = parse_digest(&fields[1].1)?;
@@ -406,30 +531,124 @@ impl crate::MailboxRepository {
                 _ => false,
             };
             if !authority_current {
-                return Err(MailboxPersistenceError::MailboxConflict);
+                return Err(MailboxPersistenceError::HistoryRecoveryInvalidated);
             }
             let unsigned = encode_deterministic_cbor(&command.unsigned_value()).map_err(|_| invalid("grant unsigned"))?;
             verify(provider_key, GRANT_SIGNATURE_DOMAIN, &unsigned, command.provider_signature)?;
             verify(authority_key, AUTHORITY_SIGNATURE_DOMAIN, &unsigned, command.authority_signature)?;
             if command.recipient_key_digest != Sha256Digest::hash_domain(RECIPIENT_KEY_DOMAIN, &command.candidate_recipient_key) { return Err(MailboxPersistenceError::DeviceAuthenticationRejected); }
             if command.mailbox_highwater.get() != mailbox.next_delivery_sequence as u64 { return Err(MailboxPersistenceError::MailboxConflict); }
+            let offer_len = i64::try_from(command.exact_offer.len())
+                .map_err(|_| MailboxPersistenceError::CapacityExceeded)?;
+            if mailbox.active_envelope_count >= MAX_ACTIVE_ENVELOPES as i64
+                || mailbox.active_envelope_bytes
+                    .checked_add(offer_len)
+                    .is_none_or(|bytes| bytes > MAX_ACTIVE_ENVELOPE_BYTES as i64)
+            {
+                return Err(MailboxPersistenceError::CapacityExceeded);
+            }
             let sequence = mailbox.next_delivery_sequence.checked_add(1).ok_or(MailboxPersistenceError::CapacityExceeded)?;
             let envelope_exact = encode_deterministic_cbor(&CanonicalValue::Map(vec![(CanonicalValue::Unsigned(1),CanonicalValue::Unsigned(1)),(CanonicalValue::Unsigned(2),CanonicalValue::Text(command.envelope_id.to_string())),(CanonicalValue::Unsigned(3),CanonicalValue::Bytes(command.exact_offer.clone())),(CanonicalValue::Unsigned(4),command.expires_at.to_canonical_value())])).map_err(|_| invalid("envelope"))?;
-            let envelope = MailboxEnvelopeCommand::new(command.idempotency_digest, command.mailbox_id, command.envelope_id, command.exact_offer.clone(), command.expires_at, envelope_exact)?;
+            let envelope = MailboxEnvelopeCommand::new_history_grant(command.idempotency_digest, command.mailbox_id, command.envelope_id, command.exact_offer.clone(), command.expires_at, envelope_exact)?;
             let fact_id = command.delivery_fact_id;
             let event_id = Uuid::now_v7(); let outbox_id = Uuid::now_v7();
             let fact = encode_deterministic_cbor(&CanonicalValue::Map(vec![(CanonicalValue::Unsigned(1),CanonicalValue::Unsigned(2)),(CanonicalValue::Unsigned(2),CanonicalValue::Text(fact_id.to_string())),(CanonicalValue::Unsigned(3),CanonicalValue::Text(command.mailbox_id.to_string())),(CanonicalValue::Unsigned(4),CanonicalValue::Text(command.envelope_id.to_string())),(CanonicalValue::Unsigned(5),CanonicalValue::Unsigned(sequence as u64)),(CanonicalValue::Unsigned(6),grant_digest.to_canonical_value()),(CanonicalValue::Unsigned(7),command.offer_digest.to_canonical_value()),(CanonicalValue::Unsigned(8),CanonicalValue::Text(command.request_id.to_string())),(CanonicalValue::Unsigned(9),CanonicalValue::Text(command.candidate_device_id.to_string())),(CanonicalValue::Unsigned(10),now.to_canonical_value()),(CanonicalValue::Unsigned(11),CanonicalValue::Text(event_id.to_string())),(CanonicalValue::Unsigned(12),CanonicalValue::Text(outbox_id.to_string()))])).map_err(|_| invalid("delivery fact"))?;
-            let receipt = encode_deterministic_cbor(&CanonicalValue::Map(vec![(CanonicalValue::Unsigned(1),CanonicalValue::Unsigned(2)),(CanonicalValue::Unsigned(2),CanonicalValue::Bytes(fact.clone())),(CanonicalValue::Unsigned(3),Sha256Digest::hash_domain(DELIVERY_FACT_DOMAIN,&fact).to_canonical_value()),(CanonicalValue::Unsigned(4),now.to_canonical_value())])).map_err(|_| invalid("delivery receipt"))?;
-            sqlx::query("UPDATE messaging.mailboxes SET next_delivery_sequence=$2,active_envelope_count=active_envelope_count+1,active_envelope_bytes=active_envelope_bytes+$3 WHERE mailbox_id=$1").bind(*command.mailbox_id.as_uuid()).bind(sequence).bind(command.exact_offer.len() as i64).execute(&mut *tx.connection()).await?;
+            let receipt = encode_deterministic_cbor(&CanonicalValue::Map(vec![(CanonicalValue::Unsigned(1),CanonicalValue::Unsigned(2)),(CanonicalValue::Unsigned(2),decode_bytes(&fact)),(CanonicalValue::Unsigned(3),Sha256Digest::hash_domain(DELIVERY_FACT_DOMAIN,&fact).to_canonical_value()),(CanonicalValue::Unsigned(4),now.to_canonical_value())])).map_err(|_| invalid("delivery receipt"))?;
+            sqlx::query("UPDATE messaging.mailboxes SET next_delivery_sequence=$2,active_envelope_count=active_envelope_count+1,active_envelope_bytes=active_envelope_bytes+$3 WHERE mailbox_id=$1").bind(*command.mailbox_id.as_uuid()).bind(sequence).bind(offer_len).execute(&mut *tx.connection()).await?;
             sqlx::query("INSERT INTO messaging.mailbox_envelopes(mailbox_id,envelope_id,delivery_sequence,opaque_ciphertext,request_digest,receipt_bytes,receipt_hash,expires_at_ms,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)").bind(*command.mailbox_id.as_uuid()).bind(*command.envelope_id.as_uuid()).bind(sequence).bind(&command.exact_offer).bind(grant_digest.as_bytes().as_slice()).bind(&receipt).bind(Sha256Digest::hash_domain(DELIVERY_RECEIPT_DOMAIN,&receipt).as_bytes().as_slice()).bind(command.expires_at.get()).bind(now.get()).execute(&mut *tx.connection()).await?;
             enqueue_opaque_push_intent(tx.connection(), command.mailbox_id, command.envelope_id).await?;
-            append_identity_delivery_and_realtime(tx.connection(), command.identity_id, &envelope, now).await?;
+            append_identity_delivery_and_realtime_with_ids(
+                tx.connection(),
+                command.identity_id,
+                &envelope,
+                now,
+                event_id,
+                outbox_id,
+            )
+            .await?;
+            let journal_row = sqlx::query(
+                "SELECT identity_id,cursor FROM realtime.journal
+                 WHERE event_id=$1",
+            )
+            .bind(event_id)
+            .fetch_optional(&mut *tx.connection())
+            .await?;
+            let Some(journal_row) = journal_row else {
+                return Err(MailboxPersistenceError::CorruptData("grant journal event"));
+            };
+            if journal_row.try_get::<String, _>("identity_id")? != command.identity_id.to_string() {
+                return Err(MailboxPersistenceError::CorruptData("grant journal identity"));
+            }
+            let outbox_row = sqlx::query(
+                "SELECT identity_id,cursor FROM realtime.outbox
+                 WHERE record_id=$1",
+            )
+            .bind(outbox_id)
+            .fetch_optional(&mut *tx.connection())
+            .await?;
+            let Some(outbox_row) = outbox_row else {
+                return Err(MailboxPersistenceError::CorruptData("grant outbox record"));
+            };
+            if outbox_row.try_get::<String, _>("identity_id")? != command.identity_id.to_string()
+                || outbox_row.try_get::<i64, _>("cursor")?
+                    != journal_row.try_get::<i64, _>("cursor")?
+            {
+                return Err(MailboxPersistenceError::CorruptData("grant outbox binding"));
+            }
             sqlx::query("INSERT INTO messaging.history_recovery_grants_v4(identity_id,request_id,request_digest,manifest_digest,catalog_id,generation,catalog_head_bytes,catalog_head_digest,catalog_merkle_root,catalog_leaf_count,catalog_leaf_set_digest,candidate_device_id,candidate_signing_key,candidate_recipient_key,pre_head_sequence,pre_head_hash,post_head_sequence,post_head_hash,device_add_digest,preparation_digest,provider_device_id,provider_descriptor,authority_descriptor,recipient_key_digest,offer_digest,mailbox_id,envelope_id,mailbox_highwater,earliest_sequence,delivery_fact_id,issued_at_ms,expires_at_ms,idempotency_digest,provider_signature,authority_signature,exact_offer,exact_grant,grant_digest,delivery_fact_bytes,delivery_fact_digest,receipt_bytes,receipt_hash,accepted_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43)")
                 .bind(command.identity_id.to_string()).bind(*command.request_id.as_uuid()).bind(command.request_digest.as_bytes()).bind(command.manifest_digest.as_bytes()).bind(command.catalog_id).bind(command.generation.get() as i64).bind(&command.catalog_head_bytes).bind(command.catalog_head_digest.as_bytes()).bind(command.catalog_merkle_root.as_bytes()).bind(command.catalog_leaf_count.get() as i64).bind(command.catalog_leaf_set_digest.as_bytes()).bind(*command.candidate_device_id.as_uuid()).bind(command.candidate_signing_key.as_bytes()).bind(command.candidate_recipient_key.as_slice()).bind(command.pre_head_sequence.get() as i64).bind(command.pre_head_hash.as_bytes()).bind(command.post_head_sequence.get() as i64).bind(command.post_head_hash.as_bytes()).bind(command.device_add_digest.as_bytes()).bind(command.preparation_digest.as_bytes()).bind(*command.provider_device_id.as_uuid()).bind(&command.provider_descriptor).bind(&command.authority_descriptor).bind(command.recipient_key_digest.as_bytes()).bind(command.offer_digest.as_bytes()).bind(*command.mailbox_id.as_uuid()).bind(*command.envelope_id.as_uuid()).bind(command.mailbox_highwater.get() as i64).bind(command.earliest_sequence.get() as i64).bind(command.delivery_fact_id).bind(command.issued_at.get()).bind(command.expires_at.get()).bind(command.idempotency_digest.as_bytes()).bind(command.provider_signature.as_bytes()).bind(command.authority_signature.as_bytes()).bind(&command.exact_offer).bind(&command.exact_grant).bind(grant_digest.as_bytes()).bind(&fact).bind(Sha256Digest::hash_domain(DELIVERY_FACT_DOMAIN,&fact).as_bytes()).bind(&receipt).bind(Sha256Digest::hash_domain(DELIVERY_RECEIPT_DOMAIN,&receipt).as_bytes()).bind(now.get()).execute(&mut *tx.connection()).await?;
             Ok(MailboxOperationOutcome::new(receipt, false))
         }.await;
         finish_transaction(tx, result).await
     }
+}
+
+fn validate_manifest_coordinates(
+    bytes: &[u8],
+    command: &DeviceHistoryGrantV4Command,
+) -> Result<(), MailboxPersistenceError> {
+    if bytes.is_empty() || bytes.len() > 35_477 {
+        return Err(invalid("manifest bounds"));
+    }
+    if Sha256Digest::hash_domain(MANIFEST_DIGEST_DOMAIN, bytes) != command.manifest_digest {
+        return Err(invalid("manifest digest"));
+    }
+    let value = decode_deterministic_cbor(bytes).map_err(|_| invalid("manifest cbor"))?;
+    let fields = numbered(&value, 10)?;
+    if fields[0] != CanonicalValue::Unsigned(2)
+        || fields[1] != CanonicalValue::Text(command.identity_id.to_string())
+        || fields[2] != CanonicalValue::Text(command.catalog_id.to_string())
+        || fields[3] != command.generation.to_canonical_value()
+        || fields[4] != CanonicalValue::Bytes(command.catalog_head_bytes.clone())
+        || fields[5] != command.catalog_head_digest.to_canonical_value()
+        || fields[6] != command.catalog_merkle_root.to_canonical_value()
+        || fields[7] != command.catalog_leaf_count.to_canonical_value()
+        || fields[8] != command.catalog_leaf_set_digest.to_canonical_value()
+    {
+        return Err(invalid("manifest coordinates"));
+    }
+    let CanonicalValue::Array(leaves) = &fields[9] else {
+        return Err(invalid("manifest leaf set"));
+    };
+    let mut seen = HashSet::with_capacity(leaves.len());
+    if leaves.len() != command.catalog_leaf_count.get() as usize
+        || leaves.iter().any(|leaf| {
+            let Ok(digest) = parse_digest(leaf) else {
+                return true;
+            };
+            !seen.insert(digest)
+        })
+    {
+        return Err(invalid("manifest leaf set"));
+    }
+    let leaf_set =
+        encode_deterministic_cbor(&fields[9]).map_err(|_| invalid("manifest leaf set"))?;
+    if Sha256Digest::hash_domain(b"dirextalk.history-recovery.leaf-set.v2\0", &leaf_set)
+        != command.catalog_leaf_set_digest
+    {
+        return Err(invalid("manifest leaf-set digest"));
+    }
+    Ok(())
 }
 
 fn numbered(
@@ -503,7 +722,17 @@ fn parse_envelope(v: &CanonicalValue) -> Result<EnvelopeId, MailboxPersistenceEr
 }
 fn parse_uuid(v: &CanonicalValue) -> Result<Uuid, MailboxPersistenceError> {
     match v {
-        CanonicalValue::Text(s) => Uuid::parse_str(s).map_err(|_| invalid("uuid")),
+        CanonicalValue::Text(s) => {
+            let uuid = Uuid::parse_str(s).map_err(|_| invalid("uuid"))?;
+            if s != &uuid.to_string() {
+                return Err(invalid("uuid canonical"));
+            }
+            let bytes = uuid.as_bytes();
+            if (bytes[6] >> 4) != 7 || (bytes[8] & 0xc0) != 0x80 {
+                return Err(invalid("uuid v7"));
+            }
+            Ok(uuid)
+        }
         _ => Err(invalid("uuid")),
     }
 }
@@ -554,7 +783,16 @@ fn exact_descriptor(
     let CanonicalValue::Map(f) = v else {
         return Err(invalid("descriptor"));
     };
-    if f.len() != 3 || f[0].1 != CanonicalValue::Unsigned(version) || b.len() > max {
+    if f.len() != 3
+        || f.iter()
+            .enumerate()
+            .any(|(index, (key, _))| *key != CanonicalValue::Unsigned((index + 1) as u64))
+        || f[0].1 != CanonicalValue::Unsigned(version)
+        || b.len() != 77
+        || b.len() > max
+        || parse_device_device(&f[1].1).is_err()
+        || parse_key(&f[2].1).is_err()
+    {
         return Err(invalid("descriptor"));
     };
     Ok(b)
@@ -579,7 +817,11 @@ fn exact_authority_descriptor(v: &CanonicalValue) -> Result<Vec<u8>, MailboxPers
     let CanonicalValue::Map(f) = v else {
         return Err(invalid("authority"));
     };
-    if f.len() != 3 {
+    if f.len() != 3
+        || f.iter()
+            .enumerate()
+            .any(|(index, (key, _))| *key != CanonicalValue::Unsigned((index + 1) as u64))
+    {
         return Err(invalid("authority"));
     };
     let kind = match f[0].1 {
@@ -592,13 +834,29 @@ fn exact_authority_descriptor(v: &CanonicalValue) -> Result<Vec<u8>, MailboxPers
         parse_digest(&f[1].1)?;
     }
     parse_key(&f[2].1)?;
-    encode_deterministic_cbor(v).map_err(|_| invalid("authority"))
+    let encoded = encode_deterministic_cbor(v).map_err(|_| invalid("authority"))?;
+    if !(73..=77).contains(&encoded.len()) {
+        return Err(invalid("authority bounds"));
+    }
+    Ok(encoded)
 }
 fn parse_authority_key(v: &CanonicalValue) -> Result<SigningPublicKey, MailboxPersistenceError> {
     let CanonicalValue::Map(f) = v else {
         return Err(invalid("authority"));
     };
     parse_key(&f[2].1)
+}
+
+fn validate_attachment_reference(v: &CanonicalValue) -> Result<(), MailboxPersistenceError> {
+    let CanonicalValue::Null = v else {
+        let fields = numbered(v, 4)?;
+        parse_uuid(&fields[0])?;
+        parse_digest(&fields[1])?;
+        parse_positive(&fields[2])?;
+        parse_digest(&fields[3])?;
+        return Ok(());
+    };
+    Ok(())
 }
 fn authority_device(v: &CanonicalValue) -> Result<Option<DeviceId>, MailboxPersistenceError> {
     let CanonicalValue::Map(fields) = v else {

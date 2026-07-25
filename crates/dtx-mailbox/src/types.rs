@@ -38,6 +38,7 @@ pub const MAX_PAGE_ENTRIES: usize = 100;
 
 const MAX_REGISTER_COMMAND_BYTES: usize = 16_384;
 const MAX_ENVELOPE_COMMAND_BYTES: usize = 262_400;
+const MAX_HISTORY_GRANT_ENVELOPE_BYTES: usize = 1_049_100;
 const MAX_ACK_COMMAND_BYTES: usize = 8_192;
 
 /// A raw 256-bit mailbox write capability held only at the sender boundary.
@@ -250,6 +251,35 @@ impl MailboxEnvelopeCommand {
         if opaque_ciphertext.is_empty() || opaque_ciphertext.len() > MAX_OPAQUE_CIPHERTEXT_BYTES {
             return Err(MailboxPersistenceError::InvalidCommand(
                 "mailbox opaque ciphertext byte length",
+            ));
+        }
+        let command = Self {
+            idempotency_key_hash,
+            mailbox_id,
+            envelope_id,
+            opaque_ciphertext,
+            expires_at,
+            exact_bytes,
+        };
+        command.require_exact_bytes()?;
+        Ok(command)
+    }
+
+    /// Constructs the bounded opaque envelope used only by History Grant V4.
+    /// This path deliberately does not widen the generic mailbox enqueue
+    /// ceiling; the grant's exact Offer V2 bytes own the larger bound.
+    pub(crate) fn new_history_grant(
+        idempotency_key_hash: Sha256Digest,
+        mailbox_id: MailboxId,
+        envelope_id: EnvelopeId,
+        opaque_ciphertext: Vec<u8>,
+        expires_at: UtcMillis,
+        exact_bytes: Vec<u8>,
+    ) -> Result<Self, MailboxPersistenceError> {
+        validate_exact_command_bytes(&exact_bytes, MAX_HISTORY_GRANT_ENVELOPE_BYTES)?;
+        if opaque_ciphertext.is_empty() || opaque_ciphertext.len() > 1_049_059 {
+            return Err(MailboxPersistenceError::InvalidCommand(
+                "history grant opaque ciphertext byte length",
             ));
         }
         let command = Self {

@@ -22,6 +22,9 @@ impl MailboxSuccess {
 pub(super) enum MailboxFailure {
     InvalidRequest,
     AuthenticationRejected,
+    Forbidden,
+    Gone,
+    Invalidated,
     Unavailable,
     Conflict,
     IdempotencyConflict,
@@ -35,6 +38,9 @@ pub(super) fn map_persistence_error(error: &MailboxPersistenceError) -> MailboxF
         MailboxPersistenceError::DeviceAuthenticationRejected => {
             MailboxFailure::AuthenticationRejected
         }
+        MailboxPersistenceError::ProviderAuthorizationRejected => MailboxFailure::Forbidden,
+        MailboxPersistenceError::HistoryRecoveryExpired => MailboxFailure::Gone,
+        MailboxPersistenceError::HistoryRecoveryInvalidated => MailboxFailure::Invalidated,
         MailboxPersistenceError::MailboxUnavailable
         | MailboxPersistenceError::KeyMaterialUnavailable => MailboxFailure::Unavailable,
         MailboxPersistenceError::MailboxConflict => MailboxFailure::Conflict,
@@ -71,6 +77,17 @@ pub(super) fn mailbox_failure_response(failure: MailboxFailure, request_id: Requ
             MailboxErrorCode::DeviceAuthenticationFailed,
             false,
         ),
+        MailboxFailure::Forbidden => (
+            StatusCode::FORBIDDEN,
+            MailboxErrorCode::ProviderForbidden,
+            false,
+        ),
+        MailboxFailure::Gone => (StatusCode::GONE, MailboxErrorCode::WorkflowExpired, false),
+        MailboxFailure::Invalidated => (
+            StatusCode::PRECONDITION_FAILED,
+            MailboxErrorCode::RecoveryInvalidated,
+            false,
+        ),
         MailboxFailure::Unavailable => {
             (StatusCode::NOT_FOUND, MailboxErrorCode::Unavailable, false)
         }
@@ -100,6 +117,12 @@ enum MailboxErrorCode {
     Invalid,
     #[serde(rename = "DEVICE_AUTHENTICATION_FAILED")]
     DeviceAuthenticationFailed,
+    #[serde(rename = "PROVIDER_NOT_AUTHORIZED")]
+    ProviderForbidden,
+    #[serde(rename = "WORKFLOW_EXPIRED")]
+    WorkflowExpired,
+    #[serde(rename = "RECOVERY_INVALIDATED")]
+    RecoveryInvalidated,
     #[serde(rename = "MAILBOX_UNAVAILABLE")]
     Unavailable,
     #[serde(rename = "MAILBOX_CONFLICT")]

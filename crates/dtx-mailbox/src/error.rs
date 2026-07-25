@@ -15,6 +15,9 @@ pub enum MailboxPersistenceError {
     InvalidCommand(&'static str),
     /// A device session was missing, expired, invalid, or revoked.
     DeviceAuthenticationRejected,
+    /// The authenticated provider session is valid but not authorized for the
+    /// exact Grant descriptor.
+    ProviderAuthorizationRejected,
     /// Identity authorization could not be safely read in this transaction.
     IdentityAuthorizationUnavailable,
     /// No active provider with the required client-held E2EE material exists.
@@ -23,6 +26,10 @@ pub enum MailboxPersistenceError {
     MailboxUnavailable,
     /// An immutable mailbox or envelope identity conflicts with existing state.
     MailboxConflict,
+    /// A first-admission Grant failed currentness or was invalidated.
+    HistoryRecoveryInvalidated,
+    /// A first-admission Grant or its challenge window has expired.
+    HistoryRecoveryExpired,
     /// One idempotency key was reused for a different canonical request.
     IdempotencyConflict,
     /// Active opaque delivery quota would be exceeded.
@@ -44,10 +51,15 @@ impl fmt::Display for MailboxPersistenceError {
             Self::TenantContextLeak => "mailbox transaction retained tenant context",
             Self::InvalidCommand(_) => "mailbox command is invalid",
             Self::DeviceAuthenticationRejected => "device session authentication was rejected",
+            Self::ProviderAuthorizationRejected => {
+                "history grant provider authorization was rejected"
+            }
             Self::IdentityAuthorizationUnavailable => "identity authorization is unavailable",
             Self::KeyMaterialUnavailable => "history recovery key material is unavailable",
             Self::MailboxUnavailable => "mailbox is unavailable",
             Self::MailboxConflict => "mailbox conflicts with immutable state",
+            Self::HistoryRecoveryInvalidated => "history recovery grant was invalidated",
+            Self::HistoryRecoveryExpired => "history recovery grant expired",
             Self::IdempotencyConflict => "mailbox idempotency key conflicts",
             Self::CapacityExceeded => "mailbox capacity is exceeded",
             Self::ReceiptIntegrity => "mailbox receipt integrity check failed",
@@ -65,10 +77,13 @@ impl Error for MailboxPersistenceError {
             | Self::TenantContextLeak
             | Self::InvalidCommand(_)
             | Self::DeviceAuthenticationRejected
+            | Self::ProviderAuthorizationRejected
             | Self::IdentityAuthorizationUnavailable
             | Self::KeyMaterialUnavailable
             | Self::MailboxUnavailable
             | Self::MailboxConflict
+            | Self::HistoryRecoveryInvalidated
+            | Self::HistoryRecoveryExpired
             | Self::IdempotencyConflict
             | Self::CapacityExceeded
             | Self::ReceiptIntegrity
