@@ -334,6 +334,34 @@ fn rejects_malformed_route_bootstrap_payloads_without_logging_opaque_bytes() {
             .is_err()
     );
 
+    let invalid_health_pair_payload = v1::DeliverAgentRouteBootstrap {
+        bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1".to_owned(),
+        delivery_id: "01890f47-3a5b-7c1d-8e2f-123456789ac5".to_owned(),
+        route_id: "01890f47-3a5b-7c1d-8e2f-123456789ac6".to_owned(),
+        recipient_id: "01890f47-3a5b-7c1d-8e2f-123456789ac7".to_owned(),
+        capsule_digest: vec![0x33; 32],
+        opaque_sealed_bootstrap: b"private-sealed-bootstrap".to_vec(),
+        expires_at_millis: 2_000,
+        installation_id: "01890f47-3a5b-7c1d-8e2f-123456789ab4".to_owned(),
+        binding_id: "01890f47-3a5b-7c1d-8e2f-123456789ab3".to_owned(),
+        agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5".to_owned(),
+        route_health_key_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1".to_owned(),
+        route_health_public_key_digest: Vec::new(),
+    }
+    .encode_to_vec();
+    let invalid_health_pair_digest = command_payload_digest(&invalid_health_pair_payload)
+        .expect("bounded payload")
+        .as_bytes();
+    assert!(
+        ProtobufDurableCommandDecoder
+            .decode(&encode_command(
+                16,
+                &invalid_health_pair_payload,
+                invalid_health_pair_digest,
+            ))
+            .is_err()
+    );
+
     let invalid_expiry_payload = v1::PrepareAgentRouteRecipient {
         bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1".to_owned(),
         tenant_id: "01890f47-3a5b-7c1d-8e2f-123456789ac2".to_owned(),

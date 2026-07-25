@@ -51,8 +51,8 @@ use dtx_domain::{
     AgentDeviceId, AgentId, AgentRouteBootstrapId, AgentRouteDeliveryId, AgentRouteRecipientId,
     BindingId, BootId, Clock, ConnectorId, ConversationId, DeviceId, DeviceSessionId,
     Ed25519PublicKey, EventId, HostCredentialId, HostId, IdGenerator, IdentityId, InstallationId,
-    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, SystemClock, TenantId,
-    UuidV7Generator,
+    ProvisioningDeliveryId, ProvisioningRecipientKeyId, RequestId, Revision, RouteHealthKeyId,
+    SystemClock, TenantId, UuidV7Generator,
 };
 use dtx_identity_log::{
     DeviceCertificateV1, DeviceEncryptionPublicKey, IdentityLogEventPayloadV1, IdentityLogEventV1,
@@ -192,14 +192,17 @@ async fn production_owner_http_and_control_survive_loss_and_revoke_fail_closed()
                 spec_revision: completion.credential.revision(),
                 protocol: ParsedProtocolRange {
                     minimum_major: 1,
-                    minimum_minor: 3,
+                    minimum_minor: 6,
                     maximum_major: 1,
-                    maximum_minor: 3,
+                    maximum_minor: 6,
                 },
                 runtime_claims: claims()?,
                 capacity: capacity(),
                 last_applied_command_sequence: 0,
-                required_server_capabilities: vec!["opaque-agent-provisioning".into()],
+                required_server_capabilities: vec![
+                    "agent-route-health.v1".into(),
+                    "opaque-agent-provisioning".into(),
+                ],
             },
         )
         .await?;
@@ -2493,6 +2496,10 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         recipient_capsule_digest,
         bootstrap_expires_at,
     );
+    let health_signing_key = key(75);
+    let route_health_key_id = RouteHealthKeyId::new();
+    let route_health_public_key =
+        Ed25519PublicKey::try_from(health_signing_key.verifying_key().to_bytes())?;
     let ready = ParsedAgentRouteRecipientReady {
         connector_fence: parsed_fence(fence),
         bootstrap_id,
@@ -2507,9 +2514,75 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         opaque_recipient_capsule,
         expires_at_millis: bootstrap_expires_at,
         result_digest: recipient_result_digest,
-        route_health_key_id: None,
-        route_health_public_key: None,
+        route_health_key_id: Some(route_health_key_id),
+        route_health_public_key: Some(route_health_public_key),
     };
+    let competing_recipient_id = AgentRouteRecipientId::new();
+    let competing_capsule = vec![0x79; 256];
+    let competing_capsule_digest = ControlDigest::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-route-recipient-capsule.v1\0",
+            &competing_capsule,
+        )
+        .as_bytes(),
+    );
+    let competing_ready = ParsedAgentRouteRecipientReady {
+        recipient_id: competing_recipient_id,
+        recipient_capsule_digest: competing_capsule_digest,
+        opaque_recipient_capsule: competing_capsule,
+        result_digest: route_bootstrap_recipient_ready_result_digest(
+            bootstrap_id,
+            tenant_id,
+            installation_id,
+            binding_id,
+            agent_control_device_id,
+            competing_recipient_id,
+            prepare_command.sequence(),
+            competing_capsule_digest,
+            bootstrap_expires_at,
+        ),
+        route_health_key_id: Some(RouteHealthKeyId::new()),
+        route_health_public_key: Some(Ed25519PublicKey::try_from(
+            key(76).verifying_key().to_bytes(),
+        )?),
+        ..ready.clone()
+    };
+    let (first_ready, second_ready) = tokio::join!(
+        app.record_agent_route_recipient_ready(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            ready.clone(),
+        ),
+        app.record_agent_route_recipient_ready(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            competing_ready.clone(),
+        )
+    );
+    assert_eq!(first_ready.is_ok(), second_ready.is_err());
+    assert_eq!(first_ready.is_err(), second_ready.is_ok());
+    let ready = if first_ready.is_ok() {
+        ready
+    } else {
+        competing_ready
+    };
+    let winner_health_key_id = ready.route_health_key_id.expect("health key ID");
+    let winner_health_public_key = ready.route_health_public_key.expect("health public key");
+    let route_health_public_key_digest = ControlDigest::from_bytes(
+        *Sha256Digest::hash_domain(
+            b"dirextalk.agent-route-health-public-key.v1\0",
+            winner_health_public_key.as_bytes(),
+        )
+        .as_bytes(),
+    );
     let mut changed_ready = ready.clone();
     changed_ready.result_digest = ControlDigest::from_bytes([0x77; 32]);
     assert!(
@@ -2532,9 +2605,24 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
             &completion.credential,
             route_auth_time_ms,
         )?,
-        ready,
+        ready.clone(),
     )
     .await?;
+    let mut changed_health_ready = ready.clone();
+    changed_health_ready.route_health_key_id = Some(RouteHealthKeyId::new());
+    assert_eq!(
+        app.record_agent_route_recipient_ready(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            changed_health_ready,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict),
+    );
 
     let mut ready_session = store.begin_tenant(tenant_id).await?;
     let (bootstrap_state, prepare_state): (String, String) = sqlx::query_as(
@@ -2621,6 +2709,19 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         .collect::<Vec<_>>();
     assert_eq!(delivery_commands.len(), 1);
     let delivery_command = delivery_commands[0];
+    let ServerCommandPayload::DeliverAgentRouteBootstrap(delivery_payload) =
+        delivery_command.payload()
+    else {
+        panic!("expected DeliverAgentRouteBootstrap command");
+    };
+    assert_eq!(
+        delivery_payload.route_health_key_id,
+        Some(winner_health_key_id)
+    );
+    assert_eq!(
+        delivery_payload.route_health_public_key_digest,
+        Some(route_health_public_key_digest),
+    );
 
     assert_eq!(
         app.acknowledge_command(
@@ -2684,9 +2785,24 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
             route_fence,
             installed_at,
         ),
-        route_health_key_id: None,
-        route_health_public_key_digest: None,
+        route_health_key_id: ready.route_health_key_id,
+        route_health_public_key_digest: Some(route_health_public_key_digest),
     };
+    let mut changed_installed = installed.clone();
+    changed_installed.route_health_public_key_digest = Some(ControlDigest::from_bytes([0x7a; 32]));
+    assert_eq!(
+        app.complete_agent_route_bootstrap(
+            authenticate_at(
+                index.clone(),
+                &ca_der,
+                &completion.credential,
+                route_auth_time_ms,
+            )?,
+            changed_installed,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict),
+    );
     app.complete_agent_route_bootstrap(
         authenticate_at(
             index.clone(),
@@ -2694,7 +2810,7 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
             &completion.credential,
             route_auth_time_ms,
         )?,
-        installed,
+        installed.clone(),
     )
     .await?;
 
@@ -2723,6 +2839,49 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     .await?;
     assert_eq!(head_route_id, Uuid::from(route_id));
     assert_eq!(head_route_fence, route_fence);
+    let (stored_health_key_id, stored_health_public_key): (Uuid, Vec<u8>) = sqlx::query_as(
+        "SELECT route_health_key_id, route_health_public_key
+           FROM agent.agent_route_bootstraps
+          WHERE tenant_id=$1 AND bootstrap_id=$2",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(bootstrap_id))
+    .fetch_one(installed_session.connection())
+    .await?;
+    assert_eq!(stored_health_key_id, Uuid::from(winner_health_key_id));
+    assert_eq!(
+        stored_health_public_key,
+        winner_health_public_key.as_bytes()
+    );
+    let current_health_key_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent.agent_route_bootstraps
+          WHERE tenant_id=$1 AND route_health_key_id=$2
+            AND state IN ('recipient_ready','pending_delivery','installed')",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(Uuid::from(winner_health_key_id))
+    .fetch_one(installed_session.connection())
+    .await?;
+    assert_eq!(current_health_key_count, 1);
+    let owner_receipt = owner_get(
+        router.clone(),
+        &format!("/v1/agent-route-bootstraps/{bootstrap_id}"),
+        &owner_authorization,
+    )
+    .await?;
+    assert_eq!(owner_receipt.0, StatusCode::OK);
+    assert!(
+        !owner_receipt
+            .1
+            .windows(winner_health_key_id.to_string().len())
+            .any(|window| window == winner_health_key_id.to_string().as_bytes())
+    );
+    assert!(
+        !owner_receipt
+            .1
+            .windows(winner_health_public_key.as_bytes().len())
+            .any(|window| window == winner_health_public_key.as_bytes())
+    );
     let acknowledged_after_installed: i64 = sqlx::query_scalar(
         "SELECT acknowledged_command_sequence
            FROM agent.connector_control_stream_heads
@@ -2737,7 +2896,6 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
         i64::try_from(delivery_command.sequence())?
     );
     installed_session.rollback().await?;
-
     let admitted_operation = RequestId::new();
     let admitted_event = EventId::try_from(*admitted_operation.as_uuid())?;
     let admitted = owner_agent_route_run(
@@ -2779,6 +2937,67 @@ async fn route_bootstrap_v1_postgres_happy_path_gates_route_run_until_installed(
     .await?;
     assert_eq!(admitted_binding, Uuid::from(binding_id));
     admitted_session.rollback().await?;
+
+    let reopened = app
+        .open_control(
+            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            ParsedHello {
+                tenant_id,
+                connector_id: connector.connector_id(),
+                host_id: host.host_id(),
+                boot_id: BootId::new(),
+                connector_generation: completion.credential.generation(),
+                spec_revision: completion.credential.revision(),
+                protocol: ParsedProtocolRange {
+                    minimum_major: 1,
+                    minimum_minor: 6,
+                    maximum_major: 1,
+                    maximum_minor: 6,
+                },
+                runtime_claims: claims()?,
+                capacity: capacity(),
+                last_applied_command_sequence: 0,
+                required_server_capabilities: vec!["agent-route-health.v1".into()],
+            },
+        )
+        .await?;
+    assert!(
+        reopened
+            .server_capabilities
+            .windows(2)
+            .all(|window| window[0] <= window[1])
+    );
+    assert!(
+        reopened
+            .server_capabilities
+            .iter()
+            .any(|capability| capability == "agent-route-health.v1")
+    );
+
+    let legacy = app
+        .open_control(
+            authenticate(index.clone(), &ca_der, &completion.credential)?,
+            ParsedHello {
+                tenant_id,
+                connector_id: connector.connector_id(),
+                host_id: host.host_id(),
+                boot_id: BootId::new(),
+                connector_generation: completion.credential.generation(),
+                spec_revision: completion.credential.revision(),
+                protocol: ParsedProtocolRange {
+                    minimum_major: 1,
+                    minimum_minor: 5,
+                    maximum_major: 1,
+                    maximum_minor: 5,
+                },
+                runtime_claims: claims()?,
+                capacity: capacity(),
+                last_applied_command_sequence: 0,
+                required_server_capabilities: Vec::new(),
+            },
+        )
+        .await?;
+    assert!(legacy.server_capabilities.is_empty());
 
     drop(owner_credential);
     Ok(())
