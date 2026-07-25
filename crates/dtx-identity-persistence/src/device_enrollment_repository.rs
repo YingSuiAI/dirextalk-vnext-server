@@ -668,6 +668,9 @@ fn validate_history_recovery_manifest_v2(
     catalog: &sqlx::postgres::PgRow,
     preparation: &sqlx::postgres::PgRow,
 ) -> Result<(), IdentityPersistenceError> {
+    if bytes.is_empty() || bytes.len() > 35_477 {
+        return Err(IdentityPersistenceError::InvalidCommand("history recovery manifest"));
+    }
     let value = decode_deterministic_cbor(bytes)
         .map_err(|_| IdentityPersistenceError::InvalidCommand("history recovery manifest"))?;
     let CanonicalValue::Map(fields) = value else {
