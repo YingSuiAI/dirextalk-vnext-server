@@ -8,6 +8,7 @@
 use std::{collections::HashSet, fmt};
 
 use dtx_domain::{DeviceEnrollmentChallengeId, DeviceId, EnvelopeId, IdentityId, MailboxId};
+use dtx_history_recovery_protocol as recovery_protocol;
 use dtx_identity_persistence::{
     DeviceSessionCredential, DeviceSessionRepository, IdentityPersistenceError,
     lock_and_load_active_snapshot, parse_signed_catalog_head_v2,
@@ -46,7 +47,7 @@ pub const PROVIDER_RESPONSE_DOMAIN: &[u8] =
     b"dirextalk.recovery-scope-catalog-handoff-provider-response.v2\0";
 pub const MANIFEST_DIGEST_DOMAIN: &[u8] = b"dirextalk.history-recovery.manifest.v2\0";
 const MAX_EXACT_OFFER_BYTES: usize = 1_049_093;
-const MAX_EXACT_GRANT_BYTES: usize = 1_050_733;
+const MAX_EXACT_GRANT_BYTES: usize = recovery_protocol::MAX_GRANT_BYTES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceHistoryGrantV5Command {
@@ -97,6 +98,8 @@ impl DeviceHistoryGrantV5Command {
         bytes: Vec<u8>,
         idempotency_digest: Sha256Digest,
     ) -> Result<Self, MailboxPersistenceError> {
+        recovery_protocol::validate_grant_v5(&bytes)
+            .map_err(|_| invalid("grant protocol validation"))?;
         validate_bounded_bytes(&bytes, MAX_EXACT_GRANT_BYTES, "grant bytes")?;
         let value = decode_deterministic_cbor_with_limit(&bytes, MAX_EXACT_GRANT_BYTES)
             .map_err(|_| invalid("grant cbor"))?;

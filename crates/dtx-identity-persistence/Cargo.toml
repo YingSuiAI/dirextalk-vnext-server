@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 dtx-domain = { path = "../dtx-domain" }
 dtx-identity-log = { path = "../dtx-identity-log" }
+dtx-history-recovery-protocol = { path = "../dtx-history-recovery-protocol" }
 dtx-storage = { path = "../dtx-storage" }
 dtx-wire = { path = "../dtx-wire" }
 ed25519-dalek.workspace = true

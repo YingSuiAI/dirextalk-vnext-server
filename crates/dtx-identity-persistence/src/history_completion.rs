@@ -1,3 +1,4 @@
+use dtx_history_recovery_protocol as recovery_protocol;
 use dtx_wire::{
     CanonicalEncode, CanonicalValue, Ed25519Signature, Sha256Digest, SigningPublicKey, UtcMillis,
     encode_deterministic_cbor,
@@ -170,6 +171,22 @@ impl HistoryRecoveryCompletionCommand {
         if fields[0] != CanonicalValue::Unsigned(2) {
             return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
         }
+        // The neutral production validator owns nested wire semantics. Keep the
+        // persistence parser focused on DB currentness and completion coordinates.
+        macro_rules! validate_nested {
+            ($field:expr, $validator:path) => {{
+                let nested = bytes_field(&fields[$field - 1], 3_593_836)
+                    .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+                $validator(&nested)
+                    .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+            }};
+        }
+        validate_nested!(11, recovery_protocol::validate_catalog_head_v2);
+        validate_nested!(16, recovery_protocol::validate_manifest_v2);
+        validate_nested!(18, recovery_protocol::validate_request_v4);
+        validate_nested!(22, recovery_protocol::validate_grant_v5);
+        validate_nested!(24, recovery_protocol::validate_offer_v3);
+        validate_nested!(26, recovery_protocol::validate_delivery_v2);
         let completion_id = uuid_field(&fields[1])?;
         let identity_id = text_field(&fields[2])?;
         let device_id = uuid_field(&fields[3])?;
@@ -234,7 +251,7 @@ impl HistoryRecoveryCompletionCommand {
         {
             return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
         }
-        let grant = bytes_field(&fields[21], 1_050_733)?;
+        let grant = bytes_field(&fields[21], recovery_protocol::MAX_GRANT_BYTES)?;
         let grant_digest = digest_field(&fields[22])?;
         if Sha256Digest::hash_domain(b"dirextalk.history-recovery.grant.v5\0", &grant)
             != grant_digest
@@ -264,6 +281,9 @@ impl HistoryRecoveryCompletionCommand {
             CanonicalValue::Array(v) if v.len() == entry_count as usize => v,
             _ => return Err(IdentityPersistenceError::RecoveryCompletionInvalid),
         };
+        for (index, entry) in entries.iter().enumerate() {
+            validate_entry(entry, completion_id, catalog_leaf_count, (index + 1) as u64)?;
+        }
         let computed = merkle_entries(entries)?;
         if computed != entry_root {
             return Err(IdentityPersistenceError::RecoveryCompletionInvalid);
@@ -486,6 +506,18 @@ fn merkle_entries(entries: &[CanonicalValue]) -> Result<Sha256Digest, IdentityPe
     }
     Ok(level[0])
 }
+fn validate_entry(
+    value: &CanonicalValue,
+    completion_id: Uuid,
+    count: u64,
+    index: u64,
+) -> Result<(), IdentityPersistenceError> {
+    let encoded = encode_deterministic_cbor(value)
+        .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+    recovery_protocol::validate_completion_entry_v2(&encoded, completion_id, count, index)
+        .map_err(|_| IdentityPersistenceError::RecoveryCompletionInvalid)?;
+    Ok(())
+}
 fn k(v: u64) -> CanonicalValue {
     CanonicalValue::Unsigned(v)
 }
@@ -563,13 +595,24 @@ impl HistoryRecoveryCompletionRepository {
             }
             if command.issued_at > now || now >= command.expires_at { return Err(IdentityPersistenceError::RecoveryCompletionExpired); }
             if now < descriptor.issued_at || now >= descriptor.expires_at || command.issued_at < descriptor.issued_at || command.expires_at > descriptor.expires_at { return Err(IdentityPersistenceError::RecoveryCompletionExpired); }
-            let request = sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,request_digest,manifest_digest,preparation_digest,post_head_hash,post_head_sequence,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1").bind(command.request_id).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::RecoveryCompletionInvalid)?;
+            // Serialize terminal consumption on the immutable candidate request.  The
+            // completion uniqueness fence below remains authoritative, but this lock
+            // makes concurrent submissions observe the same request/grant state before
+            // either can construct a terminal receipt.
+            let request = sqlx::query("SELECT identity_id,candidate_device_id,candidate_signing_key,request_digest,manifest_digest,preparation_digest,post_head_hash,post_head_sequence,expires_at_ms FROM identity.history_recovery_requests WHERE request_id=$1 FOR UPDATE").bind(command.request_id).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::RecoveryCompletionInvalid)?;
             if request.try_get::<String,_>("identity_id")? != command.identity_id || request.try_get::<Uuid,_>("candidate_device_id")? != command.device_id || request.try_get::<Vec<u8>,_>("candidate_signing_key")? != command.candidate_signing_key || request.try_get::<Vec<u8>,_>("request_digest")? != command.request_digest.as_bytes() || request.try_get::<Vec<u8>,_>("manifest_digest")? != command.manifest_digest.as_bytes() || request.try_get::<Vec<u8>,_>("preparation_digest")? != command.preparation_digest.as_bytes() || request.try_get::<Vec<u8>,_>("post_head_hash")? != command.final_head_hash.as_bytes() || request.try_get::<i64,_>("post_head_sequence")? as u64 != command.highwater_next || request.try_get::<i64,_>("expires_at_ms")? <= now.get() { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
+            // A competing transaction may have committed while this request row was
+            // waiting for its lock. Re-read the terminal fence after the lock so the
+            // same request+grant pair is an exact replay, never a second receipt.
+            if let Some(row) = sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND request_id=$2 AND grant_digest=$3").bind(&command.identity_id).bind(command.request_id).bind(command.grant_digest.as_bytes()).fetch_optional(&mut *tx.connection()).await? {
+                if row.try_get::<Vec<u8>,_>("completion_digest")? != Sha256Digest::hash_domain(b"dirextalk.history-recovery.completion-command.v2\0", &command.exact_bytes).as_bytes() { return Err(IdentityPersistenceError::IdempotencyConflict); }
+                return Ok(CompletionReceiptOutcome { created:false, receipt_bytes:row.try_get("receipt_bytes")? });
+            }
             let delivery_value=dtx_wire::decode_deterministic_cbor(&extract_bytes(&command.exact_bytes,26)?).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?; let delivery_fields=numbered(&delivery_value,12)?;
             let delivery_fact_id = uuid_field(&delivery_fields[1])?; let accepted_at = now;
             let grant_value = dtx_wire::decode_deterministic_cbor(&extract_bytes(&command.exact_bytes,22)?).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?; let grant_fields = numbered(&grant_value,36)?;
             if uint_field(&grant_fields[0])? != 5 || text_field(&grant_fields[1])? != command.identity_id || uuid_field(&grant_fields[2])? != command.request_id || digest_field(&grant_fields[3])? != command.request_digest || digest_field(&grant_fields[4])? != command.manifest_digest || uuid_field(&grant_fields[5])? != command.catalog_id || uint_field(&grant_fields[6])? != command.catalog_generation || digest_field(&grant_fields[8])? != command.catalog_head_digest || digest_field(&grant_fields[9])? != command.catalog_root_digest || uint_field(&grant_fields[10])? != command.catalog_leaf_count || digest_field(&grant_fields[11])? != command.leaf_set_digest || uuid_field(&grant_fields[12])? != command.device_id || uint_field(&grant_fields[15])? != command.highwater || uint_field(&grant_fields[17])? != command.highwater_next || digest_field(&grant_fields[18])? != command.final_head_hash || digest_field(&grant_fields[20])? != command.preparation_digest || digest_field(&grant_fields[24])? != command.offer_digest || uuid_field(&grant_fields[29])? != delivery_fact_id { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
-            if uint_field(&delivery_fields[0])? != 2 || digest_field(&delivery_fields[5])? != command.grant_digest || digest_field(&delivery_fields[6])? != command.offer_digest || uuid_field(&delivery_fields[7])? != command.request_id || uuid_field(&delivery_fields[8])? != command.device_id { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
+            if uint_field(&delivery_fields[0])? != 2 || uuid_field(&delivery_fields[2])? != uuid_field(&grant_fields[25])? || uuid_field(&delivery_fields[3])? != uuid_field(&grant_fields[26])? || uint_field(&delivery_fields[4])? != uint_field(&grant_fields[28])? || digest_field(&delivery_fields[5])? != command.grant_digest || digest_field(&delivery_fields[6])? != command.offer_digest || uuid_field(&delivery_fields[7])? != command.request_id || uuid_field(&delivery_fields[8])? != command.device_id || uint_field(&delivery_fields[9])? < uint_field(&grant_fields[30])? || uint_field(&delivery_fields[9])? > uint_field(&grant_fields[31])? { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
             let offer_value = dtx_wire::decode_deterministic_cbor(&extract_bytes(&command.exact_bytes,24)?).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?; let offer_fields = numbered(&offer_value,16)?;
             if uint_field(&offer_fields[0])? != 3 || uuid_field(&offer_fields[1])? != command.request_id || digest_field(&offer_fields[2])? != command.request_digest || digest_field(&offer_fields[3])? != command.manifest_digest || uuid_field(&offer_fields[4])? != command.catalog_id || uint_field(&offer_fields[5])? != command.catalog_generation || digest_field(&offer_fields[6])? != command.catalog_head_digest || digest_field(&offer_fields[7])? != command.leaf_set_digest { return Err(IdentityPersistenceError::RecoveryCompletionInvalid); }
             let context_digest = digest_field(&extract_value(&command.exact_bytes,35)?)?;
@@ -578,7 +621,11 @@ impl HistoryRecoveryCompletionRepository {
             let descriptor_value=dtx_wire::decode_deterministic_cbor(&descriptor.exact_bytes).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?; let receipt=CanonicalValue::Map(vec![(k(1),u(2)),(k(2),CanonicalValue::Text(command.completion_id.to_string())),(k(3),CanonicalValue::Text(command.identity_id.clone())),(k(4),CanonicalValue::Text(command.device_id.to_string())),(k(5),u(command.highwater)),(k(6),CanonicalValue::Unsigned(command.highwater_next)),(k(7),command.final_head_hash.to_canonical_value()),(k(8),CanonicalValue::Text(command.catalog_id.to_string())),(k(9),u(command.catalog_generation)),(k(10),command.catalog_head_digest.to_canonical_value()),(k(11),u(command.catalog_leaf_count)),(k(12),command.leaf_set_digest.to_canonical_value()),(k(13),CanonicalValue::Text(command.request_id.to_string())),(k(14),command.request_digest.to_canonical_value()),(k(15),command.manifest_digest.to_canonical_value()),(k(16),command.grant_digest.to_canonical_value()),(k(17),command.offer_digest.to_canonical_value()),(k(18),CanonicalValue::Text(delivery_fact_id.to_string())),(k(19),command.delivery_digest.to_canonical_value()),(k(20),command.entry_root.to_canonical_value()),(k(21),u(command.catalog_leaf_count)),(k(22),ack),(k(23),Sha256Digest::hash_domain(b"dirextalk.history-recovery.offer-ack.v2\0",&ack_bytes).to_canonical_value()),(k(24),complete),(k(25),Sha256Digest::hash_domain(b"dirextalk.history-recovery.complete.v2\0",&complete_bytes).to_canonical_value()),(k(26),context_digest.to_canonical_value()),(k(27),CanonicalValue::Text(descriptor.key_id.to_string())),(k(28),descriptor.digest.to_canonical_value()),(k(29),u(descriptor.epoch)),(k(30),accepted_at.to_canonical_value()),(k(31),u(1))]); let receipt_bytes=encode_deterministic_cbor(&receipt).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?; let receipt_digest=Sha256Digest::hash_domain(COMPLETION_RECEIPT_DOMAIN,&receipt_bytes); let wrapper_unsigned=CanonicalValue::Map(vec![(k(1),receipt.clone()),(k(2),receipt_digest.to_canonical_value()),(k(3),descriptor_value.clone()),(k(4),descriptor.digest.to_canonical_value())]); let mut sig_input=COMPLETION_RECEIPT_SIGNATURE_DOMAIN.to_vec(); sig_input.extend_from_slice(&encode_deterministic_cbor(&wrapper_unsigned).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?); let signature=Ed25519Signature::from_bytes(signing_key.sign(&sig_input).to_bytes()); let signed=encode_deterministic_cbor(&CanonicalValue::Map(vec![(k(1),receipt),(k(2),receipt_digest.to_canonical_value()),(k(3),descriptor_value),(k(4),descriptor.digest.to_canonical_value()),(k(5),signature.to_canonical_value())])).map_err(|_|IdentityPersistenceError::RecoveryCompletionInvalid)?;
             let inserted = sqlx::query("INSERT INTO identity.history_recovery_completions_v2(identity_id,completion_id,candidate_device_id,request_id,grant_digest,idempotency_digest,completion_digest,completion_bytes,descriptor_digest,descriptor_bytes,receipt_digest,receipt_bytes,accepted_at_ms,created_at_ms) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING").bind(&command.identity_id).bind(command.completion_id).bind(command.device_id).bind(command.request_id).bind(command.grant_digest.as_bytes()).bind(command.idempotency_digest.as_bytes()).bind(Sha256Digest::hash_domain(b"dirextalk.history-recovery.completion-command.v2\0",&command.exact_bytes).as_bytes()).bind(&command.exact_bytes).bind(descriptor.digest.as_bytes()).bind(&descriptor.exact_bytes).bind(receipt_digest.as_bytes()).bind(&signed).bind(accepted_at.get()).bind(now.get()).execute(&mut *tx.connection()).await?;
             if inserted.rows_affected() == 0 {
-                let row = sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND completion_id=$2").bind(&command.identity_id).bind(command.completion_id).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::CorruptData("completion conflict"))?;
+                let row = sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND completion_id=$2").bind(&command.identity_id).bind(command.completion_id).fetch_optional(&mut *tx.connection()).await?;
+                let row = match row {
+                    Some(row) => row,
+                    None => sqlx::query("SELECT receipt_bytes,completion_digest FROM identity.history_recovery_completions_v2 WHERE identity_id=$1 AND request_id=$2 AND grant_digest=$3").bind(&command.identity_id).bind(command.request_id).bind(command.grant_digest.as_bytes()).fetch_optional(&mut *tx.connection()).await?.ok_or(IdentityPersistenceError::CorruptData("completion conflict"))?,
+                };
                 if row.try_get::<Vec<u8>,_>("completion_digest")? != Sha256Digest::hash_domain(b"dirextalk.history-recovery.completion-command.v2\0", &command.exact_bytes).as_bytes() { return Err(IdentityPersistenceError::IdempotencyConflict); }
                 return Ok(CompletionReceiptOutcome { created:false, receipt_bytes:row.try_get("receipt_bytes")? });
             }

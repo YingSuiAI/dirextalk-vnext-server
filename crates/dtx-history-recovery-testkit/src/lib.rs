@@ -130,7 +130,7 @@ pub const GRANT_SIGNATURE_DOMAIN: &[u8] =
 pub const AUTHORITY_SIGNATURE_DOMAIN: &[u8] =
     b"dirextalk.history-recovery.grant-authority-signature.v5\0";
 pub const MAX_EXACT_OFFER_BYTES: usize = 1_049_093;
-pub const MAX_EXACT_GRANT_BYTES: usize = 1_050_733;
+pub const MAX_EXACT_GRANT_BYTES: usize = 1_050_699;
 
 fn field(key: u64, value: CanonicalValue) -> (CanonicalValue, CanonicalValue) {
     (CanonicalValue::Unsigned(key), value)
@@ -650,6 +650,9 @@ pub fn grant_v5(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dtx_history_recovery_protocol::{
+        validate_catalog_head_v2, validate_grant_v5, validate_offer_v3, validate_request_v4,
+    };
 
     #[test]
     fn signing_key_is_not_exposed_by_artifact_builders() {
@@ -698,5 +701,191 @@ mod tests {
         assert_eq!(fields[8].1, digest([7; 32]));
         assert_eq!(fields[14].1, digest([8; 32]));
         assert_eq!(fields[15].1, digest([9; 32]));
+    }
+
+    #[test]
+    fn neutral_validator_accepts_golden_testkit_chain_and_rejects_signature_tamper() {
+        let authority = SigningKey::from_bytes(&[17; 32]);
+        let candidate = SigningKey::from_bytes(&[18; 32]);
+        let authority_device = DeviceId::new();
+        let identity = IdentityId::derive(public(&authority).as_domain_key());
+        let catalog_id = Uuid::now_v7();
+        let upload = catalog_v2(
+            identity,
+            catalog_id,
+            1,
+            None,
+            0,
+            [11; 32],
+            authority_device,
+            Uuid::now_v7(),
+            &authority,
+            [31; 32],
+            b"opaque-catalog",
+            1_000,
+            10_000,
+        );
+        let CanonicalValue::Map(upload_fields) =
+            dtx_wire::decode_deterministic_cbor(&upload).expect("catalog upload")
+        else {
+            panic!("catalog map");
+        };
+        let head = dtx_wire::encode_deterministic_cbor(&upload_fields[0].1).expect("head");
+        let head_digest =
+            Sha256Digest::hash_domain(b"dirextalk.recovery-scope-catalog-head.v2\0", &head);
+        let request_id = DeviceEnrollmentChallengeId::new();
+        let candidate_device = DeviceId::new();
+        let request = request_v4(
+            request_id,
+            identity,
+            candidate_device,
+            &candidate,
+            [21; 32],
+            0,
+            [12; 32],
+            1,
+            [13; 32],
+            b"device-add",
+            b"preparation",
+            catalog_id,
+            &head,
+            *head_digest.as_bytes(),
+            [22; 32],
+            "request-idempotency",
+            1_000,
+            9_000,
+        );
+        validate_catalog_head_v2(&head).expect("catalog head golden");
+        let CanonicalValue::Map(mut tampered_head_fields) =
+            dtx_wire::decode_deterministic_cbor(&head).expect("head map")
+        else {
+            panic!("head map");
+        };
+        if let CanonicalValue::Bytes(signature) = &mut tampered_head_fields[15].1 {
+            signature[0] ^= 1;
+        }
+        let tampered_head =
+            dtx_wire::encode_deterministic_cbor(&CanonicalValue::Map(tampered_head_fields))
+                .expect("tampered head");
+        assert!(validate_catalog_head_v2(&tampered_head).is_err());
+        validate_request_v4(&request).expect("request golden");
+        let mut tampered = request.clone();
+        *tampered.last_mut().expect("signature") ^= 1;
+        assert!(validate_request_v4(&tampered).is_err());
+        let offer = offer_v3(
+            request_id,
+            [3; 32],
+            [4; 32],
+            catalog_id,
+            1,
+            *head_digest.as_bytes(),
+            [6; 32],
+            [7; 32],
+            [8; 32],
+            b"opaque-offer",
+            [9; 32],
+            1_000,
+            2_000,
+        );
+        validate_offer_v3(&offer).expect("offer golden");
+        let CanonicalValue::Map(mut tampered_offer_fields) =
+            dtx_wire::decode_deterministic_cbor(&offer).expect("offer map")
+        else {
+            panic!("offer map");
+        };
+        if let CanonicalValue::Bytes(ciphertext) = &mut tampered_offer_fields[9].1 {
+            ciphertext[0] ^= 1;
+        }
+        let tampered_offer =
+            dtx_wire::encode_deterministic_cbor(&CanonicalValue::Map(tampered_offer_fields))
+                .expect("tampered offer");
+        assert!(validate_offer_v3(&tampered_offer).is_err());
+
+        let CanonicalValue::Map(request_fields) =
+            dtx_wire::decode_deterministic_cbor(&request).expect("request map")
+        else {
+            panic!("request map");
+        };
+        let manifest =
+            dtx_wire::encode_deterministic_cbor(&request_fields[14].1).expect("manifest");
+        let manifest_digest =
+            Sha256Digest::hash_domain(b"dirextalk.history-recovery.manifest.v2\0", &manifest);
+        let leaf_set_digest = Sha256Digest::hash_domain(
+            b"dirextalk.history-recovery.leaf-set.v2\0",
+            &dtx_wire::encode_deterministic_cbor(&CanonicalValue::Array(vec![
+                CanonicalValue::Bytes(vec![31; 32]),
+            ]))
+            .expect("leaf set"),
+        );
+        let provider = SigningKey::from_bytes(&[19; 32]);
+        let provider_device = DeviceId::new();
+        let provider_descriptor = CanonicalValue::Map(vec![
+            field(1, CanonicalValue::Unsigned(2)),
+            field(2, CanonicalValue::Text(provider_device.to_string())),
+            field(3, public(&provider).to_canonical_value()),
+        ]);
+        let authority_descriptor = CanonicalValue::Map(vec![
+            field(1, CanonicalValue::Unsigned(1)),
+            field(2, CanonicalValue::Text(authority_device.to_string())),
+            field(3, public(&authority).to_canonical_value()),
+        ]);
+        let grant_offer = offer_v3(
+            request_id,
+            *Sha256Digest::hash_domain(b"dirextalk.history-recovery.request.v4\0", &request)
+                .as_bytes(),
+            *manifest_digest.as_bytes(),
+            catalog_id,
+            1,
+            *head_digest.as_bytes(),
+            *leaf_set_digest.as_bytes(),
+            [7; 32],
+            *Sha256Digest::hash_domain(b"dirextalk.recovery-recipient-key.v1\0", &[21; 32])
+                .as_bytes(),
+            b"opaque-offer",
+            [9; 32],
+            1_000,
+            8_000,
+        );
+        let grant = grant_v5(
+            identity,
+            request_id,
+            *Sha256Digest::hash_domain(b"dirextalk.history-recovery.request.v4\0", &request)
+                .as_bytes(),
+            *manifest_digest.as_bytes(),
+            catalog_id,
+            1,
+            &head,
+            *head_digest.as_bytes(),
+            [31; 32],
+            1,
+            *leaf_set_digest.as_bytes(),
+            candidate_device,
+            &candidate,
+            [21; 32],
+            0,
+            [12; 32],
+            1,
+            [13; 32],
+            [14; 32],
+            [15; 32],
+            provider_descriptor,
+            authority_descriptor,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            0,
+            Uuid::now_v7(),
+            1_000,
+            8_000,
+            &provider,
+            &authority,
+            &grant_offer,
+            [44; 32],
+            1_000,
+            8_000,
+        );
+        validate_grant_v5(&grant).expect("grant golden");
+        let mut tampered_grant = grant;
+        tampered_grant[20] ^= 1;
+        assert!(validate_grant_v5(&tampered_grant).is_err());
     }
 }

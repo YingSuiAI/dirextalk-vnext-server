@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 dtx-domain = { path = "../dtx-domain" }
+dtx-history-recovery-protocol = { path = "../dtx-history-recovery-protocol" }
 dtx-identity-persistence = { path = "../dtx-identity-persistence" }
 dtx-storage = { path = "../dtx-storage" }
 dtx-wire = { path = "../dtx-wire" }

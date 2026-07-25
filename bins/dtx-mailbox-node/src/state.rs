@@ -338,7 +338,7 @@ impl MailboxNodeState {
         let credential = parse_device_session_authorization(headers)?;
         let idempotency_key_hash =
             idempotency_key_hash(headers, HTTP_HISTORY_GRANT_V5_IDEMPOTENCY_HASH_DOMAIN)?;
-        let bytes = read_exact_body(body, 1_050_733).await?;
+        let bytes = read_exact_body(body, dtx_history_recovery_protocol::MAX_GRANT_BYTES).await?;
         let command = parse_device_history_grant_v5(&bytes, idempotency_key_hash)?;
         let outcome = self
             .repository

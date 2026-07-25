@@ -13,6 +13,7 @@ path = "src/main.rs"
 axum.workspace = true
 base64ct.workspace = true
 dtx-domain = { path = "../../crates/dtx-domain" }
+dtx-history-recovery-protocol = { path = "../../crates/dtx-history-recovery-protocol" }
 dtx-identity-persistence = { path = "../../crates/dtx-identity-persistence" }
 dtx-mailbox = { path = "../../crates/dtx-mailbox" }
 dtx-wire = { path = "../../crates/dtx-wire" }

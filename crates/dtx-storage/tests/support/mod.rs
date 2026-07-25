@@ -516,6 +516,12 @@ impl PostgresHarness {
              GRANT SELECT, INSERT ON identity.key_package_publish_claims TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.key_package_claims TO dtx_identity_runtime;
              GRANT SELECT, INSERT ON identity.key_package_claim_receipts TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.history_recovery_completion_descriptors
+                TO dtx_identity_runtime;
+             GRANT SELECT, INSERT, UPDATE(descriptor_digest, updated_at_ms)
+                ON identity.history_recovery_completion_key_head TO dtx_identity_runtime;
+             GRANT SELECT, INSERT ON identity.history_recovery_completions_v2
+                TO dtx_identity_runtime;
              GRANT EXECUTE ON FUNCTION identity.prune_expired_key_packages(bigint, integer)
                 TO dtx_identity_runtime;
              GRANT USAGE ON SCHEMA realtime TO dtx_identity_runtime;

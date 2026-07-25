@@ -1102,10 +1102,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtx-history-recovery-protocol"
+version = "0.1.4"
+dependencies = [
+ "dtx-domain",
+ "dtx-wire",
+ "ed25519-dalek",
+ "uuid",
+]
+
+[[package]]
 name = "dtx-history-recovery-testkit"
 version = "0.1.4"
 dependencies = [
  "dtx-domain",
+ "dtx-history-recovery-protocol",
  "dtx-identity-log",
  "dtx-wire",
  "ed25519-dalek",
@@ -1169,6 +1180,7 @@ version = "0.1.4"
 dependencies = [
  "base64ct",
  "dtx-domain",
+ "dtx-history-recovery-protocol",
  "dtx-identity-log",
  "dtx-storage",
  "dtx-wire",
@@ -1229,6 +1241,7 @@ name = "dtx-mailbox"
 version = "0.1.4"
 dependencies = [
  "dtx-domain",
+ "dtx-history-recovery-protocol",
  "dtx-identity-log",
  "dtx-identity-persistence",
  "dtx-storage",
@@ -1251,6 +1264,7 @@ dependencies = [
  "axum",
  "base64ct",
  "dtx-domain",
+ "dtx-history-recovery-protocol",
  "dtx-history-recovery-testkit",
  "dtx-identity-log",
  "dtx-identity-node",
