@@ -49,8 +49,10 @@ fi
 
 make_fixture() {
   local fixture=$1
-  mkdir -p "$fixture/scripts" "$fixture/bin" "$fixture/target/debug" "$fixture/maps" "$fixture/proxy-ports"
+  mkdir -p "$fixture/scripts" "$fixture/bin" "$fixture/target/debug" "$fixture/maps" "$fixture/proxy-ports" "$fixture/sdk/platforms/android-35" "$fixture/sdk/build-tools/35.0.0"
   cp "$script" "$fixture/scripts/android-acceptance.sh"
+  cp "$root/scripts/android-platform-trust-probe.java" "$fixture/scripts/android-platform-trust-probe.java"
+  : >"$fixture/sdk/platforms/android-35/android.jar"
   : >"$fixture/docker-compose.local.yml"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "cargo $*" >>"$DTX_TEST_LOG"' 'exit 0' >"$fixture/bin/cargo"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "docker $*" >>"$DTX_TEST_LOG"' 'case " $* " in *" up "*) if [[ "${DTX_TEST_COMPOSE_UP:-ok}" == fail ]]; then exit 1; fi; sleep "${DTX_TEST_COMPOSE_SLEEP:-0}";; *" cp "*) dest="${*: -1}"; mkdir -p "$(dirname "$dest")"; printf ca-fixture >"$dest";; esac' 'exit 0' >"$fixture/bin/docker"
@@ -72,8 +74,11 @@ make_fixture() {
     'esac' >"$fixture/bin/adb"
   printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "emulator $DTX_TEST_RUN_ID $*" >>"$DTX_TEST_LOG"' 'avd=""; port=""; while (($#)); do case "$1" in -avd) avd=$2; shift 2;; -port) port=$2; shift 2;; *) shift;; esac; done' 'tmp_map="$DTX_TEST_MAP/.emulator-$port.$$"; printf "%s\n" "$avd" >"$tmp_map"; mv -f -- "$tmp_map" "$DTX_TEST_MAP/emulator-$port"' 'exec python3 -c '\''import signal,sys; signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.pause()'\'' emulator -avd "$avd" -port "$port"' >"$fixture/bin/emulator"
   printf '%s\n' '#!/usr/bin/env bash' 'printf "deadbeef\n"' >"$fixture/bin/openssl"
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'port="${*: -1}"; port="${port##*:}"; [[ -f "${DTX_TEST_PROXY_PORTS:-/nonexistent}/$port" ]] && printf "LISTEN\n"' >"$fixture/bin/ss"
-  chmod +x "$fixture/bin"/*
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "javac $*" >>"$DTX_TEST_LOG"' 'if [[ "$*" == *"-version"* ]]; then [[ "${DTX_TEST_JAVAC_VERSION_SLEEP:-0}" == 1 ]] && sleep 5; printf "javac 17.0.0\n" >&2; exit 0; fi' '[[ "${DTX_TEST_JAVAC_COMPILE_SLEEP:-0}" == 1 ]] && sleep 5' 'while (($#)); do if [[ "$1" == -d ]]; then mkdir -p "$2"; : >"$2/PlatformTrustProbe.class"; break; fi; shift; done' >"$fixture/bin/javac"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'echo "d8 $*" >>"$DTX_TEST_LOG"' '[[ "${DTX_TEST_D8_SLEEP:-0}" == 1 ]] && sleep 5' 'while (($#)); do if [[ "$1" == --output ]]; then mkdir -p "$2"; : >"$2/classes.dex"; break; fi; shift; done' >"$fixture/sdk/build-tools/35.0.0/d8"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'if [[ "${DTX_TEST_PS_SLEEP_ON_MARKER:-0}" == 1 && -e "$DTX_TEST_ROOT/cleanup-probe-marker" ]]; then echo "ps cleanup probe" >>"$DTX_TEST_LOG"; sleep 5; fi' 'exec /usr/bin/ps "$@"' >"$fixture/bin/ps"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'if [[ "${DTX_TEST_SS_SLEEP_ON_MARKER:-0}" == 1 && -e "$DTX_TEST_ROOT/cleanup-probe-marker" ]]; then echo "ss cleanup probe" >>"$DTX_TEST_LOG"; sleep 5; fi' 'port="${*: -1}"; port="${port##*:}"; if [[ -f "${DTX_TEST_PROXY_PORTS:-/nonexistent}/$port" ]]; then printf "LISTEN\n"; fi' >"$fixture/bin/ss"
+  chmod +x "$fixture/bin"/* "$fixture/sdk/build-tools/35.0.0/d8"
 }
 
 run_fixture() {
@@ -259,6 +264,34 @@ if DTX_TEST_APP_PROCESS_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 run_fixture "
 rg -F 'shell app_process' "$fixture/log" >/dev/null
 rg -F -- '--project-name dtx-android-accept-hung-app-process down' "$fixture/log" >/dev/null
 [[ ! -e "$fixture/.android-acceptance/hung-app-process" ]]
+
+# Native trust-probe toolchain calls use the same deadline as foreground
+# commands, including javac version/compilation and d8.
+fixture="$tmp/hung-javac-version"; make_fixture "$fixture"
+if DTX_TEST_NATIVE_TRUST_PROBE=1 DTX_TEST_JAVAC_VERSION_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 ANDROID_SDK_ROOT="$fixture/sdk" run_fixture "$fixture" hung-javac-version env >/dev/null 2>&1; then exit 1; fi
+rg -F 'javac -version' "$fixture/log" >/dev/null
+[[ ! -e "$fixture/.android-acceptance/hung-javac-version" ]]
+fixture="$tmp/hung-javac-compile"; make_fixture "$fixture"
+if DTX_TEST_NATIVE_TRUST_PROBE=1 DTX_TEST_JAVAC_COMPILE_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 ANDROID_SDK_ROOT="$fixture/sdk" run_fixture "$fixture" hung-javac-compile env >/dev/null 2>&1; then exit 1; fi
+rg -F -- '-source 8 -target 8' "$fixture/log" >/dev/null
+[[ ! -e "$fixture/.android-acceptance/hung-javac-compile" ]]
+fixture="$tmp/hung-d8"; make_fixture "$fixture"
+if DTX_TEST_NATIVE_TRUST_PROBE=1 DTX_TEST_D8_SLEEP=1 DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 ANDROID_SDK_ROOT="$fixture/sdk" run_fixture "$fixture" hung-d8 env >/dev/null 2>&1; then exit 1; fi
+rg -F 'd8 --lib ' "$fixture/log" >/dev/null
+[[ ! -e "$fixture/.android-acceptance/hung-d8" ]]
+
+# Cleanup inspection commands cannot make owned teardown wait forever.  ps is
+# checked before signalling, while ss is checked after the process has exited.
+for cleanup_probe in ps ss; do
+  fixture="$tmp/hung-cleanup-$cleanup_probe"; make_fixture "$fixture"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'listen=${1##*:}; control=${3##*:}; : >"$DTX_TEST_PROXY_PORTS/$listen"; : >"$DTX_TEST_PROXY_PORTS/$control"' 'if [[ "${DTX_TEST_PS_SLEEP_ON_MARKER:-0}" == 1 ]]; then : >"$DTX_TEST_ROOT/cleanup-probe-marker"; fi' 'trap '\''if [[ "${DTX_TEST_SS_SLEEP_ON_MARKER:-0}" == 1 ]]; then : >"$DTX_TEST_ROOT/cleanup-probe-marker"; fi; rm -f "$DTX_TEST_PROXY_PORTS/$listen" "$DTX_TEST_PROXY_PORTS/$control"; exit 0'\'' TERM' 'while :; do sleep 1; done' >"$fixture/target/debug/dtx-android-response-loss-proxy"; chmod +x "$fixture/target/debug/dtx-android-response-loss-proxy"
+  case "$cleanup_probe" in
+    ps) if DTX_TEST_REVERSE=fail DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 DTX_TEST_PS_SLEEP_ON_MARKER=1 run_fixture "$fixture" "hung-cleanup-$cleanup_probe" env >/dev/null 2>&1; then exit 1; fi ;;
+    ss) if DTX_TEST_REVERSE=fail DTX_TEST_COMMAND_TIMEOUT_SECONDS=1 DTX_TEST_SS_SLEEP_ON_MARKER=1 run_fixture "$fixture" "hung-cleanup-$cleanup_probe" env >/dev/null 2>&1; then exit 1; fi ;;
+  esac
+  rg -F -- "--project-name dtx-android-accept-hung-cleanup-$cleanup_probe down" "$fixture/log" >/dev/null
+  cleanup_fixture_processes
+done
 
 # Invalid closed configuration is rejected before any Android side effect.
 fixture="$tmp/config"; make_fixture "$fixture"

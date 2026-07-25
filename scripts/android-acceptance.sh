@@ -58,6 +58,8 @@ run_bounded() {
 adb_bounded() { local label=$1; shift; run_bounded "adb $label" adb "$@"; }
 compose_bounded() { local label=$1; shift; run_bounded "docker compose $label" docker compose "$@"; }
 avd_bounded() { local label=$1; shift; run_bounded "avdmanager $label" avdmanager "$@"; }
+ps_bounded() { run_bounded 'ps' ps "$@"; }
+ss_bounded() { run_bounded 'ss' ss "$@"; }
 start_owned_process() {
   local label=$1
   shift
@@ -220,7 +222,7 @@ pid_cmdline_matches() {
 }
 process_group_pgid() {
   local pid=$1 pgid
-  pgid="$(ps -o pgid= -p "$pid" | tr -d ' ')"
+  pgid="$(ps_bounded -o pgid= -p "$pid" | tr -d ' ')"
   [[ "$pgid" =~ ^[1-9][0-9]*$ && "$pgid" == "$pid" ]] || return 1
   printf '%s' "$pgid"
 }
@@ -244,7 +246,7 @@ stop_pid() {
     wait "$pid" 2>/dev/null || true
   fi
   ! kill -0 "$pid" 2>/dev/null || return 1
-  ! ss -ltnH "sport = :$port" | grep -q . || return 1
+  ! ss_bounded -ltnH "sport = :$port" | grep -q . || return 1
 }
 cleanup_probe_remote() {
   local serial=$1 pid=$2 avd=$3 port=$4 result_path=$5
@@ -315,7 +317,7 @@ preflight() {
 }
 prepare_trust_probe() {
   local source="$SCRIPT_DIR/android-platform-trust-probe.java" android_jar d8 javac_version probe_dir classes_dir dex_output dex_size source_copy
-  if [[ "${DTX_ANDROID_TEST_MODE:-}" == 1 ]]; then
+  if [[ "${DTX_ANDROID_TEST_MODE:-}" == 1 && "${DTX_TEST_NATIVE_TRUST_PROBE:-}" != 1 ]]; then
     probe_dir="$(mktemp -d "$RUN_ROOT/trust-probe.XXXXXX")" || die 'unable to create private trust probe directory'
     TRUST_PROBE_DEX="$probe_dir/classes.dex"; printf test-dex >"$TRUST_PROBE_DEX"
     TRUST_PROBE_HASH="$(sha256sum "$TRUST_PROBE_DEX" | awk '{print $1}')"
@@ -325,17 +327,22 @@ prepare_trust_probe() {
   [[ -n "$ANDROID_SDK_ROOT_VALUE" && -d "$ANDROID_SDK_ROOT_VALUE" && ! -L "$ANDROID_SDK_ROOT_VALUE" ]] || die 'Android SDK root is unavailable'
   android_jar="$ANDROID_SDK_ROOT_VALUE/platforms/android-35/android.jar"
   [[ -f "$android_jar" && ! -L "$android_jar" ]] || die 'API35 android.jar is unavailable'
-  javac_version="$(javac -version 2>&1)" || die 'JDK javac is unavailable'
+  javac_version="$(run_bounded 'javac version' javac -version 2>&1)" || die 'JDK javac is unavailable'
   [[ "$javac_version" == 'javac 17.'* ]] || die 'pinned JDK 17 javac is required'
-  d8="$(find "$ANDROID_SDK_ROOT_VALUE/build-tools" -mindepth 2 -maxdepth 2 -type f -name d8 ! -type l | sort -V | tail -n 1)"
-  [[ -n "$d8" && -x "$d8" && ! -L "$d8" ]] || die 'Android SDK d8 is unavailable'
+  d8="$(run_bounded 'build-tools discovery' bash -c '
+    shopt -s nullglob
+    candidates=("$1"/build-tools/*/d8)
+    ((${#candidates[@]})) || exit 1
+    printf "%s\\n" "${candidates[@]}" | sort -V | tail -n 1
+  ' bash "$ANDROID_SDK_ROOT_VALUE")" || die 'Android SDK d8 is unavailable'
+  [[ -n "$d8" && -f "$d8" && -x "$d8" && ! -L "$d8" && ! -L "${d8%/d8}" ]] || die 'Android SDK d8 is unavailable'
   probe_dir="$(mktemp -d "$RUN_ROOT/trust-probe.XXXXXX")" || die 'unable to create private trust probe directory'
   classes_dir="$probe_dir/classes"; dex_output="$probe_dir/dex"; mkdir -- "$classes_dir" "$dex_output"
   source_copy="$probe_dir/PlatformTrustProbe.java"
   cp -- "$source" "$source_copy"
   [[ -f "$source_copy" && ! -L "$source_copy" ]] || die 'private trust probe source copy is unsafe'
-  javac -source 8 -target 8 -cp "$android_jar" -d "$classes_dir" "$source_copy" || die 'trust probe compilation failed'
-  "$d8" --lib "$android_jar" --output "$dex_output" "$classes_dir" || die 'trust probe dex compilation failed'
+  run_bounded 'javac trust probe' javac -source 8 -target 8 -cp "$android_jar" -d "$classes_dir" "$source_copy" || die 'trust probe compilation failed'
+  run_bounded 'd8 trust probe' "$d8" --lib "$android_jar" --output "$dex_output" "$classes_dir" || die 'trust probe dex compilation failed'
   TRUST_PROBE_DEX="$dex_output/classes.dex"
   [[ -f "$TRUST_PROBE_DEX" && ! -L "$TRUST_PROBE_DEX" ]] || die 'trust probe dex output is missing or symlinked'
   dex_size="$(stat -c '%s' "$TRUST_PROBE_DEX")"
@@ -385,8 +392,8 @@ assert_emulator_ports_free() {
   adb_port=$((console_port + 1))
   valid_emulator_port "$console_port" || die 'invalid emulator console port'
   valid_port "$adb_port" || die 'invalid emulator adb port'
-  ! ss -ltnH "sport = :$console_port" | grep -q . || die "emulator console port $console_port is already listening"
-  ! ss -ltnH "sport = :$adb_port" | grep -q . || die "emulator adb port $adb_port is already listening"
+  ! ss_bounded -ltnH "sport = :$console_port" | grep -q . || die "emulator console port $console_port is already listening"
+  ! ss_bounded -ltnH "sport = :$adb_port" | grep -q . || die "emulator adb port $adb_port is already listening"
   ! adb_bounded 'devices' devices | grep -Eq "^emulator-($console_port|$adb_port)[[:space:]]" || die "emulator port $console_port is already owned by adb"
 }
 adb_shell_ok() { local serial=$1 command=$2; adb_bounded "shell $command" -s "$serial" shell "$command" >/dev/null; }
@@ -476,7 +483,7 @@ start_proxy() {
   local deadline=$((SECONDS + ANDROID_BOOT_TIMEOUT_SECONDS))
   while :; do
     kill -0 "$pid" 2>/dev/null || die 'proxy exited during startup'
-    if ss -ltnH "sport = :$listen" | grep -q . && ss -ltnH "sport = :$control" | grep -q .; then
+    if ss_bounded -ltnH "sport = :$listen" | grep -q . && ss_bounded -ltnH "sport = :$control" | grep -q .; then
       return 0
     fi
     (( SECONDS < deadline )) || die 'proxy listeners not ready'
