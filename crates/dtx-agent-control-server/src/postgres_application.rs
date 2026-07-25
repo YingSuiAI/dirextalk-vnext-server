@@ -3673,7 +3673,8 @@ impl PostgresConnectorControlApplication {
                     b.recipient_id, b.route_id, b.bootstrap_capsule_digest,
                     b.opaque_sealed_bootstrap, b.route_fence, b.route_health_key_id,
                     b.route_health_public_key, b.server_receipt_key_id,
-                    b.server_receipt_public_key_digest, o.operation_id,
+                    b.server_receipt_public_key, b.server_receipt_public_key_digest,
+                    o.operation_id,
                     o.command_sequence, o.command_payload_digest, o.encoded_command_digest,
                     o.state AS outbox_state, o.result_digest, o.rejection_code
                FROM agent.agent_route_bootstraps AS b
