@@ -20,11 +20,13 @@ readonly ANDROID_CORES="${DTX_ANDROID_CORES:-2}"
 readonly ANDROID_MEMORY_MIB="${DTX_ANDROID_MEMORY_MIB:-2048}"
 readonly ANDROID_BOOT_TIMEOUT_SECONDS="${DTX_ANDROID_BOOT_TIMEOUT_SECONDS:-180}"
 readonly ANDROID_AVD_RSS_MIB="${DTX_ANDROID_AVD_RSS_MIB:-4300}"
-readonly ANDROID_TRUST_PROBE_DEX="${DTX_ANDROID_TRUST_PROBE_DEX:-}"
+readonly ANDROID_SDK_ROOT_VALUE="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 readonly ANDROID_AVD_COUNT=2
 CLAIMED=0 COMPOSE_OWNED=0 AVD_A_CREATED=0 AVD_B_CREATED=0 REVERSE_A=0 REVERSE_B=0
 CA_A_INSTALLED=0 CA_B_INSTALLED=0 CA_A_TOUCHED=0 CA_B_TOUCHED=0
 TRUST_PROBE_A_TOUCHED=0 TRUST_PROBE_B_TOUCHED=0
+TRUST_PROBE_DEX='' TRUST_PROBE_HASH='' TRUST_RESULT_A_PATH='' TRUST_RESULT_B_PATH=''
+TRUST_PROBE_A_NONCE='' TRUST_PROBE_B_NONCE=''
 PID_A='' PID_B='' PROXY_A_PID='' PROXY_B_PID=''
 SERIAL_A='' SERIAL_B='' PROXY_A_PORT='' CONTROL_A_PORT='' PROXY_B_PORT='' CONTROL_B_PORT='' NODE_A_PORT='' NODE_B_PORT='' EMULATOR_A_PORT='' EMULATOR_B_PORT='' ALLOCATOR_LOCK_FD='' CA_HASH=''
 
@@ -167,16 +169,37 @@ stop_pid() {
   ! kill -0 "$pid" 2>/dev/null || return 1
   ! ss -ltnH "sport = :$port" | grep -q . || return 1
 }
+cleanup_probe_remote() {
+  local serial=$1 pid=$2 avd=$3 port=$4 result_path=$5
+  [[ -n "$result_path" ]] || return 0
+  (verify_emulator "$serial" "$pid" "$avd" "$port") || return 1
+  adb -s "$serial" shell "rm -f '$result_path' /data/local/tmp/dtx-platform-trust-probe.dex && test ! -e '$result_path' && test ! -e /data/local/tmp/dtx-platform-trust-probe.dex" >/dev/null 2>&1 || return 1
+}
+cleanup_remote_serial() {
+  local serial=$1 pid=$2 avd=$3 port=$4 result_path=$5 ca_touched=$6 probe_touched=$7 reverse=$8
+  if ! (verify_emulator "$serial" "$pid" "$avd" "$port"); then
+    return 1
+  fi
+  if [[ "$ca_touched" == 1 ]]; then
+    remove_ca_system_store "$serial" || return 1
+  fi
+  if [[ "$probe_touched" == 1 ]]; then
+    cleanup_probe_remote "$serial" "$pid" "$avd" "$port" "$result_path" || return 1
+  fi
+  if [[ "$reverse" == 1 ]]; then
+    adb -s "$serial" reverse --remove tcp:8443 >/dev/null 2>&1 || return 1
+  fi
+}
 cleanup() {
   local status=$? cleanup_failed=0
   set +e
   [[ "$MODE" == run ]] || exit "$status"
-  [[ "$CA_A_TOUCHED" != 1 ]] || remove_ca_system_store "$SERIAL_A" || cleanup_failed=1
-  [[ "$CA_B_TOUCHED" != 1 ]] || remove_ca_system_store "$SERIAL_B" || cleanup_failed=1
-  [[ "$TRUST_PROBE_A_TOUCHED" != 1 ]] || adb -s "$SERIAL_A" shell 'rm -f /data/local/tmp/dtx-platform-trust-probe.dex && test ! -e /data/local/tmp/dtx-platform-trust-probe.dex' >/dev/null 2>&1 || cleanup_failed=1
-  [[ "$TRUST_PROBE_B_TOUCHED" != 1 ]] || adb -s "$SERIAL_B" shell 'rm -f /data/local/tmp/dtx-platform-trust-probe.dex && test ! -e /data/local/tmp/dtx-platform-trust-probe.dex' >/dev/null 2>&1 || cleanup_failed=1
-  [[ "$REVERSE_A" != 1 ]] || adb -s "$SERIAL_A" reverse --remove tcp:8443 >/dev/null 2>&1 || cleanup_failed=1
-  [[ "$REVERSE_B" != 1 ]] || adb -s "$SERIAL_B" reverse --remove tcp:8443 >/dev/null 2>&1 || cleanup_failed=1
+  if [[ "$CA_A_TOUCHED" == 1 || "$TRUST_PROBE_A_TOUCHED" == 1 || "$REVERSE_A" == 1 ]]; then
+    cleanup_remote_serial "$SERIAL_A" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT" "$TRUST_RESULT_A_PATH" "$CA_A_TOUCHED" "$TRUST_PROBE_A_TOUCHED" "$REVERSE_A" || cleanup_failed=1
+  fi
+  if [[ "$CA_B_TOUCHED" == 1 || "$TRUST_PROBE_B_TOUCHED" == 1 || "$REVERSE_B" == 1 ]]; then
+    cleanup_remote_serial "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT" "$TRUST_RESULT_B_PATH" "$CA_B_TOUCHED" "$TRUST_PROBE_B_TOUCHED" "$REVERSE_B" || cleanup_failed=1
+  fi
   stop_pid "$PROXY_A_PID" "$PROXY_A_PORT" || cleanup_failed=1; stop_pid "$PROXY_B_PID" "$PROXY_B_PORT" || cleanup_failed=1
   stop_pid "$PID_A" "$EMULATOR_A_PORT" || cleanup_failed=1; stop_pid "$PID_B" "$EMULATOR_B_PORT" || cleanup_failed=1
   [[ "$AVD_A_CREATED" != 1 ]] || { safe_avd "$AVD_A" && avdmanager delete avd --name "$AVD_A" >/dev/null 2>&1 && ! avdmanager list avd | grep -Fqx "    Name: $AVD_A"; } || cleanup_failed=1
@@ -198,14 +221,51 @@ trap 'on_signal 143' TERM
 preflight() {
   valid_run_id && safe_run_root && safe_project || die 'unsafe run identity'
   valid_config || die 'invalid Android acceptance configuration'
-  [[ -n "$ANDROID_TRUST_PROBE_DEX" && -f "$ANDROID_TRUST_PROBE_DEX" && ! -L "$ANDROID_TRUST_PROBE_DEX" ]] || die 'DTX_ANDROID_TRUST_PROBE_DEX must name a fixed probe dex'
   command -v docker >/dev/null || die 'docker is required'; command -v adb >/dev/null || die 'adb is required'; command -v timeout >/dev/null || die 'timeout is required'
   command -v emulator >/dev/null || die 'emulator is required'; command -v avdmanager >/dev/null || die 'avdmanager is required'; command -v ss >/dev/null || die 'ss is required'
   ! avdmanager list avd | grep -Fqx "    Name: $AVD_A" || die 'AVD A already exists'
   ! avdmanager list avd | grep -Fqx "    Name: $AVD_B" || die 'AVD B already exists'
   ! adb devices | grep -Eq "^(${SERIAL_A}|${SERIAL_B})[[:space:]]" || die 'reserved emulator serial is already active'
 }
+prepare_trust_probe() {
+  local source="$SCRIPT_DIR/android-platform-trust-probe.java" android_jar d8 javac_version probe_dir classes_dir dex_output dex_size source_copy
+  if [[ "${DTX_ANDROID_TEST_MODE:-}" == 1 ]]; then
+    probe_dir="$(mktemp -d "$RUN_ROOT/trust-probe.XXXXXX")" || die 'unable to create private trust probe directory'
+    TRUST_PROBE_DEX="$probe_dir/classes.dex"; printf test-dex >"$TRUST_PROBE_DEX"
+    TRUST_PROBE_HASH="$(sha256sum "$TRUST_PROBE_DEX" | awk '{print $1}')"
+    return 0
+  fi
+  [[ -f "$source" && ! -L "$source" ]] || die 'fixed trust probe source is missing or symlinked'
+  [[ -n "$ANDROID_SDK_ROOT_VALUE" && -d "$ANDROID_SDK_ROOT_VALUE" && ! -L "$ANDROID_SDK_ROOT_VALUE" ]] || die 'Android SDK root is unavailable'
+  android_jar="$ANDROID_SDK_ROOT_VALUE/platforms/android-35/android.jar"
+  [[ -f "$android_jar" && ! -L "$android_jar" ]] || die 'API35 android.jar is unavailable'
+  javac_version="$(javac -version 2>&1)" || die 'JDK javac is unavailable'
+  [[ "$javac_version" == 'javac 17.'* ]] || die 'pinned JDK 17 javac is required'
+  d8="$(find "$ANDROID_SDK_ROOT_VALUE/build-tools" -mindepth 2 -maxdepth 2 -type f -name d8 ! -type l | sort -V | tail -n 1)"
+  [[ -n "$d8" && -x "$d8" && ! -L "$d8" ]] || die 'Android SDK d8 is unavailable'
+  probe_dir="$(mktemp -d "$RUN_ROOT/trust-probe.XXXXXX")" || die 'unable to create private trust probe directory'
+  classes_dir="$probe_dir/classes"; dex_output="$probe_dir/dex"; mkdir -- "$classes_dir" "$dex_output"
+  source_copy="$probe_dir/PlatformTrustProbe.java"
+  cp -- "$source" "$source_copy"
+  [[ -f "$source_copy" && ! -L "$source_copy" ]] || die 'private trust probe source copy is unsafe'
+  javac -source 8 -target 8 -cp "$android_jar" -d "$classes_dir" "$source_copy" || die 'trust probe compilation failed'
+  "$d8" --lib "$android_jar" --output "$dex_output" "$classes_dir" || die 'trust probe dex compilation failed'
+  TRUST_PROBE_DEX="$dex_output/classes.dex"
+  [[ -f "$TRUST_PROBE_DEX" && ! -L "$TRUST_PROBE_DEX" ]] || die 'trust probe dex output is missing or symlinked'
+  dex_size="$(stat -c '%s' "$TRUST_PROBE_DEX")"
+  [[ "$dex_size" =~ ^[0-9]+$ && dex_size -le 4194304 ]] || die 'trust probe dex output exceeds bound'
+  TRUST_PROBE_HASH="$(sha256sum "$TRUST_PROBE_DEX" | awk '{print $1}')"
+  [[ "$TRUST_PROBE_HASH" =~ ^[0-9a-f]{64}$ ]] || die 'trust probe dex hash is invalid'
+}
 verify_emulator() {
+  local serial=$1 pid=$2 avd=$3 port=$4
+  verify_emulator_identity "$serial" "$pid" "$avd" "$port"
+  adb -s "$serial" root >/dev/null || die 'adb root failed'
+  verify_emulator_identity "$serial" "$pid" "$avd" "$port"
+  [[ "$(adb -s "$serial" shell 'getprop ro.kernel.qemu' | tr -d '\r')" == 1 ]] || die 'image is not rooted emulator'
+  [[ "$(adb -s "$serial" shell 'id -u' | tr -d '\r')" == 0 ]] || die 'emulator root uid is not zero'
+}
+verify_emulator_identity() {
   local serial=$1 pid=$2 avd=$3 port=$4
   valid_pid "$pid" || die 'emulator PID ownership is required'
   valid_emulator_port "$port" || die 'emulator console port ownership is required'
@@ -232,9 +292,7 @@ verify_emulator() {
   done <<<"$avd_reply"
   (( ${#console_lines[@]} == 2 )) || die 'serial does not map to this AVD'
   [[ "${console_lines[0]}" == "$avd" && "${console_lines[1]}" == OK ]] || die 'serial does not map to this AVD'
-  adb -s "$serial" root >/dev/null || die 'adb root failed'
   [[ "$(adb -s "$serial" shell 'getprop ro.kernel.qemu' | tr -d '\r')" == 1 ]] || die 'image is not rooted emulator'
-  [[ "$(adb -s "$serial" shell 'id -u' | tr -d '\r')" == 0 ]] || die 'emulator root uid is not zero'
 }
 assert_emulator_ports_free() {
   local console_port=$1 adb_port
@@ -246,12 +304,28 @@ assert_emulator_ports_free() {
   ! adb devices | grep -Eq "^emulator-($console_port|$adb_port)[[:space:]]" || die "emulator port $console_port is already owned by adb"
 }
 adb_shell_ok() { adb -s "$1" shell "$2" >/dev/null; }
+new_nonce() {
+  local nonce
+  nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ "$nonce" =~ ^[0-9a-f]{32}$ ]] || return 1
+  printf '%s' "$nonce"
+}
 platform_trust_probe() {
-  local serial=$1 endpoint=$2 output
-  if [[ "$serial" == "$SERIAL_A" ]]; then TRUST_PROBE_A_TOUCHED=1; else TRUST_PROBE_B_TOUCHED=1; fi
-  adb -s "$serial" push "$ANDROID_TRUST_PROBE_DEX" /data/local/tmp/dtx-platform-trust-probe.dex >/dev/null || return 1
-  output="$(adb -s "$serial" shell "app_process -Djava.class.path=/data/local/tmp/dtx-platform-trust-probe.dex /system/bin com.dirextalk.android.PlatformTrustProbe '$endpoint'" 2>/dev/null)" || return 1
-  [[ "$output" == *'TRUSTED'* ]] || return 1
+  local serial=$1 pid=$2 avd=$3 port=$4 endpoint=$5 expected=$6 nonce result_path app_status result
+  nonce="$(new_nonce)" || return 1
+  result_path="/data/local/tmp/dtx-platform-trust-result-$nonce"
+  if [[ "$serial" == "$SERIAL_A" ]]; then TRUST_PROBE_A_TOUCHED=1; TRUST_PROBE_A_NONCE="$nonce"; TRUST_RESULT_A_PATH="$result_path"; else TRUST_PROBE_B_TOUCHED=1; TRUST_PROBE_B_NONCE="$nonce"; TRUST_RESULT_B_PATH="$result_path"; fi
+  (verify_emulator "$serial" "$pid" "$avd" "$port") || return 1
+  adb -s "$serial" shell "rm -f '$result_path' && test ! -e '$result_path'" >/dev/null 2>&1 || return 1
+  app_status=0
+  adb -s "$serial" push "$TRUST_PROBE_DEX" /data/local/tmp/dtx-platform-trust-probe.dex >/dev/null || app_status=$?
+  if [[ "$app_status" == 0 ]]; then
+    adb -s "$serial" shell "app_process -Djava.class.path=/data/local/tmp/dtx-platform-trust-probe.dex /system/bin com.dirextalk.android.PlatformTrustProbe '$endpoint' '$nonce' '$result_path'" >/dev/null 2>&1 || app_status=$?
+  fi
+  (verify_emulator "$serial" "$pid" "$avd" "$port") || return 1
+  result="$(adb -s "$serial" shell "cat '$result_path'" 2>/dev/null | tr -d '\r')" || result=''
+  [[ "$result" == "$expected $nonce" ]] || return 1
+  [[ "$app_status" =~ ^[0-9]+$ ]] || return 1
 }
 verify_system_rw() {
   local serial=$1 probe="/system/etc/security/cacerts/.dtx-writable-$RUN_ID"
@@ -318,6 +392,7 @@ start_proxy() {
 }
 real_run() {
   claim; preflight
+  prepare_trust_probe
   cargo build --locked -p dtx-android-response-loss-proxy
   COMPOSE_OWNED=1; record compose_owned 1
   DTX_ANDROID_NODE_A_PORT="$NODE_A_PORT" DTX_ANDROID_NODE_B_PORT="$NODE_B_PORT" docker compose --project-directory "$REPOSITORY_ROOT" -f "$REPOSITORY_ROOT/docker-compose.local.yml" --project-name "$COMPOSE_PROJECT" up --detach --wait
@@ -332,12 +407,12 @@ real_run() {
   verify_emulator "$SERIAL_A" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT"; verify_emulator "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT"
   REVERSE_A=1; adb -s "$SERIAL_A" reverse tcp:8443 "tcp:$NODE_A_PORT"
   REVERSE_B=1; adb -s "$SERIAL_B" reverse tcp:8443 "tcp:$NODE_B_PORT"
-  platform_trust_probe "$SERIAL_A" 'https://localhost:8443/local/ready' && die 'platform trust unexpectedly succeeded before CA installation' || true
-  platform_trust_probe "$SERIAL_B" 'https://localhost:8443/local/ready' && die 'platform trust unexpectedly succeeded before CA installation' || true
+  platform_trust_probe "$SERIAL_A" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT" 'https://localhost:8443/local/ready' UNTRUSTED || die 'platform trust preinstall classification was not certificate-chain rejection'
+  platform_trust_probe "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT" 'https://localhost:8443/local/ready' UNTRUSTED || die 'platform trust preinstall classification was not certificate-chain rejection'
   install_ca_system_store "$SERIAL_A" "$RUN_ROOT/tls/ca.pem" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT"
-  platform_trust_probe "$SERIAL_A" 'https://localhost:8443/local/ready' || die 'platform trust did not accept installed CA'
+  platform_trust_probe "$SERIAL_A" "$PID_A" "$AVD_A" "$EMULATOR_A_PORT" 'https://localhost:8443/local/ready' TRUSTED || die 'platform trust did not accept installed CA'
   install_ca_system_store "$SERIAL_B" "$RUN_ROOT/tls/ca.pem" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT"
-  platform_trust_probe "$SERIAL_B" 'https://localhost:8443/local/ready' || die 'platform trust did not accept installed CA'
+  platform_trust_probe "$SERIAL_B" "$PID_B" "$AVD_B" "$EMULATOR_B_PORT" 'https://localhost:8443/local/ready' TRUSTED || die 'platform trust did not accept installed CA'
   start_proxy "$PROXY_A_PORT" "$NODE_A_PORT" "$CONTROL_A_PORT" PROXY_A_PID; start_proxy "$PROXY_B_PORT" "$NODE_B_PORT" "$CONTROL_B_PORT" PROXY_B_PID
   REVERSE_A=1; adb -s "$SERIAL_A" reverse tcp:8443 "tcp:$PROXY_A_PORT"
   REVERSE_B=1; adb -s "$SERIAL_B" reverse tcp:8443 "tcp:$PROXY_B_PORT"

@@ -17,12 +17,12 @@ DTX_ANDROID_CORES=1..8
 DTX_ANDROID_MEMORY_MIB=1536..8192
 DTX_ANDROID_BOOT_TIMEOUT_SECONDS=30..900
 DTX_ANDROID_AVD_RSS_MIB=3000..12000
-DTX_ANDROID_TRUST_PROBE_DEX=/path/to/PlatformTrustProbe.dex
 ```
 
-Build the fixed probe with the API 35 platform jar and Android `d8`, then pass
-the resulting dex through `DTX_ANDROID_TRUST_PROBE_DEX`; the harness rejects a
-missing, symlinked, or implicit probe path.
+The harness compiles the checked-in Java probe in a private run directory with
+the API 35 platform jar, JDK 17 `javac`, and an SDK `d8`, then validates the
+non-symlinked dex size and SHA-256 before pushing it. No caller-supplied dex or
+probe path is accepted.
 
 The writable-system prerequisite is fail-closed. Each emulator is mapped to
 its recorded PID and exact AVD reply (`<name>` followed by a separate `OK`),
@@ -35,8 +35,11 @@ Before CA installation, each owned emulator connects to the fixed local node
 endpoint and is expected to fail platform trust. After installation and reboot,
 the same HTTPS connection is made by `HttpsURLConnection` in the fixed
 `scripts/android-platform-trust-probe.java` probe. It uses the Android default
-platform TrustManager and must print `TRUSTED`; no custom trust store,
-hostname-verifier override, or insecure TLS flag is accepted.
+platform TrustManager and hostname verifier. The host supplies a fresh nonce
+and exact result path; the probe atomically publishes only `UNTRUSTED <nonce>`
+for a certificate-chain rejection or `TRUSTED <nonce>` for an HTTP 200 response.
+Connect, hostname, timeout, response, class, and lost-result failures are
+terminal; no adb exit status is interpreted as trust evidence.
 
 The bootstrap CA is installed at its OpenSSL subject-hash filename and checked
 for byte content, `0644`, `root:root`, and `u:object_r:system_file:s0` context.
