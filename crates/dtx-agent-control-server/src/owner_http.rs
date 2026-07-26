@@ -1,6 +1,7 @@
 //! Owner-authenticated HTTP boundary for Agent identity approval and opaque provisioning.
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -61,7 +62,8 @@ use crate::{
     AgentRouteBootstrapDeliveryCommand, AgentRouteBootstrapError, ConnectorCommandFence,
     ConnectorControlApplicationError, ConnectorLifecycleAction, ConnectorLifecycleCommandWrite,
     CreateAgentRunRequest, PostgresConnectorControlApplication, ProtobufDurableCommandDecoder,
-    approve_agent_identity, begin_agent_route_bootstrap as begin_agent_route_bootstrap_application,
+    approve_agent_identity,
+    begin_agent_route_bootstrap_with_receipt_keyring as begin_agent_route_bootstrap_application,
     create_agent_provisioning_delivery,
     deliver_agent_route_bootstrap as deliver_agent_route_bootstrap_application,
     get_agent_identity_approval, get_agent_provisioning_delivery, get_agent_provisioning_target,
@@ -459,6 +461,7 @@ pub struct PostgresAgentProvisioningOwnerBackend {
     store: PgStore,
     tenant_id: TenantId,
     connector_control: Arc<PostgresConnectorControlApplication>,
+    receipt_keyring: Option<Arc<BTreeMap<RouteHealthKeyId, [u8; 32]>>>,
 }
 
 impl PostgresAgentProvisioningOwnerBackend {
@@ -472,7 +475,17 @@ impl PostgresAgentProvisioningOwnerBackend {
             store,
             tenant_id,
             connector_control,
+            receipt_keyring: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_route_health_receipt_keyring(
+        mut self,
+        receipt_keyring: Arc<BTreeMap<RouteHealthKeyId, [u8; 32]>>,
+    ) -> Self {
+        self.receipt_keyring = Some(receipt_keyring);
+        self
     }
 
     async fn connector_projection_reply(
@@ -840,6 +853,7 @@ impl AgentProvisioningOwnerBackend for PostgresAgentProvisioningOwnerBackend {
                 command,
                 exact_body,
                 now,
+                self.receipt_keyring.as_deref(),
             )
             .await
             .map_err(map_agent_route_bootstrap_error)?;

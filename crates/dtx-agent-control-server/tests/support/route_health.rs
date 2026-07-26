@@ -70,7 +70,9 @@ impl<'a> RouteHealthFixtureBuilder<'a> {
         fixture::grant_agent_route_run_runtime_access(self.harness).await?;
         sqlx::raw_sql(
             "GRANT SELECT, INSERT ON agent.agent_route_health_receipts TO dtx_runtime_test;
-             GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_runtime_test;",
+             GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_runtime_test;
+             GRANT EXECUTE ON FUNCTION agent.route_health_receipt_preflight(bigint)
+                 TO dtx_runtime_test;",
         )
         .execute(self.harness.admin_pool())
         .await?;

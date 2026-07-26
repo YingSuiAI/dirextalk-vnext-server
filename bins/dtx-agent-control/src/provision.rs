@@ -99,7 +99,10 @@ const REQUIRED_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("agent.connector_control_credential_heads", "SELECT"),
     ("agent.connector_control_credential_rotations", "SELECT"),
 ];
-const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[("system.current_tenant_id()", "EXECUTE")];
+const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[
+    ("system.current_tenant_id()", "EXECUTE"),
+    ("agent.route_health_receipt_preflight(bigint)", "EXECUTE"),
+];
 const ACCEPTANCE_PREPARE_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("system.schema_versions", "SELECT"),
     ("system.tenant_stream_heads", "SELECT"),

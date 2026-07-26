@@ -85,6 +85,23 @@ pub struct RouteHealthHttpState {
     pub receipt_keyring: Option<Arc<BTreeMap<RouteHealthKeyId, [u8; 32]>>>,
 }
 
+pub(crate) fn validate_receipt_pin(
+    keyring: &BTreeMap<RouteHealthKeyId, [u8; 32]>,
+    key_id: Option<RouteHealthKeyId>,
+    public_key: Option<[u8; 32]>,
+) -> Result<(), RouteHealthParseError> {
+    let (Some(key_id), Some(public_key)) = (key_id, public_key) else {
+        return Err(RouteHealthParseError::InvalidShape);
+    };
+    let Some(seed) = keyring.get(&key_id) else {
+        return Err(RouteHealthParseError::InvalidShape);
+    };
+    if SigningKey::from_bytes(seed).verifying_key().to_bytes() != public_key {
+        return Err(RouteHealthParseError::InvalidShape);
+    }
+    Ok(())
+}
+
 /// Validates and durably records one Route Health observation. All relation
 /// checks, replay locking and head allocation occur in one tenant transaction;
 /// no receipt is emitted before the commit succeeds.
@@ -314,68 +331,39 @@ pub async fn record_route_health(
 /// This read-only gate runs before the HTTPS listener accepts traffic.
 pub async fn preflight_route_health_receipt_keyring(
     store: &PgStore,
-    tenant_id: TenantId,
     keyring: &BTreeMap<RouteHealthKeyId, [u8; 32]>,
     now_ms: i64,
 ) -> Result<(), RouteHealthParseError> {
-    let mut session = store
-        .begin_tenant(tenant_id)
+    let rows = store
+        .route_health_receipt_preflight(now_ms)
         .await
         .map_err(|_| RouteHealthParseError::InvalidShape)?;
-    let rows = sqlx::query(
-        "SELECT h.server_receipt_key_id, h.server_receipt_public_key,
-                b.server_receipt_key_id AS bootstrap_receipt_key_id,
-                b.server_receipt_public_key AS bootstrap_receipt_public_key
-           FROM agent.agent_route_binding_heads h
-           JOIN agent.agent_route_bootstraps b
-             ON b.tenant_id=h.tenant_id AND b.bootstrap_id=h.bootstrap_id
-          WHERE h.tenant_id=$1 AND h.expires_at_ms > $2 AND b.expires_at_ms > $2
-            AND b.state IN ('pending_recipient','recipient_ready','pending_delivery','installed')",
-    )
-    .bind(Uuid::from(tenant_id))
-    .bind(now_ms)
-    .fetch_all(session.connection())
-    .await
-    .map_err(|_| RouteHealthParseError::InvalidShape)?;
-    for row in rows {
-        let binding_key: Option<Uuid> = row
-            .try_get("server_receipt_key_id")
+    for (key_id, public_key, digest) in rows {
+        let key_id = key_id
+            .map(RouteHealthKeyId::try_from)
+            .transpose()
             .map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let binding_public: Option<Vec<u8>> = row
-            .try_get("server_receipt_public_key")
+        let public_key: Option<[u8; 32]> = public_key
+            .map(|value| value.try_into())
+            .transpose()
             .map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let bootstrap_key: Option<Uuid> = row
-            .try_get("bootstrap_receipt_key_id")
+        let digest: Option<[u8; 32]> = digest
+            .map(|value| value.try_into())
+            .transpose()
             .map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let bootstrap_public: Option<Vec<u8>> = row
-            .try_get("bootstrap_receipt_public_key")
-            .map_err(|_| RouteHealthParseError::InvalidShape)?;
-        if binding_key != bootstrap_key || binding_public != bootstrap_public {
-            let _ = session.rollback().await;
-            return Err(RouteHealthParseError::InvalidShape);
-        }
-        let (Some(key), Some(public)) = (binding_key, binding_public) else {
-            let _ = session.rollback().await;
+        let Some(public_key_bytes) = public_key else {
             return Err(RouteHealthParseError::InvalidShape);
         };
-        let key =
-            RouteHealthKeyId::try_from(key).map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let public: [u8; 32] = public
-            .try_into()
-            .map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let Some(seed) = keyring.get(&key) else {
-            let _ = session.rollback().await;
-            return Err(RouteHealthParseError::InvalidShape);
-        };
-        if SigningKey::from_bytes(seed).verifying_key().to_bytes() != public {
-            let _ = session.rollback().await;
+        let expected_digest = Sha256Digest::hash_domain(
+            crate::agent_route_bootstrap::AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN,
+            &public_key_bytes,
+        );
+        if digest != Some(*expected_digest.as_bytes()) {
             return Err(RouteHealthParseError::InvalidShape);
         }
+        validate_receipt_pin(keyring, key_id, Some(public_key_bytes))?;
     }
-    session
-        .rollback()
-        .await
-        .map_err(|_| RouteHealthParseError::InvalidShape)
+    Ok(())
 }
 
 fn replay_receipt(

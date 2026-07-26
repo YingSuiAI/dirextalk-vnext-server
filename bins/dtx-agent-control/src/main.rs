@@ -73,6 +73,7 @@ const REQUIRED_FUNCTION_PRIVILEGES: &[(&str, &str)] = &[
         "EXECUTE",
     ),
     ("agent.router_stable_names(text[])", "EXECUTE"),
+    ("agent.route_health_receipt_preflight(bigint)", "EXECUTE"),
     ("identity.identity_agent_reader_authorized()", "EXECUTE"),
     (
         "groups.private_conversation_owner_authorized(uuid,uuid,text)",
@@ -266,14 +267,10 @@ async fn run() -> Result<(), BootstrapError> {
         .and_then(|duration| {
             i64::try_from(duration.as_millis()).map_err(|_| BootstrapError::Tls)
         })?;
-    preflight_route_health_receipt_keyring(
-        &store,
-        config.owner_api.tenant_id,
-        &route_health_keyring,
-        preflight_now,
-    )
-    .await
-    .map_err(|_| BootstrapError::Tls)?;
+    preflight_route_health_receipt_keyring(&store, &route_health_keyring, preflight_now)
+        .await
+        .map_err(|_| BootstrapError::Tls)?;
+    let route_health_keyring = Arc::new(route_health_keyring);
     let route_health_receipt_public_key = route_health_receipt_key.public_key;
     let route_health_receipt_seed = route_health_receipt_key.seed;
     let gateway_roots = Arc::new(load_root_store(
@@ -387,7 +384,7 @@ async fn run() -> Result<(), BootstrapError> {
                 store: route_health_store,
                 receipt_key_id: config.route_health.receipt_key_id,
                 receipt_seed: route_health_receipt_seed,
-                receipt_keyring: Some(Arc::new(route_health_keyring)),
+                receipt_keyring: Some(Arc::clone(&route_health_keyring)),
             })
             .into_make_service_with_connect_info::<RouteHealthConnectInfo>(),
         )
@@ -396,11 +393,14 @@ async fn run() -> Result<(), BootstrapError> {
         })
         .await
     };
-    let owner_backend = Arc::new(PostgresAgentProvisioningOwnerBackend::new(
-        owner_api_store,
-        config.owner_api.tenant_id,
-        owner_application,
-    ));
+    let owner_backend = Arc::new(
+        PostgresAgentProvisioningOwnerBackend::new(
+            owner_api_store,
+            config.owner_api.tenant_id,
+            owner_application,
+        )
+        .with_route_health_receipt_keyring(route_health_keyring),
+    );
     let owner_api_server = async move {
         axum::serve(
             owner_api_listener,

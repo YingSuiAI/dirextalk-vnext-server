@@ -24,7 +24,9 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
     // ledger relations; production grants and tenant RLS remain unchanged.
     sqlx::raw_sql(
         "GRANT SELECT, INSERT ON agent.agent_route_health_receipts TO dtx_runtime_test;
-         GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_runtime_test;",
+         GRANT SELECT, INSERT, UPDATE ON agent.agent_route_health_heads TO dtx_runtime_test;
+         GRANT EXECUTE ON FUNCTION agent.route_health_receipt_preflight(bigint)
+             TO dtx_runtime_test;",
     )
     .execute(harness.admin_pool())
     .await?;
@@ -45,6 +47,19 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
         !credential_update,
         "credential snapshots must remain append-only for the runtime role"
     );
+    let preflight_execute: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege(
+             'dtx_runtime_test', 'agent.route_health_receipt_preflight(bigint)', 'EXECUTE')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(
+        preflight_execute,
+        "runtime role must call only the narrow preflight function"
+    );
+    let store = harness.runtime_store(2).await?;
+    let preflight_rows = store.route_health_receipt_preflight(i64::MAX).await?;
+    assert!(preflight_rows.is_empty());
     for constraint in [
         "connector_enrollment_intents_receipt_pin_shape",
         "connector_control_credentials_receipt_pin_shape",

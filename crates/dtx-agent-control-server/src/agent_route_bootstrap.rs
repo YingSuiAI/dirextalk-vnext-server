@@ -5,6 +5,7 @@
 //! result path may advance a bootstrap to `Installed`; no HTTP action can
 //! manufacture an eligible binding head.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use dtx_agent_control::{
@@ -316,6 +317,20 @@ pub async fn begin_agent_route_bootstrap(
     exact_body: Vec<u8>,
     now: UtcMillis,
 ) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
+    begin_agent_route_bootstrap_with_receipt_keyring(
+        store, credential, command, exact_body, now, None,
+    )
+    .await
+}
+
+pub async fn begin_agent_route_bootstrap_with_receipt_keyring(
+    store: &PgStore,
+    credential: &DeviceSessionCredential,
+    command: AgentRouteBootstrapBeginCommand,
+    exact_body: Vec<u8>,
+    now: UtcMillis,
+    receipt_keyring: Option<&BTreeMap<RouteHealthKeyId, [u8; 32]>>,
+) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
     validate_begin(&command, &exact_body, now)?;
     let request_digest =
         Sha256Digest::hash_domain(AGENT_ROUTE_BOOTSTRAP_BEGIN_REQUEST_DOMAIN, &exact_body);
@@ -330,6 +345,7 @@ pub async fn begin_agent_route_bootstrap(
         &exact_body,
         request_digest,
         now,
+        receipt_keyring,
     )
     .await;
     match result {
@@ -620,8 +636,10 @@ async fn record_agent_route_bootstrap_installed(
             "INSERT INTO agent.agent_route_binding_heads (
                  tenant_id, owner_identity_id, owner_device_id, installation_id, binding_id,
                  agent_control_device_id, bootstrap_id, delivery_id, route_id, route_fence,
-                 capsule_digest, expires_at_ms, installed_at_ms
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                 capsule_digest, expires_at_ms, installed_at_ms,
+                 server_receipt_key_id, server_receipt_public_key,
+                 server_receipt_public_key_digest
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
              ON CONFLICT (tenant_id, owner_identity_id, owner_device_id, installation_id,
                           binding_id, agent_control_device_id)
              DO UPDATE SET bootstrap_id=EXCLUDED.bootstrap_id,
@@ -630,7 +648,10 @@ async fn record_agent_route_bootstrap_installed(
                            route_fence=EXCLUDED.route_fence,
                            capsule_digest=EXCLUDED.capsule_digest,
                            expires_at_ms=EXCLUDED.expires_at_ms,
-                           installed_at_ms=EXCLUDED.installed_at_ms
+                           installed_at_ms=EXCLUDED.installed_at_ms,
+                           server_receipt_key_id=EXCLUDED.server_receipt_key_id,
+                           server_receipt_public_key=EXCLUDED.server_receipt_public_key,
+                           server_receipt_public_key_digest=EXCLUDED.server_receipt_public_key_digest
              WHERE agent.agent_route_binding_heads.bootstrap_id=EXCLUDED.bootstrap_id
                 OR agent.agent_route_binding_heads.expires_at_ms <= EXCLUDED.installed_at_ms",
         )
@@ -647,6 +668,12 @@ async fn record_agent_route_bootstrap_installed(
         .bind(command.capsule_digest.as_bytes().as_slice())
         .bind(row.expires_at.get())
         .bind(now.get())
+        .bind(row.server_receipt_key_id.map(Uuid::from))
+        .bind(row.server_receipt_public_key.map(|value| value.to_vec()))
+        .bind(
+            row.server_receipt_public_key_digest
+                .map(|value| value.as_bytes().to_vec()),
+        )
         .execute(session.connection())
         .await
         .map_err(map_sql)?;
@@ -746,6 +773,7 @@ async fn begin_in_transaction(
     _exact_body: &[u8],
     request_digest: Sha256Digest,
     now: UtcMillis,
+    receipt_keyring: Option<&BTreeMap<RouteHealthKeyId, [u8; 32]>>,
 ) -> Result<AgentRouteBootstrapOwnerReceipt, AgentRouteBootstrapError> {
     let owner = authenticate_owner(connection, credential, now).await?;
     if owner.0 != command.owner_identity_id || owner.1 != command.owner_device_id {
@@ -800,6 +828,12 @@ async fn begin_in_transaction(
     let connector_id = ensure_owner_target(connection, command).await?;
     let (server_receipt_key_id, server_receipt_public_key) =
         load_current_server_receipt_pin(connection, command.tenant_id, connector_id).await?;
+    if let Some(keyring) = receipt_keyring {
+        let public = server_receipt_public_key.ok_or(AgentRouteBootstrapError::Conflict)?;
+        let key_id = server_receipt_key_id.ok_or(AgentRouteBootstrapError::Conflict)?;
+        crate::route_health_http::validate_receipt_pin(keyring, Some(key_id), Some(public))
+            .map_err(|_| AgentRouteBootstrapError::Conflict)?;
+    }
     let server_receipt_public_key_digest = server_receipt_public_key
         .map(|value| Sha256Digest::hash_domain(AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN, &value));
     expire_live_tuple(connection, command, now).await?;

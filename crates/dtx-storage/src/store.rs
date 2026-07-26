@@ -5,6 +5,7 @@ use sqlx::{
     PgConnection, PgPool, Postgres, Transaction,
     postgres::{PgConnectOptions, PgListener, PgPoolOptions},
 };
+use uuid::Uuid;
 
 use crate::{
     StorageError,
@@ -204,6 +205,23 @@ impl PgStore {
             tenant_id,
             transaction,
         })
+    }
+
+    /// Reads the narrow cross-tenant Route Health signer preflight projection.
+    /// The database function is SECURITY DEFINER and returns no tenant or
+    /// route identifiers; callers cannot use this as a general RLS bypass.
+    pub async fn route_health_receipt_preflight(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<(Option<Uuid>, Option<Vec<u8>>, Option<Vec<u8>>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT server_receipt_key_id, server_receipt_public_key,
+                    server_receipt_public_key_digest
+               FROM agent.route_health_receipt_preflight($1)",
+        )
+        .bind(now_ms)
+        .fetch_all(&self.pool)
+        .await
     }
 }
 
