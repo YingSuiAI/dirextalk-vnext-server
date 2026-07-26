@@ -159,7 +159,11 @@ pub async fn record_route_health(
         let route = sqlx::query(
             "SELECT h.route_fence, h.bootstrap_id, h.expires_at_ms AS binding_expires_at_ms,
                     b.expires_at_ms AS bootstrap_expires_at_ms, b.state,
-                    b.route_health_key_id, b.route_health_public_key, b.connector_id
+                    b.route_health_key_id, b.route_health_public_key, b.connector_id,
+                    h.server_receipt_key_id AS binding_receipt_key_id,
+                    h.server_receipt_public_key AS binding_receipt_public_key,
+                    b.server_receipt_key_id AS bootstrap_receipt_key_id,
+                    b.server_receipt_public_key AS bootstrap_receipt_public_key
                FROM agent.agent_route_binding_heads h
                JOIN agent.agent_route_bootstraps b
                  ON b.tenant_id=h.tenant_id AND b.bootstrap_id=h.bootstrap_id
@@ -180,6 +184,10 @@ pub async fn record_route_health(
         let route_connector: Uuid = route.try_get("connector_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
         let stored_key: Uuid = route.try_get("route_health_key_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
         let stored_public: Vec<u8> = route.try_get("route_health_public_key").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let binding_receipt_key: Option<Uuid> = route.try_get("binding_receipt_key_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let binding_receipt_public: Option<Vec<u8>> = route.try_get("binding_receipt_public_key").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let bootstrap_receipt_key: Option<Uuid> = route.try_get("bootstrap_receipt_key_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let bootstrap_receipt_public: Option<Vec<u8>> = route.try_get("bootstrap_receipt_public_key").map_err(|_| RouteHealthParseError::InvalidShape)?;
 
         // A concurrent first-time request may have committed while this
         // transaction waited for the route row. Recheck the immutable ledger
@@ -218,9 +226,13 @@ pub async fn record_route_health(
             || bootstrap_expires_at_ms <= now_ms
             || bootstrap_state != "installed"
             || route_connector != Uuid::from(request.connector_id)
-            || stored_key != Uuid::from(request.health_key_id) || stored_public.len() != 32 { return Err(RouteHealthParseError::InvalidShape); }
+            || stored_key != Uuid::from(request.health_key_id) || stored_public.len() != 32
+            || binding_receipt_key != bootstrap_receipt_key
+            || binding_receipt_public != bootstrap_receipt_public
+            || binding_receipt_key.is_some() != binding_receipt_public.is_some()
+        { return Err(RouteHealthParseError::InvalidShape); }
         let active = sqlx::query(
-            "SELECT c.route_health_receipt_key_id, c.route_health_receipt_public_key
+            "SELECT 1
                 FROM agent.connector_leases l JOIN agent.connector_control_credentials c
              ON c.tenant_id=l.tenant_id AND c.connector_id=l.connector_id
              AND c.connector_generation=l.generation
@@ -233,10 +245,8 @@ pub async fn record_route_health(
             .bind(i64::try_from(request.lease_epoch).map_err(|_| RouteHealthParseError::InvalidShape)?)
             .bind(now_ms).bind(peer.certificate_fingerprint().as_bytes().to_vec())
             .fetch_optional(session.connection()).await.map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let Some(active) = active else { return Err(RouteHealthParseError::InvalidShape); };
-        let stored_receipt_key: Option<Uuid> = active.try_get("route_health_receipt_key_id").map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let stored_receipt_public: Option<Vec<u8>> = active.try_get("route_health_receipt_public_key").map_err(|_| RouteHealthParseError::InvalidShape)?;
-        let (receipt_key_id, receipt_seed) = match (stored_receipt_key, stored_receipt_public) {
+        let Some(_active) = active else { return Err(RouteHealthParseError::InvalidShape); };
+        let (receipt_key_id, receipt_seed) = match (binding_receipt_key, binding_receipt_public) {
             (None, None) if receipt_keyring.is_none() => (receipt_key_id, *receipt_seed),
             (None, None) => return Err(RouteHealthParseError::InvalidShape),
             (Some(key_id), Some(public_key)) => {
@@ -298,6 +308,74 @@ pub async fn record_route_health(
             Err(error)
         }
     }
+}
+
+/// Verifies every live route snapshot can be signed with the configured or retained keyring.
+/// This read-only gate runs before the HTTPS listener accepts traffic.
+pub async fn preflight_route_health_receipt_keyring(
+    store: &PgStore,
+    tenant_id: TenantId,
+    keyring: &BTreeMap<RouteHealthKeyId, [u8; 32]>,
+    now_ms: i64,
+) -> Result<(), RouteHealthParseError> {
+    let mut session = store
+        .begin_tenant(tenant_id)
+        .await
+        .map_err(|_| RouteHealthParseError::InvalidShape)?;
+    let rows = sqlx::query(
+        "SELECT h.server_receipt_key_id, h.server_receipt_public_key,
+                b.server_receipt_key_id AS bootstrap_receipt_key_id,
+                b.server_receipt_public_key AS bootstrap_receipt_public_key
+           FROM agent.agent_route_binding_heads h
+           JOIN agent.agent_route_bootstraps b
+             ON b.tenant_id=h.tenant_id AND b.bootstrap_id=h.bootstrap_id
+          WHERE h.tenant_id=$1 AND h.expires_at_ms > $2 AND b.expires_at_ms > $2
+            AND b.state IN ('pending_recipient','recipient_ready','pending_delivery','installed')",
+    )
+    .bind(Uuid::from(tenant_id))
+    .bind(now_ms)
+    .fetch_all(session.connection())
+    .await
+    .map_err(|_| RouteHealthParseError::InvalidShape)?;
+    for row in rows {
+        let binding_key: Option<Uuid> = row
+            .try_get("server_receipt_key_id")
+            .map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let binding_public: Option<Vec<u8>> = row
+            .try_get("server_receipt_public_key")
+            .map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let bootstrap_key: Option<Uuid> = row
+            .try_get("bootstrap_receipt_key_id")
+            .map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let bootstrap_public: Option<Vec<u8>> = row
+            .try_get("bootstrap_receipt_public_key")
+            .map_err(|_| RouteHealthParseError::InvalidShape)?;
+        if binding_key != bootstrap_key || binding_public != bootstrap_public {
+            let _ = session.rollback().await;
+            return Err(RouteHealthParseError::InvalidShape);
+        }
+        let (Some(key), Some(public)) = (binding_key, binding_public) else {
+            let _ = session.rollback().await;
+            return Err(RouteHealthParseError::InvalidShape);
+        };
+        let key =
+            RouteHealthKeyId::try_from(key).map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let public: [u8; 32] = public
+            .try_into()
+            .map_err(|_| RouteHealthParseError::InvalidShape)?;
+        let Some(seed) = keyring.get(&key) else {
+            let _ = session.rollback().await;
+            return Err(RouteHealthParseError::InvalidShape);
+        };
+        if SigningKey::from_bytes(seed).verifying_key().to_bytes() != public {
+            let _ = session.rollback().await;
+            return Err(RouteHealthParseError::InvalidShape);
+        }
+    }
+    session
+        .rollback()
+        .await
+        .map_err(|_| RouteHealthParseError::InvalidShape)
 }
 
 fn replay_receipt(

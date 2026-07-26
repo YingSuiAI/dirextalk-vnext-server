@@ -92,7 +92,8 @@ pub use provisioning::*;
 pub use route_health_http::{
     MAX_ROUTE_HEALTH_REQUEST_BYTES, ROUTE_HEALTH_MEDIA_TYPE_V1, ROUTE_HEALTH_RECEIPT_DOMAIN,
     ROUTE_HEALTH_SIGNATURE_DOMAIN, RouteHealthHttpState, RouteHealthParseError, RouteHealthReceipt,
-    RouteHealthRequest, record_route_health, route_health_router, route_health_router_with_state,
+    RouteHealthRequest, preflight_route_health_receipt_keyring, record_route_health,
+    route_health_router, route_health_router_with_state,
 };
 pub use route_health_transport::{RouteHealthConnectInfo, RouteHealthTlsListener};
 pub use run_notifications::RunOfferNotificationSubscription;

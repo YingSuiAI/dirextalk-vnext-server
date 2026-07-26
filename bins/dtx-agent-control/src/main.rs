@@ -13,7 +13,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -29,7 +29,8 @@ use dtx_agent_control_server::{
     PostgresConnectorControlApplication, ProtobufDurableCommandDecoder, RouteHealthConnectInfo,
     RouteHealthTlsListener, agent_provisioning_owner_router, agent_run_ingress_service,
     connector_control_service, connector_enrollment_service_with_route_health_pin,
-    connector_tls_incoming, route_health_router_with_state, tls_incoming,
+    connector_tls_incoming, preflight_route_health_receipt_keyring, route_health_router_with_state,
+    tls_incoming,
 };
 use dtx_security::{
     ConnectorCredentialAuthorizer, ConnectorMtlsClientVerifier, InternalServiceKind,
@@ -259,6 +260,20 @@ async fn run() -> Result<(), BootstrapError> {
     // included in readiness output or diagnostics.
     let (route_health_receipt_key, route_health_keyring) =
         load_receipt_keyring(&config.route_health)?;
+    let preflight_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| BootstrapError::Tls)
+        .and_then(|duration| {
+            i64::try_from(duration.as_millis()).map_err(|_| BootstrapError::Tls)
+        })?;
+    preflight_route_health_receipt_keyring(
+        &store,
+        config.owner_api.tenant_id,
+        &route_health_keyring,
+        preflight_now,
+    )
+    .await
+    .map_err(|_| BootstrapError::Tls)?;
     let route_health_receipt_public_key = route_health_receipt_key.public_key;
     let route_health_receipt_seed = route_health_receipt_key.seed;
     let gateway_roots = Arc::new(load_root_store(
