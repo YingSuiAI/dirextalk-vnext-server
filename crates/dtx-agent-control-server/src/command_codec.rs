@@ -520,6 +520,22 @@ fn decode_payload(
         (15, Some(v1::durable_command::Command::PrepareAgentRouteRecipient(command))) => {
             validate_wire_schema(exact_payload, PREPARE_AGENT_ROUTE_RECIPIENT_RULES)?;
             let expires_at_millis = positive_expiry(command.expires_at_millis)?;
+            let server_receipt_key_id = (!command.server_receipt_key_id.is_empty())
+                .then(|| command.server_receipt_key_id.parse::<RouteHealthKeyId>())
+                .transpose()
+                .map_err(|_| DurableCommandDecodeError)?;
+            let server_receipt_public_key = (!command.server_receipt_public_key.is_empty())
+                .then(|| {
+                    command
+                        .server_receipt_public_key
+                        .clone()
+                        .try_into()
+                        .map_err(|_| DurableCommandDecodeError)
+                })
+                .transpose()?;
+            if server_receipt_key_id.is_some() != server_receipt_public_key.is_some() {
+                return Err(DurableCommandDecodeError);
+            }
             Ok(ServerCommandPayload::PrepareAgentRouteRecipient(
                 PrepareAgentRouteRecipient {
                     bootstrap_id: command
@@ -553,18 +569,8 @@ fn decode_payload(
                     owner_signed_intent: OpaqueAgentRouteBytes::new(command.owner_signed_intent)
                         .map_err(|_| DurableCommandDecodeError)?,
                     expires_at_millis,
-                    server_receipt_key_id: (!command.server_receipt_key_id.is_empty())
-                        .then(|| command.server_receipt_key_id.parse::<RouteHealthKeyId>())
-                        .transpose()
-                        .map_err(|_| DurableCommandDecodeError)?,
-                    server_receipt_public_key: (!command.server_receipt_public_key.is_empty())
-                        .then(|| {
-                            command
-                                .server_receipt_public_key
-                                .try_into()
-                                .map_err(|_| DurableCommandDecodeError)
-                        })
-                        .transpose()?,
+                    server_receipt_key_id,
+                    server_receipt_public_key,
                 },
             ))
         }

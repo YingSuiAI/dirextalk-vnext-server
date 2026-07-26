@@ -255,6 +255,8 @@ fn production_encoder_round_trips_every_closed_command_without_reconstruction() 
             owner_signed_intent: OpaqueAgentRouteBytes::new(b"private-owner-intent".to_vec())
                 .unwrap(),
             expires_at_millis: 2_000,
+            server_receipt_key_id: Some("01890f47-3a5b-7c1d-8e2f-123456789ac8".parse().unwrap()),
+            server_receipt_public_key: Some([0x44; 32]),
         }),
         ServerCommandPayload::DeliverAgentRouteBootstrap(DeliverAgentRouteBootstrap {
             bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1"
@@ -286,6 +288,8 @@ fn production_encoder_round_trips_every_closed_command_without_reconstruction() 
                 .unwrap(),
             route_health_key_id: None,
             route_health_public_key_digest: None,
+            server_receipt_key_id: Some("01890f47-3a5b-7c1d-8e2f-123456789ac8".parse().unwrap()),
+            server_receipt_public_key_digest: Some(Sha256Digest::from_bytes([0x55; 32])),
         }),
     ];
     for payload in payloads {
@@ -323,6 +327,8 @@ fn rejects_malformed_route_bootstrap_payloads_without_logging_opaque_bytes() {
         agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5".to_owned(),
         route_health_key_id: String::new(),
         route_health_public_key_digest: Vec::new(),
+        server_receipt_key_id: String::new(),
+        server_receipt_public_key_digest: Vec::new(),
     }
     .encode_to_vec();
     let invalid_digest = command_payload_digest(&invalid_digest_payload)
@@ -347,6 +353,8 @@ fn rejects_malformed_route_bootstrap_payloads_without_logging_opaque_bytes() {
         agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5".to_owned(),
         route_health_key_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1".to_owned(),
         route_health_public_key_digest: Vec::new(),
+        server_receipt_key_id: String::new(),
+        server_receipt_public_key_digest: Vec::new(),
     }
     .encode_to_vec();
     let invalid_health_pair_digest = command_payload_digest(&invalid_health_pair_payload)
@@ -372,6 +380,8 @@ fn rejects_malformed_route_bootstrap_payloads_without_logging_opaque_bytes() {
         owner_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ac4".to_owned(),
         owner_signed_intent: b"private-owner-intent".to_vec(),
         expires_at_millis: 0,
+        server_receipt_key_id: String::new(),
+        server_receipt_public_key: Vec::new(),
     }
     .encode_to_vec();
     let invalid_expiry = command_payload_digest(&invalid_expiry_payload)
@@ -382,6 +392,37 @@ fn rejects_malformed_route_bootstrap_payloads_without_logging_opaque_bytes() {
             .decode(&encode_command(15, &invalid_expiry_payload, invalid_expiry))
             .is_err()
     );
+
+    for (server_receipt_key_id, server_receipt_public_key) in [
+        (
+            "01890f47-3a5b-7c1d-8e2f-123456789ac8".to_owned(),
+            Vec::new(),
+        ),
+        (String::new(), vec![0x44; 32]),
+    ] {
+        let malformed_prepare = v1::PrepareAgentRouteRecipient {
+            bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1".to_owned(),
+            tenant_id: "01890f47-3a5b-7c1d-8e2f-123456789ac2".to_owned(),
+            installation_id: "01890f47-3a5b-7c1d-8e2f-123456789ab4".to_owned(),
+            binding_id: "01890f47-3a5b-7c1d-8e2f-123456789ab3".to_owned(),
+            agent_control_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ab5".to_owned(),
+            owner_identity_id: OWNER_IDENTITY_ID.to_owned(),
+            owner_device_id: "01890f47-3a5b-7c1d-8e2f-123456789ac4".to_owned(),
+            owner_signed_intent: b"private-owner-intent".to_vec(),
+            expires_at_millis: 2_000,
+            server_receipt_key_id,
+            server_receipt_public_key,
+        }
+        .encode_to_vec();
+        let digest = command_payload_digest(&malformed_prepare)
+            .expect("bounded payload")
+            .as_bytes();
+        assert!(
+            ProtobufDurableCommandDecoder
+                .decode(&encode_command(15, &malformed_prepare, digest))
+                .is_err()
+        );
+    }
 
     let payload = PrepareAgentRouteRecipient {
         bootstrap_id: "01890f47-3a5b-7c1d-8e2f-123456789ac1"
@@ -405,6 +446,8 @@ fn rejects_malformed_route_bootstrap_payloads_without_logging_opaque_bytes() {
             .unwrap(),
         owner_signed_intent: OpaqueAgentRouteBytes::new(b"private-owner-intent".to_vec()).unwrap(),
         expires_at_millis: 2_000,
+        server_receipt_key_id: None,
+        server_receipt_public_key: None,
     };
     let debug = format!("{payload:?}");
     assert!(!debug.contains("private-owner-intent"));

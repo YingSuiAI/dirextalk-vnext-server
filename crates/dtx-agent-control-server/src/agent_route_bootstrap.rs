@@ -1384,11 +1384,16 @@ async fn load_current_server_receipt_pin(
     connector_id: ConnectorId,
 ) -> Result<(Option<RouteHealthKeyId>, Option<[u8; 32]>), AgentRouteBootstrapError> {
     let row = sqlx::query(
-        "SELECT route_health_receipt_key_id,
-                route_health_receipt_public_key
-           FROM agent.connector_control_credentials
-          WHERE tenant_id=$1 AND connector_id=$2
-          ORDER BY connector_generation DESC, credential_revision DESC
+        "SELECT c.route_health_receipt_key_id,
+                c.route_health_receipt_public_key
+           FROM agent.connector_control_credential_heads AS h
+           JOIN agent.connector_control_credential_revisions AS r
+             ON r.tenant_id=h.tenant_id AND r.connector_id=h.connector_id
+            AND r.authorization_revision=h.current_revision
+           JOIN agent.connector_control_credentials AS c
+             ON c.tenant_id=r.tenant_id AND c.connector_id=r.connector_id
+            AND c.credential_id=r.current_credential_id
+          WHERE h.tenant_id=$1 AND h.connector_id=$2
           LIMIT 1",
     )
     .bind(Uuid::from(tenant_id))
@@ -1453,45 +1458,12 @@ async fn resolve_owned_agent_route_bootstrap_target(
     .map_err(map_sql)?;
     let (connector_id, agent_control_device_id) =
         target.ok_or(AgentRouteBootstrapError::NotFound)?;
-    let pin = sqlx::query(
-        "SELECT route_health_receipt_key_id, route_health_receipt_public_key
-           FROM agent.connector_control_credentials
-          WHERE tenant_id=$1 AND connector_id=$2
-          ORDER BY connector_generation DESC, credential_revision DESC
-          LIMIT 1",
+    let (server_receipt_key_id, server_receipt_public_key) = load_current_server_receipt_pin(
+        connection,
+        tenant_id,
+        ConnectorId::try_from(connector_id).map_err(|_| AgentRouteBootstrapError::Unavailable)?,
     )
-    .bind(Uuid::from(tenant_id))
-    .bind(connector_id)
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(map_sql)?;
-    let key_id: Option<Uuid> = pin
-        .as_ref()
-        .map(|row| row.try_get("route_health_receipt_key_id"))
-        .transpose()
-        .map_err(|_| AgentRouteBootstrapError::Unavailable)?
-        .flatten();
-    let public: Option<Vec<u8>> = pin
-        .as_ref()
-        .map(|row| row.try_get("route_health_receipt_public_key"))
-        .transpose()
-        .map_err(|_| AgentRouteBootstrapError::Unavailable)?
-        .flatten();
-    let (server_receipt_key_id, server_receipt_public_key) = match (key_id, public) {
-        (None, None) => (None, None),
-        (Some(key_id), Some(public)) => (
-            Some(
-                RouteHealthKeyId::try_from(key_id)
-                    .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
-            ),
-            Some(
-                public
-                    .try_into()
-                    .map_err(|_| AgentRouteBootstrapError::Unavailable)?,
-            ),
-        ),
-        _ => return Err(AgentRouteBootstrapError::Unavailable),
-    };
+    .await?;
     Ok(AgentRouteBootstrapTarget {
         connector_id: ConnectorId::try_from(connector_id)
             .map_err(|_| AgentRouteBootstrapError::Unavailable)?,

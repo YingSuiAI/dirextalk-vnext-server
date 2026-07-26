@@ -88,7 +88,11 @@ impl PrepareAgentRouteRecipient {
     ///
     /// Rejects an empty or oversized opaque intent, or a non-positive expiry.
     pub fn validate(&self) -> Result<(), CommandError> {
-        validate_opaque_command_payload(&self.owner_signed_intent, self.expires_at_millis)
+        validate_opaque_command_payload(&self.owner_signed_intent, self.expires_at_millis)?;
+        if self.server_receipt_key_id.is_some() != self.server_receipt_public_key.is_some() {
+            return Err(CommandError::InvalidCommandPayload);
+        }
+        Ok(())
     }
 }
 

@@ -16,11 +16,12 @@ use axum::{
 };
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_agent_control::{
-    EnrollmentRequest, EnrollmentToken, EnrollmentTranscript, RuntimeClaims, ServerCommandPayload,
-    Sha256Digest as ControlDigest,
+    CredentialRotationTranscript, EnrollmentRequest, EnrollmentToken, EnrollmentTranscript,
+    RuntimeClaims, ServerCommandPayload, Sha256Digest as ControlDigest,
 };
+use dtx_agent_control_proto::v1;
 use dtx_agent_control_server::{
-    AgentProvisioningInstalledReceiptFacts, ConnectorCertificateAuthority,
+    AgentProvisioningInstalledReceiptFacts, ConnectorCertificateAuthority, ConnectorCommandFence,
     ConnectorControlApplication, ConnectorControlApplicationError, ConnectorControlPolicy,
     ConnectorCredentialAuthorizationIndex, CreateConnectorEnrollmentRequest,
     MAX_CONNECTOR_PROJECTION_BINDINGS, ParsedAgentProvisioningInstalled,
@@ -28,8 +29,9 @@ use dtx_agent_control_server::{
     ParsedAgentRouteRecipientReady, ParsedCapacity, ParsedCommandAcknowledgement, ParsedEnrollment,
     ParsedHello, ParsedLeaseFence, ParsedProtocolRange, ParsedProvisioningRecipientAnnouncement,
     PostgresAgentProvisioningOwnerBackend, PostgresConnectorControlApplication,
-    ProtobufDurableCommandDecoder, agent_provisioning_installed_receipt_digest,
-    agent_provisioning_owner_router,
+    ProtobufDurableCommandDecoder, RotateConnectorCredentialRequest,
+    agent_provisioning_installed_receipt_digest, agent_provisioning_owner_router,
+    build_lease_fence, parse_credential_rotation_proof,
 };
 use dtx_agent_host::AgentHost;
 use dtx_agent_persistence::{
@@ -3068,7 +3070,7 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
         .as_bytes(),
     );
     let app = Arc::new(
-        application(store.clone(), issuer, index.clone())
+        application(store.clone(), issuer.clone(), index.clone())
             .with_route_health_receipt_pin(server_pin_a, server_public_a),
     );
     let enrollment = app
@@ -3348,6 +3350,17 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
             .windows(server_pin_a.to_string().len())
             .any(|window| { window == server_pin_a.to_string().as_bytes() })
     );
+    let target_uri = format!(
+        "/v1/agent-installations/{installation_id}/agent-route-target?binding_id={binding_id}"
+    );
+    let target_a = owner_get(router.clone(), &target_uri, &owner_authorization).await?;
+    assert_eq!(target_a.0, StatusCode::OK);
+    assert!(
+        target_a
+            .1
+            .windows(server_pin_a.to_string().len())
+            .any(|window| window == server_pin_a.to_string().as_bytes())
+    );
 
     let server_pin_b = RouteHealthKeyId::new();
     let server_public_b = [0x3b; 32];
@@ -3358,26 +3371,129 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
         )
         .as_bytes(),
     );
-    let mut rotation_tx = harness.admin_pool().begin().await?;
-    sqlx::query("ALTER TABLE agent.connector_control_credentials DISABLE TRIGGER USER")
-        .execute(&mut *rotation_tx)
+    let mut wrong_pin = rejected.clone();
+    wrong_pin.server_receipt_key_id = Some(server_pin_b);
+    wrong_pin.server_receipt_public_key_digest = Some(server_digest_b);
+    assert_eq!(
+        app.reject_agent_route_bootstrap(
+            authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
+            wrong_pin,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict)
+    );
+    let rotated_app = Arc::new(
+        application(store.clone(), issuer.clone(), index.clone())
+            .with_route_health_receipt_pin(server_pin_b, server_public_b),
+    );
+    let rotation_request = RotateConnectorCredentialRequest {
+        fence: ConnectorCommandFence {
+            tenant_id,
+            connector_id: connector.connector_id(),
+            generation: completion.credential.generation(),
+            spec_revision: completion.credential.revision(),
+        },
+        operation_id: RequestId::new(),
+        deadline_millis: now() + 300_000,
+    };
+    let rotation_command = rotated_app
+        .enqueue_credential_rotation(rotation_request)
         .await?;
-    sqlx::query(
-        "UPDATE agent.connector_control_credentials
-            SET route_health_receipt_key_id = $3,
-                route_health_receipt_public_key = $4
-          WHERE tenant_id = $1 AND connector_id = $2",
-    )
-    .bind(Uuid::from(tenant_id))
-    .bind(Uuid::from(connector.connector_id()))
-    .bind(Uuid::from(server_pin_b))
-    .bind(server_public_b.to_vec())
-    .execute(&mut *rotation_tx)
-    .await?;
-    sqlx::query("ALTER TABLE agent.connector_control_credentials ENABLE TRIGGER USER")
-        .execute(&mut *rotation_tx)
+    let ServerCommandPayload::RotateCredential(rotation) = rotation_command.payload() else {
+        return Err("expected credential rotation command".into());
+    };
+    let successor_control = key(139);
+    let successor_public_key =
+        Ed25519PublicKey::try_from(successor_control.verifying_key().to_bytes())?;
+    let transcript = CredentialRotationTranscript::new(
+        tenant_id,
+        connector.connector_id(),
+        rotation_request.operation_id,
+        completion.credential.credential_id(),
+        completion.credential.generation(),
+        rotation_command.sequence(),
+        rotation_command.payload_digest(),
+        rotation.successor_revision(),
+        rotation.nonce(),
+        successor_public_key,
+    )?;
+    let signing_bytes = transcript.signing_bytes();
+    let current_refresh = key(137);
+    let rotation_proof = parse_credential_rotation_proof(v1::CredentialRotationProof {
+        fence: Some(build_lease_fence(fence)),
+        request_id: rotation_request.operation_id.to_string(),
+        command_sequence: rotation_command.sequence(),
+        command_payload_digest: rotation_command.payload_digest().as_bytes().to_vec(),
+        encoded_command_digest: rotation_command
+            .encoded_command_digest()
+            .as_bytes()
+            .to_vec(),
+        successor_revision: rotation.successor_revision().get(),
+        new_control_public_key: successor_public_key.as_bytes().to_vec(),
+        current_refresh_signature: current_refresh.sign(&signing_bytes).to_bytes().to_vec(),
+        new_control_signature: successor_control.sign(&signing_bytes).to_bytes().to_vec(),
+    })?;
+    let rotation_completion = rotated_app
+        .rotate_credential(
+            authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
+            rotation_proof,
+        )
         .await?;
-    rotation_tx.commit().await?;
+    let pending_target = owner_get(router.clone(), &target_uri, &owner_authorization).await?;
+    assert_eq!(pending_target.0, StatusCode::OK);
+    assert!(
+        pending_target
+            .1
+            .windows(server_pin_a.to_string().len())
+            .any(|window| window == server_pin_a.to_string().as_bytes())
+    );
+    assert!(
+        !pending_target
+            .1
+            .windows(server_pin_b.to_string().len())
+            .any(|window| window == server_pin_b.to_string().as_bytes())
+    );
+    let successor_peer = authenticate_at(
+        index.clone(),
+        &ca_der,
+        &rotation_completion.credential,
+        auth_time,
+    )?;
+    let promoted = rotated_app
+        .open_control(
+            successor_peer,
+            ParsedHello {
+                tenant_id,
+                connector_id: connector.connector_id(),
+                host_id: host.host_id(),
+                boot_id: BootId::new(),
+                connector_generation: rotation_completion.credential.generation(),
+                spec_revision: rotation_completion.credential.revision(),
+                protocol: ParsedProtocolRange {
+                    minimum_major: 1,
+                    minimum_minor: 6,
+                    maximum_major: 1,
+                    maximum_minor: 6,
+                },
+                runtime_claims: claims()?,
+                capacity: capacity(),
+                last_applied_command_sequence: rotation_command.sequence(),
+                required_server_capabilities: vec!["agent-route-health.v1".into()],
+            },
+        )
+        .await?;
+    assert_eq!(
+        promoted.lease.fence().generation().get(),
+        rotation_completion.credential.generation()
+    );
+    let promoted_target = owner_get(router.clone(), &target_uri, &owner_authorization).await?;
+    assert_eq!(promoted_target.0, StatusCode::OK);
+    assert!(
+        promoted_target
+            .1
+            .windows(server_pin_b.to_string().len())
+            .any(|window| window == server_pin_b.to_string().as_bytes())
+    );
 
     let old_receipt_after_rotation = owner_get(
         router.clone(),
@@ -3397,13 +3513,21 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
         PostgresAgentProvisioningOwnerBackend::new(store.clone(), tenant_id, restarted_app),
     ));
     let old_receipt_after_restart = owner_get(
-        restarted_router,
+        restarted_router.clone(),
         &format!("/v1/agent-route-bootstraps/{bootstrap_id}"),
         &owner_authorization,
     )
     .await?;
     assert_eq!(old_receipt_after_restart.0, StatusCode::OK);
     assert_eq!(old_receipt_after_restart.1, old_receipt.1);
+    let restart_target = owner_get(restarted_router, &target_uri, &owner_authorization).await?;
+    assert_eq!(restart_target.0, StatusCode::OK);
+    assert!(
+        restart_target
+            .1
+            .windows(server_pin_b.to_string().len())
+            .any(|window| window == server_pin_b.to_string().as_bytes())
+    );
 
     let successor_id = AgentRouteBootstrapId::new();
     let successor = owner_post(
@@ -3434,17 +3558,6 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
             .any(|window| window == server_pin_b.to_string().as_bytes())
     );
 
-    let mut wrong_pin = rejected;
-    wrong_pin.server_receipt_key_id = Some(server_pin_b);
-    wrong_pin.server_receipt_public_key_digest = Some(server_digest_b);
-    assert_eq!(
-        app.reject_agent_route_bootstrap(
-            authenticate_at(index, &ca_der, &completion.credential, auth_time)?,
-            wrong_pin,
-        )
-        .await,
-        Err(ConnectorControlApplicationError::Conflict)
-    );
     Ok(())
 }
 

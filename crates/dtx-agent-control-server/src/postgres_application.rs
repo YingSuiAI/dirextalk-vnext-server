@@ -2445,7 +2445,7 @@ impl PostgresConnectorControlApplication {
         request
             .verify(current.control_key())
             .map_err(|_| ConnectorControlApplicationError::AuthenticationFailed)?;
-        let credential = self.issue_credential_raw(
+        let credential = self.issue_credential(
             tenant_id,
             request.connector_id(),
             request.generation(),
@@ -2454,11 +2454,6 @@ impl PostgresConnectorControlApplication {
             current.refresh_key(),
             now,
         )?;
-        let credential = current
-            .route_health_receipt_pin()
-            .map_or(credential.clone(), |(key_id, public_key)| {
-                credential.with_route_health_receipt_pin(key_id, public_key)
-            });
         authorization
             .propose_reissue(credential.clone())
             .map_err(|_| ConnectorControlApplicationError::AuthenticationFailed)?;
@@ -4638,7 +4633,7 @@ impl PostgresConnectorControlApplication {
                 {
                     return Err(ConnectorControlApplicationError::AuthenticationFailed);
                 }
-                let credential = self.issue_credential_raw(
+                let credential = self.issue_credential(
                     proof_fence.tenant_id,
                     proof_fence.connector_id,
                     request.transcript().successor_generation(),
@@ -4647,12 +4642,6 @@ impl PostgresConnectorControlApplication {
                     current.refresh_key(),
                     now,
                 )?;
-                let credential = current.route_health_receipt_pin().map_or(
-                    credential.clone(),
-                    |(key_id, public_key)| {
-                        credential.with_route_health_receipt_pin(key_id, public_key)
-                    },
-                );
                 authorization
                     .propose_successor(&request, credential)
                     .map_err(|_| ConnectorControlApplicationError::AuthenticationFailed)?
