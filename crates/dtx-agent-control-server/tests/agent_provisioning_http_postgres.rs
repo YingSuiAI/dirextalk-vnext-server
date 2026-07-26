@@ -3732,7 +3732,11 @@ async fn owner_agent_route_target_resolves_only_one_active_owned_binding()
     let revision = bindings.binding(binding_ref)?.revision();
     bindings.disable(binding_ref, revision)?;
     repository
-        .save(session.connection(), &bindings, now())
+        .save(
+            session.connection(),
+            &bindings,
+            next_binding_fixture_timestamp(),
+        )
         .await?;
     session.commit().await?;
     let disabled_binding = owner_get(router.clone(), &target_uri, &owner_authorization).await?;
@@ -3752,7 +3756,11 @@ async fn owner_agent_route_target_resolves_only_one_active_owned_binding()
     let revision = bindings.binding(binding_ref)?.revision();
     bindings.enable(binding_ref, revision, &installation, &device)?;
     repository
-        .save(session.connection(), &bindings, now())
+        .save(
+            session.connection(),
+            &bindings,
+            next_binding_fixture_timestamp(),
+        )
         .await?;
     session.commit().await?;
     let restored = owner_get(router.clone(), &target_uri, &owner_authorization).await?;
