@@ -84,6 +84,7 @@ use uuid::Uuid;
 static TEST_NOW: OnceLock<i64> = OnceLock::new();
 static BINDING_FIXTURE_CLOCK_OFFSET: AtomicI64 = AtomicI64::new(0);
 const AGENT_ID: &str = "dtxa17sv7zwzpr7aduy467sdm3pkmxe6if34eoarhaxdnau44fjwfseda";
+const PRIVATE_CONVERSATION_PROFILE_V1: &[u8] = b"dirextalk/private-conversation-agent-profile/v1\nmention-only\nfuture-messages\nsend-messages\nexclude-history\nexclude-attachments\nexclude-tools\nexclude-cloud\nexclude-egress";
 const PRIVATE_CONVERSATION_TOOLS_PROFILE_V1: &[u8] = b"dirextalk/private-conversation-agent-profile/v1\nmention-only\nfuture-messages\nsend-messages\nexclude-history\nexclude-attachments\ninclude-tools\nexclude-cloud\nexclude-egress";
 pub(crate) fn init_test_clock() {
     TEST_NOW.get_or_init(|| {
@@ -859,6 +860,10 @@ pub(crate) fn conversation_grant_body(
 
 pub(crate) fn private_conversation_tools_profile_v1_digest() -> [u8; 32] {
     *Sha256Digest::hash_domain(&[], PRIVATE_CONVERSATION_TOOLS_PROFILE_V1).as_bytes()
+}
+
+pub(crate) fn private_conversation_profile_v1_digest() -> [u8; 32] {
+    *Sha256Digest::hash_domain(&[], PRIVATE_CONVERSATION_PROFILE_V1).as_bytes()
 }
 
 #[allow(clippy::too_many_arguments)]

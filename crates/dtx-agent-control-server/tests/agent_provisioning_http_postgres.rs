@@ -1435,7 +1435,7 @@ async fn private_conversation_owner_grant_http_is_exact_and_revoke_fences_persis
         owner_device_id,
         &owner_device_key,
         Some(now() + 600_000),
-        Some([0x91; 32]),
+        Some(private_conversation_profile_v1_digest()),
         expiring_proof_at,
     )?;
     let first = owner_conversation_grant_mutation(
