@@ -118,6 +118,151 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
     let store = harness.runtime_store(2).await?;
     let preflight_rows = store.route_health_receipt_preflight(i64::MAX).await?;
     assert!(preflight_rows.is_empty());
+    let tenant_a = uuid::Uuid::now_v7();
+    let tenant_b = uuid::Uuid::now_v7();
+    let bootstrap_b = uuid::Uuid::now_v7();
+    let installation_b = uuid::Uuid::now_v7();
+    let binding_b = uuid::Uuid::now_v7();
+    let device_b = uuid::Uuid::now_v7();
+    let control_device_b = uuid::Uuid::now_v7();
+    let connector_b = uuid::Uuid::now_v7();
+    let recipient_b = uuid::Uuid::now_v7();
+    let route_b = uuid::Uuid::now_v7();
+    let delivery_b = uuid::Uuid::now_v7();
+    let head_b = uuid::Uuid::now_v7();
+    let key_b = uuid::Uuid::now_v7();
+    let key_c = uuid::Uuid::now_v7();
+    let public_b = vec![0x51; 32];
+    let public_c = vec![0x52; 32];
+    let digest_b = dtx_wire::Sha256Digest::hash_domain(
+        dtx_agent_control_server::AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN,
+        &public_b,
+    );
+    let digest_c = dtx_wire::Sha256Digest::hash_domain(
+        dtx_agent_control_server::AGENT_ROUTE_HEALTH_PUBLIC_KEY_DOMAIN,
+        &public_c,
+    );
+    let mut admin = harness.admin_pool().acquire().await?;
+    sqlx::query("SET session_replication_role='replica'")
+        .execute(&mut *admin)
+        .await?;
+    sqlx::query(
+        "INSERT INTO system.tenant_stream_heads (tenant_id,last_sequence) VALUES ($1,0),($2,0)",
+    )
+    .bind(tenant_a)
+    .bind(tenant_b)
+    .execute(&mut *admin)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.agent_route_bootstraps (
+             tenant_id, bootstrap_id, owner_identity_id, owner_device_id,
+             installation_id, binding_id, agent_control_device_id, connector_id,
+             route_fence, owner_signed_intent, request_digest, begin_receipt_bytes,
+             begin_receipt_digest, recipient_id, recipient_capsule_digest,
+             opaque_recipient_capsule, route_id, delivery_id, bootstrap_capsule_digest,
+             opaque_sealed_bootstrap, delivery_request_digest, delivery_receipt_bytes,
+             delivery_receipt_digest, state, expires_at_ms, created_at_ms, updated_at_ms,
+             server_receipt_key_id, server_receipt_public_key, server_receipt_public_key_digest
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,'installed',$24,$25,$26,$27,$28,$29)",
+    )
+    .bind(tenant_b)
+    .bind(bootstrap_b)
+    .bind("dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la")
+    .bind(device_b)
+    .bind(installation_b)
+    .bind(binding_b)
+    .bind(control_device_b)
+    .bind(connector_b)
+    .bind(vec![0x61_u8; 32])
+    .bind(vec![1_u8])
+    .bind(vec![0_u8; 32])
+    .bind(vec![1_u8])
+    .bind(vec![0_u8; 32])
+    .bind(recipient_b)
+    .bind(vec![0_u8; 32])
+    .bind(vec![1_u8])
+    .bind(route_b)
+    .bind(delivery_b)
+    .bind(vec![0_u8; 32])
+    .bind(vec![1_u8])
+    .bind(vec![0_u8; 32])
+    .bind(vec![1_u8])
+    .bind(vec![0_u8; 32])
+    .bind(100_000_i64)
+    .bind(1_i64)
+    .bind(1_i64)
+    .bind(key_b)
+    .bind(public_b)
+    .bind(digest_b.as_bytes().to_vec())
+    .execute(&mut *admin)
+    .await?;
+    sqlx::query(
+        "INSERT INTO agent.agent_route_binding_heads (
+             tenant_id, owner_identity_id, owner_device_id, installation_id, binding_id,
+             agent_control_device_id, bootstrap_id, delivery_id, route_id, route_fence,
+             capsule_digest, expires_at_ms, installed_at_ms,
+             server_receipt_key_id, server_receipt_public_key, server_receipt_public_key_digest
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+    )
+    .bind(tenant_b)
+    .bind("dtxi1eci4tbb6kk5wk4vwv5ckekifwqtxy7bdd5vbmd7vac45r5xwu4la")
+    .bind(device_b)
+    .bind(installation_b)
+    .bind(binding_b)
+    .bind(control_device_b)
+    .bind(bootstrap_b)
+    .bind(delivery_b)
+    .bind(route_b)
+    .bind(vec![0x61_u8; 32])
+    .bind(vec![0_u8; 32])
+    .bind(100_000_i64)
+    .bind(2_i64)
+    .bind(key_c)
+    .bind(public_c)
+    .bind(digest_c.as_bytes().to_vec())
+    .execute(&mut *admin)
+    .await?;
+    sqlx::query("RESET session_replication_role")
+        .execute(&mut *admin)
+        .await?;
+    sqlx::query(
+        "GRANT EXECUTE ON FUNCTION agent.route_health_receipt_preflight(bigint)
+             TO dtx_runtime_test",
+    )
+    .execute(&mut *admin)
+    .await?;
+    sqlx::query("SET ROLE dtx_runtime_test")
+        .execute(&mut *admin)
+        .await?;
+    let bypass_rls: bool = sqlx::query_scalar(
+        "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname=current_user",
+    )
+    .fetch_one(&mut *admin)
+    .await?;
+    assert!(!bypass_rls);
+    sqlx::query("SELECT set_config('dtx.tenant_id', $1, false)")
+        .bind(tenant_a.to_string())
+        .execute(&mut *admin)
+        .await?;
+    let global_rows: Vec<(Option<uuid::Uuid>, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT server_receipt_key_id, server_receipt_public_key,
+                server_receipt_public_key_digest
+           FROM agent.route_health_receipt_preflight(0)",
+    )
+    .fetch_all(&mut *admin)
+    .await?;
+    assert!(
+        global_rows
+            .iter()
+            .any(|(key, public, digest)| { key.is_none() && public.is_none() && digest.is_none() })
+    );
+    let hidden_rows = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent.agent_route_bootstraps WHERE tenant_id=$1",
+    )
+    .bind(tenant_b)
+    .fetch_one(&mut *admin)
+    .await;
+    assert!(hidden_rows.is_err());
     for constraint in [
         "connector_enrollment_intents_receipt_pin_shape",
         "connector_control_credentials_receipt_pin_shape",
