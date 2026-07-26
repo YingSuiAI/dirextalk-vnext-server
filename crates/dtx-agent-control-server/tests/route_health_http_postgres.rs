@@ -57,6 +57,64 @@ async fn route_health_migration_and_runtime_role_preflight() -> Result<(), Box<d
         preflight_execute,
         "runtime role must call only the narrow preflight function"
     );
+    let role_facts: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT rolcanlogin, rolsuper, rolbypassrls, rolcreatedb,
+                rolcreaterole, rolreplication,
+                EXISTS (SELECT 1 FROM pg_auth_members
+                         WHERE roleid=pg_roles.oid OR member=pg_roles.oid)
+           FROM pg_roles
+          WHERE rolname='dtx_agent_route_health_preflight'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(
+        role_facts,
+        (false, false, false, false, false, false, false)
+    );
+    let owner: String = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(p.proowner)
+           FROM pg_proc p
+          WHERE p.oid='agent.route_health_receipt_preflight(bigint)'::regprocedure",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(owner, "dtx_agent_route_health_preflight");
+    let schema_usage: bool = sqlx::query_scalar(
+        "SELECT has_schema_privilege(
+             'dtx_agent_route_health_preflight', 'agent', 'USAGE')",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert!(schema_usage);
+    let bootstrap_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM information_schema.role_column_grants
+          WHERE grantee='dtx_agent_route_health_preflight'
+            AND table_schema='agent' AND table_name='agent_route_bootstraps'
+            AND privilege_type='SELECT'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    let head_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM information_schema.role_column_grants
+          WHERE grantee='dtx_agent_route_health_preflight'
+            AND table_schema='agent' AND table_name='agent_route_binding_heads'
+            AND privilege_type='SELECT'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(bootstrap_columns, 7);
+    assert_eq!(head_columns, 6);
+    let policy_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM pg_policies
+          WHERE schemaname='agent'
+            AND policyname='route_health_preflight_public_read'",
+    )
+    .fetch_one(harness.admin_pool())
+    .await?;
+    assert_eq!(policy_count, 2);
     let store = harness.runtime_store(2).await?;
     let preflight_rows = store.route_health_receipt_preflight(i64::MAX).await?;
     assert!(preflight_rows.is_empty());

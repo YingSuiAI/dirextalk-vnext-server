@@ -3159,37 +3159,48 @@ async fn route_bootstrap_v1_postgres_rejected_health_lifecycle() -> Result<(), B
     );
     let key_id = RouteHealthKeyId::new();
     let public_key = Ed25519PublicKey::try_from(key(138).verifying_key().to_bytes())?;
-    app.record_agent_route_recipient_ready(
-        authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
-        ParsedAgentRouteRecipientReady {
-            connector_fence: parsed_fence(fence),
+    let ready = ParsedAgentRouteRecipientReady {
+        connector_fence: parsed_fence(fence),
+        bootstrap_id,
+        command_sequence: prepare.sequence(),
+        command_payload_digest: prepare.payload_digest(),
+        encoded_command_digest: prepare.encoded_command_digest(),
+        installation_id,
+        binding_id,
+        agent_control_device_id: agent_device_id,
+        recipient_id,
+        recipient_capsule_digest: recipient_digest,
+        opaque_recipient_capsule: recipient_capsule,
+        expires_at_millis: now() + 300_000,
+        result_digest: route_bootstrap_recipient_ready_result_digest(
             bootstrap_id,
-            command_sequence: prepare.sequence(),
-            command_payload_digest: prepare.payload_digest(),
-            encoded_command_digest: prepare.encoded_command_digest(),
+            tenant_id,
             installation_id,
             binding_id,
-            agent_control_device_id: agent_device_id,
+            agent_device_id,
             recipient_id,
-            recipient_capsule_digest: recipient_digest,
-            opaque_recipient_capsule: recipient_capsule,
-            expires_at_millis: now() + 300_000,
-            result_digest: route_bootstrap_recipient_ready_result_digest(
-                bootstrap_id,
-                tenant_id,
-                installation_id,
-                binding_id,
-                agent_device_id,
-                recipient_id,
-                prepare.sequence(),
-                recipient_digest,
-                now() + 300_000,
-            ),
-            route_health_key_id: Some(key_id),
-            route_health_public_key: Some(public_key),
-            server_receipt_key_id: Some(server_pin_a),
-            server_receipt_public_key: Some(Ed25519PublicKey::try_from(server_public_a)?),
-        },
+            prepare.sequence(),
+            recipient_digest,
+            now() + 300_000,
+        ),
+        route_health_key_id: Some(key_id),
+        route_health_public_key: Some(public_key),
+        server_receipt_key_id: Some(server_pin_a),
+        server_receipt_public_key: Some(Ed25519PublicKey::try_from(server_public_a)?),
+    };
+    let mut conflicting_ready = ready.clone();
+    conflicting_ready.route_health_public_key = conflicting_ready.server_receipt_public_key;
+    assert!(matches!(
+        app.record_agent_route_recipient_ready(
+            authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
+            conflicting_ready,
+        )
+        .await,
+        Err(ConnectorControlApplicationError::Conflict)
+    ));
+    app.record_agent_route_recipient_ready(
+        authenticate_at(index.clone(), &ca_der, &completion.credential, auth_time)?,
+        ready,
     )
     .await?;
     let delivery_id = AgentRouteDeliveryId::new();

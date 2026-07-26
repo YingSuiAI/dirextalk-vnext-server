@@ -3435,6 +3435,14 @@ impl PostgresConnectorControlApplication {
         {
             return Err(ConnectorControlApplicationError::Conflict);
         }
+        if let (Some(server_public), Some(native_public)) = (
+            ready_server_receipt_public_key,
+            ready_health_public_key.as_deref(),
+        ) {
+            if server_public.as_slice() == native_public {
+                return Err(ConnectorControlApplicationError::Conflict);
+            }
+        }
         if bootstrap_state == "recipient_ready" && outbox_state == "acknowledged" {
             let stored_recipient = row
                 .try_get::<Option<Uuid>, _>("recipient_id")
