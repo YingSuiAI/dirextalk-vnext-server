@@ -178,6 +178,17 @@ done
   die 'Direct-stage evidence is unavailable'
 rg -N -x 'direct_ring=passed' "$SOURCE_RUN/run.properties" >/dev/null ||
   die 'Direct-stage evidence is not passed'
+CONTACT_A_B="$(jq -er \
+  'if (.contacts | length) == 1
+   then .contacts[0].contact_id
+   else error("A-B contact evidence is ambiguous")
+   end' "$SOURCE_RUN/008-ab-inviter-reconcile.json")"
+CONTACT_A_C="$(jq -er --arg existing "$CONTACT_A_B" \
+  '[.contacts[].contact_id | select(. != $existing)] |
+   if length == 1
+   then .[0]
+   else error("A-C contact evidence is ambiguous")
+   end' "$SOURCE_RUN/017-ca-importer-reconcile.json")"
 for serial in "$SERIAL_A" "$SERIAL_B" "$SERIAL_C"; do
   assert_device "$serial"
 done
@@ -212,14 +223,18 @@ SCOPE_ID="$(jq -er '.scope_id' "$CREATE_RESULT")"
 
 run_action issue-invite-b "$SERIAL_A" \
   "$(jq -nc --arg origin "$ORIGIN_A" --arg scope "$SCOPE_ID" \
-    '{action:"issue_group_invite",origin:$origin,scope_id:$scope}')"
+    --arg contact "$CONTACT_A_B" \
+    '{action:"issue_group_invite",origin:$origin,scope_id:$scope,
+      contact_id:$contact}')"
 INVITE_B_RESULT=$RUN_ACTION_OUTPUT
 require_applied issue-invite-b "$INVITE_B_RESULT"
 INVITE_B="$(jq -er '.invite_id' "$INVITE_B_RESULT")"
 
 run_action issue-invite-c "$SERIAL_A" \
   "$(jq -nc --arg origin "$ORIGIN_A" --arg scope "$SCOPE_ID" \
-    '{action:"issue_group_invite",origin:$origin,scope_id:$scope}')"
+    --arg contact "$CONTACT_A_C" \
+    '{action:"issue_group_invite",origin:$origin,scope_id:$scope,
+      contact_id:$contact}')"
 INVITE_C_RESULT=$RUN_ACTION_OUTPUT
 require_applied issue-invite-c "$INVITE_C_RESULT"
 INVITE_C="$(jq -er '.invite_id' "$INVITE_C_RESULT")"
