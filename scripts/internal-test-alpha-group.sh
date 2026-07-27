@@ -11,7 +11,6 @@ readonly PACKAGE="com.dirextalk.dirextalk_vnext_client"
 readonly RUN_ID="${DTX_ALPHA_RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$$}"
 readonly EVIDENCE_ROOT="$SERVER_ROOT/artifacts/internal-test-alpha/$RUN_ID"
 readonly SOURCE_RUN="${DTX_ALPHA_SOURCE_RUN:-"$SERVER_ROOT/artifacts/internal-test-alpha/remote-x345-20260728-0020"}"
-readonly RESUME_GROUP_RUN="${DTX_ALPHA_RESUME_GROUP_RUN:-}"
 readonly SERIAL_A="${DTX_ALPHA_DEVICE_A:-192.168.1.100:5555}"
 readonly SERIAL_B="${DTX_ALPHA_DEVICE_B:-192.168.1.101:5555}"
 readonly SERIAL_C="${DTX_ALPHA_DEVICE_C:-192.168.1.102:5555}"
@@ -98,21 +97,6 @@ discover_until() {
   die "owner did not discover pending joins: $label"
 }
 
-join_group() {
-  local label=$1 serial=$2 invite=$3 discovery=$4 control result
-  control="$(jq -nc \
-    --arg origin "$ORIGIN_A" \
-    --arg scope "$SCOPE_ID" \
-    --arg invite "$invite" \
-    --arg revision "$(jq -er '.policy_revision' "$discovery")" \
-    --arg head "$(jq -er '.sequencer_head' "$discovery")" \
-    '{action:"join_group",origin:$origin,scope_id:$scope,
-      invite_id:$invite,policy_revision:$revision,sequencer_head:$head}')"
-  run_action "$label" "$serial" "$control"
-  result=$RUN_ACTION_OUTPUT
-  require_applied "$label" "$result"
-}
-
 approve_join() {
   local label=$1 invite=$2 discovery=$3 item control result
   item="$(jq -cer --arg invite "$invite" \
@@ -181,10 +165,19 @@ receive_group() {
 }
 
 sync_group_invitation() {
-  local label=$1 serial=$2
-  run_action "$label" "$serial" '{"action":"sync_direct"}'
-  jq -e '.messaging == "ready"' "$RUN_ACTION_OUTPUT" >/dev/null ||
-    die "candidate did not Pull targeted group invitation: $label"
+  local label=$1 serial=$2 result
+  for attempt in 1 2 3 4 5 6; do
+    run_action "$label-$attempt" "$serial" '{"action":"sync_direct"}'
+    result=$RUN_ACTION_OUTPUT
+    jq -e '.requires_resolution == false' "$result" >/dev/null ||
+      die "candidate invitation requires resolution: $label"
+    if jq -e \
+      '.messaging == "awaitingApproval" and .awaiting_approval >= 1' \
+      "$result" >/dev/null; then
+      return 0
+    fi
+  done
+  die "candidate did not submit targeted V2 join: $label"
 }
 
 for command in adb find flutter jq openssl rg sha256sum sort xargs; do
@@ -216,7 +209,6 @@ printf '%s\n' \
   "server_commit=$(git -C "$SERVER_ROOT" rev-parse HEAD)" \
   "client_commit=$(git -C "$CLIENT_ROOT" rev-parse HEAD)" \
   "source_direct_evidence=$SOURCE_RUN" \
-  "source_group_evidence=$RESUME_GROUP_RUN" \
   "device_a=$SERIAL_A" \
   "device_b=$SERIAL_B" \
   "device_c=$SERIAL_C" \
@@ -233,70 +225,42 @@ run_action refresh-identity-c "$SERIAL_C" \
   "$(jq -nc --arg origin "$IDENTITY_ORIGIN_C" \
     '{action:"provision",origin:$origin}')"
 
-if [[ -n "$RESUME_GROUP_RUN" ]]; then
-  [[ -f "$RESUME_GROUP_RUN/004-create-group.json" &&
-    -f "$RESUME_GROUP_RUN/005-issue-invite-b.json" &&
-    -f "$RESUME_GROUP_RUN/006-issue-invite-c.json" &&
-    -f "$RESUME_GROUP_RUN/011-pending-bc-1.json" ]] ||
-    die 'resumable Group evidence is incomplete'
-  SCOPE_ID="$(jq -er '.scope_id' "$RESUME_GROUP_RUN/004-create-group.json")"
-  INVITE_B="$(jq -er '.invite_id' "$RESUME_GROUP_RUN/005-issue-invite-b.json")"
-  INVITE_C="$(jq -er '.invite_id' "$RESUME_GROUP_RUN/006-issue-invite-c.json")"
-  PENDING_BC="$RESUME_GROUP_RUN/011-pending-bc-1.json"
-  jq -e --arg invite_b "$INVITE_B" --arg invite_c "$INVITE_C" \
-    '([.items[].invite_id] | contains([$invite_b, $invite_c])) and
-     (.items | length) == 2' "$PENDING_BC" >/dev/null ||
-    die 'resumable Group evidence does not bind both pending joins'
-  sync_group_invitation invitation-sync-b "$SERIAL_B"
-  sync_group_invitation invitation-sync-c "$SERIAL_C"
-else
-  run_action create-group "$SERIAL_A" \
-    "$(jq -nc --arg origin "$ORIGIN_A" \
-      '{action:"create_group",origin:$origin}')"
-  CREATE_RESULT=$RUN_ACTION_OUTPUT
-  require_applied create-group "$CREATE_RESULT"
-  SCOPE_ID="$(jq -er '.scope_id' "$CREATE_RESULT")"
+run_action create-group "$SERIAL_A" \
+  "$(jq -nc --arg origin "$ORIGIN_A" \
+    '{action:"create_group",origin:$origin}')"
+CREATE_RESULT=$RUN_ACTION_OUTPUT
+require_applied create-group "$CREATE_RESULT"
+SCOPE_ID="$(jq -er '.scope_id' "$CREATE_RESULT")"
 
-  run_action issue-invite-b "$SERIAL_A" \
-    "$(jq -nc --arg origin "$ORIGIN_A" --arg scope "$SCOPE_ID" \
-      --arg contact "$CONTACT_A_B" \
-      '{action:"issue_group_invite",origin:$origin,scope_id:$scope,
-        contact_id:$contact}')"
-  INVITE_B_RESULT=$RUN_ACTION_OUTPUT
-  require_applied issue-invite-b "$INVITE_B_RESULT"
-  INVITE_B="$(jq -er '.invite_id' "$INVITE_B_RESULT")"
+run_action issue-invite-b "$SERIAL_A" \
+  "$(jq -nc --arg origin "$ORIGIN_A" --arg scope "$SCOPE_ID" \
+    --arg contact "$CONTACT_A_B" \
+    '{action:"issue_group_invite",origin:$origin,scope_id:$scope,
+      contact_id:$contact}')"
+INVITE_B_RESULT=$RUN_ACTION_OUTPUT
+require_applied issue-invite-b "$INVITE_B_RESULT"
+INVITE_B="$(jq -er '.invite_id' "$INVITE_B_RESULT")"
+sync_group_invitation invitation-sync-b "$SERIAL_B"
+discover_until pending-b 1
+PENDING_B=$DISCOVERY_OUTPUT
+approve_join approve-b "$INVITE_B" "$PENDING_B"
+reconcile_member reconcile-b "$SERIAL_B"
 
-  run_action issue-invite-c "$SERIAL_A" \
-    "$(jq -nc --arg origin "$ORIGIN_A" --arg scope "$SCOPE_ID" \
-      --arg contact "$CONTACT_A_C" \
-      '{action:"issue_group_invite",origin:$origin,scope_id:$scope,
-        contact_id:$contact}')"
-  INVITE_C_RESULT=$RUN_ACTION_OUTPUT
-  require_applied issue-invite-c "$INVITE_C_RESULT"
-  INVITE_C="$(jq -er '.invite_id' "$INVITE_C_RESULT")"
-  [[ "$INVITE_B" != "$INVITE_C" ]] || die 'group invites are not distinct'
-
-  sync_group_invitation invitation-sync-b "$SERIAL_B"
-  sync_group_invitation invitation-sync-c "$SERIAL_C"
-
-  discover_until owner-head 0
-  JOIN_HEAD=$DISCOVERY_OUTPUT
-  join_group join-b "$SERIAL_B" "$INVITE_B" "$JOIN_HEAD"
-
-  discover_until pending-b 1
-  PENDING_B=$DISCOVERY_OUTPUT
-  join_group join-c "$SERIAL_C" "$INVITE_C" "$PENDING_B"
-
-  discover_until pending-bc 2
-  PENDING_BC=$DISCOVERY_OUTPUT
-fi
-approve_join approve-b "$INVITE_B" "$PENDING_BC"
+run_action issue-invite-c "$SERIAL_A" \
+  "$(jq -nc --arg origin "$ORIGIN_A" --arg scope "$SCOPE_ID" \
+    --arg contact "$CONTACT_A_C" \
+    '{action:"issue_group_invite",origin:$origin,scope_id:$scope,
+      contact_id:$contact}')"
+INVITE_C_RESULT=$RUN_ACTION_OUTPUT
+require_applied issue-invite-c "$INVITE_C_RESULT"
+INVITE_C="$(jq -er '.invite_id' "$INVITE_C_RESULT")"
+[[ "$INVITE_B" != "$INVITE_C" ]] || die 'group invites are not distinct'
+sync_group_invitation invitation-sync-c "$SERIAL_C"
 discover_until pending-c 1
 PENDING_C=$DISCOVERY_OUTPUT
 approve_join approve-c "$INVITE_C" "$PENDING_C"
-
-reconcile_member reconcile-b "$SERIAL_B"
 reconcile_member reconcile-c "$SERIAL_C"
+reconcile_member reconcile-b-after-c "$SERIAL_B"
 run_action reconcile-owner "$SERIAL_A" \
   "$(jq -nc --arg scope "$SCOPE_ID" \
     '{action:"reconcile_group",scope_id:$scope}')"
