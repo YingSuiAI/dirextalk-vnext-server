@@ -9,6 +9,7 @@ readonly FLUTTER_ROOT="$CLIENT_ROOT/app/flutter"
 readonly TEST_TARGET="integration_test/internal_test_alpha_direct_harness_test.dart"
 readonly PACKAGE="com.dirextalk.dirextalk_vnext_client"
 readonly RUN_ID="${DTX_ALPHA_RUN_ID:-$(date -u +%Y%m%d%H%M%S)-$$}"
+readonly TARGET_MODE="${DTX_ALPHA_TARGET_MODE:-local}"
 readonly COMPOSE_PROJECT="dtx-alpha-direct-$RUN_ID"
 readonly EVIDENCE_ROOT="$SERVER_ROOT/artifacts/internal-test-alpha/$RUN_ID"
 readonly SERIAL_A="${DTX_ALPHA_DEVICE_A:-192.168.1.100:5555}"
@@ -21,9 +22,18 @@ readonly POSTGRES_PORT="${DTX_ALPHA_POSTGRES_PORT:-25432}"
 readonly REALTIME_A_PORT="${DTX_ALPHA_REALTIME_A_PORT:-29443}"
 readonly REALTIME_B_PORT="${DTX_ALPHA_REALTIME_B_PORT:-29444}"
 readonly REALTIME_C_PORT="${DTX_ALPHA_REALTIME_C_PORT:-29445}"
-readonly ORIGIN_A="https://localhost:8443"
-readonly ORIGIN_B="https://localhost:8444"
-readonly ORIGIN_C="https://localhost:8445"
+if [[ "$TARGET_MODE" == remote ]]; then
+  readonly ORIGIN_A="${DTX_ALPHA_ORIGIN_A:-https://x3.dirextalk.ai}"
+  readonly ORIGIN_B="${DTX_ALPHA_ORIGIN_B:-https://x4.dirextalk.ai}"
+  readonly ORIGIN_C="${DTX_ALPHA_ORIGIN_C:-https://x5.dirextalk.ai}"
+elif [[ "$TARGET_MODE" == local ]]; then
+  readonly ORIGIN_A="https://localhost:8443"
+  readonly ORIGIN_B="https://localhost:8444"
+  readonly ORIGIN_C="https://localhost:8445"
+else
+  printf '%s\n' "internal-test-alpha-direct: unsupported target mode: $TARGET_MODE" >&2
+  exit 1
+fi
 readonly CA_LOCAL="$EVIDENCE_ROOT/local-ca.pem"
 readonly APP_APK="$FLUTTER_ROOT/build/app/outputs/flutter-apk/app-debug.apk"
 
@@ -265,18 +275,25 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for command in adb docker flutter jq openssl sha256sum ss; do
+for command in adb flutter jq openssl sha256sum; do
   require_command "$command"
 done
+if [[ "$TARGET_MODE" == local ]]; then
+  for command in docker ss; do
+    require_command "$command"
+  done
+fi
 [[ -d "$CLIENT_ROOT/.git" && -f "$FLUTTER_ROOT/pubspec.yaml" ]] ||
   die 'client repository is unavailable'
-for port in \
-  "$POSTGRES_PORT" \
-  "$NODE_A_PORT" "$NODE_B_PORT" "$NODE_C_PORT" \
-  "$REALTIME_A_PORT" "$REALTIME_B_PORT" "$REALTIME_C_PORT"; do
-  valid_port "$port" || die "invalid port: $port"
-  assert_port_free "$port"
-done
+if [[ "$TARGET_MODE" == local ]]; then
+  for port in \
+    "$POSTGRES_PORT" \
+    "$NODE_A_PORT" "$NODE_B_PORT" "$NODE_C_PORT" \
+    "$REALTIME_A_PORT" "$REALTIME_B_PORT" "$REALTIME_C_PORT"; do
+    valid_port "$port" || die "invalid port: $port"
+    assert_port_free "$port"
+  done
+fi
 for serial in "$SERIAL_A" "$SERIAL_B" "$SERIAL_C"; do
   assert_device "$serial"
 done
@@ -288,20 +305,26 @@ printf '%s\n' \
   "device_a=$SERIAL_A" \
   "device_b=$SERIAL_B" \
   "device_c=$SERIAL_C" \
+  "target_mode=$TARGET_MODE" \
+  "origin_a=$ORIGIN_A" \
+  "origin_b=$ORIGIN_B" \
+  "origin_c=$ORIGIN_C" \
   >"$EVIDENCE_ROOT/run.properties"
 
-COMPOSE_STARTED=1
-compose up --detach --wait
-compose cp tls-bootstrap:/run/dtx-local-tls/ca.pem "$CA_LOCAL"
-CA_HASH="$(openssl x509 -hash -noout -in "$CA_LOCAL" | tr -d '\r\n')"
-[[ "$CA_HASH" =~ ^[0-9a-fA-F]{8}$ ]] || die 'local CA hash invalid'
+if [[ "$TARGET_MODE" == local ]]; then
+  COMPOSE_STARTED=1
+  compose up --detach --wait
+  compose cp tls-bootstrap:/run/dtx-local-tls/ca.pem "$CA_LOCAL"
+  CA_HASH="$(openssl x509 -hash -noout -in "$CA_LOCAL" | tr -d '\r\n')"
+  [[ "$CA_HASH" =~ ^[0-9a-fA-F]{8}$ ]] || die 'local CA hash invalid'
 
-for serial in "$SERIAL_A" "$SERIAL_B" "$SERIAL_C"; do
-  install_ca_if_needed "$serial"
-  claim_reverse "$serial" 8443 "$NODE_A_PORT"
-  claim_reverse "$serial" 8444 "$NODE_B_PORT"
-  claim_reverse "$serial" 8445 "$NODE_C_PORT"
-done
+  for serial in "$SERIAL_A" "$SERIAL_B" "$SERIAL_C"; do
+    install_ca_if_needed "$serial"
+    claim_reverse "$serial" 8443 "$NODE_A_PORT"
+    claim_reverse "$serial" 8444 "$NODE_B_PORT"
+    claim_reverse "$serial" 8445 "$NODE_C_PORT"
+  done
+fi
 
 (
   cd -- "$FLUTTER_ROOT"
