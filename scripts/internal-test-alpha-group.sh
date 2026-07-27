@@ -15,6 +15,9 @@ readonly SERIAL_A="${DTX_ALPHA_DEVICE_A:-192.168.1.100:5555}"
 readonly SERIAL_B="${DTX_ALPHA_DEVICE_B:-192.168.1.101:5555}"
 readonly SERIAL_C="${DTX_ALPHA_DEVICE_C:-192.168.1.102:5555}"
 readonly ORIGIN_A="${DTX_ALPHA_ORIGIN_A:-https://x3.dirextalk.ai/}"
+readonly IDENTITY_ORIGIN_A="${ORIGIN_A%/}"
+readonly IDENTITY_ORIGIN_B="${DTX_ALPHA_IDENTITY_ORIGIN_B:-https://x4.dirextalk.ai}"
+readonly IDENTITY_ORIGIN_C="${DTX_ALPHA_IDENTITY_ORIGIN_C:-https://x5.dirextalk.ai}"
 
 ACTION_INDEX=0
 RUN_ACTION_OUTPUT=''
@@ -189,6 +192,16 @@ printf '%s\n' \
   "device_c=$SERIAL_C" \
   "origin_a=$ORIGIN_A" \
   >"$EVIDENCE_ROOT/run.properties"
+
+run_action refresh-identity-a "$SERIAL_A" \
+  "$(jq -nc --arg origin "$IDENTITY_ORIGIN_A" \
+    '{action:"provision",origin:$origin}')"
+run_action refresh-identity-b "$SERIAL_B" \
+  "$(jq -nc --arg origin "$IDENTITY_ORIGIN_B" \
+    '{action:"provision",origin:$origin}')"
+run_action refresh-identity-c "$SERIAL_C" \
+  "$(jq -nc --arg origin "$IDENTITY_ORIGIN_C" \
+    '{action:"provision",origin:$origin}')"
 
 run_action create-group "$SERIAL_A" \
   "$(jq -nc --arg origin "$ORIGIN_A" \
