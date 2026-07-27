@@ -3,7 +3,8 @@
 
 GRANT USAGE ON SCHEMA system TO dtx_identity_runtime, dtx_group_runtime,
     dtx_mailbox_runtime, dtx_realtime_sync_runtime;
-GRANT SELECT ON system.schema_epoch TO dtx_identity_runtime, dtx_group_runtime,
+GRANT SELECT ON system.schema_epoch, system.schema_versions
+    TO dtx_identity_runtime, dtx_group_runtime,
     dtx_mailbox_runtime, dtx_realtime_sync_runtime;
 
 GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
