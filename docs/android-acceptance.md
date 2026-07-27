@@ -1,16 +1,35 @@
 # Android acceptance harness
 
-`scripts/android-acceptance.sh` owns only disposable emulator and local-stack
-setup. It intentionally stops after the Connector transport is reachable;
-the Direct/Group product scenario runner is not part of this harness.
+The required Internal Test Alpha outcome is a real three-device scenario:
+three clients provision and contact, complete Direct Pull+ACK, complete Group
+invite/join/owner approval with B+C ACK, and retain the evidence bundle. That
+scenario is not implemented by the current server-local harness.
 
-The production-safe defaults are two exact API 35 `aosp_atd` x86_64 AVDs, software
-acceleration (`-accel off`), two cores, 2048 MiB per AVD, SwiftShader GPU, and
-an explicit `-writable-system`. The reservation records 4300 MiB empirical RSS
-per AVD (8600 MiB for the pair). CI may override only the closed values below:
+## Current executable surface
+
+`scripts/android-acceptance.sh` currently owns disposable emulator and
+local-stack setup, platform-CA trust probing, and shell cleanup checks. It
+terminates before the Direct/Group product scenario. It has no supported
+three-serial or client-checkout interface, so these setup commands must not be
+reported as full Internal Test acceptance:
+
+```bash
+bash scripts/android-acceptance.sh --run
+bash scripts/test-android-acceptance.sh
+```
+
+The three-device Direct/Group runner, device/client wiring, and corresponding
+evidence publication are a missing target capability. Until that capability is
+implemented and independently evidenced, Android acceptance remains pending.
+
+## Setup contract
+
+The current setup uses two exact API 35 `aosp_atd` x86_64 disposable AVDs,
+software acceleration (`-accel off`), two cores, 2048 MiB per AVD, SwiftShader
+GPU, and explicit `-writable-system`. CI may override only these closed values:
 
 ```text
-DTX_ANDROID_SYSTEM_IMAGE=system-images;android-35;aosp_atd;x86_64  # exact, not overridable
+DTX_ANDROID_SYSTEM_IMAGE=system-images;android-35;aosp_atd;x86_64  # exact
 DTX_ANDROID_ACCELERATION=off|on
 DTX_ANDROID_GPU=swiftshader_indirect|software|host
 DTX_ANDROID_CORES=1..8
@@ -19,37 +38,18 @@ DTX_ANDROID_BOOT_TIMEOUT_SECONDS=30..900
 DTX_ANDROID_AVD_RSS_MIB=3000..12000
 ```
 
-The harness compiles the checked-in Java probe in a private run directory with
-the API 35 platform jar, JDK 17 `javac`, and an SDK `d8`, then validates the
-non-symlinked dex size and SHA-256 before pushing it. No caller-supplied dex or
-probe path is accepted.
+The setup harness compiles the checked-in Java trust probe in a private run
+directory with the API 35 platform jar, JDK 17 `javac`, and SDK `d8`, then
+validates the non-symlinked dex size and SHA-256. No caller-supplied dex or
+probe path is accepted. Before CA installation each owned emulator must fail
+platform trust; after installation and reboot the same `HttpsURLConnection`
+probe must report `TRUSTED <nonce>` over the fixed local endpoint. Connect,
+hostname, timeout, response, class, and lost-result failures are terminal.
 
-The writable-system prerequisite is fail-closed. Each emulator is mapped to
-its recorded PID and exact AVD reply (`<name>` followed by a separate `OK`),
-then `ro.kernel.qemu=1` and `id -u=0` are rechecked after every reboot or
-reconnect. If the first `adb remount` disables verity, the harness reboots,
-repeats those ownership gates, and requires the second remount plus a real
-write probe under `/system/etc/security/cacerts`.
+CA installation is checked for byte content, `0644`, `root:root`, and
+`u:object_r:system_file:s0` context, then rechecked after reboot. Cleanup
+removes only the owned CA, reverse mappings, processes, run record, and
+disposable stack; a failed cleanup retains the private run record.
 
-Before CA installation, each owned emulator connects to the fixed local node
-endpoint and is expected to fail platform trust. After installation and reboot,
-the same HTTPS connection is made by `HttpsURLConnection` in the fixed
-`scripts/android-platform-trust-probe.java` probe. It uses the Android default
-platform TrustManager and hostname verifier. The host supplies a fresh nonce
-and exact result path; the probe atomically publishes only `UNTRUSTED <nonce>`
-for a certificate-chain rejection or `TRUSTED <nonce>` for an HTTP 200 response.
-Connect, hostname, timeout, response, class, and lost-result failures are
-terminal; no adb exit status is interpreted as trust evidence.
-
-The bootstrap CA is installed at its OpenSSL subject-hash filename and checked
-for byte content, `0644`, `root:root`, and `u:object_r:system_file:s0` context.
-Presence is rechecked after reboot. Cleanup removes the exact hash and pushed
-temporary file, remounts `/system` read-only, removes reverse mappings, stops
-owned processes, deletes both AVDs, and tears down only the owned Compose
-project. A failed cleanup retains the private run record for diagnosis.
-
-Run deterministic shell checks without launching an emulator:
-
-```bash
-bash scripts/test-android-acceptance.sh
-```
+These setup and shell checks are useful boundary evidence, but they cannot
+substitute for the missing three-device Direct/Group runner.

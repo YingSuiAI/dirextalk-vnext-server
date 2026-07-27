@@ -1,70 +1,31 @@
-# Product Core Alpha Security Boundary
+# Internal Test Alpha security boundary
 
-This is the active security contract for Product Core Alpha. Historical ADRs
-and version-specific operator notes are not security authorities.
+This is the minimal active privacy and authorization boundary for the Internal
+Test Alpha workflow.
 
-## Trust boundary
+## Privacy
 
-Client devices own:
+- Conversation events, MLS state, attachments, prompts, and runtime input stay
+  encrypted/opaque end to end through the Sidecar. The server and Agent
+  Control may validate envelopes, digests, ordering, and authorization, but
+  never decrypt or log content.
+- Device private keys, MLS secrets, bearer material, database keys, and
+  provider credentials remain on their owning device/Host and never enter
+  protocol responses or logs.
+- Logs and acceptance bundles contain only bounded error codes, identifiers,
+  and digests needed for correlation; synthetic credentials are used in tests.
 
-- identity root and device private keys;
-- HPKE opening keys and MLS group state;
-- plaintext private events and local conversation history;
-- attachment content keys and private read capabilities;
-- the encrypted `client.redb` database key, wrapped by the platform Keystore.
+## Authorization and fencing
 
-Product Core servers own:
-
-- identity/device public facts and signed log ordering;
-- group membership authorization and MLS commit sequencing;
-- opaque Mailbox ciphertext, blinded capability digests, receipts, and cursors;
-- opaque attachment chunks and their integrity metadata;
-- durable realtime invalidations and opaque Push registrations.
-
-The server may validate signatures, canonical encodings, digests,
-authorization, ordering, idempotency, leases, and fences. It must not decrypt
-or log private-event bodies, attachment plaintext, MLS secrets, private keys,
-raw capabilities, or client database keys.
-
-## Metadata that remains visible
-
-Product Core does not claim SimpleX-style relationship anonymity. Depending on
-the service role, an operator may observe stable identity/device identifiers,
-service origins, Mailbox ownership, group membership authorization, request
-timing, IP addresses, and ciphertext sizes. Logs and metrics must minimize
-these values and never combine them with plaintext or secrets.
-
-Push payloads are wake-up hints. They must not contain identity,
-conversation/group, Mailbox, MLS, contact-name, message-body, or attachment
-identifiers. After a wake-up, the authenticated client reconciles from the
-durable server high-water mark.
-
-## Required fail-closed behavior
-
-- A schema epoch or aggregate baseline digest mismatch refuses startup.
-- Revoked devices cannot obtain new sessions, Pull new Mailbox data, or send
-  new authorized operations.
-- A changed retry under the same idempotency key is rejected.
-- Stale leases, generations, epochs, revisions, and fences are rejected.
-- Mailbox ACK occurs only after ciphertext validation, deduplication, MLS
-  advancement, message persistence, and cursor persistence commit atomically.
-- Missing keys, invalid signatures/descriptors, corrupt ciphertext, cursor
-  gaps, and incomplete local state enter an explicit degraded/reset-required
-  state; they never silently accept partial state.
-- Agent Control and Public services are optional profiles and have no database
-  or runtime path that bypasses Product Core message authorization.
-
-## Logging and diagnostics
-
-Production logs may include bounded error codes, service role, operation ID,
-state revision, coarse latency, and redacted digests where needed for
-correlation. They must not include:
-
-- message or filename plaintext;
-- identity/device private keys, MLS secrets, or database keys;
-- bearer material, raw Mailbox/attachment capabilities, or Push credentials;
-- HPKE plaintext, decrypted events, or decrypted attachment content.
-
-Tests and fixtures use synthetic credentials only. X3/X4/X5 acceptance resets
-may remove vNext state, but must preserve host TLS/CA/domain material and every
-non-vNext service, directory, container, and database.
+- Every device, contact, Group membership, Connector event, and Deployer/Host
+  mutation is origin-bound and authorized by its current identity, generation,
+  or operation fence.
+- An offer is not execution authority. Only the exact matching
+  `RunLeaseGranted` can start a runtime; stale Connector or Run lease fences
+  fail closed.
+- Mailbox ACK is accepted only after ciphertext validation, deduplication,
+  domain/MLS state, and cursor persistence commit atomically. WSS is a wake-up
+  signal; Pull at the durable highwater is the recovery authority.
+- Missing keys, invalid signatures, cursor gaps, changed retries, and stale
+  generations enter an explicit reset/degraded result and never silently
+  accept partial state.

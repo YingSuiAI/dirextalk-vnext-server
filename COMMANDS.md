@@ -1,92 +1,40 @@
 # Command Map
 
-Run commands from this repository root.
+The active cross-repository contract is
+[`docs/internal-test-alpha.md`](docs/internal-test-alpha.md). Run commands from
+this repository root. Focused checks come first; production and release checks
+below are optional hardening and cannot block Internal Test Alpha.
+
+## Focused server checks
 
 | Task | Command |
 | --- | --- |
-| pinned Cargo (Ubuntu/WSL) | `bash scripts/cargo.sh <cargo-command> [arguments...]` |
+| Android harness self-check | `bash scripts/test-android-acceptance.sh` |
+| Android setup/trust run (not Direct/Group acceptance) | `bash scripts/android-acceptance.sh --run` |
+| focused server tests | `cargo test --locked` |
+| persistence baseline | `cargo test -p dtx-storage --test migrations --locked` |
+| persistence contracts | `cargo test -p dtx-storage --test persistence_contract --locked` |
+| generated contracts | `cargo run -p dtx-protocol --locked -- check-generated .` |
+| schema and vectors | `cargo run -p dtx-protocol --locked -- validate .` |
+| exact Alpha inventory | `cargo run -p dtx-protocol --locked -- check-alpha .` |
 | format | `cargo fmt` |
+| build | `cargo build --locked` |
 | verify (Ubuntu/WSL) | `bash scripts/verify.sh` |
 | verify (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify.ps1` |
-| test | `cargo test --locked` |
-| persistence fresh baseline | `cargo test -p dtx-storage --test migrations --locked` |
-| persistence contracts | `cargo test -p dtx-storage --test persistence_contract --locked` |
-| SQLx baseline/prepare gate (Ubuntu/WSL) | `bash scripts/sqlx-prepare.sh` |
-| SQLx baseline/prepare gate (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\sqlx-prepare.ps1` |
-| testkit dependency boundary (Ubuntu/WSL) | `bash scripts/check-testkit-boundary.sh` |
-| testkit dependency boundary (Windows) | `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-testkit-boundary.ps1` |
-| build | `cargo build --locked` |
-| release-build | `cargo build --locked --release` |
-| release-image-check | `bash scripts/check-release-image.sh` |
-| Product Core production-stack gate | `bash scripts/check-production-stack.sh` |
-| production PostgreSQL role/readiness gate | `bash scripts/test-production-postgres.sh` |
-| publish production images | `bash scripts/publish-production-release.sh` |
-| clean interrupted release builder/cache | `bash scripts/cleanup-production-release.sh` |
-| regenerate contracts | `cargo run -p dtx-protocol --locked -- generate .` |
-| check generated contracts | `cargo run -p dtx-protocol --locked -- check-generated .` |
-| validate schema and vectors | `cargo run -p dtx-protocol --locked -- validate .` |
-| check Product Core Alpha inventory | `cargo run -p dtx-protocol --locked -- check-alpha .` |
-| update Product Core Alpha inventory | `cargo run -p dtx-protocol --locked -- write-alpha .` |
 
-Cargo `default-members` is the authoritative Product Core package set. Agent,
-Connector, Public Feed, and Indexer remain workspace members but are excluded
-from the current release gate.
+## Optional production hardening
 
-The full Product Core verification gate checks generated Rust/Dart sources before and after
-idempotent regeneration, validates Product Core Alpha CDDL/OpenAPI/Protobuf and
-golden vectors, checks the exact current Alpha inventory, runs Dart VM and
-compiled-JavaScript conformance, then runs fmt/clippy/test/deny/audit and
-`git diff --check`. CI installs the pinned tools and invokes this same script
-instead of maintaining a second copy of the gate. CI pins the stable Dart SDK
-selected for S0.3
-(`3.12.2`). Agent/Public source remains frozen and is intentionally outside the
-Alpha release gate; its operator and VM acceptance commands are not current
-Product Core entry points.
+| Task | Command |
+| --- | --- |
+| production stack contract | `bash scripts/check-production-stack.sh` |
+| production PostgreSQL gate | `bash scripts/test-production-postgres.sh` |
+| release image contract | `bash scripts/check-release-image.sh` |
+| publish production image | `bash scripts/publish-production-release.sh` |
+| clean interrupted release builder | `bash scripts/cleanup-production-release.sh` |
 
-On Ubuntu/WSL, `scripts/cargo.sh` resolves the channel from
-`rust-toolchain.toml`, refuses an uninstalled toolchain, and passes every
-argument and Cargo environment setting through unchanged. This keeps explicit
-`--locked` and opt-in offline settings at the calling command boundary.
-
-On Windows, a normal Rust MSVC installation also requires the Visual C++ Build
-Tools. When they are unavailable but the user-scoped LLVM-MinGW toolchain is
-installed, use the checked-in wrapper:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 fmt -- --check
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 clippy --locked --all-targets -- -D warnings
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 test --locked
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 deny check
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 audit
-```
-
-The Windows wrapper preserves an existing Visual Studio Developer Prompt and
-otherwise selects the pinned `1.97.0-x86_64-pc-windows-gnu` toolchain plus a
-local linker. CI may use normal `cargo` commands after installing the repository
-toolchain explicitly.
-
-### Opt-in local PostgreSQL integration tests
-
-Integration tests use Testcontainers by default. To avoid container startup during
-local development, set `DTX_TEST_LOCAL_POSTGRES=1` together with literal-loopback
-`DTX_TEST_LOCAL_POSTGRES_HOST`, `DTX_TEST_LOCAL_POSTGRES_PORT`,
-`DTX_TEST_LOCAL_POSTGRES_USER`, `DTX_TEST_LOCAL_POSTGRES_PASSWORD`, and
-`DTX_TEST_LOCAL_POSTGRES_MAINTENANCE_DATABASE`. The harness creates only a unique
-`dtx_test_<uuid>` database and removes it with `DROP DATABASE ... WITH (FORCE)`
-after the test; it rejects DNS and non-loopback hosts. Keep credentials ephemeral
-in the invoking shell and never save them in tracked files.
-
-The SQLx gate uses exact PostgreSQL `18.4-alpine3.24` in an ephemeral Docker
-container. Install its pinned user-scoped CLI once when it is not already
-available:
-
-```bash
-bash scripts/cargo.sh install sqlx-cli --version 0.9.0 --force --no-default-features --features 'rustls,postgres' --root "${XDG_DATA_HOME:-$HOME/.local/share}/dirextalk/tools/sqlx-cli-0.9.0"
-```
-
-Override that WSL location with `DTX_SQLX_TOOL_ROOT` when necessary. The
-Windows alternative remains:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\cargo.ps1 install sqlx-cli --version 0.9.0 --force --no-default-features --features 'rustls,postgres' --root "$env:LOCALAPPDATA\Dirextalk\tools\sqlx-cli-0.9.0"
-```
+The focused commands establish implementation evidence only. Internal Test
+Alpha passes only with the executable server/client/Connector/Deployer bundle
+and three-device record described in the active spec; no local command alone
+is a completion claim. The current Android script provides setup and shell
+checks only and terminates before Direct/Group. A three-device Direct/Group
+runner is a missing target capability, not an executable command in this map.
