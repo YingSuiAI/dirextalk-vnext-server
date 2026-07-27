@@ -14,7 +14,7 @@ readonly SOURCE_RUN="${DTX_ALPHA_SOURCE_RUN:-"$SERVER_ROOT/artifacts/internal-te
 readonly SERIAL_A="${DTX_ALPHA_DEVICE_A:-192.168.1.100:5555}"
 readonly SERIAL_B="${DTX_ALPHA_DEVICE_B:-192.168.1.101:5555}"
 readonly SERIAL_C="${DTX_ALPHA_DEVICE_C:-192.168.1.102:5555}"
-readonly ORIGIN_A="${DTX_ALPHA_ORIGIN_A:-https://x3.dirextalk.ai}"
+readonly ORIGIN_A="${DTX_ALPHA_ORIGIN_A:-https://x3.dirextalk.ai/}"
 
 ACTION_INDEX=0
 RUN_ACTION_OUTPUT=''
