@@ -180,6 +180,13 @@ receive_group() {
   die "group member did not Pull and ACK exact message: $label"
 }
 
+sync_group_invitation() {
+  local label=$1 serial=$2
+  run_action "$label" "$serial" '{"action":"sync_direct"}'
+  jq -e '.messaging == "ready"' "$RUN_ACTION_OUTPUT" >/dev/null ||
+    die "candidate did not Pull targeted group invitation: $label"
+}
+
 for command in adb find flutter jq openssl rg sha256sum sort xargs; do
   require_command "$command"
 done
@@ -240,6 +247,8 @@ if [[ -n "$RESUME_GROUP_RUN" ]]; then
     '([.items[].invite_id] | contains([$invite_b, $invite_c])) and
      (.items | length) == 2' "$PENDING_BC" >/dev/null ||
     die 'resumable Group evidence does not bind both pending joins'
+  sync_group_invitation invitation-sync-b "$SERIAL_B"
+  sync_group_invitation invitation-sync-c "$SERIAL_C"
 else
   run_action create-group "$SERIAL_A" \
     "$(jq -nc --arg origin "$ORIGIN_A" \
@@ -266,6 +275,9 @@ else
   require_applied issue-invite-c "$INVITE_C_RESULT"
   INVITE_C="$(jq -er '.invite_id' "$INVITE_C_RESULT")"
   [[ "$INVITE_B" != "$INVITE_C" ]] || die 'group invites are not distinct'
+
+  sync_group_invitation invitation-sync-b "$SERIAL_B"
+  sync_group_invitation invitation-sync-c "$SERIAL_C"
 
   discover_until owner-head 0
   JOIN_HEAD=$DISCOVERY_OUTPUT
