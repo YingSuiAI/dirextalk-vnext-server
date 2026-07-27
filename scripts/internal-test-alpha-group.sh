@@ -130,9 +130,19 @@ approve_join() {
       candidate_identity_id:$item.candidate_identity_id,
       candidate_device_id:$item.candidate_device_id,
       invite_id:$item.invite_id}')"
-  run_action "$label" "$SERIAL_A" "$control"
-  result=$RUN_ACTION_OUTPUT
-  require_applied "$label" "$result"
+  for attempt in 1 2 3 4 5 6 7 8; do
+    run_action "$label-$attempt" "$SERIAL_A" "$control"
+    result=$RUN_ACTION_OUTPUT
+    jq -e '.requires_resolution == 0' "$result" >/dev/null ||
+      die "group approval requires resolution: $label"
+    if jq -e '.outcome == "applied"' "$result" >/dev/null; then
+      return 0
+    fi
+    jq -e '.outcome == "retryPending" and .retryable == true' \
+      "$result" >/dev/null ||
+      die "group approval was not safely retryable: $label"
+  done
+  die "group approval did not commit: $label"
 }
 
 reconcile_member() {
