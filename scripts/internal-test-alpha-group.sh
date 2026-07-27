@@ -148,6 +148,24 @@ reconcile_member() {
   die "group member did not commit and become timeline-ready: $label"
 }
 
+reconcile_owner() {
+  local label=$1 minimum=$2 result control
+  control="$(jq -nc --arg scope "$SCOPE_ID" \
+    '{action:"reconcile_group",scope_id:$scope}')"
+  for attempt in 1 2 3 4 5 6; do
+    run_action "$label-$attempt" "$SERIAL_A" "$control"
+    result=$RUN_ACTION_OUTPUT
+    if jq -e --argjson minimum "$minimum" \
+      '.requires_resolution == 0 and
+       .timeline_availability == "ready" and
+       .member_count >= $minimum' \
+      "$result" >/dev/null; then
+      return 0
+    fi
+  done
+  die "owner did not Pull and ACK the current group epoch: $label"
+}
+
 receive_group() {
   local label=$1 serial=$2 control result
   control="$(jq -nc --arg scope "$SCOPE_ID" --arg message "$MESSAGE" \
@@ -245,6 +263,7 @@ discover_until pending-b 1
 PENDING_B=$DISCOVERY_OUTPUT
 approve_join approve-b "$INVITE_B" "$PENDING_B"
 reconcile_member reconcile-b "$SERIAL_B"
+reconcile_owner reconcile-owner-after-b 1
 
 run_action issue-invite-c "$SERIAL_A" \
   "$(jq -nc --arg origin "$ORIGIN_A" --arg scope "$SCOPE_ID" \
@@ -261,14 +280,7 @@ PENDING_C=$DISCOVERY_OUTPUT
 approve_join approve-c "$INVITE_C" "$PENDING_C"
 reconcile_member reconcile-c "$SERIAL_C"
 reconcile_member reconcile-b-after-c "$SERIAL_B"
-run_action reconcile-owner "$SERIAL_A" \
-  "$(jq -nc --arg scope "$SCOPE_ID" \
-    '{action:"reconcile_group",scope_id:$scope}')"
-jq -e \
-  '.requires_resolution == 0 and
-   .timeline_availability == "ready" and .member_count >= 2' \
-  "$RUN_ACTION_OUTPUT" >/dev/null ||
-  die 'owner did not observe both committed group members'
+reconcile_owner reconcile-owner-after-c 2
 
 MESSAGE="$(openssl rand -hex 24)"
 run_action send-group "$SERIAL_A" \
