@@ -243,7 +243,10 @@ INVITE_C="$(jq -er '.invite_id' "$INVITE_C_RESULT")"
 discover_until owner-head 0
 JOIN_HEAD=$DISCOVERY_OUTPUT
 join_group join-b "$SERIAL_B" "$INVITE_B" "$JOIN_HEAD"
-join_group join-c "$SERIAL_C" "$INVITE_C" "$JOIN_HEAD"
+
+discover_until pending-b 1
+PENDING_B=$DISCOVERY_OUTPUT
+join_group join-c "$SERIAL_C" "$INVITE_C" "$PENDING_B"
 
 discover_until pending-bc 2
 PENDING_BC=$DISCOVERY_OUTPUT
