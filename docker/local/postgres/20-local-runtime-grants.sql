@@ -3,10 +3,12 @@
 -- their schemas. Keep it explicit: if a new runtime requirement is added, the
 -- local cluster must fail closed until this matrix is updated deliberately.
 
-GRANT USAGE ON SCHEMA system TO dtx_identity_runtime, dtx_group_runtime,
-    dtx_mailbox_runtime, dtx_realtime_sync_runtime;
-GRANT SELECT ON system.schema_epoch TO dtx_identity_runtime, dtx_group_runtime,
-    dtx_mailbox_runtime, dtx_realtime_sync_runtime;
+-- Service roles can read only immutable migration metadata from the system
+-- schema so each store can validate the exact fresh-only schema epoch.
+GRANT USAGE ON SCHEMA system TO dtx_identity_runtime, dtx_group_runtime, dtx_mailbox_runtime,
+    dtx_realtime_sync_runtime;
+GRANT SELECT ON system.schema_epoch, system.schema_versions TO dtx_identity_runtime,
+    dtx_group_runtime, dtx_mailbox_runtime, dtx_realtime_sync_runtime;
 
 GRANT USAGE ON SCHEMA identity TO dtx_identity_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA identity TO dtx_identity_runtime;

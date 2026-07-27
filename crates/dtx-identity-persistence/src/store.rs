@@ -288,8 +288,7 @@ async fn session_principal_can_escalate_role(
 
 async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, IdentityPersistenceError> {
     sqlx::query_scalar(
-        "SELECT has_schema_privilege(current_user, 'system', 'USAGE') \
-             OR has_schema_privilege(current_user, 'system', 'CREATE') \
+        "SELECT has_schema_privilege(current_user, 'system', 'CREATE') \
              OR has_schema_privilege(current_user, 'agent', 'USAGE') \
              OR has_schema_privilege(current_user, 'agent', 'CREATE') \
              OR EXISTS (\
@@ -299,7 +298,11 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, IdentityPers
                   WHERE namespace.nspname IN ('system', 'agent') \
                     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f') \
                     AND (\
-                        has_table_privilege(current_user, relation.oid, 'SELECT') \
+                        (namespace.nspname = 'system' \
+                         AND relation.relname NOT IN ('schema_epoch', 'schema_versions') \
+                         AND has_table_privilege(current_user, relation.oid, 'SELECT')) \
+                        OR (namespace.nspname = 'agent' \
+                            AND has_table_privilege(current_user, relation.oid, 'SELECT')) \
                         OR has_table_privilege(current_user, relation.oid, 'INSERT') \
                         OR has_table_privilege(current_user, relation.oid, 'UPDATE') \
                         OR has_table_privilege(current_user, relation.oid, 'DELETE') \

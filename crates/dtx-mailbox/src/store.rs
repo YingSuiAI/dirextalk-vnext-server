@@ -236,7 +236,6 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, MailboxPersi
     sqlx::query_scalar(
         r"SELECT has_schema_privilege(current_user, 'messaging', 'CREATE')
              OR has_schema_privilege(current_user, 'identity', 'CREATE')
-             OR has_schema_privilege(current_user, 'system', 'USAGE')
              OR has_schema_privilege(current_user, 'system', 'CREATE')
              OR has_schema_privilege(current_user, 'agent', 'USAGE')
              OR has_schema_privilege(current_user, 'agent', 'CREATE')
@@ -248,7 +247,10 @@ async fn role_has_cross_scope_access(pool: &PgPool) -> Result<bool, MailboxPersi
                    JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
                   WHERE namespace.nspname IN ('system', 'agent', 'groups')
                     AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
-                    AND (has_table_privilege(current_user, relation.oid, 'SELECT')
+                    AND (((namespace.nspname = 'system'
+                           AND relation.relname NOT IN ('schema_epoch', 'schema_versions'))
+                          OR namespace.nspname IN ('agent', 'groups'))
+                         AND has_table_privilege(current_user, relation.oid, 'SELECT')
                       OR has_table_privilege(current_user, relation.oid, 'INSERT')
                       OR has_table_privilege(current_user, relation.oid, 'UPDATE')
                       OR has_table_privilege(current_user, relation.oid, 'DELETE')
