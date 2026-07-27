@@ -373,6 +373,7 @@ async fn run() -> Result<(), BootstrapError> {
             })
             .await
     };
+    let route_health_server_keyring = Arc::clone(&route_health_keyring);
     let route_health_server = async move {
         axum::serve(
             RouteHealthTlsListener::new(
@@ -384,7 +385,7 @@ async fn run() -> Result<(), BootstrapError> {
                 store: route_health_store,
                 receipt_key_id: config.route_health.receipt_key_id,
                 receipt_seed: route_health_receipt_seed,
-                receipt_keyring: Some(Arc::clone(&route_health_keyring)),
+                receipt_keyring: Some(route_health_server_keyring),
             })
             .into_make_service_with_connect_info::<RouteHealthConnectInfo>(),
         )
