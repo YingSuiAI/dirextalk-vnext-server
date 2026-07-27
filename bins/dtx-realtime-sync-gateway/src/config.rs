@@ -59,18 +59,38 @@ pub fn database_url() -> Result<String, std::io::Error> {
                     "realtime database credential is not UTF-8",
                 )
             })?;
-            let value = value
-                .strip_suffix('\n')
-                .unwrap_or(value)
-                .strip_suffix('\r')
-                .unwrap_or(value);
-            if value.is_empty() || value.chars().any(char::is_control) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "realtime database credential shape rejected",
-                ));
-            }
-            Ok(value.to_owned())
+            normalize_database_url(value).map(str::to_owned)
         }
+    }
+}
+
+fn normalize_database_url(value: &str) -> Result<&str, std::io::Error> {
+    let value = value.strip_suffix('\n').unwrap_or(value);
+    let value = value.strip_suffix('\r').unwrap_or(value);
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "realtime database credential shape rejected",
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_database_url;
+
+    #[test]
+    fn database_url_accepts_secret_file_line_endings_only_at_eof() {
+        assert_eq!(
+            normalize_database_url("postgres://runtime@node/database\n").expect("LF"),
+            "postgres://runtime@node/database"
+        );
+        assert_eq!(
+            normalize_database_url("postgres://runtime@node/database\r\n").expect("CRLF"),
+            "postgres://runtime@node/database"
+        );
+        assert!(normalize_database_url("postgres://runtime@\nnode/database").is_err());
+        assert!(normalize_database_url("\n").is_err());
     }
 }
