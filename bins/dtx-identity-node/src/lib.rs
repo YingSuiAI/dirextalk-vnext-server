@@ -42,8 +42,8 @@ use dtx_identity_persistence::{
     ClientBindingAuthorization, ClientBindingRepository, ClientBindingWorkflowError,
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,
     CreateHistoryRecoveryRequestV4Command, DEVICE_ENROLLMENT_CAPABILITY_HASH_DOMAIN,
-    DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability, DeviceEnrollmentChallenge,
-    DeviceEnrollmentChallengeOutcome, DeviceEnrollmentChallengeState,
+    DeploymentBindingTicketRepository, DeviceEnrollmentApprovalCommand, DeviceEnrollmentCapability,
+    DeviceEnrollmentChallenge, DeviceEnrollmentChallengeOutcome, DeviceEnrollmentChallengeState,
     DeviceEnrollmentChallengeStatus, DeviceEnrollmentRepository, DeviceRevokeCommand,
     DeviceSessionCompletionCommand, DeviceSessionCredential, DeviceSessionOutcome,
     DeviceSessionRepository, FEDERATED_KEY_PACKAGE_CLAIM_PATH, FederatedKeyPackageClaimProof,
@@ -72,6 +72,8 @@ mod completion;
 mod completion_key;
 #[path = "http/contacts.rs"]
 mod contacts;
+#[path = "http/deployment_bindings.rs"]
+mod deployment_bindings;
 #[path = "http/enrollment_codec.rs"]
 mod enrollment_codec;
 #[path = "http/error_types.rs"]
@@ -108,6 +110,7 @@ pub(crate) use contacts::{
     create_contact_invite, get_contact_receipt, pending_contact_requests, review_contact_request,
     revoke_contact_invite, submit_contact_request,
 };
+pub(crate) use deployment_bindings::{get_deployment_binding_status, redeem_deployment_binding};
 pub use enrollment_codec::parse_device_session_authorization;
 pub(crate) use enrollment_codec::{
     DeviceSessionAuthorizationError, decode_base64url_32, parse_device_enrollment_candidate,
@@ -228,6 +231,8 @@ pub const DEVICE_ENROLLMENT_PATH: &str = "/v1/devices/enroll";
 pub const KEY_PACKAGE_PUBLISH_PATH_TEMPLATE: &str = "/v1/key-packages/{package_id}";
 /// Route that atomically consumes one opaque `KeyPackage` for a target device.
 pub const KEY_PACKAGE_CLAIM_PATH: &str = "/v1/key-packages/claim";
+pub const DEPLOYMENT_BINDING_REDEEM_PATH: &str = "/v1/deployment-bindings/redeem";
+pub const DEPLOYMENT_BINDING_STATUS_PATH: &str = "/v1/deployment-bindings/{ticket_id}/status";
 /// Remote-device proof route for a claim against another identity origin.
 pub const KEY_PACKAGE_FEDERATED_CLAIM_PATH: &str = FEDERATED_KEY_PACKAGE_CLAIM_PATH;
 /// Public read-only route template for exact signed identity-log pages.
@@ -408,6 +413,7 @@ pub struct IdentityBootstrapState {
     recovery_catalogs: RecoveryScopeCatalogRepository,
     contacts: ContactRepository,
     client_bindings: ClientBindingRepository,
+    deployment_bindings: DeploymentBindingTicketRepository,
     federated_identity: FederatedIdentityVerifier,
     public_origin: Arc<str>,
     clock: Arc<dyn Clock>,
@@ -456,6 +462,7 @@ impl IdentityBootstrapState {
             recovery_catalogs: RecoveryScopeCatalogRepository,
             contacts: ContactRepository,
             client_bindings: ClientBindingRepository,
+            deployment_bindings: DeploymentBindingTicketRepository,
             federated_identity,
             public_origin: device_session_audience.clone(),
             clock,
@@ -545,6 +552,14 @@ pub fn identity_bootstrap_router_with_state(state: IdentityBootstrapState) -> Ro
         .route(
             DEPLOYMENT_INITIAL_DEVICE_PATH,
             post(deployment_initial_device),
+        )
+        .route(
+            DEPLOYMENT_BINDING_REDEEM_PATH,
+            post(redeem_deployment_binding),
+        )
+        .route(
+            DEPLOYMENT_BINDING_STATUS_PATH,
+            get(get_deployment_binding_status),
         )
         .route(IDENTITY_LOG_PAGE_PATH_TEMPLATE, get(get_identity_log_page))
         .route(

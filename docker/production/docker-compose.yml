@@ -132,6 +132,28 @@ services:
       - /run/dtx-client-binding/import.json
     profiles: ["client-binding"]
 
+  # One-shot deployment ticket issuer. Only ticket/capability digests are
+  # durable in Postgres; the short-lived export is removed by the host helper.
+  deployment-binding-ticket-issuer:
+    <<: *server-image
+    user: "0:0"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    entrypoint: ["/usr/local/bin/dtx-identity-provision"]
+    volumes:
+      - ${DTX_SECRET_ROOT:?set secret root}/identity-database-url:/run/dtx-secrets/identity-database-url:ro
+      - /etc/dirextalk/vnext/deployment-binding:/run/dtx-deployment-binding
+    command:
+      - deployment-binding-ticket-issue
+      - --database-url-file
+      - /run/dtx-secrets/identity-database-url
+      - --request-file
+      - /run/dtx-deployment-binding/request.json
+      - --output-file
+      - /run/dtx-deployment-binding/ticket.json
+    profiles: ["deployment-binding"]
+
   client-binding-expirer:
     <<: *server-image
     user: "0:0"

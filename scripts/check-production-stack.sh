@@ -81,7 +81,7 @@ python3 "$root/tools/validate-production-images.py" "$example"
 for script in "$root"/scripts/production-stack/{install,bootstrap,verify,down,validate-images,validate-files}.sh; do
     test -x "$script" || { echo "not executable: $script" >&2; exit 1; }
 done
-for helper in "$root"/scripts/production-stack/host/{client-binding-issue,client-binding-expire,client-binding-revoke,client-binding-export-cleanup}; do
+for helper in "$root"/scripts/production-stack/host/{install-vnext,provision-vnext,read-vnext-receipt,client-binding-issue,client-binding-expire,client-binding-revoke,client-binding-export-cleanup,deployment-binding-ticket-issue,deployment-binding-ticket-cleanup}; do
     test -x "$helper" || { echo "not executable: $helper" >&2; exit 1; }
 done
 python3 "$root/tools/test-client-binding-release-artifacts.py"

@@ -9,7 +9,9 @@ use std::{
 
 use base64ct::{Base64UrlUnpadded, Encoding};
 use dtx_identity_persistence::{
-    ClientBindingIssueCommand, ClientBindingRepository, IdentityPgStore,
+    ClientBindingIssueCommand, ClientBindingRepository, DEPLOYMENT_BINDING_CAPABILITY_HASH_DOMAIN,
+    DEPLOYMENT_BINDING_STATUS_TOKEN_HASH_DOMAIN, DeploymentBindingTicketIssueCommand,
+    DeploymentBindingTicketRepository, IdentityPgStore,
 };
 use dtx_wire::Sha256Digest;
 use getrandom::fill as fill_random;
@@ -46,6 +48,9 @@ async fn run() -> Result<(), ProvisionError> {
     }
     if command.as_deref() == Some(std::ffi::OsStr::new("client-binding-expire")) {
         return run_expire().await;
+    }
+    if command.as_deref() == Some(std::ffi::OsStr::new("deployment-binding-ticket-issue")) {
+        return run_ticket_issue().await;
     }
     let arguments = Arguments::parse(env::args_os())?;
     let request_bytes = Zeroizing::new(read_root_file(&arguments.request_file, MAX_REQUEST_BYTES)?);
@@ -146,6 +151,127 @@ async fn run() -> Result<(), ProvisionError> {
     }
     write_new_root_file(&arguments.output_file, &output_bytes)?;
     Ok(())
+}
+
+async fn run_ticket_issue() -> Result<(), ProvisionError> {
+    let arguments = Arguments::parse_for(env::args_os(), "deployment-binding-ticket-issue")?;
+    let request_bytes = Zeroizing::new(read_root_file(&arguments.request_file, MAX_REQUEST_BYTES)?);
+    let request: IssueRequest =
+        serde_json::from_slice(&request_bytes).map_err(|_| ProvisionError::Request)?;
+    let canonical_request =
+        Zeroizing::new(serde_json::to_vec(&request).map_err(|_| ProvisionError::Request)?);
+    if *canonical_request != *request_bytes {
+        return Err(ProvisionError::Request);
+    }
+    request.validate_schema("dirextalk.deployment-binding-ticket-issue")?;
+    let ca_bytes = Zeroizing::new(read_root_file(
+        &request.identity_tls_root_ca_file,
+        MAX_CA_BYTES,
+    )?);
+    validate_ca_certificate(&ca_bytes)?;
+    let ca_digest = Sha256Digest::from_bytes(Sha256::digest(&ca_bytes).into());
+    let now = now_ms()?;
+    let (ticket_id, binding_id, capability, status_token, issued_at_ms, expires_at_ms, output) =
+        if let Ok(existing) = read_root_file(&arguments.output_file, MAX_REQUEST_BYTES) {
+            let existing = Zeroizing::new(existing);
+            let parsed: TicketIssueOutputOwned =
+                serde_json::from_slice(&existing).map_err(|_| ProvisionError::ArtifactLost)?;
+            parsed.validate(&request, ca_digest, now)?;
+            let capability = decode_secret(&parsed.capability)?;
+            let status_token = decode_secret(&parsed.status_token)?;
+            (
+                parsed.ticket_id,
+                parsed.binding_id,
+                capability,
+                status_token,
+                parsed
+                    .expires_at_unix_ms
+                    .checked_sub(request.ttl_millis)
+                    .ok_or(ProvisionError::ArtifactLost)?,
+                parsed.expires_at_unix_ms,
+                existing,
+            )
+        } else {
+            let ticket_id = Uuid::now_v7();
+            let binding_id = Uuid::now_v7();
+            let expires_at_ms = now
+                .checked_add(request.ttl_millis)
+                .ok_or(ProvisionError::Request)?;
+            let mut capability = Zeroizing::new([0_u8; 32]);
+            let mut status_token = Zeroizing::new([0_u8; 32]);
+            fill_random(&mut *capability).map_err(|_| ProvisionError::Random)?;
+            fill_random(&mut *status_token).map_err(|_| ProvisionError::Random)?;
+            let capability_text = Base64UrlUnpadded::encode_string(&*capability);
+            let status_token_text = Base64UrlUnpadded::encode_string(&*status_token);
+            let payload = TicketQrPayload {
+                server_origin: request.server_origin.clone(),
+                ticket_id,
+                capability: capability_text.clone(),
+                protocol_version: 1,
+                expires_at_unix_ms: expires_at_ms,
+            };
+            let payload_bytes = serde_json::to_vec(&payload).map_err(|_| ProvisionError::Output)?;
+            let output = TicketIssueOutput {
+                schema: "dirextalk.deployment-binding-ticket",
+                schema_version: 1,
+                ticket_id,
+                binding_id,
+                deployment_operation_id: request.deployment_operation_id,
+                tenant_id: request.tenant_id,
+                server_origin: request.server_origin.clone(),
+                expires_at_unix_ms: expires_at_ms,
+                protocol_version: 1,
+                capability: capability_text,
+                status_token: status_token_text,
+                qr_payload: format!("dtxb1:{}", Base64UrlUnpadded::encode_string(&payload_bytes)),
+            };
+            (
+                ticket_id,
+                binding_id,
+                capability,
+                status_token,
+                now,
+                expires_at_ms,
+                Zeroizing::new(serde_json::to_vec(&output).map_err(|_| ProvisionError::Output)?),
+            )
+        };
+    let command = DeploymentBindingTicketIssueCommand {
+        ticket_id,
+        binding_id,
+        deployment_operation_id: request.deployment_operation_id,
+        tenant_id: request.tenant_id,
+        server_origin: request.server_origin,
+        tls_root_ca_pem: String::from_utf8(ca_bytes.to_vec())
+            .map_err(|_| ProvisionError::Request)?,
+        tls_root_ca_sha256: ca_digest,
+        capability_digest: Sha256Digest::hash_domain(
+            DEPLOYMENT_BINDING_CAPABILITY_HASH_DOMAIN,
+            &*capability,
+        ),
+        status_token_digest: Sha256Digest::hash_domain(
+            DEPLOYMENT_BINDING_STATUS_TOKEN_HASH_DOMAIN,
+            &*status_token,
+        ),
+        issued_at_ms,
+        expires_at_ms,
+    };
+    DeploymentBindingTicketRepository
+        .issue(&open_store(&arguments.database_url_file).await?, &command)
+        .await
+        .map_err(|_| ProvisionError::Database)?;
+    if fs::symlink_metadata(&arguments.output_file).is_err() {
+        write_new_root_file(&arguments.output_file, &output)?;
+    }
+    Ok(())
+}
+
+fn decode_secret(value: &str) -> Result<Zeroizing<[u8; 32]>, ProvisionError> {
+    if value.len() != 43 {
+        return Err(ProvisionError::ArtifactLost);
+    }
+    let mut raw = Zeroizing::new([0_u8; 32]);
+    Base64UrlUnpadded::decode(value, &mut *raw).map_err(|_| ProvisionError::ArtifactLost)?;
+    Ok(raw)
 }
 
 type ExistingArtifactAuthorization = (Uuid, i64, i64, Zeroizing<[u8; 32]>);
@@ -278,7 +404,11 @@ struct IssueRequest {
 
 impl IssueRequest {
     fn validate(&self) -> Result<(), ProvisionError> {
-        if self.schema != "dirextalk.client-binding-issue"
+        self.validate_schema("dirextalk.client-binding-issue")
+    }
+
+    fn validate_schema(&self, schema: &str) -> Result<(), ProvisionError> {
+        if self.schema != schema
             || self.schema_version != 1
             || self.deployment_operation_id.get_version_num() != 7
             || self.tenant_id.get_version_num() != 7
@@ -290,6 +420,103 @@ impl IssueRequest {
             return Err(ProvisionError::Request);
         }
         Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct TicketQrPayload {
+    server_origin: String,
+    ticket_id: Uuid,
+    capability: String,
+    protocol_version: u8,
+    expires_at_unix_ms: i64,
+}
+
+#[derive(Serialize)]
+struct TicketIssueOutput {
+    schema: &'static str,
+    schema_version: u8,
+    ticket_id: Uuid,
+    binding_id: Uuid,
+    deployment_operation_id: Uuid,
+    tenant_id: Uuid,
+    server_origin: String,
+    expires_at_unix_ms: i64,
+    protocol_version: u8,
+    capability: String,
+    status_token: String,
+    qr_payload: String,
+}
+
+impl Drop for TicketIssueOutput {
+    fn drop(&mut self) {
+        self.capability.zeroize();
+        self.status_token.zeroize();
+        self.qr_payload.zeroize();
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TicketIssueOutputOwned {
+    schema: String,
+    schema_version: u8,
+    ticket_id: Uuid,
+    binding_id: Uuid,
+    deployment_operation_id: Uuid,
+    tenant_id: Uuid,
+    server_origin: String,
+    expires_at_unix_ms: i64,
+    protocol_version: u8,
+    capability: String,
+    status_token: String,
+    qr_payload: String,
+}
+
+impl TicketIssueOutputOwned {
+    fn validate(
+        &self,
+        request: &IssueRequest,
+        _ca_digest: Sha256Digest,
+        now: i64,
+    ) -> Result<(), ProvisionError> {
+        let capability = decode_secret(&self.capability)?;
+        let _status_token = decode_secret(&self.status_token)?;
+        let payload = TicketQrPayload {
+            server_origin: self.server_origin.clone(),
+            ticket_id: self.ticket_id,
+            capability: Base64UrlUnpadded::encode_string(&*capability),
+            protocol_version: self.protocol_version,
+            expires_at_unix_ms: self.expires_at_unix_ms,
+        };
+        let payload_bytes =
+            serde_json::to_vec(&payload).map_err(|_| ProvisionError::ArtifactLost)?;
+        let expected_qr = Zeroizing::new(format!(
+            "dtxb1:{}",
+            Base64UrlUnpadded::encode_string(&payload_bytes)
+        ));
+        if self.schema != "dirextalk.deployment-binding-ticket"
+            || self.schema_version != 1
+            || self.protocol_version != 1
+            || self.ticket_id.get_version_num() != 7
+            || self.binding_id.get_version_num() != 7
+            || self.deployment_operation_id != request.deployment_operation_id
+            || self.tenant_id != request.tenant_id
+            || self.server_origin != request.server_origin
+            || self.expires_at_unix_ms <= now
+            || self.qr_payload != *expected_qr
+        {
+            return Err(ProvisionError::ArtifactLost);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TicketIssueOutputOwned {
+    fn drop(&mut self) {
+        self.capability.zeroize();
+        self.status_token.zeroize();
+        self.qr_payload.zeroize();
     }
 }
 
@@ -379,9 +606,16 @@ impl FixedActionArguments {
 }
 
 impl Arguments {
-    fn parse(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<Self, ProvisionError> {
+    fn parse(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Self, ProvisionError> {
+        Self::parse_for(args, "client-binding-issue")
+    }
+
+    fn parse_for(
+        mut args: impl Iterator<Item = std::ffi::OsString>,
+        command: &str,
+    ) -> Result<Self, ProvisionError> {
         let _ = args.next();
-        if args.next().as_deref() != Some(std::ffi::OsStr::new("client-binding-issue")) {
+        if args.next().as_deref() != Some(std::ffi::OsStr::new(command)) {
             return Err(ProvisionError::Usage);
         }
         let mut database_url_file = None;
