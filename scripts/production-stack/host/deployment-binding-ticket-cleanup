@@ -14,6 +14,7 @@ for file in \
   "$root/request.json" \
   "$root/ticket.json" \
   "$root/private-ca.pem" \
+  "$root/identity-database-url" \
   /home/ubuntu/dirextalk-deployment-binding.request \
   /home/ubuntu/dirextalk-deployment-binding.ticket.json; do
   if [[ -e "$file" || -L "$file" ]]; then

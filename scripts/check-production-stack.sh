@@ -96,6 +96,11 @@ done
 for helper in "$root"/scripts/production-stack/host/{install-vnext,provision-vnext,read-vnext-receipt,client-binding-issue,client-binding-expire,client-binding-revoke,client-binding-export-cleanup,deployment-binding-ticket-issue,deployment-binding-ticket-cleanup}; do
     test -x "$helper" || { echo "not executable: $helper" >&2; exit 1; }
 done
+grep -Fq -- '/run/dtx-deployment-binding/identity-database-url' "$compose"
+grep -Fq -- 'source_database_url=/etc/dirextalk/vnext/secrets/identity-database-url' \
+    "$root/scripts/production-stack/host/deployment-binding-ticket-issue"
+grep -Fq -- '"$root/identity-database-url"' \
+    "$root/scripts/production-stack/host/deployment-binding-ticket-cleanup"
 python3 "$root/tools/test-client-binding-release-artifacts.py"
 bash "$root/scripts/check-release-image.sh"
 echo 'Product Core production stack gates passed'

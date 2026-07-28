@@ -142,12 +142,11 @@ services:
     cap_drop: ["ALL"]
     entrypoint: ["/usr/local/bin/dtx-identity-provision"]
     volumes:
-      - ${DTX_SECRET_ROOT:?set secret root}/identity-database-url:/run/dtx-secrets/identity-database-url:ro
       - /etc/dirextalk/vnext/deployment-binding:/run/dtx-deployment-binding
     command:
       - deployment-binding-ticket-issue
       - --database-url-file
-      - /run/dtx-secrets/identity-database-url
+      - /run/dtx-deployment-binding/identity-database-url
       - --request-file
       - /run/dtx-deployment-binding/request.json
       - --output-file
