@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 0 )) || [[ "$(id -u)" != 0 ]]; then
+  echo 'usage: deployment-binding-ticket-issue (root only)' >&2
+  exit 2
+fi
+
+root=/etc/dirextalk/vnext/deployment-binding
+staged=/home/ubuntu/dirextalk-deployment-binding.request
+request="$root/request.json"
+output="$root/ticket.json"
+export=/home/ubuntu/dirextalk-deployment-binding.ticket.json
+source_ca=/etc/dirextalk/vnext/tls/private-ca.pem
+ca="$root/private-ca.pem"
+source_database_url=/etc/dirextalk/vnext/secrets/identity-database-url
+database_url="$root/identity-database-url"
+compose=/etc/dirextalk/vnext/config/production-compose.yml
+env_file=/etc/dirextalk/vnext/config/production.env
+
+[[ -f "$compose" && ! -L "$compose" ]] || exit 1
+[[ -f "$env_file" && ! -L "$env_file" ]] || exit 1
+[[ -d /home/ubuntu && ! -L /home/ubuntu ]] || exit 1
+install -d -o 0 -g 0 -m 0700 -- "$root"
+[[ "$(stat -c '%u:%g:%a' "$root")" == '0:0:700' ]] || exit 1
+[[ -f "$source_ca" && ! -L "$source_ca" ]] || exit 1
+[[ -f "$source_database_url" && ! -L "$source_database_url" ]] || exit 1
+
+valid_root_file() {
+  [[ -f "$1" && ! -L "$1" && "$(stat -c '%u:%g:%a:%h' "$1")" == '0:0:600:1' ]]
+}
+valid_staged_file() {
+  [[ -f "$1" && ! -L "$1" && "$(stat -c '%u:%g:%a:%h' "$1")" == '1000:1000:400:1' ]]
+}
+
+if [[ -e "$staged" || -L "$staged" ]]; then
+  valid_staged_file "$staged" || exit 1
+  if [[ -e "$request" || -L "$request" ]]; then
+    valid_root_file "$request" && cmp -s -- "$staged" "$request" || exit 1
+    shred --remove=unlink -- "$staged" >/dev/null 2>&1
+  else
+    install -o 0 -g 0 -m 0600 -- "$staged" "$request"
+    shred --remove=unlink -- "$staged" >/dev/null 2>&1
+  fi
+fi
+valid_root_file "$request" || exit 1
+grep -Fq -- '"schema":"dirextalk.deployment-binding-ticket-issue"' "$request" || exit 1
+grep -Fq -- '"identity_tls_root_ca_file":"/run/dtx-deployment-binding/private-ca.pem"' "$request" || exit 1
+
+if [[ ! -e "$ca" && ! -L "$ca" ]]; then
+  install -o 0 -g 0 -m 0600 -- "$source_ca" "$ca"
+fi
+valid_root_file "$ca" && cmp -s -- "$ca" "$source_ca" || exit 1
+if [[ ! -e "$database_url" && ! -L "$database_url" ]]; then
+  install -o 0 -g 0 -m 0600 -- "$source_database_url" "$database_url"
+fi
+valid_root_file "$database_url" && cmp -s -- "$database_url" "$source_database_url" || exit 1
+
+if [[ ! -e "$output" && ! -L "$output" ]]; then
+  docker compose --project-name dirextalk-vnext-production \
+    --env-file "$env_file" -f "$compose" \
+    --profile deployment-binding run --rm --no-deps deployment-binding-ticket-issuer >/dev/null
+fi
+valid_root_file "$output" || exit 1
+
+if [[ -e "$export" || -L "$export" ]]; then
+  valid_staged_file "$export" && cmp -s -- "$export" "$output" || exit 1
+else
+  install -o 1000 -g 1000 -m 0400 -- "$output" "$export"
+fi
+valid_staged_file "$export" || exit 1

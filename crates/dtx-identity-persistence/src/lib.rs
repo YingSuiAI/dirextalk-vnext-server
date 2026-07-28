@@ -3,6 +3,7 @@
 //! Durable `PostgreSQL` storage for the self-certifying identity log.
 
 mod client_binding;
+mod deployment_binding;
 mod device_enrollment;
 mod device_session;
 mod error;
@@ -19,6 +20,12 @@ pub use client_binding::{
     ClientBindingAuthorization, ClientBindingImport, ClientBindingImportError,
     ClientBindingIssueCommand, ClientBindingIssueOutcome, ClientBindingRepository,
     ClientBindingState, ClientBindingWorkflowError, is_canonical_https_origin,
+};
+pub use deployment_binding::{
+    DEPLOYMENT_BINDING_CAPABILITY_HASH_DOMAIN, DEPLOYMENT_BINDING_CLIENT_AUTHORIZATION_DOMAIN,
+    DEPLOYMENT_BINDING_STATUS_TOKEN_HASH_DOMAIN, DeploymentBindingTicket,
+    DeploymentBindingTicketError, DeploymentBindingTicketIssueCommand,
+    DeploymentBindingTicketRepository, DeploymentBindingTicketState,
 };
 pub use device_enrollment::{
     CreateDeviceEnrollmentChallengeCommand, CreateHistoryRecoveryRequestCommand,

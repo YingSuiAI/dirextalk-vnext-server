@@ -50,8 +50,8 @@ run_migrator() {
 run_migrator migrate >/dev/null
 run_migrator migrate >/dev/null
 docker exec "$database" psql -Atq -U postgres -d dtx_node \
-    -c "SELECT (SELECT count(*) FROM public._sqlx_migrations WHERE success) = 21
-               AND (SELECT epoch = 'product-core-alpha-20260724'
+    -c "SELECT (SELECT count(*) FROM public._sqlx_migrations WHERE success) = 31
+               AND (SELECT epoch = 'product-core-alpha-20260725-history-recovery-completion-v2'
                           AND octet_length(baseline_digest) = 32
                       FROM system.schema_epoch WHERE singleton);" | grep -qx t
 

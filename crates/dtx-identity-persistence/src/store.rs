@@ -157,6 +157,7 @@ async fn validate_identity_runtime_role(pool: &PgPool) -> Result<(), IdentityPer
              AND has_table_privilege(current_user, 'identity.history_recovery_completion_key_head', 'SELECT,INSERT,UPDATE') \
              AND has_table_privilege(current_user, 'identity.history_recovery_completions_v2', 'SELECT,INSERT') \
              AND has_table_privilege(current_user, 'identity.client_bindings', 'SELECT,INSERT,UPDATE') \
+             AND has_table_privilege(current_user, 'identity.deployment_binding_tickets', 'SELECT,INSERT,UPDATE') \
              AND has_schema_privilege(current_user, 'messaging', 'USAGE') \
              AND has_function_privilege(current_user, 'messaging.is_uuid_v7(uuid)', 'EXECUTE') \
              AND has_column_privilege(current_user, 'identity.recovery_scope_catalog_preparations', 'provider_response_bytes', 'UPDATE') \
@@ -437,6 +438,13 @@ async fn role_has_excess_identity_privileges(
                             OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
                             OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
                         )) \
+                        OR (relation.relname = 'deployment_binding_tickets' AND (\
+                            has_table_privilege(current_user, relation.oid, 'DELETE') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRUNCATE') \
+                            OR has_table_privilege(current_user, relation.oid, 'REFERENCES') \
+                            OR has_table_privilege(current_user, relation.oid, 'TRIGGER') \
+                            OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')\
+                        )) \
                         OR (relation.relname IN (\
                             'device_sessions', 'device_session_idempotency_claims', \
                             'device_session_receipts', 'key_package_publish_claims', \
@@ -484,6 +492,7 @@ async fn role_has_excess_identity_privileges(
                             'history_recovery_completions_v2', \
                             'history_recovery_completion_key_head', \
                             'client_bindings', \
+                            'deployment_binding_tickets', \
                             'fork_evidence', 'log_outbox'\
                         ) AND (\
                             has_table_privilege(current_user, relation.oid, 'SELECT') \

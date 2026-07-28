@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( $# != 0 )) || [[ "$(id -u)" != 0 ]]; then
+  echo 'usage: deployment-binding-ticket-cleanup (root only)' >&2
+  exit 2
+fi
+
+root=/etc/dirextalk/vnext/deployment-binding
+[[ -d "$root" && ! -L "$root" ]] || exit 1
+[[ "$(stat -c '%u:%g:%a' "$root")" == '0:0:700' ]] || exit 1
+
+for file in \
+  "$root/request.json" \
+  "$root/ticket.json" \
+  "$root/private-ca.pem" \
+  "$root/identity-database-url" \
+  /home/ubuntu/dirextalk-deployment-binding.request \
+  /home/ubuntu/dirextalk-deployment-binding.ticket.json; do
+  if [[ -e "$file" || -L "$file" ]]; then
+    [[ -f "$file" && ! -L "$file" && "$(stat -c '%h' "$file")" == 1 ]] || exit 1
+    shred --remove=unlink -- "$file" >/dev/null 2>&1
+  fi
+done

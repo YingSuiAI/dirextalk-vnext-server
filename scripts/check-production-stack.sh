@@ -5,6 +5,9 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 compose="$root/docker/production/docker-compose.yml"
 example="$root/docker/production/examples/production.env.example"
 [[ -f "$compose" && -f "$example" ]] || { echo 'production compose/example missing' >&2; exit 1; }
+grep -q '"docker/production/examples/production.env.example"' "$root/tools/production-stack-bundle.py"
+grep -q "example='docker/production/examples/production.env.example'" "$root/scripts/production-stack/host/provision-vnext"
+! grep -q 'examples/{v\\[\"target\"\\]}.env.example' "$root/scripts/production-stack/host/provision-vnext"
 
 grep -q 'dirextalk/vnet-server@sha256:<64 lowercase hex>' "$root/docker/production/README.md"
 grep -q 'condition: service_completed_successfully' "$compose"
@@ -27,6 +30,15 @@ grep -q 'push-root-key' "$compose"
 grep -q 'push-fcm-service-account.json' "$compose"
 grep -q 'push-certificate.pem' "$compose"
 grep -q 'push-private-key.pem' "$compose"
+for material in push-identity-database-url push-registration-database-url push-broker-database-url push-root-key push-fcm-service-account.json; do
+    grep -q "'$material'" "$root/scripts/production-stack/host/provision-vnext"
+done
+grep -q "TLS/'push-certificate.pem'" "$root/scripts/production-stack/host/provision-vnext"
+grep -q "TLS/'push-private-key.pem'" "$root/scripts/production-stack/host/provision-vnext"
+grep -q "write(SECRETS/'push-root-key',os.urandom(32),0o400)" "$root/scripts/production-stack/host/provision-vnext"
+grep -q "rsa_keygen_bits:2048" "$root/scripts/production-stack/host/provision-vnext"
+grep -q 'DTX_AGENT_CONTROL_BIND={v\["private_ipv4"\]}' "$root/scripts/production-stack/host/provision-vnext"
+! grep -q 'unauthenticated MCP probe' "$root/scripts/production-stack/host/provision-vnext"
 grep -q 'DTX_AGENT_CONTROL_BIND.*:9443:9443' "$compose"
 grep -q 'network_mode: service:agent-control' "$compose"
 grep -q 'https://.*:8443/local/ready' "$compose"
@@ -81,9 +93,14 @@ python3 "$root/tools/validate-production-images.py" "$example"
 for script in "$root"/scripts/production-stack/{install,bootstrap,verify,down,validate-images,validate-files}.sh; do
     test -x "$script" || { echo "not executable: $script" >&2; exit 1; }
 done
-for helper in "$root"/scripts/production-stack/host/{client-binding-issue,client-binding-expire,client-binding-revoke,client-binding-export-cleanup}; do
+for helper in "$root"/scripts/production-stack/host/{install-vnext,provision-vnext,read-vnext-receipt,client-binding-issue,client-binding-expire,client-binding-revoke,client-binding-export-cleanup,deployment-binding-ticket-issue,deployment-binding-ticket-cleanup}; do
     test -x "$helper" || { echo "not executable: $helper" >&2; exit 1; }
 done
+grep -Fq -- '/run/dtx-deployment-binding/identity-database-url' "$compose"
+grep -Fq -- 'source_database_url=/etc/dirextalk/vnext/secrets/identity-database-url' \
+    "$root/scripts/production-stack/host/deployment-binding-ticket-issue"
+grep -Fq -- '"$root/identity-database-url"' \
+    "$root/scripts/production-stack/host/deployment-binding-ticket-cleanup"
 python3 "$root/tools/test-client-binding-release-artifacts.py"
 bash "$root/scripts/check-release-image.sh"
 echo 'Product Core production stack gates passed'
