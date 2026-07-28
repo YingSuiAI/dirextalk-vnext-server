@@ -61,9 +61,7 @@ fn validation_query(
     let mut cross_membership = String::new();
     for role in RUNTIME_ROLES {
         if *role != expected_role {
-            cross_membership.push_str(
-                " AND NOT COALESCE(pg_has_role(current_user, to_regrole('",
-            );
+            cross_membership.push_str(" AND NOT COALESCE(pg_has_role(current_user, to_regrole('");
             cross_membership.push_str(role);
             cross_membership.push_str("'), 'MEMBER'), false)");
         }
