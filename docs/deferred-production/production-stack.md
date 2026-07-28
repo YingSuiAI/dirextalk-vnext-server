@@ -30,3 +30,12 @@ roles/migrations, and node/realtime readiness. They do not publish or mutate
 the Internal Test Alpha evidence bundle. Agent Control and Public/Indexer
 services remain explicit profiles, and opaque push remains a separate reviewed
 service. Fixed client-binding helpers accept only closed, root-owned files.
+
+The deployment-binding ticket issuer is also a root-only one-shot profile.
+Its host helper copies the shared identity database URL into the isolated
+deployment-binding directory as a root-owned `0600` transient file; the
+container never relaxes the protected-file reader to accept the runtime
+service group's `0440` secret. Ticket cleanup shreds that transient copy with
+the request, CA copy, ticket, and exported fallback file. This path shipped in
+0.1.12 and was exercised on a fresh Hong Kong EC2 deployment through live
+ticket redemption.
