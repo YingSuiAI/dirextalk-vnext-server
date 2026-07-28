@@ -24,6 +24,7 @@ FILES: tuple[tuple[str, int], ...] = (
     ("docker/production/Caddyfile", 0o444),
     ("docker/production/README.md", 0o444),
     ("docker/production/docker-compose.yml", 0o444),
+    ("docker/production/examples/production.env.example", 0o444),
     ("docker/production/migration-compatibility", 0o444),
     ("scripts/production-stack/bootstrap.sh", 0o555),
     ("scripts/production-stack/down.sh", 0o555),

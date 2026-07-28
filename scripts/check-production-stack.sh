@@ -5,6 +5,7 @@ root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 compose="$root/docker/production/docker-compose.yml"
 example="$root/docker/production/examples/production.env.example"
 [[ -f "$compose" && -f "$example" ]] || { echo 'production compose/example missing' >&2; exit 1; }
+grep -q '"docker/production/examples/production.env.example"' "$root/tools/production-stack-bundle.py"
 
 grep -q 'dirextalk/vnet-server@sha256:<64 lowercase hex>' "$root/docker/production/README.md"
 grep -q 'condition: service_completed_successfully' "$compose"
