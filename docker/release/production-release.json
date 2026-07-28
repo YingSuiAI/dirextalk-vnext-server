@@ -1,1 +1,1 @@
-{"latest_discovery":true,"migrator_dockerfile":"docker/production/Dockerfile.migrate","platform":"linux/amd64","repository":"dirextalk/vnet-server","runtime_dockerfile":"docker/release/Dockerfile","schema":"dirextalk.vnet-server-release-input","schema_version":1,"version":"0.1.5"}
+{"latest_discovery":true,"migrator_dockerfile":"docker/production/Dockerfile.migrate","platform":"linux/amd64","repository":"dirextalk/vnet-server","runtime_dockerfile":"docker/release/Dockerfile","schema":"dirextalk.vnet-server-release-input","schema_version":1,"version":"0.1.6"}

@@ -24,6 +24,7 @@ FILES: tuple[tuple[str, int], ...] = (
     ("docker/production/Caddyfile", 0o444),
     ("docker/production/README.md", 0o444),
     ("docker/production/docker-compose.yml", 0o444),
+    ("docker/production/migration-compatibility", 0o444),
     ("scripts/production-stack/bootstrap.sh", 0o555),
     ("scripts/production-stack/down.sh", 0o555),
     ("scripts/production-stack/install.sh", 0o555),
@@ -45,7 +46,7 @@ class BundleError(RuntimeError):
 
 
 def canonical(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 def digest(raw: bytes) -> str:
