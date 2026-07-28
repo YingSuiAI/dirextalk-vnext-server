@@ -303,15 +303,15 @@ def release_documents(v, manifest_raw, receipt_raw, payloads):
     for key in ('version','source_commit','server_image','migrator_image'):
         if receipt.get(key)!=manifest.get(key): raise ContractError('installed release receipt differs from manifest')
     if manifest['server_image']!=v['server_image'] or manifest['migrator_image']!=v['migrator_image']: raise ContractError('installed release images differ from request')
-    compose='docker/production/docker-compose.yml'; example=f'docker/production/examples/{v["target"]}.env.example'
-    if compose not in payloads or example not in payloads or sha(payloads[compose])!=v['compose_sha256']: raise ContractError('installed release compose or target example invalid')
+    compose='docker/production/docker-compose.yml'; example='docker/production/examples/production.env.example'
+    if compose not in payloads or example not in payloads or sha(payloads[compose])!=v['compose_sha256']: raise ContractError('installed release compose or production example invalid')
     contract={}
     try: lines=payloads[example].decode().splitlines()
-    except UnicodeError as e: raise ContractError('installed target example invalid') from e
+    except UnicodeError as e: raise ContractError('installed production example invalid') from e
     for line in lines:
         if line.startswith('DTX_') and '=' in line:
             key,value=line.split('=',1)
-            if key in contract: raise ContractError('installed target example duplicates a key')
+            if key in contract: raise ContractError('installed production example duplicates a key')
             contract[key]=value
     bindings={'postgres_image':'DTX_POSTGRES_IMAGE','caddy_image':'DTX_CADDY_IMAGE','probe_image':'DTX_PROBE_IMAGE'}
     if any(contract.get(env)!=v[key] for key,env in bindings.items()): raise ContractError('request dependency image is outside installed production contract')

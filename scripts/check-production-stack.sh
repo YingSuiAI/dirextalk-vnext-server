@@ -6,6 +6,8 @@ compose="$root/docker/production/docker-compose.yml"
 example="$root/docker/production/examples/production.env.example"
 [[ -f "$compose" && -f "$example" ]] || { echo 'production compose/example missing' >&2; exit 1; }
 grep -q '"docker/production/examples/production.env.example"' "$root/tools/production-stack-bundle.py"
+grep -q "example='docker/production/examples/production.env.example'" "$root/scripts/production-stack/host/provision-vnext"
+! grep -q 'examples/{v\\[\"target\"\\]}.env.example' "$root/scripts/production-stack/host/provision-vnext"
 
 grep -q 'dirextalk/vnet-server@sha256:<64 lowercase hex>' "$root/docker/production/README.md"
 grep -q 'condition: service_completed_successfully' "$compose"
