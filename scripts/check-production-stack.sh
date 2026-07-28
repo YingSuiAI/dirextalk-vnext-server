@@ -37,6 +37,7 @@ grep -q "TLS/'push-certificate.pem'" "$root/scripts/production-stack/host/provis
 grep -q "TLS/'push-private-key.pem'" "$root/scripts/production-stack/host/provision-vnext"
 grep -q "write(SECRETS/'push-root-key',os.urandom(32),0o400)" "$root/scripts/production-stack/host/provision-vnext"
 grep -q "rsa_keygen_bits:2048" "$root/scripts/production-stack/host/provision-vnext"
+grep -q 'DTX_AGENT_CONTROL_BIND={v\["private_ipv4"\]}' "$root/scripts/production-stack/host/provision-vnext"
 grep -q 'DTX_AGENT_CONTROL_BIND.*:9443:9443' "$compose"
 grep -q 'network_mode: service:agent-control' "$compose"
 grep -q 'https://.*:8443/local/ready' "$compose"

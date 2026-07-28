@@ -492,6 +492,7 @@ async fn role_has_excess_identity_privileges(
                             'history_recovery_completions_v2', \
                             'history_recovery_completion_key_head', \
                             'client_bindings', \
+                            'deployment_binding_tickets', \
                             'fork_evidence', 'log_outbox'\
                         ) AND (\
                             has_table_privilege(current_user, relation.oid, 'SELECT') \
