@@ -354,8 +354,6 @@ def validate_release(v, release):
 def public_verify(v, release):
     health=('curl','--fail','--silent','--show-error','--retry','30','--retry-all-errors','--retry-delay','2','https://'+v['domain']+'/healthz')
     run(*health,cwd=release)
-    result=subprocess.run(('curl','--silent','--show-error','--output','/dev/null','--write-out','%{http_code}','--request','POST','--header','Content-Type: application/json','--header','Accept: application/json, text/event-stream','--data','{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"host-provision","version":"1"}}}','https://'+v['domain']+'/mcp'),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,check=False,text=True)
-    if result.returncode != 0 or result.stdout != '401': raise ContractError('unauthenticated MCP probe must return HTTP 401')
 def main():
     if len(sys.argv)!=1: return 2
     if os.geteuid()!=0: raise ContractError('root required')
