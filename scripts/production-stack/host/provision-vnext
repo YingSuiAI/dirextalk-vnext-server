@@ -253,7 +253,36 @@ def make_tls(v):
         key=TLS/keyname
         run('openssl','genpkey','-algorithm','ED25519','-out',str(key)); os.chmod(key,0o440); os.chown(key,0,10001)
         csr=Path(str(key)+'.csr'); ext=Path(str(key)+'.ext'); write(ext,('subjectAltName=DNS:'+v['domain']+'\n').encode(),0o600); run('openssl','req','-new','-key',str(key),'-out',str(csr),'-subj','/CN='+v['domain']); cert=TLS/certname; run('openssl','x509','-req','-in',str(csr),'-CA',str(ca),'-CAkey',str(cak),'-CAcreateserial','-extfile',str(ext),'-out',str(cert),'-days','825'); write(cert,cert.read_bytes()+ca.read_bytes(),0o444); csr.unlink(missing_ok=True); ext.unlink(missing_ok=True)
+    push_key=TLS/'push-private-key.pem'
+    run('openssl','genpkey','-algorithm','ED25519','-out',str(push_key)); os.chmod(push_key,0o400); os.chown(push_key,0,0)
+    push_csr=TLS/'push-private-key.pem.csr'; push_ext=TLS/'push-private-key.pem.ext'
+    write(push_ext,('subjectAltName=DNS:'+v['domain']+'\n').encode(),0o600)
+    run('openssl','req','-new','-key',str(push_key),'-out',str(push_csr),'-subj','/CN='+v['domain'])
+    push_cert=TLS/'push-certificate.pem'
+    run('openssl','x509','-req','-in',str(push_csr),'-CA',str(ca),'-CAkey',str(cak),'-CAcreateserial','-extfile',str(push_ext),'-out',str(push_cert),'-days','825')
+    write(push_cert,push_cert.read_bytes()+ca.read_bytes(),0o400)
+    push_csr.unlink(missing_ok=True); push_ext.unlink(missing_ok=True)
     write(TLS/'mls-sequencer-key.pem',os.urandom(32),0o400,10001,10001)
+def make_push_material(passwords):
+    database_roles={
+        'push-identity-database-url':'dtx_push_identity_auth',
+        'push-registration-database-url':'dtx_push_registration',
+        'push-broker-database-url':'dtx_push_broker',
+    }
+    for name,role in database_roles.items():
+        write(SECRETS/name,('postgresql://'+role+':'+passwords[role]+'@postgres/dtx_node\n').encode(),0o400)
+    write(SECRETS/'push-root-key',os.urandom(32),0o400)
+    key_path=SECRETS/'.push-fcm-bootstrap-key.pem'
+    try:
+        run('openssl','genpkey','-algorithm','RSA','-pkeyopt','rsa_keygen_bits:2048','-out',str(key_path))
+        service_account={
+            'project_id':'dirextalk-unconfigured',
+            'client_email':'push-agent@dirextalk-unconfigured.iam.gserviceaccount.com',
+            'private_key':key_path.read_text(),
+        }
+        write(SECRETS/'push-fcm-service-account.json',canonical(service_account),0o400)
+    finally:
+        key_path.unlink(missing_ok=True)
 def material(v, release):
     for p,m,g in ((CONFIG,0o755,0),(SECRETS,0o750,10001),(SECRETS/'role-passwords',0o700,0),(TLS,0o750,10001)): mkdir(p,m,g)
     write(CONFIG/'production-compose.yml',transform_compose((release/'docker/production/docker-compose.yml').read_text()).encode(),0o644)
@@ -267,6 +296,7 @@ def material(v, release):
     for name in ('identity','group','mailbox','public-feed','indexer','realtime'):
         role={'realtime':'dtx_realtime_sync_gateway'}.get(name,'dtx_'+name.replace('-','_')+'_node')
         write(SECRETS/(name+'-database-url'),('postgresql://'+role+':'+passwords[role]+'@postgres/dtx_node\n').encode(),0o440,10001)
+    make_push_material(passwords)
     make_tls(v)
 def ready(v, reqsha):
     body={'schema':RECEIPT_SCHEMA,'schema_version':1,'state':'ready','request_sha256':reqsha,'target':v['target'],'domain':v['domain'],'tenant_id':v['tenant_id'],'indexer_id':v['indexer_id'],'release_version':v['release_version'],'bundle_sha256':v['bundle_sha256'],'compose_sha256':v['compose_sha256']}; body['receipt_sha256']=sha(canonical(body)); return canonical(body)
